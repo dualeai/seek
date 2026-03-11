@@ -6,10 +6,38 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"syscall"
 )
 
+// Set via ldflags (-X main.version=...) by make build / GoReleaser.
+var version = ""
+
+func versionString() string {
+	if version != "" {
+		return "seek " + version
+	}
+	// Fallback to VCS info embedded by go build.
+	if info, ok := debug.ReadBuildInfo(); ok {
+		v := info.Main.Version
+		for _, s := range info.Settings {
+			if s.Key == "vcs.revision" && len(s.Value) >= 7 {
+				v += " (" + s.Value[:7] + ")"
+			}
+		}
+		if v != "" {
+			return "seek " + v
+		}
+	}
+	return "seek (unknown)"
+}
+
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == "--version" {
+		fmt.Println(versionString())
+		return
+	}
+
 	if len(os.Args) < 2 || os.Args[1] == "" {
 		fmt.Fprintln(os.Stderr, "Usage: seek <pattern>")
 		os.Exit(2)

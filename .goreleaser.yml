@@ -1,10 +1,11 @@
 version: 2
 
+gomod:
+  proxy: true
+
 builds:
   - main: ./cmd/seek
     binary: seek
-    ldflags:
-      - -s -w
     env:
       - CGO_ENABLED=0
     goos:
@@ -13,6 +14,11 @@ builds:
     goarch:
       - amd64
       - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Env.VERSION }}
 
 archives:
   - format: tar.gz
@@ -36,3 +42,15 @@ changelog:
 release:
   extra_files:
     - glob: sbom.cyclonedx.json
+  footer: |
+    ## Verify
+
+    ### Checksums
+    ```bash
+    sha256sum -c checksums.txt
+    ```
+
+    ### GitHub attestation
+    ```bash
+    gh attestation verify <artifact> --repo duale-ai/seek
+    ```

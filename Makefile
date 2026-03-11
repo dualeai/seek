@@ -13,7 +13,7 @@ upgrade:
 	go mod tidy
 
 build:
-	go build -ldflags="-s -w" -o seek ./cmd/seek
+	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=$$($(MAKE) -s version-full)" -o seek ./cmd/seek
 
 test:
 	$(MAKE) test-static
@@ -29,4 +29,7 @@ test-unit:
 lint:
 	golangci-lint run --fix ./...
 
-.PHONY: install upgrade build test test-static test-unit lint
+release:
+	VERSION=$$($(MAKE) -s version-full) goreleaser release --clean
+
+.PHONY: install upgrade build test test-static test-unit lint release
