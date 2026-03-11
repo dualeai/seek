@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -13,6 +14,15 @@ import (
 	"runtime/debug"
 	"syscall"
 )
+
+// errNoMatch is returned by run when the query executed successfully but
+// produced zero results. Following the POSIX grep convention, this maps to
+// exit code 1 — distinguishing "no match" from both success (0) and error (2).
+// This lets callers use seek reliably in shell pipelines and conditionals:
+//
+//	if seek "TODO"; then … fi       # runs body only when matches exist
+//	seek "pattern" || echo "nope"   # "nope" printed only on no-match
+var errNoMatch = errors.New("no match")
 
 // Set via ldflags (-X main.version=...) by make build / GoReleaser.
 var version = ""
@@ -78,8 +88,11 @@ func main() {
 	defer cancel()
 
 	if err := run(ctx, pattern); err != nil {
+		if errors.Is(err, errNoMatch) {
+			os.Exit(1)
+		}
 		slog.Error(err.Error())
-		os.Exit(1)
+		os.Exit(2)
 	}
 }
 
@@ -135,10 +148,10 @@ func run(ctx context.Context, pattern string) error {
 		return err
 	}
 
-	output := formatResults(results)
-	if output != "" {
-		fmt.Print(output)
+	if len(results) == 0 {
+		return errNoMatch
 	}
 
+	fmt.Print(formatResults(results))
 	return nil
 }

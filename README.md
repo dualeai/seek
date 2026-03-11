@@ -171,9 +171,11 @@ When multiple processes search the same repo concurrently:
 
 | Code | Meaning |
 |------|---------|
-| 0 | Success (including zero results) |
-| 1 | Error (indexing failed, ctags missing, invalid query) |
-| 2 | Usage error (no pattern provided) |
+| 0 | Success (one or more matches) |
+| 1 | No match (query ran successfully, zero results) |
+| 2 | Error (usage error, indexing failed, invalid query) |
+
+Follows the POSIX `grep` / `ripgrep` convention, so `seek` composes naturally in shell pipelines and conditionals.
 
 ## Security
 
