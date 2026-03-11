@@ -94,8 +94,14 @@ func formatFileMatch(sb *strings.Builder, fm zoekt.FileMatch) {
 		beforeLines := splitContextLines(lm.Before)
 		firstBeforeLine := matchLine - len(beforeLines)
 		if firstBeforeLine < 1 {
-			// Guard against more Before lines than actual file lines above match
-			beforeLines = beforeLines[1-firstBeforeLine:]
+			// Guard against before-context exceeding file start (matchLine near 0)
+			// or file-only matches where matchLine=0 and beforeLines is empty.
+			skip := 1 - firstBeforeLine
+			if skip >= len(beforeLines) {
+				beforeLines = nil
+			} else {
+				beforeLines = beforeLines[skip:]
+			}
 			firstBeforeLine = 1
 		}
 
