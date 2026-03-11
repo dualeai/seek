@@ -17,6 +17,20 @@ import (
 	"github.com/sourcegraph/zoekt/index"
 )
 
+const (
+	// cacheDir is the directory name for seek's cache within the repo root.
+	cacheDir = ".seek-cache"
+	// stateFile stores the hash of the last indexed git state.
+	stateFile = ".state"
+	// stateTmpFile is used for atomic writes of the state file.
+	stateTmpFile = ".state.tmp"
+	// lockFile is used for mutual exclusion during indexing.
+	lockFile = ".lock"
+	// repoUncommitted is the zoekt repository name for uncommitted file shards.
+	// Also used as the staging subdirectory name within cacheDir.
+	repoUncommitted = "uncommitted"
+)
+
 // computeStateHash computes the MD5 hash of raw git status v2 output.
 // The raw output already contains the HEAD SHA in the # branch.oid header,
 // so no domain separator is needed.
@@ -27,28 +41,28 @@ func computeStateHash(rawOutput string) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-// readStateFile reads the cached state hash from .zoekt-index/.state.
+// readStateFile reads the cached state hash from the stateFile in indexDir.
 func readStateFile(indexDir string) string {
-	data, err := os.ReadFile(filepath.Join(indexDir, ".state"))
+	data, err := os.ReadFile(filepath.Join(indexDir, stateFile))
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
 }
 
-// writeStateFile atomically writes the state hash to .zoekt-index/.state.
+// writeStateFile atomically writes the state hash to the stateFile in indexDir.
 func writeStateFile(indexDir, state string) error {
-	tmpPath := filepath.Join(indexDir, ".state.tmp")
+	tmpPath := filepath.Join(indexDir, stateTmpFile)
 	if err := os.WriteFile(tmpPath, []byte(state), 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, filepath.Join(indexDir, ".state"))
+	return os.Rename(tmpPath, filepath.Join(indexDir, stateFile))
 }
 
 // deleteStateFiles removes .state and .state.tmp.
 func deleteStateFiles(indexDir string) {
-	_ = os.Remove(filepath.Join(indexDir, ".state"))
-	_ = os.Remove(filepath.Join(indexDir, ".state.tmp"))
+	_ = os.Remove(filepath.Join(indexDir, stateFile))
+	_ = os.Remove(filepath.Join(indexDir, stateTmpFile))
 }
 
 // indexParallelism returns the number of parallel indexing workers.
@@ -82,10 +96,10 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 		return err
 	}
 
-	lockPath := filepath.Join(indexDir, ".lock")
+	lockPath := filepath.Join(indexDir, lockFile)
 
 	// Ensure partial state file is cleaned up on all exit paths
-	defer func() { _ = os.Remove(filepath.Join(indexDir, ".state.tmp")) }()
+	defer func() { _ = os.Remove(filepath.Join(indexDir, stateTmpFile)) }()
 
 	lockFd, acquired, err := acquireLock(ctx, indexDir, lockPath)
 	if err != nil {
@@ -115,7 +129,7 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 
 	if len(state.Files) > 0 {
 		go func() {
-			tmpDir, err := prepareUncommittedFiles(repoDir, state.Files, parallelism)
+			tmpDir, err := prepareUncommittedFiles(repoDir, indexDir, state.Files, parallelism)
 			hardlinkCh <- hardlinkResult{tmpDir, err}
 		}()
 	} else {
@@ -261,8 +275,8 @@ func indexCommitted(ctx context.Context, repoDir, indexDir string, parallelism i
 // prepareUncommittedFiles copies uncommitted files into a temp directory.
 // The temp dir is always recreated to avoid stale files from previous crashed runs.
 // Uses a worker pool for bounded memory and early cancellation on error.
-func prepareUncommittedFiles(repoDir string, files []string, parallelism int) (string, error) {
-	tmpDir := filepath.Join(repoDir, ".zoekt-uncommitted")
+func prepareUncommittedFiles(repoDir, indexDir string, files []string, parallelism int) (string, error) {
+	tmpDir := filepath.Join(indexDir, repoUncommitted)
 
 	// Remove stale temp dir from previous crashed runs to avoid phantom files
 	_ = os.RemoveAll(tmpDir)

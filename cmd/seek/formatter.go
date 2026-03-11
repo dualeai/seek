@@ -8,10 +8,6 @@ import (
 	"github.com/sourcegraph/zoekt"
 )
 
-// repoUncommitted is the repository name used for uncommitted file shards.
-// This constant ties indexer naming (indexUncommitted) to formatter detection.
-const repoUncommitted = "uncommitted"
-
 // formatResults formats zoekt FileMatch results into the output format.
 // Files are deduplicated (uncommitted wins), sorted by score descending.
 func formatResults(files []zoekt.FileMatch) string {
@@ -80,7 +76,7 @@ func formatFileMatch(sb *strings.Builder, fm zoekt.FileMatch) {
 	sb.WriteByte(')')
 
 	if fm.Repository == repoUncommitted {
-		sb.WriteString(" [uncommitted]")
+		sb.WriteString(" [" + repoUncommitted + "]")
 	}
 	sb.WriteByte('\n')
 

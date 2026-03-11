@@ -119,6 +119,5 @@ $RECYCLE.BIN/
 /seek
 /*.exe
 
-# Zoekt index (generated at runtime)
-.zoekt-index/
-.zoekt-uncommitted/
+# Seek cache (generated at runtime)
+.seek-cache/

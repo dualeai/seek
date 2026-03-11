@@ -42,7 +42,7 @@ func TestFormatResults_UncommittedTag(t *testing.T) {
 	files := []zoekt.FileMatch{
 		{
 			FileName:   "lib/utils.py",
-			Repository: "uncommitted",
+			Repository: repoUncommitted,
 			Language:   "Python",
 			Score:      5,
 			LineMatches: []zoekt.LineMatch{
@@ -74,7 +74,7 @@ func TestFormatResults_Deduplication_UncommittedWins(t *testing.T) {
 		},
 		{
 			FileName:   "src/app.go",
-			Repository: "uncommitted",
+			Repository: repoUncommitted,
 			Language:   "Go",
 			Score:      5,
 			LineMatches: []zoekt.LineMatch{
@@ -185,7 +185,7 @@ func TestFormatResults_MultiFile(t *testing.T) {
 		},
 		{
 			FileName:   "b.py",
-			Repository: "uncommitted",
+			Repository: repoUncommitted,
 			Language:   "Python",
 			Score:      5,
 			LineMatches: []zoekt.LineMatch{
@@ -278,7 +278,7 @@ func TestDeduplicateFiles_OrderIndependence(t *testing.T) {
 	}
 	uncommitted := zoekt.FileMatch{
 		FileName:   "app.go",
-		Repository: "uncommitted",
+		Repository: repoUncommitted,
 		Language:   "Go",
 		Score:      5,
 		LineMatches: []zoekt.LineMatch{
@@ -294,10 +294,10 @@ func TestDeduplicateFiles_OrderIndependence(t *testing.T) {
 	if len(r1) != 1 || len(r2) != 1 {
 		t.Fatalf("expected 1 result each, got %d and %d", len(r1), len(r2))
 	}
-	if r1[0].Repository != "uncommitted" {
+	if r1[0].Repository != repoUncommitted {
 		t.Error("committed-first: expected uncommitted to win")
 	}
-	if r2[0].Repository != "uncommitted" {
+	if r2[0].Repository != repoUncommitted {
 		t.Error("uncommitted-first: expected uncommitted to win")
 	}
 }
@@ -314,10 +314,10 @@ func TestDeduplicateFiles_CommittedOnly(t *testing.T) {
 
 func TestDeduplicateFiles_UncommittedOnly(t *testing.T) {
 	files := []zoekt.FileMatch{
-		{FileName: "a.go", Repository: "uncommitted", Score: 5},
+		{FileName: "a.go", Repository: repoUncommitted, Score: 5},
 	}
 	result := deduplicateFiles(files)
-	if len(result) != 1 || result[0].Repository != "uncommitted" {
+	if len(result) != 1 || result[0].Repository != repoUncommitted {
 		t.Error("single uncommitted entry should pass through unchanged")
 	}
 }

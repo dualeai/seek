@@ -32,7 +32,7 @@ func run(ctx context.Context, pattern string) error {
 	}
 
 	// Use absolute paths to avoid dependence on process CWD
-	indexDir := filepath.Join(repoDir, ".zoekt-index")
+	indexDir := filepath.Join(repoDir, cacheDir)
 	if err := os.MkdirAll(indexDir, 0o755); err != nil {
 		return fmt.Errorf("create index directory: %w", err)
 	}
