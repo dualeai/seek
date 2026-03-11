@@ -21,7 +21,8 @@ builds:
       - -s -w -X main.version={{ .Env.VERSION }}
 
 archives:
-  - format: tar.gz
+  - formats:
+      - tar.gz
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
 
 checksum:
