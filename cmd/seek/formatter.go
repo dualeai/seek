@@ -35,7 +35,7 @@ func formatResults(files []zoekt.FileMatch) string {
 		formatFileMatch(&sb, fm)
 	}
 
-	// §8 rule 4: no trailing newline after the last line
+	// No trailing newline after the last line
 	return strings.TrimRight(sb.String(), "\n")
 }
 
@@ -79,7 +79,9 @@ func formatFileMatch(sb *strings.Builder, fm zoekt.FileMatch) {
 	sb.WriteByte(')')
 
 	if fm.Repository == repoUncommitted {
-		sb.WriteString(" [" + repoUncommitted + "]")
+		sb.WriteString(" [")
+		sb.WriteString(repoUncommitted)
+		sb.WriteByte(']')
 	}
 	sb.WriteByte('\n')
 
@@ -188,10 +190,13 @@ func splitContextLines(data []byte) []string {
 	return lines
 }
 
-// countContextLines counts how many context lines are in the raw bytes.
+// countContextLines counts how many context lines are in the raw bytes
+// without allocating. It mirrors splitContextLines' trimming logic:
+// a trailing newline is ignored (it's a terminator, not an empty line).
 func countContextLines(data []byte) int {
 	if len(data) == 0 {
 		return 0
 	}
-	return len(splitContextLines(data))
+	data = bytes.TrimSuffix(data, []byte("\n"))
+	return bytes.Count(data, []byte("\n")) + 1
 }

@@ -218,7 +218,7 @@ func TestFormatResults_NoTrailingNewline(t *testing.T) {
 
 	result := formatResults(files)
 	if len(result) > 0 && result[len(result)-1] == '\n' {
-		t.Error("output must not end with trailing newline (§8 rule 4)")
+		t.Error("output must not end with trailing newline")
 	}
 }
 
@@ -860,6 +860,129 @@ func TestFormatResults_FileOnlyMatch_LineNumberZero(t *testing.T) {
 	result := formatResults(files)
 	if !strings.Contains(result, "## path/to/file.go (Go)") {
 		t.Errorf("expected file header, got: %s", result)
+	}
+}
+
+func TestDeduplicateFiles_EmptyInput(t *testing.T) {
+	result := deduplicateFiles(nil)
+	if len(result) != 0 {
+		t.Errorf("expected 0 results, got %d", len(result))
+	}
+	result2 := deduplicateFiles([]zoekt.FileMatch{})
+	if len(result2) != 0 {
+		t.Errorf("expected 0 results for empty slice, got %d", len(result2))
+	}
+}
+
+func TestDeduplicateFiles_ManyDuplicates(t *testing.T) {
+	files := make([]zoekt.FileMatch, 200)
+	for i := range 100 {
+		files[i] = zoekt.FileMatch{FileName: "dup.go", Repository: "repo", Score: float64(i)}
+	}
+	for i := range 100 {
+		files[100+i] = zoekt.FileMatch{FileName: "dup.go", Repository: repoUncommitted, Score: float64(i)}
+	}
+	result := deduplicateFiles(files)
+	if len(result) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(result))
+	}
+	if result[0].Repository != repoUncommitted {
+		t.Error("expected uncommitted to win")
+	}
+}
+
+func TestDeduplicateFiles_DifferentFiles(t *testing.T) {
+	files := make([]zoekt.FileMatch, 10)
+	for i := range 10 {
+		files[i] = zoekt.FileMatch{
+			FileName:   fmt.Sprintf("file_%d.go", i),
+			Repository: "repo",
+			Score:      float64(i),
+		}
+	}
+	result := deduplicateFiles(files)
+	if len(result) != 10 {
+		t.Errorf("expected 10 results (no duplicates), got %d", len(result))
+	}
+}
+
+func TestFormatResults_VeryLongFileName(t *testing.T) {
+	longName := strings.Repeat("a", 1000) + ".go"
+	files := []zoekt.FileMatch{
+		{
+			FileName:   longName,
+			Repository: "repo",
+			Language:   "Go",
+			Score:      1,
+			LineMatches: []zoekt.LineMatch{
+				{Line: []byte("match\n"), LineNumber: 1},
+			},
+		},
+	}
+	result := formatResults(files)
+	if !strings.Contains(result, longName) {
+		t.Error("expected long filename to appear in output without truncation")
+	}
+}
+
+func TestFormatResults_VeryLongLine(t *testing.T) {
+	longLine := strings.Repeat("x", 10000) + "\n"
+	files := []zoekt.FileMatch{
+		{
+			FileName:   "long.go",
+			Repository: "repo",
+			Language:   "Go",
+			Score:      1,
+			LineMatches: []zoekt.LineMatch{
+				{Line: []byte(longLine), LineNumber: 1},
+			},
+		},
+	}
+	result := formatResults(files)
+	if !strings.Contains(result, strings.Repeat("x", 10000)) {
+		t.Error("expected long line to appear without truncation")
+	}
+}
+
+func TestFormatResults_SpecialCharsInLine(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{
+			FileName:   "special.go",
+			Repository: "repo",
+			Language:   "Go",
+			Score:      1,
+			LineMatches: []zoekt.LineMatch{
+				{Line: []byte("tab\there unicode: 日本語 emoji: 🎉\n"), LineNumber: 1},
+			},
+		},
+	}
+	result := formatResults(files)
+	if !strings.Contains(result, "tab\there unicode: 日本語 emoji: 🎉") {
+		t.Errorf("expected special chars preserved, got: %s", result)
+	}
+}
+
+func TestFormatResults_LineNumber_MaxUint32(t *testing.T) {
+	// Large line number — verify no overflow in context line arithmetic
+	files := []zoekt.FileMatch{
+		{
+			FileName:   "big.go",
+			Repository: "repo",
+			Language:   "Go",
+			Score:      1,
+			LineMatches: []zoekt.LineMatch{
+				{
+					Line:       []byte("match\n"),
+					LineNumber: 1<<31 - 1, // max int32
+					Before:     []byte("before\n"),
+				},
+			},
+		},
+	}
+	// Should not panic
+	result := formatResults(files)
+	if !strings.Contains(result, "match") {
+		t.Error("expected match to appear in output")
 	}
 }
 
