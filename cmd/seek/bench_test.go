@@ -263,6 +263,13 @@ func BenchmarkSplitContextLines(b *testing.B) {
 	}
 }
 
+func BenchmarkCountContextLines(b *testing.B) {
+	data := []byte("line one\nline two\nline three\n")
+	for b.Loop() {
+		countContextLines(data)
+	}
+}
+
 // --- End-to-end benchmark (requires git + ctags) ---
 
 func BenchmarkEndToEnd_ColdIndex(b *testing.B) {

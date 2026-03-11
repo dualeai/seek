@@ -190,10 +190,13 @@ func splitContextLines(data []byte) []string {
 	return lines
 }
 
-// countContextLines counts how many context lines are in the raw bytes.
+// countContextLines counts how many context lines are in the raw bytes
+// without allocating. It mirrors splitContextLines' trimming logic:
+// a trailing newline is ignored (it's a terminator, not an empty line).
 func countContextLines(data []byte) int {
 	if len(data) == 0 {
 		return 0
 	}
-	return len(splitContextLines(data))
+	data = bytes.TrimSuffix(data, []byte("\n"))
+	return bytes.Count(data, []byte("\n")) + 1
 }
