@@ -9,15 +9,15 @@ import (
 )
 
 // requireTools skips the test if git or universal-ctags is not available.
+// Uses checkCtags (same check as runIndexing) to avoid false positives when
+// a non-universal ctags is on PATH.
 func requireTools(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("requires git on PATH")
 	}
-	if _, err := exec.LookPath("universal-ctags"); err != nil {
-		if _, err := exec.LookPath("ctags"); err != nil {
-			t.Skip("requires universal-ctags on PATH")
-		}
+	if err := checkCtags(); err != nil {
+		t.Skipf("requires universal-ctags: %v", err)
 	}
 }
 
