@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -111,7 +112,7 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 	}
 	if !acquired {
 		// Lock not acquired but shards exist — use stale index
-		fmt.Fprintln(os.Stderr, "Warning: another process is indexing, using existing index")
+		slog.Warn("Another process is indexing, using existing index")
 		return nil
 	}
 	defer releaseLock(lockFd)
@@ -145,7 +146,7 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 	// Index committed files
 	committedErr := indexCommitted(ctx, repoDir, indexDir, parallelism)
 	if committedErr != nil {
-		fmt.Fprintf(os.Stderr, "Warning: committed indexing failed: %v\n", committedErr)
+		slog.Warn("Committed indexing failed", "error", committedErr)
 	}
 
 	// Wait for uncommitted file reads
@@ -160,7 +161,7 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 	// Index uncommitted files
 	if len(readRes.docs) > 0 {
 		if err := indexUncommitted(ctx, repoDir, indexDir, readRes.docs, parallelism); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: uncommitted indexing failed: %v\n", err)
+			slog.Warn("Uncommitted indexing failed", "error", err)
 		}
 	}
 
@@ -170,7 +171,7 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 	if committedErr != nil {
 		// §5.7 step 4: Don't cache state, but do NOT exit — proceed to search
 		deleteStateFiles(indexDir)
-		fmt.Fprintln(os.Stderr, "Warning: index incomplete, will re-index on next search")
+		slog.Warn("Index incomplete, will re-index on next search")
 		return nil
 	}
 
@@ -180,7 +181,7 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 		}
 	} else {
 		deleteStateFiles(indexDir)
-		fmt.Fprintln(os.Stderr, "Warning: index may be stale, will re-index on next search")
+		slog.Warn("Index may be stale, will re-index on next search")
 	}
 
 	return nil
@@ -311,7 +312,7 @@ func readUncommittedFiles(repoDir string, files []string, parallelism int) []fil
 				}
 
 				if fi.Size() > maxUncommittedFileSize {
-					fmt.Fprintf(os.Stderr, "Warning: skipping large uncommitted file %s (%d MB)\n", f, fi.Size()/(1024*1024))
+					slog.Warn("Skipping large uncommitted file", "path", f, "size_mb", fi.Size()/(1024*1024))
 					continue
 				}
 

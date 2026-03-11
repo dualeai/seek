@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
+	"io"
+	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -33,24 +37,70 @@ func versionString() string {
 }
 
 func main() {
-	if len(os.Args) >= 2 && os.Args[1] == "--version" {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <pattern>\n\nFlags:\n", os.Args[0])
+		flag.PrintDefaults()
+	}
+
+	showVersion := flag.Bool("version", false, "print version and exit")
+	verbose := flag.Bool("verbose", false, "enable debug logging")
+	flag.BoolVar(verbose, "v", false, "alias for -verbose")
+	flag.Parse()
+
+	if *showVersion {
 		fmt.Println(versionString())
 		return
 	}
 
-	if len(os.Args) < 2 || os.Args[1] == "" {
-		fmt.Fprintln(os.Stderr, "Usage: seek <pattern>")
+	// Configure logging: warn+ by default, debug+ with -verbose.
+	logLevel := slog.LevelWarn
+	if *verbose {
+		logLevel = slog.LevelDebug
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel}))
+	slog.SetDefault(logger)
+
+	// Silence zoekt's log.Printf output by default; bridge to slog when verbose.
+	if *verbose {
+		log.SetOutput(newSlogWriter(logger))
+		log.SetFlags(0)
+	} else {
+		log.SetOutput(io.Discard)
+	}
+
+	if flag.NArg() != 1 {
+		flag.Usage()
 		os.Exit(2)
 	}
-	pattern := os.Args[1]
+	pattern := flag.Arg(0)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
 	if err := run(ctx, pattern); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		slog.Error(err.Error())
 		os.Exit(1)
 	}
+}
+
+// slogWriter bridges Go's standard log package to slog. Each log.Printf call
+// becomes a single slog.Info message.
+type slogWriter struct {
+	logger *slog.Logger
+}
+
+func newSlogWriter(l *slog.Logger) *slogWriter {
+	return &slogWriter{logger: l}
+}
+
+func (w *slogWriter) Write(p []byte) (int, error) {
+	// Trim trailing newline added by log.Printf
+	msg := string(p)
+	if len(msg) > 0 && msg[len(msg)-1] == '\n' {
+		msg = msg[:len(msg)-1]
+	}
+	w.logger.Info(msg)
+	return len(p), nil
 }
 
 func run(ctx context.Context, pattern string) error {
@@ -74,7 +124,7 @@ func run(ctx context.Context, pattern string) error {
 	if currentState != cachedState {
 		// Step 6: run indexing
 		if err := runIndexing(ctx, repoDir, indexDir, state, currentState); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: indexing failed: %v\n", err)
+			slog.Warn("Indexing failed", "error", err)
 			// Continue to search with whatever shards exist
 		}
 	}
