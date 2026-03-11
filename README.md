@@ -24,6 +24,29 @@ AI coding agents like [Claude Code](https://claude.com/product/claude-code), [Co
 
 seek is not a ripgrep replacement for ad-hoc regex. It's for the use case where the same repo is searched dozens of times per session and results need to be [compact enough for an LLM context window](https://milvus.io/blog/why-im-against-claude-codes-grep-only-retrieval-it-just-burns-too-many-tokens.md).
 
+### Example: finding a function definition
+
+```bash
+# ripgrep: 31 matches across the codebase, no way to filter to definitions
+$ rg "formatResults"
+cmd/seek/main.go:88:    output := formatResults(results)
+cmd/seek/formatter_test.go:12:  result := formatResults(nil)
+cmd/seek/formatter_test.go:34:  result := formatResults(files)
+cmd/seek/formatter_test.go:57:  result := formatResults(files)
+# ... 27 more matches
+
+# seek: 1 result, the definition, with symbol annotation and context
+$ seek "sym:formatResults"
+## cmd/seek/formatter.go (Go)
+  11
+  12 // formatResults formats zoekt FileMatch results into the output format.
+  13 // Files are deduplicated (uncommitted wins), sorted by score descending.
+  14 [func] func formatResults(files []zoekt.FileMatch) string {
+  15     if len(files) == 0 {
+  16         return ""
+  17     }
+```
+
 ## Highlights
 
 - **Under 200ms search on large repos** -- grep is O(corpus) per query; seek is O(matches) after a one-time index build
@@ -92,17 +115,39 @@ Results are grouped by file, sorted by relevance. Each match includes 3 lines of
 
 ## Query Syntax
 
+### Search
+
 | Query | What it does |
 |-------|-------------|
 | `seek "CoreRouter"` | Substring search across content and file names |
-| `seek "sym:CoreRouter"` | Symbol search (function/class/method definitions) |
+| `seek "content:async def.*handler"` | Search only file content (not file names) |
+| `seek "regex:foo.*bar"` | Explicit regex search |
+
+### Symbols
+
+| Query | What it does |
+|-------|-------------|
+| `seek "sym:CoreRouter"` | Symbol search (function/class/method definitions via ctags) |
+
+### Filters
+
+| Query | What it does |
+|-------|-------------|
 | `seek "file:router/src"` | Filter results to paths matching `router/src` |
-| `seek "-file:test"` | Exclude paths matching `test` |
 | `seek "lang:python error"` | Filter by language |
-| `seek "content:async def.*handler"` | Regex search |
+| `seek "case:yes FooBar"` | Case-sensitive search (`yes`, `no`, `auto`) |
+| `seek "type:file config"` | Return matching file names only (no content matches) |
+
+### Boolean Logic
+
+| Query | What it does |
+|-------|-------------|
+| `seek "-file:test"` | Exclude paths matching `test` |
+| `seek "foo or bar"` | Match either term |
+| `seek "(foo or bar) lang:go"` | Group expressions with parentheses |
 | `seek "handleError file:api -file:test"` | Combined: substring + path filter + exclusion |
 
-All [zoekt query syntax](https://github.com/sourcegraph/zoekt/blob/main/doc/query_syntax.md) is supported.
+All [zoekt query syntax](https://github.com/sourcegraph/zoekt/blob/main/doc/query_syntax.md) is supported. Searches are ranked using [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) scoring for relevance.
 
 ## How It Works
 
