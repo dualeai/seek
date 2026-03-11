@@ -9,7 +9,7 @@ func FuzzParseGitStatusV2(f *testing.F) {
 	f.Add("# branch.oid abc123\n# branch.head main\n")
 	f.Add("# branch.oid abc123\n1 .M N... 100644 100644 100644 abc def src/main.go\x00")
 	f.Add("# branch.oid abc123\n? new_file.txt\x00")
-	f.Add("# branch.oid abc123\n2 R. N... 100644 100644 100644 abc def R100 new.go\x00old.go\x00")
+	f.Add("# branch.oid abc123\n1 A. N... 100644 100644 100644 abc def added.go\x00")
 	f.Add("# branch.oid abc123\nu UU N... 100644 100644 100644 100644 a b c conflict.go\x00")
 	f.Add("")
 	f.Add("\x00\x00\x00")
@@ -32,7 +32,7 @@ func FuzzParseGitStatusV2(f *testing.F) {
 
 func FuzzExtractV2Path(f *testing.F) {
 	f.Add("1 .M N... 100644 100644 100644 abc def src/main.go", 8)
-	f.Add("2 R. N... 100644 100644 100644 abc def R100 new.go", 9)
+	f.Add("u UU N... 100644 100644 100644 100644 abc def ghi conflict.go", 10)
 	f.Add("short", 5)
 	f.Add("", 0)
 	f.Add("a b c", 100)

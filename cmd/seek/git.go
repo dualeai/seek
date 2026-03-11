@@ -38,19 +38,18 @@ func gitRepoRoot(ctx context.Context) (string, error) {
 }
 
 // gitRepoState returns the current repository state using a single
-// git status --porcelain=v2 --branch -z command. This eliminates
+// git status --porcelain=v2 --branch --no-renames -z command. This eliminates
 // the TOCTOU window between separate git rev-parse and git status calls.
 func gitRepoState(ctx context.Context) repoState {
-	out, err := gitCmd(ctx, "status", "--porcelain=v2", "--branch", "-z").Output()
+	out, err := gitCmd(ctx, "status", "--porcelain=v2", "--branch", "--no-renames", "-z").Output()
 	if err != nil {
 		return repoState{HeadSHA: "no-head"}
 	}
 	return parseGitStatusV2(string(out))
 }
 
-// parseGitStatusV2 parses git status --porcelain=v2 --branch -z output.
+// parseGitStatusV2 parses git status --porcelain=v2 --branch --no-renames -z output.
 // Header lines (# ...) are LF-terminated. Entry records are NUL-terminated.
-// Rename entries (type 2) have two NUL-terminated path fields.
 func parseGitStatusV2(raw string) repoState {
 	state := repoState{
 		HeadSHA:   "no-head",
@@ -96,17 +95,8 @@ func parseGitStatusV2(raw string) repoState {
 		switch entry[0] {
 		case '?': // untracked: "? <path>"
 			path = entry[2:]
-		case '!': // ignored
-			continue
 		case '1': // changed: "1 XY sub mH mI mW hH hI <path>"
 			path = extractV2Path(entry, 8)
-		case '2': // renamed/copied: "2 XY sub mH mI mW hH hI Xscore <path>"
-			path = extractV2Path(entry, 9)
-			// Skip the origPath (next NUL-terminated field)
-			nextEnd := strings.IndexByte(raw[pos:], 0)
-			if nextEnd >= 0 {
-				pos += nextEnd + 1
-			}
 		case 'u': // unmerged: "u XY sub m1 m2 m3 mW h1 h2 h3 <path>"
 			path = extractV2Path(entry, 10)
 		}

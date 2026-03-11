@@ -27,12 +27,15 @@ All source in `cmd/seek/`:
 - `formatter.go` — output formatting (file-grouped, score-sorted, symbol metadata)
 - `lock.go` — platform-specific file locking (flock)
 - `signal.go` — platform-specific git cancel signal (SIGTERM)
+- `clone_darwin.go` — macOS clonefile (CoW) for uncommitted file staging
+- `clone_linux.go` — Linux ioctl FICLONE (CoW) for uncommitted file staging
+- `clone_other.go` — no-op fallback for other platforms
 
 ## Key decisions
 
 - Uses zoekt as a Go library (not CLI) to avoid process spawns
-- Single atomic `git status --porcelain=v2 --branch -z` eliminates TOCTOU between HEAD and status
-- State hash = MD5("v2\0" + raw porcelain v2 output) for cache invalidation
-- Uncommitted files indexed via hardlinks + index.NewBuilder
+- Single atomic `git status --porcelain=v2 --branch --no-renames -z` eliminates TOCTOU between HEAD and status
+- State hash = xxHash64("v3\0" + raw porcelain v2 output) for cache invalidation
+- Uncommitted files staged via clonefile (CoW) → hardlink → copy fallback, indexed with index.NewBuilder
 - Non-blocking flock with fallback to stale index for parallel agent safety
 - Output format: `## file (lang) [uncommitted]` headers with indented line matches

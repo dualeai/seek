@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/md5"
 	"fmt"
 	"io"
 	"io/fs"
@@ -13,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/sourcegraph/zoekt/gitindex"
 	"github.com/sourcegraph/zoekt/index"
 )
@@ -29,16 +29,19 @@ const (
 	// repoUncommitted is the zoekt repository name for uncommitted file shards.
 	// Also used as the staging subdirectory name within cacheDir.
 	repoUncommitted = "uncommitted"
+	// stateVersion is the prefix used in state hashing to invalidate caches
+	// when the hash algorithm or input format changes.
+	stateVersion = "v3\x00"
 )
 
-// computeStateHash computes the MD5 hash of raw git status v2 output.
+// computeStateHash computes the xxHash64 of raw git status v2 output.
 // The raw output already contains the HEAD SHA in the # branch.oid header,
 // so no domain separator is needed.
 func computeStateHash(rawOutput string) string {
-	h := md5.New()
-	h.Write([]byte("v2\x00")) // version prefix for cache invalidation on format change
-	h.Write([]byte(rawOutput))
-	return fmt.Sprintf("%x", h.Sum(nil))
+	h := xxhash.New()
+	_, _ = h.Write([]byte(stateVersion))
+	_, _ = h.Write([]byte(rawOutput))
+	return fmt.Sprintf("%016x", h.Sum64())
 }
 
 // readStateFile reads the cached state hash from the stateFile in indexDir.
@@ -121,19 +124,19 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 	parallelism := indexParallelism()
 
 	// Prepare uncommitted files in parallel with committed indexing
-	type hardlinkResult struct {
+	type stagingResult struct {
 		tempDir string
 		err     error
 	}
-	hardlinkCh := make(chan hardlinkResult, 1)
+	stagingCh := make(chan stagingResult, 1)
 
 	if len(state.Files) > 0 {
 		go func() {
 			tmpDir, err := prepareUncommittedFiles(repoDir, indexDir, state.Files, parallelism)
-			hardlinkCh <- hardlinkResult{tmpDir, err}
+			stagingCh <- stagingResult{tmpDir, err}
 		}()
 	} else {
-		hardlinkCh <- hardlinkResult{"", nil}
+		stagingCh <- stagingResult{"", nil}
 	}
 
 	// Index committed files
@@ -142,19 +145,19 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 		fmt.Fprintf(os.Stderr, "Warning: committed indexing failed: %v\n", committedErr)
 	}
 
-	// Wait for hardlink preparation
-	hlResult := <-hardlinkCh
+	// Wait for uncommitted file staging
+	stgResult := <-stagingCh
 
 	// §5.5 step 2: Always clean stale uncommitted shards before rebuilding
 	cleanUncommittedShards(indexDir)
 
 	// §5.5 steps 3-7: Index uncommitted files (sequential, after committed)
 	if len(state.Files) > 0 {
-		if hlResult.err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: uncommitted file preparation failed: %v\n", hlResult.err)
-		} else if hlResult.tempDir != "" {
-			defer func() { _ = os.RemoveAll(hlResult.tempDir) }()
-			if err := indexUncommitted(ctx, indexDir, hlResult.tempDir, parallelism); err != nil {
+		if stgResult.err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: uncommitted file preparation failed: %v\n", stgResult.err)
+		} else if stgResult.tempDir != "" {
+			defer func() { _ = os.RemoveAll(stgResult.tempDir) }()
+			if err := indexUncommitted(ctx, indexDir, stgResult.tempDir, parallelism); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: uncommitted indexing failed: %v\n", err)
 			}
 		}
@@ -272,7 +275,8 @@ func indexCommitted(ctx context.Context, repoDir, indexDir string, parallelism i
 	return err
 }
 
-// prepareUncommittedFiles copies uncommitted files into a temp directory.
+// prepareUncommittedFiles stages uncommitted files into a temp directory
+// using clonefile (CoW), hardlink, or copy as fallback.
 // The temp dir is always recreated to avoid stale files from previous crashed runs.
 // Uses a worker pool for bounded memory and early cancellation on error.
 func prepareUncommittedFiles(repoDir, indexDir string, files []string, parallelism int) (string, error) {
@@ -337,11 +341,13 @@ func prepareUncommittedFiles(repoDir, indexDir string, files []string, paralleli
 					return
 				}
 
-				// Try hardlink first, fallback to copy
-				if err := os.Link(srcPath, dstPath); err != nil {
-					if err := copyFile(srcPath, dstPath); err != nil {
-						setErr(err)
-						return
+				// Try clonefile (CoW), then hardlink, then copy
+				if !tryCloneFile(srcPath, dstPath) {
+					if err := os.Link(srcPath, dstPath); err != nil {
+						if err := copyFile(srcPath, dstPath); err != nil {
+							setErr(err)
+							return
+						}
 					}
 				}
 			}

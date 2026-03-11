@@ -44,7 +44,7 @@ All [zoekt query syntax](https://github.com/sourcegraph/zoekt/blob/main/doc/quer
 
 ## How it works
 
-1. **State check** — Single atomic `git status --porcelain=v2 --branch -z` captures HEAD SHA + dirty files; hashes the raw output for cache invalidation
+1. **State check** — Single atomic `git status --porcelain=v2 --branch --no-renames -z` captures HEAD SHA + dirty files; hashes the raw output for cache invalidation
 2. **Index** — If stale, locks `.seek-cache/` and runs zoekt's trigram indexer on committed files (via `gitindex.IndexGitRepo`) and uncommitted files (via `index.NewBuilder`)
 3. **Search** — Loads shards from `.seek-cache/`, parses query, returns results sorted by relevance
 

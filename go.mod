@@ -2,7 +2,11 @@ module github.com/dualeai/seek
 
 go 1.24.0
 
-require github.com/sourcegraph/zoekt v0.0.0-20260114143800-c747a3bccc2a
+require (
+	github.com/cespare/xxhash/v2 v2.3.0
+	github.com/sourcegraph/zoekt v0.0.0-20260114143800-c747a3bccc2a
+	golang.org/x/sys v0.38.0
+)
 
 require (
 	dario.cat/mergo v1.0.1 // indirect
@@ -12,7 +16,6 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.20.0 // indirect
 	github.com/bmatcuk/doublestar v1.3.4 // indirect
-	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cloudflare/circl v1.6.1 // indirect
 	github.com/cyphar/filepath-securejoin v0.4.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
@@ -46,7 +49,6 @@ require (
 	golang.org/x/crypto v0.45.0 // indirect
 	golang.org/x/net v0.47.0 // indirect
 	golang.org/x/sync v0.18.0 // indirect
-	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250825161204-c5933d9347a5 // indirect
 	google.golang.org/grpc v1.75.0 // indirect

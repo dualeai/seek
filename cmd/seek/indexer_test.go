@@ -27,15 +27,15 @@ func TestComputeStateHash_DifferentInputs(t *testing.T) {
 
 func TestComputeStateHash_Length(t *testing.T) {
 	h := computeStateHash("# branch.oid abc123\n")
-	if len(h) != 32 {
-		t.Errorf("expected 32-char hex hash, got %d chars: %q", len(h), h)
+	if len(h) != 16 {
+		t.Errorf("expected 16-char hex hash (xxHash64), got %d chars: %q", len(h), h)
 	}
 }
 
 func TestComputeStateHash_EmptyInput(t *testing.T) {
 	h := computeStateHash("")
-	if len(h) != 32 {
-		t.Errorf("expected 32-char hex hash for empty input, got %d chars: %q", len(h), h)
+	if len(h) != 16 {
+		t.Errorf("expected 16-char hex hash (xxHash64) for empty input, got %d chars: %q", len(h), h)
 	}
 	h2 := computeStateHash("")
 	if h != h2 {
@@ -86,26 +86,6 @@ func TestParseGitStatusV2_Untracked(t *testing.T) {
 	assertContains(t, state.Files, "new_file.txt")
 }
 
-func TestParseGitStatusV2_Renamed(t *testing.T) {
-	raw := "# branch.oid abc123\n" +
-		"2 R. N... 100644 100644 100644 abc123 def456 R100 new_name.go\x00old_name.go\x00"
-	state := parseGitStatusV2(raw)
-	assertContains(t, state.Files, "new_name.go")
-	if containsStr(state.Files, "old_name.go") {
-		t.Error("should not include old name from rename")
-	}
-}
-
-func TestParseGitStatusV2_Copied(t *testing.T) {
-	raw := "# branch.oid abc123\n" +
-		"2 C. N... 100644 100644 100644 abc123 def456 C100 copy.go\x00original.go\x00"
-	state := parseGitStatusV2(raw)
-	assertContains(t, state.Files, "copy.go")
-	if containsStr(state.Files, "original.go") {
-		t.Error("should not include original name from copy")
-	}
-}
-
 func TestParseGitStatusV2_Unmerged(t *testing.T) {
 	raw := "# branch.oid abc123\n" +
 		"u UU N... 100644 100644 100644 100644 abc123 def456 ghi789 conflict.go\x00"
@@ -116,18 +96,16 @@ func TestParseGitStatusV2_Unmerged(t *testing.T) {
 func TestParseGitStatusV2_Mixed(t *testing.T) {
 	raw := "# branch.oid abc123\n# branch.head develop\n" +
 		"1 .M N... 100644 100644 100644 abc123 def456 modified.go\x00" +
-		"? untracked.txt\x00" +
-		"2 R. N... 100644 100644 100644 abc123 def456 R100 renamed.go\x00original.go\x00"
+		"? untracked.txt\x00"
 	state := parseGitStatusV2(raw)
 	if state.HeadSHA != "abc123" {
 		t.Errorf("expected HeadSHA %q, got %q", "abc123", state.HeadSHA)
 	}
-	if len(state.Files) != 3 {
-		t.Errorf("expected 3 files, got %d: %v", len(state.Files), state.Files)
+	if len(state.Files) != 2 {
+		t.Errorf("expected 2 files, got %d: %v", len(state.Files), state.Files)
 	}
 	assertContains(t, state.Files, "modified.go")
 	assertContains(t, state.Files, "untracked.txt")
-	assertContains(t, state.Files, "renamed.go")
 }
 
 func TestParseGitStatusV2_Deduplication(t *testing.T) {
@@ -183,25 +161,6 @@ func TestParseGitStatusV2_BlankLineBetweenHeadersAndEntries(t *testing.T) {
 	assertContains(t, state.Files, "new.txt")
 }
 
-func TestParseGitStatusV2_ConsecutiveRenames(t *testing.T) {
-	// Two consecutive rename entries — each has two NUL-terminated path fields.
-	// The parser must correctly skip the origPath of each rename.
-	raw := "# branch.oid abc123\n" +
-		"2 R. N... 100644 100644 100644 abc123 def456 R100 new_a.go\x00old_a.go\x00" +
-		"2 R. N... 100644 100644 100644 abc123 def456 R090 new_b.go\x00old_b.go\x00" +
-		"? untracked.txt\x00"
-	state := parseGitStatusV2(raw)
-	if len(state.Files) != 3 {
-		t.Errorf("expected 3 files, got %d: %v", len(state.Files), state.Files)
-	}
-	assertContains(t, state.Files, "new_a.go")
-	assertContains(t, state.Files, "new_b.go")
-	assertContains(t, state.Files, "untracked.txt")
-	if containsStr(state.Files, "old_a.go") || containsStr(state.Files, "old_b.go") {
-		t.Error("should not include old names from renames")
-	}
-}
-
 func TestExtractV2Path(t *testing.T) {
 	tests := []struct {
 		entry      string
@@ -209,7 +168,6 @@ func TestExtractV2Path(t *testing.T) {
 		expected   string
 	}{
 		{"1 .M N... 100644 100644 100644 abc123 def456 src/main.go", 8, "src/main.go"},
-		{"2 R. N... 100644 100644 100644 abc123 def456 R100 new.go", 9, "new.go"},
 		{"u UU N... 100644 100644 100644 100644 abc123 def456 ghi789 conflict.go", 10, "conflict.go"},
 		{"short", 5, ""},
 		{"1 .M N... 100644 100644 100644 abc123 def456 path/with spaces/file.go", 8, "path/with spaces/file.go"},
