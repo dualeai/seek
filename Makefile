@@ -26,10 +26,13 @@ test-static:
 test-unit:
 	go test ./... -v -race
 
+test-bench:
+	go test ./cmd/seek/ -bench=. -benchmem -count=5
+
 lint:
 	golangci-lint run --fix ./...
 
 release:
 	VERSION=$$($(MAKE) -s version-full) goreleaser release --clean
 
-.PHONY: install upgrade build test test-static test-unit lint release
+.PHONY: install upgrade build test test-static test-unit test-bench lint release
