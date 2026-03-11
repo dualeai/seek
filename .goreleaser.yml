@@ -1,0 +1,56 @@
+version: 2
+
+gomod:
+  proxy: true
+
+builds:
+  - main: ./cmd/seek
+    binary: seek
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Env.VERSION }}
+
+archives:
+  - format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+sboms:
+  - artifacts: archive
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^ci:"
+      - "^chore:"
+
+release:
+  extra_files:
+    - glob: sbom.cyclonedx.json
+  footer: |
+    ## Verify
+
+    ### Checksums
+    ```bash
+    sha256sum -c checksums.txt
+    ```
+
+    ### GitHub attestation
+    ```bash
+    gh attestation verify <artifact> --repo duale-ai/seek
+    ```
