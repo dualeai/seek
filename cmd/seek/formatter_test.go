@@ -1,13 +1,15 @@
 package main
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/sourcegraph/zoekt"
 )
 
 func TestFormatResults_Empty(t *testing.T) {
-	result := formatResults(nil, "github.com/org/repo")
+	result := formatResults(nil)
 	if result != "" {
 		t.Errorf("expected empty string, got %q", result)
 	}
@@ -29,7 +31,7 @@ func TestFormatResults_BasicFileMatch(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, "github.com/org/repo")
+	result := formatResults(files)
 	expected := "## src/main.go (Go)\n  5 func main() {"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -52,7 +54,7 @@ func TestFormatResults_UncommittedTag(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, "github.com/org/repo")
+	result := formatResults(files)
 	expected := "## lib/utils.py (Python) [uncommitted]\n  10 def helper():"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -81,14 +83,14 @@ func TestFormatResults_Deduplication_UncommittedWins(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, "github.com/org/repo")
-	if !contains(result, "[uncommitted]") {
+	result := formatResults(files)
+	if !strings.Contains(result, "[uncommitted]") {
 		t.Error("expected uncommitted version to win deduplication")
 	}
-	if contains(result, "old content from repo") {
+	if strings.Contains(result, "old content from repo") {
 		t.Error("committed version should not appear when uncommitted exists")
 	}
-	if !contains(result, "new local changes") {
+	if !strings.Contains(result, "new local changes") {
 		t.Error("uncommitted content should appear")
 	}
 }
@@ -115,9 +117,9 @@ func TestFormatResults_ScoreSorting(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, "repo")
-	highIdx := indexOf(result, "high.go")
-	lowIdx := indexOf(result, "low.go")
+	result := formatResults(files)
+	highIdx := strings.Index(result, "high.go")
+	lowIdx := strings.Index(result, "low.go")
 	if highIdx > lowIdx {
 		t.Error("expected high-score file to appear first")
 	}
@@ -144,7 +146,7 @@ func TestFormatResults_SymbolKind(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, "repo")
+	result := formatResults(files)
 	expected := "## router.go (Go)\n  15 [function] func CoreRouter() {"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -164,8 +166,8 @@ func TestFormatResults_LanguageFallback(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, "repo")
-	if !contains(result, "(unknown)") {
+	result := formatResults(files)
+	if !strings.Contains(result, "(unknown)") {
 		t.Error("expected language fallback to 'unknown'")
 	}
 }
@@ -192,11 +194,11 @@ func TestFormatResults_MultiFile(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, "repo")
-	if !contains(result, "## a.go (Go)") {
+	result := formatResults(files)
+	if !strings.Contains(result, "## a.go (Go)") {
 		t.Error("expected a.go header")
 	}
-	if !contains(result, "## b.py (Python) [uncommitted]") {
+	if !strings.Contains(result, "## b.py (Python) [uncommitted]") {
 		t.Error("expected b.py header with uncommitted tag")
 	}
 }
@@ -214,25 +216,140 @@ func TestFormatResults_NoTrailingNewline(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, "repo")
+	result := formatResults(files)
 	if len(result) > 0 && result[len(result)-1] == '\n' {
 		t.Error("output must not end with trailing newline (§8 rule 4)")
 	}
 }
 
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && indexOfStr(s, substr) >= 0
+func TestFormatResults_ZeroLineMatches(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{
+			FileName:   "empty.go",
+			Repository: "repo",
+			Language:   "Go",
+			Score:      1,
+		},
+	}
+
+	result := formatResults(files)
+	expected := "## empty.go (Go)"
+	if result != expected {
+		t.Errorf("expected %q, got %q", expected, result)
+	}
 }
 
-func indexOf(s, substr string) int {
-	return indexOfStr(s, substr)
-}
-
-func indexOfStr(s, substr string) int {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
+func TestFormatResults_ManyFiles_SortedByScore(t *testing.T) {
+	files := make([]zoekt.FileMatch, 1000)
+	for i := range files {
+		files[i] = zoekt.FileMatch{
+			FileName:   fmt.Sprintf("file_%04d.go", i),
+			Repository: "repo",
+			Language:   "Go",
+			Score:      float64(i), // ascending scores
+			LineMatches: []zoekt.LineMatch{
+				{Line: []byte("match\n"), LineNumber: 1},
+			},
 		}
 	}
-	return -1
+
+	result := formatResults(files)
+
+	// Highest score (999) should appear before lowest (0)
+	highIdx := strings.Index(result, "file_0999.go")
+	lowIdx := strings.Index(result, "file_0000.go")
+	if highIdx < 0 || lowIdx < 0 {
+		t.Fatal("expected both file_0999.go and file_0000.go in output")
+	}
+	if highIdx > lowIdx {
+		t.Error("expected highest score file to appear first")
+	}
+}
+
+func TestDeduplicateFiles_OrderIndependence(t *testing.T) {
+	committed := zoekt.FileMatch{
+		FileName:   "app.go",
+		Repository: "repo",
+		Language:   "Go",
+		Score:      10,
+		LineMatches: []zoekt.LineMatch{
+			{Line: []byte("committed\n"), LineNumber: 1},
+		},
+	}
+	uncommitted := zoekt.FileMatch{
+		FileName:   "app.go",
+		Repository: "uncommitted",
+		Language:   "Go",
+		Score:      5,
+		LineMatches: []zoekt.LineMatch{
+			{Line: []byte("uncommitted\n"), LineNumber: 1},
+		},
+	}
+
+	// committed first
+	r1 := deduplicateFiles([]zoekt.FileMatch{committed, uncommitted})
+	// uncommitted first
+	r2 := deduplicateFiles([]zoekt.FileMatch{uncommitted, committed})
+
+	if len(r1) != 1 || len(r2) != 1 {
+		t.Fatalf("expected 1 result each, got %d and %d", len(r1), len(r2))
+	}
+	if r1[0].Repository != "uncommitted" {
+		t.Error("committed-first: expected uncommitted to win")
+	}
+	if r2[0].Repository != "uncommitted" {
+		t.Error("uncommitted-first: expected uncommitted to win")
+	}
+}
+
+func TestDeduplicateFiles_CommittedOnly(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{FileName: "a.go", Repository: "repo", Score: 10},
+	}
+	result := deduplicateFiles(files)
+	if len(result) != 1 || result[0].Repository != "repo" {
+		t.Error("single committed entry should pass through unchanged")
+	}
+}
+
+func TestDeduplicateFiles_UncommittedOnly(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{FileName: "a.go", Repository: "uncommitted", Score: 5},
+	}
+	result := deduplicateFiles(files)
+	if len(result) != 1 || result[0].Repository != "uncommitted" {
+		t.Error("single uncommitted entry should pass through unchanged")
+	}
+}
+
+func TestFormatResults_ScoreTiebreaking_Stable(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{FileName: "b.go", Repository: "repo", Language: "Go", Score: 10,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("b\n"), LineNumber: 1}}},
+		{FileName: "a.go", Repository: "repo", Language: "Go", Score: 10,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("a\n"), LineNumber: 1}}},
+	}
+	result := formatResults(files)
+	aIdx := strings.Index(result, "a.go")
+	bIdx := strings.Index(result, "b.go")
+	if aIdx > bIdx {
+		t.Error("expected alphabetical tiebreaking for equal scores")
+	}
+}
+
+func TestDeduplicateFiles_TwoCommittedSameFile(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{FileName: "a.go", Repository: "repo", Score: 10,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("first\n"), LineNumber: 1}}},
+		{FileName: "a.go", Repository: "repo", Score: 5,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("second\n"), LineNumber: 2}}},
+	}
+	result := deduplicateFiles(files)
+	if len(result) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(result))
+	}
+	// First-seen wins
+	if !strings.Contains(string(result[0].LineMatches[0].Line), "first") {
+		t.Error("expected first-seen committed entry to win")
+	}
 }

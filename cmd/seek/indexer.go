@@ -11,18 +11,19 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/sourcegraph/zoekt/gitindex"
 	"github.com/sourcegraph/zoekt/index"
 )
 
-// computeStateHash computes the MD5 hash of HEAD SHA + git status porcelain output.
-func computeStateHash(headSHA, statusOutput string) string {
+// computeStateHash computes the MD5 hash of raw git status v2 output.
+// The raw output already contains the HEAD SHA in the # branch.oid header,
+// so no domain separator is needed.
+func computeStateHash(rawOutput string) string {
 	h := md5.New()
-	h.Write([]byte(headSHA))
-	h.Write([]byte(statusOutput))
+	h.Write([]byte("v2\x00")) // version prefix for cache invalidation on format change
+	h.Write([]byte(rawOutput))
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
@@ -75,7 +76,7 @@ func checkCtags() error {
 }
 
 // runIndexing orchestrates committed and uncommitted indexing with locking.
-func runIndexing(ctx context.Context, repoDir, indexDir, headSHA, statusOutput, preState string) error {
+func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState, preState string) error {
 	// §9: Fail fast if ctags is missing — fatal error
 	if err := checkCtags(); err != nil {
 		return err
@@ -104,7 +105,6 @@ func runIndexing(ctx context.Context, repoDir, indexDir, headSHA, statusOutput, 
 	}
 
 	parallelism := indexParallelism()
-	uncommittedFiles := parseGitStatusFiles(statusOutput)
 
 	// Prepare uncommitted files in parallel with committed indexing
 	type hardlinkResult struct {
@@ -113,9 +113,9 @@ func runIndexing(ctx context.Context, repoDir, indexDir, headSHA, statusOutput, 
 	}
 	hardlinkCh := make(chan hardlinkResult, 1)
 
-	if len(uncommittedFiles) > 0 {
+	if len(state.Files) > 0 {
 		go func() {
-			tmpDir, err := prepareUncommittedFiles(repoDir, uncommittedFiles, parallelism)
+			tmpDir, err := prepareUncommittedFiles(repoDir, state.Files, parallelism)
 			hardlinkCh <- hardlinkResult{tmpDir, err}
 		}()
 	} else {
@@ -132,11 +132,10 @@ func runIndexing(ctx context.Context, repoDir, indexDir, headSHA, statusOutput, 
 	hlResult := <-hardlinkCh
 
 	// §5.5 step 2: Always clean stale uncommitted shards before rebuilding
-	// (covers both current "uncommitted" and legacy ".zoekt-uncommitted" naming)
 	cleanUncommittedShards(indexDir)
 
 	// §5.5 steps 3-7: Index uncommitted files (sequential, after committed)
-	if len(uncommittedFiles) > 0 {
+	if len(state.Files) > 0 {
 		if hlResult.err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: uncommitted file preparation failed: %v\n", hlResult.err)
 		} else if hlResult.tempDir != "" {
@@ -147,10 +146,8 @@ func runIndexing(ctx context.Context, repoDir, indexDir, headSHA, statusOutput, 
 		}
 	}
 
-	// §5.7: Post-indexing verification
-	postHeadSHA := gitHeadSHA(ctx)
-	postStatus := gitStatusPorcelain(ctx)
-	postState := computeStateHash(postHeadSHA, postStatus)
+	// §5.7: Post-indexing verification — single atomic call eliminates TOCTOU
+	postState := computeStateHash(gitRepoState(ctx).RawOutput)
 
 	if committedErr != nil {
 		// §5.7 step 4: Don't cache state, but do NOT exit — proceed to search
@@ -180,7 +177,7 @@ func acquireLock(ctx context.Context, indexDir, lockPath string) (*os.File, bool
 	}
 
 	// Try non-blocking lock first
-	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	err = lockFileExclusive(f)
 	if err == nil {
 		return f, true, nil
 	}
@@ -192,28 +189,41 @@ func acquireLock(ctx context.Context, indexDir, lockPath string) (*os.File, bool
 		return nil, false, nil
 	}
 
-	// No shards exist (first run) — block with timeout
-	type lockResult struct {
-		err error
-	}
-	ch := make(chan lockResult, 1)
-	go func() {
-		ch <- lockResult{syscall.Flock(int(f.Fd()), syscall.LOCK_EX)}
-	}()
-
+	// No shards exist (first run) — poll with exponential backoff.
+	// We avoid a blocking flock goroutine to prevent fd-reuse races
+	// when the timeout fires and closes the file.
 	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer timeoutCancel()
 
-	select {
-	case result := <-ch:
-		if result.err != nil {
+	backoff := 100 * time.Millisecond
+	const maxBackoff = 2 * time.Second
+
+	for {
+		select {
+		case <-timeoutCtx.Done():
 			_ = f.Close()
-			return nil, false, fmt.Errorf("flock: %w", result.err)
+			return nil, false, fmt.Errorf("indexer lock held >60s")
+		default:
 		}
-		return f, true, nil
-	case <-timeoutCtx.Done():
-		_ = f.Close()
-		return nil, false, fmt.Errorf("indexer lock held >60s")
+
+		err = lockFileExclusive(f)
+		if err == nil {
+			return f, true, nil
+		}
+
+		timer := time.NewTimer(backoff)
+		select {
+		case <-timeoutCtx.Done():
+			timer.Stop()
+			_ = f.Close()
+			return nil, false, fmt.Errorf("indexer lock held >60s")
+		case <-timer.C:
+		}
+
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
 	}
 }
 
@@ -222,7 +232,7 @@ func releaseLock(f *os.File) {
 	if f == nil {
 		return
 	}
-	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	unlockFile(f)
 	_ = f.Close()
 }
 
@@ -248,57 +258,95 @@ func indexCommitted(ctx context.Context, repoDir, indexDir string, parallelism i
 	return err
 }
 
-// prepareUncommittedFiles hardlinks uncommitted files into a temp directory.
+// prepareUncommittedFiles copies uncommitted files into a temp directory.
+// The temp dir is always recreated to avoid stale files from previous crashed runs.
+// Uses a worker pool for bounded memory and early cancellation on error.
 func prepareUncommittedFiles(repoDir string, files []string, parallelism int) (string, error) {
 	tmpDir := filepath.Join(repoDir, ".zoekt-uncommitted")
+
+	// Remove stale temp dir from previous crashed runs to avoid phantom files
+	_ = os.RemoveAll(tmpDir)
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
 		return "", err
 	}
 
-	sem := make(chan struct{}, parallelism)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch := make(chan string, parallelism)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error
 
-	for _, file := range files {
-		wg.Add(1)
-		go func(f string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			srcPath := filepath.Join(repoDir, f)
-			dstPath := filepath.Join(tmpDir, f)
-
-			// Skip files that don't exist on disk (deleted files)
-			if _, err := os.Stat(srcPath); os.IsNotExist(err) {
-				return
-			}
-
-			// Create parent directories
-			if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				mu.Unlock()
-				return
-			}
-
-			// Try hardlink first, fallback to copy
-			if err := os.Link(srcPath, dstPath); err != nil {
-				if err := copyFile(srcPath, dstPath); err != nil {
-					mu.Lock()
-					if firstErr == nil {
-						firstErr = err
-					}
-					mu.Unlock()
-				}
-			}
-		}(file)
+	// setErr records the first error and cancels remaining work.
+	setErr := func(e error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = e
+			cancel()
+		}
+		mu.Unlock()
 	}
 
+	// Start worker pool
+	for range parallelism {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for f := range ch {
+				// Check for cancellation
+				if ctx.Err() != nil {
+					return
+				}
+
+				srcPath := filepath.Join(repoDir, f)
+				dstPath := filepath.Join(tmpDir, f)
+
+				// Use Lstat to avoid following symlinks
+				fi, err := os.Lstat(srcPath)
+				if err != nil {
+					if os.IsNotExist(err) {
+						continue
+					}
+					setErr(err)
+					return
+				}
+
+				// Skip directories (e.g. dirty submodules) and symlinks
+				if fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+					continue
+				}
+
+				// Create parent directories
+				if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+					setErr(err)
+					return
+				}
+
+				// Try hardlink first, fallback to copy
+				if err := os.Link(srcPath, dstPath); err != nil {
+					if err := copyFile(srcPath, dstPath); err != nil {
+						setErr(err)
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	// Send files to workers
+	for _, f := range files {
+		select {
+		case ch <- f:
+		case <-ctx.Done():
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	close(ch)
 	wg.Wait()
+
 	if firstErr != nil {
 		_ = os.RemoveAll(tmpDir)
 		return "", firstErr
@@ -327,6 +375,10 @@ func copyFile(src, dst string) error {
 	return out.Close()
 }
 
+// maxUncommittedFileSize is the maximum file size (in bytes) for uncommitted file indexing.
+// Files larger than this are skipped to prevent excessive memory usage.
+const maxUncommittedFileSize = 10 * 1024 * 1024 // 10 MB
+
 // indexUncommitted indexes uncommitted files using index.NewBuilder.
 func indexUncommitted(ctx context.Context, indexDir, tempDir string, parallelism int) error {
 	opts := index.Options{
@@ -334,7 +386,7 @@ func indexUncommitted(ctx context.Context, indexDir, tempDir string, parallelism
 		Parallelism:      parallelism,
 		CTagsMustSucceed: true,
 	}
-	opts.RepositoryDescription.Name = "uncommitted"
+	opts.RepositoryDescription.Name = repoUncommitted
 	opts.RepositoryDescription.Source = tempDir
 	opts.SetDefaults()
 
@@ -356,6 +408,15 @@ func indexUncommitted(ctx context.Context, indexDir, tempDir string, parallelism
 			return err
 		}
 
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if info.Size() > maxUncommittedFileSize {
+			fmt.Fprintf(os.Stderr, "Warning: skipping large uncommitted file %s (%d MB)\n", relPath, info.Size()/(1024*1024))
+			return nil
+		}
+
 		content, err := os.ReadFile(path)
 		if err != nil {
 			return err
@@ -375,7 +436,7 @@ func indexUncommitted(ctx context.Context, indexDir, tempDir string, parallelism
 
 // cleanUncommittedShards removes stale uncommitted shard files.
 func cleanUncommittedShards(indexDir string) {
-	matches, err := filepath.Glob(filepath.Join(indexDir, "*uncommitted*.zoekt"))
+	matches, err := filepath.Glob(filepath.Join(indexDir, repoUncommitted+"_v*.zoekt"))
 	if err != nil {
 		return
 	}

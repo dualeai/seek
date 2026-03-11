@@ -25,7 +25,11 @@ func executeSearch(ctx context.Context, indexDir, pattern string) ([]zoekt.FileM
 	q = query.Map(q, query.ExpandFileContent)
 	q = query.Simplify(q)
 
-	result, err := searcher.Search(ctx, q, &zoekt.SearchOptions{})
+	result, err := searcher.Search(ctx, q, &zoekt.SearchOptions{
+		MaxDocDisplayCount: 1000,
+		TotalMaxMatchCount: 10000,
+		ShardMaxMatchCount: 10000,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("search: %w", err)
 	}

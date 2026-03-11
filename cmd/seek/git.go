@@ -1,161 +1,135 @@
 package main
 
 import (
-	"bytes"
 	"context"
+	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
+	"time"
 )
 
+// repoState holds the parsed result of a single git status call.
+type repoState struct {
+	HeadSHA   string   // commit SHA from # branch.oid, or "no-head"
+	RawOutput string   // full raw output for state hashing
+	Files     []string // paths of changed/untracked files
+}
+
+// gitCmd creates an exec.Cmd for git with graceful shutdown and lock safety.
+// Sets GIT_OPTIONAL_LOCKS=0 to prevent index lock contention, and uses
+// a graceful signal on context cancellation so git can release locks.
+func gitCmd(ctx context.Context, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	cmd.Cancel = func() error {
+		return cmd.Process.Signal(gitCancelSignal())
+	}
+	cmd.WaitDelay = 3 * time.Second
+	return cmd
+}
+
 // gitRepoRoot returns the absolute path to the git repository root.
-func gitRepoRoot() (string, error) {
-	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
-	out, err := cmd.Output()
+func gitRepoRoot(ctx context.Context) (string, error) {
+	out, err := gitCmd(ctx, "rev-parse", "--show-toplevel").Output()
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
 }
 
-// gitHeadSHA returns the current HEAD SHA. Falls back to "no-head" on error.
-func gitHeadSHA(ctx context.Context) string {
-	cmd := exec.CommandContext(ctx, "git", "rev-parse", "HEAD")
-	out, err := cmd.Output()
+// gitRepoState returns the current repository state using a single
+// git status --porcelain=v2 --branch -z command. This eliminates
+// the TOCTOU window between separate git rev-parse and git status calls.
+func gitRepoState(ctx context.Context) repoState {
+	out, err := gitCmd(ctx, "status", "--porcelain=v2", "--branch", "-z").Output()
 	if err != nil {
-		return "no-head"
+		return repoState{HeadSHA: "no-head"}
 	}
-	return strings.TrimSpace(string(out))
+	return parseGitStatusV2(string(out))
 }
 
-// gitStatusPorcelain returns the raw output of git status --porcelain.
-func gitStatusPorcelain(ctx context.Context) string {
-	cmd := exec.CommandContext(ctx, "git", "--no-optional-locks", "status", "--porcelain")
-	out, err := cmd.Output()
-	if err != nil {
-		return ""
-	}
-	return string(out)
-}
-
-// parseGitStatusFiles extracts file paths from git status --porcelain output.
-func parseGitStatusFiles(porcelainOutput string) []string {
-	if porcelainOutput == "" {
-		return nil
+// parseGitStatusV2 parses git status --porcelain=v2 --branch -z output.
+// Header lines (# ...) are LF-terminated. Entry records are NUL-terminated.
+// Rename entries (type 2) have two NUL-terminated path fields.
+func parseGitStatusV2(raw string) repoState {
+	state := repoState{
+		HeadSHA:   "no-head",
+		RawOutput: raw,
 	}
 
 	seen := make(map[string]bool)
-	var files []string
+	pos := 0
 
-	for _, line := range strings.Split(porcelainOutput, "\n") {
-		if len(line) < 4 {
+	// Parse header lines (LF-terminated, start with #)
+	for pos < len(raw) && raw[pos] == '#' {
+		end := strings.IndexByte(raw[pos:], '\n')
+		if end < 0 {
+			break
+		}
+		line := raw[pos : pos+end]
+		pos += end + 1
+
+		if strings.HasPrefix(line, "# branch.oid ") {
+			state.HeadSHA = line[len("# branch.oid "):]
+		}
+	}
+
+	// Skip any stray whitespace between headers and entries
+	for pos < len(raw) && (raw[pos] == '\n' || raw[pos] == '\r') {
+		pos++
+	}
+
+	// Parse NUL-terminated entries
+	for pos < len(raw) {
+		end := strings.IndexByte(raw[pos:], 0)
+		if end < 0 {
+			break
+		}
+		entry := raw[pos : pos+end]
+		pos += end + 1
+
+		if len(entry) < 2 {
 			continue
 		}
-		statusCode := line[0]
-		path := line[3:]
 
-		// Handle renames and copies: "R old -> new" or "C old -> new"
-		if statusCode == 'R' || statusCode == 'C' {
-			if idx := strings.Index(path, " -> "); idx >= 0 {
-				path = path[idx+4:]
+		var path string
+		switch entry[0] {
+		case '?': // untracked: "? <path>"
+			path = entry[2:]
+		case '!': // ignored
+			continue
+		case '1': // changed: "1 XY sub mH mI mW hH hI <path>"
+			path = extractV2Path(entry, 8)
+		case '2': // renamed/copied: "2 XY sub mH mI mW hH hI Xscore <path>"
+			path = extractV2Path(entry, 9)
+			// Skip the origPath (next NUL-terminated field)
+			nextEnd := strings.IndexByte(raw[pos:], 0)
+			if nextEnd >= 0 {
+				pos += nextEnd + 1
 			}
+		case 'u': // unmerged: "u XY sub m1 m2 m3 mW h1 h2 h3 <path>"
+			path = extractV2Path(entry, 10)
 		}
-
-		// Handle quoted filenames
-		path = unquoteGitPath(path)
 
 		if path != "" && !seen[path] {
 			seen[path] = true
-			files = append(files, path)
+			state.Files = append(state.Files, path)
 		}
 	}
 
-	return files
+	return state
 }
 
-// unquoteGitPath strips surrounding quotes and unescapes git-quoted filenames.
-func unquoteGitPath(s string) string {
-	if len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"' {
-		return s
-	}
-	s = s[1 : len(s)-1]
-
-	var buf bytes.Buffer
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\\' && i+1 < len(s) {
-			i++
-			switch s[i] {
-			case 'n':
-				buf.WriteByte('\n')
-			case 't':
-				buf.WriteByte('\t')
-			case '\\':
-				buf.WriteByte('\\')
-			case '"':
-				buf.WriteByte('"')
-			case 'a':
-				buf.WriteByte('\a')
-			case 'b':
-				buf.WriteByte('\b')
-			case 'f':
-				buf.WriteByte('\f')
-			case 'r':
-				buf.WriteByte('\r')
-			case 'v':
-				buf.WriteByte('\v')
-			default:
-				// Octal escape: \NNN
-				if s[i] >= '0' && s[i] <= '7' {
-					val := int(s[i] - '0')
-					for j := 0; j < 2 && i+1 < len(s) && s[i+1] >= '0' && s[i+1] <= '7'; j++ {
-						i++
-						val = val*8 + int(s[i]-'0')
-					}
-					buf.WriteByte(byte(val))
-				} else {
-					buf.WriteByte('\\')
-					buf.WriteByte(s[i])
-				}
-			}
-		} else {
-			buf.WriteByte(s[i])
+// extractV2Path extracts the path from a porcelain v2 entry by skipping
+// the given number of space-separated fields.
+func extractV2Path(entry string, skipFields int) string {
+	idx := 0
+	for i := 0; i < skipFields; i++ {
+		space := strings.IndexByte(entry[idx:], ' ')
+		if space < 0 {
+			return ""
 		}
+		idx += space + 1
 	}
-	return buf.String()
-}
-
-// deriveRepoPrefix computes the repository prefix from the git remote URL.
-func deriveRepoPrefix(ctx context.Context, repoDir string) string {
-	cmd := exec.CommandContext(ctx, "git", "config", "--get", "remote.origin.url")
-	out, err := cmd.Output()
-	if err != nil {
-		return filepath.Base(repoDir)
-	}
-
-	url := strings.TrimSpace(string(out))
-	return stripRemoteURL(url)
-}
-
-// stripRemoteURL derives a repo prefix from a git remote URL.
-func stripRemoteURL(url string) string {
-	// Strip protocols
-	for _, prefix := range []string{"https://", "http://", "ssh://", "git://", "file://"} {
-		url = strings.TrimPrefix(url, prefix)
-	}
-
-	// Strip user@ prefix (e.g., git@github.com:org/repo)
-	if at := strings.Index(url, "@"); at >= 0 {
-		url = url[at+1:]
-	}
-
-	// Replace colon with slash (git@github.com:org/repo -> github.com/org/repo)
-	url = strings.Replace(url, ":", "/", 1)
-
-	// Strip trailing .git
-	url = strings.TrimSuffix(url, ".git")
-
-	// Strip trailing slash
-	url = strings.TrimSuffix(url, "/")
-
-	return url
+	return entry[idx:]
 }

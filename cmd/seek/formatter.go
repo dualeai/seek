@@ -1,16 +1,20 @@
 package main
 
 import (
-	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/sourcegraph/zoekt"
 )
 
+// repoUncommitted is the repository name used for uncommitted file shards.
+// This constant ties indexer naming (indexUncommitted) to formatter detection.
+const repoUncommitted = "uncommitted"
+
 // formatResults formats zoekt FileMatch results into the output format.
 // Files are deduplicated (uncommitted wins), sorted by score descending.
-func formatResults(files []zoekt.FileMatch, repoPrefix string) string {
+func formatResults(files []zoekt.FileMatch) string {
 	if len(files) == 0 {
 		return ""
 	}
@@ -19,8 +23,11 @@ func formatResults(files []zoekt.FileMatch, repoPrefix string) string {
 	deduped := deduplicateFiles(files)
 
 	// Sort by score descending
-	sort.Slice(deduped, func(i, j int) bool {
-		return deduped[i].Score > deduped[j].Score
+	sort.SliceStable(deduped, func(i, j int) bool {
+		if deduped[i].Score != deduped[j].Score {
+			return deduped[i].Score > deduped[j].Score
+		}
+		return deduped[i].FileName < deduped[j].FileName
 	})
 
 	var sb strings.Builder
@@ -28,7 +35,7 @@ func formatResults(files []zoekt.FileMatch, repoPrefix string) string {
 		if i > 0 {
 			sb.WriteByte('\n')
 		}
-		formatFileMatch(&sb, fm, repoPrefix)
+		formatFileMatch(&sb, fm)
 	}
 
 	// §8 rule 4: no trailing newline after the last line
@@ -41,31 +48,25 @@ func deduplicateFiles(files []zoekt.FileMatch) []zoekt.FileMatch {
 		match       zoekt.FileMatch
 		uncommitted bool
 	}
-
 	byPath := make(map[string]*fileEntry)
-	var order []string
-
 	for _, fm := range files {
-		isUncommitted := fm.Repository == "uncommitted"
+		isUncommitted := fm.Repository == repoUncommitted
 		existing, ok := byPath[fm.FileName]
 		if !ok {
-			order = append(order, fm.FileName)
 			byPath[fm.FileName] = &fileEntry{match: fm, uncommitted: isUncommitted}
 		} else if isUncommitted && !existing.uncommitted {
-			// Uncommitted wins over committed
 			byPath[fm.FileName] = &fileEntry{match: fm, uncommitted: isUncommitted}
 		}
 	}
-
 	result := make([]zoekt.FileMatch, 0, len(byPath))
-	for _, path := range order {
-		result = append(result, byPath[path].match)
+	for _, entry := range byPath {
+		result = append(result, entry.match)
 	}
 	return result
 }
 
 // formatFileMatch formats a single FileMatch into the output format.
-func formatFileMatch(sb *strings.Builder, fm zoekt.FileMatch, repoPrefix string) {
+func formatFileMatch(sb *strings.Builder, fm zoekt.FileMatch) {
 	lang := fm.Language
 	if lang == "" {
 		lang = "unknown"
@@ -78,7 +79,7 @@ func formatFileMatch(sb *strings.Builder, fm zoekt.FileMatch, repoPrefix string)
 	sb.WriteString(lang)
 	sb.WriteByte(')')
 
-	if fm.Repository == "uncommitted" {
+	if fm.Repository == repoUncommitted {
 		sb.WriteString(" [uncommitted]")
 	}
 	sb.WriteByte('\n')
@@ -86,7 +87,7 @@ func formatFileMatch(sb *strings.Builder, fm zoekt.FileMatch, repoPrefix string)
 	// Line entries
 	for _, lm := range fm.LineMatches {
 		sb.WriteString("  ")
-		fmt.Fprintf(sb, "%d", lm.LineNumber)
+		sb.WriteString(strconv.Itoa(int(lm.LineNumber)))
 		sb.WriteByte(' ')
 
 		// Symbol kind from first line fragment

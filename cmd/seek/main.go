@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 )
 
@@ -25,43 +26,38 @@ func main() {
 }
 
 func run(ctx context.Context, pattern string) error {
-	// Step 2: cd to git repo root
-	repoDir, err := gitRepoRoot()
+	repoDir, err := gitRepoRoot(ctx)
 	if err != nil {
 		return fmt.Errorf("not a git repository: %w", err)
 	}
-	if err := os.Chdir(repoDir); err != nil {
-		return fmt.Errorf("chdir to repo root: %w", err)
-	}
 
-	indexDir := ".zoekt-index"
+	// Use absolute paths to avoid dependence on process CWD
+	indexDir := filepath.Join(repoDir, ".zoekt-index")
 	if err := os.MkdirAll(indexDir, 0o755); err != nil {
 		return fmt.Errorf("create index directory: %w", err)
 	}
 
-	// Step 4: compute state hash
-	headSHA := gitHeadSHA(ctx)
-	statusOutput := gitStatusPorcelain(ctx)
-	currentState := computeStateHash(headSHA, statusOutput)
+	// Step 4: compute state hash (single atomic git call)
+	state := gitRepoState(ctx)
+	currentState := computeStateHash(state.RawOutput)
 
 	// Step 5: check cached state
 	cachedState := readStateFile(indexDir)
 	if currentState != cachedState {
 		// Step 6: run indexing
-		if err := runIndexing(ctx, repoDir, indexDir, headSHA, statusOutput, currentState); err != nil {
+		if err := runIndexing(ctx, repoDir, indexDir, state, currentState); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: indexing failed: %v\n", err)
 			// Continue to search with whatever shards exist
 		}
 	}
 
 	// Step 7-8: execute search and format results
-	repoPrefix := deriveRepoPrefix(ctx, repoDir)
 	results, err := executeSearch(ctx, indexDir, pattern)
 	if err != nil {
 		return err
 	}
 
-	output := formatResults(results, repoPrefix)
+	output := formatResults(results)
 	if output != "" {
 		fmt.Print(output)
 	}
