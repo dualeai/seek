@@ -112,7 +112,7 @@ main() {
   curl -sSfL -o "${tmp}/checksums.txt" "${base_url}/checksums.txt"
 
   # Verify checksum
-  expected="$(grep -F "${archive}" "${tmp}/checksums.txt" | cut -d ' ' -f 1)"
+  expected="$(grep "  ${archive}\$" "${tmp}/checksums.txt" | cut -d ' ' -f 1)"
   if [ -z "$expected" ]; then
     echo "Error: archive '${archive}' not found in checksums.txt" >&2
     exit 1
