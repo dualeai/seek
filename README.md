@@ -107,7 +107,7 @@ All [zoekt query syntax](https://github.com/sourcegraph/zoekt/blob/main/doc/quer
 ## How It Works
 
 1. **State check** -- a single `git status` call captures HEAD SHA and dirty files, hashed for cache invalidation
-2. **Index** -- if the cache is stale, builds a trigram index of committed files and stages uncommitted files for separate indexing
+2. **Index** -- if the cache is stale, builds a trigram index of committed files and reads uncommitted files directly into memory for separate indexing
 3. **Search** -- loads index shards, runs the query, deduplicates results (uncommitted version wins over committed)
 
 The index is stored in `.seek-cache/` at the repo root. First run takes ~10s (dominated by indexing), subsequent searches complete in under a second.
@@ -144,7 +144,7 @@ Contributions are welcome. Please open an issue to discuss changes before submit
 git clone https://github.com/dualeai/seek.git
 cd seek
 make install       # Download deps + install linter
-make build         # Build binary (requires Go 1.24+)
+make build         # Build binary (requires Go 1.25+)
 make test          # Static analysis + unit tests
 make lint          # golangci-lint --fix
 ```

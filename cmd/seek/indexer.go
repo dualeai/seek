@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -27,11 +25,14 @@ const (
 	// lockFile is used for mutual exclusion during indexing.
 	lockFile = ".lock"
 	// repoUncommitted is the zoekt repository name for uncommitted file shards.
-	// Also used as the staging subdirectory name within cacheDir.
 	repoUncommitted = "uncommitted"
 	// stateVersion is the prefix used in state hashing to invalidate caches
 	// when the hash algorithm or input format changes.
 	stateVersion = "v3\x00"
+	// maxUncommittedFileSize is the maximum file size (in bytes) for uncommitted
+	// file indexing. Files larger than this are skipped to prevent excessive
+	// memory usage.
+	maxUncommittedFileSize = 10 * 1024 * 1024 // 10 MB
 )
 
 // computeStateHash computes the xxHash64 of raw git status v2 output.
@@ -123,20 +124,22 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 
 	parallelism := indexParallelism()
 
-	// Prepare uncommitted files in parallel with committed indexing
-	type stagingResult struct {
-		tempDir string
-		err     error
+	// Read uncommitted files directly into memory, in parallel with
+	// committed indexing. This avoids staging files to a temp directory
+	// (and the associated hardlink mutation risks and double I/O on
+	// non-CoW filesystems).
+	type readResult struct {
+		docs []fileContent
 	}
-	stagingCh := make(chan stagingResult, 1)
+	readCh := make(chan readResult, 1)
 
 	if len(state.Files) > 0 {
 		go func() {
-			tmpDir, err := prepareUncommittedFiles(repoDir, indexDir, state.Files, parallelism)
-			stagingCh <- stagingResult{tmpDir, err}
+			docs := readUncommittedFiles(repoDir, state.Files, parallelism)
+			readCh <- readResult{docs}
 		}()
 	} else {
-		stagingCh <- stagingResult{"", nil}
+		readCh <- readResult{nil}
 	}
 
 	// Index committed files
@@ -145,21 +148,19 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 		fmt.Fprintf(os.Stderr, "Warning: committed indexing failed: %v\n", committedErr)
 	}
 
-	// Wait for uncommitted file staging
-	stgResult := <-stagingCh
+	// Wait for uncommitted file reads
+	readRes := <-readCh
 
-	// §5.5 step 2: Always clean stale uncommitted shards before rebuilding
+	// Always clean stale uncommitted shards before rebuilding
 	cleanUncommittedShards(indexDir)
 
-	// §5.5 steps 3-7: Index uncommitted files (sequential, after committed)
-	if len(state.Files) > 0 {
-		if stgResult.err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: uncommitted file preparation failed: %v\n", stgResult.err)
-		} else if stgResult.tempDir != "" {
-			defer func() { _ = os.RemoveAll(stgResult.tempDir) }()
-			if err := indexUncommitted(ctx, indexDir, stgResult.tempDir, parallelism); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: uncommitted indexing failed: %v\n", err)
-			}
+	// Clean up stale staging directory from previous seek versions
+	_ = os.RemoveAll(filepath.Join(indexDir, repoUncommitted))
+
+	// Index uncommitted files
+	if len(readRes.docs) > 0 {
+		if err := indexUncommitted(ctx, repoDir, indexDir, readRes.docs, parallelism); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: uncommitted indexing failed: %v\n", err)
 		}
 	}
 
@@ -275,59 +276,33 @@ func indexCommitted(ctx context.Context, repoDir, indexDir string, parallelism i
 	return err
 }
 
-// prepareUncommittedFiles stages uncommitted files into a temp directory
-// using clonefile (CoW), hardlink, or copy as fallback.
-// The temp dir is always recreated to avoid stale files from previous crashed runs.
-// Uses a worker pool for bounded memory and early cancellation on error.
-func prepareUncommittedFiles(repoDir, indexDir string, files []string, parallelism int) (string, error) {
-	tmpDir := filepath.Join(indexDir, repoUncommitted)
+// fileContent holds a file's path and content read from the working tree.
+type fileContent struct {
+	name    string
+	content []byte
+}
 
-	// Remove stale temp dir from previous crashed runs to avoid phantom files
-	_ = os.RemoveAll(tmpDir)
-	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
-		return "", err
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
+// readUncommittedFiles reads uncommitted files directly from the working tree
+// into memory using a bounded worker pool. Files larger than maxUncommittedFileSize,
+// symlinks, and directories are skipped. Individual file failures are non-fatal
+// since files may be deleted or modified between git status and read.
+func readUncommittedFiles(repoDir string, files []string, parallelism int) []fileContent {
 	ch := make(chan string, parallelism)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	var firstErr error
+	var results []fileContent
 
-	// setErr records the first error and cancels remaining work.
-	setErr := func(e error) {
-		mu.Lock()
-		if firstErr == nil {
-			firstErr = e
-			cancel()
-		}
-		mu.Unlock()
-	}
-
-	// Start worker pool
 	for range parallelism {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for f := range ch {
-				// Check for cancellation
-				if ctx.Err() != nil {
-					return
-				}
-
 				srcPath := filepath.Join(repoDir, f)
-				dstPath := filepath.Join(tmpDir, f)
 
 				// Use Lstat to avoid following symlinks
 				fi, err := os.Lstat(srcPath)
 				if err != nil {
-					if os.IsNotExist(err) {
-						continue
-					}
-					setErr(err)
-					return
+					continue
 				}
 
 				// Skip directories (e.g. dirty submodules) and symlinks
@@ -335,79 +310,41 @@ func prepareUncommittedFiles(repoDir, indexDir string, files []string, paralleli
 					continue
 				}
 
-				// Create parent directories
-				if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
-					setErr(err)
-					return
+				if fi.Size() > maxUncommittedFileSize {
+					fmt.Fprintf(os.Stderr, "Warning: skipping large uncommitted file %s (%d MB)\n", f, fi.Size()/(1024*1024))
+					continue
 				}
 
-				// Try clonefile (CoW), then hardlink, then copy
-				if !tryCloneFile(srcPath, dstPath) {
-					if err := os.Link(srcPath, dstPath); err != nil {
-						if err := copyFile(srcPath, dstPath); err != nil {
-							setErr(err)
-							return
-						}
-					}
+				content, err := os.ReadFile(srcPath)
+				if err != nil {
+					continue
 				}
+
+				mu.Lock()
+				results = append(results, fileContent{name: f, content: content})
+				mu.Unlock()
 			}
 		}()
 	}
 
-	// Send files to workers
 	for _, f := range files {
-		select {
-		case ch <- f:
-		case <-ctx.Done():
-		}
-		if ctx.Err() != nil {
-			break
-		}
+		ch <- f
 	}
 	close(ch)
 	wg.Wait()
 
-	if firstErr != nil {
-		_ = os.RemoveAll(tmpDir)
-		return "", firstErr
-	}
-
-	return tmpDir, nil
+	return results
 }
 
-// copyFile copies a file from src to dst.
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = in.Close() }()
-
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = out.Close() }()
-
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-	return out.Close()
-}
-
-// maxUncommittedFileSize is the maximum file size (in bytes) for uncommitted file indexing.
-// Files larger than this are skipped to prevent excessive memory usage.
-const maxUncommittedFileSize = 10 * 1024 * 1024 // 10 MB
-
-// indexUncommitted indexes uncommitted files using index.NewBuilder.
-func indexUncommitted(ctx context.Context, indexDir, tempDir string, parallelism int) error {
+// indexUncommitted indexes pre-read uncommitted file contents using index.NewBuilder.
+func indexUncommitted(ctx context.Context, repoDir, indexDir string, docs []fileContent, parallelism int) error {
 	opts := index.Options{
 		IndexDir:         indexDir,
 		Parallelism:      parallelism,
 		CTagsMustSucceed: true,
 	}
 	opts.RepositoryDescription.Name = repoUncommitted
-	opts.RepositoryDescription.Source = tempDir
+	opts.RepositoryDescription.Source = repoDir
 	opts.SetDefaults()
 
 	builder, err := index.NewBuilder(opts)
@@ -415,40 +352,13 @@ func indexUncommitted(ctx context.Context, indexDir, tempDir string, parallelism
 		return fmt.Errorf("create builder: %w", err)
 	}
 
-	err = filepath.WalkDir(tempDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
+	for _, doc := range docs {
+		if err := builder.Add(index.Document{
+			Name:    doc.name,
+			Content: doc.content,
+		}); err != nil {
+			return fmt.Errorf("add document %s: %w", doc.name, err)
 		}
-		if d.IsDir() {
-			return nil
-		}
-
-		relPath, err := filepath.Rel(tempDir, path)
-		if err != nil {
-			return err
-		}
-
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		if info.Size() > maxUncommittedFileSize {
-			fmt.Fprintf(os.Stderr, "Warning: skipping large uncommitted file %s (%d MB)\n", relPath, info.Size()/(1024*1024))
-			return nil
-		}
-
-		content, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-
-		return builder.Add(index.Document{
-			Name:    relPath,
-			Content: content,
-		})
-	})
-	if err != nil {
-		return fmt.Errorf("walk uncommitted files: %w", err)
 	}
 
 	return builder.Finish()

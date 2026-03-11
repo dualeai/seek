@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
+	"sort"
 	"testing"
 )
 
@@ -190,6 +193,298 @@ func TestIndexParallelism_Bounds(t *testing.T) {
 		t.Errorf("parallelism should be at most 16, got %d", p)
 	}
 }
+
+// --- State file tests ---
+
+func TestStateFile_Roundtrip(t *testing.T) {
+	dir := t.TempDir()
+	state := "abc123def456789a"
+	if err := writeStateFile(dir, state); err != nil {
+		t.Fatalf("writeStateFile: %v", err)
+	}
+	got := readStateFile(dir)
+	if got != state {
+		t.Errorf("expected %q, got %q", state, got)
+	}
+}
+
+func TestStateFile_ReadNonexistent(t *testing.T) {
+	dir := t.TempDir()
+	got := readStateFile(dir)
+	if got != "" {
+		t.Errorf("expected empty string for nonexistent state file, got %q", got)
+	}
+}
+
+func TestStateFile_WriteRemovesTmp(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeStateFile(dir, "test"); err != nil {
+		t.Fatalf("writeStateFile: %v", err)
+	}
+	// .state.tmp should not exist after successful atomic write (rename removes it)
+	if _, err := os.Stat(filepath.Join(dir, stateTmpFile)); !os.IsNotExist(err) {
+		t.Error("expected .state.tmp to not exist after successful write")
+	}
+	// .state should exist
+	if _, err := os.Stat(filepath.Join(dir, stateFile)); err != nil {
+		t.Error("expected .state to exist after write")
+	}
+}
+
+func TestStateFile_Delete(t *testing.T) {
+	dir := t.TempDir()
+	// Write both files
+	_ = os.WriteFile(filepath.Join(dir, stateFile), []byte("x"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, stateTmpFile), []byte("y"), 0o644)
+
+	deleteStateFiles(dir)
+
+	if _, err := os.Stat(filepath.Join(dir, stateFile)); !os.IsNotExist(err) {
+		t.Error("expected .state to be deleted")
+	}
+	if _, err := os.Stat(filepath.Join(dir, stateTmpFile)); !os.IsNotExist(err) {
+		t.Error("expected .state.tmp to be deleted")
+	}
+}
+
+func TestStateFile_DeleteNonexistent(t *testing.T) {
+	dir := t.TempDir()
+	// Should not panic on nonexistent files
+	deleteStateFiles(dir)
+}
+
+func TestStateFile_OverwriteExisting(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeStateFile(dir, "first"); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if err := writeStateFile(dir, "second"); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	got := readStateFile(dir)
+	if got != "second" {
+		t.Errorf("expected %q after overwrite, got %q", "second", got)
+	}
+}
+
+// --- readUncommittedFiles tests ---
+
+func TestReadUncommittedFiles_RegularFiles(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "a.go"), []byte("package a"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "b.go"), []byte("package b"), 0o644)
+
+	results := readUncommittedFiles(dir, []string{"a.go", "b.go"}, 2)
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+
+	// Sort for deterministic assertion
+	sort.Slice(results, func(i, j int) bool { return results[i].name < results[j].name })
+	if results[0].name != "a.go" || string(results[0].content) != "package a" {
+		t.Errorf("unexpected result[0]: %+v", results[0])
+	}
+	if results[1].name != "b.go" || string(results[1].content) != "package b" {
+		t.Errorf("unexpected result[1]: %+v", results[1])
+	}
+}
+
+func TestReadUncommittedFiles_EmptyList(t *testing.T) {
+	dir := t.TempDir()
+	results := readUncommittedFiles(dir, nil, 2)
+	if len(results) != 0 {
+		t.Errorf("expected 0 results, got %d", len(results))
+	}
+}
+
+func TestReadUncommittedFiles_NonexistentFile(t *testing.T) {
+	dir := t.TempDir()
+	results := readUncommittedFiles(dir, []string{"does_not_exist.go"}, 1)
+	if len(results) != 0 {
+		t.Errorf("expected 0 results for nonexistent file, got %d", len(results))
+	}
+}
+
+func TestReadUncommittedFiles_SkipsDirectories(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.Mkdir(filepath.Join(dir, "subdir"), 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "real.go"), []byte("package real"), 0o644)
+
+	results := readUncommittedFiles(dir, []string{"subdir", "real.go"}, 2)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result (directory skipped), got %d", len(results))
+	}
+	if results[0].name != "real.go" {
+		t.Errorf("expected real.go, got %s", results[0].name)
+	}
+}
+
+func TestReadUncommittedFiles_SkipsSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.go")
+	_ = os.WriteFile(target, []byte("package target"), 0o644)
+	_ = os.Symlink(target, filepath.Join(dir, "link.go"))
+
+	results := readUncommittedFiles(dir, []string{"link.go", "target.go"}, 2)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result (symlink skipped), got %d", len(results))
+	}
+	if results[0].name != "target.go" {
+		t.Errorf("expected target.go, got %s", results[0].name)
+	}
+}
+
+func TestReadUncommittedFiles_NestedPath(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(dir, "src", "pkg"), 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "src", "pkg", "main.go"), []byte("package main"), 0o644)
+
+	results := readUncommittedFiles(dir, []string{"src/pkg/main.go"}, 1)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0].name != "src/pkg/main.go" {
+		t.Errorf("expected src/pkg/main.go, got %s", results[0].name)
+	}
+}
+
+func TestReadUncommittedFiles_EmptyFile(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "empty.go"), []byte{}, 0o644)
+
+	results := readUncommittedFiles(dir, []string{"empty.go"}, 1)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if len(results[0].content) != 0 {
+		t.Errorf("expected empty content, got %d bytes", len(results[0].content))
+	}
+}
+
+func TestReadUncommittedFiles_MixedExistingAndMissing(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "exists.go"), []byte("yes"), 0o644)
+
+	results := readUncommittedFiles(dir, []string{"exists.go", "gone.go", "also_gone.go"}, 2)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0].name != "exists.go" {
+		t.Errorf("expected exists.go, got %s", results[0].name)
+	}
+}
+
+func TestReadUncommittedFiles_PreservesRelativeName(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(dir, "a", "b"), 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "a", "b", "c.go"), []byte("x"), 0o644)
+
+	results := readUncommittedFiles(dir, []string{"a/b/c.go"}, 1)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	// Name must be the relative path as passed in, not an absolute path
+	if results[0].name != "a/b/c.go" {
+		t.Errorf("expected relative name a/b/c.go, got %s", results[0].name)
+	}
+}
+
+func TestReadUncommittedFiles_SpacesInPath(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(dir, "my dir"), 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "my dir", "my file.go"), []byte("hello"), 0o644)
+
+	results := readUncommittedFiles(dir, []string{"my dir/my file.go"}, 1)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0].name != "my dir/my file.go" {
+		t.Errorf("expected name with spaces preserved, got %s", results[0].name)
+	}
+}
+
+func TestReadUncommittedFiles_Parallelism1(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 10; i++ {
+		_ = os.WriteFile(filepath.Join(dir, filepath.Base(t.Name())+string(rune('a'+i))+".go"), []byte("x"), 0o644)
+	}
+
+	files := make([]string, 10)
+	for i := 0; i < 10; i++ {
+		files[i] = filepath.Base(t.Name()) + string(rune('a'+i)) + ".go"
+	}
+
+	results := readUncommittedFiles(dir, files, 1)
+	if len(results) != 10 {
+		t.Errorf("expected 10 results with parallelism=1, got %d", len(results))
+	}
+}
+
+// --- cleanUncommittedShards tests ---
+
+func TestCleanUncommittedShards_RemovesMatching(t *testing.T) {
+	dir := t.TempDir()
+	// Create shard files matching the pattern
+	_ = os.WriteFile(filepath.Join(dir, "uncommitted_v16.00000.zoekt"), []byte{}, 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "uncommitted_v16.00001.zoekt"), []byte{}, 0o644)
+	// Create a non-matching shard that should be preserved
+	_ = os.WriteFile(filepath.Join(dir, "myrepo_v16.00000.zoekt"), []byte{}, 0o644)
+
+	cleanUncommittedShards(dir)
+
+	entries, _ := filepath.Glob(filepath.Join(dir, "*.zoekt"))
+	if len(entries) != 1 {
+		t.Errorf("expected 1 remaining shard, got %d: %v", len(entries), entries)
+	}
+	if filepath.Base(entries[0]) != "myrepo_v16.00000.zoekt" {
+		t.Errorf("wrong shard preserved: %s", entries[0])
+	}
+}
+
+func TestCleanUncommittedShards_NoShards(t *testing.T) {
+	dir := t.TempDir()
+	// Should not panic on empty directory
+	cleanUncommittedShards(dir)
+}
+
+func TestCleanUncommittedShards_NonexistentDir(t *testing.T) {
+	// Should not panic
+	cleanUncommittedShards("/nonexistent/path/that/does/not/exist")
+}
+
+// --- shardsExist tests ---
+
+func TestShardsExist_WithShards(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "repo_v16.00000.zoekt"), []byte{}, 0o644)
+	if !shardsExist(dir) {
+		t.Error("expected shardsExist to return true")
+	}
+}
+
+func TestShardsExist_Empty(t *testing.T) {
+	dir := t.TempDir()
+	if shardsExist(dir) {
+		t.Error("expected shardsExist to return false for empty dir")
+	}
+}
+
+func TestShardsExist_NonZoektFiles(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, ".state"), []byte("x"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, ".lock"), []byte{}, 0o644)
+	if shardsExist(dir) {
+		t.Error("expected shardsExist to return false with only non-zoekt files")
+	}
+}
+
+func TestShardsExist_NonexistentDir(t *testing.T) {
+	if shardsExist("/nonexistent/path") {
+		t.Error("expected shardsExist to return false for nonexistent dir")
+	}
+}
+
+// --- helpers ---
 
 func assertContains(t *testing.T, slice []string, item string) {
 	t.Helper()
