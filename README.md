@@ -1,8 +1,8 @@
 # seek
 
-Indexed code search for git repositories. Finds matches in <400ms regardless of repo size, including uncommitted files.
+Indexed code search for git repositories. Finds matches in under a second regardless of repo size, including uncommitted files.
 
-AI coding agents like [Claude Code](https://claude.com/product/claude-code), [Codex](https://openai.com/codex/), [Cursor](https://www.cursor.com/), and [Amp](https://ampcode.com/) default to grep or ripgrep for code search. On large repos, this [burns tokens on irrelevant matches](https://milvus.io/blog/why-im-against-claude-codes-grep-only-retrieval-it-just-burns-too-many-tokens.md) and [scales linearly with corpus size](https://www.moderne.ai/blog/from-grep-to-moderne-trigrep-code-search-for-agents). seek replaces that with a trigram index powered by [zoekt](https://github.com/sourcegraph/zoekt) (the engine behind [Sourcegraph](https://sourcegraph.com/)) -- build once in ~15s, search in <400ms every time after. Single binary, no server, works as a tool call in any agent loop, an [MCP server](https://modelcontextprotocol.io/), or a shell alias.
+AI coding agents like [Claude Code](https://claude.com/product/claude-code), [Codex](https://openai.com/codex/), [Cursor](https://www.cursor.com/), and [Amp](https://ampcode.com/) default to grep or ripgrep for code search. On large repos, this [burns tokens on irrelevant matches](https://milvus.io/blog/why-im-against-claude-codes-grep-only-retrieval-it-just-burns-too-many-tokens.md) and [scales linearly with corpus size](https://www.moderne.ai/blog/from-grep-to-moderne-trigrep-code-search-for-agents). seek replaces that with a trigram index powered by [zoekt](https://github.com/sourcegraph/zoekt) (the engine behind [Sourcegraph](https://sourcegraph.com/)) -- build once in ~10s, search in under a second every time after. Single binary, no server, works as a tool call in any agent loop, an [MCP server](https://modelcontextprotocol.io/), or a shell alias.
 
 <!-- Status -->
 [![CI](https://github.com/dualeai/seek/actions/workflows/ci.yml/badge.svg)](https://github.com/dualeai/seek/actions/workflows/ci.yml)
@@ -110,7 +110,7 @@ All [zoekt query syntax](https://github.com/sourcegraph/zoekt/blob/main/doc/quer
 2. **Index** -- if the cache is stale, builds a trigram index of committed files and stages uncommitted files for separate indexing
 3. **Search** -- loads index shards, runs the query, deduplicates results (uncommitted version wins over committed)
 
-The index is stored in `.seek-cache/` at the repo root. First run takes ~15s (dominated by indexing), subsequent searches are <400ms.
+The index is stored in `.seek-cache/` at the repo root. First run takes ~10s (dominated by indexing), subsequent searches complete in under a second.
 
 ### Parallel Safety
 
