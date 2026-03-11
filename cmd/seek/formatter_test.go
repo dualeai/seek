@@ -838,6 +838,31 @@ func TestFormatResults_ContextLines_BeforeNoTrailingNewline(t *testing.T) {
 	}
 }
 
+func TestFormatResults_FileOnlyMatch_LineNumberZero(t *testing.T) {
+	// Reproduces panic on file-only queries where zoekt returns LineNumber=0
+	// with empty Before/After (e.g. "file:foo" with no content term).
+	files := []zoekt.FileMatch{
+		{
+			FileName:   "path/to/file.go",
+			Repository: "github.com/example/repo",
+			Language:   "Go",
+			Score:      10,
+			LineMatches: []zoekt.LineMatch{{
+				LineNumber: 0,
+				Line:       nil,
+				Before:     nil,
+				After:      nil,
+			}},
+		},
+	}
+
+	// Should not panic
+	result := formatResults(files)
+	if !strings.Contains(result, "## path/to/file.go (Go)") {
+		t.Errorf("expected file header, got: %s", result)
+	}
+}
+
 func TestSplitContextLines(t *testing.T) {
 	tests := []struct {
 		name     string
