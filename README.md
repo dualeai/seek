@@ -68,7 +68,7 @@ Multiple agents can search in parallel safely:
 - **Index fresh** — All agents skip indexing, search concurrently
 - **Index stale** — First agent indexes, others search stale index with a warning
 - **No index yet** — First agent indexes, others block up to 60s
-- Uses `flock` for lock coordination; `--no-optional-locks` on `git status` prevents git index contention
+- Uses `flock` for lock coordination; `GIT_OPTIONAL_LOCKS=0` on all git calls prevents git index contention
 
 ## Performance
 

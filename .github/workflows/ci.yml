@@ -6,17 +6,56 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  test-static:
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-go@v5.4.0
         with:
           go-version-file: go.mod
-      - run: go vet ./...
-      - run: go test ./... -v -race
-      - run: go build -ldflags="-s -w" -o seek ./cmd/seek
+      - run: make install
+      - run: make test-static
+
+  test-unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest       # Linux x86_64
+          - ubuntu-24.04-arm    # Linux arm64
+          - macos-latest        # macOS arm64
+          - macos-26-intel      # macOS x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-go@v5.4.0
+        with:
+          go-version-file: go.mod
+      - run: make test-unit
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest       # Linux x86_64
+          - ubuntu-24.04-arm    # Linux arm64
+          - macos-latest        # macOS arm64
+          - macos-26-intel      # macOS x86_64
+    runs-on: ${{ matrix.os }}
+    needs: [test-static, test-unit]
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-go@v5.4.0
+        with:
+          go-version-file: go.mod
+      - run: make build

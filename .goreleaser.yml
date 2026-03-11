@@ -5,6 +5,8 @@ builds:
     binary: seek
     ldflags:
       - -s -w
+    env:
+      - CGO_ENABLED=0
     goos:
       - darwin
       - linux
@@ -14,9 +16,23 @@ builds:
 
 archives:
   - format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
 
 checksum:
   name_template: checksums.txt
+  algorithm: sha256
+
+sboms:
+  - artifacts: archive
 
 changelog:
   sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^ci:"
+      - "^chore:"
+
+release:
+  extra_files:
+    - glob: sbom.cyclonedx.json
