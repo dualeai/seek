@@ -29,6 +29,7 @@ func executeSearch(ctx context.Context, indexDir, pattern string) ([]zoekt.FileM
 		MaxDocDisplayCount: 1000,
 		TotalMaxMatchCount: 10000,
 		ShardMaxMatchCount: 10000,
+		NumContextLines:    3,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("search: %w", err)

@@ -8,11 +8,27 @@ AI coding agents like [Claude Code](https://claude.com/product/claude-code), [Co
 [![CI](https://github.com/dualeai/seek/actions/workflows/ci.yml/badge.svg)](https://github.com/dualeai/seek/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
+## Why Not Just ripgrep?
+
+[ripgrep](https://github.com/BurntSushi/ripgrep) is excellent for small-to-medium repos. On large codebases with repeated queries (the AI agent use case), seek adds:
+
+| | ripgrep | seek |
+|---|---|---|
+| **Search model** | Linear scan -- O(corpus) per query | Trigram index -- O(matches) after one-time build |
+| **Relevance ranking** | Results in file-path order | Sorted by score, best matches first |
+| **Symbol metadata** | None | `[function]`, `[class]`, `[method]` via ctags |
+| **Context lines** | None by default | 3 lines of surrounding code with every match |
+| **Uncommitted awareness** | Always reads working tree | Indexes both, tags `[uncommitted]` files |
+| **Language detection** | `--type` filter (extension-based) | Labels each file `(Go)`, `(Python)` (content-based) |
+| **Parallel agents** | No coordination | flock-based, safe for concurrent use |
+
+seek is not a ripgrep replacement for ad-hoc regex. It's for the use case where the same repo is searched dozens of times per session and results need to be [compact enough for an LLM context window](https://milvus.io/blog/why-im-against-claude-codes-grep-only-retrieval-it-just-burns-too-many-tokens.md).
+
 ## Highlights
 
 - **Sub-second search on large repos** -- grep is O(corpus) per query; seek is O(matches) after a one-time index build
 - **Searches uncommitted files** -- modified, staged, and untracked files are indexed alongside committed code. Agents see the same code you do
-- **Single binary, no server** -- `seek "pattern"` returns results and exits. Fits anywhere grep does, but with an index behind it
+- **Context included** -- 3 lines of surrounding code with every match. Agents understand the code without a follow-up Read call
 - **Symbol-aware** -- find definitions with `sym:`, powered by universal-ctags. Agents jump to definitions instead of sifting through every mention
 - **Safe for parallel use** -- multiple agents search concurrently without corrupting the index. Essential when tools like Claude Code or Codex [spawn parallel sub-agents](https://openai.com/index/unrolling-the-codex-agent-loop/)
 
@@ -48,14 +64,31 @@ seek "handleRequest"
 
 ```
 ## src/server.go (Go)
+  12
+  13 // handleRequest processes incoming HTTP requests.
+  14 // It validates auth and delegates to the appropriate handler.
   15 [function] func handleRequest(w http.ResponseWriter, r *http.Request) {
-  42 go handleRequest(w, r)
+  16     ctx := r.Context()
+  17     log.Info("handling request")
+  18     validateAuth(ctx, r)
+
+  40     }
+  41     // dispatch to handler
+  42     go handleRequest(w, r)
+  43     return nil
+  44 }
 
 ## lib/middleware.py (Python) [uncommitted]
+  7
+  8  logger = logging.getLogger(__name__)
+  9
   10 async def handleRequest(ctx):
+  11     """Process incoming request."""
+  12     await validate(ctx)
+  13     return Response(200)
 ```
 
-Results are grouped by file, sorted by relevance. `[uncommitted]` marks files with local changes. `[function]` shows symbol metadata from ctags.
+Results are grouped by file, sorted by relevance. Each match includes 3 lines of surrounding context. `[uncommitted]` marks files with local changes. `[function]` shows symbol metadata from ctags.
 
 ## Query Syntax
 
