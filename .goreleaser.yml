@@ -21,7 +21,8 @@ builds:
       - -s -w -X main.version={{ .Env.VERSION }}
 
 archives:
-  - format: tar.gz
+  - formats:
+      - tar.gz
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
 
 checksum:
@@ -32,26 +33,9 @@ sboms:
   - artifacts: archive
 
 changelog:
-  sort: asc
-  filters:
-    exclude:
-      - "^docs:"
-      - "^ci:"
-      - "^chore:"
+  disable: "true"
 
 release:
-  mode: replace
+  mode: keep-existing
   extra_files:
     - glob: sbom.cyclonedx.json
-  footer: |
-    ## Verify
-
-    ### Checksums
-    ```bash
-    sha256sum -c checksums.txt
-    ```
-
-    ### GitHub attestation
-    ```bash
-    gh attestation verify <artifact> --repo duale-ai/seek
-    ```
