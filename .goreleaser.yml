@@ -40,6 +40,7 @@ changelog:
       - "^chore:"
 
 release:
+  mode: replace
   extra_files:
     - glob: sbom.cyclonedx.json
   footer: |
