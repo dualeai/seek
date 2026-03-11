@@ -1,0 +1,22 @@
+version: 2
+
+builds:
+  - main: ./cmd/seek
+    binary: seek
+    ldflags:
+      - -s -w
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - format: tar.gz
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
