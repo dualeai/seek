@@ -35,7 +35,7 @@ func formatResults(files []zoekt.FileMatch) string {
 		formatFileMatch(&sb, fm)
 	}
 
-	// §8 rule 4: no trailing newline after the last line
+	// No trailing newline after the last line
 	return strings.TrimRight(sb.String(), "\n")
 }
 
@@ -79,7 +79,9 @@ func formatFileMatch(sb *strings.Builder, fm zoekt.FileMatch) {
 	sb.WriteByte(')')
 
 	if fm.Repository == repoUncommitted {
-		sb.WriteString(" [" + repoUncommitted + "]")
+		sb.WriteString(" [")
+		sb.WriteString(repoUncommitted)
+		sb.WriteByte(']')
 	}
 	sb.WriteByte('\n')
 

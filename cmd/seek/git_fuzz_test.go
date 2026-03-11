@@ -5,15 +5,15 @@ import (
 )
 
 func FuzzParseGitStatusV2(f *testing.F) {
-	// Seed with realistic v2 outputs
-	f.Add("# branch.oid abc123\n# branch.head main\n")
-	f.Add("# branch.oid abc123\n1 .M N... 100644 100644 100644 abc def src/main.go\x00")
-	f.Add("# branch.oid abc123\n? new_file.txt\x00")
-	f.Add("# branch.oid abc123\n1 A. N... 100644 100644 100644 abc def added.go\x00")
-	f.Add("# branch.oid abc123\nu UU N... 100644 100644 100644 100644 a b c conflict.go\x00")
+	// Seed with realistic v2 -z outputs (NUL-terminated records)
+	f.Add("# branch.oid abc123\x00# branch.head main\x00")
+	f.Add("# branch.oid abc123\x001 .M N... 100644 100644 100644 abc def src/main.go\x00")
+	f.Add("# branch.oid abc123\x00? new_file.txt\x00")
+	f.Add("# branch.oid abc123\x001 A. N... 100644 100644 100644 abc def added.go\x00")
+	f.Add("# branch.oid abc123\x00u UU N... 100644 100644 100644 100644 a b c conflict.go\x00")
 	f.Add("")
 	f.Add("\x00\x00\x00")
-	f.Add("# branch.oid abc\n\x00\x00? \x00")
+	f.Add("# branch.oid abc\x00\x00? \x00")
 	f.Fuzz(func(t *testing.T, raw string) {
 		// Must never panic
 		state := parseGitStatusV2(raw)

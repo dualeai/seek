@@ -29,21 +29,46 @@ const (
 	repoUncommitted = "uncommitted"
 	// stateVersion is the prefix used in state hashing to invalidate caches
 	// when the hash algorithm or input format changes.
-	stateVersion = "v3\x00"
+	stateVersion = "v4\x00"
 	// maxUncommittedFileSize is the maximum file size (in bytes) for uncommitted
 	// file indexing. Files larger than this are skipped to prevent excessive
 	// memory usage.
 	maxUncommittedFileSize = 10 * 1024 * 1024 // 10 MB
 )
 
-// computeStateHash computes the xxHash64 of raw git status v2 output.
-// The raw output already contains the HEAD SHA in the # branch.oid header,
-// so no domain separator is needed.
+// computeStateHash computes the xxHash64 of the given state string.
+// In production, the input is a repoStateFingerprint (raw git status output
+// enriched with file stats). The stateVersion prefix invalidates old caches
+// when the hash algorithm or input format changes.
 func computeStateHash(rawOutput string) string {
 	h := xxhash.New()
 	_, _ = h.Write([]byte(stateVersion))
 	_, _ = h.Write([]byte(rawOutput))
 	return fmt.Sprintf("%016x", h.Sum64())
+}
+
+// repoStateFingerprint returns the raw git status output enriched with working
+// tree file stats (mtime + size) for dirty files. git status --porcelain=v2
+// doesn't include working tree content hashes, so consecutive edits to an
+// already-modified file produce identical porcelain output. Appending file
+// stats ensures the state hash changes whenever a dirty file is modified.
+func repoStateFingerprint(repoDir string, state repoState) string {
+	if len(state.Files) == 0 {
+		return state.RawOutput
+	}
+	var b strings.Builder
+	b.WriteString(state.RawOutput)
+	for _, f := range state.Files {
+		fi, err := os.Lstat(filepath.Join(repoDir, f))
+		if err != nil {
+			// File may have been deleted between git status and stat;
+			// include a sentinel so deletions also change the hash.
+			fmt.Fprintf(&b, "\x00%s\x00deleted\x00", f)
+			continue
+		}
+		fmt.Fprintf(&b, "\x00%s\x00%d\x00%d\x00", f, fi.ModTime().UnixNano(), fi.Size())
+	}
+	return b.String()
 }
 
 // readStateFile reads the cached state hash from the stateFile in indexDir.
@@ -84,7 +109,7 @@ func indexParallelism() int {
 
 // checkCtags verifies that universal-ctags is installed. Zoekt silently skips
 // symbol parsing when ctags is missing (even with CTagsMustSucceed), so we
-// must detect this explicitly (§9).
+// must detect this explicitly.
 func checkCtags() error {
 	var opts index.Options
 	opts.SetDefaults()
@@ -96,10 +121,13 @@ func checkCtags() error {
 
 // runIndexing orchestrates committed and uncommitted indexing with locking.
 func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState, preState string) error {
-	// §9: Fail fast if ctags is missing — fatal error
+	// Fail fast if ctags is missing
 	if err := checkCtags(); err != nil {
 		return err
 	}
+
+	// Ensure cache dir is excluded from git status for post-verification.
+	ensureGitExclude(repoDir, cacheDir)
 
 	lockPath := filepath.Join(indexDir, lockFile)
 
@@ -152,24 +180,34 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 	// Wait for uncommitted file reads
 	readRes := <-readCh
 
-	// Always clean stale uncommitted shards before rebuilding
-	cleanUncommittedShards(indexDir)
-
 	// Clean up stale staging directory from previous seek versions
 	_ = os.RemoveAll(filepath.Join(indexDir, repoUncommitted))
 
-	// Index uncommitted files
+	// Index uncommitted files. When docs exist, zoekt's builder.Finish()
+	// atomically replaces old shards (write to .tmp then os.Rename), so we
+	// must NOT delete old shards before writing new ones — that creates a
+	// gap where concurrent searchers see no uncommitted shard at all.
+	// When no docs exist, we clean up stale uncommitted shards from a
+	// previous run where uncommitted files did exist.
+	var uncommittedErr error
 	if len(readRes.docs) > 0 {
-		if err := indexUncommitted(ctx, repoDir, indexDir, readRes.docs, parallelism); err != nil {
-			slog.Warn("Uncommitted indexing failed", "error", err)
+		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, readRes.docs, parallelism)
+		if uncommittedErr != nil {
+			slog.Warn("Uncommitted indexing failed", "error", uncommittedErr)
 		}
+	} else {
+		cleanUncommittedShards(indexDir)
 	}
 
-	// §5.7: Post-indexing verification — single atomic call eliminates TOCTOU
-	postState := computeStateHash(gitRepoState(ctx).RawOutput)
+	// Post-indexing verification — single atomic call eliminates TOCTOU.
+	// Use repoDir explicitly so this works regardless of process CWD.
+	postRepoState := gitRepoStateIn(ctx, repoDir)
+	postState := computeStateHash(repoStateFingerprint(repoDir, postRepoState))
 
-	if committedErr != nil {
-		// §5.7 step 4: Don't cache state, but do NOT exit — proceed to search
+	if committedErr != nil || uncommittedErr != nil {
+		// Don't cache state when either indexing step failed — forces
+		// re-index on next search so transient failures don't leave
+		// uncommitted content permanently invisible.
 		deleteStateFiles(indexDir)
 		slog.Warn("Index incomplete, will re-index on next search")
 		return nil

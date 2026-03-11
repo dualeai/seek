@@ -128,21 +128,40 @@ func run(ctx context.Context, pattern string) error {
 		return fmt.Errorf("create index directory: %w", err)
 	}
 
-	// Step 4: compute state hash (single atomic git call)
-	state := gitRepoState(ctx)
-	currentState := computeStateHash(state.RawOutput)
+	// Exclude the cache directory from git status before computing state.
+	// Also called inside runIndexing as a defensive measure, but we need it
+	// here for the search-only path (when the index is already up-to-date).
+	ensureGitExclude(repoDir, cacheDir)
 
-	// Step 5: check cached state
+	// Compute state hash from a single atomic git status call.
+	state := gitRepoState(ctx)
+	currentState := computeStateHash(repoStateFingerprint(repoDir, state))
+
+	// Re-index if the cached state differs from the current working tree.
 	cachedState := readStateFile(indexDir)
 	if currentState != cachedState {
-		// Step 6: run indexing
 		if err := runIndexing(ctx, repoDir, indexDir, state, currentState); err != nil {
 			slog.Warn("Indexing failed", "error", err)
 			// Continue to search with whatever shards exist
 		}
 	}
 
-	// Step 7-8: execute search and format results
+	// Execute search with LOCK_SH so concurrent indexers (which hold LOCK_EX)
+	// finish before we read shards. Multiple searchers can hold LOCK_SH
+	// simultaneously — no contention between readers.
+	searchLockPath := filepath.Join(indexDir, lockFile)
+	searchLockFd, err := os.OpenFile(searchLockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return fmt.Errorf("open search lock: %w", err)
+	}
+	defer func() {
+		unlockFile(searchLockFd)
+		_ = searchLockFd.Close()
+	}()
+	if err := lockFileShared(searchLockFd); err != nil {
+		return fmt.Errorf("acquire search lock: %w", err)
+	}
+
 	results, err := executeSearch(ctx, indexDir, pattern)
 	if err != nil {
 		return err

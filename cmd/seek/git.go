@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -15,12 +17,14 @@ type repoState struct {
 	Files     []string // paths of changed/untracked files
 }
 
-// gitCmd creates an exec.Cmd for git with graceful shutdown and lock safety.
-// Sets GIT_OPTIONAL_LOCKS=0 to prevent index lock contention, and uses
-// a graceful signal on context cancellation so git can release locks.
+// gitCmd creates an exec.Cmd for git with graceful shutdown.
+// Uses a graceful signal on context cancellation so git can release locks.
+// Note: we intentionally do NOT set GIT_OPTIONAL_LOCKS=0. While it
+// prevents lock contention on .git/index, it also prevents git from
+// refreshing its stat cache, which can cause same-second edits to be
+// invisible (same mtime + same size = git thinks file is unchanged).
 func gitCmd(ctx context.Context, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
 	cmd.Cancel = func() error {
 		return cmd.Process.Signal(gitCancelSignal())
 	}
@@ -48,8 +52,21 @@ func gitRepoState(ctx context.Context) repoState {
 	return parseGitStatusV2(string(out))
 }
 
+// gitRepoStateIn returns the repository state for a specific directory.
+// Used when the CWD may not be inside the target repository (e.g., post-
+// indexing verification in runIndexing).
+func gitRepoStateIn(ctx context.Context, dir string) repoState {
+	cmd := gitCmd(ctx, "status", "--porcelain=v2", "--branch", "--no-renames", "-z")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return repoState{HeadSHA: "no-head"}
+	}
+	return parseGitStatusV2(string(out))
+}
+
 // parseGitStatusV2 parses git status --porcelain=v2 --branch --no-renames -z output.
-// Header lines (# ...) are LF-terminated. Entry records are NUL-terminated.
+// With -z, ALL records (headers and entries) are NUL-terminated.
 func parseGitStatusV2(raw string) repoState {
 	state := repoState{
 		HeadSHA:   "no-head",
@@ -59,26 +76,8 @@ func parseGitStatusV2(raw string) repoState {
 	seen := make(map[string]bool)
 	pos := 0
 
-	// Parse header lines (LF-terminated, start with #)
-	for pos < len(raw) && raw[pos] == '#' {
-		end := strings.IndexByte(raw[pos:], '\n')
-		if end < 0 {
-			break
-		}
-		line := raw[pos : pos+end]
-		pos += end + 1
-
-		if strings.HasPrefix(line, "# branch.oid ") {
-			state.HeadSHA = line[len("# branch.oid "):]
-		}
-	}
-
-	// Skip any stray whitespace between headers and entries
-	for pos < len(raw) && (raw[pos] == '\n' || raw[pos] == '\r') {
-		pos++
-	}
-
-	// Parse NUL-terminated entries
+	// Parse NUL-terminated records. With -z, both header lines (# ...)
+	// and entry records use NUL as the terminator.
 	for pos < len(raw) {
 		end := strings.IndexByte(raw[pos:], 0)
 		if end < 0 {
@@ -88,6 +87,14 @@ func parseGitStatusV2(raw string) repoState {
 		pos += end + 1
 
 		if len(entry) < 2 {
+			continue
+		}
+
+		// Header lines start with '#'
+		if entry[0] == '#' {
+			if strings.HasPrefix(entry, "# branch.oid ") {
+				state.HeadSHA = entry[len("# branch.oid "):]
+			}
 			continue
 		}
 
@@ -108,6 +115,35 @@ func parseGitStatusV2(raw string) repoState {
 	}
 
 	return state
+}
+
+// ensureGitExclude adds the cache directory to .git/info/exclude if not
+// already present. This prevents the cache from appearing as untracked in
+// git status, which would cause the state hash to drift between pre- and
+// post-indexing verification. Uses .git/info/exclude rather than .gitignore
+// to avoid modifying the user's working tree.
+func ensureGitExclude(repoDir, pattern string) {
+	infoDir := filepath.Join(repoDir, ".git", "info")
+	excludePath := filepath.Join(infoDir, "exclude")
+
+	data, _ := os.ReadFile(excludePath)
+	needle := "/" + pattern
+	if strings.Contains(string(data), needle) {
+		return
+	}
+
+	_ = os.MkdirAll(infoDir, 0o755)
+	f, err := os.OpenFile(excludePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		slog.Warn("Failed to update .git/info/exclude — cache directory may cause repeated re-indexing", "error", err)
+		return
+	}
+	defer func() { _ = f.Close() }()
+	// Add newline before if file doesn't end with one
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		_, _ = f.WriteString("\n")
+	}
+	_, _ = f.WriteString(needle + "\n")
 }
 
 // extractV2Path extracts the path from a porcelain v2 entry by skipping
