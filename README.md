@@ -92,17 +92,39 @@ Results are grouped by file, sorted by relevance. Each match includes 3 lines of
 
 ## Query Syntax
 
+### Search
+
 | Query | What it does |
 |-------|-------------|
 | `seek "CoreRouter"` | Substring search across content and file names |
-| `seek "sym:CoreRouter"` | Symbol search (function/class/method definitions) |
+| `seek "content:async def.*handler"` | Search only file content (not file names) |
+| `seek "regex:foo.*bar"` | Explicit regex search |
+
+### Symbols
+
+| Query | What it does |
+|-------|-------------|
+| `seek "sym:CoreRouter"` | Symbol search (function/class/method definitions via ctags) |
+
+### Filters
+
+| Query | What it does |
+|-------|-------------|
 | `seek "file:router/src"` | Filter results to paths matching `router/src` |
-| `seek "-file:test"` | Exclude paths matching `test` |
 | `seek "lang:python error"` | Filter by language |
-| `seek "content:async def.*handler"` | Regex search |
+| `seek "case:yes FooBar"` | Case-sensitive search (`yes`, `no`, `auto`) |
+| `seek "type:file config"` | Return matching file names only (no content matches) |
+
+### Boolean Logic
+
+| Query | What it does |
+|-------|-------------|
+| `seek "-file:test"` | Exclude paths matching `test` |
+| `seek "foo or bar"` | Match either term |
+| `seek "(foo or bar) lang:go"` | Group expressions with parentheses |
 | `seek "handleError file:api -file:test"` | Combined: substring + path filter + exclusion |
 
-All [zoekt query syntax](https://github.com/sourcegraph/zoekt/blob/main/doc/query_syntax.md) is supported.
+All [zoekt query syntax](https://github.com/sourcegraph/zoekt/blob/main/doc/query_syntax.md) is supported. Searches are ranked using [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) scoring for relevance.
 
 ## How It Works
 
