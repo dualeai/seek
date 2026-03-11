@@ -35,7 +35,7 @@ seek is not a ripgrep replacement for ad-hoc regex. It's for the use case where 
 ## Install
 
 ```bash
-brew install dualeai/tap/seek
+curl -sSfL https://raw.githubusercontent.com/dualeai/seek/main/install.sh | sh
 ```
 
 Or with Go:
