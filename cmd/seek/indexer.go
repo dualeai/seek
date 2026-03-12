@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
-	"time"
+	"syscall"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/sourcegraph/zoekt/gitindex"
@@ -29,7 +31,7 @@ const (
 	repoUncommitted = "uncommitted"
 	// stateVersion is the prefix used in state hashing to invalidate caches
 	// when the hash algorithm or input format changes.
-	stateVersion = "v4\x00"
+	stateVersion = "v5\x00"
 	// maxUncommittedFileSize is the maximum file size (in bytes) for uncommitted
 	// file indexing. Files larger than this are skipped to prevent excessive
 	// memory usage.
@@ -42,31 +44,49 @@ const (
 // when the hash algorithm or input format changes.
 func computeStateHash(rawOutput string) string {
 	h := xxhash.New()
-	_, _ = h.Write([]byte(stateVersion))
-	_, _ = h.Write([]byte(rawOutput))
+	_, _ = h.WriteString(stateVersion)
+	_, _ = h.WriteString(rawOutput)
 	return fmt.Sprintf("%016x", h.Sum64())
 }
 
 // repoStateFingerprint returns the raw git status output enriched with working
-// tree file stats (mtime + size) for dirty files. git status --porcelain=v2
-// doesn't include working tree content hashes, so consecutive edits to an
-// already-modified file produce identical porcelain output. Appending file
-// stats ensures the state hash changes whenever a dirty file is modified.
+// tree file stats (mtime, size, and inode) for dirty files. git status
+// --porcelain=v2 doesn't include working tree content hashes, so consecutive
+// edits to an already-modified file produce identical porcelain output.
+// Appending file stats ensures the state hash changes whenever a dirty file is
+// modified. The inode detects atomic-write editors (vim, emacs) that replace
+// files via write-to-tmp + rename, which changes the inode but may preserve
+// mtime.
 func repoStateFingerprint(repoDir string, state repoState) string {
 	if len(state.Files) == 0 {
 		return state.RawOutput
 	}
 	var b strings.Builder
+	b.Grow(len(state.RawOutput) + len(state.Files)*80)
 	b.WriteString(state.RawOutput)
 	for _, f := range state.Files {
 		fi, err := os.Lstat(filepath.Join(repoDir, f))
 		if err != nil {
 			// File may have been deleted between git status and stat;
 			// include a sentinel so deletions also change the hash.
-			fmt.Fprintf(&b, "\x00%s\x00deleted\x00", f)
+			b.WriteByte(0)
+			b.WriteString(f)
+			b.WriteString("\x00deleted\x00")
 			continue
 		}
-		fmt.Fprintf(&b, "\x00%s\x00%d\x00%d\x00", f, fi.ModTime().UnixNano(), fi.Size())
+		ino := uint64(0)
+		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+			ino = stat.Ino
+		}
+		b.WriteByte(0)
+		b.WriteString(f)
+		b.WriteByte(0)
+		b.WriteString(strconv.FormatInt(fi.ModTime().UnixNano(), 10))
+		b.WriteByte(0)
+		b.WriteString(strconv.FormatInt(fi.Size(), 10))
+		b.WriteByte(0)
+		b.WriteString(strconv.FormatUint(ino, 10))
+		b.WriteByte(0)
 	}
 	return b.String()
 }
@@ -110,13 +130,39 @@ func indexParallelism() int {
 // checkCtags verifies that universal-ctags is installed. Zoekt silently skips
 // symbol parsing when ctags is missing (even with CTagsMustSucceed), so we
 // must detect this explicitly.
+//
+// Detection order:
+//  1. CTAGS_COMMAND env var (explicit user override)
+//  2. "universal-ctags" binary on PATH (zoekt default)
+//  3. "ctags" binary on PATH, verified via --version (Homebrew on macOS
+//     installs universal-ctags as "ctags")
 func checkCtags() error {
+	// 1. Explicit env var — trust the user.
+	if cmd := os.Getenv("CTAGS_COMMAND"); cmd != "" {
+		if _, err := exec.LookPath(cmd); err != nil {
+			return fmt.Errorf("CTAGS_COMMAND=%q not found on PATH: %w", cmd, err)
+		}
+		return nil
+	}
+
+	// 2. Zoekt default: looks for "universal-ctags" on PATH.
 	var opts index.Options
 	opts.SetDefaults()
-	if opts.CTagsPath == "" {
-		return fmt.Errorf("universal-ctags required but not found.\n  macOS:  brew install universal-ctags\n  Linux:  sudo apt-get install universal-ctags\n  Or set CTAGS_COMMAND=/path/to/ctags")
+	if opts.CTagsPath != "" {
+		return nil
 	}
-	return nil
+
+	// 3. Fallback: Homebrew installs universal-ctags as "ctags".
+	// Verify via --version to distinguish from Exuberant Ctags.
+	if ctags, err := exec.LookPath("ctags"); err == nil {
+		out, err := exec.Command(ctags, "--version").Output()
+		if err == nil && strings.Contains(string(out), "Universal Ctags") {
+			_ = os.Setenv("CTAGS_COMMAND", ctags)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("universal-ctags required but not found.\n  macOS:  brew install universal-ctags\n  Linux:  sudo apt-get install universal-ctags\n  Or set CTAGS_COMMAND=/path/to/ctags")
 }
 
 // runIndexing orchestrates committed and uncommitted indexing with locking.
@@ -153,45 +199,41 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 
 	parallelism := indexParallelism()
 
-	// Read uncommitted files directly into memory, in parallel with
-	// committed indexing. This avoids staging files to a temp directory
-	// (and the associated hardlink mutation risks and double I/O on
-	// non-CoW filesystems).
-	type readResult struct {
-		docs []fileContent
-	}
-	readCh := make(chan readResult, 1)
-
+	// Stream uncommitted files through a channel, in parallel with
+	// committed indexing. The bounded channel (size=parallelism) provides
+	// backpressure so at most 2*parallelism files are in flight
+	// (channel buffer + blocked workers), rather than buffering all
+	// dirty files into a single slice.
+	var fileCh <-chan fileContent
 	if len(state.Files) > 0 {
-		go func() {
-			docs := readUncommittedFiles(repoDir, state.Files, parallelism)
-			readCh <- readResult{docs}
+		fileCh = streamFiles(repoDir, state.Files, parallelism)
+		// Ensure the producer goroutine is drained on all exit paths
+		// (including panics) to prevent goroutine leaks.
+		defer func() {
+			for range fileCh {
+			}
 		}()
-	} else {
-		readCh <- readResult{nil}
 	}
 
-	// Index committed files
+	// Index committed files (concurrent with channel fill)
 	committedErr := indexCommitted(ctx, repoDir, indexDir, parallelism)
 	if committedErr != nil {
 		slog.Warn("Committed indexing failed", "error", committedErr)
 	}
 
-	// Wait for uncommitted file reads
-	readRes := <-readCh
-
 	// Clean up stale staging directory from previous seek versions
 	_ = os.RemoveAll(filepath.Join(indexDir, repoUncommitted))
 
-	// Index uncommitted files. When docs exist, zoekt's builder.Finish()
-	// atomically replaces old shards (write to .tmp then os.Rename), so we
-	// must NOT delete old shards before writing new ones — that creates a
-	// gap where concurrent searchers see no uncommitted shard at all.
-	// When no docs exist, we clean up stale uncommitted shards from a
-	// previous run where uncommitted files did exist.
+	// Index uncommitted files streamed from the channel. When files exist,
+	// zoekt's builder.Finish() atomically replaces old shards (write to
+	// .tmp then os.Rename), so we must NOT delete old shards before writing
+	// new ones — that creates a gap where concurrent searchers see no
+	// uncommitted shard at all. When no files exist, we clean up stale
+	// uncommitted shards from a previous run where uncommitted files did
+	// exist.
 	var uncommittedErr error
-	if len(readRes.docs) > 0 {
-		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, readRes.docs, parallelism)
+	if fileCh != nil {
+		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, fileCh, parallelism)
 		if uncommittedErr != nil {
 			slog.Warn("Uncommitted indexing failed", "error", uncommittedErr)
 		}
@@ -225,74 +267,6 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 	return nil
 }
 
-// acquireLock tries to acquire an exclusive flock on the lock file.
-// Returns (fd, acquired, error).
-func acquireLock(ctx context.Context, indexDir, lockPath string) (*os.File, bool, error) {
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, false, fmt.Errorf("open lock file: %w", err)
-	}
-
-	// Try non-blocking lock first
-	err = lockFileExclusive(f)
-	if err == nil {
-		return f, true, nil
-	}
-
-	// Lock held by another process
-	if shardsExist(indexDir) {
-		// Stale index is acceptable
-		_ = f.Close()
-		return nil, false, nil
-	}
-
-	// No shards exist (first run) — poll with exponential backoff.
-	// We avoid a blocking flock goroutine to prevent fd-reuse races
-	// when the timeout fires and closes the file.
-	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, 60*time.Second)
-	defer timeoutCancel()
-
-	backoff := 100 * time.Millisecond
-	const maxBackoff = 2 * time.Second
-
-	for {
-		select {
-		case <-timeoutCtx.Done():
-			_ = f.Close()
-			return nil, false, fmt.Errorf("indexer lock held >60s")
-		default:
-		}
-
-		err = lockFileExclusive(f)
-		if err == nil {
-			return f, true, nil
-		}
-
-		timer := time.NewTimer(backoff)
-		select {
-		case <-timeoutCtx.Done():
-			timer.Stop()
-			_ = f.Close()
-			return nil, false, fmt.Errorf("indexer lock held >60s")
-		case <-timer.C:
-		}
-
-		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
-		}
-	}
-}
-
-// releaseLock releases the flock and closes the file.
-func releaseLock(f *os.File) {
-	if f == nil {
-		return
-	}
-	unlockFile(f)
-	_ = f.Close()
-}
-
 // shardsExist checks if any *.zoekt shard files exist in the index directory.
 func shardsExist(indexDir string) bool {
 	entries, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
@@ -321,15 +295,14 @@ type fileContent struct {
 	content []byte
 }
 
-// readUncommittedFiles reads uncommitted files directly from the working tree
-// into memory using a bounded worker pool. Files larger than maxUncommittedFileSize,
-// symlinks, and directories are skipped. Individual file failures are non-fatal
-// since files may be deleted or modified between git status and read.
-func readUncommittedFiles(repoDir string, files []string, parallelism int) []fileContent {
+// readFilesToChannel reads files from the working tree using a bounded worker
+// pool and sends them to out. Files larger than maxUncommittedFileSize,
+// symlinks, and directories are skipped. Individual file failures are
+// non-fatal since files may be deleted or modified between git status and
+// read. The channel is closed after all workers finish.
+func readFilesToChannel(repoDir string, files []string, parallelism int, out chan<- fileContent) {
 	ch := make(chan string, parallelism)
 	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var results []fileContent
 
 	for range parallelism {
 		wg.Add(1)
@@ -344,24 +317,33 @@ func readUncommittedFiles(repoDir string, files []string, parallelism int) []fil
 					continue
 				}
 
-				// Skip directories (e.g. dirty submodules) and symlinks
-				if fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+				// Only process regular files — skip directories (dirty
+				// submodules), symlinks, FIFOs, sockets, and devices to
+				// avoid blocking or reading unexpected data.
+				if !fi.Mode().IsRegular() {
 					continue
 				}
 
-				if fi.Size() > maxUncommittedFileSize {
-					slog.Warn("Skipping large uncommitted file", "path", f, "size_mb", fi.Size()/(1024*1024))
+				size := fi.Size()
+				if size > maxUncommittedFileSize {
+					slog.Warn("Skipping large uncommitted file", "path", f, "size_mb", size/(1024*1024))
 					continue
 				}
 
-				content, err := os.ReadFile(srcPath)
+				// Read using the known size from Lstat to avoid the
+				// extra Fstat that os.ReadFile performs internally.
+				fh, err := os.Open(srcPath)
 				if err != nil {
 					continue
 				}
+				buf := make([]byte, size)
+				n, err := fh.Read(buf)
+				_ = fh.Close()
+				if err != nil && n == 0 {
+					continue
+				}
 
-				mu.Lock()
-				results = append(results, fileContent{name: f, content: content})
-				mu.Unlock()
+				out <- fileContent{name: f, content: buf[:n]}
 			}
 		}()
 	}
@@ -371,36 +353,74 @@ func readUncommittedFiles(repoDir string, files []string, parallelism int) []fil
 	}
 	close(ch)
 	wg.Wait()
-
-	return results
+	close(out)
 }
 
-// indexUncommitted indexes pre-read uncommitted file contents using index.NewBuilder.
-func indexUncommitted(ctx context.Context, repoDir, indexDir string, docs []fileContent, parallelism int) error {
-	opts := index.Options{
-		IndexDir:         indexDir,
-		Parallelism:      parallelism,
-		CTagsMustSucceed: true,
-	}
-	opts.RepositoryDescription.Name = repoUncommitted
-	opts.RepositoryDescription.Source = repoDir
-	opts.SetDefaults()
+// streamFiles returns a channel that yields file contents read from the
+// working tree. The channel is bounded by parallelism to provide backpressure,
+// so at most 2*parallelism files are in flight (buffer + blocked workers)
+// rather than all dirty files at once.
+func streamFiles(repoDir string, files []string, parallelism int) <-chan fileContent {
+	out := make(chan fileContent, parallelism)
+	go readFilesToChannel(repoDir, files, parallelism, out)
+	return out
+}
 
-	builder, err := index.NewBuilder(opts)
-	if err != nil {
-		return fmt.Errorf("create builder: %w", err)
-	}
+// indexUncommitted indexes uncommitted file contents streamed through fileCh
+// using index.NewBuilder. The builder is created lazily on the first file to
+// avoid spawning ctags processes when the channel is empty. On NewBuilder
+// error the channel is explicitly drained; on Add error the loop continues
+// consuming remaining items. Both paths prevent goroutine leaks in the
+// producer. Finish is always called when a builder exists (even after Add
+// errors) to ensure cleanup.
+func indexUncommitted(ctx context.Context, repoDir, indexDir string, fileCh <-chan fileContent, parallelism int) error {
+	var builder *index.Builder
+	var addErr error
 
-	for _, doc := range docs {
-		if err := builder.Add(index.Document{
-			Name:    doc.name,
-			Content: doc.content,
-		}); err != nil {
-			return fmt.Errorf("add document %s: %w", doc.name, err)
+	for doc := range fileCh {
+		if builder == nil {
+			opts := index.Options{
+				IndexDir:         indexDir,
+				Parallelism:      parallelism,
+				CTagsMustSucceed: true,
+			}
+			opts.RepositoryDescription.Name = repoUncommitted
+			opts.RepositoryDescription.Source = repoDir
+			opts.SetDefaults()
+
+			var err error
+			builder, err = index.NewBuilder(opts)
+			if err != nil {
+				// Drain remaining items to unblock producer goroutines.
+				for range fileCh {
+				}
+				return fmt.Errorf("create builder: %w", err)
+			}
+		}
+
+		if addErr == nil {
+			if err := builder.Add(index.Document{
+				Name:    doc.name,
+				Content: doc.content,
+			}); err != nil {
+				addErr = fmt.Errorf("add document %s: %w", doc.name, err)
+				// Continue draining the channel to unblock producer goroutines.
+			}
 		}
 	}
 
-	return builder.Finish()
+	if builder == nil {
+		// No files arrived — clean stale shards from a previous run.
+		cleanUncommittedShards(indexDir)
+		return nil
+	}
+
+	// Always call Finish to ensure cleanup (safe to call even after errors).
+	finishErr := builder.Finish()
+	if addErr != nil {
+		return addErr
+	}
+	return finishErr
 }
 
 // cleanUncommittedShards removes stale uncommitted shard files.

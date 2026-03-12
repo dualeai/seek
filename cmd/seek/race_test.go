@@ -44,8 +44,8 @@ func TestBug_PostIndexingStateDrift(t *testing.T) {
 // ===========================================================================
 
 // searchWithLock mirrors the production search path in run(): acquires
-// LOCK_SH before searching, ensuring the searcher waits for any active
-// indexer (LOCK_EX holder) to finish.
+// a shared lock via acquireSearchLock before searching, ensuring the
+// searcher waits for any active indexer (LOCK_EX holder) to finish.
 func searchWithLock(ctx context.Context, indexDir, pattern string) ([]zoekt.FileMatch, error) {
 	lockPath := filepath.Join(indexDir, lockFile)
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
@@ -56,7 +56,7 @@ func searchWithLock(ctx context.Context, indexDir, pattern string) ([]zoekt.File
 		unlockFile(f)
 		_ = f.Close()
 	}()
-	if err := lockFileShared(f); err != nil {
+	if err := acquireSearchLock(ctx, f); err != nil {
 		return nil, fmt.Errorf("acquire search lock: %w", err)
 	}
 	return executeSearch(ctx, indexDir, pattern)
@@ -134,11 +134,13 @@ func TestFix_NoShardGapDuringReindexing(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix #2: LOCK_SH blocks search until LOCK_EX is released
+// Fix #2: acquireSearchLock polls until LOCK_EX is released
 //
-// The production search path in run() acquires LOCK_SH before calling
-// executeSearch. Since LOCK_SH blocks while any LOCK_EX is held, a
-// searcher waits for an active indexer to finish before reading shards.
+// The production search path in run() acquires a shared lock via
+// acquireSearchLock (non-blocking poll with exponential backoff) before
+// calling executeSearch. Since the NB shared lock fails while any LOCK_EX
+// is held, a searcher waits for an active indexer to finish before reading
+// shards.
 // ---------------------------------------------------------------------------
 
 func TestFix_SharedLockBlocksSearchDuringIndexing(t *testing.T) {
@@ -157,7 +159,7 @@ func TestFix_SharedLockBlocksSearchDuringIndexing(t *testing.T) {
 	var sharedAcquiredAt atomic.Int64
 	done := make(chan struct{})
 
-	// Goroutine tries to acquire LOCK_SH — should block until LOCK_EX released
+	// Goroutine tries to acquire shared lock — polls until LOCK_EX released
 	go func() {
 		defer close(done)
 		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
@@ -168,8 +170,8 @@ func TestFix_SharedLockBlocksSearchDuringIndexing(t *testing.T) {
 			unlockFile(f)
 			_ = f.Close()
 		}()
-		// This blocks until LOCK_EX is released
-		if err := lockFileShared(f); err != nil {
+		// This polls until LOCK_EX is released
+		if err := acquireSearchLock(context.Background(), f); err != nil {
 			return
 		}
 		sharedAcquiredAt.Store(time.Now().UnixNano())

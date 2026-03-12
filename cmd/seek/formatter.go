@@ -36,7 +36,11 @@ func formatResults(files []zoekt.FileMatch) string {
 	}
 
 	// No trailing newline after the last line
-	return strings.TrimRight(sb.String(), "\n")
+	s := sb.String()
+	if len(s) > 0 && s[len(s)-1] == '\n' {
+		return s[:len(s)-1]
+	}
+	return s
 }
 
 // deduplicateFiles groups FileMatches by filename, preferring uncommitted versions.

@@ -8,24 +8,25 @@ import (
 	"testing"
 )
 
-// requireTools skips the test if git or universal-ctags is not available.
-// Uses checkCtags (same check as runIndexing) to avoid false positives when
-// a non-universal ctags is on PATH.
-func requireTools(t *testing.T) {
-	t.Helper()
+// requireTools fails the test/benchmark if git or universal-ctags is not
+// available. A failure here means the detection pipeline in checkCtags is
+// broken — ctags should be auto-detected whether the binary is named
+// "universal-ctags" or "ctags".
+func requireTools(tb testing.TB) {
+	tb.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("requires git on PATH")
+		tb.Fatal("requires git on PATH")
 	}
 	if err := checkCtags(); err != nil {
-		t.Skipf("requires universal-ctags: %v", err)
+		tb.Fatalf("requires universal-ctags: %v", err)
 	}
 }
 
 // initGitRepo creates a temp git repo with a single committed file.
 // Returns the repo directory. The caller's working directory is unchanged.
-func initGitRepo(t *testing.T, fileName, content string) string {
-	t.Helper()
-	dir := t.TempDir()
+func initGitRepo(tb testing.TB, fileName, content string) string {
+	tb.Helper()
+	dir := tb.TempDir()
 
 	cmds := [][]string{
 		{"git", "init"},
@@ -39,7 +40,7 @@ func initGitRepo(t *testing.T, fileName, content string) string {
 		cmd := exec.Command(args[0], args[1:]...)
 		cmd.Dir = dir
 		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("%v failed: %v\n%s", args, err, out)
+			tb.Fatalf("%v failed: %v\n%s", args, err, out)
 		}
 	}
 
@@ -48,7 +49,7 @@ func initGitRepo(t *testing.T, fileName, content string) string {
 
 	// Write and commit the file
 	if err := os.WriteFile(filepath.Join(dir, fileName), []byte(content), 0o644); err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	for _, args := range [][]string{
 		{"git", "add", "."},
@@ -57,7 +58,7 @@ func initGitRepo(t *testing.T, fileName, content string) string {
 		cmd := exec.Command(args[0], args[1:]...)
 		cmd.Dir = dir
 		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("%v failed: %v\n%s", args, err, out)
+			tb.Fatalf("%v failed: %v\n%s", args, err, out)
 		}
 	}
 
@@ -93,6 +94,22 @@ func runSeekInRepo(t *testing.T, repoDir, pattern string) ([]string, error) {
 		fileNames = append(fileNames, fm.FileName)
 	}
 	return fileNames, nil
+}
+
+// gitRun executes a git command in dir, failing the test on error.
+func gitRun(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	gitRunIn(t, dir, args...)
+}
+
+// gitRunIn executes a git command in the specified directory.
+func gitRunIn(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, out)
+	}
 }
 
 func TestIntegration_SearchCleanRepo(t *testing.T) {
@@ -287,16 +304,8 @@ func TestIntegration_MultipleFiles_EditOne(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command("git", "add", ".")
-	cmd.Dir = dir
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git add failed: %v\n%s", err, out)
-	}
-	cmd = exec.Command("git", "commit", "-m", "add changing")
-	cmd.Dir = dir
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git commit failed: %v\n%s", err, out)
-	}
+	gitRun(t, dir, "add", ".")
+	gitRun(t, dir, "commit", "-m", "add changing")
 
 	// Edit only changing.go
 	if err := os.WriteFile(filepath.Join(dir, "changing.go"), []byte(`package main

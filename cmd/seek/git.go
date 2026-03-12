@@ -45,7 +45,7 @@ func gitRepoRoot(ctx context.Context) (string, error) {
 // git status --porcelain=v2 --branch --no-renames -z command. This eliminates
 // the TOCTOU window between separate git rev-parse and git status calls.
 func gitRepoState(ctx context.Context) repoState {
-	out, err := gitCmd(ctx, "status", "--porcelain=v2", "--branch", "--no-renames", "-z").Output()
+	out, err := gitCmd(ctx, "status", "--porcelain=v2", "--branch", "--no-renames", "--no-ahead-behind", "-z").Output()
 	if err != nil {
 		return repoState{HeadSHA: "no-head"}
 	}
@@ -56,7 +56,7 @@ func gitRepoState(ctx context.Context) repoState {
 // Used when the CWD may not be inside the target repository (e.g., post-
 // indexing verification in runIndexing).
 func gitRepoStateIn(ctx context.Context, dir string) repoState {
-	cmd := gitCmd(ctx, "status", "--porcelain=v2", "--branch", "--no-renames", "-z")
+	cmd := gitCmd(ctx, "status", "--porcelain=v2", "--branch", "--no-renames", "--no-ahead-behind", "-z")
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
@@ -104,6 +104,15 @@ func parseGitStatusV2(raw string) repoState {
 			path = entry[2:]
 		case '1': // changed: "1 XY sub mH mI mW hH hI <path>"
 			path = extractV2Path(entry, 8)
+		case '2': // renamed/copied: "2 XY sub mH mI mW hH hI Xscore <path>"
+			// With -z, rename entries emit an additional NUL-terminated
+			// record for the original path. Consume it so it's not
+			// misinterpreted as a separate entry. This should not occur
+			// with --no-renames but handles it defensively.
+			path = extractV2Path(entry, 9)
+			if nextEnd := strings.IndexByte(raw[pos:], 0); nextEnd >= 0 {
+				pos += nextEnd + 1
+			}
 		case 'u': // unmerged: "u XY sub m1 m2 m3 mW h1 h2 h3 <path>"
 			path = extractV2Path(entry, 10)
 		}
@@ -128,8 +137,13 @@ func ensureGitExclude(repoDir, pattern string) {
 
 	data, _ := os.ReadFile(excludePath)
 	needle := "/" + pattern
-	if strings.Contains(string(data), needle) {
-		return
+	// Check for exact line match, not substring. Substring matching
+	// could false-positive on patterns like /.seek-cache-old when
+	// looking for /.seek-cache.
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == needle {
+			return
+		}
 	}
 
 	_ = os.MkdirAll(infoDir, 0o755)
