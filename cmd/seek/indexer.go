@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
@@ -29,7 +30,7 @@ const (
 	repoUncommitted = "uncommitted"
 	// stateVersion is the prefix used in state hashing to invalidate caches
 	// when the hash algorithm or input format changes.
-	stateVersion = "v4\x00"
+	stateVersion = "v5\x00"
 	// maxUncommittedFileSize is the maximum file size (in bytes) for uncommitted
 	// file indexing. Files larger than this are skipped to prevent excessive
 	// memory usage.
@@ -42,21 +43,25 @@ const (
 // when the hash algorithm or input format changes.
 func computeStateHash(rawOutput string) string {
 	h := xxhash.New()
-	_, _ = h.Write([]byte(stateVersion))
-	_, _ = h.Write([]byte(rawOutput))
+	_, _ = h.WriteString(stateVersion)
+	_, _ = h.WriteString(rawOutput)
 	return fmt.Sprintf("%016x", h.Sum64())
 }
 
 // repoStateFingerprint returns the raw git status output enriched with working
-// tree file stats (mtime + size) for dirty files. git status --porcelain=v2
-// doesn't include working tree content hashes, so consecutive edits to an
-// already-modified file produce identical porcelain output. Appending file
-// stats ensures the state hash changes whenever a dirty file is modified.
+// tree file stats (mtime, size, and inode) for dirty files. git status
+// --porcelain=v2 doesn't include working tree content hashes, so consecutive
+// edits to an already-modified file produce identical porcelain output.
+// Appending file stats ensures the state hash changes whenever a dirty file is
+// modified. The inode detects atomic-write editors (vim, emacs) that replace
+// files via write-to-tmp + rename, which changes the inode but may preserve
+// mtime.
 func repoStateFingerprint(repoDir string, state repoState) string {
 	if len(state.Files) == 0 {
 		return state.RawOutput
 	}
 	var b strings.Builder
+	b.Grow(len(state.RawOutput) + len(state.Files)*80)
 	b.WriteString(state.RawOutput)
 	for _, f := range state.Files {
 		fi, err := os.Lstat(filepath.Join(repoDir, f))
@@ -66,7 +71,11 @@ func repoStateFingerprint(repoDir string, state repoState) string {
 			fmt.Fprintf(&b, "\x00%s\x00deleted\x00", f)
 			continue
 		}
-		fmt.Fprintf(&b, "\x00%s\x00%d\x00%d\x00", f, fi.ModTime().UnixNano(), fi.Size())
+		ino := uint64(0)
+		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+			ino = stat.Ino
+		}
+		fmt.Fprintf(&b, "\x00%s\x00%d\x00%d\x00%d\x00", f, fi.ModTime().UnixNano(), fi.Size(), ino)
 	}
 	return b.String()
 }
