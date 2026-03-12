@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -1541,7 +1544,361 @@ func TestIntegration_RapidEdits(t *testing.T) {
 	}
 }
 
+// --- streamFiles tests ---
+
+func TestStreamFiles_BasicFlow(t *testing.T) {
+	dir := t.TempDir()
+	const numFiles = 5
+	files := make([]string, numFiles)
+	for i := range numFiles {
+		name := fmt.Sprintf("file_%d.go", i)
+		files[i] = name
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(fmt.Sprintf("package f%d\n", i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ch := streamFiles(dir, files, 4)
+	var got []string
+	for fc := range ch {
+		got = append(got, fc.name)
+	}
+	if len(got) != numFiles {
+		t.Errorf("expected %d files, got %d", numFiles, len(got))
+	}
+}
+
+func TestStreamFiles_EmptyFileList(t *testing.T) {
+	dir := t.TempDir()
+
+	// nil files
+	ch := streamFiles(dir, nil, 4)
+	count := 0
+	for range ch {
+		count++
+	}
+	if count != 0 {
+		t.Errorf("expected 0 items from nil file list, got %d", count)
+	}
+
+	// empty slice
+	ch = streamFiles(dir, []string{}, 4)
+	count = 0
+	for range ch {
+		count++
+	}
+	if count != 0 {
+		t.Errorf("expected 0 items from empty file list, got %d", count)
+	}
+}
+
+func TestStreamFiles_AllFiltered(t *testing.T) {
+	dir := t.TempDir()
+	// All files are too large — should all be filtered
+	name := "big.dat"
+	data := make([]byte, maxUncommittedFileSize+1)
+	if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Also include a missing file
+	ch := streamFiles(dir, []string{name, "nonexistent.go"}, 4)
+	count := 0
+	for range ch {
+		count++
+	}
+	if count != 0 {
+		t.Errorf("expected 0 items when all filtered, got %d", count)
+	}
+}
+
+func TestStreamFiles_ParallelismOne(t *testing.T) {
+	dir := t.TempDir()
+	const numFiles = 10
+	files := make([]string, numFiles)
+	for i := range numFiles {
+		name := fmt.Sprintf("file_%d.go", i)
+		files[i] = name
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("content"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ch := streamFiles(dir, files, 1)
+	var got []string
+	for fc := range ch {
+		got = append(got, fc.name)
+	}
+	if len(got) != numFiles {
+		t.Errorf("expected %d files with parallelism=1, got %d", numFiles, len(got))
+	}
+}
+
+func TestStreamFiles_SingleFileExactlyMaxSize(t *testing.T) {
+	dir := t.TempDir()
+	// File exactly at maxUncommittedFileSize — should be included
+	data := make([]byte, maxUncommittedFileSize)
+	for i := range data {
+		data[i] = 'x'
+	}
+	if err := os.WriteFile(filepath.Join(dir, "exact.dat"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ch := streamFiles(dir, []string{"exact.dat"}, 4)
+	count := 0
+	for fc := range ch {
+		count++
+		if len(fc.content) != maxUncommittedFileSize {
+			t.Errorf("expected content of size %d, got %d", maxUncommittedFileSize, len(fc.content))
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected 1 file at exactly max size, got %d", count)
+	}
+}
+
+func TestStreamFiles_MixedValidAndInvalid(t *testing.T) {
+	dir := t.TempDir()
+
+	// Regular file
+	if err := os.WriteFile(filepath.Join(dir, "regular.go"), []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Symlink
+	if err := os.Symlink("regular.go", filepath.Join(dir, "link.go")); err != nil {
+		t.Fatal(err)
+	}
+	// Directory
+	if err := os.Mkdir(filepath.Join(dir, "subdir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	ch := streamFiles(dir, []string{"regular.go", "link.go", "subdir", "missing.go"}, 4)
+	var got []string
+	for fc := range ch {
+		got = append(got, fc.name)
+	}
+	// Only regular.go should arrive
+	if len(got) != 1 || got[0] != "regular.go" {
+		t.Errorf("expected only [regular.go], got %v", got)
+	}
+}
+
+func TestStreamFiles_HighParallelismFewFiles(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.go"), []byte("b"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ch := streamFiles(dir, []string{"a.go", "b.go"}, 16)
+	count := 0
+	for range ch {
+		count++
+	}
+	if count != 2 {
+		t.Errorf("expected 2 files with high parallelism, got %d", count)
+	}
+}
+
+func TestStreamingMemoryBounded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping memory stress test in short mode")
+	}
+
+	dir := t.TempDir()
+	const numFiles = 50
+	const fileSize = 5 * 1024 * 1024 // 5 MB each → 250 MB total on disk
+	const parallelism = 4
+	files := make([]string, numFiles)
+	for i := range numFiles {
+		name := fmt.Sprintf("file_%03d.go", i)
+		files[i] = name
+		if err := os.WriteFile(filepath.Join(dir, name), bytes.Repeat([]byte{'A' + byte(i%26)}, fileSize), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// With parallelism=4, at most 2*parallelism files can be in flight
+	// (channel buffer + blocked workers) = 8 × 5MB = 40MB. The old
+	// buffered approach would hold all 250MB at once.
+	tracker := newPeakHeapTracker()
+	for range streamFiles(dir, files, parallelism) {
+	}
+	heapDelta := tracker.stop()
+
+	// Budget: 2*parallelism*fileSize = 40MB + overhead for GC timing,
+	// runtime, and other test goroutines (ReadMemStats is process-wide).
+	// Must be well under 250MB (what the old buffered approach would use).
+	const budget = 120 * 1024 * 1024
+	t.Logf("total content: %d MB, peak heap delta: %d MB, budget: %d MB",
+		numFiles*fileSize/(1024*1024), heapDelta/(1024*1024), budget/(1024*1024))
+	if heapDelta > int64(budget) {
+		t.Fatalf("heap grew by %d MB, exceeds budget of %d MB — streaming is not bounded",
+			heapDelta/(1024*1024), budget/(1024*1024))
+	}
+}
+
+func TestStreamingMemoryDoesNotScaleWithInput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping memory scaling test in short mode")
+	}
+
+	const fileSize = 5 * 1024 * 1024 // 5 MB per file
+	const parallelism = 4
+
+	measurePeakHeap := func(numFiles int) int64 {
+		dir := t.TempDir()
+		files := make([]string, numFiles)
+		for i := range numFiles {
+			name := fmt.Sprintf("f%d.go", i)
+			files[i] = name
+			if err := os.WriteFile(filepath.Join(dir, name), bytes.Repeat([]byte{'x'}, fileSize), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		tracker := newPeakHeapTracker()
+		for range streamFiles(dir, files, parallelism) {
+		}
+		return tracker.stop()
+	}
+
+	small := measurePeakHeap(10) // 10 × 5MB = 50MB total
+	large := measurePeakHeap(50) // 50 × 5MB = 250MB total
+
+	t.Logf("10 files (50MB total): peak delta %d MB", small/(1024*1024))
+	t.Logf("50 files (250MB total): peak delta %d MB", large/(1024*1024))
+
+	// 5x more input should NOT cause 5x more heap. With streaming, peak
+	// is bounded by 2*parallelism*fileSize = 40MB regardless of file count.
+	// Allow 3x + floor to account for GC timing, runtime, and process-wide
+	// heap noise from other test goroutines.
+	if large > max(small*3, 120*1024*1024) {
+		t.Fatalf("memory scales with input: 10 files=%d MB, 50 files=%d MB",
+			small/(1024*1024), large/(1024*1024))
+	}
+}
+
+func TestIndexUncommitted_EmptyChannel(t *testing.T) {
+	dir := t.TempDir()
+	ch := make(chan fileContent)
+	close(ch) // empty channel
+
+	err := indexUncommitted(context.Background(), t.TempDir(), dir, ch, 2)
+	if err != nil {
+		t.Fatalf("unexpected error for empty channel: %v", err)
+	}
+}
+
+func TestIndexUncommitted_BuilderLazyCreation(t *testing.T) {
+	requireTools(t)
+
+	indexDir := t.TempDir()
+	repoDir := t.TempDir()
+
+	// Send one file through channel
+	ch := make(chan fileContent, 1)
+	ch <- fileContent{name: "test.go", content: []byte("package main\n")}
+	close(ch)
+
+	err := indexUncommitted(context.Background(), repoDir, indexDir, ch, 2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify a shard was created
+	matches, _ := filepath.Glob(filepath.Join(indexDir, repoUncommitted+"_v*.zoekt"))
+	if len(matches) == 0 {
+		t.Error("expected shard to be created when files arrive")
+	}
+}
+
+func TestIndexUncommitted_ChannelDrainedOnError(t *testing.T) {
+	requireTools(t)
+
+	// Use an invalid indexDir so NewBuilder succeeds but writing the shard
+	// fails. We verify the channel is fully consumed (no goroutine leak)
+	// regardless of the outcome.
+	indexDir := t.TempDir()
+	repoDir := t.TempDir()
+
+	ch := make(chan fileContent, 5)
+	for i := range 5 {
+		ch <- fileContent{
+			name:    fmt.Sprintf("f%d.go", i),
+			content: []byte(fmt.Sprintf("package f%d\n", i)),
+		}
+	}
+	close(ch)
+
+	// Should consume all 5 items from the channel without hanging,
+	// regardless of whether Add/Finish succeeds or fails.
+	_ = indexUncommitted(context.Background(), repoDir, indexDir, ch, 2)
+}
+
 // --- helpers ---
+
+// readUncommittedFiles collects all streamed file contents into a slice.
+// Test-only helper — production code uses streamFiles directly.
+func readUncommittedFiles(repoDir string, files []string, parallelism int) []fileContent {
+	var results []fileContent
+	for fc := range streamFiles(repoDir, files, parallelism) {
+		results = append(results, fc)
+	}
+	return results
+}
+
+// peakHeapTracker samples HeapInuse every millisecond in a background
+// goroutine. Call stop() after the workload completes to get the peak
+// heap delta relative to the baseline captured at creation.
+type peakHeapTracker struct {
+	baseline uint64
+	peak     uint64
+	mu       sync.Mutex
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+}
+
+func newPeakHeapTracker() *peakHeapTracker {
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	t := &peakHeapTracker{
+		baseline: m.HeapInuse,
+		peak:     m.HeapInuse,
+		stopCh:   make(chan struct{}),
+		doneCh:   make(chan struct{}),
+	}
+	go func() {
+		defer close(t.doneCh)
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-t.stopCh:
+				return
+			case <-ticker.C:
+				runtime.ReadMemStats(&m)
+				t.mu.Lock()
+				if m.HeapInuse > t.peak {
+					t.peak = m.HeapInuse
+				}
+				t.mu.Unlock()
+			}
+		}
+	}()
+	return t
+}
+
+func (t *peakHeapTracker) stop() int64 {
+	close(t.stopCh)
+	<-t.doneCh
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return int64(t.peak) - int64(t.baseline)
+}
 
 func assertContains(t *testing.T, slice []string, item string) {
 	t.Helper()

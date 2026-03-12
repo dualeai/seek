@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 
 	"github.com/cespare/xxhash/v2"
@@ -36,9 +35,6 @@ const (
 	// file indexing. Files larger than this are skipped to prevent excessive
 	// memory usage.
 	maxUncommittedFileSize = 10 * 1024 * 1024 // 10 MB
-	// maxUncommittedTotalSize is the aggregate memory budget for all
-	// uncommitted file contents held in memory simultaneously.
-	maxUncommittedTotalSize = 512 * 1024 * 1024 // 512 MB
 )
 
 // computeStateHash computes the xxHash64 of the given state string.
@@ -176,45 +172,41 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 
 	parallelism := indexParallelism()
 
-	// Read uncommitted files directly into memory, in parallel with
-	// committed indexing. This avoids staging files to a temp directory
-	// (and the associated hardlink mutation risks and double I/O on
-	// non-CoW filesystems).
-	type readResult struct {
-		docs []fileContent
-	}
-	readCh := make(chan readResult, 1)
-
+	// Stream uncommitted files through a channel, in parallel with
+	// committed indexing. The bounded channel (size=parallelism) provides
+	// backpressure so at most 2*parallelism files are in flight
+	// (channel buffer + blocked workers), rather than buffering all
+	// dirty files into a single slice.
+	var fileCh <-chan fileContent
 	if len(state.Files) > 0 {
-		go func() {
-			docs := readUncommittedFiles(repoDir, state.Files, parallelism)
-			readCh <- readResult{docs}
+		fileCh = streamFiles(repoDir, state.Files, parallelism)
+		// Ensure the producer goroutine is drained on all exit paths
+		// (including panics) to prevent goroutine leaks.
+		defer func() {
+			for range fileCh {
+			}
 		}()
-	} else {
-		readCh <- readResult{nil}
 	}
 
-	// Index committed files
+	// Index committed files (concurrent with channel fill)
 	committedErr := indexCommitted(ctx, repoDir, indexDir, parallelism)
 	if committedErr != nil {
 		slog.Warn("Committed indexing failed", "error", committedErr)
 	}
 
-	// Wait for uncommitted file reads
-	readRes := <-readCh
-
 	// Clean up stale staging directory from previous seek versions
 	_ = os.RemoveAll(filepath.Join(indexDir, repoUncommitted))
 
-	// Index uncommitted files. When docs exist, zoekt's builder.Finish()
-	// atomically replaces old shards (write to .tmp then os.Rename), so we
-	// must NOT delete old shards before writing new ones — that creates a
-	// gap where concurrent searchers see no uncommitted shard at all.
-	// When no docs exist, we clean up stale uncommitted shards from a
-	// previous run where uncommitted files did exist.
+	// Index uncommitted files streamed from the channel. When files exist,
+	// zoekt's builder.Finish() atomically replaces old shards (write to
+	// .tmp then os.Rename), so we must NOT delete old shards before writing
+	// new ones — that creates a gap where concurrent searchers see no
+	// uncommitted shard at all. When no files exist, we clean up stale
+	// uncommitted shards from a previous run where uncommitted files did
+	// exist.
 	var uncommittedErr error
-	if len(readRes.docs) > 0 {
-		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, readRes.docs, parallelism)
+	if fileCh != nil {
+		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, fileCh, parallelism)
 		if uncommittedErr != nil {
 			slog.Warn("Uncommitted indexing failed", "error", uncommittedErr)
 		}
@@ -276,19 +268,14 @@ type fileContent struct {
 	content []byte
 }
 
-// readUncommittedFiles reads uncommitted files directly from the working tree
-// into memory using a bounded worker pool. Files larger than maxUncommittedFileSize,
-// symlinks, and directories are skipped. Individual file failures are non-fatal
-// since files may be deleted or modified between git status and read. An
-// aggregate memory budget (maxUncommittedTotalSize) prevents unbounded memory
-// growth when many large dirty files exist.
-func readUncommittedFiles(repoDir string, files []string, parallelism int) []fileContent {
+// readFilesToChannel reads files from the working tree using a bounded worker
+// pool and sends them to out. Files larger than maxUncommittedFileSize,
+// symlinks, and directories are skipped. Individual file failures are
+// non-fatal since files may be deleted or modified between git status and
+// read. The channel is closed after all workers finish.
+func readFilesToChannel(repoDir string, files []string, parallelism int, out chan<- fileContent) {
 	ch := make(chan string, parallelism)
 	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var totalSize atomic.Int64
-	var results []fileContent
-	var budgetWarned atomic.Bool
 
 	for range parallelism {
 		wg.Add(1)
@@ -316,15 +303,6 @@ func readUncommittedFiles(repoDir string, files []string, parallelism int) []fil
 					continue
 				}
 
-				// Check aggregate memory budget before reading.
-				if totalSize.Load()+size > maxUncommittedTotalSize {
-					if budgetWarned.CompareAndSwap(false, true) {
-						slog.Warn("Uncommitted memory budget exceeded, skipping remaining files",
-							"budget_mb", maxUncommittedTotalSize/(1024*1024))
-					}
-					continue
-				}
-
 				// Read using the known size from Lstat to avoid the
 				// extra Fstat that os.ReadFile performs internally.
 				fh, err := os.Open(srcPath)
@@ -337,12 +315,8 @@ func readUncommittedFiles(repoDir string, files []string, parallelism int) []fil
 				if err != nil && n == 0 {
 					continue
 				}
-				content := buf[:n]
 
-				totalSize.Add(int64(n))
-				mu.Lock()
-				results = append(results, fileContent{name: f, content: content})
-				mu.Unlock()
+				out <- fileContent{name: f, content: buf[:n]}
 			}
 		}()
 	}
@@ -352,36 +326,74 @@ func readUncommittedFiles(repoDir string, files []string, parallelism int) []fil
 	}
 	close(ch)
 	wg.Wait()
-
-	return results
+	close(out)
 }
 
-// indexUncommitted indexes pre-read uncommitted file contents using index.NewBuilder.
-func indexUncommitted(ctx context.Context, repoDir, indexDir string, docs []fileContent, parallelism int) error {
-	opts := index.Options{
-		IndexDir:         indexDir,
-		Parallelism:      parallelism,
-		CTagsMustSucceed: true,
-	}
-	opts.RepositoryDescription.Name = repoUncommitted
-	opts.RepositoryDescription.Source = repoDir
-	opts.SetDefaults()
+// streamFiles returns a channel that yields file contents read from the
+// working tree. The channel is bounded by parallelism to provide backpressure,
+// so at most 2*parallelism files are in flight (buffer + blocked workers)
+// rather than all dirty files at once.
+func streamFiles(repoDir string, files []string, parallelism int) <-chan fileContent {
+	out := make(chan fileContent, parallelism)
+	go readFilesToChannel(repoDir, files, parallelism, out)
+	return out
+}
 
-	builder, err := index.NewBuilder(opts)
-	if err != nil {
-		return fmt.Errorf("create builder: %w", err)
-	}
+// indexUncommitted indexes uncommitted file contents streamed through fileCh
+// using index.NewBuilder. The builder is created lazily on the first file to
+// avoid spawning ctags processes when the channel is empty. On NewBuilder
+// error the channel is explicitly drained; on Add error the loop continues
+// consuming remaining items. Both paths prevent goroutine leaks in the
+// producer. Finish is always called when a builder exists (even after Add
+// errors) to ensure cleanup.
+func indexUncommitted(ctx context.Context, repoDir, indexDir string, fileCh <-chan fileContent, parallelism int) error {
+	var builder *index.Builder
+	var addErr error
 
-	for _, doc := range docs {
-		if err := builder.Add(index.Document{
-			Name:    doc.name,
-			Content: doc.content,
-		}); err != nil {
-			return fmt.Errorf("add document %s: %w", doc.name, err)
+	for doc := range fileCh {
+		if builder == nil {
+			opts := index.Options{
+				IndexDir:         indexDir,
+				Parallelism:      parallelism,
+				CTagsMustSucceed: true,
+			}
+			opts.RepositoryDescription.Name = repoUncommitted
+			opts.RepositoryDescription.Source = repoDir
+			opts.SetDefaults()
+
+			var err error
+			builder, err = index.NewBuilder(opts)
+			if err != nil {
+				// Drain remaining items to unblock producer goroutines.
+				for range fileCh {
+				}
+				return fmt.Errorf("create builder: %w", err)
+			}
+		}
+
+		if addErr == nil {
+			if err := builder.Add(index.Document{
+				Name:    doc.name,
+				Content: doc.content,
+			}); err != nil {
+				addErr = fmt.Errorf("add document %s: %w", doc.name, err)
+				// Continue draining the channel to unblock producer goroutines.
+			}
 		}
 	}
 
-	return builder.Finish()
+	if builder == nil {
+		// No files arrived — clean stale shards from a previous run.
+		cleanUncommittedShards(indexDir)
+		return nil
+	}
+
+	// Always call Finish to ensure cleanup (safe to call even after errors).
+	finishErr := builder.Finish()
+	if addErr != nil {
+		return addErr
+	}
+	return finishErr
 }
 
 // cleanUncommittedShards removes stale uncommitted shard files.

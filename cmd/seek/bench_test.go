@@ -18,6 +18,7 @@ func BenchmarkComputeStateHash_Small(b *testing.B) {
 	// Typical clean repo: headers only (~80 bytes)
 	input := "# branch.oid abc123def456789012345678901234567890\x00# branch.head main\x00"
 	b.SetBytes(int64(len(input)))
+	b.ReportAllocs()
 	for b.Loop() {
 		computeStateHash(input)
 	}
@@ -36,6 +37,7 @@ func BenchmarkComputeStateHash_Dirty(b *testing.B) {
 	}
 	input := sb.String()
 	b.SetBytes(int64(len(input)))
+	b.ReportAllocs()
 	for b.Loop() {
 		computeStateHash(input)
 	}
@@ -43,6 +45,7 @@ func BenchmarkComputeStateHash_Dirty(b *testing.B) {
 
 func BenchmarkParseGitStatusV2_Clean(b *testing.B) {
 	raw := "# branch.oid abc123def456789012345678901234567890\x00# branch.head main\x00# branch.upstream origin/main\x00# branch.ab +0 -0\x00"
+	b.ReportAllocs()
 	for b.Loop() {
 		parseGitStatusV2(raw)
 	}
@@ -55,6 +58,7 @@ func BenchmarkParseGitStatusV2_50Files(b *testing.B) {
 		fmt.Fprintf(&sb, "1 .M N... 100644 100644 100644 abc123 def456 src/deeply/nested/pkg%d/file%d.go\x00", i, i)
 	}
 	raw := sb.String()
+	b.ReportAllocs()
 	for b.Loop() {
 		parseGitStatusV2(raw)
 	}
@@ -71,6 +75,7 @@ func BenchmarkParseGitStatusV2_200Files(b *testing.B) {
 		}
 	}
 	raw := sb.String()
+	b.ReportAllocs()
 	for b.Loop() {
 		parseGitStatusV2(raw)
 	}
@@ -81,6 +86,7 @@ func BenchmarkRepoStateFingerprint_NoFiles(b *testing.B) {
 		HeadSHA:   "abc123",
 		RawOutput: "# branch.oid abc123\x00# branch.head main\x00",
 	}
+	b.ReportAllocs()
 	for b.Loop() {
 		repoStateFingerprint("/tmp/fake", state)
 	}
@@ -99,6 +105,7 @@ func BenchmarkRepoStateFingerprint_10Files(b *testing.B) {
 		RawOutput: "# branch.oid abc123\x00",
 		Files:     files,
 	}
+	b.ReportAllocs()
 	for b.Loop() {
 		repoStateFingerprint(dir, state)
 	}
@@ -119,6 +126,7 @@ func BenchmarkRepoStateFingerprint_50Files(b *testing.B) {
 		RawOutput: "# branch.oid abc123\x00",
 		Files:     files,
 	}
+	b.ReportAllocs()
 	for b.Loop() {
 		repoStateFingerprint(dir, state)
 	}
@@ -131,6 +139,7 @@ func BenchmarkRepoStateFingerprint_DeletedFiles(b *testing.B) {
 		RawOutput: "# branch.oid abc123\x00",
 		Files:     []string{"gone1.go", "gone2.go", "gone3.go", "gone4.go", "gone5.go"},
 	}
+	b.ReportAllocs()
 	for b.Loop() {
 		repoStateFingerprint("/tmp/nonexistent", state)
 	}
@@ -139,6 +148,7 @@ func BenchmarkRepoStateFingerprint_DeletedFiles(b *testing.B) {
 func BenchmarkReadStateFile(b *testing.B) {
 	dir := b.TempDir()
 	_ = writeStateFile(dir, "abc123def456789a")
+	b.ReportAllocs()
 	for b.Loop() {
 		readStateFile(dir)
 	}
@@ -146,6 +156,7 @@ func BenchmarkReadStateFile(b *testing.B) {
 
 func BenchmarkWriteStateFile(b *testing.B) {
 	dir := b.TempDir()
+	b.ReportAllocs()
 	for b.Loop() {
 		_ = writeStateFile(dir, "abc123def456789a")
 	}
@@ -153,6 +164,7 @@ func BenchmarkWriteStateFile(b *testing.B) {
 
 func BenchmarkExtractV2Path(b *testing.B) {
 	entry := "1 .M N... 100644 100644 100644 abc123def456 def456abc123 src/deeply/nested/package/file.go"
+	b.ReportAllocs()
 	for b.Loop() {
 		extractV2Path(entry, 8)
 	}
@@ -162,6 +174,7 @@ func BenchmarkEnsureGitExclude_AlreadyPresent(b *testing.B) {
 	dir := b.TempDir()
 	_ = os.MkdirAll(filepath.Join(dir, ".git", "info"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir, ".git", "info", "exclude"), []byte("/.seek-cache\n"), 0o644)
+	b.ReportAllocs()
 	for b.Loop() {
 		ensureGitExclude(dir, cacheDir)
 	}
@@ -178,6 +191,7 @@ func BenchmarkFormatResults_1File_1Match(b *testing.B) {
 			},
 		},
 	}
+	b.ReportAllocs()
 	for b.Loop() {
 		formatResults(files)
 	}
@@ -196,6 +210,7 @@ func BenchmarkFormatResults_10Files_3Matches(b *testing.B) {
 			},
 		}
 	}
+	b.ReportAllocs()
 	for b.Loop() {
 		formatResults(files)
 	}
@@ -216,6 +231,7 @@ func BenchmarkFormatResults_100Files_WithDedup(b *testing.B) {
 			LineMatches: []zoekt.LineMatch{{Line: []byte("updated match\n"), LineNumber: 1}},
 		}
 	}
+	b.ReportAllocs()
 	for b.Loop() {
 		formatResults(files)
 	}
@@ -239,6 +255,7 @@ func BenchmarkFormatResults_WithSymbols(b *testing.B) {
 			},
 		}
 	}
+	b.ReportAllocs()
 	for b.Loop() {
 		formatResults(files)
 	}
@@ -250,6 +267,7 @@ func BenchmarkDeduplicateFiles_100(b *testing.B) {
 		files[i] = zoekt.FileMatch{FileName: fmt.Sprintf("f%d.go", i), Repository: "repo"}
 		files[100+i] = zoekt.FileMatch{FileName: fmt.Sprintf("f%d.go", i), Repository: repoUncommitted}
 	}
+	b.ReportAllocs()
 	for b.Loop() {
 		deduplicateFiles(files)
 	}
@@ -257,6 +275,7 @@ func BenchmarkDeduplicateFiles_100(b *testing.B) {
 
 func BenchmarkSplitContextLines(b *testing.B) {
 	data := []byte("line one\nline two\nline three\n")
+	b.ReportAllocs()
 	for b.Loop() {
 		splitContextLines(data)
 	}
@@ -264,8 +283,45 @@ func BenchmarkSplitContextLines(b *testing.B) {
 
 func BenchmarkCountContextLines(b *testing.B) {
 	data := []byte("line one\nline two\nline three\n")
+	b.ReportAllocs()
 	for b.Loop() {
 		countContextLines(data)
+	}
+}
+
+// --- Streaming indexer benchmarks ---
+
+func BenchmarkStreamFiles_50Files(b *testing.B) {
+	dir := b.TempDir()
+	const numFiles = 50
+	files := make([]string, numFiles)
+	for i := range numFiles {
+		name := fmt.Sprintf("file_%03d.go", i)
+		files[i] = name
+		_ = os.WriteFile(filepath.Join(dir, name), []byte(fmt.Sprintf("package f%d\n// content_%d\n", i, i)), 0o644)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		for range streamFiles(dir, files, 4) {
+		}
+	}
+}
+
+func BenchmarkStreamFiles_200Files(b *testing.B) {
+	dir := b.TempDir()
+	const numFiles = 200
+	files := make([]string, numFiles)
+	for i := range numFiles {
+		name := fmt.Sprintf("file_%03d.go", i)
+		files[i] = name
+		_ = os.WriteFile(filepath.Join(dir, name), []byte(fmt.Sprintf("package f%d\n// content_%d\n", i, i)), 0o644)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		for range streamFiles(dir, files, 4) {
+		}
 	}
 }
 
