@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -129,13 +130,39 @@ func indexParallelism() int {
 // checkCtags verifies that universal-ctags is installed. Zoekt silently skips
 // symbol parsing when ctags is missing (even with CTagsMustSucceed), so we
 // must detect this explicitly.
+//
+// Detection order:
+//  1. CTAGS_COMMAND env var (explicit user override)
+//  2. "universal-ctags" binary on PATH (zoekt default)
+//  3. "ctags" binary on PATH, verified via --version (Homebrew on macOS
+//     installs universal-ctags as "ctags")
 func checkCtags() error {
+	// 1. Explicit env var — trust the user.
+	if cmd := os.Getenv("CTAGS_COMMAND"); cmd != "" {
+		if _, err := exec.LookPath(cmd); err != nil {
+			return fmt.Errorf("CTAGS_COMMAND=%q not found on PATH: %w", cmd, err)
+		}
+		return nil
+	}
+
+	// 2. Zoekt default: looks for "universal-ctags" on PATH.
 	var opts index.Options
 	opts.SetDefaults()
-	if opts.CTagsPath == "" {
-		return fmt.Errorf("universal-ctags required but not found.\n  macOS:  brew install universal-ctags\n  Linux:  sudo apt-get install universal-ctags\n  Or set CTAGS_COMMAND=/path/to/ctags")
+	if opts.CTagsPath != "" {
+		return nil
 	}
-	return nil
+
+	// 3. Fallback: Homebrew installs universal-ctags as "ctags".
+	// Verify via --version to distinguish from Exuberant Ctags.
+	if ctags, err := exec.LookPath("ctags"); err == nil {
+		out, err := exec.Command(ctags, "--version").Output()
+		if err == nil && strings.Contains(string(out), "Universal Ctags") {
+			_ = os.Setenv("CTAGS_COMMAND", ctags)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("universal-ctags required but not found.\n  macOS:  brew install universal-ctags\n  Linux:  sudo apt-get install universal-ctags\n  Or set CTAGS_COMMAND=/path/to/ctags")
 }
 
 // runIndexing orchestrates committed and uncommitted indexing with locking.

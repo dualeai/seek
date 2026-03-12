@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -490,6 +491,49 @@ func TestShardsExist_NonZoektFiles(t *testing.T) {
 func TestShardsExist_NonexistentDir(t *testing.T) {
 	if shardsExist("/nonexistent/path") {
 		t.Error("expected shardsExist to return false for nonexistent dir")
+	}
+}
+
+// --- checkCtags detection tests ---
+
+func TestCheckCtags_CTAGS_COMMAND_Valid(t *testing.T) {
+	// Point CTAGS_COMMAND to a known-good binary (the real ctags).
+	requireTools(t)
+	ctags, err := exec.LookPath("ctags")
+	if err != nil {
+		ctags, err = exec.LookPath("universal-ctags")
+		if err != nil {
+			t.Fatal("neither ctags nor universal-ctags on PATH")
+		}
+	}
+	t.Setenv("CTAGS_COMMAND", ctags)
+	if err := checkCtags(); err != nil {
+		t.Fatalf("checkCtags failed with valid CTAGS_COMMAND=%q: %v", ctags, err)
+	}
+}
+
+func TestCheckCtags_CTAGS_COMMAND_Invalid(t *testing.T) {
+	t.Setenv("CTAGS_COMMAND", "/nonexistent/binary")
+	if err := checkCtags(); err == nil {
+		t.Fatal("expected error for nonexistent CTAGS_COMMAND")
+	}
+}
+
+func TestCheckCtags_CTAGS_COMMAND_TakesPrecedence(t *testing.T) {
+	// Even when universal-ctags is on PATH, CTAGS_COMMAND should be checked first.
+	// Pointing to a bad path should fail, proving we don't fall through.
+	t.Setenv("CTAGS_COMMAND", "/nonexistent/ctags")
+	if err := checkCtags(); err == nil {
+		t.Fatal("expected error: CTAGS_COMMAND should take precedence over PATH lookup")
+	}
+}
+
+func TestCheckCtags_DetectsFromPATH(t *testing.T) {
+	requireTools(t)
+	// Unset CTAGS_COMMAND so detection relies on PATH.
+	t.Setenv("CTAGS_COMMAND", "")
+	if err := checkCtags(); err != nil {
+		t.Fatalf("checkCtags should detect ctags from PATH: %v", err)
 	}
 }
 
