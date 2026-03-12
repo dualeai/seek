@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -276,10 +275,10 @@ func BenchmarkEndToEnd_ColdIndex(b *testing.B) {
 	if testing.Short() {
 		b.Skip("skipping end-to-end benchmark in short mode")
 	}
-	requireToolsB(b)
+	requireTools(b)
 
 	for b.Loop() {
-		dir := initGitRepoB(b, "app.go", "package main\n\nfunc main() {\n\t// benchmark_marker_cold\n}\n")
+		dir := initGitRepo(b, "app.go", "package main\n\nfunc main() {\n\t// benchmark_marker_cold\n}\n")
 		ctx := context.Background()
 		indexDir := filepath.Join(dir, cacheDir)
 		_ = os.MkdirAll(indexDir, 0o755)
@@ -295,9 +294,9 @@ func BenchmarkEndToEnd_WarmIndex(b *testing.B) {
 	if testing.Short() {
 		b.Skip("skipping end-to-end benchmark in short mode")
 	}
-	requireToolsB(b)
+	requireTools(b)
 
-	dir := initGitRepoB(b, "app.go", "package main\n\nfunc main() {\n\t// benchmark_marker_warm\n}\n")
+	dir := initGitRepo(b, "app.go", "package main\n\nfunc main() {\n\t// benchmark_marker_warm\n}\n")
 	ctx := context.Background()
 	indexDir := filepath.Join(dir, cacheDir)
 	_ = os.MkdirAll(indexDir, 0o755)
@@ -324,9 +323,9 @@ func BenchmarkEndToEnd_DirtyReindex(b *testing.B) {
 	if testing.Short() {
 		b.Skip("skipping end-to-end benchmark in short mode")
 	}
-	requireToolsB(b)
+	requireTools(b)
 
-	dir := initGitRepoB(b, "app.go", "package main\n\nfunc main() {\n\t// dirty_bench\n}\n")
+	dir := initGitRepo(b, "app.go", "package main\n\nfunc main() {\n\t// dirty_bench\n}\n")
 	ctx := context.Background()
 	indexDir := filepath.Join(dir, cacheDir)
 	_ = os.MkdirAll(indexDir, 0o755)
@@ -349,47 +348,3 @@ func BenchmarkEndToEnd_DirtyReindex(b *testing.B) {
 	}
 }
 
-// --- Benchmark helpers ---
-
-func requireToolsB(b *testing.B) {
-	b.Helper()
-	if err := checkCtags(); err != nil {
-		b.Skip("requires universal-ctags on PATH")
-	}
-}
-
-func initGitRepoB(b *testing.B, fileName, content string) string {
-	b.Helper()
-	dir := b.TempDir()
-
-	for _, args := range [][]string{
-		{"git", "init"},
-		{"git", "config", "user.email", "bench@test.com"},
-		{"git", "config", "user.name", "Bench"},
-		{"git", "remote", "add", "origin", "https://github.com/test/bench.git"},
-	} {
-		cmd := exec.Command(args[0], args[1:]...)
-		cmd.Dir = dir
-		if out, err := cmd.CombinedOutput(); err != nil {
-			b.Fatalf("%v failed: %v\n%s", args, err, out)
-		}
-	}
-
-	ensureGitExclude(dir, cacheDir)
-
-	if err := os.WriteFile(filepath.Join(dir, fileName), []byte(content), 0o644); err != nil {
-		b.Fatal(err)
-	}
-	for _, args := range [][]string{
-		{"git", "add", "."},
-		{"git", "commit", "-m", "initial"},
-	} {
-		cmd := exec.Command(args[0], args[1:]...)
-		cmd.Dir = dir
-		if out, err := cmd.CombinedOutput(); err != nil {
-			b.Fatalf("%v failed: %v\n%s", args, err, out)
-		}
-	}
-
-	return dir
-}

@@ -624,13 +624,34 @@ func TestParseGitStatusV2_UnknownEntryType(t *testing.T) {
 }
 
 func TestParseGitStatusV2_RenameEntry(t *testing.T) {
-	// Type '2' is rename in v2 format — not handled by the parser because
-	// we pass --no-renames to git status. Verify it's silently skipped.
+	// Type '2' is rename in v2 format. Although --no-renames prevents these,
+	// the parser handles them defensively: extracts the destination path and
+	// consumes the extra NUL-terminated origPath record.
 	raw := "# branch.oid abc\x00" +
-		"2 R. N... 100644 100644 100644 abc def R100 old.go\x00new.go\x00"
+		"2 R. N... 100644 100644 100644 abc def R100 new.go\x00old.go\x00"
 	state := parseGitStatusV2(raw)
-	if len(state.Files) != 0 {
-		t.Errorf("expected rename entry to be skipped, got %v", state.Files)
+	if len(state.Files) != 1 {
+		t.Fatalf("expected 1 file from rename entry, got %v", state.Files)
+	}
+	assertContains(t, state.Files, "new.go")
+}
+
+func TestParseGitStatusV2_RenameOrigPathNotMisinterpreted(t *testing.T) {
+	// The origPath record after a rename must be consumed, not
+	// misinterpreted as an independent entry.
+	raw := "# branch.oid abc\x00" +
+		"2 R. N... 100644 100644 100644 abc def R100 new.go\x00? suspicious.go\x00" +
+		"? real_untracked.go\x00"
+	state := parseGitStatusV2(raw)
+	// "? suspicious.go" is the origPath of the rename — must be consumed.
+	// Only "new.go" (from rename) and "real_untracked.go" should appear.
+	if len(state.Files) != 2 {
+		t.Fatalf("expected 2 files, got %d: %v", len(state.Files), state.Files)
+	}
+	assertContains(t, state.Files, "new.go")
+	assertContains(t, state.Files, "real_untracked.go")
+	if containsStr(state.Files, "? suspicious.go") {
+		t.Error("origPath record was misinterpreted as an untracked file")
 	}
 }
 

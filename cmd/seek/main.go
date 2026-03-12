@@ -148,7 +148,8 @@ func run(ctx context.Context, pattern string) error {
 
 	// Execute search with LOCK_SH so concurrent indexers (which hold LOCK_EX)
 	// finish before we read shards. Multiple searchers can hold LOCK_SH
-	// simultaneously — no contention between readers.
+	// simultaneously — no contention between readers. Uses non-blocking
+	// poll with timeout to prevent indefinite hang if an indexer is stuck.
 	searchLockPath := filepath.Join(indexDir, lockFile)
 	searchLockFd, err := os.OpenFile(searchLockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
@@ -158,7 +159,7 @@ func run(ctx context.Context, pattern string) error {
 		unlockFile(searchLockFd)
 		_ = searchLockFd.Close()
 	}()
-	if err := lockFileShared(searchLockFd); err != nil {
+	if err := acquireSearchLock(ctx, searchLockFd); err != nil {
 		return fmt.Errorf("acquire search lock: %w", err)
 	}
 

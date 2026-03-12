@@ -7,10 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
-	"time"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/sourcegraph/zoekt/gitindex"
@@ -35,6 +36,9 @@ const (
 	// file indexing. Files larger than this are skipped to prevent excessive
 	// memory usage.
 	maxUncommittedFileSize = 10 * 1024 * 1024 // 10 MB
+	// maxUncommittedTotalSize is the aggregate memory budget for all
+	// uncommitted file contents held in memory simultaneously.
+	maxUncommittedTotalSize = 512 * 1024 * 1024 // 512 MB
 )
 
 // computeStateHash computes the xxHash64 of the given state string.
@@ -68,14 +72,24 @@ func repoStateFingerprint(repoDir string, state repoState) string {
 		if err != nil {
 			// File may have been deleted between git status and stat;
 			// include a sentinel so deletions also change the hash.
-			fmt.Fprintf(&b, "\x00%s\x00deleted\x00", f)
+			b.WriteByte(0)
+			b.WriteString(f)
+			b.WriteString("\x00deleted\x00")
 			continue
 		}
 		ino := uint64(0)
 		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
 			ino = stat.Ino
 		}
-		fmt.Fprintf(&b, "\x00%s\x00%d\x00%d\x00%d\x00", f, fi.ModTime().UnixNano(), fi.Size(), ino)
+		b.WriteByte(0)
+		b.WriteString(f)
+		b.WriteByte(0)
+		b.WriteString(strconv.FormatInt(fi.ModTime().UnixNano(), 10))
+		b.WriteByte(0)
+		b.WriteString(strconv.FormatInt(fi.Size(), 10))
+		b.WriteByte(0)
+		b.WriteString(strconv.FormatUint(ino, 10))
+		b.WriteByte(0)
 	}
 	return b.String()
 }
@@ -234,74 +248,6 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 	return nil
 }
 
-// acquireLock tries to acquire an exclusive flock on the lock file.
-// Returns (fd, acquired, error).
-func acquireLock(ctx context.Context, indexDir, lockPath string) (*os.File, bool, error) {
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, false, fmt.Errorf("open lock file: %w", err)
-	}
-
-	// Try non-blocking lock first
-	err = lockFileExclusive(f)
-	if err == nil {
-		return f, true, nil
-	}
-
-	// Lock held by another process
-	if shardsExist(indexDir) {
-		// Stale index is acceptable
-		_ = f.Close()
-		return nil, false, nil
-	}
-
-	// No shards exist (first run) — poll with exponential backoff.
-	// We avoid a blocking flock goroutine to prevent fd-reuse races
-	// when the timeout fires and closes the file.
-	timeoutCtx, timeoutCancel := context.WithTimeout(ctx, 60*time.Second)
-	defer timeoutCancel()
-
-	backoff := 100 * time.Millisecond
-	const maxBackoff = 2 * time.Second
-
-	for {
-		select {
-		case <-timeoutCtx.Done():
-			_ = f.Close()
-			return nil, false, fmt.Errorf("indexer lock held >60s")
-		default:
-		}
-
-		err = lockFileExclusive(f)
-		if err == nil {
-			return f, true, nil
-		}
-
-		timer := time.NewTimer(backoff)
-		select {
-		case <-timeoutCtx.Done():
-			timer.Stop()
-			_ = f.Close()
-			return nil, false, fmt.Errorf("indexer lock held >60s")
-		case <-timer.C:
-		}
-
-		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
-		}
-	}
-}
-
-// releaseLock releases the flock and closes the file.
-func releaseLock(f *os.File) {
-	if f == nil {
-		return
-	}
-	unlockFile(f)
-	_ = f.Close()
-}
-
 // shardsExist checks if any *.zoekt shard files exist in the index directory.
 func shardsExist(indexDir string) bool {
 	entries, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
@@ -333,12 +279,16 @@ type fileContent struct {
 // readUncommittedFiles reads uncommitted files directly from the working tree
 // into memory using a bounded worker pool. Files larger than maxUncommittedFileSize,
 // symlinks, and directories are skipped. Individual file failures are non-fatal
-// since files may be deleted or modified between git status and read.
+// since files may be deleted or modified between git status and read. An
+// aggregate memory budget (maxUncommittedTotalSize) prevents unbounded memory
+// growth when many large dirty files exist.
 func readUncommittedFiles(repoDir string, files []string, parallelism int) []fileContent {
 	ch := make(chan string, parallelism)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
+	var totalSize atomic.Int64
 	var results []fileContent
+	var budgetWarned atomic.Bool
 
 	for range parallelism {
 		wg.Add(1)
@@ -353,21 +303,43 @@ func readUncommittedFiles(repoDir string, files []string, parallelism int) []fil
 					continue
 				}
 
-				// Skip directories (e.g. dirty submodules) and symlinks
-				if fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+				// Only process regular files — skip directories (dirty
+				// submodules), symlinks, FIFOs, sockets, and devices to
+				// avoid blocking or reading unexpected data.
+				if !fi.Mode().IsRegular() {
 					continue
 				}
 
-				if fi.Size() > maxUncommittedFileSize {
-					slog.Warn("Skipping large uncommitted file", "path", f, "size_mb", fi.Size()/(1024*1024))
+				size := fi.Size()
+				if size > maxUncommittedFileSize {
+					slog.Warn("Skipping large uncommitted file", "path", f, "size_mb", size/(1024*1024))
 					continue
 				}
 
-				content, err := os.ReadFile(srcPath)
+				// Check aggregate memory budget before reading.
+				if totalSize.Load()+size > maxUncommittedTotalSize {
+					if budgetWarned.CompareAndSwap(false, true) {
+						slog.Warn("Uncommitted memory budget exceeded, skipping remaining files",
+							"budget_mb", maxUncommittedTotalSize/(1024*1024))
+					}
+					continue
+				}
+
+				// Read using the known size from Lstat to avoid the
+				// extra Fstat that os.ReadFile performs internally.
+				fh, err := os.Open(srcPath)
 				if err != nil {
 					continue
 				}
+				buf := make([]byte, size)
+				n, err := fh.Read(buf)
+				_ = fh.Close()
+				if err != nil && n == 0 {
+					continue
+				}
+				content := buf[:n]
 
+				totalSize.Add(int64(n))
 				mu.Lock()
 				results = append(results, fileContent{name: f, content: content})
 				mu.Unlock()
