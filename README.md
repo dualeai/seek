@@ -64,6 +64,109 @@ brew install universal-ctags       # macOS
 sudo apt-get install universal-ctags  # Linux
 ```
 
+### Agent Integration
+
+Paste this prompt into your AI coding agent (Claude Code, Codex, Cursor, Amp, etc.) to install seek and configure it for your project. The agent will install the binary, test it, and write usage instructions to your agent config file so that future sessions use seek automatically.
+
+<details>
+<summary>Bootstrap prompt -- click to expand, then copy-paste into your agent</summary>
+
+```
+Install and configure `seek` for this repository. seek is a ranked code search
+tool that replaces grep/ripgrep for codebase exploration -- results sorted by
+relevance, symbol-aware, with context included.
+
+Step 1 -- Install
+
+  curl -sSfL https://raw.githubusercontent.com/dualeai/seek/main/install.sh | sh
+
+If curl is unavailable: go install github.com/dualeai/seek/cmd/seek@latest
+
+universal-ctags is required (used for indexing and symbol search):
+  macOS:  brew install universal-ctags
+  Linux:  sudo apt-get install universal-ctags
+
+Verify: seek --version
+
+Step 2 -- Test
+
+Run in this repo:
+
+  seek 'main'
+
+You should see ranked results with file paths, language labels, line numbers,
+and surrounding context.
+
+Step 3 -- Learn the tool
+
+Usage: seek '<query>'
+
+One positional argument. All filters go inside a single quoted string.
+Use single quotes to avoid shell interpretation of |, (, ).
+
+Filters (combine with spaces inside the quotes):
+  sym:Name        Find definitions (functions, classes, methods) via ctags
+  file:path       Include paths matching substring
+  -file:path      Exclude paths matching substring
+  lang:python     Filter by detected language
+  content:regex   Regex on file content only (bare words match content + filenames)
+  type:file       Return matching file names only
+  case:yes        Force case-sensitive search
+  or, ()          Boolean logic (space = implicit AND)
+
+Examples:
+  seek 'sym:handleRequest'                          # find definition
+  seek 'handleRequest file:api -file:test'          # scoped search
+  seek 'content:async def.*handler lang:python'     # regex + language
+  seek '(lang:go or lang:python) ValidationError'   # multi-language
+  seek 'type:file config'                           # find files by name
+
+Output: ranked by BM25 relevance, grouped by file, 3 lines of context.
+Symbol lines tagged [func], [class], etc. Modified files tagged [uncommitted].
+
+Exit codes: 0 = matches found, 1 = no matches, 2 = error.
+
+Pitfalls:
+  - ONE argument: seek 'sym:Foo file:bar' not seek 'sym:Foo' 'file:bar'
+  - Single quotes to prevent shell expanding |, (, )
+  - Multi-word queries are AND'd substrings, not phrase match: seek 'foo bar'
+    matches files containing both "foo" and "bar" independently
+  - Large output: redirect to file (seek 'q' > /tmp/seek.txt) then read it
+
+Step 4 -- Discover project-specific examples
+
+Run a few searches of varying complexity against this repo to find real examples
+that showcase seek's value. Try:
+  - A sym: search for a key class or function in the project
+  - A scoped search using file: and -file:test
+  - A lang: or content: filtered search
+  - A type:file search for a common config or entry point
+
+Keep 3-4 queries that returned useful, ranked results. You will use these as
+examples in the config file (not the generic examples from Step 3).
+
+Step 5 -- Configure this project
+
+Add seek instructions to this project's agent config so future sessions and
+team members use seek automatically:
+  - Claude Code     -> CLAUDE.md
+  - OpenAI Codex    -> AGENTS.md
+  - Cursor          -> .cursor/rules or .cursorrules
+  - Other           -> your agent's instruction file
+
+Write concise, task-oriented instructions (not this entire prompt). Include:
+  1. Prefer seek over grep/ripgrep for code search
+  2. Key patterns: sym:, file:, -file:, lang:, content:
+  3. The project-specific examples you found in Step 4 (not generic ones)
+  4. Pitfalls: single argument, single quotes
+  5. Install command as fallback if seek is not found
+  6. When spawning sub-agents that don't inherit the config, pass them a
+     one-liner: "Use seek 'pattern' for code search. All filters in ONE
+     quoted string. Never use grep/rg."
+```
+
+</details>
+
 ## Quick Start
 
 ```bash
