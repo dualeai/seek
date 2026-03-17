@@ -476,8 +476,8 @@ func TestFormatResults_ContextLines_NonContiguousRegions(t *testing.T) {
 	result := formatResults(files)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
-		"  5 first match",
-		"  6 after first",
+		"   5 first match",
+		"   6 after first",
 		"",
 		"  49 before second",
 		"  50 second match",
@@ -711,7 +711,7 @@ func TestFormatResults_ContextLines_OnlyBefore(t *testing.T) {
 	result := formatResults(files)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
-		"  99 penultimate",
+		"   99 penultimate",
 		"  100 last line",
 	}, "\n")
 	if result != expected {
@@ -983,6 +983,88 @@ func TestFormatResults_LineNumber_MaxUint32(t *testing.T) {
 	result := formatResults(files)
 	if !strings.Contains(result, "match") {
 		t.Error("expected match to appear in output")
+	}
+}
+
+func TestWriteLineNum(t *testing.T) {
+	tests := []struct {
+		lineNum int
+		width   int
+		want    string
+	}{
+		{1, 1, "1"},
+		{1, 3, "  1"},
+		{10, 3, " 10"},
+		{100, 3, "100"},
+		{100, 2, "100"}, // overflow: no truncation, no panic
+		{0, 1, "0"},
+		{1, 0, "1"}, // zero width: no padding
+	}
+	for _, tt := range tests {
+		var sb strings.Builder
+		writeLineNum(&sb, tt.lineNum, tt.width)
+		if got := sb.String(); got != tt.want {
+			t.Errorf("writeLineNum(%d, %d) = %q, want %q", tt.lineNum, tt.width, got, tt.want)
+		}
+	}
+}
+
+func TestMaxLineNumWidth(t *testing.T) {
+	tests := []struct {
+		name  string
+		files []zoekt.FileMatch
+		want  int
+	}{
+		{"nil", nil, 1},
+		{"empty", []zoekt.FileMatch{}, 1},
+		{"single digit", []zoekt.FileMatch{
+			{LineMatches: []zoekt.LineMatch{{LineNumber: 5}}},
+		}, 1},
+		{"boundary 9 to 10 via after-context", []zoekt.FileMatch{
+			{LineMatches: []zoekt.LineMatch{{LineNumber: 9, After: []byte("line10\n")}}},
+		}, 2},
+		{"triple digit", []zoekt.FileMatch{
+			{LineMatches: []zoekt.LineMatch{{LineNumber: 99, After: []byte("line100\nline101\n")}}},
+		}, 3},
+		{"zero line number", []zoekt.FileMatch{
+			{LineMatches: []zoekt.LineMatch{{LineNumber: 0}}},
+		}, 1},
+		{"cross-file max", []zoekt.FileMatch{
+			{LineMatches: []zoekt.LineMatch{{LineNumber: 5}}},
+			{LineMatches: []zoekt.LineMatch{{LineNumber: 100}}},
+		}, 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := maxLineNumWidth(tt.files); got != tt.want {
+				t.Errorf("maxLineNumWidth() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatResults_GlobalAlignment_CrossFile(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{
+			FileName: "shallow.go", Repository: "repo", Language: "Go", Score: 10,
+			LineMatches: []zoekt.LineMatch{
+				{Line: []byte("near top\n"), LineNumber: 5},
+			},
+		},
+		{
+			FileName: "deep.go", Repository: "repo", Language: "Go", Score: 9,
+			LineMatches: []zoekt.LineMatch{
+				{Line: []byte("far down\n"), LineNumber: 100},
+			},
+		},
+	}
+	result := formatResults(files)
+	// Both should be padded to width 3 (len("100") == 3)
+	if !strings.Contains(result, "    5 near top") {
+		t.Errorf("expected shallow match padded to width 3, got:\n%s", result)
+	}
+	if !strings.Contains(result, "  100 far down") {
+		t.Errorf("expected deep match at width 3, got:\n%s", result)
 	}
 }
 

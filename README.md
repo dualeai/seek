@@ -191,9 +191,9 @@ seek "handleRequest"
   44 }
 
 ## lib/middleware.py (Python) [uncommitted]
-  7
-  8  logger = logging.getLogger(__name__)
-  9
+   7
+   8 logger = logging.getLogger(__name__)
+   9
   10 async def handleRequest(ctx):
   11     """Process incoming request."""
   12     await validate(ctx)
