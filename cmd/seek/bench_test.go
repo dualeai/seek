@@ -404,3 +404,257 @@ func BenchmarkEndToEnd_DirtyReindex(b *testing.B) {
 	}
 }
 
+// --- Large-repo benchmarks ---
+// Set SEEK_BENCH_REPO to a git repo path (e.g. a kubernetes checkout) to
+// enable these. They measure real-world indexing and search latency on a
+// large codebase where the overhead is actually visible.
+//
+//   git clone --depth=1 https://github.com/kubernetes/kubernetes /tmp/k8s
+//   SEEK_BENCH_REPO=/tmp/k8s go test ./cmd/seek/ -bench=BenchmarkLargeRepo -benchmem -count=3
+
+func requireBenchRepo(b *testing.B) string {
+	b.Helper()
+	dir := os.Getenv("SEEK_BENCH_REPO")
+	if dir == "" {
+		b.Skip("SEEK_BENCH_REPO not set — skipping large-repo benchmark")
+	}
+	requireTools(b)
+	return dir
+}
+
+// setupLargeRepoBench ensures the index is warm and returns the repo/index dirs.
+func setupLargeRepoBench(b *testing.B) (repoDir, indexDir string) {
+	b.Helper()
+	repoDir = requireBenchRepo(b)
+	indexDir = filepath.Join(repoDir, cacheDir)
+	_ = os.MkdirAll(indexDir, 0o755)
+	ensureGitExclude(repoDir, cacheDir)
+
+	ctx := context.Background()
+	state := gitRepoStateIn(ctx, repoDir)
+	currentState := computeStateHash(repoStateFingerprint(repoDir, state))
+	cachedState := readStateFile(indexDir)
+	if currentState != cachedState {
+		if err := runIndexing(ctx, repoDir, indexDir, state, currentState); err != nil {
+			b.Fatalf("initial indexing failed: %v", err)
+		}
+	}
+	return repoDir, indexDir
+}
+
+func BenchmarkLargeRepo_WarmSearch(b *testing.B) {
+	repoDir, indexDir := setupLargeRepoBench(b)
+	ctx := context.Background()
+	b.ResetTimer()
+	for b.Loop() {
+		state := gitRepoStateIn(ctx, repoDir)
+		currentState := computeStateHash(repoStateFingerprint(repoDir, state))
+		cachedState := readStateFile(indexDir)
+		if currentState != cachedState {
+			_ = runIndexing(ctx, repoDir, indexDir, state, currentState)
+		}
+		_, _ = executeSearch(ctx, indexDir, "func main")
+	}
+}
+
+func BenchmarkLargeRepo_DirtyReindex_1File(b *testing.B) {
+	benchmarkLargeRepoDirtyN(b, 1)
+}
+
+func BenchmarkLargeRepo_DirtyReindex_10Files(b *testing.B) {
+	benchmarkLargeRepoDirtyN(b, 10)
+}
+
+func BenchmarkLargeRepo_DirtyReindex_50Files(b *testing.B) {
+	benchmarkLargeRepoDirtyN(b, 50)
+}
+
+func benchmarkLargeRepoDirtyN(b *testing.B, n int) {
+	b.Helper()
+	repoDir, indexDir := setupLargeRepoBench(b)
+	ctx := context.Background()
+
+	targets := findGoFiles(b, repoDir, n)
+	originals := make([][]byte, len(targets))
+	for i, t := range targets {
+		data, err := os.ReadFile(t)
+		if err != nil {
+			b.Fatal(err)
+		}
+		originals[i] = data
+	}
+	b.Cleanup(func() {
+		for i, t := range targets {
+			_ = os.WriteFile(t, originals[i], 0o644)
+		}
+	})
+
+	b.ResetTimer()
+	for i := 0; b.Loop(); i++ {
+		for j, t := range targets {
+			content := fmt.Appendf(originals[j][:len(originals[j]):len(originals[j])], "\n// bench_%d\n", i)
+			_ = os.WriteFile(t, content, 0o644)
+		}
+		state := gitRepoStateIn(ctx, repoDir)
+		currentState := computeStateHash(repoStateFingerprint(repoDir, state))
+		_ = runIndexing(ctx, repoDir, indexDir, state, currentState)
+		_, _ = executeSearch(ctx, indexDir, "func main")
+	}
+}
+
+// BenchmarkLargeRepo_Phases breaks down the dirty-reindex path into
+// individual phases so we can see where time is actually spent.
+func BenchmarkLargeRepo_Phases(b *testing.B) {
+	repoDir := requireBenchRepo(b)
+	indexDir := filepath.Join(repoDir, cacheDir)
+	_ = os.MkdirAll(indexDir, 0o755)
+	ensureGitExclude(repoDir, cacheDir)
+	ctx := context.Background()
+
+	// Ensure index is warm
+	state := gitRepoStateIn(ctx, repoDir)
+	currentState := computeStateHash(repoStateFingerprint(repoDir, state))
+	cachedState := readStateFile(indexDir)
+	if currentState != cachedState {
+		if err := runIndexing(ctx, repoDir, indexDir, state, currentState); err != nil {
+			b.Fatalf("initial indexing: %v", err)
+		}
+	}
+
+	target := findGoFile(b, repoDir)
+	original, err := os.ReadFile(target)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = os.WriteFile(target, original, 0o644) })
+
+	b.Run("gitRepoState", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			gitRepoStateIn(ctx, repoDir)
+		}
+	})
+
+	b.Run("stateHash", func(b *testing.B) {
+		state := gitRepoStateIn(ctx, repoDir)
+		b.ReportAllocs()
+		for b.Loop() {
+			computeStateHash(repoStateFingerprint(repoDir, state))
+		}
+	})
+
+	b.Run("checkCtags", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = checkCtags()
+		}
+	})
+
+	b.Run("ensureGitExclude", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			ensureGitExclude(repoDir, cacheDir)
+		}
+	})
+
+	b.Run("ensureUntrackedCache", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			ensureUntrackedCache(ctx, repoDir)
+		}
+	})
+
+	b.Run("indexCommitted_incremental", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = indexCommitted(ctx, repoDir, indexDir, indexParallelism())
+		}
+	})
+
+	b.Run("indexUncommitted_1file", func(b *testing.B) {
+		// Dirty the file once, capture the file list, then benchmark just
+		// the indexing loop without re-running git status each iteration.
+		_ = os.WriteFile(target, append(original, []byte("\n// dirty\n")...), 0o644)
+		state := gitRepoStateIn(ctx, repoDir)
+		if len(state.Files) == 0 {
+			b.Fatal("expected dirty files")
+		}
+		dirtyFiles := state.Files
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; b.Loop(); i++ {
+			content := fmt.Appendf(original[:len(original):len(original)], "\n// p_%d\n", i)
+			_ = os.WriteFile(target, content, 0o644)
+			fileCh := streamFiles(repoDir, dirtyFiles, indexParallelism())
+			_ = indexUncommitted(ctx, repoDir, indexDir, fileCh, indexParallelism())
+		}
+	})
+
+	b.Run("postVerify_gitStatus", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			postState := gitRepoStateIn(ctx, repoDir)
+			computeStateHash(repoStateFingerprint(repoDir, postState))
+		}
+	})
+
+	b.Run("postVerify_restat", func(b *testing.B) {
+		// Lightweight alternative: re-stat only the known dirty files
+		// instead of running a full git status. Uses the same state struct
+		// (same RawOutput), but repoStateFingerprint re-Lstats each file.
+		_ = os.WriteFile(target, append(original, []byte("\n// dirty_for_restat\n")...), 0o644)
+		dirtyState := gitRepoStateIn(ctx, repoDir)
+		if len(dirtyState.Files) == 0 {
+			b.Fatal("expected dirty files")
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			computeStateHash(repoStateFingerprint(repoDir, dirtyState))
+		}
+	})
+
+	b.Run("executeSearch", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = executeSearch(ctx, indexDir, "func main")
+		}
+	})
+}
+
+// findGoFile returns the absolute path of a Go file suitable for editing.
+func findGoFile(b *testing.B, repoDir string) string {
+	b.Helper()
+	targets := findGoFiles(b, repoDir, 1)
+	return targets[0]
+}
+
+// findGoFiles returns absolute paths of n Go files suitable for editing.
+func findGoFiles(b *testing.B, repoDir string, n int) []string {
+	b.Helper()
+	var result []string
+	err := filepath.WalkDir(repoDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			if d != nil && d.IsDir() && d.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return err
+		}
+		if len(result) >= n {
+			return filepath.SkipAll
+		}
+		if filepath.Ext(path) == ".go" {
+			result = append(result, path)
+		}
+		return nil
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(result) < n {
+		b.Skipf("repo has fewer than %d .go files", n)
+	}
+	return result
+}
+

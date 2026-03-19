@@ -57,6 +57,11 @@ func computeStateHash(rawOutput string) string {
 // modified. The inode detects atomic-write editors (vim, emacs) that replace
 // files via write-to-tmp + rename, which changes the inode but may preserve
 // mtime.
+//
+// Called twice per indexing cycle: once before indexing (to compute the
+// pre-state hash) and once after (to detect drift). The second call
+// re-Lstats the same files, so any modification during indexing produces
+// a different hash.
 func repoStateFingerprint(repoDir string, state repoState) string {
 	if len(state.Files) == 0 {
 		return state.RawOutput
@@ -172,7 +177,7 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 		return err
 	}
 
-	// Ensure cache dir is excluded from git status for post-verification.
+	// Ensure cache dir is excluded from git status.
 	ensureGitExclude(repoDir, cacheDir)
 
 	lockPath := filepath.Join(indexDir, lockFile)
@@ -241,10 +246,19 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 		cleanUncommittedShards(indexDir)
 	}
 
-	// Post-indexing verification — single atomic call eliminates TOCTOU.
-	// Use repoDir explicitly so this works regardless of process CWD.
-	postRepoState := gitRepoStateIn(ctx, repoDir)
-	postState := computeStateHash(repoStateFingerprint(repoDir, postRepoState))
+	// Post-indexing verification — re-stat the known dirty files to detect
+	// changes made during the indexing window. This replaces a full
+	// gitRepoStateIn call (~250-450ms on large repos) with cheap Lstat
+	// calls (~0.004ms) on only the files we just indexed.
+	//
+	// What this catches: any dirty file modified, deleted, or atomically
+	// replaced during indexing (mtime, size, or inode change).
+	//
+	// What this defers to the next search: new untracked files appearing
+	// or HEAD changes during the indexing window. Both are caught by the
+	// next invocation's gitRepoState() call in run(), which always runs
+	// a full git status.
+	postState := computeStateHash(repoStateFingerprint(repoDir, state))
 
 	if committedErr != nil || uncommittedErr != nil {
 		// Don't cache state when either indexing step failed — forces
