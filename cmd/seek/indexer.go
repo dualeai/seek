@@ -204,11 +204,13 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 
 	parallelism := indexParallelism()
 
-	// Stream uncommitted files through a channel, in parallel with
-	// committed indexing. The bounded channel (size=parallelism) provides
-	// backpressure so at most 2*parallelism files are in flight
-	// (channel buffer + blocked workers), rather than buffering all
-	// dirty files into a single slice.
+	// Clean up stale staging directory from previous seek versions.
+	// Must run before either indexer starts to avoid racing with shard writes.
+	_ = os.RemoveAll(filepath.Join(indexDir, repoUncommitted))
+
+	// Stream uncommitted files through a channel. The bounded channel
+	// (size=parallelism) provides backpressure so at most 2*parallelism
+	// files are in flight (channel buffer + blocked workers).
 	var fileCh <-chan fileContent
 	if len(state.Files) > 0 {
 		fileCh = streamFiles(repoDir, state.Files, parallelism)
@@ -220,30 +222,29 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 		}()
 	}
 
-	// Index committed files (concurrent with channel fill)
-	committedErr := indexCommitted(ctx, repoDir, indexDir, parallelism)
+	// Run committed and uncommitted indexing. They write different shard
+	// files (repo name vs "uncommitted" prefix) so when both are needed
+	// they run in parallel. When only one is needed, it runs alone.
+	var committedErr, uncommittedErr error
+	if fileCh != nil {
+		// Both needed — run committed in a goroutine, uncommitted in
+		// the current goroutine (it must drain fileCh).
+		committedDone := make(chan error, 1)
+		go func() {
+			committedDone <- indexCommitted(ctx, repoDir, indexDir, parallelism)
+		}()
+		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, fileCh, parallelism)
+		committedErr = <-committedDone
+	} else {
+		committedErr = indexCommitted(ctx, repoDir, indexDir, parallelism)
+		cleanUncommittedShards(indexDir)
+	}
+
 	if committedErr != nil {
 		slog.Warn("Committed indexing failed", "error", committedErr)
 	}
-
-	// Clean up stale staging directory from previous seek versions
-	_ = os.RemoveAll(filepath.Join(indexDir, repoUncommitted))
-
-	// Index uncommitted files streamed from the channel. When files exist,
-	// zoekt's builder.Finish() atomically replaces old shards (write to
-	// .tmp then os.Rename), so we must NOT delete old shards before writing
-	// new ones — that creates a gap where concurrent searchers see no
-	// uncommitted shard at all. When no files exist, we clean up stale
-	// uncommitted shards from a previous run where uncommitted files did
-	// exist.
-	var uncommittedErr error
-	if fileCh != nil {
-		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, fileCh, parallelism)
-		if uncommittedErr != nil {
-			slog.Warn("Uncommitted indexing failed", "error", uncommittedErr)
-		}
-	} else {
-		cleanUncommittedShards(indexDir)
+	if uncommittedErr != nil {
+		slog.Warn("Uncommitted indexing failed", "error", uncommittedErr)
 	}
 
 	// Post-indexing verification — re-stat the known dirty files to detect
@@ -381,7 +382,10 @@ func streamFiles(repoDir string, files []string, parallelism int) <-chan fileCon
 }
 
 // indexUncommitted indexes uncommitted file contents streamed through fileCh
-// using index.NewBuilder. The builder is created lazily on the first file to
+// using index.NewBuilder. Old uncommitted shards are not deleted before
+// writing — zoekt's builder.Finish() atomically replaces them (write to
+// .tmp then os.Rename), avoiding a gap where concurrent searchers see no
+// uncommitted shard. The builder is created lazily on the first file to
 // avoid spawning ctags processes when the channel is empty. On NewBuilder
 // error the channel is explicitly drained; on Add error the loop continues
 // consuming remaining items. Both paths prevent goroutine leaks in the
