@@ -29,10 +29,14 @@ test-unit:
 test-bench:
 	go test ./cmd/seek/ -bench=. -benchmem -count=5
 
+test-bench-repo:
+	@if [ -z "$(SEEK_BENCH_REPO)" ]; then echo "Usage: make test-bench-repo SEEK_BENCH_REPO=/path/to/repo"; exit 1; fi
+	SEEK_BENCH_REPO=$(SEEK_BENCH_REPO) go test ./cmd/seek/ -bench=BenchmarkLargeRepo -benchmem -count=3 -timeout=600s
+
 lint:
 	golangci-lint run --fix ./...
 
 release:
 	VERSION=$$($(MAKE) -s version-full) goreleaser release --clean
 
-.PHONY: install upgrade build test test-static test-unit test-bench lint release
+.PHONY: install upgrade build test test-static test-unit test-bench test-bench-repo lint release
