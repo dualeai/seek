@@ -905,10 +905,55 @@ func TestStateCaching_BothSucceed_StateStable(t *testing.T) {
 	}
 }
 
-// TestStateCaching_BothSucceed_StateDrifted verifies that when indexing
-// succeeds but the repo changes during indexing, the state file is NOT
-// written (forces re-index on next search).
-func TestStateCaching_BothSucceed_StateDrifted(t *testing.T) {
+// TestStateCaching_BothSucceed_DirtyFileDrifted verifies that when a file
+// in state.Files is modified during indexing, post-verification detects
+// the drift via re-stat and does NOT write the state file.
+func TestStateCaching_BothSucceed_DirtyFileDrifted(t *testing.T) {
+	requireTools(t)
+
+	dir := initGitRepo(t, "app.go", "package main\n// original\n")
+
+	// Create an uncommitted edit so app.go appears in state.Files
+	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// first_edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	indexDir := filepath.Join(dir, cacheDir)
+	if err := os.MkdirAll(indexDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Capture pre-state (app.go is dirty → in state.Files)
+	state := gitRepoStateIn(ctx, dir)
+	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+	if len(state.Files) == 0 {
+		t.Fatal("precondition: app.go should be in state.Files")
+	}
+
+	// Mutate the dirty file AGAIN (simulates user editing during indexing)
+	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// second_edit_during_indexing\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run indexing with the pre-mutation state.
+	// Post-verification re-stats state.Files and detects the drift.
+	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+		t.Fatalf("indexing failed: %v", err)
+	}
+
+	// State file should NOT be written (drift detected via re-stat)
+	cached := readStateFile(indexDir)
+	if cached != "" {
+		t.Errorf("expected no state file after dirty-file drift, got %q", cached)
+	}
+}
+
+// TestStateCaching_BothSucceed_CleanFileBecomesDirty verifies that when
+// a previously clean file becomes dirty during indexing (new mutation not
+// in state.Files), the state file IS written. The next search's
+// gitRepoState() detects the new dirty file and triggers re-indexing.
+func TestStateCaching_BothSucceed_CleanFileBecomesDirty(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// original\n")
@@ -919,37 +964,223 @@ func TestStateCaching_BothSucceed_StateDrifted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Capture pre-state
+	// Capture pre-state (clean repo, state.Files is empty)
 	state := gitRepoStateIn(ctx, dir)
 	stateHash := computeStateHash(repoStateFingerprint(dir, state))
 
-	// Index (succeeds)
-	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
-		t.Fatalf("indexing failed: %v", err)
-	}
-
-	// State file should be written (repo didn't change during indexing)
-	cached := readStateFile(indexDir)
-	if cached == "" {
-		t.Fatal("expected state file after initial indexing")
-	}
-
-	// Now mutate the repo
+	// Mutate a file not in state.Files (simulates user editing during indexing)
 	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// mutated\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	// Re-index with OLD state (simulates pre-state captured before mutation)
-	// Post-verification will see the drift and delete the state file
 	deleteStateFiles(indexDir)
 	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
-		t.Fatalf("re-indexing failed: %v", err)
+		t.Fatalf("indexing failed: %v", err)
 	}
 
-	// State file should NOT be written (drift detected)
-	cached = readStateFile(indexDir)
+	// State file IS written (mutation not visible to re-stat of empty file list).
+	// This is intentional: the next search's gitRepoState() will detect the
+	// dirty file, produce a different hash, and trigger re-indexing.
+	cached := readStateFile(indexDir)
+	if cached == "" {
+		t.Fatal("expected state file to be written (clean→dirty not detected by restat)")
+	}
+
+	// Verify the next search would detect the mismatch
+	newState := gitRepoStateIn(ctx, dir)
+	newHash := computeStateHash(repoStateFingerprint(dir, newState))
+	if newHash == cached {
+		t.Error("next search should see a different state hash, but got the same")
+	}
+}
+
+// TestStateCaching_DirtyFileDeleted verifies that deleting a dirty file
+// during indexing is detected by the restat post-verification.
+func TestStateCaching_DirtyFileDeleted(t *testing.T) {
+	requireTools(t)
+
+	dir := initGitRepo(t, "app.go", "package main\n// original\n")
+
+	// Create a dirty file
+	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	indexDir := filepath.Join(dir, cacheDir)
+	_ = os.MkdirAll(indexDir, 0o755)
+
+	state := gitRepoStateIn(ctx, dir)
+	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+	if len(state.Files) == 0 {
+		t.Fatal("precondition: app.go should be dirty")
+	}
+
+	// Delete the file (simulates deletion during indexing)
+	if err := os.Remove(filepath.Join(dir, "app.go")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+		t.Fatalf("indexing failed: %v", err)
+	}
+
+	// Drift should be detected (file deleted → sentinel in fingerprint)
+	cached := readStateFile(indexDir)
 	if cached != "" {
-		t.Errorf("expected no state file after drift, got %q", cached)
+		t.Errorf("expected no state file after file deletion during indexing, got %q", cached)
+	}
+}
+
+// TestStateCaching_DirtyFileAtomicReplace verifies that an atomic-write
+// editor (write-to-tmp + rename) during indexing is detected via inode change.
+func TestStateCaching_DirtyFileAtomicReplace(t *testing.T) {
+	requireTools(t)
+
+	dir := initGitRepo(t, "app.go", "package main\n// original\n")
+
+	// Create a dirty file
+	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	indexDir := filepath.Join(dir, cacheDir)
+	_ = os.MkdirAll(indexDir, 0o755)
+
+	state := gitRepoStateIn(ctx, dir)
+	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+
+	// Simulate atomic-write editor: write to tmp, rename over original.
+	// This changes the inode even if mtime/size happen to match.
+	tmpPath := filepath.Join(dir, "app.go.tmp")
+	if err := os.WriteFile(tmpPath, []byte("package main\n// atomic_replaced\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmpPath, filepath.Join(dir, "app.go")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+		t.Fatalf("indexing failed: %v", err)
+	}
+
+	// Drift should be detected (inode changed via rename)
+	cached := readStateFile(indexDir)
+	if cached != "" {
+		t.Errorf("expected no state file after atomic replace, got %q", cached)
+	}
+}
+
+// TestStateCaching_UntouchedDirtyFile verifies that when a dirty file is
+// NOT modified during indexing, the state file IS written (no false drift).
+func TestStateCaching_UntouchedDirtyFile(t *testing.T) {
+	requireTools(t)
+
+	dir := initGitRepo(t, "app.go", "package main\n// original\n")
+
+	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// dirty_but_stable\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	indexDir := filepath.Join(dir, cacheDir)
+	_ = os.MkdirAll(indexDir, 0o755)
+
+	state := gitRepoStateIn(ctx, dir)
+	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+
+	// Do NOT modify the file — indexing should detect no drift
+	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+		t.Fatalf("indexing failed: %v", err)
+	}
+
+	cached := readStateFile(indexDir)
+	if cached == "" {
+		t.Fatal("expected state file to be written when dirty file is untouched during indexing")
+	}
+	if cached != stateHash {
+		t.Errorf("state file mismatch: got %q, want %q", cached, stateHash)
+	}
+}
+
+// TestStateCaching_HeadChangeDuringIndexing verifies that a HEAD change
+// during indexing (e.g. git commit) is not detected by restat but IS
+// caught by the next search's gitRepoState.
+func TestStateCaching_HeadChangeDuringIndexing(t *testing.T) {
+	requireTools(t)
+
+	dir := initGitRepo(t, "app.go", "package main\n// v1\n")
+
+	// Dirty the file
+	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// v2_dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	indexDir := filepath.Join(dir, cacheDir)
+	_ = os.MkdirAll(indexDir, 0o755)
+
+	// Capture pre-state (HEAD = commit1, app.go dirty)
+	state := gitRepoStateIn(ctx, dir)
+	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+
+	// Simulate HEAD change: commit the dirty file
+	gitRunIn(t, dir, "add", "app.go")
+	gitRunIn(t, dir, "commit", "-m", "commit during indexing")
+
+	// Run indexing with old state
+	deleteStateFiles(indexDir)
+	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+		t.Fatalf("indexing failed: %v", err)
+	}
+
+	// Restat doesn't detect HEAD change — state file IS written.
+	// (app.go content on disk is unchanged, only git's view changed.)
+	cached := readStateFile(indexDir)
+
+	// The critical guarantee: next search MUST detect the mismatch.
+	newState := gitRepoStateIn(ctx, dir)
+	newHash := computeStateHash(repoStateFingerprint(dir, newState))
+	if newHash == cached {
+		t.Error("next search should see different state after HEAD change, but hashes match")
+	}
+}
+
+// TestStateCaching_NewUntrackedFileDuringIndexing verifies that a new
+// untracked file appearing during indexing is not detected by restat
+// but IS caught by the next search.
+func TestStateCaching_NewUntrackedFileDuringIndexing(t *testing.T) {
+	requireTools(t)
+
+	dir := initGitRepo(t, "app.go", "package main\n// original\n")
+
+	ctx := context.Background()
+	indexDir := filepath.Join(dir, cacheDir)
+	_ = os.MkdirAll(indexDir, 0o755)
+
+	// Capture pre-state (clean repo)
+	state := gitRepoStateIn(ctx, dir)
+	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+
+	// Simulate: new file appears during indexing
+	if err := os.WriteFile(filepath.Join(dir, "new_file.go"), []byte("package main\n// brand_new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	deleteStateFiles(indexDir)
+	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+		t.Fatalf("indexing failed: %v", err)
+	}
+
+	// Restat doesn't detect new file (not in state.Files) — state IS written
+	cached := readStateFile(indexDir)
+
+	// The critical guarantee: next search detects the new file
+	newState := gitRepoStateIn(ctx, dir)
+	newHash := computeStateHash(repoStateFingerprint(dir, newState))
+	if newHash == cached {
+		t.Error("next search should see different state after new file, but hashes match")
 	}
 }
 

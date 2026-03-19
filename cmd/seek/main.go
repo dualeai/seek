@@ -133,6 +133,9 @@ func run(ctx context.Context, pattern string) error {
 	// here for the search-only path (when the index is already up-to-date).
 	ensureGitExclude(repoDir, cacheDir)
 
+	// Enable the untracked cache for faster git status on large repos.
+	ensureUntrackedCache(ctx, repoDir)
+
 	// Compute state hash from a single atomic git status call.
 	state := gitRepoState(ctx)
 	currentState := computeStateHash(repoStateFingerprint(repoDir, state))

@@ -33,7 +33,7 @@ func TestBug_StaleFallbackMissesUncommittedContent(t *testing.T) {
 }
 
 func TestBug_PostIndexingStateDrift(t *testing.T) {
-	t.Skip("Known limitation: mutation during indexing serves stale results for the current search. Post-verification deletes state so the next search re-indexes.")
+	t.Skip("Known limitation: mutation during indexing serves stale results for the current search. Post-verification re-stats dirty files so the next search re-indexes.")
 }
 
 // ===========================================================================

@@ -1,6 +1,6 @@
 # seek
 
-Ranked, symbol-aware code search for AI agents. Single binary, no server, no API key. Build the index once in ~10s, search in under 200ms every time after.
+Ranked, symbol-aware code search for AI agents. Single binary, no server, no API key. ~150ms per search on kubernetes (29k files) -- including re-indexing dirty files.
 
 AI coding agents like [Claude Code](https://claude.com/product/claude-code), [Codex](https://openai.com/codex/), [Cursor](https://www.cursor.com/), and [Amp](https://ampcode.com/) search your code dozens of times per session. With grep or ripgrep, every query returns [unranked results in file-path order](https://milvus.io/blog/why-im-against-claude-codes-grep-only-retrieval-it-just-burns-too-many-tokens.md), forcing agents to read through noise to find what matters. seek gives them the best match first -- ranked by [BM25 relevance](https://en.wikipedia.org/wiki/Okapi_BM25), filtered by language or path, with symbol annotations and surrounding context included. Powered by [zoekt](https://github.com/sourcegraph/zoekt) (the engine behind [Sourcegraph](https://sourcegraph.com/)), it works as a tool call in any agent loop, an [MCP](https://modelcontextprotocol.io/) tool, or a shell alias.
 
@@ -39,7 +39,7 @@ $ seek "sym:formatResults"
 - **Filters that cut noise** -- `lang:python`, `file:api`, `-file:test` let agents narrow results in a single query. No grep-then-grep-again loops
 - **Searches uncommitted files** -- modified, staged, and untracked files are indexed alongside committed code, tagged `[uncommitted]`. Agents see the same code you do
 - **Safe for parallel agents** -- multiple agents search concurrently via flock-based locking. Essential when tools like Claude Code or Codex [spawn parallel sub-agents](https://openai.com/index/unrolling-the-codex-agent-loop/)
-- **Under 200ms search** -- trigram index means O(matches) per query, not O(corpus). First run builds the index in ~10s, every search after is instant
+- **~150ms search** -- trigram index means O(matches) per query, not O(corpus). Measured on kubernetes (29k files): cold index ~8s, every search after ~145ms including dirty-file re-indexing
 
 ## Install
 
@@ -260,7 +260,21 @@ seek works alongside ripgrep -- use ripgrep for ad-hoc regex, seek when you want
 2. **Index** -- if the cache is stale, builds a trigram index of committed files and reads uncommitted files directly into memory for separate indexing
 3. **Search** -- loads index shards, runs the query, deduplicates results (uncommitted version wins over committed)
 
-The index is stored in `.seek-cache/` at the repo root. First run takes ~10s (dominated by indexing), subsequent searches complete in under 200ms.
+The index is stored in `.seek-cache/` at the repo root. Benchmarks on Apple M1 Max:
+
+| Repo | Files | Cold index | Warm search | Dirty re-index |
+|------|-------|------------|-------------|----------------|
+| spf13/cobra | 66 | 0.4s | 75ms | 89ms |
+| prometheus/prometheus | 1,583 | 1.4s | 82ms | 96ms |
+| kubernetes/kubernetes | 29,179 | 7.5s | 132ms | 145ms |
+| torvalds/linux | 93,016 | 59s | 295ms | 301ms |
+
+Cold index runs once. Every subsequent search hits the warm or dirty path. Reproduce with:
+
+```bash
+git clone --depth=1 https://github.com/kubernetes/kubernetes /tmp/k8s
+make test-bench-repo SEEK_BENCH_REPO=/tmp/k8s
+```
 
 ### Parallel Safety
 

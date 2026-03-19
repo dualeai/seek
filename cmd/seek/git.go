@@ -53,8 +53,7 @@ func gitRepoState(ctx context.Context) repoState {
 }
 
 // gitRepoStateIn returns the repository state for a specific directory.
-// Used when the CWD may not be inside the target repository (e.g., post-
-// indexing verification in runIndexing).
+// Used when the CWD may not be inside the target repository.
 func gitRepoStateIn(ctx context.Context, dir string) repoState {
 	cmd := gitCmd(ctx, "status", "--porcelain=v2", "--branch", "--no-renames", "--no-ahead-behind", "-z")
 	cmd.Dir = dir
@@ -128,9 +127,8 @@ func parseGitStatusV2(raw string) repoState {
 
 // ensureGitExclude adds the cache directory to .git/info/exclude if not
 // already present. This prevents the cache from appearing as untracked in
-// git status, which would cause the state hash to drift between pre- and
-// post-indexing verification. Uses .git/info/exclude rather than .gitignore
-// to avoid modifying the user's working tree.
+// git status, which would pollute the state hash. Uses .git/info/exclude
+// rather than .gitignore to avoid modifying the user's working tree.
 func ensureGitExclude(repoDir, pattern string) {
 	infoDir := filepath.Join(repoDir, ".git", "info")
 	excludePath := filepath.Join(infoDir, "exclude")
@@ -158,6 +156,28 @@ func ensureGitExclude(repoDir, pattern string) {
 		_, _ = f.WriteString("\n")
 	}
 	_, _ = f.WriteString(needle + "\n")
+}
+
+// ensureUntrackedCache enables core.untrackedCache if not already set.
+// The untracked cache stores directory mtimes in the git index so that
+// git status can skip scanning unchanged directories. On a 17k-file repo
+// this reduces git status from ~400ms to ~70ms (6-7x). The setting is
+// safe, reversible, and stored in .git/config (per-repo only).
+//
+// Reads .git/config directly (~14µs) instead of spawning git config
+// (~8ms) to avoid subprocess overhead on the hot path.
+func ensureUntrackedCache(ctx context.Context, repoDir string) {
+	configPath := filepath.Join(repoDir, ".git", "config")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+	if strings.Contains(string(data), "untrackedCache") {
+		return
+	}
+	cmd := gitCmd(ctx, "config", "core.untrackedCache", "true")
+	cmd.Dir = repoDir
+	_ = cmd.Run()
 }
 
 // extractV2Path extracts the path from a porcelain v2 entry by skipping
