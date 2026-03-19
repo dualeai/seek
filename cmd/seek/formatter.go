@@ -10,14 +10,17 @@ import (
 )
 
 // formatResults formats zoekt FileMatch results into the output format.
-// Files are deduplicated (uncommitted wins), sorted by score descending.
-func formatResults(files []zoekt.FileMatch) string {
+// Files are deduplicated (uncommitted wins over committed; committed results
+// for dirty files are suppressed even when the uncommitted shard has no
+// match — the committed content is stale). Sorted by score descending.
+// Returns "" when all results are suppressed (caller should treat as no match).
+func formatResults(files []zoekt.FileMatch, dirtyFiles map[string]bool) string {
 	if len(files) == 0 {
 		return ""
 	}
 
 	// Deduplicate: uncommitted version wins over committed
-	deduped := deduplicateFiles(files)
+	deduped := deduplicateFiles(files, dirtyFiles)
 
 	// Sort by score descending
 	sort.SliceStable(deduped, func(i, j int) bool {
@@ -47,8 +50,11 @@ func formatResults(files []zoekt.FileMatch) string {
 	return s
 }
 
-// deduplicateFiles groups FileMatches by filename, preferring uncommitted versions.
-func deduplicateFiles(files []zoekt.FileMatch) []zoekt.FileMatch {
+// deduplicateFiles groups FileMatches by filename, preferring uncommitted
+// versions. When dirtyFiles is non-nil, committed-shard results for dirty
+// files are suppressed even when the uncommitted shard has no match — the
+// committed content is stale (e.g. the matched symbol was renamed locally).
+func deduplicateFiles(files []zoekt.FileMatch, dirtyFiles map[string]bool) []zoekt.FileMatch {
 	type fileEntry struct {
 		match       zoekt.FileMatch
 		uncommitted bool
@@ -65,6 +71,11 @@ func deduplicateFiles(files []zoekt.FileMatch) []zoekt.FileMatch {
 	}
 	result := make([]zoekt.FileMatch, 0, len(byPath))
 	for _, entry := range byPath {
+		// Suppress stale committed results for dirty files: the committed
+		// shard has HEAD content which is outdated for modified files.
+		if !entry.uncommitted && dirtyFiles[entry.match.FileName] {
+			continue
+		}
 		result = append(result, entry.match)
 	}
 	return result

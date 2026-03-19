@@ -172,6 +172,23 @@ func run(ctx context.Context, pattern string) error {
 		return errNoMatch
 	}
 
-	fmt.Print(formatResults(results))
+	// Build dirty-file set so formatResults can suppress stale committed
+	// results for files that have been modified in the working tree.
+	var dirtyFiles map[string]bool
+	if len(state.Files) > 0 {
+		dirtyFiles = make(map[string]bool, len(state.Files))
+		for _, f := range state.Files {
+			dirtyFiles[f] = true
+		}
+	}
+
+	// formatResults returns "" when all results were stale committed
+	// matches for dirty files — treat as no match (exit code 1).
+	output := formatResults(results, dirtyFiles)
+	if output == "" {
+		return errNoMatch
+	}
+
+	fmt.Print(output)
 	return nil
 }
