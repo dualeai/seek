@@ -36,6 +36,12 @@ const (
 	// file indexing. Files larger than this are skipped to prevent excessive
 	// memory usage.
 	maxUncommittedFileSize = 10 * 1024 * 1024 // 10 MB
+	// shardMax is the maximum corpus size (in bytes) per zoekt shard.
+	// Smaller shards allow more parallel shard building during cold index.
+	// Default zoekt value is 100MB (3 shards for k8s, ~1.7 cores used).
+	// 10MB produces ~23 shards for k8s, utilizing ~5 cores → 2.7x faster.
+	// No measurable impact on warm search latency.
+	shardMax = 10 * 1024 * 1024 // 10 MB
 )
 
 // computeStateHash computes the xxHash64 of the given state string.
@@ -298,6 +304,7 @@ func indexCommitted(ctx context.Context, repoDir, indexDir string, parallelism i
 			IndexDir:         indexDir,
 			Parallelism:      parallelism,
 			CTagsMustSucceed: true,
+			ShardMax:         shardMax,
 		},
 	}
 	_, err := gitindex.IndexGitRepo(opts)

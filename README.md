@@ -39,7 +39,7 @@ $ seek "sym:formatResults"
 - **Filters that cut noise** -- `lang:python`, `file:api`, `-file:test` let agents narrow results in a single query. No grep-then-grep-again loops
 - **Searches uncommitted files** -- modified, staged, and untracked files are indexed alongside committed code, tagged `[uncommitted]`. Agents see the same code you do
 - **Safe for parallel agents** -- multiple agents search concurrently via flock-based locking. Essential when tools like Claude Code or Codex [spawn parallel sub-agents](https://openai.com/index/unrolling-the-codex-agent-loop/)
-- **~150ms search** -- trigram index means O(matches) per query, not O(corpus). Measured on kubernetes (29k files): cold index ~21s, every search after ~150ms including dirty-file re-indexing
+- **~150ms search** -- trigram index means O(matches) per query, not O(corpus). Measured on kubernetes (29k files): cold index ~8s, every search after ~145ms including dirty-file re-indexing
 
 ## Install
 
@@ -264,10 +264,10 @@ The index is stored in `.seek-cache/` at the repo root. Benchmarks on Apple M1 M
 
 | Repo | Files | Cold index | Warm search | Dirty re-index |
 |------|-------|------------|-------------|----------------|
-| spf13/cobra | 66 | 0.2s | 74ms | 88ms |
-| prometheus/prometheus | 1,583 | 2.2s | 82ms | 94ms |
-| kubernetes/kubernetes | 29,179 | 21s | 140ms | 151ms |
-| torvalds/linux | 93,016 | 67s | 303ms | 326ms |
+| spf13/cobra | 66 | 0.4s | 75ms | 89ms |
+| prometheus/prometheus | 1,583 | 1.4s | 82ms | 96ms |
+| kubernetes/kubernetes | 29,179 | 7.5s | 132ms | 145ms |
+| torvalds/linux | 93,016 | 59s | 295ms | 301ms |
 
 Cold index runs once. Every subsequent search hits the warm or dirty path. Reproduce with:
 
