@@ -9,7 +9,7 @@ import (
 )
 
 func TestFormatResults_Empty(t *testing.T) {
-	result := formatResults(nil)
+	result := formatResults(nil, nil)
 	if result != "" {
 		t.Errorf("expected empty string, got %q", result)
 	}
@@ -31,7 +31,7 @@ func TestFormatResults_BasicFileMatch(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	expected := "## src/main.go (Go)\n  5 func main() {"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -54,7 +54,7 @@ func TestFormatResults_UncommittedTag(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	expected := "## lib/utils.py (Python) [uncommitted]\n  10 def helper():"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -83,7 +83,7 @@ func TestFormatResults_Deduplication_UncommittedWins(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	if !strings.Contains(result, "[uncommitted]") {
 		t.Error("expected uncommitted version to win deduplication")
 	}
@@ -117,7 +117,7 @@ func TestFormatResults_ScoreSorting(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	highIdx := strings.Index(result, "high.go")
 	lowIdx := strings.Index(result, "low.go")
 	if highIdx > lowIdx {
@@ -146,7 +146,7 @@ func TestFormatResults_SymbolKind(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	expected := "## router.go (Go)\n  15 [function] func CoreRouter() {"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -166,7 +166,7 @@ func TestFormatResults_LanguageFallback(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	if !strings.Contains(result, "(unknown)") {
 		t.Error("expected language fallback to 'unknown'")
 	}
@@ -194,7 +194,7 @@ func TestFormatResults_MultiFile(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	if !strings.Contains(result, "## a.go (Go)") {
 		t.Error("expected a.go header")
 	}
@@ -216,7 +216,7 @@ func TestFormatResults_NoTrailingNewline(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	if len(result) > 0 && result[len(result)-1] == '\n' {
 		t.Error("output must not end with trailing newline")
 	}
@@ -232,7 +232,7 @@ func TestFormatResults_ZeroLineMatches(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	expected := "## empty.go (Go)"
 	if result != expected {
 		t.Errorf("expected %q, got %q", expected, result)
@@ -253,7 +253,7 @@ func TestFormatResults_ManyFiles_SortedByScore(t *testing.T) {
 		}
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 
 	// Highest score (999) should appear before lowest (0)
 	highIdx := strings.Index(result, "file_0999.go")
@@ -287,9 +287,9 @@ func TestDeduplicateFiles_OrderIndependence(t *testing.T) {
 	}
 
 	// committed first
-	r1 := deduplicateFiles([]zoekt.FileMatch{committed, uncommitted})
+	r1 := deduplicateFiles([]zoekt.FileMatch{committed, uncommitted}, nil)
 	// uncommitted first
-	r2 := deduplicateFiles([]zoekt.FileMatch{uncommitted, committed})
+	r2 := deduplicateFiles([]zoekt.FileMatch{uncommitted, committed}, nil)
 
 	if len(r1) != 1 || len(r2) != 1 {
 		t.Fatalf("expected 1 result each, got %d and %d", len(r1), len(r2))
@@ -306,7 +306,7 @@ func TestDeduplicateFiles_CommittedOnly(t *testing.T) {
 	files := []zoekt.FileMatch{
 		{FileName: "a.go", Repository: "repo", Score: 10},
 	}
-	result := deduplicateFiles(files)
+	result := deduplicateFiles(files, nil)
 	if len(result) != 1 || result[0].Repository != "repo" {
 		t.Error("single committed entry should pass through unchanged")
 	}
@@ -316,7 +316,7 @@ func TestDeduplicateFiles_UncommittedOnly(t *testing.T) {
 	files := []zoekt.FileMatch{
 		{FileName: "a.go", Repository: repoUncommitted, Score: 5},
 	}
-	result := deduplicateFiles(files)
+	result := deduplicateFiles(files, nil)
 	if len(result) != 1 || result[0].Repository != repoUncommitted {
 		t.Error("single uncommitted entry should pass through unchanged")
 	}
@@ -329,7 +329,7 @@ func TestFormatResults_ScoreTiebreaking_Stable(t *testing.T) {
 		{FileName: "a.go", Repository: "repo", Language: "Go", Score: 10,
 			LineMatches: []zoekt.LineMatch{{Line: []byte("a\n"), LineNumber: 1}}},
 	}
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	aIdx := strings.Index(result, "a.go")
 	bIdx := strings.Index(result, "b.go")
 	if aIdx > bIdx {
@@ -344,7 +344,7 @@ func TestDeduplicateFiles_TwoCommittedSameFile(t *testing.T) {
 		{FileName: "a.go", Repository: "repo", Score: 5,
 			LineMatches: []zoekt.LineMatch{{Line: []byte("second\n"), LineNumber: 2}}},
 	}
-	result := deduplicateFiles(files)
+	result := deduplicateFiles(files, nil)
 	if len(result) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(result))
 	}
@@ -375,7 +375,7 @@ func TestFormatResults_ContextLines_BeforeAndAfter(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	expected := strings.Join([]string{
 		"## server.go (Go)",
 		"  13 ",
@@ -406,7 +406,7 @@ func TestFormatResults_ContextLines_NoContext(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	expected := "## main.go (Go)\n  5 func main() {"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -438,7 +438,7 @@ func TestFormatResults_ContextLines_OverlappingContext(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"  10 first match",
@@ -473,11 +473,11 @@ func TestFormatResults_ContextLines_NonContiguousRegions(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
-		"  5 first match",
-		"  6 after first",
+		"   5 first match",
+		"   6 after first",
 		"",
 		"  49 before second",
 		"  50 second match",
@@ -510,7 +510,7 @@ func TestFormatResults_ContextLines_AdjacentMatches(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"  10 line one",
@@ -540,7 +540,7 @@ func TestFormatResults_ContextLines_ThreeContextLines(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	expected := strings.Join([]string{
 		"## main.go (Go)",
 		"  17 ctx line 17",
@@ -574,7 +574,7 @@ func TestFormatResults_ContextLines_MatchOnLine1(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	expected := strings.Join([]string{
 		"## main.go (Go)",
 		"  1 package main",
@@ -605,7 +605,7 @@ func TestFormatResults_ContextLines_MatchOnLine1_ExcessBefore(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	// Before lines should be silently dropped — no negative line numbers
 	if strings.Contains(result, "phantom") {
 		t.Errorf("expected excess Before lines to be dropped, got:\n%s", result)
@@ -636,7 +636,7 @@ func TestFormatResults_ContextLines_MatchOnLine2_PartialBefore(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	expected := strings.Join([]string{
 		"## main.go (Go)",
 		"  1 package main",
@@ -676,7 +676,7 @@ func TestFormatResults_ContextLines_ThreeConsecutiveMatches(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"  10 match A",
@@ -708,10 +708,10 @@ func TestFormatResults_ContextLines_OnlyBefore(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
-		"  99 penultimate",
+		"   99 penultimate",
 		"  100 last line",
 	}, "\n")
 	if result != expected {
@@ -737,7 +737,7 @@ func TestFormatResults_ContextLines_OnlyAfter(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"  1 first line",
@@ -767,7 +767,7 @@ func TestFormatResults_ContextLines_EmptyLinesInContext(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"  2 import \"fmt\"",
@@ -801,7 +801,7 @@ func TestFormatResults_ContextLines_EmptyByteSlice(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	expected := "## app.go (Go)\n  5 match"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -826,7 +826,7 @@ func TestFormatResults_ContextLines_BeforeNoTrailingNewline(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"  1 line one",
@@ -857,18 +857,241 @@ func TestFormatResults_FileOnlyMatch_LineNumberZero(t *testing.T) {
 	}
 
 	// Should not panic
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	if !strings.Contains(result, "## path/to/file.go (Go)") {
 		t.Errorf("expected file header, got: %s", result)
 	}
 }
 
+func TestDeduplicateFiles_StaleCommittedSuppressed(t *testing.T) {
+	// Bug: a file is dirty (edited locally) but the query only matches the
+	// committed (HEAD) version — the local edit changed the matched content.
+	// Example: user renames _MIGRATIONS to _get_migrations(), then searches
+	// for "_MIGRATIONS". The committed shard still has _MIGRATIONS but the
+	// uncommitted shard does not. The stale committed result must be suppressed.
+	files := []zoekt.FileMatch{
+		{
+			FileName:   "repositories/sqlite.py",
+			Repository: "github.com/org/repo",
+			Language:   "Python",
+			Score:      10,
+			LineMatches: []zoekt.LineMatch{
+				{Line: []byte("_MIGRATIONS: list[Migration] = [\n"), LineNumber: 60},
+			},
+		},
+	}
+	dirtyFiles := map[string]bool{"repositories/sqlite.py": true}
+	result := deduplicateFiles(files, dirtyFiles)
+	if len(result) != 0 {
+		t.Errorf("expected dirty file's stale committed result to be suppressed, got %d results", len(result))
+	}
+}
+
+func TestDeduplicateFiles_DirtyFileUncommittedWins(t *testing.T) {
+	// When both shards match a dirty file, uncommitted still wins (existing behavior).
+	files := []zoekt.FileMatch{
+		{FileName: "app.go", Repository: "repo", Score: 10,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("old\n"), LineNumber: 1}}},
+		{FileName: "app.go", Repository: repoUncommitted, Score: 5,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("new\n"), LineNumber: 1}}},
+	}
+	dirtyFiles := map[string]bool{"app.go": true}
+	result := deduplicateFiles(files, dirtyFiles)
+	if len(result) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(result))
+	}
+	if result[0].Repository != repoUncommitted {
+		t.Error("expected uncommitted to win")
+	}
+}
+
+func TestDeduplicateFiles_CleanFileCommittedKept(t *testing.T) {
+	// A committed-only match for a CLEAN file is fine — no suppression.
+	files := []zoekt.FileMatch{
+		{FileName: "clean.go", Repository: "repo", Score: 10,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("content\n"), LineNumber: 1}}},
+	}
+	dirtyFiles := map[string]bool{"other.go": true}
+	result := deduplicateFiles(files, dirtyFiles)
+	if len(result) != 1 {
+		t.Errorf("expected clean file's committed result to be kept, got %d", len(result))
+	}
+}
+
+func TestDeduplicateFiles_NilDirtyFiles(t *testing.T) {
+	// nil dirtyFiles — all committed results pass through (backward compat).
+	files := []zoekt.FileMatch{
+		{FileName: "a.go", Repository: "repo", Score: 10},
+	}
+	result := deduplicateFiles(files, nil)
+	if len(result) != 1 {
+		t.Errorf("expected 1 result with nil dirtyFiles, got %d", len(result))
+	}
+}
+
+func TestFormatResults_StaleDirtyFileSuppressed(t *testing.T) {
+	// End-to-end: formatResults should produce no output when the only match
+	// is a stale committed result for a dirty file.
+	files := []zoekt.FileMatch{
+		{
+			FileName:   "sqlite.py",
+			Repository: "repo",
+			Language:   "Python",
+			Score:      10,
+			LineMatches: []zoekt.LineMatch{
+				{Line: []byte("_MIGRATIONS = []\n"), LineNumber: 60},
+			},
+		},
+	}
+	dirtyFiles := map[string]bool{"sqlite.py": true}
+	result := formatResults(files, dirtyFiles)
+	if result != "" {
+		t.Errorf("expected empty output for stale dirty file, got:\n%s", result)
+	}
+}
+
+func TestDeduplicateFiles_DeletedDirtyFile(t *testing.T) {
+	// A deleted file appears in git status (dirty). The committed shard may
+	// still match old content. Must be suppressed — file no longer exists.
+	files := []zoekt.FileMatch{
+		{FileName: "removed.go", Repository: "repo", Score: 10,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("old code\n"), LineNumber: 5}}},
+	}
+	dirtyFiles := map[string]bool{"removed.go": true}
+	result := deduplicateFiles(files, dirtyFiles)
+	if len(result) != 0 {
+		t.Errorf("expected deleted dirty file to be suppressed, got %d results", len(result))
+	}
+}
+
+func TestDeduplicateFiles_MixedDirtyAndClean(t *testing.T) {
+	// Mix of dirty and clean files: only dirty committed-only results suppressed.
+	files := []zoekt.FileMatch{
+		{FileName: "dirty.go", Repository: "repo", Score: 10,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("stale\n"), LineNumber: 1}}},
+		{FileName: "clean.go", Repository: "repo", Score: 8,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("valid\n"), LineNumber: 1}}},
+		{FileName: "also_dirty.go", Repository: repoUncommitted, Score: 6,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("fresh\n"), LineNumber: 1}}},
+	}
+	dirtyFiles := map[string]bool{"dirty.go": true, "also_dirty.go": true}
+	result := deduplicateFiles(files, dirtyFiles)
+	if len(result) != 2 {
+		t.Fatalf("expected 2 results (clean + uncommitted), got %d", len(result))
+	}
+	for _, fm := range result {
+		if fm.FileName == "dirty.go" {
+			t.Error("stale committed result for dirty.go should have been suppressed")
+		}
+	}
+}
+
+func TestDeduplicateFiles_EmptyDirtyFilesMap(t *testing.T) {
+	// Empty (non-nil) dirtyFiles map — no suppression, same as nil.
+	files := []zoekt.FileMatch{
+		{FileName: "a.go", Repository: "repo", Score: 10},
+	}
+	result := deduplicateFiles(files, map[string]bool{})
+	if len(result) != 1 {
+		t.Errorf("expected 1 result with empty dirtyFiles, got %d", len(result))
+	}
+}
+
+func TestDeduplicateFiles_UncommittedOnlyDirtyFile(t *testing.T) {
+	// New untracked file — only in uncommitted shard, also in dirtyFiles.
+	// Should pass through (it IS the uncommitted entry).
+	files := []zoekt.FileMatch{
+		{FileName: "new_file.go", Repository: repoUncommitted, Score: 5,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("new\n"), LineNumber: 1}}},
+	}
+	dirtyFiles := map[string]bool{"new_file.go": true}
+	result := deduplicateFiles(files, dirtyFiles)
+	if len(result) != 1 {
+		t.Errorf("expected uncommitted-only dirty file to pass through, got %d", len(result))
+	}
+	if result[0].Repository != repoUncommitted {
+		t.Error("expected uncommitted entry")
+	}
+}
+
+func TestDeduplicateFiles_AllSuppressed(t *testing.T) {
+	// All results are stale committed for dirty files — empty output.
+	files := []zoekt.FileMatch{
+		{FileName: "a.go", Repository: "repo", Score: 10},
+		{FileName: "b.go", Repository: "repo", Score: 8},
+		{FileName: "c.go", Repository: "repo", Score: 6},
+	}
+	dirtyFiles := map[string]bool{"a.go": true, "b.go": true, "c.go": true}
+	result := deduplicateFiles(files, dirtyFiles)
+	if len(result) != 0 {
+		t.Errorf("expected all stale results suppressed, got %d", len(result))
+	}
+}
+
+func TestFormatResults_AllSuppressedReturnsEmpty(t *testing.T) {
+	// When all results are suppressed, formatResults returns "" so the caller
+	// can detect "no valid results" and return errNoMatch (exit code 1).
+	files := []zoekt.FileMatch{
+		{FileName: "a.py", Repository: "repo", Language: "Python", Score: 10,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("old\n"), LineNumber: 1}}},
+		{FileName: "b.py", Repository: "repo", Language: "Python", Score: 5,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("stale\n"), LineNumber: 2}}},
+	}
+	dirtyFiles := map[string]bool{"a.py": true, "b.py": true}
+	result := formatResults(files, dirtyFiles)
+	if result != "" {
+		t.Errorf("expected empty string when all results suppressed, got:\n%s", result)
+	}
+}
+
+func TestFormatResults_PartialSuppression(t *testing.T) {
+	// Some results suppressed, some kept.
+	files := []zoekt.FileMatch{
+		{FileName: "stale.go", Repository: "repo", Language: "Go", Score: 10,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("old\n"), LineNumber: 1}}},
+		{FileName: "valid.go", Repository: "repo", Language: "Go", Score: 5,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("good\n"), LineNumber: 1}}},
+	}
+	dirtyFiles := map[string]bool{"stale.go": true}
+	result := formatResults(files, dirtyFiles)
+	if strings.Contains(result, "stale.go") {
+		t.Error("stale.go should be suppressed")
+	}
+	if !strings.Contains(result, "valid.go") {
+		t.Error("valid.go should be present")
+	}
+	if !strings.Contains(result, "good") {
+		t.Error("valid content should be present")
+	}
+}
+
+func TestDeduplicateFiles_BothShardsMatchDirtyFile_OrderIndependence(t *testing.T) {
+	// When both shards match a dirty file, uncommitted wins regardless of order.
+	committed := zoekt.FileMatch{FileName: "f.go", Repository: "repo", Score: 10,
+		LineMatches: []zoekt.LineMatch{{Line: []byte("old\n"), LineNumber: 1}}}
+	uncommitted := zoekt.FileMatch{FileName: "f.go", Repository: repoUncommitted, Score: 5,
+		LineMatches: []zoekt.LineMatch{{Line: []byte("new\n"), LineNumber: 1}}}
+	dirtyFiles := map[string]bool{"f.go": true}
+
+	r1 := deduplicateFiles([]zoekt.FileMatch{committed, uncommitted}, dirtyFiles)
+	r2 := deduplicateFiles([]zoekt.FileMatch{uncommitted, committed}, dirtyFiles)
+
+	for _, r := range [][]zoekt.FileMatch{r1, r2} {
+		if len(r) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(r))
+		}
+		if r[0].Repository != repoUncommitted {
+			t.Error("expected uncommitted to win for dirty file")
+		}
+	}
+}
+
 func TestDeduplicateFiles_EmptyInput(t *testing.T) {
-	result := deduplicateFiles(nil)
+	result := deduplicateFiles(nil, nil)
 	if len(result) != 0 {
 		t.Errorf("expected 0 results, got %d", len(result))
 	}
-	result2 := deduplicateFiles([]zoekt.FileMatch{})
+	result2 := deduplicateFiles([]zoekt.FileMatch{}, nil)
 	if len(result2) != 0 {
 		t.Errorf("expected 0 results for empty slice, got %d", len(result2))
 	}
@@ -882,7 +1105,7 @@ func TestDeduplicateFiles_ManyDuplicates(t *testing.T) {
 	for i := range 100 {
 		files[100+i] = zoekt.FileMatch{FileName: "dup.go", Repository: repoUncommitted, Score: float64(i)}
 	}
-	result := deduplicateFiles(files)
+	result := deduplicateFiles(files, nil)
 	if len(result) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(result))
 	}
@@ -900,7 +1123,7 @@ func TestDeduplicateFiles_DifferentFiles(t *testing.T) {
 			Score:      float64(i),
 		}
 	}
-	result := deduplicateFiles(files)
+	result := deduplicateFiles(files, nil)
 	if len(result) != 10 {
 		t.Errorf("expected 10 results (no duplicates), got %d", len(result))
 	}
@@ -919,7 +1142,7 @@ func TestFormatResults_VeryLongFileName(t *testing.T) {
 			},
 		},
 	}
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	if !strings.Contains(result, longName) {
 		t.Error("expected long filename to appear in output without truncation")
 	}
@@ -938,7 +1161,7 @@ func TestFormatResults_VeryLongLine(t *testing.T) {
 			},
 		},
 	}
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	if !strings.Contains(result, strings.Repeat("x", 10000)) {
 		t.Error("expected long line to appear without truncation")
 	}
@@ -956,7 +1179,7 @@ func TestFormatResults_SpecialCharsInLine(t *testing.T) {
 			},
 		},
 	}
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	if !strings.Contains(result, "tab\there unicode: 日本語 emoji: 🎉") {
 		t.Errorf("expected special chars preserved, got: %s", result)
 	}
@@ -980,9 +1203,91 @@ func TestFormatResults_LineNumber_MaxUint32(t *testing.T) {
 		},
 	}
 	// Should not panic
-	result := formatResults(files)
+	result := formatResults(files, nil)
 	if !strings.Contains(result, "match") {
 		t.Error("expected match to appear in output")
+	}
+}
+
+func TestWriteLineNum(t *testing.T) {
+	tests := []struct {
+		lineNum int
+		width   int
+		want    string
+	}{
+		{1, 1, "1"},
+		{1, 3, "  1"},
+		{10, 3, " 10"},
+		{100, 3, "100"},
+		{100, 2, "100"}, // overflow: no truncation, no panic
+		{0, 1, "0"},
+		{1, 0, "1"}, // zero width: no padding
+	}
+	for _, tt := range tests {
+		var sb strings.Builder
+		writeLineNum(&sb, tt.lineNum, tt.width)
+		if got := sb.String(); got != tt.want {
+			t.Errorf("writeLineNum(%d, %d) = %q, want %q", tt.lineNum, tt.width, got, tt.want)
+		}
+	}
+}
+
+func TestMaxLineNumWidth(t *testing.T) {
+	tests := []struct {
+		name  string
+		files []zoekt.FileMatch
+		want  int
+	}{
+		{"nil", nil, 1},
+		{"empty", []zoekt.FileMatch{}, 1},
+		{"single digit", []zoekt.FileMatch{
+			{LineMatches: []zoekt.LineMatch{{LineNumber: 5}}},
+		}, 1},
+		{"boundary 9 to 10 via after-context", []zoekt.FileMatch{
+			{LineMatches: []zoekt.LineMatch{{LineNumber: 9, After: []byte("line10\n")}}},
+		}, 2},
+		{"triple digit", []zoekt.FileMatch{
+			{LineMatches: []zoekt.LineMatch{{LineNumber: 99, After: []byte("line100\nline101\n")}}},
+		}, 3},
+		{"zero line number", []zoekt.FileMatch{
+			{LineMatches: []zoekt.LineMatch{{LineNumber: 0}}},
+		}, 1},
+		{"cross-file max", []zoekt.FileMatch{
+			{LineMatches: []zoekt.LineMatch{{LineNumber: 5}}},
+			{LineMatches: []zoekt.LineMatch{{LineNumber: 100}}},
+		}, 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := maxLineNumWidth(tt.files); got != tt.want {
+				t.Errorf("maxLineNumWidth() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFormatResults_GlobalAlignment_CrossFile(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{
+			FileName: "shallow.go", Repository: "repo", Language: "Go", Score: 10,
+			LineMatches: []zoekt.LineMatch{
+				{Line: []byte("near top\n"), LineNumber: 5},
+			},
+		},
+		{
+			FileName: "deep.go", Repository: "repo", Language: "Go", Score: 9,
+			LineMatches: []zoekt.LineMatch{
+				{Line: []byte("far down\n"), LineNumber: 100},
+			},
+		},
+	}
+	result := formatResults(files, nil)
+	// Both should be padded to width 3 (len("100") == 3)
+	if !strings.Contains(result, "    5 near top") {
+		t.Errorf("expected shallow match padded to width 3, got:\n%s", result)
+	}
+	if !strings.Contains(result, "  100 far down") {
+		t.Errorf("expected deep match at width 3, got:\n%s", result)
 	}
 }
 

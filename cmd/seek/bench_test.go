@@ -193,7 +193,7 @@ func BenchmarkFormatResults_1File_1Match(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		formatResults(files)
+		formatResults(files, nil)
 	}
 }
 
@@ -212,7 +212,7 @@ func BenchmarkFormatResults_10Files_3Matches(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		formatResults(files)
+		formatResults(files, nil)
 	}
 }
 
@@ -233,7 +233,7 @@ func BenchmarkFormatResults_100Files_WithDedup(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		formatResults(files)
+		formatResults(files, nil)
 	}
 }
 
@@ -257,7 +257,7 @@ func BenchmarkFormatResults_WithSymbols(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		formatResults(files)
+		formatResults(files, nil)
 	}
 }
 
@@ -269,7 +269,7 @@ func BenchmarkDeduplicateFiles_100(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		deduplicateFiles(files)
+		deduplicateFiles(files, nil)
 	}
 }
 

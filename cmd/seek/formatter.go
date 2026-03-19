@@ -10,14 +10,17 @@ import (
 )
 
 // formatResults formats zoekt FileMatch results into the output format.
-// Files are deduplicated (uncommitted wins), sorted by score descending.
-func formatResults(files []zoekt.FileMatch) string {
+// Files are deduplicated (uncommitted wins over committed; committed results
+// for dirty files are suppressed even when the uncommitted shard has no
+// match — the committed content is stale). Sorted by score descending.
+// Returns "" when all results are suppressed (caller should treat as no match).
+func formatResults(files []zoekt.FileMatch, dirtyFiles map[string]bool) string {
 	if len(files) == 0 {
 		return ""
 	}
 
 	// Deduplicate: uncommitted version wins over committed
-	deduped := deduplicateFiles(files)
+	deduped := deduplicateFiles(files, dirtyFiles)
 
 	// Sort by score descending
 	sort.SliceStable(deduped, func(i, j int) bool {
@@ -27,12 +30,16 @@ func formatResults(files []zoekt.FileMatch) string {
 		return deduped[i].FileName < deduped[j].FileName
 	})
 
+	// Compute the digit width of the largest line number across all files
+	// so every line number in the output uses a consistent field width.
+	width := maxLineNumWidth(deduped)
+
 	var sb strings.Builder
 	for i, fm := range deduped {
 		if i > 0 {
 			sb.WriteByte('\n')
 		}
-		formatFileMatch(&sb, fm)
+		formatFileMatch(&sb, fm, width)
 	}
 
 	// No trailing newline after the last line
@@ -43,8 +50,11 @@ func formatResults(files []zoekt.FileMatch) string {
 	return s
 }
 
-// deduplicateFiles groups FileMatches by filename, preferring uncommitted versions.
-func deduplicateFiles(files []zoekt.FileMatch) []zoekt.FileMatch {
+// deduplicateFiles groups FileMatches by filename, preferring uncommitted
+// versions. When dirtyFiles is non-nil, committed-shard results for dirty
+// files are suppressed even when the uncommitted shard has no match — the
+// committed content is stale (e.g. the matched symbol was renamed locally).
+func deduplicateFiles(files []zoekt.FileMatch, dirtyFiles map[string]bool) []zoekt.FileMatch {
 	type fileEntry struct {
 		match       zoekt.FileMatch
 		uncommitted bool
@@ -61,15 +71,40 @@ func deduplicateFiles(files []zoekt.FileMatch) []zoekt.FileMatch {
 	}
 	result := make([]zoekt.FileMatch, 0, len(byPath))
 	for _, entry := range byPath {
+		// Suppress stale committed results for dirty files: the committed
+		// shard has HEAD content which is outdated for modified files.
+		if !entry.uncommitted && dirtyFiles[entry.match.FileName] {
+			continue
+		}
 		result = append(result, entry.match)
 	}
 	return result
 }
 
+// maxLineNumWidth returns the digit count of the largest line number that will
+// be displayed. After-context lines can extend past the match line; before-context
+// lines are always smaller, so only match + after-count is checked.
+func maxLineNumWidth(files []zoekt.FileMatch) int {
+	maxLine := 0
+	for _, fm := range files {
+		for _, lm := range fm.LineMatches {
+			lineNum := int(lm.LineNumber)
+			afterCount := countContextLines(lm.After)
+			if end := lineNum + afterCount; end > maxLine {
+				maxLine = end
+			}
+		}
+	}
+	if maxLine == 0 {
+		return 1
+	}
+	return len(strconv.Itoa(maxLine))
+}
+
 // formatFileMatch formats a single FileMatch into the output format.
 // Context lines (Before/After) are rendered with the same indentation as match
 // lines but without symbol annotations, making matches visually prominent.
-func formatFileMatch(sb *strings.Builder, fm zoekt.FileMatch) {
+func formatFileMatch(sb *strings.Builder, fm zoekt.FileMatch, width int) {
 	lang := fm.Language
 	if lang == "" {
 		lang = "unknown"
@@ -125,12 +160,12 @@ func formatFileMatch(sb *strings.Builder, fm zoekt.FileMatch) {
 			if lineNum <= lastEmittedLine {
 				continue
 			}
-			writeContextLine(sb, lineNum, cl)
+			writeContextLine(sb, lineNum, cl, width)
 		}
 
 		// Emit the match line itself
 		sb.WriteString("  ")
-		sb.WriteString(strconv.Itoa(matchLine))
+		writeLineNum(sb, matchLine, width)
 		sb.WriteByte(' ')
 
 		// Symbol kind from first line fragment
@@ -165,16 +200,27 @@ func formatFileMatch(sb *strings.Builder, fm zoekt.FileMatch) {
 
 		for k := range afterLimit {
 			lineNum := matchLine + 1 + k
-			writeContextLine(sb, lineNum, afterLines[k])
+			writeContextLine(sb, lineNum, afterLines[k], width)
 			lastEmittedLine = lineNum
 		}
 	}
 }
 
-// writeContextLine writes a single context line in the format "  {linenum} {content}\n".
-func writeContextLine(sb *strings.Builder, lineNum int, content string) {
+// writeLineNum right-aligns lineNum within a field of width digits.
+func writeLineNum(sb *strings.Builder, lineNum, width int) {
+	s := strconv.Itoa(lineNum)
+	// Go 1.22+: range over negative int iterates zero times.
+	for range width - len(s) {
+		sb.WriteByte(' ')
+	}
+	sb.WriteString(s)
+}
+
+// writeContextLine writes a context line: two-space indent, right-aligned
+// line number, a space separator, the content, and a newline.
+func writeContextLine(sb *strings.Builder, lineNum int, content string, width int) {
 	sb.WriteString("  ")
-	sb.WriteString(strconv.Itoa(lineNum))
+	writeLineNum(sb, lineNum, width)
 	sb.WriteByte(' ')
 	sb.WriteString(content)
 	sb.WriteByte('\n')

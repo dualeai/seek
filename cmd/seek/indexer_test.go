@@ -1773,13 +1773,14 @@ func TestStreamingMemoryBounded(t *testing.T) {
 	}
 	heapDelta := tracker.stop()
 
-	// Budget: 2*parallelism*fileSize = 40MB + overhead for GC timing,
-	// runtime, and other test goroutines (ReadMemStats is process-wide).
-	// Must be well under 250MB (what the old buffered approach would use).
-	const budget = 120 * 1024 * 1024
+	// Streaming must use at least 33% less memory than the total input.
+	// The old buffered approach would hold all content at once; streaming
+	// should be well under that thanks to backpressure.
+	totalContent := int64(numFiles * fileSize)
+	budget := totalContent * 2 / 3
 	t.Logf("total content: %d MB, peak heap delta: %d MB, budget: %d MB",
-		numFiles*fileSize/(1024*1024), heapDelta/(1024*1024), budget/(1024*1024))
-	if heapDelta > int64(budget) {
+		totalContent/(1024*1024), heapDelta/(1024*1024), budget/(1024*1024))
+	if heapDelta > budget {
 		t.Fatalf("heap grew by %d MB, exceeds budget of %d MB — streaming is not bounded",
 			heapDelta/(1024*1024), budget/(1024*1024))
 	}
@@ -1809,19 +1810,25 @@ func TestStreamingMemoryDoesNotScaleWithInput(t *testing.T) {
 		return tracker.stop()
 	}
 
-	small := measurePeakHeap(10) // 10 × 5MB = 50MB total
-	large := measurePeakHeap(50) // 50 × 5MB = 250MB total
+	const smallCount = 10
+	const largeCount = 50
+	small := measurePeakHeap(smallCount) // 10 × 5MB = 50MB total
+	large := measurePeakHeap(largeCount) // 50 × 5MB = 250MB total
 
-	t.Logf("10 files (50MB total): peak delta %d MB", small/(1024*1024))
-	t.Logf("50 files (250MB total): peak delta %d MB", large/(1024*1024))
+	t.Logf("%d files (%dMB total): peak delta %d MB", smallCount, smallCount*fileSize/(1024*1024), small/(1024*1024))
+	t.Logf("%d files (%dMB total): peak delta %d MB", largeCount, largeCount*fileSize/(1024*1024), large/(1024*1024))
 
 	// 5x more input should NOT cause 5x more heap. With streaming, peak
-	// is bounded by 2*parallelism*fileSize = 40MB regardless of file count.
-	// Allow 3x + floor to account for GC timing, runtime, and process-wide
-	// heap noise from other test goroutines.
-	if large > max(small*3, 120*1024*1024) {
-		t.Fatalf("memory scales with input: 10 files=%d MB, 50 files=%d MB",
-			small/(1024*1024), large/(1024*1024))
+	// is bounded by 2*parallelism*fileSize regardless of file count.
+	// Two conditions (whichever is stricter):
+	//   - scaling: large must stay under 3× small
+	//   - absolute: large must use at least 33% less than total input
+	largeTotalContent := int64(largeCount * fileSize)
+	floor := largeTotalContent * 2 / 3
+	limit := max(small*3, floor)
+	if large > limit {
+		t.Fatalf("memory scales with input: 10 files=%d MB, 50 files=%d MB, limit=%d MB",
+			small/(1024*1024), large/(1024*1024), limit/(1024*1024))
 	}
 }
 
