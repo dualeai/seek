@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -45,7 +46,7 @@ func initGitRepo(tb testing.TB, fileName, content string) string {
 	}
 
 	// Exclude seek's cache directory from git status to match production behavior
-	ensureGitExclude(dir, cacheDir)
+	ensureGitExclude(fallbackGitPaths(dir), cacheDir)
 
 	// Write and commit the file
 	if err := os.WriteFile(filepath.Join(dir, fileName), []byte(content), 0o644); err != nil {
@@ -109,6 +110,64 @@ func gitRunIn(t *testing.T, dir string, args ...string) {
 	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v failed: %v\n%s", args, err, out)
+	}
+}
+
+func gitCurrentBranch(t *testing.T, dir string) string {
+	t.Helper()
+	cmd := exec.Command("git", "symbolic-ref", "--quiet", "--short", "HEAD")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git current branch failed: %v\n%s", err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func initGitWorktree(t *testing.T, fileName, content string) (string, string) {
+	t.Helper()
+
+	repoDir := initGitRepo(t, fileName, content)
+	gitRunIn(t, repoDir, "branch", "worktree-branch")
+
+	worktreeRoot := t.TempDir()
+	worktreeDir := filepath.Join(worktreeRoot, "wt")
+	gitRunIn(t, repoDir, "worktree", "add", worktreeDir, "worktree-branch")
+
+	return repoDir, worktreeDir
+}
+
+func TestResolveGitPaths_Worktree(t *testing.T) {
+	requireTools(t)
+
+	repoDir, worktreeDir := initGitWorktree(t, "app.go", "package main\n// worktree_base\n")
+	paths, err := resolveGitPaths(context.Background(), worktreeDir)
+	if err != nil {
+		t.Fatalf("resolveGitPaths: %v", err)
+	}
+	resolvedRepoDir, err := filepath.EvalSymlinks(repoDir)
+	if err != nil {
+		resolvedRepoDir = repoDir
+	}
+	resolvedWorktreeDir, err := filepath.EvalSymlinks(worktreeDir)
+	if err != nil {
+		resolvedWorktreeDir = worktreeDir
+	}
+
+	if paths.RepoDir != resolvedWorktreeDir {
+		t.Fatalf("expected RepoDir %q, got %q", resolvedWorktreeDir, paths.RepoDir)
+	}
+	if !strings.Contains(paths.GitDir, "/.git/worktrees/") {
+		t.Fatalf("expected worktree git dir, got %q", paths.GitDir)
+	}
+	if paths.CommonDir != filepath.Join(resolvedRepoDir, ".git") {
+		t.Fatalf("expected common git dir %q, got %q", filepath.Join(resolvedRepoDir, ".git"), paths.CommonDir)
+	}
+	if !strings.HasSuffix(paths.ExcludePath, "/info/exclude") {
+		t.Fatalf("expected git exclude path, got %q", paths.ExcludePath)
+	}
+	if paths.ConfigPath != filepath.Join(resolvedRepoDir, ".git", "config") {
+		t.Fatalf("expected shared config path %q, got %q", filepath.Join(resolvedRepoDir, ".git", "config"), paths.ConfigPath)
 	}
 }
 

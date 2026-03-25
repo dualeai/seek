@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -15,6 +16,14 @@ type repoState struct {
 	HeadSHA   string   // commit SHA from # branch.oid, or "no-head"
 	RawOutput string   // full raw output for state hashing
 	Files     []string // paths of changed/untracked files
+}
+
+type gitPaths struct {
+	RepoDir     string
+	GitDir      string
+	CommonDir   string
+	ExcludePath string
+	ConfigPath  string
 }
 
 // gitCmd creates an exec.Cmd for git with graceful shutdown.
@@ -32,13 +41,66 @@ func gitCmd(ctx context.Context, args ...string) *exec.Cmd {
 	return cmd
 }
 
-// gitRepoRoot returns the absolute path to the git repository root.
-func gitRepoRoot(ctx context.Context) (string, error) {
-	out, err := gitCmd(ctx, "rev-parse", "--show-toplevel").Output()
-	if err != nil {
-		return "", err
+// resolveGitPathsFromCWD resolves git paths from the current working directory.
+func resolveGitPathsFromCWD(ctx context.Context) (gitPaths, error) {
+	return resolveGitPaths(ctx, "")
+}
+
+func resolveGitPaths(ctx context.Context, dir string) (gitPaths, error) {
+	cmd := gitCmd(ctx,
+		"rev-parse",
+		"--path-format=absolute",
+		"--show-toplevel",
+		"--git-dir",
+		"--git-common-dir",
+		"--git-path", "info/exclude",
+		"--git-path", "config",
+	)
+	if dir != "" {
+		cmd.Dir = dir
 	}
-	return strings.TrimSpace(string(out)), nil
+	out, err := cmd.Output()
+	if err != nil {
+		return gitPaths{}, err
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 5 {
+		return gitPaths{}, fmt.Errorf("unexpected git rev-parse output: got %d lines", len(lines))
+	}
+
+	paths := gitPaths{
+		RepoDir:     strings.TrimSpace(lines[0]),
+		GitDir:      strings.TrimSpace(lines[1]),
+		CommonDir:   strings.TrimSpace(lines[2]),
+		ExcludePath: strings.TrimSpace(lines[3]),
+		ConfigPath:  strings.TrimSpace(lines[4]),
+	}
+	return paths, nil
+}
+
+func fallbackGitPaths(repoDir string) gitPaths {
+	absRepoDir, err := filepath.Abs(repoDir)
+	if err != nil {
+		absRepoDir = repoDir
+	}
+	gitDir := filepath.Join(absRepoDir, ".git")
+	return gitPaths{
+		RepoDir:     absRepoDir,
+		GitDir:      gitDir,
+		CommonDir:   gitDir,
+		ExcludePath: filepath.Join(gitDir, "info", "exclude"),
+		ConfigPath:  filepath.Join(gitDir, "config"),
+	}
+}
+
+func resolveGitPathsOrFallback(ctx context.Context, repoDir string) gitPaths {
+	paths, err := resolveGitPaths(ctx, repoDir)
+	if err == nil {
+		return paths
+	}
+	slog.Warn("Failed to resolve git paths, using fallback", "dir", repoDir, "error", err)
+	return fallbackGitPaths(repoDir)
 }
 
 // gitRepoState returns the current repository state using a single
@@ -129,9 +191,9 @@ func parseGitStatusV2(raw string) repoState {
 // already present. This prevents the cache from appearing as untracked in
 // git status, which would pollute the state hash. Uses .git/info/exclude
 // rather than .gitignore to avoid modifying the user's working tree.
-func ensureGitExclude(repoDir, pattern string) {
-	infoDir := filepath.Join(repoDir, ".git", "info")
-	excludePath := filepath.Join(infoDir, "exclude")
+func ensureGitExclude(paths gitPaths, pattern string) {
+	infoDir := filepath.Dir(paths.ExcludePath)
+	excludePath := paths.ExcludePath
 
 	data, _ := os.ReadFile(excludePath)
 	needle := "/" + pattern
@@ -166,8 +228,8 @@ func ensureGitExclude(repoDir, pattern string) {
 //
 // Reads .git/config directly (~14µs) instead of spawning git config
 // (~8ms) to avoid subprocess overhead on the hot path.
-func ensureUntrackedCache(ctx context.Context, repoDir string) {
-	configPath := filepath.Join(repoDir, ".git", "config")
+func ensureUntrackedCache(ctx context.Context, paths gitPaths) {
+	configPath := paths.ConfigPath
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return
@@ -176,7 +238,7 @@ func ensureUntrackedCache(ctx context.Context, repoDir string) {
 		return
 	}
 	cmd := gitCmd(ctx, "config", "core.untrackedCache", "true")
-	cmd.Dir = repoDir
+	cmd.Dir = paths.RepoDir
 	_ = cmd.Run()
 }
 

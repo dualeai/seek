@@ -174,9 +174,10 @@ func BenchmarkEnsureGitExclude_AlreadyPresent(b *testing.B) {
 	dir := b.TempDir()
 	_ = os.MkdirAll(filepath.Join(dir, ".git", "info"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir, ".git", "info", "exclude"), []byte("/.seek-cache\n"), 0o644)
+	paths := fallbackGitPaths(dir)
 	b.ReportAllocs()
 	for b.Loop() {
-		ensureGitExclude(dir, cacheDir)
+		ensureGitExclude(paths, cacheDir)
 	}
 }
 
@@ -428,7 +429,7 @@ func setupLargeRepoBench(b *testing.B) (repoDir, indexDir string) {
 	repoDir = requireBenchRepo(b)
 	indexDir = filepath.Join(repoDir, cacheDir)
 	_ = os.MkdirAll(indexDir, 0o755)
-	ensureGitExclude(repoDir, cacheDir)
+	ensureGitExclude(fallbackGitPaths(repoDir), cacheDir)
 
 	ctx := context.Background()
 	state := gitRepoStateIn(ctx, repoDir)
@@ -508,7 +509,8 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 	repoDir := requireBenchRepo(b)
 	indexDir := filepath.Join(repoDir, cacheDir)
 	_ = os.MkdirAll(indexDir, 0o755)
-	ensureGitExclude(repoDir, cacheDir)
+	paths := fallbackGitPaths(repoDir)
+	ensureGitExclude(paths, cacheDir)
 	ctx := context.Background()
 
 	// Ensure index is warm
@@ -553,21 +555,21 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 	b.Run("ensureGitExclude", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			ensureGitExclude(repoDir, cacheDir)
+			ensureGitExclude(paths, cacheDir)
 		}
 	})
 
 	b.Run("ensureUntrackedCache", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			ensureUntrackedCache(ctx, repoDir)
+			ensureUntrackedCache(ctx, paths)
 		}
 	})
 
 	b.Run("indexCommitted_incremental", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			_ = indexCommitted(ctx, repoDir, indexDir, indexParallelism())
+			_ = indexCommitted(ctx, paths, indexDir, indexParallelism())
 		}
 	})
 
@@ -657,4 +659,3 @@ func findGoFiles(b *testing.B, repoDir string, n int) []string {
 	}
 	return result
 }
-

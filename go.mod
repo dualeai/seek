@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
-	github.com/sourcegraph/zoekt v0.0.0-20260114143800-c747a3bccc2a
+	github.com/sourcegraph/zoekt v0.0.0-20260325124901-a0f5789d25cb
 )
 
 require (
@@ -44,6 +44,9 @@ require (
 	github.com/sergi/go-diff v1.4.0 // indirect
 	github.com/skeema/knownhosts v1.3.2 // indirect
 	github.com/sourcegraph/go-ctags v0.0.0-20250729094530-349a251d78d8 // indirect
+	github.com/tetratelabs/wazero v1.9.0 // indirect
+	github.com/wasilibs/go-re2 v1.10.0 // indirect
+	github.com/wasilibs/wazero-helpers v0.0.0-20240620070341-3dff1577cd52 // indirect
 	github.com/xanzy/ssh-agent v0.3.3 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
