@@ -6,6 +6,7 @@ AI coding agents like [Claude Code](https://claude.com/product/claude-code), [Co
 
 <!-- Status -->
 [![CI](https://github.com/dualeai/seek/actions/workflows/ci.yml/badge.svg)](https://github.com/dualeai/seek/actions/workflows/ci.yml)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/dualeai/seek?utm_source=badge)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
 ### Example: dozens of grep matches vs. 1 ranked result
