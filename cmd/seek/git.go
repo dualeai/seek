@@ -47,6 +47,8 @@ func resolveGitPathsFromCWD(ctx context.Context) (gitPaths, error) {
 }
 
 func resolveGitPaths(ctx context.Context, dir string) (gitPaths, error) {
+	// --path-format=absolute requires Git 2.31+. Older Git falls back to
+	// the legacy path assumption in fallbackGitPaths.
 	cmd := gitCmd(ctx,
 		"rev-parse",
 		"--path-format=absolute",
@@ -92,15 +94,6 @@ func fallbackGitPaths(repoDir string) gitPaths {
 		ExcludePath: filepath.Join(gitDir, "info", "exclude"),
 		ConfigPath:  filepath.Join(gitDir, "config"),
 	}
-}
-
-func resolveGitPathsOrFallback(ctx context.Context, repoDir string) gitPaths {
-	paths, err := resolveGitPaths(ctx, repoDir)
-	if err == nil {
-		return paths
-	}
-	slog.Warn("Failed to resolve git paths, using fallback", "dir", repoDir, "error", err)
-	return fallbackGitPaths(repoDir)
 }
 
 // gitRepoState returns the current repository state using a single

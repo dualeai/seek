@@ -144,7 +144,7 @@ func run(ctx context.Context, pattern string) error {
 	// Re-index if the cached state differs from the current working tree.
 	cachedState := readStateFile(indexDir)
 	if currentState != cachedState {
-		if err := runIndexing(ctx, repoDir, indexDir, state, currentState); err != nil {
+		if err := runIndexing(ctx, paths, indexDir, state, currentState); err != nil {
 			slog.Warn("Indexing failed", "error", err)
 			// Continue to search with whatever shards exist
 		}

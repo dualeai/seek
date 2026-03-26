@@ -67,9 +67,15 @@ func initGitRepo(tb testing.TB, fileName, content string) string {
 }
 
 // runSeekInRepo runs the full seek pipeline against a repo directory.
+// It resolves gitPaths (covering the worktree case) before calling runIndexing.
 func runSeekInRepo(t *testing.T, repoDir, pattern string) ([]string, error) {
 	t.Helper()
 	ctx := context.Background()
+
+	paths, err := resolveGitPaths(ctx, repoDir)
+	if err != nil {
+		paths = fallbackGitPaths(repoDir)
+	}
 
 	indexDir := filepath.Join(repoDir, cacheDir)
 	if err := os.MkdirAll(indexDir, 0o755); err != nil {
@@ -80,7 +86,7 @@ func runSeekInRepo(t *testing.T, repoDir, pattern string) ([]string, error) {
 	currentState := computeStateHash(repoStateFingerprint(repoDir, state))
 	cachedState := readStateFile(indexDir)
 	if currentState != cachedState {
-		if err := runIndexing(ctx, repoDir, indexDir, state, currentState); err != nil {
+		if err := runIndexing(ctx, paths, indexDir, state, currentState); err != nil {
 			return nil, err
 		}
 	}
@@ -389,5 +395,46 @@ func TestIntegration_MultipleFiles_EditOne(t *testing.T) {
 	}
 	if len(files) == 0 {
 		t.Fatal("expected changed file to be searchable")
+	}
+}
+
+// verifies the full seek pipeline inside a git worktree
+func TestIntegration_Worktree_CommittedContent(t *testing.T) {
+	requireTools(t)
+
+	_, worktreeDir := initGitWorktree(t, "wt.go", `package main
+// worktree_committed_marker_e2e
+`)
+
+	files, err := runSeekInRepo(t, worktreeDir, "worktree_committed_marker_e2e")
+	if err != nil {
+		t.Fatalf("search failed: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("expected committed marker to be found inside worktree")
+	}
+}
+
+// verifies that an uncommitted edit inside a git worktree is visible without committing
+func TestIntegration_Worktree_DirtyFile(t *testing.T) {
+	requireTools(t)
+
+	_, worktreeDir := initGitWorktree(t, "wt_dirty.go", `package main
+// worktree_clean_marker_fff
+`)
+
+	// Dirty the file without committing
+	if err := os.WriteFile(filepath.Join(worktreeDir, "wt_dirty.go"), []byte(`package main
+// worktree_dirty_marker_fff
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := runSeekInRepo(t, worktreeDir, "worktree_dirty_marker_fff")
+	if err != nil {
+		t.Fatalf("search failed: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("FRESHNESS VIOLATION: uncommitted edit inside worktree not found")
 	}
 }

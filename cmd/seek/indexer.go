@@ -177,9 +177,8 @@ func checkCtags() error {
 }
 
 // runIndexing orchestrates committed and uncommitted indexing with locking.
-func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState, preState string) error {
-	paths := resolveGitPathsOrFallback(ctx, repoDir)
-	repoDir = paths.RepoDir
+func runIndexing(ctx context.Context, paths gitPaths, indexDir string, state repoState, preState string) error {
+	repoDir := paths.RepoDir
 	// Fail fast if ctags is missing
 	if err := checkCtags(); err != nil {
 		return err
@@ -239,12 +238,12 @@ func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState,
 		// the current goroutine (it must drain fileCh).
 		committedDone := make(chan error, 1)
 		go func() {
-			committedDone <- indexCommitted(ctx, paths, indexDir, parallelism)
+			committedDone <- indexCommitted(ctx, repoDir, indexDir, parallelism)
 		}()
 		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, fileCh, parallelism)
 		committedErr = <-committedDone
 	} else {
-		committedErr = indexCommitted(ctx, paths, indexDir, parallelism)
+		committedErr = indexCommitted(ctx, repoDir, indexDir, parallelism)
 		cleanUncommittedShards(indexDir)
 	}
 
@@ -297,9 +296,9 @@ func shardsExist(indexDir string) bool {
 }
 
 // indexCommitted indexes committed files using gitindex.IndexGitRepo.
-func indexCommitted(ctx context.Context, paths gitPaths, indexDir string, parallelism int) error {
+func indexCommitted(ctx context.Context, repoDir, indexDir string, parallelism int) error {
 	opts := gitindex.Options{
-		RepoDir:     paths.RepoDir,
+		RepoDir:     repoDir,
 		Incremental: true,
 		Branches:    []string{"HEAD"},
 		BuildOptions: index.Options{

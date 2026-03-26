@@ -342,7 +342,7 @@ func BenchmarkEndToEnd_ColdIndex(b *testing.B) {
 
 		state := gitRepoStateIn(ctx, dir)
 		stateHash := computeStateHash(repoStateFingerprint(dir, state))
-		_ = runIndexing(ctx, dir, indexDir, state, stateHash)
+		_ = runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash)
 		_, _ = executeSearch(ctx, indexDir, "benchmark_marker_cold")
 	}
 }
@@ -361,7 +361,7 @@ func BenchmarkEndToEnd_WarmIndex(b *testing.B) {
 	// Cold run to build index
 	state := gitRepoStateIn(ctx, dir)
 	stateHash := computeStateHash(repoStateFingerprint(dir, state))
-	_ = runIndexing(ctx, dir, indexDir, state, stateHash)
+	_ = runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash)
 
 	b.ResetTimer()
 	for b.Loop() {
@@ -370,7 +370,7 @@ func BenchmarkEndToEnd_WarmIndex(b *testing.B) {
 		currentState := computeStateHash(repoStateFingerprint(dir, state))
 		cachedState := readStateFile(indexDir)
 		if currentState != cachedState {
-			_ = runIndexing(ctx, dir, indexDir, state, currentState)
+			_ = runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, currentState)
 		}
 		_, _ = executeSearch(ctx, indexDir, "benchmark_marker_warm")
 	}
@@ -390,7 +390,7 @@ func BenchmarkEndToEnd_DirtyReindex(b *testing.B) {
 	// Cold run
 	state := gitRepoStateIn(ctx, dir)
 	stateHash := computeStateHash(repoStateFingerprint(dir, state))
-	_ = runIndexing(ctx, dir, indexDir, state, stateHash)
+	_ = runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash)
 
 	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
@@ -400,7 +400,7 @@ func BenchmarkEndToEnd_DirtyReindex(b *testing.B) {
 
 		state := gitRepoStateIn(ctx, dir)
 		currentState := computeStateHash(repoStateFingerprint(dir, state))
-		_ = runIndexing(ctx, dir, indexDir, state, currentState)
+		_ = runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, currentState)
 		_, _ = executeSearch(ctx, indexDir, "dirty_bench")
 	}
 }
@@ -436,7 +436,7 @@ func setupLargeRepoBench(b *testing.B) (repoDir, indexDir string) {
 	currentState := computeStateHash(repoStateFingerprint(repoDir, state))
 	cachedState := readStateFile(indexDir)
 	if currentState != cachedState {
-		if err := runIndexing(ctx, repoDir, indexDir, state, currentState); err != nil {
+		if err := runIndexing(ctx, fallbackGitPaths(repoDir), indexDir, state, currentState); err != nil {
 			b.Fatalf("initial indexing failed: %v", err)
 		}
 	}
@@ -452,7 +452,7 @@ func BenchmarkLargeRepo_WarmSearch(b *testing.B) {
 		currentState := computeStateHash(repoStateFingerprint(repoDir, state))
 		cachedState := readStateFile(indexDir)
 		if currentState != cachedState {
-			_ = runIndexing(ctx, repoDir, indexDir, state, currentState)
+			_ = runIndexing(ctx, fallbackGitPaths(repoDir), indexDir, state, currentState)
 		}
 		_, _ = executeSearch(ctx, indexDir, "func main")
 	}
@@ -498,7 +498,7 @@ func benchmarkLargeRepoDirtyN(b *testing.B, n int) {
 		}
 		state := gitRepoStateIn(ctx, repoDir)
 		currentState := computeStateHash(repoStateFingerprint(repoDir, state))
-		_ = runIndexing(ctx, repoDir, indexDir, state, currentState)
+		_ = runIndexing(ctx, fallbackGitPaths(repoDir), indexDir, state, currentState)
 		_, _ = executeSearch(ctx, indexDir, "func main")
 	}
 }
@@ -518,7 +518,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 	currentState := computeStateHash(repoStateFingerprint(repoDir, state))
 	cachedState := readStateFile(indexDir)
 	if currentState != cachedState {
-		if err := runIndexing(ctx, repoDir, indexDir, state, currentState); err != nil {
+		if err := runIndexing(ctx, paths, indexDir, state, currentState); err != nil {
 			b.Fatalf("initial indexing: %v", err)
 		}
 	}
@@ -569,7 +569,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 	b.Run("indexCommitted_incremental", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			_ = indexCommitted(ctx, paths, indexDir, indexParallelism())
+			_ = indexCommitted(ctx, paths.RepoDir, indexDir, indexParallelism())
 		}
 	})
 

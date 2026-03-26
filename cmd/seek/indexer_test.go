@@ -877,7 +877,7 @@ func TestStateCaching_BothSucceed_StateStable(t *testing.T) {
 	state := gitRepoStateIn(ctx, dir)
 	stateHash := computeStateHash(repoStateFingerprint(dir, state))
 
-	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -896,7 +896,7 @@ func TestStateCaching_BothSucceed_StateStable(t *testing.T) {
 	}
 	// runIndexing should short-circuit at the state check in run()
 	// We verify by checking the state file is unchanged
-	if err := runIndexing(ctx, dir, indexDir, state2, stateHash2); err != nil {
+	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state2, stateHash2); err != nil {
 		t.Fatalf("second indexing failed: %v", err)
 	}
 	cached2 := readStateFile(indexDir)
@@ -938,7 +938,7 @@ func TestStateCaching_BothSucceed_DirtyFileDrifted(t *testing.T) {
 
 	// Run indexing with the pre-mutation state.
 	// Post-verification re-stats state.Files and detects the drift.
-	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -974,7 +974,7 @@ func TestStateCaching_BothSucceed_CleanFileBecomesDirty(t *testing.T) {
 	}
 
 	deleteStateFiles(indexDir)
-	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -1021,7 +1021,7 @@ func TestStateCaching_DirtyFileDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -1061,7 +1061,7 @@ func TestStateCaching_DirtyFileAtomicReplace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -1091,7 +1091,7 @@ func TestStateCaching_UntouchedDirtyFile(t *testing.T) {
 	stateHash := computeStateHash(repoStateFingerprint(dir, state))
 
 	// Do NOT modify the file — indexing should detect no drift
-	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -1131,7 +1131,7 @@ func TestStateCaching_HeadChangeDuringIndexing(t *testing.T) {
 
 	// Run indexing with old state
 	deleteStateFiles(indexDir)
-	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -1169,7 +1169,7 @@ func TestStateCaching_NewUntrackedFileDuringIndexing(t *testing.T) {
 	}
 
 	deleteStateFiles(indexDir)
-	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -1213,7 +1213,7 @@ func TestStateCaching_CommittedFails(t *testing.T) {
 
 	// runIndexing will fail at ctags check or committed indexing.
 	// The error itself is expected — we only verify state file behavior.
-	err := runIndexing(ctx, dir, indexDir, state, stateHash)
+	err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash)
 
 	// State file must not retain the old value after a failed indexing run
 	cached := readStateFile(indexDir)
@@ -1248,7 +1248,7 @@ func TestStateCaching_WithUncommittedFiles_BothSucceed(t *testing.T) {
 		t.Fatal("precondition: state should have uncommitted files")
 	}
 
-	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -1288,7 +1288,7 @@ func TestStateCaching_NoUncommittedFiles(t *testing.T) {
 		t.Fatalf("precondition: clean repo should have no uncommitted files, got %v", state.Files)
 	}
 
-	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -1327,7 +1327,7 @@ func TestStateCaching_DoubleCheck_SkipsRedundantIndex(t *testing.T) {
 	stateHash := computeStateHash(repoStateFingerprint(dir, state))
 
 	// First index
-	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
 		t.Fatalf("first indexing failed: %v", err)
 	}
 
@@ -1338,7 +1338,7 @@ func TestStateCaching_DoubleCheck_SkipsRedundantIndex(t *testing.T) {
 	}
 
 	// Second index with same state should be a no-op (double-check hit)
-	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
 		t.Fatalf("second indexing failed: %v", err)
 	}
 
@@ -1365,7 +1365,7 @@ func TestStateCaching_StaleFallback_DoesNotWriteState(t *testing.T) {
 	// First index to create shards
 	state := gitRepoStateIn(ctx, dir)
 	stateHash := computeStateHash(repoStateFingerprint(dir, state))
-	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
 		t.Fatalf("initial indexing failed: %v", err)
 	}
 
@@ -1387,7 +1387,7 @@ func TestStateCaching_StaleFallback_DoesNotWriteState(t *testing.T) {
 	}
 
 	// runIndexing should fall back (shards exist, lock held)
-	if err := runIndexing(ctx, dir, indexDir, state, stateHash); err != nil {
+	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
 		t.Fatalf("stale fallback should not error: %v", err)
 	}
 
