@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -233,6 +234,62 @@ func ensureUntrackedCache(ctx context.Context, paths gitPaths) {
 	cmd := gitCmd(ctx, "config", "core.untrackedCache", "true")
 	cmd.Dir = paths.RepoDir
 	_ = cmd.Run()
+}
+
+// ensureFSMonitor enables the built-in filesystem monitor daemon if not
+// already configured. The fsmonitor daemon uses OS-level file watchers
+// (FSEvents on macOS, inotify on Linux) so git status can query a socket
+// instead of lstat'ing every tracked file. On large repos this reduces
+// git status from hundreds of milliseconds to single-digit ms. The
+// setting is safe, reversible, and stored in .git/config (per-repo only).
+//
+// Requires Git 2.36+ where core.fsmonitor=true means "use the built-in
+// daemon". On older versions this key expects a hook script path, and
+// setting it to "true" would be misinterpreted (on Unix, /usr/bin/true
+// exists and would silently disable change detection).
+//
+// Only called on first run (when no cached state exists), so the
+// subprocess cost of version detection is amortized.
+func ensureFSMonitor(ctx context.Context, paths gitPaths) {
+	configPath := paths.ConfigPath
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+	if strings.Contains(string(data), "fsmonitor") {
+		return
+	}
+	// Gate on Git 2.36+ to avoid misinterpretation of the boolean value.
+	if !gitVersionAtLeast(ctx, paths.RepoDir, 2, 36) {
+		return
+	}
+	cmd := gitCmd(ctx, "config", "core.fsmonitor", "true")
+	cmd.Dir = paths.RepoDir
+	_ = cmd.Run()
+}
+
+// gitVersionAtLeast returns true if the installed git version is at least
+// major.minor. Returns false on any parse error (conservative).
+func gitVersionAtLeast(ctx context.Context, dir string, major, minor int) bool {
+	cmd := gitCmd(ctx, "version")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	// Parse "git version 2.43.0" or "git version 2.43.0.windows.1"
+	s := strings.TrimSpace(string(out))
+	s = strings.TrimPrefix(s, "git version ")
+	parts := strings.SplitN(s, ".", 3)
+	if len(parts) < 2 {
+		return false
+	}
+	maj, err1 := strconv.Atoi(parts[0])
+	min, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return maj > major || (maj == major && min >= minor)
 }
 
 // extractV2Path extracts the path from a porcelain v2 entry by skipping

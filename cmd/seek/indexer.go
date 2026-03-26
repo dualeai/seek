@@ -25,6 +25,11 @@ const (
 	stateFile = ".state"
 	// stateTmpFile is used for atomic writes of the state file.
 	stateTmpFile = ".state.tmp"
+	// headFile stores the HEAD SHA of the last successful committed index.
+	// Used to skip incremental committed indexing when HEAD hasn't changed,
+	// avoiding ~560µs of git repo opening + shard metadata checks and
+	// eliminating CPU contention when running alongside uncommitted indexing.
+	headFile = ".head"
 	// lockFile is used for mutual exclusion during indexing.
 	lockFile = ".lock"
 	// repoUncommitted is the zoekt repository name for uncommitted file shards.
@@ -102,28 +107,46 @@ func repoStateFingerprint(repoDir string, state repoState) string {
 	return b.String()
 }
 
-// readStateFile reads the cached state hash from the stateFile in indexDir.
-func readStateFile(indexDir string) string {
-	data, err := os.ReadFile(filepath.Join(indexDir, stateFile))
+// readCacheFile reads a single-line cached value from indexDir/name.
+func readCacheFile(indexDir, name string) string {
+	data, err := os.ReadFile(filepath.Join(indexDir, name))
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
 }
 
-// writeStateFile atomically writes the state hash to the stateFile in indexDir.
-func writeStateFile(indexDir, state string) error {
-	tmpPath := filepath.Join(indexDir, stateTmpFile)
-	if err := os.WriteFile(tmpPath, []byte(state), 0o644); err != nil {
+// writeCacheFile atomically writes value to indexDir/name via tmp+rename.
+func writeCacheFile(indexDir, name, value string) error {
+	tmpPath := filepath.Join(indexDir, name+".tmp")
+	if err := os.WriteFile(tmpPath, []byte(value), 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, filepath.Join(indexDir, stateFile))
+	return os.Rename(tmpPath, filepath.Join(indexDir, name))
 }
 
-// deleteStateFiles removes .state and .state.tmp.
+// readStateFile reads the cached state hash.
+func readStateFile(indexDir string) string { return readCacheFile(indexDir, stateFile) }
+
+// writeStateFile atomically writes the state hash.
+func writeStateFile(indexDir, state string) error { return writeCacheFile(indexDir, stateFile, state) }
+
+// readHeadFile reads the last indexed HEAD SHA.
+func readHeadFile(indexDir string) string { return readCacheFile(indexDir, headFile) }
+
+// writeHeadFile atomically writes the HEAD SHA.
+func writeHeadFile(indexDir, sha string) error { return writeCacheFile(indexDir, headFile, sha) }
+
+// deleteStateFiles removes .state, .state.tmp, .head, and .head.tmp.
+// Clearing .head alongside .state ensures that a failed or drifted
+// indexing cycle forces a full re-index (including committed) on the
+// next invocation, rather than relying on a potentially stale .head
+// to skip committed indexing.
 func deleteStateFiles(indexDir string) {
 	_ = os.Remove(filepath.Join(indexDir, stateFile))
-	_ = os.Remove(filepath.Join(indexDir, stateTmpFile))
+	_ = os.Remove(filepath.Join(indexDir, stateFile+".tmp"))
+	_ = os.Remove(filepath.Join(indexDir, headFile))
+	_ = os.Remove(filepath.Join(indexDir, headFile+".tmp"))
 }
 
 // indexParallelism returns the number of parallel indexing workers.
@@ -189,8 +212,11 @@ func runIndexing(ctx context.Context, paths gitPaths, indexDir string, state rep
 
 	lockPath := filepath.Join(indexDir, lockFile)
 
-	// Ensure partial state file is cleaned up on all exit paths
-	defer func() { _ = os.Remove(filepath.Join(indexDir, stateTmpFile)) }()
+	// Ensure partial temp files are cleaned up on all exit paths
+	defer func() {
+		_ = os.Remove(filepath.Join(indexDir, stateTmpFile))
+		_ = os.Remove(filepath.Join(indexDir, headFile+".tmp"))
+	}()
 
 	lockFd, acquired, err := acquireLock(ctx, indexDir, lockPath)
 	if err != nil {
@@ -229,11 +255,17 @@ func runIndexing(ctx context.Context, paths gitPaths, indexDir string, state rep
 		}()
 	}
 
+	// Skip committed indexing when HEAD hasn't moved since the last
+	// successful index. This avoids ~560µs of git repo opening + shard
+	// metadata reads on the incremental no-op path, and eliminates CPU
+	// contention when running alongside the uncommitted indexer.
+	needCommitted := state.HeadSHA != readHeadFile(indexDir)
+
 	// Run committed and uncommitted indexing. They write different shard
 	// files (repo name vs "uncommitted" prefix) so when both are needed
 	// they run in parallel. When only one is needed, it runs alone.
 	var committedErr, uncommittedErr error
-	if fileCh != nil {
+	if fileCh != nil && needCommitted {
 		// Both needed — run committed in a goroutine, uncommitted in
 		// the current goroutine (it must drain fileCh).
 		committedDone := make(chan error, 1)
@@ -242,8 +274,15 @@ func runIndexing(ctx context.Context, paths gitPaths, indexDir string, state rep
 		}()
 		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, fileCh, parallelism)
 		committedErr = <-committedDone
-	} else {
+	} else if fileCh != nil {
+		// Only uncommitted files changed — HEAD is the same.
+		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, fileCh, parallelism)
+	} else if needCommitted {
 		committedErr = indexCommitted(ctx, repoDir, indexDir, parallelism)
+		cleanUncommittedShards(indexDir)
+	} else {
+		// HEAD unchanged, no dirty files — this shouldn't normally
+		// reach here (state hash would match), but handle defensively.
 		cleanUncommittedShards(indexDir)
 	}
 
@@ -280,6 +319,11 @@ func runIndexing(ctx context.Context, paths gitPaths, indexDir string, state rep
 	if postState == preState {
 		if err := writeStateFile(indexDir, preState); err != nil {
 			return fmt.Errorf("write state file: %w", err)
+		}
+		// Persist the HEAD SHA so subsequent runs with only working tree
+		// changes can skip the committed indexer entirely.
+		if err := writeHeadFile(indexDir, state.HeadSHA); err != nil {
+			slog.Warn("Failed to write head file", "error", err)
 		}
 	} else {
 		deleteStateFiles(indexDir)
@@ -409,6 +453,7 @@ func indexUncommitted(ctx context.Context, repoDir, indexDir string, fileCh <-ch
 				IndexDir:         indexDir,
 				Parallelism:      parallelism,
 				CTagsMustSucceed: true,
+				ShardMax:         shardMax,
 			}
 			opts.RepositoryDescription.Name = repoUncommitted
 			opts.RepositoryDescription.Source = repoDir
