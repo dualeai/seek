@@ -6,6 +6,7 @@ AI coding agents like [Claude Code](https://claude.com/product/claude-code), [Co
 
 <!-- Status -->
 [![CI](https://github.com/dualeai/seek/actions/workflows/ci.yml/badge.svg)](https://github.com/dualeai/seek/actions/workflows/ci.yml)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/dualeai/seek?utm_source=badge)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
 ### Example: dozens of grep matches vs. 1 ranked result
@@ -63,6 +64,8 @@ Or download a pre-built binary from [GitHub Releases](https://github.com/dualeai
 brew install universal-ctags       # macOS
 sudo apt-get install universal-ctags  # Linux
 ```
+
+**Git 2.31+** is required for native [git worktree](https://git-scm.com/docs/git-worktree) support. On older Git versions, normal repos still work.
 
 ### Agent Integration
 

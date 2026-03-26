@@ -34,7 +34,13 @@ func formatResults(files []zoekt.FileMatch, dirtyFiles map[string]bool) string {
 	// so every line number in the output uses a consistent field width.
 	width := maxLineNumWidth(deduped)
 
+	// Pre-size the builder: ~200 bytes per file header + ~80 bytes per match.
+	matches := 0
+	for _, fm := range deduped {
+		matches += len(fm.LineMatches)
+	}
 	var sb strings.Builder
+	sb.Grow(len(deduped)*200 + matches*80)
 	for i, fm := range deduped {
 		if i > 0 {
 			sb.WriteByte('\n')
@@ -55,28 +61,28 @@ func formatResults(files []zoekt.FileMatch, dirtyFiles map[string]bool) string {
 // files are suppressed even when the uncommitted shard has no match — the
 // committed content is stale (e.g. the matched symbol was renamed locally).
 func deduplicateFiles(files []zoekt.FileMatch, dirtyFiles map[string]bool) []zoekt.FileMatch {
-	type fileEntry struct {
-		match       zoekt.FileMatch
+	type dedup struct {
+		idx         int
 		uncommitted bool
 	}
-	byPath := make(map[string]*fileEntry)
-	for _, fm := range files {
+	byPath := make(map[string]dedup, len(files))
+	for i, fm := range files {
 		isUncommitted := fm.Repository == repoUncommitted
 		existing, ok := byPath[fm.FileName]
 		if !ok {
-			byPath[fm.FileName] = &fileEntry{match: fm, uncommitted: isUncommitted}
+			byPath[fm.FileName] = dedup{idx: i, uncommitted: isUncommitted}
 		} else if isUncommitted && !existing.uncommitted {
-			byPath[fm.FileName] = &fileEntry{match: fm, uncommitted: isUncommitted}
+			byPath[fm.FileName] = dedup{idx: i, uncommitted: isUncommitted}
 		}
 	}
 	result := make([]zoekt.FileMatch, 0, len(byPath))
 	for _, entry := range byPath {
 		// Suppress stale committed results for dirty files: the committed
 		// shard has HEAD content which is outdated for modified files.
-		if !entry.uncommitted && dirtyFiles[entry.match.FileName] {
+		if !entry.uncommitted && dirtyFiles[files[entry.idx].FileName] {
 			continue
 		}
-		result = append(result, entry.match)
+		result = append(result, files[entry.idx])
 	}
 	return result
 }
@@ -131,17 +137,17 @@ func formatFileMatch(sb *strings.Builder, fm zoekt.FileMatch, width int) {
 	for i, lm := range fm.LineMatches {
 		matchLine := int(lm.LineNumber)
 
-		// Compute context "before" lines
-		beforeLines := splitContextLines(lm.Before)
-		firstBeforeLine := matchLine - len(beforeLines)
+		// Compute context "before" line count and boundaries.
+		// Uses countContextLines (0-alloc) instead of splitContextLines.
+		beforeCount := countContextLines(lm.Before)
+		firstBeforeLine := matchLine - beforeCount
+		skipLines := 0
 		if firstBeforeLine < 1 {
 			// Guard against before-context exceeding file start (matchLine near 0)
 			// or file-only matches where matchLine=0 and beforeLines is empty.
-			skip := 1 - firstBeforeLine
-			if skip >= len(beforeLines) {
-				beforeLines = nil
-			} else {
-				beforeLines = beforeLines[skip:]
+			skipLines = 1 - firstBeforeLine
+			if skipLines >= beforeCount {
+				beforeCount = 0
 			}
 			firstBeforeLine = 1
 		}
@@ -153,14 +159,19 @@ func formatFileMatch(sb *strings.Builder, fm zoekt.FileMatch, width int) {
 			sb.WriteByte('\n')
 		}
 
-		// Emit "before" context lines, skipping any that overlap with the
-		// previous region's already-emitted lines.
-		for j, cl := range beforeLines {
-			lineNum := firstBeforeLine + j
-			if lineNum <= lastEmittedLine {
-				continue
+		// Emit "before" context lines directly from bytes, skipping any that
+		// overlap with the previous region's already-emitted lines.
+		if beforeCount > 0 {
+			parts := splitContextBytes(lm.Before)
+			for idx, line := range parts {
+				if idx < skipLines {
+					continue
+				}
+				lineNum := firstBeforeLine + (idx - skipLines)
+				if lineNum > lastEmittedLine {
+					writeContextLine(sb, lineNum, line, width)
+				}
 			}
-			writeContextLine(sb, lineNum, cl, width)
 		}
 
 		// Emit the match line itself
@@ -175,33 +186,35 @@ func formatFileMatch(sb *strings.Builder, fm zoekt.FileMatch, width int) {
 			sb.WriteString("] ")
 		}
 
-		line := strings.TrimRight(string(lm.Line), "\n")
-		sb.WriteString(line)
+		sb.Write(bytes.TrimRight(lm.Line, "\n"))
 		sb.WriteByte('\n')
 
 		lastEmittedLine = matchLine
 
-		// Emit "after" context lines, but stop before any line that would
-		// overlap with the next match's before-context or the next match itself.
-		afterLines := splitContextLines(lm.After)
-		afterLimit := len(afterLines)
+		// Emit "after" context lines directly from bytes, but stop before any
+		// line that would overlap with the next match's before-context or the
+		// next match itself.
+		afterCount := countContextLines(lm.After)
+		afterLimit := afterCount
 		if i+1 < len(fm.LineMatches) {
 			nextMatch := int(fm.LineMatches[i+1].LineNumber)
 			nextBeforeLen := countContextLines(fm.LineMatches[i+1].Before)
 			nextFirstBefore := nextMatch - nextBeforeLen
-			for k := range afterLines {
-				afterLineNum := matchLine + 1 + k
-				if afterLineNum >= nextFirstBefore {
+			for k := range afterCount {
+				if matchLine+1+k >= nextFirstBefore {
 					afterLimit = k
 					break
 				}
 			}
 		}
 
-		for k := range afterLimit {
-			lineNum := matchLine + 1 + k
-			writeContextLine(sb, lineNum, afterLines[k], width)
-			lastEmittedLine = lineNum
+		if afterLimit > 0 {
+			parts := splitContextBytes(lm.After)
+			for k := 0; k < afterLimit && k < len(parts); k++ {
+				lineNum := matchLine + 1 + k
+				writeContextLine(sb, lineNum, parts[k], width)
+				lastEmittedLine = lineNum
+			}
 		}
 	}
 }
@@ -216,23 +229,33 @@ func writeLineNum(sb *strings.Builder, lineNum, width int) {
 	sb.WriteString(s)
 }
 
-// writeContextLine writes a context line: two-space indent, right-aligned
-// line number, a space separator, the content, and a newline.
-func writeContextLine(sb *strings.Builder, lineNum int, content string, width int) {
+// writeContextLine writes a context line from raw bytes: two-space indent,
+// right-aligned line number, a space separator, the content, and a newline.
+func writeContextLine(sb *strings.Builder, lineNum int, content []byte, width int) {
 	sb.WriteString("  ")
 	writeLineNum(sb, lineNum, width)
 	sb.WriteByte(' ')
-	sb.WriteString(content)
+	sb.Write(content)
 	sb.WriteByte('\n')
 }
 
-// splitContextLines splits raw context bytes (from LineMatch.Before or .After)
-// into individual trimmed lines. Empty trailing entries are removed.
-func splitContextLines(data []byte) []string {
+// splitContextBytes splits raw context bytes (from LineMatch.Before or .After)
+// into sub-slices sharing the original data. A trailing newline is treated as
+// a terminator, not an empty line.
+func splitContextBytes(data []byte) [][]byte {
 	if len(data) == 0 {
 		return nil
 	}
-	raw := bytes.Split(bytes.TrimSuffix(data, []byte("\n")), []byte("\n"))
+	return bytes.Split(bytes.TrimSuffix(data, []byte("\n")), []byte("\n"))
+}
+
+// splitContextLines is the string-returning variant of splitContextBytes.
+// Used by tests; the hot path uses splitContextBytes to avoid per-line copies.
+func splitContextLines(data []byte) []string {
+	raw := splitContextBytes(data)
+	if raw == nil {
+		return nil
+	}
 	lines := make([]string, len(raw))
 	for i, r := range raw {
 		lines[i] = string(r)
@@ -241,7 +264,7 @@ func splitContextLines(data []byte) []string {
 }
 
 // countContextLines counts how many context lines are in the raw bytes
-// without allocating. It mirrors splitContextLines' trimming logic:
+// without allocating. It mirrors splitContextBytes' trimming logic:
 // a trailing newline is ignored (it's a terminator, not an empty line).
 func countContextLines(data []byte) int {
 	if len(data) == 0 {

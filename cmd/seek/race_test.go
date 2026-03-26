@@ -90,7 +90,7 @@ func TestFix_NoShardGapDuringReindexing(t *testing.T) {
 	// Initial index with uncommitted content
 	state := gitRepoStateIn(ctx, dir)
 	currentState := computeStateHash(repoStateFingerprint(dir, state))
-	if err := runIndexing(ctx, dir, indexDir, state, currentState); err != nil {
+	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, currentState); err != nil {
 		t.Fatalf("initial indexing failed: %v", err)
 	}
 
@@ -115,7 +115,7 @@ func TestFix_NoShardGapDuringReindexing(t *testing.T) {
 
 	// Force re-indexing by clearing state file
 	deleteStateFiles(indexDir)
-	if err := runIndexing(ctx, dir, indexDir, state2, currentState2); err != nil {
+	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state2, currentState2); err != nil {
 		t.Fatalf("re-indexing failed: %v", err)
 	}
 
@@ -225,7 +225,7 @@ func TestFix_ConcurrentSearchDuringReindex_Stress(t *testing.T) {
 	// Initial index
 	state := gitRepoStateIn(ctx, dir)
 	currentState := computeStateHash(repoStateFingerprint(dir, state))
-	if err := runIndexing(ctx, dir, indexDir, state, currentState); err != nil {
+	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, currentState); err != nil {
 		t.Fatalf("initial indexing: %v", err)
 	}
 
@@ -250,7 +250,7 @@ func TestFix_ConcurrentSearchDuringReindex_Stress(t *testing.T) {
 			_ = os.WriteFile(filepath.Join(dir, "changing.go"), []byte(content), 0o644)
 			st := gitRepoStateIn(ctx, dir)
 			cs := computeStateHash(repoStateFingerprint(dir, st))
-			_ = runIndexing(ctx, dir, indexDir, st, cs)
+			_ = runIndexing(ctx, fallbackGitPaths(dir), indexDir, st, cs)
 		}(i)
 
 		// Goroutine B: search concurrently WITH LOCK_SH protection

@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/sourcegraph/zoekt"
+	"github.com/sourcegraph/zoekt/query"
+	"github.com/sourcegraph/zoekt/search"
 )
 
 // --- Hot-path microbenchmarks ---
@@ -174,9 +176,10 @@ func BenchmarkEnsureGitExclude_AlreadyPresent(b *testing.B) {
 	dir := b.TempDir()
 	_ = os.MkdirAll(filepath.Join(dir, ".git", "info"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir, ".git", "info", "exclude"), []byte("/.seek-cache\n"), 0o644)
+	paths := fallbackGitPaths(dir)
 	b.ReportAllocs()
 	for b.Loop() {
-		ensureGitExclude(dir, cacheDir)
+		ensureGitExclude(paths, cacheDir)
 	}
 }
 
@@ -341,7 +344,7 @@ func BenchmarkEndToEnd_ColdIndex(b *testing.B) {
 
 		state := gitRepoStateIn(ctx, dir)
 		stateHash := computeStateHash(repoStateFingerprint(dir, state))
-		_ = runIndexing(ctx, dir, indexDir, state, stateHash)
+		_ = runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash)
 		_, _ = executeSearch(ctx, indexDir, "benchmark_marker_cold")
 	}
 }
@@ -360,7 +363,7 @@ func BenchmarkEndToEnd_WarmIndex(b *testing.B) {
 	// Cold run to build index
 	state := gitRepoStateIn(ctx, dir)
 	stateHash := computeStateHash(repoStateFingerprint(dir, state))
-	_ = runIndexing(ctx, dir, indexDir, state, stateHash)
+	_ = runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash)
 
 	b.ResetTimer()
 	for b.Loop() {
@@ -369,7 +372,7 @@ func BenchmarkEndToEnd_WarmIndex(b *testing.B) {
 		currentState := computeStateHash(repoStateFingerprint(dir, state))
 		cachedState := readStateFile(indexDir)
 		if currentState != cachedState {
-			_ = runIndexing(ctx, dir, indexDir, state, currentState)
+			_ = runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, currentState)
 		}
 		_, _ = executeSearch(ctx, indexDir, "benchmark_marker_warm")
 	}
@@ -389,7 +392,7 @@ func BenchmarkEndToEnd_DirtyReindex(b *testing.B) {
 	// Cold run
 	state := gitRepoStateIn(ctx, dir)
 	stateHash := computeStateHash(repoStateFingerprint(dir, state))
-	_ = runIndexing(ctx, dir, indexDir, state, stateHash)
+	_ = runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash)
 
 	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
@@ -399,9 +402,114 @@ func BenchmarkEndToEnd_DirtyReindex(b *testing.B) {
 
 		state := gitRepoStateIn(ctx, dir)
 		currentState := computeStateHash(repoStateFingerprint(dir, state))
-		_ = runIndexing(ctx, dir, indexDir, state, currentState)
+		_ = runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, currentState)
 		_, _ = executeSearch(ctx, indexDir, "dirty_bench")
 	}
+}
+
+// BenchmarkSmallRepo_Phases breaks down the dirty-reindex path into
+// individual phases on a tiny repo (no SEEK_BENCH_REPO needed).
+func BenchmarkSmallRepo_Phases(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping in short mode")
+	}
+	requireTools(b)
+
+	dir := initGitRepo(b, "app.go", "package main\n\nfunc main() {\n\t// phase_bench\n}\n")
+	ctx := context.Background()
+	indexDir := filepath.Join(dir, cacheDir)
+	_ = os.MkdirAll(indexDir, 0o755)
+	paths := fallbackGitPaths(dir)
+
+	// Cold index to warm up shards
+	state := gitRepoStateIn(ctx, dir)
+	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+	if err := runIndexing(ctx, paths, indexDir, state, stateHash); err != nil {
+		b.Fatalf("initial indexing: %v", err)
+	}
+
+	// Dirty the file for uncommitted phases
+	original := []byte("package main\n\nfunc main() {\n\t// phase_bench\n}\n")
+
+	b.Run("gitRepoState", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			gitRepoStateIn(ctx, dir)
+		}
+	})
+
+	b.Run("stateHash_clean", func(b *testing.B) {
+		state := gitRepoStateIn(ctx, dir)
+		b.ReportAllocs()
+		for b.Loop() {
+			computeStateHash(repoStateFingerprint(dir, state))
+		}
+	})
+
+	b.Run("checkCtags", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = checkCtags()
+		}
+	})
+
+	b.Run("ensureGitExclude", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			ensureGitExclude(paths, cacheDir)
+		}
+	})
+
+	b.Run("ensureUntrackedCache", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			ensureUntrackedCache(ctx, paths)
+		}
+	})
+
+	b.Run("indexCommitted_incremental", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = indexCommitted(ctx, dir, indexDir, indexParallelism())
+		}
+	})
+
+	b.Run("indexUncommitted_1file", func(b *testing.B) {
+		_ = os.WriteFile(filepath.Join(dir, "app.go"), append(original, []byte("\n// dirty\n")...), 0o644)
+		state := gitRepoStateIn(ctx, dir)
+		if len(state.Files) == 0 {
+			b.Fatal("expected dirty files")
+		}
+		dirtyFiles := state.Files
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; b.Loop(); i++ {
+			content := fmt.Appendf(original[:len(original):len(original)], "\n// p_%d\n", i)
+			_ = os.WriteFile(filepath.Join(dir, "app.go"), content, 0o644)
+			fileCh := streamFiles(dir, dirtyFiles, indexParallelism())
+			_ = indexUncommitted(ctx, dir, indexDir, fileCh, indexParallelism())
+		}
+	})
+
+	b.Run("postVerify_restat", func(b *testing.B) {
+		_ = os.WriteFile(filepath.Join(dir, "app.go"), append(original, []byte("\n// restat\n")...), 0o644)
+		dirtyState := gitRepoStateIn(ctx, dir)
+		if len(dirtyState.Files) == 0 {
+			b.Fatal("expected dirty files")
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			computeStateHash(repoStateFingerprint(dir, dirtyState))
+		}
+	})
+
+	b.Run("executeSearch", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_, _ = executeSearch(ctx, indexDir, "phase_bench")
+		}
+	})
 }
 
 // --- Large-repo benchmarks ---
@@ -428,14 +536,14 @@ func setupLargeRepoBench(b *testing.B) (repoDir, indexDir string) {
 	repoDir = requireBenchRepo(b)
 	indexDir = filepath.Join(repoDir, cacheDir)
 	_ = os.MkdirAll(indexDir, 0o755)
-	ensureGitExclude(repoDir, cacheDir)
+	ensureGitExclude(fallbackGitPaths(repoDir), cacheDir)
 
 	ctx := context.Background()
 	state := gitRepoStateIn(ctx, repoDir)
 	currentState := computeStateHash(repoStateFingerprint(repoDir, state))
 	cachedState := readStateFile(indexDir)
 	if currentState != cachedState {
-		if err := runIndexing(ctx, repoDir, indexDir, state, currentState); err != nil {
+		if err := runIndexing(ctx, fallbackGitPaths(repoDir), indexDir, state, currentState); err != nil {
 			b.Fatalf("initial indexing failed: %v", err)
 		}
 	}
@@ -451,7 +559,7 @@ func BenchmarkLargeRepo_WarmSearch(b *testing.B) {
 		currentState := computeStateHash(repoStateFingerprint(repoDir, state))
 		cachedState := readStateFile(indexDir)
 		if currentState != cachedState {
-			_ = runIndexing(ctx, repoDir, indexDir, state, currentState)
+			_ = runIndexing(ctx, fallbackGitPaths(repoDir), indexDir, state, currentState)
 		}
 		_, _ = executeSearch(ctx, indexDir, "func main")
 	}
@@ -497,7 +605,7 @@ func benchmarkLargeRepoDirtyN(b *testing.B, n int) {
 		}
 		state := gitRepoStateIn(ctx, repoDir)
 		currentState := computeStateHash(repoStateFingerprint(repoDir, state))
-		_ = runIndexing(ctx, repoDir, indexDir, state, currentState)
+		_ = runIndexing(ctx, fallbackGitPaths(repoDir), indexDir, state, currentState)
 		_, _ = executeSearch(ctx, indexDir, "func main")
 	}
 }
@@ -508,7 +616,8 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 	repoDir := requireBenchRepo(b)
 	indexDir := filepath.Join(repoDir, cacheDir)
 	_ = os.MkdirAll(indexDir, 0o755)
-	ensureGitExclude(repoDir, cacheDir)
+	paths := fallbackGitPaths(repoDir)
+	ensureGitExclude(paths, cacheDir)
 	ctx := context.Background()
 
 	// Ensure index is warm
@@ -516,7 +625,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 	currentState := computeStateHash(repoStateFingerprint(repoDir, state))
 	cachedState := readStateFile(indexDir)
 	if currentState != cachedState {
-		if err := runIndexing(ctx, repoDir, indexDir, state, currentState); err != nil {
+		if err := runIndexing(ctx, paths, indexDir, state, currentState); err != nil {
 			b.Fatalf("initial indexing: %v", err)
 		}
 	}
@@ -553,21 +662,21 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 	b.Run("ensureGitExclude", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			ensureGitExclude(repoDir, cacheDir)
+			ensureGitExclude(paths, cacheDir)
 		}
 	})
 
 	b.Run("ensureUntrackedCache", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			ensureUntrackedCache(ctx, repoDir)
+			ensureUntrackedCache(ctx, paths)
 		}
 	})
 
 	b.Run("indexCommitted_incremental", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			_ = indexCommitted(ctx, repoDir, indexDir, indexParallelism())
+			_ = indexCommitted(ctx, paths.RepoDir, indexDir, indexParallelism())
 		}
 	})
 
@@ -621,6 +730,120 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 			_, _ = executeSearch(ctx, indexDir, "func main")
 		}
 	})
+
+	// --- Post-indexation phase breakdown ---
+
+	b.Run("loadShards", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			s, err := search.NewDirectorySearcher(indexDir)
+			if err != nil {
+				b.Fatal(err)
+			}
+			s.Close()
+		}
+	})
+
+	b.Run("parseQuery", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			q, err := query.Parse("func main")
+			if err != nil {
+				b.Fatal(err)
+			}
+			q = query.Map(q, query.ExpandFileContent)
+			_ = query.Simplify(q)
+		}
+	})
+
+	b.Run("searchOnly", func(b *testing.B) {
+		s, err := search.NewDirectorySearcher(indexDir)
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer s.Close()
+		q, _ := query.Parse("func main")
+		q = query.Map(q, query.ExpandFileContent)
+		q = query.Simplify(q)
+		opts := &zoekt.SearchOptions{
+			MaxDocDisplayCount: 1000,
+			TotalMaxMatchCount: 10000,
+			ShardMaxMatchCount: 10000,
+			NumContextLines:    searchContextLines,
+			UseBM25Scoring:     true,
+			MaxWallTime:        searchTimeout,
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			_, _ = s.Search(ctx, q, opts)
+		}
+	})
+
+	b.Run("acquireSearchLock_uncontended", func(b *testing.B) {
+		lockPath := filepath.Join(indexDir, lockFile)
+		b.ReportAllocs()
+		for b.Loop() {
+			f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+			if err != nil {
+				b.Fatal(err)
+			}
+			_ = acquireSearchLock(ctx, f)
+			unlockFile(f)
+			_ = f.Close()
+		}
+	})
+
+	b.Run("buildDirtySet", func(b *testing.B) {
+		_ = os.WriteFile(target, append(original, []byte("\n// dirty_set\n")...), 0o644)
+		dirtyState := gitRepoStateIn(ctx, repoDir)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			if len(dirtyState.Files) > 0 {
+				m := make(map[string]bool, len(dirtyState.Files))
+				for _, f := range dirtyState.Files {
+					m[f] = true
+				}
+			}
+		}
+	})
+
+	b.Run("formatResults", func(b *testing.B) {
+		results, err := executeSearch(ctx, indexDir, "func main")
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(results) == 0 {
+			b.Skip("no results to format")
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			formatResults(results, nil)
+		}
+	})
+
+	b.Run("formatResults_withDirtyFiles", func(b *testing.B) {
+		_ = os.WriteFile(target, append(original, []byte("\n// dirty_fmt\n")...), 0o644)
+		dirtyState := gitRepoStateIn(ctx, repoDir)
+		results, err := executeSearch(ctx, indexDir, "func main")
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(results) == 0 {
+			b.Skip("no results to format")
+		}
+		dirtyFiles := make(map[string]bool, len(dirtyState.Files))
+		for _, f := range dirtyState.Files {
+			dirtyFiles[f] = true
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			formatResults(results, dirtyFiles)
+		}
+	})
 }
 
 // findGoFile returns the absolute path of a Go file suitable for editing.
@@ -657,4 +880,3 @@ func findGoFiles(b *testing.B, repoDir string, n int) []string {
 	}
 	return result
 }
-

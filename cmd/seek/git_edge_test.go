@@ -54,7 +54,7 @@ func TestIntegration_InitialCommitEmpty(t *testing.T) {
 			t.Fatalf("%v failed: %v\n%s", args, err, out)
 		}
 	}
-	ensureGitExclude(dir, cacheDir)
+	ensureGitExclude(fallbackGitPaths(dir), cacheDir)
 
 	// Add an untracked file — should be findable even with empty initial commit
 	if err := os.WriteFile(filepath.Join(dir, "new.go"), []byte("package main\n// empty_initial_marker\n"), 0o644); err != nil {
@@ -98,6 +98,7 @@ func TestIntegration_MultipleBranches(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// main_branch_marker\n")
+	defaultBranch := gitCurrentBranch(t, dir)
 
 	// Create and switch to a new branch with different content
 	gitRun(t, dir, "checkout", "-b", "feature")
@@ -117,11 +118,11 @@ func TestIntegration_MultipleBranches(t *testing.T) {
 	}
 
 	// Switch back to main — search should find main content
-	gitRun(t, dir, "checkout", "master")
+	gitRun(t, dir, "checkout", defaultBranch)
 
 	files, err = runSeekInRepo(t, dir, "main_branch_marker")
 	if err != nil {
-		t.Fatalf("search on master after branch switch failed: %v", err)
+		t.Fatalf("search on default branch after branch switch failed: %v", err)
 	}
 	if len(files) == 0 {
 		t.Fatal("expected match for main branch content after switch")
@@ -217,11 +218,11 @@ func TestExtractV2Path_TooFewFields(t *testing.T) {
 		entry      string
 		skipFields int
 	}{
-		{"1 .M N...", 8},             // only 3 fields, need 8
-		{"", 1},                      // empty entry
-		{"single", 2},                // 1 field, need 2
-		{"a b c", 10},                // 3 fields, need 10
-		{"1 .M N... 100644", 8},      // only 4 fields, need 8
+		{"1 .M N...", 8},                // only 3 fields, need 8
+		{"", 1},                         // empty entry
+		{"single", 2},                   // 1 field, need 2
+		{"a b c", 10},                   // 3 fields, need 10
+		{"1 .M N... 100644", 8},         // only 4 fields, need 8
 		{"u UU N... 100644 100644", 10}, // only 5 fields, need 10
 	}
 	for _, tc := range cases {
@@ -499,6 +500,7 @@ func TestIntegration_MergeConflictState(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// base_content\n")
+	defaultBranch := gitCurrentBranch(t, dir)
 
 	// Create a branch with a conflicting change
 	gitRun(t, dir, "checkout", "-b", "conflict-branch")
@@ -508,13 +510,13 @@ func TestIntegration_MergeConflictState(t *testing.T) {
 	gitRun(t, dir, "add", "app.go")
 	gitRun(t, dir, "commit", "-m", "branch change")
 
-	// Go back and make a conflicting change on master
-	gitRun(t, dir, "checkout", "master")
+	// Go back and make a conflicting change on the default branch
+	gitRun(t, dir, "checkout", defaultBranch)
 	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// master_conflict_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitRun(t, dir, "add", "app.go")
-	gitRun(t, dir, "commit", "-m", "master change")
+	gitRun(t, dir, "commit", "-m", "default branch change")
 
 	// Attempt merge — will conflict
 	cmd := exec.Command("git", "merge", "conflict-branch")
@@ -601,7 +603,7 @@ func TestEnsureGitExclude_Idempotent(t *testing.T) {
 
 	// Call 5 times
 	for range 5 {
-		ensureGitExclude(dir, cacheDir)
+		ensureGitExclude(fallbackGitPaths(dir), cacheDir)
 	}
 
 	data, err := os.ReadFile(filepath.Join(gitDir, "exclude"))
@@ -628,7 +630,7 @@ func TestEnsureGitExclude_PreExistingContentPreserved(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ensureGitExclude(dir, cacheDir)
+	ensureGitExclude(fallbackGitPaths(dir), cacheDir)
 
 	data, err := os.ReadFile(filepath.Join(gitDir, "exclude"))
 	if err != nil {
@@ -656,7 +658,7 @@ func TestEnsureGitExclude_NoTrailingNewline(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ensureGitExclude(dir, cacheDir)
+	ensureGitExclude(fallbackGitPaths(dir), cacheDir)
 
 	data, err := os.ReadFile(filepath.Join(gitDir, "exclude"))
 	if err != nil {
@@ -993,4 +995,3 @@ func TestIntegration_StatusShowUntrackedFilesNo(t *testing.T) {
 		t.Log("confirmed: status.showUntrackedFiles=no hides untracked files from seek")
 	}
 }
-

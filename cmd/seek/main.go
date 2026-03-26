@@ -117,10 +117,11 @@ func (w *slogWriter) Write(p []byte) (int, error) {
 }
 
 func run(ctx context.Context, pattern string) error {
-	repoDir, err := gitRepoRoot(ctx)
+	paths, err := resolveGitPathsFromCWD(ctx)
 	if err != nil {
 		return fmt.Errorf("not a git repository: %w", err)
 	}
+	repoDir := paths.RepoDir
 
 	// Use absolute paths to avoid dependence on process CWD
 	indexDir := filepath.Join(repoDir, cacheDir)
@@ -128,22 +129,26 @@ func run(ctx context.Context, pattern string) error {
 		return fmt.Errorf("create index directory: %w", err)
 	}
 
-	// Exclude the cache directory from git status before computing state.
-	// Also called inside runIndexing as a defensive measure, but we need it
-	// here for the search-only path (when the index is already up-to-date).
-	ensureGitExclude(repoDir, cacheDir)
-
-	// Enable the untracked cache for faster git status on large repos.
-	ensureUntrackedCache(ctx, repoDir)
+	// Check for existing index state. If present, one-time setup
+	// (ensureGitExclude, ensureUntrackedCache, ensureFSMonitor) was
+	// already applied by the indexing run that created the state file.
+	// Skipping them on the warm path saves ~150µs of file I/O.
+	cachedState := readStateFile(indexDir)
+	if cachedState == "" {
+		// First run or corrupted state — apply one-time setup before
+		// computing git status, so the cache dir is excluded.
+		ensureGitExclude(paths, cacheDir)
+		ensureUntrackedCache(ctx, paths)
+		ensureFSMonitor(ctx, paths)
+	}
 
 	// Compute state hash from a single atomic git status call.
 	state := gitRepoState(ctx)
 	currentState := computeStateHash(repoStateFingerprint(repoDir, state))
 
 	// Re-index if the cached state differs from the current working tree.
-	cachedState := readStateFile(indexDir)
 	if currentState != cachedState {
-		if err := runIndexing(ctx, repoDir, indexDir, state, currentState); err != nil {
+		if err := runIndexing(ctx, paths, indexDir, state, currentState); err != nil {
 			slog.Warn("Indexing failed", "error", err)
 			// Continue to search with whatever shards exist
 		}

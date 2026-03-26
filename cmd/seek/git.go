@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -15,6 +17,14 @@ type repoState struct {
 	HeadSHA   string   // commit SHA from # branch.oid, or "no-head"
 	RawOutput string   // full raw output for state hashing
 	Files     []string // paths of changed/untracked files
+}
+
+type gitPaths struct {
+	RepoDir     string
+	GitDir      string
+	CommonDir   string
+	ExcludePath string
+	ConfigPath  string
 }
 
 // gitCmd creates an exec.Cmd for git with graceful shutdown.
@@ -32,13 +42,59 @@ func gitCmd(ctx context.Context, args ...string) *exec.Cmd {
 	return cmd
 }
 
-// gitRepoRoot returns the absolute path to the git repository root.
-func gitRepoRoot(ctx context.Context) (string, error) {
-	out, err := gitCmd(ctx, "rev-parse", "--show-toplevel").Output()
-	if err != nil {
-		return "", err
+// resolveGitPathsFromCWD resolves git paths from the current working directory.
+func resolveGitPathsFromCWD(ctx context.Context) (gitPaths, error) {
+	return resolveGitPaths(ctx, "")
+}
+
+func resolveGitPaths(ctx context.Context, dir string) (gitPaths, error) {
+	// --path-format=absolute requires Git 2.31+. Older Git falls back to
+	// the legacy path assumption in fallbackGitPaths.
+	cmd := gitCmd(ctx,
+		"rev-parse",
+		"--path-format=absolute",
+		"--show-toplevel",
+		"--git-dir",
+		"--git-common-dir",
+		"--git-path", "info/exclude",
+		"--git-path", "config",
+	)
+	if dir != "" {
+		cmd.Dir = dir
 	}
-	return strings.TrimSpace(string(out)), nil
+	out, err := cmd.Output()
+	if err != nil {
+		return gitPaths{}, err
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 5 {
+		return gitPaths{}, fmt.Errorf("unexpected git rev-parse output: got %d lines", len(lines))
+	}
+
+	paths := gitPaths{
+		RepoDir:     strings.TrimSpace(lines[0]),
+		GitDir:      strings.TrimSpace(lines[1]),
+		CommonDir:   strings.TrimSpace(lines[2]),
+		ExcludePath: strings.TrimSpace(lines[3]),
+		ConfigPath:  strings.TrimSpace(lines[4]),
+	}
+	return paths, nil
+}
+
+func fallbackGitPaths(repoDir string) gitPaths {
+	absRepoDir, err := filepath.Abs(repoDir)
+	if err != nil {
+		absRepoDir = repoDir
+	}
+	gitDir := filepath.Join(absRepoDir, ".git")
+	return gitPaths{
+		RepoDir:     absRepoDir,
+		GitDir:      gitDir,
+		CommonDir:   gitDir,
+		ExcludePath: filepath.Join(gitDir, "info", "exclude"),
+		ConfigPath:  filepath.Join(gitDir, "config"),
+	}
 }
 
 // gitRepoState returns the current repository state using a single
@@ -129,9 +185,9 @@ func parseGitStatusV2(raw string) repoState {
 // already present. This prevents the cache from appearing as untracked in
 // git status, which would pollute the state hash. Uses .git/info/exclude
 // rather than .gitignore to avoid modifying the user's working tree.
-func ensureGitExclude(repoDir, pattern string) {
-	infoDir := filepath.Join(repoDir, ".git", "info")
-	excludePath := filepath.Join(infoDir, "exclude")
+func ensureGitExclude(paths gitPaths, pattern string) {
+	infoDir := filepath.Dir(paths.ExcludePath)
+	excludePath := paths.ExcludePath
 
 	data, _ := os.ReadFile(excludePath)
 	needle := "/" + pattern
@@ -166,8 +222,8 @@ func ensureGitExclude(repoDir, pattern string) {
 //
 // Reads .git/config directly (~14µs) instead of spawning git config
 // (~8ms) to avoid subprocess overhead on the hot path.
-func ensureUntrackedCache(ctx context.Context, repoDir string) {
-	configPath := filepath.Join(repoDir, ".git", "config")
+func ensureUntrackedCache(ctx context.Context, paths gitPaths) {
+	configPath := paths.ConfigPath
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return
@@ -176,8 +232,64 @@ func ensureUntrackedCache(ctx context.Context, repoDir string) {
 		return
 	}
 	cmd := gitCmd(ctx, "config", "core.untrackedCache", "true")
-	cmd.Dir = repoDir
+	cmd.Dir = paths.RepoDir
 	_ = cmd.Run()
+}
+
+// ensureFSMonitor enables the built-in filesystem monitor daemon if not
+// already configured. The fsmonitor daemon uses OS-level file watchers
+// (FSEvents on macOS, inotify on Linux) so git status can query a socket
+// instead of lstat'ing every tracked file. On large repos this reduces
+// git status from hundreds of milliseconds to single-digit ms. The
+// setting is safe, reversible, and stored in .git/config (per-repo only).
+//
+// Requires Git 2.36+ where core.fsmonitor=true means "use the built-in
+// daemon". On older versions this key expects a hook script path, and
+// setting it to "true" would be misinterpreted (on Unix, /usr/bin/true
+// exists and would silently disable change detection).
+//
+// Only called on first run (when no cached state exists), so the
+// subprocess cost of version detection is amortized.
+func ensureFSMonitor(ctx context.Context, paths gitPaths) {
+	configPath := paths.ConfigPath
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+	if strings.Contains(string(data), "fsmonitor") {
+		return
+	}
+	// Gate on Git 2.36+ to avoid misinterpretation of the boolean value.
+	if !gitVersionAtLeast(ctx, paths.RepoDir, 2, 36) {
+		return
+	}
+	cmd := gitCmd(ctx, "config", "core.fsmonitor", "true")
+	cmd.Dir = paths.RepoDir
+	_ = cmd.Run()
+}
+
+// gitVersionAtLeast returns true if the installed git version is at least
+// major.minor. Returns false on any parse error (conservative).
+func gitVersionAtLeast(ctx context.Context, dir string, major, minor int) bool {
+	cmd := gitCmd(ctx, "version")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	// Parse "git version 2.43.0" or "git version 2.43.0.windows.1"
+	s := strings.TrimSpace(string(out))
+	s = strings.TrimPrefix(s, "git version ")
+	parts := strings.SplitN(s, ".", 3)
+	if len(parts) < 2 {
+		return false
+	}
+	maj, err1 := strconv.Atoi(parts[0])
+	min, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return maj > major || (maj == major && min >= minor)
 }
 
 // extractV2Path extracts the path from a porcelain v2 entry by skipping
