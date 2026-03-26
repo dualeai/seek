@@ -1,0 +1,35 @@
+name: CodSpeed
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  # `workflow_dispatch` allows CodSpeed to trigger backtest
+  # performance analysis in order to generate initial data.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: codspeed-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codspeed:
+    name: Run benchmarks
+    runs-on: codspeed-macro
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+      - name: Install universal-ctags
+        run: sudo apt-get update && sudo apt-get install -y universal-ctags
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@e736f0d2aeb36da38e9f08eca4dff7967408d154 # v4.8.2
+        with:
+          mode: walltime
+          run: go test ./cmd/seek/ -bench=. -benchtime=5s
