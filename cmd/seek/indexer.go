@@ -177,14 +177,15 @@ func checkCtags() error {
 }
 
 // runIndexing orchestrates committed and uncommitted indexing with locking.
-func runIndexing(ctx context.Context, repoDir, indexDir string, state repoState, preState string) error {
+func runIndexing(ctx context.Context, paths gitPaths, indexDir string, state repoState, preState string) error {
+	repoDir := paths.RepoDir
 	// Fail fast if ctags is missing
 	if err := checkCtags(); err != nil {
 		return err
 	}
 
 	// Ensure cache dir is excluded from git status.
-	ensureGitExclude(repoDir, cacheDir)
+	ensureGitExclude(paths, cacheDir)
 
 	lockPath := filepath.Join(indexDir, lockFile)
 

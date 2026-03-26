@@ -64,6 +64,8 @@ brew install universal-ctags       # macOS
 sudo apt-get install universal-ctags  # Linux
 ```
 
+**Git 2.31+** is required for native [git worktree](https://git-scm.com/docs/git-worktree) support. On older Git versions, normal repos still work.
+
 ### Agent Integration
 
 Paste this prompt into your AI coding agent (Claude Code, Codex, Cursor, Amp, etc.) to install seek and configure it for your project. The agent will install the binary, test it, and write usage instructions to your agent config file so that future sessions use seek automatically.
