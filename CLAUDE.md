@@ -49,3 +49,13 @@ Requires `universal-ctags` (`brew install universal-ctags` on macOS).
 ### Sub-agents
 
 When spawning sub-agents that don't inherit this config, pass: "Use `seek 'pattern'` for code search. All filters in ONE quoted string. Never use grep/rg."
+
+## GitHub Actions
+
+All actions in `.github/workflows/` must be pinned by full commit SHA with an inline version comment. Example:
+
+```yaml
+- uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+```
+
+Never pin to a tag or branch (e.g. `@v4`). Always verify the SHA matches the version on GitHub before committing.
