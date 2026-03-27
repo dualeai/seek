@@ -28,7 +28,7 @@ jobs:
           go-version-file: go.mod
 
       # Install SBOM tools
-      - uses: anchore/sbom-action/download-syft@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0.23.1
+      - uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
 
       # SBOM generation (project-level, CycloneDX format)
       - name: Generate SBOM
@@ -54,7 +54,7 @@ jobs:
             dist/*.tar.gz
             dist/checksums.txt
       - name: Attest SBOM
-        uses: actions/attest-sbom@07e74fc4e78d1aad915e867f9a094073a9f71527 # v4.0.0
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-path: dist/*.tar.gz
           sbom-path: sbom.cyclonedx.json
