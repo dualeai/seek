@@ -35,10 +35,10 @@ jobs:
             name: linux-amd64
           - os: blacksmith-2vcpu-ubuntu-2404-arm    # Linux arm64
             name: linux-arm64
-          - os: macos-latest                        # macOS arm64
-            name: macos-arm64
-          - os: macos-26-intel                      # macOS x86_64
-            name: macos-amd64
+          - os: blacksmith-6vcpu-macos-26           # macOS arm64 (Tahoe)
+            name: macos-26-arm64
+          - os: blacksmith-6vcpu-macos-15           # macOS arm64 (Sequoia)
+            name: macos-15-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -62,10 +62,10 @@ jobs:
             name: linux-amd64
           - os: blacksmith-2vcpu-ubuntu-2404-arm    # Linux arm64
             name: linux-arm64
-          - os: macos-latest                        # macOS arm64
-            name: macos-arm64
-          - os: macos-26-intel                      # macOS x86_64
-            name: macos-amd64
+          - os: blacksmith-6vcpu-macos-26           # macOS arm64 (Tahoe)
+            name: macos-26-arm64
+          - os: blacksmith-6vcpu-macos-15           # macOS arm64 (Sequoia)
+            name: macos-15-arm64
     runs-on: ${{ matrix.os }}
     needs: [test-static, test-unit]
     steps:
