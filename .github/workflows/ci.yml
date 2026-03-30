@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   test-static:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
@@ -30,11 +30,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest       # Linux x86_64
-          - ubuntu-24.04-arm    # Linux arm64
-          - macos-latest        # macOS arm64
-          - macos-26-intel      # macOS x86_64
+        include:
+          - os: blacksmith-2vcpu-ubuntu-2404        # Linux x86_64
+            name: linux-amd64
+          - os: blacksmith-2vcpu-ubuntu-2404-arm    # Linux arm64
+            name: linux-arm64
+          - os: macos-latest                        # macOS arm64
+            name: macos-arm64
+          - os: macos-26-intel                      # macOS x86_64
+            name: macos-amd64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -53,11 +57,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest       # Linux x86_64
-          - ubuntu-24.04-arm    # Linux arm64
-          - macos-latest        # macOS arm64
-          - macos-26-intel      # macOS x86_64
+        include:
+          - os: blacksmith-2vcpu-ubuntu-2404        # Linux x86_64
+            name: linux-amd64
+          - os: blacksmith-2vcpu-ubuntu-2404-arm    # Linux arm64
+            name: linux-arm64
+          - os: macos-latest                        # macOS arm64
+            name: macos-arm64
+          - os: macos-26-intel                      # macOS x86_64
+            name: macos-amd64
     runs-on: ${{ matrix.os }}
     needs: [test-static, test-unit]
     steps:
@@ -68,5 +76,5 @@ jobs:
       - run: make build
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: seek-${{ matrix.os }}
+          name: seek-${{ matrix.name }}
           path: seek

@@ -196,7 +196,7 @@ func BenchmarkFormatResults_1File_1Match(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		formatResults(files, nil)
+		formatResults(files, nil, 0, 0)
 	}
 }
 
@@ -215,7 +215,7 @@ func BenchmarkFormatResults_10Files_3Matches(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		formatResults(files, nil)
+		formatResults(files, nil, 0, 0)
 	}
 }
 
@@ -236,7 +236,7 @@ func BenchmarkFormatResults_100Files_WithDedup(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		formatResults(files, nil)
+		formatResults(files, nil, 0, 0)
 	}
 }
 
@@ -260,7 +260,86 @@ func BenchmarkFormatResults_WithSymbols(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		formatResults(files, nil)
+		formatResults(files, nil, 0, 0)
+	}
+}
+
+// buildLargeFixture creates nFiles FileMatches, each with matchesPerFile
+// LineMatches including Before/After context and symbol annotations.
+func buildLargeFixture(nFiles, matchesPerFile int) []zoekt.FileMatch {
+	files := make([]zoekt.FileMatch, nFiles)
+	for i := range nFiles {
+		matches := make([]zoekt.LineMatch, matchesPerFile)
+		for j := range matchesPerFile {
+			matches[j] = zoekt.LineMatch{
+				Line:       []byte("func ProcessRequest(ctx context.Context) error {\n"),
+				LineNumber: 10 + j*20,
+				Before:     []byte("// handler doc\n"),
+				After:      []byte("    return nil\n"),
+				LineFragments: []zoekt.LineFragmentMatch{
+					{SymbolInfo: &zoekt.Symbol{Kind: "function"}},
+				},
+			}
+		}
+		files[i] = zoekt.FileMatch{
+			FileName:    fmt.Sprintf("pkg/service%03d/handler.go", i),
+			Repository:  "repo",
+			Language:    "Go",
+			Score:       float64(nFiles - i),
+			LineMatches: matches,
+		}
+	}
+	return files
+}
+
+func BenchmarkFormatResults_FileLimit(b *testing.B) {
+	files := buildLargeFixture(100, 5)
+	for _, limit := range []int{0, 1, 5, 10, 50} {
+		name := "unlimited"
+		if limit > 0 {
+			name = fmt.Sprintf("limit_%d", limit)
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				formatResults(files, nil, limit, 0)
+			}
+		})
+	}
+}
+
+func BenchmarkFormatResults_MatchLimit(b *testing.B) {
+	files := buildLargeFixture(20, 20)
+	for _, maxMatches := range []int{0, 1, 3, 5} {
+		name := "unlimited"
+		if maxMatches > 0 {
+			name = fmt.Sprintf("max_%d", maxMatches)
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				formatResults(files, nil, 0, maxMatches)
+			}
+		})
+	}
+}
+
+func BenchmarkFormatResults_Combined(b *testing.B) {
+	files := buildLargeFixture(100, 10)
+	cases := []struct {
+		name              string
+		limit, maxMatches int
+	}{
+		{"n5_m3", 5, 3},
+		{"n1_m1", 1, 1},
+	}
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				formatResults(files, nil, tc.limit, tc.maxMatches)
+			}
+		})
 	}
 }
 
@@ -550,6 +629,26 @@ func setupLargeRepoBench(b *testing.B) (repoDir, indexDir string) {
 	return repoDir, indexDir
 }
 
+func BenchmarkLargeRepo_ColdIndex(b *testing.B) {
+	repoDir := requireBenchRepo(b)
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for b.Loop() {
+		b.StopTimer()
+		indexDir := filepath.Join(repoDir, cacheDir)
+		_ = os.RemoveAll(indexDir)
+		_ = os.MkdirAll(indexDir, 0o755)
+		ensureGitExclude(fallbackGitPaths(repoDir), cacheDir)
+		b.StartTimer()
+
+		state := gitRepoStateIn(ctx, repoDir)
+		stateHash := computeStateHash(repoStateFingerprint(repoDir, state))
+		_ = runIndexing(ctx, fallbackGitPaths(repoDir), indexDir, state, stateHash)
+		_, _ = executeSearch(ctx, indexDir, "func main")
+	}
+}
+
 func BenchmarkLargeRepo_WarmSearch(b *testing.B) {
 	repoDir, indexDir := setupLargeRepoBench(b)
 	ctx := context.Background()
@@ -582,7 +681,7 @@ func benchmarkLargeRepoDirtyN(b *testing.B, n int) {
 	repoDir, indexDir := setupLargeRepoBench(b)
 	ctx := context.Background()
 
-	targets := findGoFiles(b, repoDir, n)
+	targets := findSourceFiles(b, repoDir, n)
 	originals := make([][]byte, len(targets))
 	for i, t := range targets {
 		data, err := os.ReadFile(t)
@@ -630,7 +729,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		}
 	}
 
-	target := findGoFile(b, repoDir)
+	target := findSourceFile(b, repoDir)
 	original, err := os.ReadFile(target)
 	if err != nil {
 		b.Fatal(err)
@@ -766,7 +865,6 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		q = query.Map(q, query.ExpandFileContent)
 		q = query.Simplify(q)
 		opts := &zoekt.SearchOptions{
-			MaxDocDisplayCount: 1000,
 			TotalMaxMatchCount: 10000,
 			ShardMaxMatchCount: 10000,
 			NumContextLines:    searchContextLines,
@@ -820,7 +918,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
-			formatResults(results, nil)
+			formatResults(results, nil, 0, 0)
 		}
 	})
 
@@ -841,20 +939,20 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
-			formatResults(results, dirtyFiles)
+			formatResults(results, dirtyFiles, 0, 0)
 		}
 	})
 }
 
-// findGoFile returns the absolute path of a Go file suitable for editing.
-func findGoFile(b *testing.B, repoDir string) string {
+// findSourceFile returns the absolute path of a source file suitable for editing.
+func findSourceFile(b *testing.B, repoDir string) string {
 	b.Helper()
-	targets := findGoFiles(b, repoDir, 1)
+	targets := findSourceFiles(b, repoDir, 1)
 	return targets[0]
 }
 
-// findGoFiles returns absolute paths of n Go files suitable for editing.
-func findGoFiles(b *testing.B, repoDir string, n int) []string {
+// findSourceFiles returns absolute paths of n source files suitable for editing.
+func findSourceFiles(b *testing.B, repoDir string, n int) []string {
 	b.Helper()
 	var result []string
 	err := filepath.WalkDir(repoDir, func(path string, d os.DirEntry, err error) error {
@@ -867,16 +965,14 @@ func findGoFiles(b *testing.B, repoDir string, n int) []string {
 		if len(result) >= n {
 			return filepath.SkipAll
 		}
-		if filepath.Ext(path) == ".go" {
-			result = append(result, path)
-		}
+		result = append(result, path)
 		return nil
 	})
 	if err != nil {
 		b.Fatal(err)
 	}
 	if len(result) < n {
-		b.Skipf("repo has fewer than %d .go files", n)
+		b.Skipf("repo has fewer than %d source files", n)
 	}
 	return result
 }

@@ -134,7 +134,8 @@ Pitfalls:
   - Single quotes to prevent shell expanding |, (, )
   - Multi-word queries are AND'd substrings, not phrase match: seek 'foo bar'
     matches files containing both "foo" and "bar" independently
-  - Large output: redirect to file (seek 'q' > /tmp/seek.txt) then read it
+  - Large output: use -n to limit files (seek -n 5 'q') or -m to limit
+    matches per file (seek -n 5 -m 3 'q')
 
 Step 4 -- Discover project-specific examples
 
@@ -240,6 +241,17 @@ Results are grouped by file, sorted by relevance. Each match includes 3 lines of
 | `seek "handleError file:api -file:test"` | Combined: substring + path filter + exclusion |
 
 All [zoekt query syntax](https://github.com/sourcegraph/zoekt/blob/main/doc/query_syntax.md) is supported. Searches are ranked using [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) scoring for relevance.
+
+### Flags
+
+| Flag | What it does |
+|------|-------------|
+| `seek -n 5 "query"` | Display at most 5 files (`--limit`) |
+| `seek -m 3 "query"` | Display at most 3 matches per file (`--max-matches`) |
+| `seek -n 5 -m 3 "query"` | Top 5 files, max 3 matches each |
+| `seek -v "query"` | Enable debug logging (`--verbose`) |
+
+Flags compose with all query filters. For example, `seek -n 3 "sym:handleRequest file:api"` returns the top 3 matching files containing a `handleRequest` definition under `api/`.
 
 ## What seek adds over grep / ripgrep
 

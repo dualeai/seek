@@ -10,11 +10,18 @@ import (
 )
 
 // formatResults formats zoekt FileMatch results into the output format.
-// Files are deduplicated (uncommitted wins over committed; committed results
-// for dirty files are suppressed even when the uncommitted shard has no
-// match — the committed content is stale). Sorted by score descending.
+//
+// Pipeline:
+//  1. Deduplicate — uncommitted wins over committed; committed results for
+//     dirty files are suppressed (the committed content is stale).
+//  2. Sort — BM25 score descending, filename ascending as tiebreaker.
+//  3. File limit — keep at most limit files (0 or negative = unlimited).
+//  4. Match limit — keep at most maxMatches LineMatches per file
+//     (0 or negative = unlimited). Keeps the earliest matches by line number.
+//  5. Format — render file headers, line numbers, context, and symbol tags.
+//
 // Returns "" when all results are suppressed (caller should treat as no match).
-func formatResults(files []zoekt.FileMatch, dirtyFiles map[string]bool) string {
+func formatResults(files []zoekt.FileMatch, dirtyFiles map[string]bool, limit, maxMatches int) string {
 	if len(files) == 0 {
 		return ""
 	}
@@ -29,6 +36,20 @@ func formatResults(files []zoekt.FileMatch, dirtyFiles map[string]bool) string {
 		}
 		return deduped[i].FileName < deduped[j].FileName
 	})
+
+	// Apply file-count limit (0 or negative = unlimited).
+	if limit > 0 && len(deduped) > limit {
+		deduped = deduped[:limit]
+	}
+
+	// Apply per-file match limit (0 or negative = unlimited).
+	if maxMatches > 0 {
+		for i := range deduped {
+			if len(deduped[i].LineMatches) > maxMatches {
+				deduped[i].LineMatches = deduped[i].LineMatches[:maxMatches]
+			}
+		}
+	}
 
 	// Compute the digit width of the largest line number across all files
 	// so every line number in the output uses a consistent field width.

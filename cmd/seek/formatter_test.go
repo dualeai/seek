@@ -9,7 +9,7 @@ import (
 )
 
 func TestFormatResults_Empty(t *testing.T) {
-	result := formatResults(nil, nil)
+	result := formatResults(nil, nil, 0, 0)
 	if result != "" {
 		t.Errorf("expected empty string, got %q", result)
 	}
@@ -31,7 +31,7 @@ func TestFormatResults_BasicFileMatch(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	expected := "## src/main.go (Go)\n  5 func main() {"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -54,7 +54,7 @@ func TestFormatResults_UncommittedTag(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	expected := "## lib/utils.py (Python) [uncommitted]\n  10 def helper():"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -83,7 +83,7 @@ func TestFormatResults_Deduplication_UncommittedWins(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	if !strings.Contains(result, "[uncommitted]") {
 		t.Error("expected uncommitted version to win deduplication")
 	}
@@ -117,7 +117,7 @@ func TestFormatResults_ScoreSorting(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	highIdx := strings.Index(result, "high.go")
 	lowIdx := strings.Index(result, "low.go")
 	if highIdx > lowIdx {
@@ -146,7 +146,7 @@ func TestFormatResults_SymbolKind(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	expected := "## router.go (Go)\n  15 [function] func CoreRouter() {"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -166,7 +166,7 @@ func TestFormatResults_LanguageFallback(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	if !strings.Contains(result, "(unknown)") {
 		t.Error("expected language fallback to 'unknown'")
 	}
@@ -194,7 +194,7 @@ func TestFormatResults_MultiFile(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	if !strings.Contains(result, "## a.go (Go)") {
 		t.Error("expected a.go header")
 	}
@@ -216,7 +216,7 @@ func TestFormatResults_NoTrailingNewline(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	if len(result) > 0 && result[len(result)-1] == '\n' {
 		t.Error("output must not end with trailing newline")
 	}
@@ -232,7 +232,7 @@ func TestFormatResults_ZeroLineMatches(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	expected := "## empty.go (Go)"
 	if result != expected {
 		t.Errorf("expected %q, got %q", expected, result)
@@ -253,7 +253,7 @@ func TestFormatResults_ManyFiles_SortedByScore(t *testing.T) {
 		}
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 
 	// Highest score (999) should appear before lowest (0)
 	highIdx := strings.Index(result, "file_0999.go")
@@ -329,7 +329,7 @@ func TestFormatResults_ScoreTiebreaking_Stable(t *testing.T) {
 		{FileName: "a.go", Repository: "repo", Language: "Go", Score: 10,
 			LineMatches: []zoekt.LineMatch{{Line: []byte("a\n"), LineNumber: 1}}},
 	}
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	aIdx := strings.Index(result, "a.go")
 	bIdx := strings.Index(result, "b.go")
 	if aIdx > bIdx {
@@ -375,7 +375,7 @@ func TestFormatResults_ContextLines_BeforeAndAfter(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## server.go (Go)",
 		"  13 ",
@@ -406,7 +406,7 @@ func TestFormatResults_ContextLines_NoContext(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	expected := "## main.go (Go)\n  5 func main() {"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -438,7 +438,7 @@ func TestFormatResults_ContextLines_OverlappingContext(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"  10 first match",
@@ -473,7 +473,7 @@ func TestFormatResults_ContextLines_NonContiguousRegions(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"   5 first match",
@@ -510,7 +510,7 @@ func TestFormatResults_ContextLines_AdjacentMatches(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"  10 line one",
@@ -540,7 +540,7 @@ func TestFormatResults_ContextLines_ThreeContextLines(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## main.go (Go)",
 		"  17 ctx line 17",
@@ -574,7 +574,7 @@ func TestFormatResults_ContextLines_MatchOnLine1(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## main.go (Go)",
 		"  1 package main",
@@ -605,7 +605,7 @@ func TestFormatResults_ContextLines_MatchOnLine1_ExcessBefore(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	// Before lines should be silently dropped — no negative line numbers
 	if strings.Contains(result, "phantom") {
 		t.Errorf("expected excess Before lines to be dropped, got:\n%s", result)
@@ -636,7 +636,7 @@ func TestFormatResults_ContextLines_MatchOnLine2_PartialBefore(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## main.go (Go)",
 		"  1 package main",
@@ -676,7 +676,7 @@ func TestFormatResults_ContextLines_ThreeConsecutiveMatches(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"  10 match A",
@@ -708,7 +708,7 @@ func TestFormatResults_ContextLines_OnlyBefore(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"   99 penultimate",
@@ -737,7 +737,7 @@ func TestFormatResults_ContextLines_OnlyAfter(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"  1 first line",
@@ -767,7 +767,7 @@ func TestFormatResults_ContextLines_EmptyLinesInContext(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"  2 import \"fmt\"",
@@ -801,7 +801,7 @@ func TestFormatResults_ContextLines_EmptyByteSlice(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	expected := "## app.go (Go)\n  5 match"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -826,7 +826,7 @@ func TestFormatResults_ContextLines_BeforeNoTrailingNewline(t *testing.T) {
 		},
 	}
 
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"  1 line one",
@@ -857,7 +857,7 @@ func TestFormatResults_FileOnlyMatch_LineNumberZero(t *testing.T) {
 	}
 
 	// Should not panic
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	if !strings.Contains(result, "## path/to/file.go (Go)") {
 		t.Errorf("expected file header, got: %s", result)
 	}
@@ -944,7 +944,7 @@ func TestFormatResults_StaleDirtyFileSuppressed(t *testing.T) {
 		},
 	}
 	dirtyFiles := map[string]bool{"sqlite.py": true}
-	result := formatResults(files, dirtyFiles)
+	result := formatResults(files, dirtyFiles, 0, 0)
 	if result != "" {
 		t.Errorf("expected empty output for stale dirty file, got:\n%s", result)
 	}
@@ -1038,7 +1038,7 @@ func TestFormatResults_AllSuppressedReturnsEmpty(t *testing.T) {
 			LineMatches: []zoekt.LineMatch{{Line: []byte("stale\n"), LineNumber: 2}}},
 	}
 	dirtyFiles := map[string]bool{"a.py": true, "b.py": true}
-	result := formatResults(files, dirtyFiles)
+	result := formatResults(files, dirtyFiles, 0, 0)
 	if result != "" {
 		t.Errorf("expected empty string when all results suppressed, got:\n%s", result)
 	}
@@ -1053,7 +1053,7 @@ func TestFormatResults_PartialSuppression(t *testing.T) {
 			LineMatches: []zoekt.LineMatch{{Line: []byte("good\n"), LineNumber: 1}}},
 	}
 	dirtyFiles := map[string]bool{"stale.go": true}
-	result := formatResults(files, dirtyFiles)
+	result := formatResults(files, dirtyFiles, 0, 0)
 	if strings.Contains(result, "stale.go") {
 		t.Error("stale.go should be suppressed")
 	}
@@ -1142,7 +1142,7 @@ func TestFormatResults_VeryLongFileName(t *testing.T) {
 			},
 		},
 	}
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	if !strings.Contains(result, longName) {
 		t.Error("expected long filename to appear in output without truncation")
 	}
@@ -1161,7 +1161,7 @@ func TestFormatResults_VeryLongLine(t *testing.T) {
 			},
 		},
 	}
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	if !strings.Contains(result, strings.Repeat("x", 10000)) {
 		t.Error("expected long line to appear without truncation")
 	}
@@ -1179,7 +1179,7 @@ func TestFormatResults_SpecialCharsInLine(t *testing.T) {
 			},
 		},
 	}
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	if !strings.Contains(result, "tab\there unicode: 日本語 emoji: 🎉") {
 		t.Errorf("expected special chars preserved, got: %s", result)
 	}
@@ -1203,7 +1203,7 @@ func TestFormatResults_LineNumber_MaxUint32(t *testing.T) {
 		},
 	}
 	// Should not panic
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	if !strings.Contains(result, "match") {
 		t.Error("expected match to appear in output")
 	}
@@ -1281,7 +1281,7 @@ func TestFormatResults_GlobalAlignment_CrossFile(t *testing.T) {
 			},
 		},
 	}
-	result := formatResults(files, nil)
+	result := formatResults(files, nil, 0, 0)
 	// Both should be padded to width 3 (len("100") == 3)
 	if !strings.Contains(result, "    5 near top") {
 		t.Errorf("expected shallow match padded to width 3, got:\n%s", result)
@@ -1326,5 +1326,375 @@ func TestSplitContextLines(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// --- Limit / MaxMatches tests ---
+
+// extractFileHeaders returns the "## filename" headers from formatted output.
+func extractFileHeaders(output string) []string {
+	var headers []string
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "## ") {
+			headers = append(headers, line)
+		}
+	}
+	return headers
+}
+
+func TestFormatResults_Limit_TopN(t *testing.T) {
+	files := make([]zoekt.FileMatch, 10)
+	for i := range 10 {
+		files[i] = zoekt.FileMatch{
+			FileName: fmt.Sprintf("file_%02d.go", i), Repository: "repo", Language: "Go",
+			Score:       float64(i),
+			LineMatches: []zoekt.LineMatch{{Line: []byte("match\n"), LineNumber: 1}},
+		}
+	}
+	result := formatResults(files, nil, 3, 0)
+	for _, want := range []string{"file_09.go", "file_08.go", "file_07.go"} {
+		if !strings.Contains(result, want) {
+			t.Errorf("expected %s in limited output", want)
+		}
+	}
+	for _, noWant := range []string{"file_06.go", "file_05.go", "file_00.go"} {
+		if strings.Contains(result, noWant) {
+			t.Errorf("did not expect %s in limited output", noWant)
+		}
+	}
+}
+
+func TestFormatResults_NonPositiveLimitsAreUnlimited(t *testing.T) {
+	files := make([]zoekt.FileMatch, 5)
+	for i := range 5 {
+		files[i] = zoekt.FileMatch{
+			FileName: fmt.Sprintf("f%d.go", i), Repository: "repo", Language: "Go",
+			Score:       float64(i),
+			LineMatches: []zoekt.LineMatch{{Line: []byte(fmt.Sprintf("line%d\n", i)), LineNumber: i + 1}},
+		}
+	}
+	for _, tc := range []struct {
+		name              string
+		limit, maxMatches int
+	}{
+		{"limit_zero", 0, 0},
+		{"limit_negative", -5, 0},
+		{"maxMatches_negative", 0, -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := formatResults(files, nil, tc.limit, tc.maxMatches)
+			for i := range 5 {
+				if !strings.Contains(result, fmt.Sprintf("f%d.go", i)) {
+					t.Errorf("expected f%d.go in output", i)
+				}
+			}
+		})
+	}
+}
+
+func TestFormatResults_Limit_ExceedsResults(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{FileName: "only.go", Repository: "repo", Language: "Go", Score: 1,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("m\n"), LineNumber: 1}}},
+	}
+	result := formatResults(files, nil, 100, 0)
+	if !strings.Contains(result, "only.go") {
+		t.Error("expected only.go in output")
+	}
+}
+
+func TestFormatResults_Limit_EqualsResults(t *testing.T) {
+	files := make([]zoekt.FileMatch, 3)
+	for i := range 3 {
+		files[i] = zoekt.FileMatch{
+			FileName: fmt.Sprintf("f%d.go", i), Repository: "repo", Language: "Go",
+			Score:       float64(i),
+			LineMatches: []zoekt.LineMatch{{Line: []byte("m\n"), LineNumber: 1}},
+		}
+	}
+	result := formatResults(files, nil, 3, 0)
+	for i := range 3 {
+		if !strings.Contains(result, fmt.Sprintf("f%d.go", i)) {
+			t.Errorf("expected f%d.go in output when limit == count", i)
+		}
+	}
+}
+
+func TestFormatResults_Limit_EmptyInput(t *testing.T) {
+	if result := formatResults(nil, nil, 5, 0); result != "" {
+		t.Errorf("expected empty output, got %q", result)
+	}
+}
+
+func TestFormatResults_Limit_DedupReducesBelowLimit(t *testing.T) {
+	files := make([]zoekt.FileMatch, 10)
+	for i := range 5 {
+		files[i] = zoekt.FileMatch{
+			FileName: fmt.Sprintf("f%d.go", i), Repository: "repo", Language: "Go",
+			Score:       float64(i),
+			LineMatches: []zoekt.LineMatch{{Line: []byte("committed\n"), LineNumber: 1}},
+		}
+		files[5+i] = zoekt.FileMatch{
+			FileName: fmt.Sprintf("f%d.go", i), Repository: repoUncommitted, Language: "Go",
+			Score:       float64(i + 1),
+			LineMatches: []zoekt.LineMatch{{Line: []byte("uncommitted\n"), LineNumber: 1}},
+		}
+	}
+	result := formatResults(files, nil, 8, 0)
+	headers := extractFileHeaders(result)
+	if len(headers) != 5 {
+		t.Errorf("expected 5 file headers after dedup (limit=8), got %d", len(headers))
+	}
+}
+
+func TestFormatResults_Limit_AllSuppressedByDirty(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{FileName: "a.go", Repository: "repo", Language: "Go", Score: 10,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("old\n"), LineNumber: 1}}},
+	}
+	dirtyFiles := map[string]bool{"a.go": true}
+	result := formatResults(files, dirtyFiles, 5, 0)
+	if result != "" {
+		t.Errorf("expected empty output, got %q", result)
+	}
+}
+
+func TestFormatResults_Limit_TiedScores(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{FileName: "b.go", Repository: "repo", Language: "Go", Score: 10,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("b\n"), LineNumber: 1}}},
+		{FileName: "a.go", Repository: "repo", Language: "Go", Score: 10,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("a\n"), LineNumber: 1}}},
+		{FileName: "c.go", Repository: "repo", Language: "Go", Score: 10,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("c\n"), LineNumber: 1}}},
+	}
+	result := formatResults(files, nil, 2, 0)
+	if !strings.Contains(result, "a.go") || !strings.Contains(result, "b.go") {
+		t.Errorf("expected a.go and b.go in output, got:\n%s", result)
+	}
+	if strings.Contains(result, "c.go") {
+		t.Error("c.go should be excluded by limit=2")
+	}
+}
+
+func TestFormatResults_Limit_PropertySameFilesAndOrder(t *testing.T) {
+	files := make([]zoekt.FileMatch, 20)
+	for i := range 20 {
+		files[i] = zoekt.FileMatch{
+			FileName: fmt.Sprintf("f%02d.go", i), Repository: "repo", Language: "Go",
+			Score:       float64(i),
+			LineMatches: []zoekt.LineMatch{{Line: []byte("m\n"), LineNumber: 1}},
+		}
+	}
+	unlimited := formatResults(files, nil, 0, 0)
+	limited := formatResults(files, nil, 5, 0)
+	unlimitedHeaders := extractFileHeaders(unlimited)
+	limitedHeaders := extractFileHeaders(limited)
+	if len(limitedHeaders) != 5 {
+		t.Fatalf("expected 5 headers, got %d", len(limitedHeaders))
+	}
+	for i, h := range limitedHeaders {
+		if h != unlimitedHeaders[i] {
+			t.Errorf("header %d: limited=%q, unlimited=%q", i, h, unlimitedHeaders[i])
+		}
+	}
+}
+
+func TestFormatResults_Limit_WithUncommittedAndSymbols(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{FileName: "top.go", Repository: repoUncommitted, Language: "Go", Score: 100,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("func Top() {\n"), LineNumber: 1,
+				LineFragments: []zoekt.LineFragmentMatch{{SymbolInfo: &zoekt.Symbol{Kind: "function"}}}}}},
+		{FileName: "mid.go", Repository: "repo", Language: "Go", Score: 50,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("mid\n"), LineNumber: 1}}},
+		{FileName: "low.go", Repository: "repo", Language: "Go", Score: 1,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("low\n"), LineNumber: 1}}},
+	}
+	result := formatResults(files, nil, 2, 0)
+	if !strings.Contains(result, "[uncommitted]") {
+		t.Error("expected uncommitted tag")
+	}
+	if !strings.Contains(result, "[function]") {
+		t.Error("expected symbol annotation")
+	}
+	if strings.Contains(result, "low.go") {
+		t.Error("low.go should be excluded by limit=2")
+	}
+}
+
+func TestFormatResults_Limit_FileOnlyMatch(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{FileName: "top.go", Repository: "repo", Language: "Go", Score: 100},
+		{FileName: "bot.go", Repository: "repo", Language: "Go", Score: 1},
+	}
+	result := formatResults(files, nil, 1, 0)
+	if !strings.Contains(result, "top.go") {
+		t.Error("expected top.go")
+	}
+	if strings.Contains(result, "bot.go") {
+		t.Error("did not expect bot.go")
+	}
+}
+
+func TestFormatResults_Limit_MixedDirtyClean(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{FileName: "dirty.go", Repository: "repo", Language: "Go", Score: 100,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("stale\n"), LineNumber: 1}}},
+		{FileName: "clean1.go", Repository: "repo", Language: "Go", Score: 50,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("ok\n"), LineNumber: 1}}},
+		{FileName: "clean2.go", Repository: "repo", Language: "Go", Score: 25,
+			LineMatches: []zoekt.LineMatch{{Line: []byte("ok2\n"), LineNumber: 1}}},
+	}
+	dirtyFiles := map[string]bool{"dirty.go": true}
+	result := formatResults(files, dirtyFiles, 1, 0)
+	if !strings.Contains(result, "clean1.go") {
+		t.Error("expected clean1.go (highest after suppression)")
+	}
+	if strings.Contains(result, "clean2.go") {
+		t.Error("did not expect clean2.go with limit=1")
+	}
+	if strings.Contains(result, "dirty.go") {
+		t.Error("dirty.go should be suppressed")
+	}
+}
+
+// --- MaxMatches tests ---
+
+func TestFormatResults_MaxMatches_Basic(t *testing.T) {
+	matches := make([]zoekt.LineMatch, 10)
+	for i := range 10 {
+		matches[i] = zoekt.LineMatch{Line: []byte(fmt.Sprintf("line%d\n", i)), LineNumber: i + 1}
+	}
+	files := []zoekt.FileMatch{
+		{FileName: "f.go", Repository: "repo", Language: "Go", Score: 10, LineMatches: matches},
+	}
+	result := formatResults(files, nil, 0, 3)
+	if !strings.Contains(result, "line0") {
+		t.Error("expected first match")
+	}
+	if !strings.Contains(result, "line2") {
+		t.Error("expected third match")
+	}
+	if strings.Contains(result, "line3") {
+		t.Error("did not expect fourth match with maxMatches=3")
+	}
+}
+
+func TestFormatResults_MaxMatches_ExceedsMatches(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{FileName: "f.go", Repository: "repo", Language: "Go", Score: 10,
+			LineMatches: []zoekt.LineMatch{
+				{Line: []byte("only\n"), LineNumber: 1},
+			}},
+	}
+	result := formatResults(files, nil, 0, 100)
+	if !strings.Contains(result, "only") {
+		t.Error("expected match when maxMatches > match count")
+	}
+}
+
+func TestFormatResults_MaxMatches_One(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{FileName: "f.go", Repository: "repo", Language: "Go", Score: 10,
+			LineMatches: []zoekt.LineMatch{
+				{Line: []byte("first\n"), LineNumber: 1},
+				{Line: []byte("second\n"), LineNumber: 10},
+				{Line: []byte("third\n"), LineNumber: 20},
+			}},
+	}
+	result := formatResults(files, nil, 0, 1)
+	if !strings.Contains(result, "first") {
+		t.Error("expected first match")
+	}
+	if strings.Contains(result, "second") {
+		t.Error("did not expect second match with maxMatches=1")
+	}
+}
+
+func TestFormatResults_MaxMatches_PreservesContext(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{FileName: "f.go", Repository: "repo", Language: "Go", Score: 10,
+			LineMatches: []zoekt.LineMatch{
+				{Line: []byte("match\n"), LineNumber: 5,
+					Before: []byte("before_ctx\n"),
+					After:  []byte("after_ctx\n")},
+				{Line: []byte("dropped\n"), LineNumber: 20},
+			}},
+	}
+	result := formatResults(files, nil, 0, 1)
+	if !strings.Contains(result, "before_ctx") {
+		t.Error("expected before-context on kept match")
+	}
+	if !strings.Contains(result, "after_ctx") {
+		t.Error("expected after-context on kept match")
+	}
+	if strings.Contains(result, "dropped") {
+		t.Error("did not expect dropped match")
+	}
+}
+
+func TestFormatResults_MaxMatches_MultipleFiles(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{FileName: "a.go", Repository: "repo", Language: "Go", Score: 10,
+			LineMatches: []zoekt.LineMatch{
+				{Line: []byte("a1\n"), LineNumber: 1},
+				{Line: []byte("a2\n"), LineNumber: 10},
+				{Line: []byte("a3\n"), LineNumber: 20},
+			}},
+		{FileName: "b.go", Repository: "repo", Language: "Go", Score: 5,
+			LineMatches: []zoekt.LineMatch{
+				{Line: []byte("b1\n"), LineNumber: 1},
+				{Line: []byte("b2\n"), LineNumber: 10},
+			}},
+	}
+	result := formatResults(files, nil, 0, 2)
+	if !strings.Contains(result, "a1") || !strings.Contains(result, "a2") {
+		t.Error("expected first 2 matches in a.go")
+	}
+	if strings.Contains(result, "a3") {
+		t.Error("did not expect third match in a.go")
+	}
+	if !strings.Contains(result, "b1") || !strings.Contains(result, "b2") {
+		t.Error("expected both matches in b.go (under limit)")
+	}
+}
+
+func TestFormatResults_MaxMatches_FileOnlyMatch(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{FileName: "f.go", Repository: "repo", Language: "Go", Score: 10},
+	}
+	result := formatResults(files, nil, 0, 3)
+	if !strings.Contains(result, "f.go") {
+		t.Error("expected file header even with no matches")
+	}
+}
+
+// --- Combined limit + maxMatches tests ---
+
+func TestFormatResults_LimitAndMaxMatches_Combined(t *testing.T) {
+	files := make([]zoekt.FileMatch, 10)
+	for i := range 10 {
+		matches := make([]zoekt.LineMatch, 5)
+		for j := range 5 {
+			matches[j] = zoekt.LineMatch{
+				Line:       []byte(fmt.Sprintf("f%d_m%d\n", i, j)),
+				LineNumber: j + 1,
+			}
+		}
+		files[i] = zoekt.FileMatch{
+			FileName: fmt.Sprintf("f%02d.go", i), Repository: "repo", Language: "Go",
+			Score: float64(i), LineMatches: matches,
+		}
+	}
+	result := formatResults(files, nil, 3, 2)
+	headers := extractFileHeaders(result)
+	if len(headers) != 3 {
+		t.Fatalf("expected 3 file headers, got %d", len(headers))
+	}
+	if !strings.Contains(result, "f09.go") || !strings.Contains(result, "f08.go") || !strings.Contains(result, "f07.go") {
+		t.Error("expected top 3 files by score")
+	}
+	if strings.Contains(result, "f9_m2") {
+		t.Error("did not expect third match in any file")
 	}
 }
