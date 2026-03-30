@@ -40,6 +40,8 @@ jobs:
           - os: blacksmith-6vcpu-macos-15           # macOS arm64 (Sequoia)
             name: macos-15-arm64
     runs-on: ${{ matrix.os }}
+    env:
+      JUNIT_XML: junit-${{ matrix.name }}.xml
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
@@ -51,7 +53,19 @@ jobs:
       - name: Install universal-ctags (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y universal-ctags
-      - run: make test-unit
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+      - name: Run unit tests
+        run: make test-unit
+        env:
+          JUNIT_XML: ${{ env.JUNIT_XML }}
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: junit-${{ matrix.name }}
+          path: ${{ env.JUNIT_XML }}
+          if-no-files-found: ignore
 
   build:
     strategy:
