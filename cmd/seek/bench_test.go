@@ -196,7 +196,7 @@ func BenchmarkFormatResults_1File_1Match(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		formatResults(files, nil)
+		formatResults(files, nil, 0, 0)
 	}
 }
 
@@ -215,7 +215,7 @@ func BenchmarkFormatResults_10Files_3Matches(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		formatResults(files, nil)
+		formatResults(files, nil, 0, 0)
 	}
 }
 
@@ -236,7 +236,7 @@ func BenchmarkFormatResults_100Files_WithDedup(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		formatResults(files, nil)
+		formatResults(files, nil, 0, 0)
 	}
 }
 
@@ -260,7 +260,86 @@ func BenchmarkFormatResults_WithSymbols(b *testing.B) {
 	}
 	b.ReportAllocs()
 	for b.Loop() {
-		formatResults(files, nil)
+		formatResults(files, nil, 0, 0)
+	}
+}
+
+// buildLargeFixture creates nFiles FileMatches, each with matchesPerFile
+// LineMatches including Before/After context and symbol annotations.
+func buildLargeFixture(nFiles, matchesPerFile int) []zoekt.FileMatch {
+	files := make([]zoekt.FileMatch, nFiles)
+	for i := range nFiles {
+		matches := make([]zoekt.LineMatch, matchesPerFile)
+		for j := range matchesPerFile {
+			matches[j] = zoekt.LineMatch{
+				Line:       []byte("func ProcessRequest(ctx context.Context) error {\n"),
+				LineNumber: 10 + j*20,
+				Before:     []byte("// handler doc\n"),
+				After:      []byte("    return nil\n"),
+				LineFragments: []zoekt.LineFragmentMatch{
+					{SymbolInfo: &zoekt.Symbol{Kind: "function"}},
+				},
+			}
+		}
+		files[i] = zoekt.FileMatch{
+			FileName:    fmt.Sprintf("pkg/service%03d/handler.go", i),
+			Repository:  "repo",
+			Language:    "Go",
+			Score:       float64(nFiles - i),
+			LineMatches: matches,
+		}
+	}
+	return files
+}
+
+func BenchmarkFormatResults_FileLimit(b *testing.B) {
+	files := buildLargeFixture(100, 5)
+	for _, limit := range []int{0, 1, 5, 10, 50} {
+		name := "unlimited"
+		if limit > 0 {
+			name = fmt.Sprintf("limit_%d", limit)
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				formatResults(files, nil, limit, 0)
+			}
+		})
+	}
+}
+
+func BenchmarkFormatResults_MatchLimit(b *testing.B) {
+	files := buildLargeFixture(20, 20)
+	for _, maxMatches := range []int{0, 1, 3, 5} {
+		name := "unlimited"
+		if maxMatches > 0 {
+			name = fmt.Sprintf("max_%d", maxMatches)
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				formatResults(files, nil, 0, maxMatches)
+			}
+		})
+	}
+}
+
+func BenchmarkFormatResults_Combined(b *testing.B) {
+	files := buildLargeFixture(100, 10)
+	cases := []struct {
+		name              string
+		limit, maxMatches int
+	}{
+		{"n5_m3", 5, 3},
+		{"n1_m1", 1, 1},
+	}
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				formatResults(files, nil, tc.limit, tc.maxMatches)
+			}
+		})
 	}
 }
 
@@ -786,7 +865,6 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		q = query.Map(q, query.ExpandFileContent)
 		q = query.Simplify(q)
 		opts := &zoekt.SearchOptions{
-			MaxDocDisplayCount: 1000,
 			TotalMaxMatchCount: 10000,
 			ShardMaxMatchCount: 10000,
 			NumContextLines:    searchContextLines,
@@ -840,7 +918,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
-			formatResults(results, nil)
+			formatResults(results, nil, 0, 0)
 		}
 	})
 
@@ -861,7 +939,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
-			formatResults(results, dirtyFiles)
+			formatResults(results, dirtyFiles, 0, 0)
 		}
 	})
 }

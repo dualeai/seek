@@ -36,7 +36,12 @@ func executeSearch(ctx context.Context, indexDir, pattern string) ([]zoekt.FileM
 	q = query.Simplify(q)
 
 	result, err := searcher.Search(ctx, q, &zoekt.SearchOptions{
-		MaxDocDisplayCount: 1000,
+		// MaxDocDisplayCount is intentionally left at 0 (unlimited). Display
+		// limiting is handled by seek's --limit/-n flag in formatResults,
+		// which applies after dedup and BM25 sort. A zoekt-level display cap
+		// would silently drop low-ranked files before seek or downstream
+		// pipes (| grep, | head) see them, causing false negatives.
+		// Search work is bounded by TotalMaxMatchCount and ShardMaxMatchCount.
 		TotalMaxMatchCount: 10000,
 		ShardMaxMatchCount: 10000,
 		NumContextLines:    searchContextLines,

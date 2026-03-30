@@ -55,6 +55,10 @@ func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	verbose := flag.Bool("verbose", false, "enable debug logging")
 	flag.BoolVar(verbose, "v", false, "alias for -verbose")
+	limit := flag.Int("limit", 0, "maximum number of files to display (0 = unlimited)")
+	flag.IntVar(limit, "n", 0, "alias for -limit")
+	maxMatches := flag.Int("max-matches", 0, "maximum number of matches per file (0 = unlimited)")
+	flag.IntVar(maxMatches, "m", 0, "alias for -max-matches")
 	flag.Parse()
 
 	if *showVersion {
@@ -87,7 +91,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
-	if err := run(ctx, pattern); err != nil {
+	if err := run(ctx, pattern, *limit, *maxMatches); err != nil {
 		if errors.Is(err, errNoMatch) {
 			os.Exit(1)
 		}
@@ -116,7 +120,7 @@ func (w *slogWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func run(ctx context.Context, pattern string) error {
+func run(ctx context.Context, pattern string, limit, maxMatches int) error {
 	paths, err := resolveGitPathsFromCWD(ctx)
 	if err != nil {
 		return fmt.Errorf("not a git repository: %w", err)
@@ -192,7 +196,7 @@ func run(ctx context.Context, pattern string) error {
 
 	// formatResults returns "" when all results were stale committed
 	// matches for dirty files — treat as no match (exit code 1).
-	output := formatResults(results, dirtyFiles)
+	output := formatResults(results, dirtyFiles, limit, maxMatches)
 	if output == "" {
 		return errNoMatch
 	}
