@@ -550,6 +550,26 @@ func setupLargeRepoBench(b *testing.B) (repoDir, indexDir string) {
 	return repoDir, indexDir
 }
 
+func BenchmarkLargeRepo_ColdIndex(b *testing.B) {
+	repoDir := requireBenchRepo(b)
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for b.Loop() {
+		b.StopTimer()
+		indexDir := filepath.Join(repoDir, cacheDir)
+		_ = os.RemoveAll(indexDir)
+		_ = os.MkdirAll(indexDir, 0o755)
+		ensureGitExclude(fallbackGitPaths(repoDir), cacheDir)
+		b.StartTimer()
+
+		state := gitRepoStateIn(ctx, repoDir)
+		stateHash := computeStateHash(repoStateFingerprint(repoDir, state))
+		_ = runIndexing(ctx, fallbackGitPaths(repoDir), indexDir, state, stateHash)
+		_, _ = executeSearch(ctx, indexDir, "func main")
+	}
+}
+
 func BenchmarkLargeRepo_WarmSearch(b *testing.B) {
 	repoDir, indexDir := setupLargeRepoBench(b)
 	ctx := context.Background()
@@ -582,7 +602,7 @@ func benchmarkLargeRepoDirtyN(b *testing.B, n int) {
 	repoDir, indexDir := setupLargeRepoBench(b)
 	ctx := context.Background()
 
-	targets := findGoFiles(b, repoDir, n)
+	targets := findSourceFiles(b, repoDir, n)
 	originals := make([][]byte, len(targets))
 	for i, t := range targets {
 		data, err := os.ReadFile(t)
@@ -630,7 +650,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		}
 	}
 
-	target := findGoFile(b, repoDir)
+	target := findSourceFile(b, repoDir)
 	original, err := os.ReadFile(target)
 	if err != nil {
 		b.Fatal(err)
@@ -846,15 +866,15 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 	})
 }
 
-// findGoFile returns the absolute path of a Go file suitable for editing.
-func findGoFile(b *testing.B, repoDir string) string {
+// findSourceFile returns the absolute path of a source file suitable for editing.
+func findSourceFile(b *testing.B, repoDir string) string {
 	b.Helper()
-	targets := findGoFiles(b, repoDir, 1)
+	targets := findSourceFiles(b, repoDir, 1)
 	return targets[0]
 }
 
-// findGoFiles returns absolute paths of n Go files suitable for editing.
-func findGoFiles(b *testing.B, repoDir string, n int) []string {
+// findSourceFiles returns absolute paths of n source files suitable for editing.
+func findSourceFiles(b *testing.B, repoDir string, n int) []string {
 	b.Helper()
 	var result []string
 	err := filepath.WalkDir(repoDir, func(path string, d os.DirEntry, err error) error {
@@ -867,16 +887,14 @@ func findGoFiles(b *testing.B, repoDir string, n int) []string {
 		if len(result) >= n {
 			return filepath.SkipAll
 		}
-		if filepath.Ext(path) == ".go" {
-			result = append(result, path)
-		}
+		result = append(result, path)
 		return nil
 	})
 	if err != nil {
 		b.Fatal(err)
 	}
 	if len(result) < n {
-		b.Skipf("repo has fewer than %d .go files", n)
+		b.Skipf("repo has fewer than %d source files", n)
 	}
 	return result
 }
