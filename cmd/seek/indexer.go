@@ -57,7 +57,19 @@ func computeStateHash(rawOutput string) string {
 	h := xxhash.New()
 	_, _ = h.WriteString(stateVersion)
 	_, _ = h.WriteString(rawOutput)
-	return fmt.Sprintf("%016x", h.Sum64())
+	return formatHex16(h.Sum64())
+}
+
+// formatHex16 formats a uint64 as a zero-padded 16-character hex string
+// without the fmt.Sprintf allocation.
+func formatHex16(v uint64) string {
+	const digits = "0123456789abcdef"
+	var buf [16]byte
+	for i := 15; i >= 0; i-- {
+		buf[i] = digits[v&0xf]
+		v >>= 4
+	}
+	return string(buf[:])
 }
 
 // repoStateFingerprint returns the raw git status output enriched with working
@@ -80,9 +92,18 @@ func repoStateFingerprint(repoDir string, state repoState) string {
 	var b strings.Builder
 	b.Grow(len(state.RawOutput) + len(state.Files)*80)
 	b.WriteString(state.RawOutput)
+
+	// Pre-build path prefix to avoid per-file filepath.Join allocation.
+	// Git status paths are clean relative paths (no double slashes or dots),
+	// so simple concatenation is safe.
+	pathPrefix := repoDir + "/"
+
+	// Scratch buffer for numeric formatting (avoids strconv.Format* allocs).
+	var numBuf [20]byte
+
 	for _, f := range state.Files {
-		fi, err := os.Lstat(filepath.Join(repoDir, f))
-		if err != nil {
+		var stat syscall.Stat_t
+		if err := syscall.Lstat(pathPrefix+f, &stat); err != nil {
 			// File may have been deleted between git status and stat;
 			// include a sentinel so deletions also change the hash.
 			b.WriteByte(0)
@@ -90,18 +111,15 @@ func repoStateFingerprint(repoDir string, state repoState) string {
 			b.WriteString("\x00deleted\x00")
 			continue
 		}
-		ino := uint64(0)
-		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
-			ino = stat.Ino
-		}
+		mtime := statMtimeNano(stat)
 		b.WriteByte(0)
 		b.WriteString(f)
 		b.WriteByte(0)
-		b.WriteString(strconv.FormatInt(fi.ModTime().UnixNano(), 10))
+		b.Write(strconv.AppendInt(numBuf[:0], mtime, 10))
 		b.WriteByte(0)
-		b.WriteString(strconv.FormatInt(fi.Size(), 10))
+		b.Write(strconv.AppendInt(numBuf[:0], stat.Size, 10))
 		b.WriteByte(0)
-		b.WriteString(strconv.FormatUint(ino, 10))
+		b.Write(strconv.AppendUint(numBuf[:0], stat.Ino, 10))
 		b.WriteByte(0)
 	}
 	return b.String()
@@ -161,6 +179,22 @@ func indexParallelism() int {
 	return p
 }
 
+// ctagsOnce caches the result of checkCtags so the PATH lookup and
+// --version subprocess run at most once per process. The result is
+// deterministic within a single invocation (ctags won't be uninstalled
+// between search cycles).
+var (
+	ctagsOnce sync.Once
+	ctagsErr  error
+)
+
+// checkCtagsCached returns the cached result of checkCtags, running the
+// check at most once per process.
+func checkCtagsCached() error {
+	ctagsOnce.Do(func() { ctagsErr = checkCtags() })
+	return ctagsErr
+}
+
 // checkCtags verifies that universal-ctags is installed. Zoekt silently skips
 // symbol parsing when ctags is missing (even with CTagsMustSucceed), so we
 // must detect this explicitly.
@@ -202,13 +236,15 @@ func checkCtags() error {
 // runIndexing orchestrates committed and uncommitted indexing with locking.
 func runIndexing(ctx context.Context, paths gitPaths, indexDir string, state repoState, preState string) error {
 	repoDir := paths.RepoDir
-	// Fail fast if ctags is missing
-	if err := checkCtags(); err != nil {
+	// Fail fast if ctags is missing. Uses sync.Once cache so the PATH
+	// lookup + --version subprocess runs at most once per process.
+	if err := checkCtagsCached(); err != nil {
 		return err
 	}
 
-	// Ensure cache dir is excluded from git status.
-	ensureGitExclude(paths, cacheDir)
+	// ensureGitExclude is handled by run() on the first invocation
+	// (before gitRepoState) and persists in .git/info/exclude — no
+	// need to re-check on every dirty reindex cycle.
 
 	lockPath := filepath.Join(indexDir, lockFile)
 

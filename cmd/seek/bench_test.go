@@ -183,6 +183,37 @@ func BenchmarkEnsureGitExclude_AlreadyPresent(b *testing.B) {
 	}
 }
 
+func BenchmarkFastResolveGitPaths(b *testing.B) {
+	dir := b.TempDir()
+	_ = os.MkdirAll(filepath.Join(dir, ".git", "info"), 0o755)
+
+	// Change to the temp dir so fastResolveGitPaths can find .git
+	origDir, _ := os.Getwd()
+	_ = os.Chdir(dir)
+	b.Cleanup(func() { _ = os.Chdir(origDir) })
+
+	b.ReportAllocs()
+	for b.Loop() {
+		fastResolveGitPaths()
+	}
+}
+
+func BenchmarkResolveGitPaths_Subprocess(b *testing.B) {
+	dir := initGitRepo(b, "dummy.go", "package dummy\n")
+	origDir, _ := os.Getwd()
+	_ = os.Chdir(dir)
+	b.Cleanup(func() { _ = os.Chdir(origDir) })
+	ctx := context.Background()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		// Call resolveGitPaths directly to bypass the fast path
+		// and measure pure subprocess cost.
+		_, _ = resolveGitPaths(ctx, "")
+	}
+}
+
 // --- Formatter benchmarks ---
 
 func BenchmarkFormatResults_1File_1Match(b *testing.B) {

@@ -43,8 +43,47 @@ func gitCmd(ctx context.Context, args ...string) *exec.Cmd {
 }
 
 // resolveGitPathsFromCWD resolves git paths from the current working directory.
+// For the common non-worktree case, it walks up the directory tree to find
+// .git, avoiding a ~5-10ms subprocess call. Falls back to git rev-parse for
+// worktrees (where .git is a file, not a directory) and edge cases.
 func resolveGitPathsFromCWD(ctx context.Context) (gitPaths, error) {
+	if paths, ok := fastResolveGitPaths(); ok {
+		return paths, nil
+	}
 	return resolveGitPaths(ctx, "")
+}
+
+// fastResolveGitPaths attempts to resolve git paths without spawning a
+// subprocess. Walks up from CWD looking for a .git directory. Returns false
+// when .git is a file (worktree), CWD cannot be determined, or no .git is
+// found, causing the caller to fall back to git rev-parse.
+func fastResolveGitPaths() (gitPaths, bool) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return gitPaths{}, false
+	}
+	for {
+		gitPath := filepath.Join(dir, ".git")
+		fi, err := os.Lstat(gitPath)
+		if err == nil {
+			if fi.IsDir() {
+				return gitPaths{
+					RepoDir:     dir,
+					GitDir:      gitPath,
+					CommonDir:   gitPath,
+					ExcludePath: filepath.Join(gitPath, "info", "exclude"),
+					ConfigPath:  filepath.Join(gitPath, "config"),
+				}, true
+			}
+			// .git is a file → worktree or submodule; fall back
+			return gitPaths{}, false
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return gitPaths{}, false
+		}
+		dir = parent
+	}
 }
 
 func resolveGitPaths(ctx context.Context, dir string) (gitPaths, error) {
