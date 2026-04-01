@@ -121,6 +121,17 @@ func (w *slogWriter) Write(p []byte) (int, error) {
 }
 
 func run(ctx context.Context, pattern string, limit, maxMatches int) error {
+	// Launch git status concurrently with path resolution. Both are
+	// read-only git subprocess calls that take ~10-30ms each. Running
+	// them in parallel overlaps their latency on the warm search path.
+	type stateResult struct {
+		state repoState
+	}
+	stateCh := make(chan stateResult, 1)
+	go func() {
+		stateCh <- stateResult{state: gitRepoState(ctx)}
+	}()
+
 	paths, err := resolveGitPathsFromCWD(ctx)
 	if err != nil {
 		return fmt.Errorf("not a git repository: %w", err)
@@ -129,25 +140,27 @@ func run(ctx context.Context, pattern string, limit, maxMatches int) error {
 
 	// Use absolute paths to avoid dependence on process CWD
 	indexDir := filepath.Join(repoDir, cacheDir)
-	if err := os.MkdirAll(indexDir, 0o755); err != nil {
-		return fmt.Errorf("create index directory: %w", err)
-	}
 
-	// Check for existing index state. If present, one-time setup
-	// (ensureGitExclude, ensureUntrackedCache, ensureFSMonitor) was
-	// already applied by the indexing run that created the state file.
-	// Skipping them on the warm path saves ~150µs of file I/O.
+	// Check for existing index state. If present, the cache directory
+	// exists and one-time setup (ensureGitExclude, ensureUntrackedCache,
+	// ensureFSMonitor) was already applied. Skip MkdirAll + setup on the
+	// warm path, saving ~150µs of stat + file I/O syscalls.
 	cachedState := readStateFile(indexDir)
 	if cachedState == "" {
-		// First run or corrupted state — apply one-time setup before
-		// computing git status, so the cache dir is excluded.
+		// First run or corrupted state — create cache dir and apply
+		// one-time setup before computing git status, so the cache
+		// dir is excluded.
+		if err := os.MkdirAll(indexDir, 0o755); err != nil {
+			return fmt.Errorf("create index directory: %w", err)
+		}
 		ensureGitExclude(paths, cacheDir)
 		ensureUntrackedCache(ctx, paths)
 		ensureFSMonitor(ctx, paths)
 	}
 
-	// Compute state hash from a single atomic git status call.
-	state := gitRepoState(ctx)
+	// Wait for concurrent git status result.
+	sr := <-stateCh
+	state := sr.state
 	currentState := computeStateHash(repoStateFingerprint(repoDir, state))
 
 	// Re-index if the cached state differs from the current working tree.
@@ -201,6 +214,6 @@ func run(ctx context.Context, pattern string, limit, maxMatches int) error {
 		return errNoMatch
 	}
 
-	fmt.Print(output)
+	_, _ = os.Stdout.WriteString(output)
 	return nil
 }
