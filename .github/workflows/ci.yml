@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   test-static:
-    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
@@ -31,13 +31,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: blacksmith-2vcpu-ubuntu-2404        # Linux x86_64
+          - os: ubuntu-24.04                        # Linux x86_64
             name: linux-amd64
-          - os: blacksmith-2vcpu-ubuntu-2404-arm    # Linux arm64
+          - os: ubuntu-24.04-arm                    # Linux arm64
             name: linux-arm64
-          - os: blacksmith-6vcpu-macos-26           # macOS arm64 (Tahoe)
+          - os: macos-26                            # macOS arm64 (Tahoe)
             name: macos-26-arm64
-          - os: blacksmith-6vcpu-macos-15           # macOS arm64 (Sequoia)
+          - os: macos-15                            # macOS arm64 (Sequoia)
             name: macos-15-arm64
     runs-on: ${{ matrix.os }}
     env:
@@ -72,13 +72,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: blacksmith-2vcpu-ubuntu-2404        # Linux x86_64
+          - os: ubuntu-24.04                        # Linux x86_64
             name: linux-amd64
-          - os: blacksmith-2vcpu-ubuntu-2404-arm    # Linux arm64
+          - os: ubuntu-24.04-arm                    # Linux arm64
             name: linux-arm64
-          - os: blacksmith-6vcpu-macos-26           # macOS arm64 (Tahoe)
+          - os: macos-26                            # macOS arm64 (Tahoe)
             name: macos-26-arm64
-          - os: blacksmith-6vcpu-macos-15           # macOS arm64 (Sequoia)
+          - os: macos-15                            # macOS arm64 (Sequoia)
             name: macos-15-arm64
     runs-on: ${{ matrix.os }}
     needs: [test-static, test-unit]
