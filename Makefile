@@ -7,6 +7,7 @@ version-full:
 install:
 	go mod download
 	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+	go install gotest.tools/gotestsum@latest
 
 upgrade:
 	go get -u ./...
@@ -23,8 +24,10 @@ test-static:
 	go vet ./...
 	golangci-lint run ./...
 
+JUNIT_XML ?= junit.xml
+
 test-unit:
-	go test ./... -v -race
+	gotestsum --junitfile $(JUNIT_XML) -- ./... -v -race
 
 test-bench:
 	go test ./cmd/seek/ -bench=. -benchmem -count=5

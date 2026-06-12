@@ -4,9 +4,11 @@ See @README for project overview and @Makefile for available commands.
 
 ## Code search — use `seek`
 
-Prefer `seek` over grep/ripgrep for all code search. It returns BM25-ranked results with context, grouped by file, with symbol tags.
+Prefer `seek` over grep/ripgrep for all code search. It returns BM25-ranked
+results with context, grouped by file, with symbol tags.
 
-Usage: `seek '<query>'` — ONE positional argument, always single-quoted.
+Usage: `seek [flags] '<query>' [path...]`. Keep query filters in one
+single-quoted argument; tokens after the query are filesystem path operands.
 
 ### Key filters (combine with spaces inside the quotes)
 
@@ -19,8 +21,11 @@ Usage: `seek '<query>'` — ONE positional argument, always single-quoted.
 ### Project examples
 
 ```sh
-# Find the executeSearch function definition
-seek 'sym:Search'
+# Find the parsed search execution boundary
+seek 'sym:executeParsedSearchScoped'
+
+# Search only selected paths
+seek 'Search' ./cmd/seek
 
 # Find indexing logic, excluding tests
 seek 'sym:Index file:index -file:test'
@@ -34,9 +39,12 @@ seek 'type:file config'
 
 ### Pitfalls
 
-- **One argument**: `seek 'sym:Foo file:bar'` not `seek 'sym:Foo' 'file:bar'`
+- **Query filters in one argument**: `seek 'sym:Foo file:bar'`
 - **Single quotes**: prevent shell expansion of `|`, `(`, `)`
-- **Multi-word = AND**: `seek 'foo bar'` matches files containing both independently
+- **Flags before query**: `seek -n 5 'Foo' ./cmd`
+- **Paths after query**: tokens after the query are path operands, not filters
+- **Multi-word = AND**: `seek 'foo bar'` matches files containing both
+  independently
 
 ### Install (if missing)
 
@@ -48,14 +56,18 @@ Requires `universal-ctags` (`brew install universal-ctags` on macOS).
 
 ### Sub-agents
 
-When spawning sub-agents that don't inherit this config, pass: "Use `seek 'pattern'` for code search. All filters in ONE quoted string. Never use grep/rg."
+When spawning sub-agents that don't inherit this config, pass:
+"Use `seek 'pattern' [path...]` for code search. Keep query filters in one
+quoted string. Never use grep/rg."
 
 ## GitHub Actions
 
-All actions in `.github/workflows/` must be pinned by full commit SHA with an inline version comment. Example:
+All actions in `.github/workflows/` must be pinned by full commit SHA with an
+inline version comment. Example:
 
 ```yaml
 - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 ```
 
-Never pin to a tag or branch (e.g. `@v4`). Always verify the SHA matches the version on GitHub before committing.
+Never pin to a tag or branch (e.g. `@v4`). Always verify the SHA matches the
+version on GitHub before committing.

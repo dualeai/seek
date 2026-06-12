@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -19,9 +21,7 @@ import (
 )
 
 const (
-	// cacheDir is the directory name for seek's cache within the repo root.
-	cacheDir = ".seek-cache"
-	// stateFile stores the hash of the last indexed git state.
+	// stateFile stores the hash of the last indexed corpus state.
 	stateFile = ".state"
 	// stateTmpFile is used for atomic writes of the state file.
 	stateTmpFile = ".state.tmp"
@@ -34,13 +34,11 @@ const (
 	lockFile = ".lock"
 	// repoUncommitted is the zoekt repository name for uncommitted file shards.
 	repoUncommitted = "uncommitted"
-	// stateVersion is the prefix used in state hashing to invalidate caches
-	// when the hash algorithm or input format changes.
+	// emptyGitTreeSHA is Git's canonical SHA-1 for the empty tree.
+	emptyGitTreeSHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+	// stateVersion is the prefix used in state hashing to invalidate previous
+	// state formats when the hash algorithm or input format changes.
 	stateVersion = "v5\x00"
-	// maxUncommittedFileSize is the maximum file size (in bytes) for uncommitted
-	// file indexing. Files larger than this are skipped to prevent excessive
-	// memory usage.
-	maxUncommittedFileSize = 10 * 1024 * 1024 // 10 MB
 	// shardMax is the maximum corpus size (in bytes) per zoekt shard.
 	// Smaller shards allow more parallel shard building during cold index.
 	// Default zoekt value is 100MB (3 shards for k8s, ~1.7 cores used).
@@ -51,13 +49,24 @@ const (
 
 // computeStateHash computes the xxHash64 of the given state string.
 // In production, the input is a repoStateFingerprint (raw git status output
-// enriched with file stats). The stateVersion prefix invalidates old caches
-// when the hash algorithm or input format changes.
+// enriched with file stats).
 func computeStateHash(rawOutput string) string {
 	h := xxhash.New()
 	_, _ = h.WriteString(stateVersion)
 	_, _ = h.WriteString(rawOutput)
-	return fmt.Sprintf("%016x", h.Sum64())
+	return formatHex16(h.Sum64())
+}
+
+// formatHex16 formats a uint64 as a zero-padded 16-character hex string
+// without the fmt.Sprintf allocation.
+func formatHex16(v uint64) string {
+	const digits = "0123456789abcdef"
+	var buf [16]byte
+	for i := 15; i >= 0; i-- {
+		buf[i] = digits[v&0xf]
+		v >>= 4
+	}
+	return string(buf[:])
 }
 
 // repoStateFingerprint returns the raw git status output enriched with working
@@ -80,9 +89,18 @@ func repoStateFingerprint(repoDir string, state repoState) string {
 	var b strings.Builder
 	b.Grow(len(state.RawOutput) + len(state.Files)*80)
 	b.WriteString(state.RawOutput)
+
+	// Pre-build path prefix to avoid per-file filepath.Join allocation.
+	// Git status paths are clean relative paths (no double slashes or dots),
+	// so simple concatenation is safe.
+	pathPrefix := repoDir + "/"
+
+	// Scratch buffer for numeric formatting (avoids strconv.Format* allocs).
+	var numBuf [20]byte
+
 	for _, f := range state.Files {
-		fi, err := os.Lstat(filepath.Join(repoDir, f))
-		if err != nil {
+		var stat syscall.Stat_t
+		if err := syscall.Lstat(pathPrefix+f, &stat); err != nil {
 			// File may have been deleted between git status and stat;
 			// include a sentinel so deletions also change the hash.
 			b.WriteByte(0)
@@ -90,63 +108,60 @@ func repoStateFingerprint(repoDir string, state repoState) string {
 			b.WriteString("\x00deleted\x00")
 			continue
 		}
-		ino := uint64(0)
-		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
-			ino = stat.Ino
-		}
+		mtime := statMtimeNano(stat)
 		b.WriteByte(0)
 		b.WriteString(f)
 		b.WriteByte(0)
-		b.WriteString(strconv.FormatInt(fi.ModTime().UnixNano(), 10))
+		b.Write(strconv.AppendInt(numBuf[:0], mtime, 10))
 		b.WriteByte(0)
-		b.WriteString(strconv.FormatInt(fi.Size(), 10))
+		b.Write(strconv.AppendInt(numBuf[:0], stat.Size, 10))
 		b.WriteByte(0)
-		b.WriteString(strconv.FormatUint(ino, 10))
+		b.Write(strconv.AppendUint(numBuf[:0], stat.Ino, 10))
 		b.WriteByte(0)
 	}
 	return b.String()
 }
 
-// readCacheFile reads a single-line cached value from indexDir/name.
-func readCacheFile(indexDir, name string) string {
-	data, err := os.ReadFile(filepath.Join(indexDir, name))
+// readCacheFile reads a single-line cached value from cacheDir/name.
+func readCacheFile(cacheDir, name string) string {
+	data, err := os.ReadFile(filepath.Join(cacheDir, name))
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
 }
 
-// writeCacheFile atomically writes value to indexDir/name via tmp+rename.
-func writeCacheFile(indexDir, name, value string) error {
-	tmpPath := filepath.Join(indexDir, name+".tmp")
+// writeCacheFile atomically writes value to cacheDir/name via tmp+rename.
+func writeCacheFile(cacheDir, name, value string) error {
+	tmpPath := filepath.Join(cacheDir, name+".tmp")
 	if err := os.WriteFile(tmpPath, []byte(value), 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, filepath.Join(indexDir, name))
+	return os.Rename(tmpPath, filepath.Join(cacheDir, name))
 }
 
 // readStateFile reads the cached state hash.
-func readStateFile(indexDir string) string { return readCacheFile(indexDir, stateFile) }
+func readStateFile(cacheDir string) string { return readCacheFile(cacheDir, stateFile) }
 
 // writeStateFile atomically writes the state hash.
-func writeStateFile(indexDir, state string) error { return writeCacheFile(indexDir, stateFile, state) }
+func writeStateFile(cacheDir, state string) error { return writeCacheFile(cacheDir, stateFile, state) }
 
 // readHeadFile reads the last indexed HEAD SHA.
-func readHeadFile(indexDir string) string { return readCacheFile(indexDir, headFile) }
+func readHeadFile(cacheDir string) string { return readCacheFile(cacheDir, headFile) }
 
 // writeHeadFile atomically writes the HEAD SHA.
-func writeHeadFile(indexDir, sha string) error { return writeCacheFile(indexDir, headFile, sha) }
+func writeHeadFile(cacheDir, sha string) error { return writeCacheFile(cacheDir, headFile, sha) }
 
 // deleteStateFiles removes .state, .state.tmp, .head, and .head.tmp.
 // Clearing .head alongside .state ensures that a failed or drifted
 // indexing cycle forces a full re-index (including committed) on the
 // next invocation, rather than relying on a potentially stale .head
 // to skip committed indexing.
-func deleteStateFiles(indexDir string) {
-	_ = os.Remove(filepath.Join(indexDir, stateFile))
-	_ = os.Remove(filepath.Join(indexDir, stateFile+".tmp"))
-	_ = os.Remove(filepath.Join(indexDir, headFile))
-	_ = os.Remove(filepath.Join(indexDir, headFile+".tmp"))
+func deleteStateFiles(cacheDir string) {
+	_ = os.Remove(filepath.Join(cacheDir, stateFile))
+	_ = os.Remove(filepath.Join(cacheDir, stateFile+".tmp"))
+	_ = os.Remove(filepath.Join(cacheDir, headFile))
+	_ = os.Remove(filepath.Join(cacheDir, headFile+".tmp"))
 }
 
 // indexParallelism returns the number of parallel indexing workers.
@@ -159,6 +174,32 @@ func indexParallelism() int {
 		p = 1
 	}
 	return p
+}
+
+func indexBuildOptions(indexDir string, parallelism int) index.Options {
+	return index.Options{
+		IndexDir:         indexDir,
+		SizeMax:          maxIndexedDocumentBytes,
+		Parallelism:      parallelism,
+		CTagsMustSucceed: true,
+		ShardMax:         shardMax,
+	}
+}
+
+// ctagsOnce caches the result of checkCtags so the PATH lookup and
+// --version subprocess run at most once per process. The result is
+// deterministic within a single invocation (ctags won't be uninstalled
+// between search cycles).
+var (
+	ctagsOnce sync.Once
+	ctagsErr  error
+)
+
+// checkCtagsCached returns the cached result of checkCtags, running the
+// check at most once per process.
+func checkCtagsCached() error {
+	ctagsOnce.Do(func() { ctagsErr = checkCtags() })
+	return ctagsErr
 }
 
 // checkCtags verifies that universal-ctags is installed. Zoekt silently skips
@@ -199,23 +240,23 @@ func checkCtags() error {
 	return fmt.Errorf("universal-ctags required but not found.\n  macOS:  brew install universal-ctags\n  Linux:  sudo apt-get install universal-ctags\n  Or set CTAGS_COMMAND=/path/to/ctags")
 }
 
-// runIndexing orchestrates committed and uncommitted indexing with locking.
-func runIndexing(ctx context.Context, paths gitPaths, indexDir string, state repoState, preState string) error {
+// runIndexingWithCache orchestrates committed and uncommitted indexing with
+// corpus metadata in cacheDir and Zoekt shards in indexDir.
+func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDir string, state repoState, preState string) error {
 	repoDir := paths.RepoDir
-	// Fail fast if ctags is missing
-	if err := checkCtags(); err != nil {
-		return err
+	// Fail fast if ctags is missing. Uses sync.Once cache so the PATH
+	// lookup + --version subprocess runs at most once per process.
+	if err := checkCtagsCached(); err != nil {
+		deleteStateFiles(cacheDir)
+		return gitCorpusError(repoDir, indexDir, err)
 	}
 
-	// Ensure cache dir is excluded from git status.
-	ensureGitExclude(paths, cacheDir)
-
-	lockPath := filepath.Join(indexDir, lockFile)
+	lockPath := filepath.Join(cacheDir, lockFile)
 
 	// Ensure partial temp files are cleaned up on all exit paths
 	defer func() {
-		_ = os.Remove(filepath.Join(indexDir, stateTmpFile))
-		_ = os.Remove(filepath.Join(indexDir, headFile+".tmp"))
+		_ = os.Remove(filepath.Join(cacheDir, stateTmpFile))
+		_ = os.Remove(filepath.Join(cacheDir, headFile+".tmp"))
 	}()
 
 	lockFd, acquired, err := acquireLock(ctx, indexDir, lockPath)
@@ -230,20 +271,20 @@ func runIndexing(ctx context.Context, paths gitPaths, indexDir string, state rep
 	defer releaseLock(lockFd)
 
 	// Double-check state after acquiring lock
-	cachedState := readStateFile(indexDir)
+	cachedState := readStateFile(cacheDir)
 	if cachedState == preState {
 		return nil
 	}
 
 	parallelism := indexParallelism()
 
-	// Clean up stale staging directory from previous seek versions.
-	// Must run before either indexer starts to avoid racing with shard writes.
-	_ = os.RemoveAll(filepath.Join(indexDir, repoUncommitted))
+	if err := checkGitDirtyFileBudget(repoDir, indexDir, state.Files); err != nil {
+		deleteStateFiles(cacheDir)
+		return err
+	}
 
-	// Stream uncommitted files through a channel. The bounded channel
-	// (size=parallelism) provides backpressure so at most 2*parallelism
-	// files are in flight (channel buffer + blocked workers).
+	// Stream uncommitted files through a bounded channel so file reads stay
+	// proportional to the active worker count.
 	var fileCh <-chan fileContent
 	if len(state.Files) > 0 {
 		fileCh = streamFiles(repoDir, state.Files, parallelism)
@@ -259,7 +300,13 @@ func runIndexing(ctx context.Context, paths gitPaths, indexDir string, state rep
 	// successful index. This avoids ~560µs of git repo opening + shard
 	// metadata reads on the incremental no-op path, and eliminates CPU
 	// contention when running alongside the uncommitted indexer.
-	needCommitted := state.HeadSHA != readHeadFile(indexDir)
+	needCommitted := state.HeadSHA != readHeadFile(cacheDir)
+	if needCommitted {
+		if _, err := scanGitCommittedIndexBudget(ctx, repoDir, maxGitCandidateFiles, maxCorpusIndexedBytes); err != nil {
+			deleteStateFiles(cacheDir)
+			return gitCorpusError(repoDir, indexDir, err)
+		}
+	}
 
 	// Run committed and uncommitted indexing. They write different shard
 	// files (repo name vs "uncommitted" prefix) so when both are needed
@@ -270,7 +317,7 @@ func runIndexing(ctx context.Context, paths gitPaths, indexDir string, state rep
 		// the current goroutine (it must drain fileCh).
 		committedDone := make(chan error, 1)
 		go func() {
-			committedDone <- indexCommitted(ctx, repoDir, indexDir, parallelism)
+			committedDone <- indexCommitted(repoDir, indexDir, parallelism)
 		}()
 		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, fileCh, parallelism)
 		committedErr = <-committedDone
@@ -278,7 +325,7 @@ func runIndexing(ctx context.Context, paths gitPaths, indexDir string, state rep
 		// Only uncommitted files changed — HEAD is the same.
 		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, fileCh, parallelism)
 	} else if needCommitted {
-		committedErr = indexCommitted(ctx, repoDir, indexDir, parallelism)
+		committedErr = indexCommitted(repoDir, indexDir, parallelism)
 		cleanUncommittedShards(indexDir)
 	} else {
 		// HEAD unchanged, no dirty files — this shouldn't normally
@@ -303,30 +350,36 @@ func runIndexing(ctx context.Context, paths gitPaths, indexDir string, state rep
 	//
 	// What this defers to the next search: new untracked files appearing
 	// or HEAD changes during the indexing window. Both are caught by the
-	// next invocation's gitRepoState() call in run(), which always runs
+	// next invocation's git status call in run(), which always runs
 	// a full git status.
-	postState := computeStateHash(repoStateFingerprint(repoDir, state))
+	postState := gitCorpusStateHash(paths, state)
 
 	if committedErr != nil || uncommittedErr != nil {
 		// Don't cache state when either indexing step failed — forces
 		// re-index on next search so transient failures don't leave
 		// uncommitted content permanently invisible.
-		deleteStateFiles(indexDir)
+		deleteStateFiles(cacheDir)
+		if errors.Is(committedErr, errGitCapExceeded) {
+			return committedErr
+		}
+		if errors.Is(uncommittedErr, errGitCapExceeded) {
+			return uncommittedErr
+		}
 		slog.Warn("Index incomplete, will re-index on next search")
 		return nil
 	}
 
 	if postState == preState {
-		if err := writeStateFile(indexDir, preState); err != nil {
+		if err := writeStateFile(cacheDir, preState); err != nil {
 			return fmt.Errorf("write state file: %w", err)
 		}
 		// Persist the HEAD SHA so subsequent runs with only working tree
 		// changes can skip the committed indexer entirely.
-		if err := writeHeadFile(indexDir, state.HeadSHA); err != nil {
+		if err := writeHeadFile(cacheDir, state.HeadSHA); err != nil {
 			slog.Warn("Failed to write head file", "error", err)
 		}
 	} else {
-		deleteStateFiles(indexDir)
+		deleteStateFiles(cacheDir)
 		slog.Warn("Index may be stale, will re-index on next search")
 	}
 
@@ -340,20 +393,18 @@ func shardsExist(indexDir string) bool {
 }
 
 // indexCommitted indexes committed files using gitindex.IndexGitRepo.
-func indexCommitted(ctx context.Context, repoDir, indexDir string, parallelism int) error {
+func indexCommitted(repoDir, indexDir string, parallelism int) error {
 	opts := gitindex.Options{
-		RepoDir:     repoDir,
-		Incremental: true,
-		Branches:    []string{"HEAD"},
-		BuildOptions: index.Options{
-			IndexDir:         indexDir,
-			Parallelism:      parallelism,
-			CTagsMustSucceed: true,
-			ShardMax:         shardMax,
-		},
+		RepoDir:      repoDir,
+		Incremental:  true,
+		Branches:     []string{"HEAD"},
+		BuildOptions: indexBuildOptions(indexDir, parallelism),
 	}
 	_, err := gitindex.IndexGitRepo(opts)
-	return err
+	if err != nil {
+		return gitCorpusError(repoDir, indexDir, err)
+	}
+	return nil
 }
 
 // fileContent holds a file's path and content read from the working tree.
@@ -363,15 +414,16 @@ type fileContent struct {
 }
 
 // readFilesToChannel reads files from the working tree using a bounded worker
-// pool and sends them to out. Files larger than maxUncommittedFileSize,
+// pool and sends them to out. Files larger than maxGitDirtyFileSize,
 // symlinks, and directories are skipped. Individual file failures are
 // non-fatal since files may be deleted or modified between git status and
 // read. The channel is closed after all workers finish.
 func readFilesToChannel(repoDir string, files []string, parallelism int, out chan<- fileContent) {
-	ch := make(chan string, parallelism)
+	workers := fileReadWorkerCount(parallelism, len(files))
+	ch := make(chan string, workers)
 	var wg sync.WaitGroup
 
-	for range parallelism {
+	for range workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -392,21 +444,27 @@ func readFilesToChannel(repoDir string, files []string, parallelism int, out cha
 				}
 
 				size := fi.Size()
-				if size > maxUncommittedFileSize {
+				if size > maxGitDirtyFileSize {
 					slog.Warn("Skipping large uncommitted file", "path", f, "size_mb", size/(1024*1024))
 					continue
 				}
 
-				// Read using the known size from Lstat to avoid the
-				// extra Fstat that os.ReadFile performs internally.
+				// Read using the known size from Lstat to avoid the extra
+				// Fstat that os.ReadFile performs internally. A single
+				// Read is not guaranteed to fill the buffer, even for
+				// regular files, so use ReadFull and keep partial content
+				// only when the file shrank during the read.
 				fh, err := os.Open(srcPath)
 				if err != nil {
 					continue
 				}
 				buf := make([]byte, size)
-				n, err := fh.Read(buf)
+				n, err := io.ReadFull(fh, buf)
 				_ = fh.Close()
-				if err != nil && n == 0 {
+				if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+					continue
+				}
+				if n == 0 && size > 0 {
 					continue
 				}
 
@@ -424,13 +482,27 @@ func readFilesToChannel(repoDir string, files []string, parallelism int, out cha
 }
 
 // streamFiles returns a channel that yields file contents read from the
-// working tree. The channel is bounded by parallelism to provide backpressure,
-// so at most 2*parallelism files are in flight (buffer + blocked workers)
-// rather than all dirty files at once.
+// working tree. The output channel is unbuffered because Zoekt's public
+// Builder API accepts []byte documents, not io.Reader streams. This keeps
+// seek-side buffering to at most the active reader workers instead of queueing
+// already-read file contents.
 func streamFiles(repoDir string, files []string, parallelism int) <-chan fileContent {
-	out := make(chan fileContent, parallelism)
+	out := make(chan fileContent)
 	go readFilesToChannel(repoDir, files, parallelism, out)
 	return out
+}
+
+func fileReadWorkerCount(parallelism, items int) int {
+	if items <= 0 {
+		return 0
+	}
+	if parallelism < 1 {
+		return 1
+	}
+	if parallelism > items {
+		return items
+	}
+	return parallelism
 }
 
 // indexUncommitted indexes uncommitted file contents streamed through fileCh
@@ -444,20 +516,26 @@ func streamFiles(repoDir string, files []string, parallelism int) <-chan fileCon
 // producer. Finish is always called when a builder exists (even after Add
 // errors) to ensure cleanup.
 func indexUncommitted(ctx context.Context, repoDir, indexDir string, fileCh <-chan fileContent, parallelism int) error {
+	_, err := indexDocuments(ctx, indexDir, repoUncommitted, repoDir, fileCh, parallelism)
+	return err
+}
+
+func indexDocuments(
+	ctx context.Context,
+	indexDir string,
+	repoName string,
+	source string,
+	fileCh <-chan fileContent,
+	parallelism int,
+) (bool, error) {
 	var builder *index.Builder
 	var addErr error
 
 	for doc := range fileCh {
 		if builder == nil {
-			opts := index.Options{
-				IndexDir:         indexDir,
-				Parallelism:      parallelism,
-				CTagsMustSucceed: true,
-				ShardMax:         shardMax,
-			}
-			opts.RepositoryDescription.Name = repoUncommitted
-			opts.RepositoryDescription.Source = repoDir
-			opts.SetDefaults()
+			opts := indexBuildOptions(indexDir, parallelism)
+			opts.RepositoryDescription.Name = repoName
+			opts.RepositoryDescription.Source = source
 
 			var err error
 			builder, err = index.NewBuilder(opts)
@@ -465,7 +543,7 @@ func indexUncommitted(ctx context.Context, repoDir, indexDir string, fileCh <-ch
 				// Drain remaining items to unblock producer goroutines.
 				for range fileCh {
 				}
-				return fmt.Errorf("create builder: %w", err)
+				return false, fmt.Errorf("create builder: %w", err)
 			}
 		}
 
@@ -482,21 +560,43 @@ func indexUncommitted(ctx context.Context, repoDir, indexDir string, fileCh <-ch
 
 	if builder == nil {
 		// No files arrived — clean stale shards from a previous run.
-		cleanUncommittedShards(indexDir)
-		return nil
+		cleanRepositoryShards(indexDir, repoName)
+		return false, nil
 	}
 
 	// Always call Finish to ensure cleanup (safe to call even after errors).
 	finishErr := builder.Finish()
 	if addErr != nil {
-		return addErr
+		return true, addErr
 	}
-	return finishErr
+	return true, finishErr
 }
 
 // cleanUncommittedShards removes stale uncommitted shard files.
 func cleanUncommittedShards(indexDir string) {
-	matches, err := filepath.Glob(filepath.Join(indexDir, repoUncommitted+"_v*.zoekt"))
+	cleanRepositoryShards(indexDir, repoUncommitted)
+}
+
+func cleanRepositoryShards(indexDir, repoName string) {
+	for _, m := range repositoryShardFiles(indexDir, repoName) {
+		_ = os.Remove(m)
+	}
+}
+
+func repositoryShardCount(indexDir, repoName string) int {
+	return len(repositoryShardFiles(indexDir, repoName))
+}
+
+func repositoryShardFiles(indexDir, repoName string) []string {
+	matches, err := filepath.Glob(filepath.Join(indexDir, repoName+"_v*.zoekt"))
+	if err != nil {
+		return nil
+	}
+	return matches
+}
+
+func cleanAllShards(indexDir string) {
+	matches, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
 	if err != nil {
 		return
 	}

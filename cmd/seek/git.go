@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,13 +42,50 @@ func gitCmd(ctx context.Context, args ...string) *exec.Cmd {
 }
 
 // resolveGitPathsFromCWD resolves git paths from the current working directory.
+// For the common non-worktree case, it walks up the directory tree to find
+// .git, avoiding a ~5-10ms subprocess call. Falls back to git rev-parse for
+// worktrees (where .git is a file, not a directory) and edge cases.
 func resolveGitPathsFromCWD(ctx context.Context) (gitPaths, error) {
+	if paths, ok := fastResolveGitPaths(); ok {
+		return paths, nil
+	}
 	return resolveGitPaths(ctx, "")
 }
 
+// fastResolveGitPaths attempts to resolve git paths without spawning a
+// subprocess. Walks up from CWD looking for a .git directory. Returns false
+// when .git is a file (worktree), CWD cannot be determined, or no .git is
+// found, causing the caller to fall back to git rev-parse.
+func fastResolveGitPaths() (gitPaths, bool) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return gitPaths{}, false
+	}
+	for {
+		gitPath := filepath.Join(dir, ".git")
+		fi, err := os.Lstat(gitPath)
+		if err == nil {
+			if fi.IsDir() {
+				return gitPaths{
+					RepoDir:     dir,
+					GitDir:      gitPath,
+					CommonDir:   gitPath,
+					ExcludePath: filepath.Join(gitPath, "info", "exclude"),
+					ConfigPath:  filepath.Join(gitPath, "config"),
+				}, true
+			}
+			// .git is a file → worktree or submodule; fall back
+			return gitPaths{}, false
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return gitPaths{}, false
+		}
+		dir = parent
+	}
+}
+
 func resolveGitPaths(ctx context.Context, dir string) (gitPaths, error) {
-	// --path-format=absolute requires Git 2.31+. Older Git falls back to
-	// the legacy path assumption in fallbackGitPaths.
 	cmd := gitCmd(ctx,
 		"rev-parse",
 		"--path-format=absolute",
@@ -82,32 +118,6 @@ func resolveGitPaths(ctx context.Context, dir string) (gitPaths, error) {
 	return paths, nil
 }
 
-func fallbackGitPaths(repoDir string) gitPaths {
-	absRepoDir, err := filepath.Abs(repoDir)
-	if err != nil {
-		absRepoDir = repoDir
-	}
-	gitDir := filepath.Join(absRepoDir, ".git")
-	return gitPaths{
-		RepoDir:     absRepoDir,
-		GitDir:      gitDir,
-		CommonDir:   gitDir,
-		ExcludePath: filepath.Join(gitDir, "info", "exclude"),
-		ConfigPath:  filepath.Join(gitDir, "config"),
-	}
-}
-
-// gitRepoState returns the current repository state using a single
-// git status --porcelain=v2 --branch --no-renames -z command. This eliminates
-// the TOCTOU window between separate git rev-parse and git status calls.
-func gitRepoState(ctx context.Context) repoState {
-	out, err := gitCmd(ctx, "status", "--porcelain=v2", "--branch", "--no-renames", "--no-ahead-behind", "-z").Output()
-	if err != nil {
-		return repoState{HeadSHA: "no-head"}
-	}
-	return parseGitStatusV2(string(out))
-}
-
 // gitRepoStateIn returns the repository state for a specific directory.
 // Used when the CWD may not be inside the target repository.
 func gitRepoStateIn(ctx context.Context, dir string) repoState {
@@ -128,7 +138,7 @@ func parseGitStatusV2(raw string) repoState {
 		RawOutput: raw,
 	}
 
-	seen := make(map[string]bool)
+	seen := make(map[string]struct{})
 	pos := 0
 
 	// Parse NUL-terminated records. With -z, both header lines (# ...)
@@ -172,46 +182,16 @@ func parseGitStatusV2(raw string) repoState {
 			path = extractV2Path(entry, 10)
 		}
 
-		if path != "" && !seen[path] {
-			seen[path] = true
+		if path != "" {
+			if _, ok := seen[path]; ok {
+				continue
+			}
+			seen[path] = struct{}{}
 			state.Files = append(state.Files, path)
 		}
 	}
 
 	return state
-}
-
-// ensureGitExclude adds the cache directory to .git/info/exclude if not
-// already present. This prevents the cache from appearing as untracked in
-// git status, which would pollute the state hash. Uses .git/info/exclude
-// rather than .gitignore to avoid modifying the user's working tree.
-func ensureGitExclude(paths gitPaths, pattern string) {
-	infoDir := filepath.Dir(paths.ExcludePath)
-	excludePath := paths.ExcludePath
-
-	data, _ := os.ReadFile(excludePath)
-	needle := "/" + pattern
-	// Check for exact line match, not substring. Substring matching
-	// could false-positive on patterns like /.seek-cache-old when
-	// looking for /.seek-cache.
-	for _, line := range strings.Split(string(data), "\n") {
-		if line == needle {
-			return
-		}
-	}
-
-	_ = os.MkdirAll(infoDir, 0o755)
-	f, err := os.OpenFile(excludePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		slog.Warn("Failed to update .git/info/exclude — cache directory may cause repeated re-indexing", "error", err)
-		return
-	}
-	defer func() { _ = f.Close() }()
-	// Add newline before if file doesn't end with one
-	if len(data) > 0 && data[len(data)-1] != '\n' {
-		_, _ = f.WriteString("\n")
-	}
-	_, _ = f.WriteString(needle + "\n")
 }
 
 // ensureUntrackedCache enables core.untrackedCache if not already set.

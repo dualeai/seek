@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -12,7 +11,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
+	"strings"
 	"syscall"
+
+	"github.com/sourcegraph/zoekt"
+	"github.com/sourcegraph/zoekt/query"
 )
 
 // errNoMatch is returned by run when the query executed successfully but
@@ -47,57 +51,163 @@ func versionString() string {
 }
 
 func main() {
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <pattern>\n\nFlags:\n", os.Args[0])
-		flag.PrintDefaults()
+	opts, err := parseCLIArgs(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		writeUsage(os.Stderr, os.Args[0])
+		os.Exit(2)
 	}
 
-	showVersion := flag.Bool("version", false, "print version and exit")
-	verbose := flag.Bool("verbose", false, "enable debug logging")
-	flag.BoolVar(verbose, "v", false, "alias for -verbose")
-	limit := flag.Int("limit", 0, "maximum number of files to display (0 = unlimited)")
-	flag.IntVar(limit, "n", 0, "alias for -limit")
-	maxMatches := flag.Int("max-matches", 0, "maximum number of matches per file (0 = unlimited)")
-	flag.IntVar(maxMatches, "m", 0, "alias for -max-matches")
-	flag.Parse()
-
-	if *showVersion {
+	if opts.showVersion {
 		fmt.Println(versionString())
 		return
 	}
 
+	if opts.query == "" {
+		writeUsage(os.Stderr, os.Args[0])
+		os.Exit(2)
+	}
+
 	// Configure logging: warn+ by default, debug+ with -verbose.
 	logLevel := slog.LevelWarn
-	if *verbose {
+	if opts.verbose {
 		logLevel = slog.LevelDebug
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel}))
 	slog.SetDefault(logger)
 
 	// Silence zoekt's log.Printf output by default; bridge to slog when verbose.
-	if *verbose {
+	if opts.verbose {
 		log.SetOutput(newSlogWriter(logger))
 		log.SetFlags(0)
 	} else {
 		log.SetOutput(io.Discard)
 	}
 
-	if flag.NArg() != 1 {
-		flag.Usage()
-		os.Exit(2)
-	}
-	pattern := flag.Arg(0)
-
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
-	if err := run(ctx, pattern, *limit, *maxMatches); err != nil {
-		if errors.Is(err, errNoMatch) {
-			os.Exit(1)
+	if err := run(ctx, opts.query, opts.paths, opts.limit, opts.maxMatches); err != nil {
+		code := exitCodeForError(err)
+		if code != 1 {
+			slog.Error(err.Error())
 		}
-		slog.Error(err.Error())
-		os.Exit(2)
+		os.Exit(code)
 	}
+}
+
+func exitCodeForError(err error) int {
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, errNoMatch):
+		return 1
+	default:
+		return 2
+	}
+}
+
+type cliOptions struct {
+	showVersion bool
+	verbose     bool
+	limit       int
+	maxMatches  int
+	query       string
+	paths       []string
+}
+
+func writeUsage(w io.Writer, prog string) {
+	_, _ = fmt.Fprintf(w, "Usage: %s [flags] <query> [path...]\n\n", prog)
+	_, _ = fmt.Fprintln(w, "Flags:")
+	_, _ = fmt.Fprintln(w, "  -v, --verbose              enable debug logging")
+	_, _ = fmt.Fprintln(w, "      --version              print version and exit")
+	_, _ = fmt.Fprintln(w, "  -n, --limit N              maximum number of files to display")
+	_, _ = fmt.Fprintln(w, "  -m, --max-matches N        maximum matches per file")
+}
+
+func parseCLIArgs(args []string) (cliOptions, error) {
+	var opts cliOptions
+
+	for i := 0; i < len(args); {
+		arg := args[i]
+		if arg == "--" {
+			i++
+			if i < len(args) {
+				opts.query = args[i]
+				opts.paths = cloneStringSlice(args[i+1:])
+			}
+			return opts, nil
+		}
+
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			opts.query = arg
+			opts.paths = cloneStringSlice(args[i+1:])
+			return opts, nil
+		}
+
+		name, value, hasValue := strings.Cut(arg, "=")
+		switch name {
+		case "-v", "--verbose", "-verbose":
+			if hasValue {
+				return opts, fmt.Errorf("%s does not accept a value", name)
+			}
+			opts.verbose = true
+			i++
+		case "--version", "-version":
+			if hasValue {
+				return opts, fmt.Errorf("%s does not accept a value", name)
+			}
+			opts.showVersion = true
+			i++
+		case "-n", "--limit", "-limit":
+			n, next, err := parseFlagInt(args, i, name, value, hasValue)
+			if err != nil {
+				return opts, err
+			}
+			opts.limit = n
+			i = next
+		case "-m", "--max-matches", "-max-matches":
+			n, next, err := parseFlagInt(args, i, name, value, hasValue)
+			if err != nil {
+				return opts, err
+			}
+			opts.maxMatches = n
+			i = next
+		default:
+			opts.query = arg
+			opts.paths = cloneStringSlice(args[i+1:])
+			return opts, nil
+		}
+	}
+
+	return opts, nil
+}
+
+func parseFlagInt(args []string, idx int, name, value string, hasValue bool) (int, int, error) {
+	if !hasValue {
+		if idx+1 >= len(args) {
+			return 0, idx, fmt.Errorf("%s requires a value", name)
+		}
+		value = args[idx+1]
+		idx += 2
+	} else {
+		idx++
+	}
+
+	n, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, idx, fmt.Errorf("%s requires an integer value", name)
+	}
+	return n, idx, nil
+}
+
+func cloneStringSlice(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, len(values))
+	copy(out, values)
+	return out
 }
 
 // slogWriter bridges Go's standard log package to slog. Each log.Printf call
@@ -120,87 +230,250 @@ func (w *slogWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func run(ctx context.Context, pattern string, limit, maxMatches int) error {
-	paths, err := resolveGitPathsFromCWD(ctx)
+func run(ctx context.Context, pattern string, pathOperands []string, limit, maxMatches int) error {
+	userQ, err := parseSearchQuery(pattern)
 	if err != nil {
-		return fmt.Errorf("not a git repository: %w", err)
-	}
-	repoDir := paths.RepoDir
-
-	// Use absolute paths to avoid dependence on process CWD
-	indexDir := filepath.Join(repoDir, cacheDir)
-	if err := os.MkdirAll(indexDir, 0o755); err != nil {
-		return fmt.Errorf("create index directory: %w", err)
+		return err
 	}
 
-	// Check for existing index state. If present, one-time setup
-	// (ensureGitExclude, ensureUntrackedCache, ensureFSMonitor) was
-	// already applied by the indexing run that created the state file.
-	// Skipping them on the warm path saves ~150µs of file I/O.
-	cachedState := readStateFile(indexDir)
+	var paths *gitPaths
+	resolvedPaths, gitErr := resolveGitPathsFromCWD(ctx)
+	if gitErr == nil {
+		paths = &resolvedPaths
+	} else if len(pathOperands) == 0 {
+		return fmt.Errorf("not a git repository: %w", gitErr)
+	}
+
+	plans, err := planCorpora(ctx, paths, pathOperands)
+	if err != nil {
+		return err
+	}
+
+	var allResults []corpusSearchResult
+	dirtyByCorpus := make(dirtyFilesByCorpus)
+
+	for _, plan := range plans {
+		results, dirtyFiles, err := prepareAndSearchCorpus(ctx, plan, paths, userQ)
+		if err != nil {
+			return err
+		}
+		if len(dirtyFiles) > 0 {
+			dirtyByCorpus[plan.id] = dirtyFiles
+		}
+		allResults = append(allResults, results...)
+	}
+
+	if len(allResults) == 0 {
+		return errNoMatch
+	}
+
+	// Formatting returns "" when all results were stale committed
+	// matches for dirty files — treat as no match (exit code 1).
+	displayMode := hideCorpusContext
+	if len(plans) > 1 {
+		displayMode = showCorpusContext
+	}
+	output := formatCorpusResultsWithContext(allResults, dirtyByCorpus, limit, maxMatches, displayMode)
+	if output == "" {
+		return errNoMatch
+	}
+
+	_, _ = os.Stdout.WriteString(output)
+	return nil
+}
+
+func prepareAndSearchCorpus(
+	ctx context.Context,
+	plan corpusPlan,
+	paths *gitPaths,
+	userQ query.Q,
+) ([]corpusSearchResult, dirtyFileSet, error) {
+	var dirtyFiles dirtyFileSet
+	var indexState corpusIndexState
+
+	switch plan.kind {
+	case corpusKindGit:
+		planPaths := plan.gitPaths
+		if planPaths == nil {
+			planPaths = paths
+		}
+		if planPaths == nil {
+			return nil, nil, fmt.Errorf("not a git repository")
+		}
+		state, readyState, err := ensureGitCorpusFresh(ctx, plan, *planPaths)
+		if err != nil {
+			return nil, nil, err
+		}
+		indexState = readyState
+		dirtyFiles = dirtyFileSetFromState(state)
+	case corpusKindFolder:
+		readyState, err := ensureFolderCorpusFresh(ctx, plan)
+		if err != nil {
+			if errors.Is(err, errFolderCapExceeded) {
+				return nil, nil, err
+			}
+			if !shardsExist(plan.indexDir) {
+				return nil, nil, err
+			}
+			slog.Warn("Indexing failed", "error", err, "root", plan.root)
+		}
+		indexState = readyState
+	default:
+		return nil, nil, fmt.Errorf("unsupported corpus kind: %s", plan.kind)
+	}
+
+	if indexState == corpusKnownEmpty {
+		return nil, dirtyFiles, nil
+	}
+
+	files, err := searchPlannedCorpusParsed(ctx, plan, userQ)
+	if err != nil {
+		return nil, nil, err
+	}
+	return wrapCorpusResults(plan, files), dirtyFiles, nil
+}
+
+func dirtyFileSetFromState(state repoState) dirtyFileSet {
+	if len(state.Files) == 0 {
+		return nil
+	}
+	dirtyFiles := make(dirtyFileSet, len(state.Files))
+	for _, f := range state.Files {
+		dirtyFiles[f] = struct{}{}
+	}
+	return dirtyFiles
+}
+
+func wrapCorpusResults(plan corpusPlan, files []zoekt.FileMatch) []corpusSearchResult {
+	if len(files) == 0 {
+		return nil
+	}
+	results := make([]corpusSearchResult, len(files))
+	for i, file := range files {
+		results[i] = corpusSearchResult{
+			corpusID:    plan.id,
+			kind:        plan.kind,
+			displayRoot: plan.displayRoot,
+			file:        file,
+		}
+	}
+	return results
+}
+
+func ensureGitCorpusFresh(ctx context.Context, plan corpusPlan, paths gitPaths) (repoState, corpusIndexState, error) {
+	// Check for existing index state. If present, the cache directory
+	// exists and one-time setup (ensureUntrackedCache,
+	// ensureFSMonitor) was already applied. Skip MkdirAll + setup on the
+	// warm path.
+	cachedState := readStateFile(plan.cacheDir)
 	if cachedState == "" {
-		// First run or corrupted state — apply one-time setup before
-		// computing git status, so the cache dir is excluded.
-		ensureGitExclude(paths, cacheDir)
+		if err := os.MkdirAll(plan.indexDir, 0o755); err != nil {
+			return repoState{}, corpusSearchable, fmt.Errorf("create index directory: %w", err)
+		}
 		ensureUntrackedCache(ctx, paths)
 		ensureFSMonitor(ctx, paths)
 	}
 
-	// Compute state hash from a single atomic git status call.
-	state := gitRepoState(ctx)
-	currentState := computeStateHash(repoStateFingerprint(repoDir, state))
-
-	// Re-index if the cached state differs from the current working tree.
-	if currentState != cachedState {
-		if err := runIndexing(ctx, paths, indexDir, state, currentState); err != nil {
-			slog.Warn("Indexing failed", "error", err)
-			// Continue to search with whatever shards exist
+	state := gitRepoStateIn(ctx, paths.RepoDir)
+	currentState := gitCorpusStateHash(paths, state)
+	hasShards := shardsExist(plan.indexDir)
+	if (currentState != cachedState || !hasShards) && gitCorpusKnownEmpty(ctx, paths, state) {
+		if cachedState == currentState && !hasShards {
+			return state, corpusKnownEmpty, nil
+		}
+		marked, err := markGitCorpusKnownEmpty(ctx, plan, state, currentState)
+		if err != nil {
+			return repoState{}, corpusSearchable, err
+		}
+		if marked {
+			return state, corpusKnownEmpty, nil
 		}
 	}
 
+	if currentState != cachedState || !hasShards {
+		if err := os.MkdirAll(plan.indexDir, 0o755); err != nil {
+			return repoState{}, corpusSearchable, fmt.Errorf("create index directory: %w", err)
+		}
+		if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, currentState); err != nil {
+			if errors.Is(err, errGitCapExceeded) {
+				return repoState{}, corpusSearchable, err
+			}
+			if !shardsExist(plan.indexDir) {
+				return repoState{}, corpusSearchable, err
+			}
+			slog.Warn("Indexing failed", "error", err)
+		}
+	}
+	return state, corpusSearchable, nil
+}
+
+func gitCorpusKnownEmpty(ctx context.Context, paths gitPaths, state repoState) bool {
+	if len(state.Files) > 0 {
+		return false
+	}
+	if state.HeadSHA == "no-head" {
+		return true
+	}
+
+	cmd := gitCmd(ctx, "rev-parse", "HEAD^{tree}")
+	cmd.Dir = paths.RepoDir
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == emptyGitTreeSHA
+}
+
+func markGitCorpusKnownEmpty(ctx context.Context, plan corpusPlan, state repoState, stateHash string) (bool, error) {
+	if err := os.MkdirAll(plan.indexDir, 0o755); err != nil {
+		return false, fmt.Errorf("create index directory: %w", err)
+	}
+
+	lockPath := filepath.Join(plan.cacheDir, lockFile)
+	lockFd, acquired, err := acquireLock(ctx, plan.indexDir, lockPath)
+	if err != nil {
+		return false, err
+	}
+	if !acquired {
+		slog.Warn("Another process is indexing, using existing index")
+		return false, nil
+	}
+	defer releaseLock(lockFd)
+
+	cleanAllShards(plan.indexDir)
+	if state.HeadSHA == "no-head" {
+		_ = os.Remove(filepath.Join(plan.cacheDir, headFile))
+		_ = os.Remove(filepath.Join(plan.cacheDir, headFile+".tmp"))
+	} else if err := writeHeadFile(plan.cacheDir, state.HeadSHA); err != nil {
+		slog.Warn("Failed to write head file", "error", err)
+	}
+	if err := writeStateFile(plan.cacheDir, stateHash); err != nil {
+		return false, fmt.Errorf("write state file: %w", err)
+	}
+	return true, nil
+}
+
+func searchPlannedCorpusParsed(ctx context.Context, plan corpusPlan, userQ query.Q) ([]zoekt.FileMatch, error) {
 	// Execute search with LOCK_SH so concurrent indexers (which hold LOCK_EX)
 	// finish before we read shards. Multiple searchers can hold LOCK_SH
 	// simultaneously — no contention between readers. Uses non-blocking
 	// poll with timeout to prevent indefinite hang if an indexer is stuck.
-	searchLockPath := filepath.Join(indexDir, lockFile)
+	searchLockPath := filepath.Join(plan.cacheDir, lockFile)
 	searchLockFd, err := os.OpenFile(searchLockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		return fmt.Errorf("open search lock: %w", err)
+		return nil, fmt.Errorf("open search lock: %w", err)
 	}
 	defer func() {
 		unlockFile(searchLockFd)
 		_ = searchLockFd.Close()
 	}()
 	if err := acquireSearchLock(ctx, searchLockFd); err != nil {
-		return fmt.Errorf("acquire search lock: %w", err)
+		return nil, fmt.Errorf("acquire search lock: %w", err)
 	}
 
-	results, err := executeSearch(ctx, indexDir, pattern)
+	results, err := executeParsedSearchScoped(ctx, plan.indexDir, userQ, plan.scope)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	if len(results) == 0 {
-		return errNoMatch
-	}
-
-	// Build dirty-file set so formatResults can suppress stale committed
-	// results for files that have been modified in the working tree.
-	var dirtyFiles map[string]bool
-	if len(state.Files) > 0 {
-		dirtyFiles = make(map[string]bool, len(state.Files))
-		for _, f := range state.Files {
-			dirtyFiles[f] = true
-		}
-	}
-
-	// formatResults returns "" when all results were stale committed
-	// matches for dirty files — treat as no match (exit code 1).
-	output := formatResults(results, dirtyFiles, limit, maxMatches)
-	if output == "" {
-		return errNoMatch
-	}
-
-	fmt.Print(output)
-	return nil
+	return results, nil
 }

@@ -9,32 +9,49 @@ import (
 	"github.com/sourcegraph/zoekt"
 )
 
-// formatResults formats zoekt FileMatch results into the output format.
-//
-// Pipeline:
-//  1. Deduplicate — uncommitted wins over committed; committed results for
-//     dirty files are suppressed (the committed content is stale).
-//  2. Sort — BM25 score descending, filename ascending as tiebreaker.
-//  3. File limit — keep at most limit files (0 or negative = unlimited).
-//  4. Match limit — keep at most maxMatches LineMatches per file
-//     (0 or negative = unlimited). Keeps the earliest matches by line number.
-//  5. Format — render file headers, line numbers, context, and symbol tags.
-//
-// Returns "" when all results are suppressed (caller should treat as no match).
-func formatResults(files []zoekt.FileMatch, dirtyFiles map[string]bool, limit, maxMatches int) string {
-	if len(files) == 0 {
+type dirtyFileSet map[string]struct{}
+
+func (s dirtyFileSet) contains(name string) bool {
+	_, ok := s[name]
+	return ok
+}
+
+type dirtyFilesByCorpus map[corpusID]dirtyFileSet
+
+type corpusDisplayMode uint8
+
+const (
+	hideCorpusContext corpusDisplayMode = iota
+	showCorpusContext
+)
+
+func formatCorpusResultsWithContext(
+	results []corpusSearchResult,
+	dirtyByCorpus dirtyFilesByCorpus,
+	limit int,
+	maxMatches int,
+	displayMode corpusDisplayMode,
+) string {
+	if len(results) == 0 {
 		return ""
 	}
 
-	// Deduplicate: uncommitted version wins over committed
-	deduped := deduplicateFiles(files, dirtyFiles)
+	deduped := deduplicateCorpusResults(results, dirtyByCorpus)
 
 	// Sort by score descending
 	sort.SliceStable(deduped, func(i, j int) bool {
-		if deduped[i].Score != deduped[j].Score {
-			return deduped[i].Score > deduped[j].Score
+		left := deduped[i].file
+		right := deduped[j].file
+		if left.Score != right.Score {
+			return left.Score > right.Score
 		}
-		return deduped[i].FileName < deduped[j].FileName
+		if left.FileName != right.FileName {
+			return left.FileName < right.FileName
+		}
+		if deduped[i].displayRoot != deduped[j].displayRoot {
+			return deduped[i].displayRoot < deduped[j].displayRoot
+		}
+		return deduped[i].corpusID < deduped[j].corpusID
 	})
 
 	// Apply file-count limit (0 or negative = unlimited).
@@ -45,28 +62,28 @@ func formatResults(files []zoekt.FileMatch, dirtyFiles map[string]bool, limit, m
 	// Apply per-file match limit (0 or negative = unlimited).
 	if maxMatches > 0 {
 		for i := range deduped {
-			if len(deduped[i].LineMatches) > maxMatches {
-				deduped[i].LineMatches = deduped[i].LineMatches[:maxMatches]
+			if len(deduped[i].file.LineMatches) > maxMatches {
+				deduped[i].file.LineMatches = deduped[i].file.LineMatches[:maxMatches]
 			}
 		}
 	}
 
 	// Compute the digit width of the largest line number across all files
 	// so every line number in the output uses a consistent field width.
-	width := maxLineNumWidth(deduped)
+	width := maxCorpusLineNumWidth(deduped)
 
 	// Pre-size the builder: ~200 bytes per file header + ~80 bytes per match.
 	matches := 0
-	for _, fm := range deduped {
-		matches += len(fm.LineMatches)
+	for _, result := range deduped {
+		matches += len(result.file.LineMatches)
 	}
 	var sb strings.Builder
 	sb.Grow(len(deduped)*200 + matches*80)
-	for i, fm := range deduped {
+	for i, result := range deduped {
 		if i > 0 {
 			sb.WriteByte('\n')
 		}
-		formatFileMatch(&sb, fm, width)
+		formatCorpusFileMatch(&sb, result, width, displayMode)
 	}
 
 	// No trailing newline after the last line
@@ -77,61 +94,73 @@ func formatResults(files []zoekt.FileMatch, dirtyFiles map[string]bool, limit, m
 	return s
 }
 
-// deduplicateFiles groups FileMatches by filename, preferring uncommitted
-// versions. When dirtyFiles is non-nil, committed-shard results for dirty
-// files are suppressed even when the uncommitted shard has no match — the
-// committed content is stale (e.g. the matched symbol was renamed locally).
-func deduplicateFiles(files []zoekt.FileMatch, dirtyFiles map[string]bool) []zoekt.FileMatch {
-	type dedup struct {
-		idx         int
-		uncommitted bool
+func deduplicateCorpusResults(
+	results []corpusSearchResult,
+	dirtyByCorpus dirtyFilesByCorpus,
+) []corpusSearchResult {
+	byPath := make(map[corpusResultKey]dedupEntry, len(results))
+	for i, result := range results {
+		isUncommitted := result.kind == corpusKindGit && result.file.Repository == repoUncommitted
+		key := corpusResultKey{corpusID: result.corpusID, fileName: result.file.FileName}
+		chooseDedupEntry(byPath, key, i, isUncommitted)
 	}
-	byPath := make(map[string]dedup, len(files))
-	for i, fm := range files {
-		isUncommitted := fm.Repository == repoUncommitted
-		existing, ok := byPath[fm.FileName]
-		if !ok {
-			byPath[fm.FileName] = dedup{idx: i, uncommitted: isUncommitted}
-		} else if isUncommitted && !existing.uncommitted {
-			byPath[fm.FileName] = dedup{idx: i, uncommitted: isUncommitted}
-		}
-	}
-	result := make([]zoekt.FileMatch, 0, len(byPath))
+	out := make([]corpusSearchResult, 0, len(byPath))
 	for _, entry := range byPath {
-		// Suppress stale committed results for dirty files: the committed
-		// shard has HEAD content which is outdated for modified files.
-		if !entry.uncommitted && dirtyFiles[files[entry.idx].FileName] {
+		result := results[entry.idx]
+		dirtyFiles := dirtyByCorpus[result.corpusID]
+		if !entry.uncommitted && dirtyFiles.contains(result.file.FileName) {
 			continue
 		}
-		result = append(result, files[entry.idx])
+		out = append(out, result)
 	}
-	return result
+	return out
 }
 
-// maxLineNumWidth returns the digit count of the largest line number that will
-// be displayed. After-context lines can extend past the match line; before-context
-// lines are always smaller, so only match + after-count is checked.
-func maxLineNumWidth(files []zoekt.FileMatch) int {
+type corpusResultKey struct {
+	corpusID corpusID
+	fileName string
+}
+
+type dedupEntry struct {
+	idx         int
+	uncommitted bool
+}
+
+func chooseDedupEntry[K comparable](entries map[K]dedupEntry, key K, idx int, uncommitted bool) {
+	existing, ok := entries[key]
+	if !ok || (uncommitted && !existing.uncommitted) {
+		entries[key] = dedupEntry{idx: idx, uncommitted: uncommitted}
+	}
+}
+
+func maxCorpusLineNumWidth(results []corpusSearchResult) int {
 	maxLine := 0
-	for _, fm := range files {
-		for _, lm := range fm.LineMatches {
-			lineNum := int(lm.LineNumber)
-			afterCount := countContextLines(lm.After)
-			if end := lineNum + afterCount; end > maxLine {
-				maxLine = end
-			}
+	for _, result := range results {
+		maxLine = maxFileLineEnd(maxLine, result.file)
+	}
+	return lineNumberWidth(maxLine)
+}
+
+func maxFileLineEnd(maxLine int, fm zoekt.FileMatch) int {
+	for _, lm := range fm.LineMatches {
+		lineNum := int(lm.LineNumber)
+		afterCount := countContextLines(lm.After)
+		if end := lineNum + afterCount; end > maxLine {
+			maxLine = end
 		}
 	}
+	return maxLine
+}
+
+func lineNumberWidth(maxLine int) int {
 	if maxLine == 0 {
 		return 1
 	}
 	return len(strconv.Itoa(maxLine))
 }
 
-// formatFileMatch formats a single FileMatch into the output format.
-// Context lines (Before/After) are rendered with the same indentation as match
-// lines but without symbol annotations, making matches visually prominent.
-func formatFileMatch(sb *strings.Builder, fm zoekt.FileMatch, width int) {
+func formatCorpusFileMatch(sb *strings.Builder, result corpusSearchResult, width int, displayMode corpusDisplayMode) {
+	fm := result.file
 	lang := fm.Language
 	if lang == "" {
 		lang = "unknown"
@@ -149,6 +178,16 @@ func formatFileMatch(sb *strings.Builder, fm zoekt.FileMatch, width int) {
 		sb.WriteString(repoUncommitted)
 		sb.WriteByte(']')
 	}
+	if displayMode == showCorpusContext && result.displayRoot != "" {
+		switch result.kind {
+		case corpusKindFolder:
+			sb.WriteString(" [folder: ")
+		default:
+			sb.WriteString(" [git: ")
+		}
+		sb.WriteString(result.displayRoot)
+		sb.WriteByte(']')
+	}
 	sb.WriteByte('\n')
 
 	// Track the last line number we emitted so we can insert a blank separator
@@ -159,7 +198,7 @@ func formatFileMatch(sb *strings.Builder, fm zoekt.FileMatch, width int) {
 		matchLine := int(lm.LineNumber)
 
 		// Compute context "before" line count and boundaries.
-		// Uses countContextLines (0-alloc) instead of splitContextLines.
+		// Count without materializing context lines on the hot path.
 		beforeCount := countContextLines(lm.Before)
 		firstBeforeLine := matchLine - beforeCount
 		skipLines := 0
@@ -268,20 +307,6 @@ func splitContextBytes(data []byte) [][]byte {
 		return nil
 	}
 	return bytes.Split(bytes.TrimSuffix(data, []byte("\n")), []byte("\n"))
-}
-
-// splitContextLines is the string-returning variant of splitContextBytes.
-// Used by tests; the hot path uses splitContextBytes to avoid per-line copies.
-func splitContextLines(data []byte) []string {
-	raw := splitContextBytes(data)
-	if raw == nil {
-		return nil
-	}
-	lines := make([]string, len(raw))
-	for i, r := range raw {
-		lines[i] = string(r)
-	}
-	return lines
 }
 
 // countContextLines counts how many context lines are in the raw bytes
