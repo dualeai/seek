@@ -26,7 +26,7 @@ const (
 // at package level to avoid per-search heap allocation.
 var searchOpts = zoekt.SearchOptions{
 	// MaxDocDisplayCount is intentionally left at 0 (unlimited). Display
-	// limiting is handled by seek's --limit/-n flag in formatResults,
+	// limiting is handled by seek's --limit/-n flag during formatting,
 	// which applies after dedup and BM25 sort. A zoekt-level display cap
 	// would silently drop low-ranked files before seek or downstream
 	// pipes (| grep, | head) see them, causing false negatives.
@@ -75,36 +75,51 @@ func loadShards(indexDir string) ([]zoekt.Searcher, error) {
 	if len(paths) == 1 {
 		s, err := openShard(paths[0])
 		if err != nil {
-			return nil, fmt.Errorf("no loadable shards in %s", indexDir)
+			return nil, fmt.Errorf("load shard %s: %w", paths[0], err)
 		}
 		return []zoekt.Searcher{s}, nil
 	}
 
-	// Multiple shards — load in parallel to overlap mmap + metadata parsing.
-	type result struct {
-		idx int
-		s   zoekt.Searcher
+	type shardLoadResult struct {
+		searcher zoekt.Searcher
+		path     string
+		err      error
 	}
-	results := make(chan result, len(paths))
+
+	// Multiple shards — load in parallel to overlap mmap + metadata parsing.
+	results := make(chan shardLoadResult, len(paths))
 	var wg sync.WaitGroup
-	for i, p := range paths {
+	for _, p := range paths {
 		wg.Add(1)
-		go func(idx int, path string) {
+		go func(path string) {
 			defer wg.Done()
 			s, err := openShard(path)
 			if err != nil {
+				results <- shardLoadResult{path: path, err: err}
 				return
 			}
-			results <- result{idx: idx, s: s}
-		}(i, p)
+			results <- shardLoadResult{searcher: s, path: path}
+		}(p)
 	}
 	wg.Wait()
 	close(results)
 
 	searchers := make([]zoekt.Searcher, 0, len(paths))
-	for r := range results {
-		_ = r.idx // preserve order is not needed — BM25 sorts results
-		searchers = append(searchers, r.s)
+	var loadErr error
+	for result := range results {
+		if result.err != nil {
+			if loadErr == nil {
+				loadErr = fmt.Errorf("load shard %s: %w", result.path, result.err)
+			}
+			continue
+		}
+		searchers = append(searchers, result.searcher)
+	}
+	if loadErr != nil {
+		for _, s := range searchers {
+			s.Close()
+		}
+		return nil, loadErr
 	}
 	if len(searchers) == 0 {
 		return nil, fmt.Errorf("no loadable shards in %s", indexDir)
@@ -112,18 +127,21 @@ func loadShards(indexDir string) ([]zoekt.Searcher, error) {
 	return searchers, nil
 }
 
-// executeSearch loads shards and runs a zoekt search against the index.
-// Shards are loaded directly via mmap (skipping the directory-watcher
-// infrastructure) for minimal latency on the warm search path.
-func executeSearch(ctx context.Context, indexDir, pattern string) ([]zoekt.FileMatch, error) {
-	// Parse query before loading shards — fail fast on invalid patterns
-	// without wasting mmap syscalls.
+func parseSearchQuery(pattern string) (query.Q, error) {
 	q, err := query.Parse(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("parse query %q: %w", pattern, err)
 	}
 	q = query.Map(q, query.ExpandFileContent)
-	q = query.Simplify(q)
+	return query.Simplify(q), nil
+}
+
+func executeParsedSearchScoped(ctx context.Context, indexDir string, userQ query.Q, scope query.Q) ([]zoekt.FileMatch, error) {
+	q := userQ
+	if scope != nil {
+		q = query.NewAnd(q, scope)
+		q = query.Simplify(q)
+	}
 
 	searchers, err := loadShards(indexDir)
 	if err != nil {
@@ -141,7 +159,7 @@ func executeSearch(ctx context.Context, indexDir, pattern string) ([]zoekt.FileM
 		if err != nil {
 			return nil, fmt.Errorf("search: %w", err)
 		}
-		return result.Files, nil
+		return cloneFileMatches(result.Files), nil
 	}
 
 	// Multiple shards: search each and merge results.
@@ -149,9 +167,95 @@ func executeSearch(ctx context.Context, indexDir, pattern string) ([]zoekt.FileM
 	for _, s := range searchers {
 		result, err := s.Search(ctx, q, &searchOpts)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("search: %w", err)
 		}
 		allFiles = append(allFiles, result.Files...)
 	}
-	return allFiles, nil
+	return cloneFileMatches(allFiles), nil
+}
+
+func cloneFileMatches(files []zoekt.FileMatch) []zoekt.FileMatch {
+	if len(files) == 0 {
+		return nil
+	}
+	out := make([]zoekt.FileMatch, len(files))
+	for i := range files {
+		out[i] = cloneFileMatch(files[i])
+	}
+	return out
+}
+
+func cloneFileMatch(in zoekt.FileMatch) zoekt.FileMatch {
+	out := in
+	out.Branches = cloneStringSlice(in.Branches)
+	out.Content = cloneBytes(in.Content)
+	out.Checksum = cloneBytes(in.Checksum)
+
+	if len(in.LineMatches) > 0 {
+		out.LineMatches = make([]zoekt.LineMatch, len(in.LineMatches))
+		for i := range in.LineMatches {
+			out.LineMatches[i] = cloneLineMatch(in.LineMatches[i])
+		}
+	}
+
+	if len(in.ChunkMatches) > 0 {
+		out.ChunkMatches = make([]zoekt.ChunkMatch, len(in.ChunkMatches))
+		for i := range in.ChunkMatches {
+			out.ChunkMatches[i] = cloneChunkMatch(in.ChunkMatches[i])
+		}
+	}
+
+	return out
+}
+
+func cloneLineMatch(in zoekt.LineMatch) zoekt.LineMatch {
+	out := in
+	out.Line = cloneBytes(in.Line)
+	out.Before = cloneBytes(in.Before)
+	out.After = cloneBytes(in.After)
+	if len(in.LineFragments) > 0 {
+		out.LineFragments = make([]zoekt.LineFragmentMatch, len(in.LineFragments))
+		for i := range in.LineFragments {
+			out.LineFragments[i] = cloneLineFragmentMatch(in.LineFragments[i])
+		}
+	}
+	return out
+}
+
+func cloneLineFragmentMatch(in zoekt.LineFragmentMatch) zoekt.LineFragmentMatch {
+	out := in
+	if in.SymbolInfo != nil {
+		symbol := *in.SymbolInfo
+		out.SymbolInfo = &symbol
+	}
+	return out
+}
+
+func cloneChunkMatch(in zoekt.ChunkMatch) zoekt.ChunkMatch {
+	out := in
+	out.Content = cloneBytes(in.Content)
+	if len(in.Ranges) > 0 {
+		out.Ranges = make([]zoekt.Range, len(in.Ranges))
+		copy(out.Ranges, in.Ranges)
+	}
+	if len(in.SymbolInfo) > 0 {
+		out.SymbolInfo = make([]*zoekt.Symbol, len(in.SymbolInfo))
+		for i, symbol := range in.SymbolInfo {
+			if symbol == nil {
+				continue
+			}
+			copied := *symbol
+			out.SymbolInfo[i] = &copied
+		}
+	}
+	return out
+}
+
+func cloneBytes(in []byte) []byte {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]byte, len(in))
+	copy(out, in)
+	return out
 }

@@ -1,46 +1,68 @@
 # seek
 
-Ranked, symbol-aware code search for AI agents. Single binary, no server, no API key. ~150ms per search on kubernetes (29k files) -- including re-indexing dirty files.
+Ranked local search for AI coding agents. Search the current Git worktree,
+selected paths, external folders, or exact files. Single binary, no server, no
+API key.
 
-AI coding agents like [Claude Code](https://claude.com/product/claude-code), [Codex](https://openai.com/codex/), [Cursor](https://www.cursor.com/), and [Amp](https://ampcode.com/) search your code dozens of times per session. With grep or ripgrep, every query returns [unranked results in file-path order](https://milvus.io/blog/why-im-against-claude-codes-grep-only-retrieval-it-just-burns-too-many-tokens.md), forcing agents to read through noise to find what matters. seek gives them the best match first -- ranked by [BM25 relevance](https://en.wikipedia.org/wiki/Okapi_BM25), filtered by language or path, with symbol annotations and surrounding context included. Powered by [zoekt](https://github.com/sourcegraph/zoekt) (the engine behind [Sourcegraph](https://sourcegraph.com/)), it works as a tool call in any agent loop, an [MCP](https://modelcontextprotocol.io/) tool, or a shell alias.
+AI coding agents need local context from code, docs, specs, generated files,
+notes, and neighboring checkouts. `seek` lets them query the files you point at
+and get the best matches first, with symbols and surrounding context included.
+It works as a tool call in any agent loop or as a shell command.
 
 <!-- Status -->
 [![CI](https://github.com/dualeai/seek/actions/workflows/ci.yml/badge.svg)](https://github.com/dualeai/seek/actions/workflows/ci.yml)
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/dualeai/seek?utm_source=badge)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
-### Example: dozens of grep matches vs. 1 ranked result
+## Quick Start
 
 ```bash
-# ripgrep: dozens of matches, no way to tell which is the definition
-$ rg "formatResults"
-cmd/seek/main.go:175:   fmt.Print(formatResults(results))
-cmd/seek/formatter_test.go:12:  result := formatResults(nil)
-cmd/seek/formatter_test.go:34:  result := formatResults(files)
-cmd/seek/formatter_test.go:57:  result := formatResults(files)
-# ... more matches across the codebase
+cd your-project
 
-# seek: the definition, with symbol annotation and context
-$ seek "sym:formatResults"
-## cmd/seek/formatter.go (Go)
-  11
-  12 // formatResults formats zoekt FileMatch results into the output format.
-  13 // Files are deduplicated (uncommitted wins), sorted by score descending.
-  14 [func] func formatResults(files []zoekt.FileMatch) string {
-  15     if len(files) == 0 {
-  16         return ""
-  17     }
+seek 'handleRequest'                 # current Git worktree
+seek 'handleRequest' ./src ./cmd     # selected paths
+seek 'TODO' ../notes                 # folder outside Git
+seek 'needle' ./src/server.go        # exact file
 ```
+
+```
+## src/server.go (Go)
+  12
+  13 // handleRequest processes incoming HTTP requests.
+  14 // It validates auth and delegates to the appropriate handler.
+  15 [func] func handleRequest(w http.ResponseWriter, r *http.Request) {
+  16     ctx := r.Context()
+  17     log.Info("handling request")
+  18     validateAuth(ctx, r)
+
+  40     }
+  41     // dispatch to handler
+  42     go handleRequest(w, r)
+  43     return nil
+  44 }
+```
+
+Results are grouped by file and sorted by relevance. Each match includes 3
+lines of surrounding context. Symbol tags like `[func]`, `[class]`, and
+`[function]` show metadata from ctags.
 
 ## Highlights
 
-- **Best match first** -- results ranked by BM25 relevance, not file-path order. Agents get the answer at the top, not buried in the noise
-- **Find definitions, not mentions** -- `sym:` search powered by universal-ctags. `seek "sym:handleRequest"` returns the function definition, not every call site
-- **Context included** -- 3 lines of surrounding code with every match. Agents understand the code without a follow-up Read call
-- **Filters that cut noise** -- `lang:python`, `file:api`, `-file:test` let agents narrow results in a single query. No grep-then-grep-again loops
-- **Searches uncommitted files** -- modified, staged, and untracked files are indexed alongside committed code, tagged `[uncommitted]`. Agents see the same code you do
-- **Safe for parallel agents** -- multiple agents search concurrently via flock-based locking. Essential when tools like Claude Code or Codex [spawn parallel sub-agents](https://openai.com/index/unrolling-the-codex-agent-loop/)
-- **~150ms search** -- trigram index means O(matches) per query, not O(corpus). Measured on kubernetes (29k files): cold index ~8s, every search after ~145ms including dirty-file re-indexing
+- **Search the local working set** -- current Git worktree by default; pass
+  paths to search selected files, selected folders, or folders outside Git
+- **Best match first** -- results are ranked by BM25 relevance, not file-path
+  order
+- **Find definitions, not mentions** -- `sym:` search uses universal-ctags for
+  functions, classes, methods, and types
+- **Context included** -- every match includes 3 surrounding lines, so agents
+  can act without an extra read step
+- **Filters that cut noise** -- `lang:python`, `file:api`, `-file:test`, and
+  `content:regex` narrow a query in one step
+- **Sees Git changes** -- modified, staged, and untracked files are indexed
+  alongside committed code and tagged `[uncommitted]`
+- **Safe for parallel agents** -- concurrent searches use flock-based locking
+- **Fast after the first index** -- measured on kubernetes (29k files): cold
+  index ~8s, warm search ~145ms including dirty-file re-indexing
 
 ## Install
 
@@ -75,9 +97,9 @@ Paste this prompt into your AI coding agent (Claude Code, Codex, Cursor, Amp, et
 <summary>Bootstrap prompt -- click to expand, then copy-paste into your agent</summary>
 
 ```
-Install and configure `seek` for this repository. seek is a ranked code search
-tool that replaces grep/ripgrep for codebase exploration -- results sorted by
-relevance, symbol-aware, with context included.
+Install and configure `seek` for this project. seek is ranked local search for
+AI coding agents. It searches the current Git worktree by default, and can also
+search selected paths, external folders, and exact files.
 
 Step 1 -- Install
 
@@ -93,7 +115,7 @@ Verify: seek --version
 
 Step 2 -- Test
 
-Run in this repo:
+Run in this project:
 
   seek 'main'
 
@@ -102,10 +124,12 @@ and surrounding context.
 
 Step 3 -- Learn the tool
 
-Usage: seek '<query>'
+Usage: seek [flags] '<query>' [path...]
 
-One positional argument. All filters go inside a single quoted string.
-Use single quotes to avoid shell interpretation of |, (, ).
+The first positional argument is the query. Optional paths after the query
+restrict the search to those files or directories. With no paths, seek searches
+the current Git worktree. Use single quotes to avoid shell
+interpretation of |, (, ).
 
 Filters (combine with spaces inside the quotes):
   sym:Name        Find definitions (functions, classes, methods) via ctags
@@ -120,6 +144,9 @@ Filters (combine with spaces inside the quotes):
 Examples:
   seek 'sym:handleRequest'                          # find definition
   seek 'handleRequest file:api -file:test'          # scoped search
+  seek 'handleRequest' ./src ./cmd                  # search paths
+  seek 'TODO' ../notes                              # search outside Git
+  seek 'needle' ./src/server.go                     # exact file only
   seek 'content:async def.*handler lang:python'     # regex + language
   seek '(lang:go or lang:python) ValidationError'   # multi-language
   seek 'type:file config'                           # find files by name
@@ -130,8 +157,10 @@ Symbol lines tagged [func], [class], etc. Modified files tagged [uncommitted].
 Exit codes: 0 = matches found, 1 = no matches, 2 = error.
 
 Pitfalls:
-  - ONE argument: seek 'sym:Foo file:bar' not seek 'sym:Foo' 'file:bar'
+  - Query filters stay in ONE argument: seek 'sym:Foo file:bar'
   - Single quotes to prevent shell expanding |, (, )
+  - Flags must come before the query: seek -n 5 'Foo' ./src
+  - Tokens after the query are filesystem paths, not extra query filters
   - Multi-word queries are AND'd substrings, not phrase match: seek 'foo bar'
     matches files containing both "foo" and "bar" independently
   - Large output: use -n to limit files (seek -n 5 'q') or -m to limit
@@ -139,8 +168,8 @@ Pitfalls:
 
 Step 4 -- Discover project-specific examples
 
-Run a few searches of varying complexity against this repo to find real examples
-that showcase seek's value. Try:
+Run a few searches of varying complexity against this project to find examples
+that show where seek helps. Try:
   - A sym: search for a key class or function in the project
   - A scoped search using file: and -file:test
   - A lang: or content: filtered search
@@ -159,52 +188,45 @@ team members use seek automatically:
   - Other           -> your agent's instruction file
 
 Write concise, task-oriented instructions (not this entire prompt). Include:
-  1. Prefer seek over grep/ripgrep for code search
-  2. Key patterns: sym:, file:, -file:, lang:, content:
+  1. Prefer seek when an agent needs ranked local context
+  2. Key patterns: sym:, file:, -file:, lang:, content:, paths after the query
   3. The project-specific examples you found in Step 4 (not generic ones)
-  4. Pitfalls: single argument, single quotes
+  4. Pitfalls: query filters in one argument, flags before query, paths after
+     query, single quotes
   5. Install command as fallback if seek is not found
   6. When spawning sub-agents that don't inherit the config, pass them a
-     one-liner: "Use seek 'pattern' for code search. All filters in ONE
-     quoted string. Never use grep/rg."
+     one-liner: "Use seek 'pattern' [path...] for code search. Keep query
+     filters in one quoted string. Never use grep/rg."
 ```
 
 </details>
 
-## Quick Start
+## Usage
 
 ```bash
-cd your-git-repo
-seek "handleRequest"
+seek [flags] "<query>" [path...]
 ```
 
-```
-## src/server.go (Go)
-  12
-  13 // handleRequest processes incoming HTTP requests.
-  14 // It validates auth and delegates to the appropriate handler.
-  15 [func] func handleRequest(w http.ResponseWriter, r *http.Request) {
-  16     ctx := r.Context()
-  17     log.Info("handling request")
-  18     validateAuth(ctx, r)
+The query is the first positional argument. Optional paths after the query
+restrict the search to those files or directories.
 
-  40     }
-  41     // dispatch to handler
-  42     go handleRequest(w, r)
-  43     return nil
-  44 }
+- No paths: search the current Git worktree.
+- Paths inside the current repo: search only those files or folders.
+- External Git repos: use the Git-aware pipeline from the user cache, including
+  Git ignore semantics.
+- Other external files or folders: index and search them from the user cache as
+  standard filesystem corpora.
+- Exact non-Git external files search only that file, not sibling files.
 
-## lib/middleware.py (Python) [uncommitted]
-   7
-   8 logger = logging.getLogger(__name__)
-   9
-  10 async def handleRequest(ctx):
-  11     """Process incoming request."""
-  12     await validate(ctx)
-  13     return Response(200)
+Flags must come before the query:
+
+```bash
+seek -n 5 -m 3 "handleRequest" ./src
 ```
 
-Results are grouped by file, sorted by relevance. Each match includes 3 lines of surrounding context. `[uncommitted]` marks files with local changes. Symbol tags like `[func]`, `[class]`, `[function]` show metadata from ctags (kind varies by language).
+Path operands must exist and cannot be symlinks. Invalid paths exit with code
+2.
+Filters such as `file:api` still live inside the query string.
 
 ## Query Syntax
 
@@ -251,7 +273,10 @@ All [zoekt query syntax](https://github.com/sourcegraph/zoekt/blob/main/doc/quer
 | `seek -n 5 -m 3 "query"` | Top 5 files, max 3 matches each |
 | `seek -v "query"` | Enable debug logging (`--verbose`) |
 
-Flags compose with all query filters. For example, `seek -n 3 "sym:handleRequest file:api"` returns the top 3 matching files containing a `handleRequest` definition under `api/`.
+Flags compose with query filters and paths. For example,
+`seek -n 3 "sym:handleRequest file:api" ./src` returns the top 3 matching files
+under `./src` containing a `handleRequest` definition under paths matching
+`api`.
 
 ## What seek adds over grep / ripgrep
 
@@ -259,7 +284,7 @@ Flags compose with all query filters. For example, `seek -n 3 "sym:handleRequest
 
 | | ripgrep | seek |
 |---|---|---|
-| **Search model** | Linear scan -- O(corpus) per query | Trigram index -- O(matches) after one-time build |
+| **Search model** | Linear scan every query | Trigram index after one-time build |
 | **Relevance ranking** | Results in file-path order | Sorted by score, best matches first |
 | **Symbol metadata** | None | `[func]`, `[class]`, `[function]`, etc. via ctags |
 | **Context lines** | None by default | 3 lines of surrounding code with every match |
@@ -271,11 +296,29 @@ seek works alongside ripgrep -- use ripgrep for ad-hoc regex, seek when you want
 
 ## How It Works
 
-1. **State check** -- `git status` captures HEAD SHA and dirty files, hashed for cache invalidation
-2. **Index** -- if the cache is stale, builds a trigram index of committed files and reads uncommitted files directly into memory for separate indexing
-3. **Search** -- loads index shards, runs the query, deduplicates results (uncommitted version wins over committed)
+1. **Plan search roots** -- no paths means the current Git worktree. Paths are
+   split into current-repo scopes and external file/folder roots.
+2. **State check** -- Git roots use `git status`, HEAD SHA, and dirty file
+   metadata. Standard folders use a bounded metadata walk.
+3. **Index** -- Git roots use the Git-aware pipeline for committed and
+   uncommitted files. Standard folders use a bounded folder/file pipeline.
+4. **Search** -- loads Zoekt shards for every requested root, runs one query,
+   merges results, deduplicates per root, sorts by score, then applies limits.
 
-The index is stored in `.seek-cache/` at the repo root. Benchmarks on Apple M1 Max:
+Indexes are stored centrally in the user cache, never inside searched folders:
+
+- macOS: `~/Library/Caches/seek/corpora/<id>/`
+- Linux: `${XDG_CACHE_HOME:-~/.cache}/seek/corpora/<id>/`
+- Shards live in `index/`; `.state`, `.head`, and `.lock` live next to it.
+
+Standard folder indexing walks regular files and only prunes `.git` metadata
+directories. Dependency, build, cache, and vendor directories are not skipped by
+name in standard folder mode. Git ignore semantics are handled only for Git
+roots, including external Git roots. Files larger than 10 MiB are skipped, and
+standard folder indexing stops at 1,000,000 candidate files or 5 GiB of indexed
+bytes.
+
+Benchmarks on Apple M1 Max:
 
 | Repo | Files | Cold index | Warm search | Dirty re-index |
 |------|-------|------------|-------------|----------------|
@@ -284,7 +327,8 @@ The index is stored in `.seek-cache/` at the repo root. Benchmarks on Apple M1 M
 | kubernetes/kubernetes | 29,179 | 7.5s | 132ms | 145ms |
 | torvalds/linux | 93,016 | 59s | 295ms | 301ms |
 
-Cold index runs once. Every subsequent search hits the warm or dirty path. Reproduce with:
+Cold index runs once. Every subsequent search hits the warm or dirty path.
+Reproduce with:
 
 ```bash
 git clone --depth=1 https://github.com/kubernetes/kubernetes /tmp/k8s
@@ -309,7 +353,8 @@ When multiple processes search the same repo concurrently:
 | 1 | No match (query ran successfully, zero results) |
 | 2 | Error (usage error, indexing failed, invalid query) |
 
-Follows the POSIX `grep` / `ripgrep` convention, so `seek` composes naturally in shell pipelines and conditionals.
+Follows the POSIX `grep` / `ripgrep` convention, so `seek` composes naturally in
+shell pipelines and conditionals.
 
 ## Security
 

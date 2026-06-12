@@ -9,66 +9,21 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/sourcegraph/zoekt"
 )
 
-// Skipped tests documenting known limitations. Each has a corresponding
-// TestFix_* test that verifies the mitigation.
-
-func TestBug_ShardGapDuringReindexing(t *testing.T) {
-	t.Skip("Known limitation: manually calling cleanUncommittedShards creates a gap. Mitigated by atomic shard swap (see TestFix_NoShardGapDuringReindexing).")
-}
-
-func TestBug_ConcurrentSearchDuringReindex_Stress(t *testing.T) {
-	t.Skip("Known limitation: probabilistic race without LOCK_SH. Mitigated by LOCK_SH (see TestFix_ConcurrentSearchDuringReindex_Stress).")
-}
-
-func TestBug_SameSecondEditStaleness(t *testing.T) {
-	t.Skip("Known limitation: git stat cache misses same-mtime same-size edits. This is a git-level limitation outside seek's control.")
-}
-
-func TestBug_StaleFallbackMissesUncommittedContent(t *testing.T) {
-	t.Skip("Known limitation: stale fallback serves old shards when another process holds LOCK_EX. The next search will re-index.")
-}
-
-func TestBug_PostIndexingStateDrift(t *testing.T) {
-	t.Skip("Known limitation: mutation during indexing serves stale results for the current search. Post-verification re-stats dirty files so the next search re-indexes.")
-}
-
 // ===========================================================================
-// Fix verification tests
+// Regression tests
 //
-// These tests verify that the applied mitigations (atomic shard swap,
-// LOCK_SH during search) actually prevent the bugs demonstrated above.
+// These tests verify that atomic shard swap and LOCK_SH search protection keep
+// search results stable across reindex boundaries.
 // ===========================================================================
-
-// searchWithLock mirrors the production search path in run(): acquires
-// a shared lock via acquireSearchLock before searching, ensuring the
-// searcher waits for any active indexer (LOCK_EX holder) to finish.
-func searchWithLock(ctx context.Context, indexDir, pattern string) ([]zoekt.FileMatch, error) {
-	lockPath := filepath.Join(indexDir, lockFile)
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("open search lock: %w", err)
-	}
-	defer func() {
-		unlockFile(f)
-		_ = f.Close()
-	}()
-	if err := acquireSearchLock(ctx, f); err != nil {
-		return nil, fmt.Errorf("acquire search lock: %w", err)
-	}
-	return executeSearch(ctx, indexDir, pattern)
-}
 
 // ---------------------------------------------------------------------------
 // Fix #1: Atomic shard swap — no gap during re-indexing
 //
-// After the fix, runIndexing no longer calls cleanUncommittedShards before
-// indexUncommitted when uncommitted docs exist. Zoekt's builder.Finish()
-// atomically replaces old shards (write .tmp then os.Rename), so there
-// is no window where zero uncommitted shards exist.
+// Planned Git corpus search refreshes dirty content through the normal
+// freshness path before reading Zoekt shards, so there is no visible gap where
+// the old uncommitted marker disappears without the new one being searchable.
 // ---------------------------------------------------------------------------
 
 func TestFix_NoShardGapDuringReindexing(t *testing.T) {
@@ -82,19 +37,9 @@ func TestFix_NoShardGapDuringReindexing(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	indexDir := filepath.Join(dir, cacheDir)
-	if err := os.MkdirAll(indexDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	paths, plan := planGitTestCorpus(t, dir)
 
-	// Initial index with uncommitted content
-	state := gitRepoStateIn(ctx, dir)
-	currentState := computeStateHash(repoStateFingerprint(dir, state))
-	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, currentState); err != nil {
-		t.Fatalf("initial indexing failed: %v", err)
-	}
-
-	results, err := executeSearch(ctx, indexDir, "uncommitted_v1")
+	results, err := runSeekInPlannedGitCorpus(ctx, "uncommitted_v1", paths, plan)
 	if err != nil {
 		t.Fatalf("initial search failed: %v", err)
 	}
@@ -102,25 +47,11 @@ func TestFix_NoShardGapDuringReindexing(t *testing.T) {
 		t.Fatal("precondition: uncommitted_v1 must be findable after initial indexing")
 	}
 
-	// Change uncommitted content and re-index through the production path
 	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// uncommitted_v2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	state2 := gitRepoStateIn(ctx, dir)
-	currentState2 := computeStateHash(repoStateFingerprint(dir, state2))
-	if currentState2 == currentState {
-		t.Fatal("precondition: state should change after edit")
-	}
-
-	// Force re-indexing by clearing state file
-	deleteStateFiles(indexDir)
-	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state2, currentState2); err != nil {
-		t.Fatalf("re-indexing failed: %v", err)
-	}
-
-	// After re-indexing, new uncommitted content must be findable
-	results, err = executeSearch(ctx, indexDir, "uncommitted_v2")
+	results, err = runSeekInPlannedGitCorpus(ctx, "uncommitted_v2", paths, plan)
 	if err != nil {
 		t.Fatalf("post-reindex search failed: %v", err)
 	}
@@ -128,19 +59,21 @@ func TestFix_NoShardGapDuringReindexing(t *testing.T) {
 		t.Fatal("FIX FAILED: uncommitted_v2 not findable after re-indexing")
 	}
 
-	// Old uncommitted content should NOT be in the uncommitted shard
-	// (it may still appear in the committed shard if it was committed)
-	t.Log("FIX VERIFIED: re-indexing via production path preserves uncommitted content availability")
+	results, err = runSeekInPlannedGitCorpus(ctx, "uncommitted_v1", paths, plan)
+	if err != nil {
+		t.Fatalf("old marker search failed: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("old uncommitted content should be tombstoned, got %d results", len(results))
+	}
 }
 
 // ---------------------------------------------------------------------------
 // Fix #2: acquireSearchLock polls until LOCK_EX is released
 //
-// The production search path in run() acquires a shared lock via
-// acquireSearchLock (non-blocking poll with exponential backoff) before
-// calling executeSearch. Since the NB shared lock fails while any LOCK_EX
-// is held, a searcher waits for an active indexer to finish before reading
-// shards.
+// acquireSearchLock is the lock primitive used by planned corpus search.
+// Since the NB shared lock fails while any LOCK_EX is held, a searcher waits
+// for an active indexer to finish before reading shards.
 // ---------------------------------------------------------------------------
 
 func TestFix_SharedLockBlocksSearchDuringIndexing(t *testing.T) {
@@ -200,64 +133,85 @@ func TestFix_SharedLockBlocksSearchDuringIndexing(t *testing.T) {
 	if acquiredTime < releaseTime {
 		t.Fatal("LOCK_SH acquired before LOCK_EX was released")
 	}
-
-	t.Log("FIX VERIFIED: LOCK_SH correctly blocks until LOCK_EX is released")
 }
 
 // ---------------------------------------------------------------------------
 // Fix #3: Concurrent search+reindex stress — with LOCK_SH protection
 //
-// Similar to TestBug_ConcurrentSearchDuringReindex_Stress but uses
-// searchWithLock (the production path) and expects ZERO missed searches.
+// Searches through the planned-corpus boundary while lower-level reindexing
+// updates shards and holds locks.
 // ---------------------------------------------------------------------------
 
 func TestFix_ConcurrentSearchDuringReindex_Stress(t *testing.T) {
 	requireTools(t)
 
+	const iterations = 20
 	dir := initGitRepo(t, "stable.go", "package main\n// always_findable_fix_test\n")
+	for iter := range iterations {
+		name := fmt.Sprintf("changing_%d.go", iter)
+		content := fmt.Sprintf("package main\n// committed_changing_%d\n", iter)
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitRun(t, dir, "add", ".")
+	gitRun(t, dir, "commit", "-m", "add changing fixtures")
 
 	ctx := context.Background()
-	indexDir := filepath.Join(dir, cacheDir)
-	if err := os.MkdirAll(indexDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	paths, plan := planGitTestCorpus(t, dir)
 
 	// Initial index
 	state := gitRepoStateIn(ctx, dir)
-	currentState := computeStateHash(repoStateFingerprint(dir, state))
-	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, currentState); err != nil {
+	currentState := gitCorpusStateHash(paths, state)
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, currentState); err != nil {
 		t.Fatalf("initial indexing: %v", err)
 	}
 
 	// Verify baseline
-	results, err := searchWithLock(ctx, indexDir, "always_findable_fix_test")
+	results, err := searchPlannedCorpusForTest(ctx, plan, "always_findable_fix_test")
 	if err != nil || len(results) == 0 {
 		t.Fatal("precondition: committed content must be findable")
 	}
 
 	var missedContent atomic.Int64
 	var searchErrors atomic.Int64
-	const iterations = 20
+	indexErrors := make(chan error, 1)
+	recordIndexError := func(err error) {
+		select {
+		case indexErrors <- err:
+		default:
+		}
+	}
 
 	var wg sync.WaitGroup
+	start := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for iter := range iterations {
+			marker := fmt.Sprintf("uncommitted_fix_iter_%d", iter)
+			content := fmt.Sprintf("package main\n// %s\n", marker)
+			if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("changing_%d.go", iter)), []byte(content), 0o644); err != nil {
+				recordIndexError(fmt.Errorf("write dirty fixture %q: %w", marker, err))
+				return
+			}
+			state := gitRepoStateIn(ctx, dir)
+			currentState := gitCorpusStateHash(paths, state)
+			if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, currentState); err != nil {
+				recordIndexError(fmt.Errorf("refresh dirty fixture %q: %w", marker, err))
+				return
+			}
+		}
+	}()
+
 	for i := range iterations {
-		wg.Add(2)
-
-		// Goroutine A: create uncommitted change and reindex
+		wg.Add(1)
 		go func(iter int) {
 			defer wg.Done()
-			content := fmt.Sprintf("package main\n// uncommitted_fix_iter_%d\n", iter)
-			_ = os.WriteFile(filepath.Join(dir, "changing.go"), []byte(content), 0o644)
-			st := gitRepoStateIn(ctx, dir)
-			cs := computeStateHash(repoStateFingerprint(dir, st))
-			_ = runIndexing(ctx, fallbackGitPaths(dir), indexDir, st, cs)
-		}(i)
-
-		// Goroutine B: search concurrently WITH LOCK_SH protection
-		go func(iter int) {
-			defer wg.Done()
+			<-start
 			time.Sleep(time.Duration(1+iter%5) * time.Millisecond)
-			res, err := searchWithLock(ctx, indexDir, "always_findable_fix_test")
+			res, err := searchPlannedCorpusForTest(ctx, plan, "always_findable_fix_test")
 			if err != nil {
 				searchErrors.Add(1)
 				return
@@ -267,16 +221,28 @@ func TestFix_ConcurrentSearchDuringReindex_Stress(t *testing.T) {
 			}
 		}(i)
 	}
+	close(start)
 	wg.Wait()
 
 	if missedContent.Load() > 0 {
 		t.Errorf("FIX REGRESSION: %d/%d searches missed committed content during concurrent reindexing",
 			missedContent.Load(), iterations)
-	} else {
-		t.Logf("FIX VERIFIED: all %d concurrent searches found committed content with LOCK_SH protection", iterations)
 	}
 	if searchErrors.Load() > 0 {
-		t.Logf("Note: %d searches returned errors", searchErrors.Load())
+		t.Errorf("FIX REGRESSION: %d searches returned errors", searchErrors.Load())
+	}
+	select {
+	case err := <-indexErrors:
+		t.Errorf("FIX REGRESSION: concurrent indexing failed: %v", err)
+	default:
+	}
+
+	latestMarker := fmt.Sprintf("uncommitted_fix_iter_%d", iterations-1)
+	latestFiles, err := runSeekInPlannedGitCorpus(ctx, latestMarker, paths, plan)
+	if err != nil {
+		t.Fatalf("final dirty search failed: %v", err)
+	}
+	if len(latestFiles) == 0 {
+		t.Fatalf("latest dirty marker should be searchable after contention settles")
 	}
 }
-

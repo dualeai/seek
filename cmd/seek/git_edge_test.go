@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -54,8 +55,6 @@ func TestIntegration_InitialCommitEmpty(t *testing.T) {
 			t.Fatalf("%v failed: %v\n%s", args, err, out)
 		}
 	}
-	ensureGitExclude(fallbackGitPaths(dir), cacheDir)
-
 	// Add an untracked file — should be findable even with empty initial commit
 	if err := os.WriteFile(filepath.Join(dir, "new.go"), []byte("package main\n// empty_initial_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -67,6 +66,34 @@ func TestIntegration_InitialCommitEmpty(t *testing.T) {
 	}
 	if len(files) == 0 {
 		t.Fatal("expected match for untracked file in repo with empty initial commit")
+	}
+}
+
+func TestRun_EmptyGitRepoReturnsNoMatch(t *testing.T) {
+	requireTools(t)
+
+	dir := t.TempDir()
+	for _, args := range [][]string{
+		{"git", "init"},
+		{"git", "config", "user.email", "test@test.com"},
+		{"git", "config", "user.name", "Test"},
+		{"git", "commit", "--allow-empty", "-m", "empty initial"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v failed: %v\n%s", args, err, out)
+		}
+	}
+
+	setTestUserCache(t)
+	t.Chdir(dir)
+
+	_, err := captureStdout(t, func() error {
+		return run(context.Background(), "absent_empty_repo_marker", nil, 0, 0)
+	})
+	if !errors.Is(err, errNoMatch) {
+		t.Fatalf("expected no match for empty git repo, got %v", err)
 	}
 }
 
@@ -247,9 +274,6 @@ func TestRepoStateFingerprint_EmptyFiles(t *testing.T) {
 	}
 }
 
-// TestRepoStateFingerprint_AllFilesDeleted verifies that when all dirty
-// files are deleted between git status and fingerprinting, each gets the
-// "deleted" sentinel.
 func TestRepoStateFingerprint_AllFilesDeleted(t *testing.T) {
 	dir := t.TempDir()
 	state := repoState{
@@ -257,11 +281,18 @@ func TestRepoStateFingerprint_AllFilesDeleted(t *testing.T) {
 		Files:     []string{"gone1.go", "gone2.go", "gone3.go"},
 	}
 	fp := repoStateFingerprint(dir, state)
-	for _, f := range state.Files {
-		sentinel := fmt.Sprintf("\x00%s\x00deleted\x00", f)
-		if !strings.Contains(fp, sentinel) {
-			t.Errorf("missing deleted sentinel for %q", f)
-		}
+	if fp == state.RawOutput {
+		t.Fatal("expected deleted files to affect fingerprint")
+	}
+	if fp != repoStateFingerprint(dir, state) {
+		t.Fatal("expected deleted-file fingerprint to be deterministic")
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "gone2.go"), []byte("restored\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if fp == repoStateFingerprint(dir, state) {
+		t.Fatal("expected restored file to change fingerprint")
 	}
 }
 
@@ -307,9 +338,9 @@ func TestStateFile_PartialWrite(t *testing.T) {
 	}
 }
 
-// TestReadUncommittedFiles_FIFOSkipped verifies that FIFO (named pipe) files
+// TestStreamFiles_FIFOSkipped verifies that FIFO (named pipe) files
 // are skipped without blocking or error.
-func TestReadUncommittedFiles_FIFOSkipped(t *testing.T) {
+func TestStreamFiles_FIFOSkipped(t *testing.T) {
 	dir := t.TempDir()
 
 	// Create a regular file alongside
@@ -317,7 +348,7 @@ func TestReadUncommittedFiles_FIFOSkipped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create a FIFO — readUncommittedFiles should not block on it.
+	// Create a FIFO — collectStreamFilesForTest should not block on it.
 	// Lstat returns ModeNamedPipe which is not ModeDir or ModeSymlink,
 	// so it passes the type check. But ReadFile on a FIFO blocks.
 	// This test documents whether the current code handles this.
@@ -327,10 +358,10 @@ func TestReadUncommittedFiles_FIFOSkipped(t *testing.T) {
 		t.Skipf("mkfifo not available: %v", err)
 	}
 
-	// Use a timeout to detect if readUncommittedFiles blocks on FIFO
+	// Use a timeout to detect if collectStreamFilesForTest blocks on FIFO
 	done := make(chan []fileContent, 1)
 	go func() {
-		done <- readUncommittedFiles(dir, []string{"regular.go", "fifo"}, 2)
+		done <- collectStreamFilesForTest(dir, []string{"regular.go", "fifo"}, 2)
 	}()
 
 	select {
@@ -346,13 +377,13 @@ func TestReadUncommittedFiles_FIFOSkipped(t *testing.T) {
 			t.Error("expected regular.go in results")
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("readUncommittedFiles blocked — likely stuck reading FIFO")
+		t.Fatal("collectStreamFilesForTest blocked — likely stuck reading FIFO")
 	}
 }
 
-// TestReadUncommittedFiles_HardlinkContent verifies hardlinked files
+// TestStreamFiles_HardlinkContent verifies hardlinked files
 // are read correctly (content matches, different paths).
-func TestReadUncommittedFiles_HardlinkContent(t *testing.T) {
+func TestStreamFiles_HardlinkContent(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "source.go")
 	link := filepath.Join(dir, "hardlink.go")
@@ -364,7 +395,7 @@ func TestReadUncommittedFiles_HardlinkContent(t *testing.T) {
 		t.Skipf("hardlinks not supported: %v", err)
 	}
 
-	results := readUncommittedFiles(dir, []string{"source.go", "hardlink.go"}, 2)
+	results := collectStreamFilesForTest(dir, []string{"source.go", "hardlink.go"}, 2)
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results for hardlinked files, got %d", len(results))
 	}
@@ -394,13 +425,14 @@ func TestRepoStateFingerprint_HardlinkSameInode(t *testing.T) {
 		RawOutput: "raw",
 		Files:     []string{"a.go", "b.go"},
 	}
-	fp := repoStateFingerprint(dir, state)
-	// Both files should produce fingerprint entries (even with same inode)
-	if strings.Count(fp, "\x00a.go\x00") != 1 {
-		t.Error("expected a.go in fingerprint")
+	fpBoth := repoStateFingerprint(dir, state)
+	fpA := repoStateFingerprint(dir, repoState{RawOutput: "raw", Files: []string{"a.go"}})
+	fpB := repoStateFingerprint(dir, repoState{RawOutput: "raw", Files: []string{"b.go"}})
+	if fpA == fpB {
+		t.Fatal("expected hardlinked paths with different names to fingerprint differently")
 	}
-	if strings.Count(fp, "\x00b.go\x00") != 1 {
-		t.Error("expected b.go in fingerprint")
+	if fpBoth == fpA || fpBoth == fpB {
+		t.Fatal("expected both hardlinked paths to contribute to fingerprint")
 	}
 }
 
@@ -532,7 +564,7 @@ func TestIntegration_MergeConflictState(t *testing.T) {
 
 // TestIntegration_SubmoduleDirtySkipped verifies that a dirty submodule
 // (which appears as a directory in git status) is skipped by
-// readUncommittedFiles without error.
+// collectStreamFilesForTest without error.
 func TestIntegration_SubmoduleDirtySkipped(t *testing.T) {
 	requireTools(t)
 
@@ -582,92 +614,12 @@ func TestGitRepoState_CancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
 
-	state := gitRepoState(ctx)
+	state := gitRepoStateIn(ctx, "")
 	if state.HeadSHA != "no-head" {
 		t.Errorf("expected no-head for cancelled context, got %q", state.HeadSHA)
 	}
 	if len(state.Files) != 0 {
 		t.Errorf("expected no files for cancelled context, got %v", state.Files)
-	}
-}
-
-// TestEnsureGitExclude_Idempotent verifies that calling ensureGitExclude
-// multiple times doesn't duplicate the pattern.
-func TestEnsureGitExclude_Idempotent(t *testing.T) {
-	dir := t.TempDir()
-	// Create .git/info structure
-	gitDir := filepath.Join(dir, ".git", "info")
-	if err := os.MkdirAll(gitDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	// Call 5 times
-	for range 5 {
-		ensureGitExclude(fallbackGitPaths(dir), cacheDir)
-	}
-
-	data, err := os.ReadFile(filepath.Join(gitDir, "exclude"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	needle := "/" + cacheDir
-	count := strings.Count(string(data), needle)
-	if count != 1 {
-		t.Errorf("expected exactly 1 occurrence of %q in exclude, got %d\ncontents: %q", needle, count, data)
-	}
-}
-
-// TestEnsureGitExclude_PreExistingContentPreserved verifies that existing
-// exclude patterns are preserved when adding the cache directory.
-func TestEnsureGitExclude_PreExistingContentPreserved(t *testing.T) {
-	dir := t.TempDir()
-	gitDir := filepath.Join(dir, ".git", "info")
-	if err := os.MkdirAll(gitDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	existing := "*.log\n*.tmp\nbuild/\n"
-	if err := os.WriteFile(filepath.Join(gitDir, "exclude"), []byte(existing), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	ensureGitExclude(fallbackGitPaths(dir), cacheDir)
-
-	data, err := os.ReadFile(filepath.Join(gitDir, "exclude"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	content := string(data)
-	if !strings.HasPrefix(content, existing) {
-		t.Errorf("existing content was not preserved: %q", content)
-	}
-	if !strings.Contains(content, "/"+cacheDir) {
-		t.Errorf("cache pattern not added: %q", content)
-	}
-}
-
-// TestEnsureGitExclude_NoTrailingNewline verifies that a file without
-// trailing newline gets one added before the pattern.
-func TestEnsureGitExclude_NoTrailingNewline(t *testing.T) {
-	dir := t.TempDir()
-	gitDir := filepath.Join(dir, ".git", "info")
-	if err := os.MkdirAll(gitDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// No trailing newline
-	if err := os.WriteFile(filepath.Join(gitDir, "exclude"), []byte("*.log"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	ensureGitExclude(fallbackGitPaths(dir), cacheDir)
-
-	data, err := os.ReadFile(filepath.Join(gitDir, "exclude"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	content := string(data)
-	// Should have newline separator between existing content and new pattern
-	if !strings.Contains(content, "*.log\n/"+cacheDir) {
-		t.Errorf("expected newline separator: %q", content)
 	}
 }
 
@@ -711,12 +663,11 @@ func TestRepoStateFingerprint_ManyDeletedFiles(t *testing.T) {
 	fp := repoStateFingerprint(dir, state)
 	elapsed := time.Since(start)
 
-	// All files are deleted — should get sentinel for each
-	for _, f := range files {
-		if !strings.Contains(fp, f+"\x00deleted\x00") {
-			t.Errorf("missing deleted sentinel for %s", f)
-			break
-		}
+	if fp == state.RawOutput {
+		t.Fatal("expected deleted files to affect fingerprint")
+	}
+	if fp != repoStateFingerprint(dir, state) {
+		t.Fatal("expected many-deleted-files fingerprint to be deterministic")
 	}
 	// Should be fast (< 100ms for 1000 Lstats on non-existent files)
 	if elapsed > 500*time.Millisecond {
@@ -738,9 +689,9 @@ func TestComputeStateHash_CollisionResistance(t *testing.T) {
 	}
 }
 
-// TestReadUncommittedFiles_HighConcurrency verifies that reading many
+// TestStreamFiles_HighConcurrency verifies that reading many
 // files with high parallelism doesn't miss or duplicate results.
-func TestReadUncommittedFiles_HighConcurrency(t *testing.T) {
+func TestStreamFiles_HighConcurrency(t *testing.T) {
 	dir := t.TempDir()
 	const numFiles = 500
 	for i := range numFiles {
@@ -755,25 +706,25 @@ func TestReadUncommittedFiles_HighConcurrency(t *testing.T) {
 		files[i] = fmt.Sprintf("file_%03d.go", i)
 	}
 
-	results := readUncommittedFiles(dir, files, 16)
+	results := collectStreamFilesForTest(dir, files, 16)
 	if len(results) != numFiles {
 		t.Errorf("expected %d results, got %d", numFiles, len(results))
 	}
 
 	// Verify no duplicates
-	seen := make(map[string]bool)
+	seen := make(map[string]struct{})
 	for _, r := range results {
-		if seen[r.name] {
+		if _, ok := seen[r.name]; ok {
 			t.Errorf("duplicate result for %s", r.name)
 		}
-		seen[r.name] = true
+		seen[r.name] = struct{}{}
 	}
 }
 
-// TestReadUncommittedFiles_RacyDeletion simulates files being deleted
-// between git status and readUncommittedFiles (TOCTOU). Some files
+// TestStreamFiles_RacyDeletion simulates files being deleted
+// between git status and collectStreamFilesForTest (TOCTOU). Some files
 // should be read, deleted ones should be silently skipped.
-func TestReadUncommittedFiles_RacyDeletion(t *testing.T) {
+func TestStreamFiles_RacyDeletion(t *testing.T) {
 	dir := t.TempDir()
 	const numFiles = 100
 	fileNames := make([]string, numFiles)
@@ -795,7 +746,7 @@ func TestReadUncommittedFiles_RacyDeletion(t *testing.T) {
 		}
 	}()
 
-	results := readUncommittedFiles(dir, fileNames, 4)
+	results := collectStreamFilesForTest(dir, fileNames, 4)
 	wg.Wait()
 
 	// Should not panic; should have between 50 and 100 results depending on timing
@@ -847,14 +798,14 @@ func TestAcquireLock_ContextCancellation(t *testing.T) {
 }
 
 // TestIntegration_VeryLargeUncommittedFile verifies that files exceeding
-// maxUncommittedFileSize are skipped but other files are still indexed.
+// maxGitDirtyFileSize are skipped but other files are still indexed.
 func TestIntegration_VeryLargeUncommittedFile(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// normal_content_marker\n")
 
 	// Create a file just over the limit
-	large := make([]byte, maxUncommittedFileSize+1)
+	large := make([]byte, maxGitDirtyFileSize+1)
 	for i := range large {
 		large[i] = 'x'
 	}
@@ -877,12 +828,14 @@ func TestIntegration_VeryLargeUncommittedFile(t *testing.T) {
 	}
 }
 
-// TestIntegration_ConcurrentSeekInvocations simulates multiple seek
-// processes running against the same repo simultaneously.
-func TestIntegration_ConcurrentSeekInvocations(t *testing.T) {
+// TestPlannedGitCorpus_ConcurrentSearches exercises concurrent planned-corpus
+// searches against the same cache/index. It intentionally stays below the CLI
+// boundary because run/captureStdout/cwd changes are process-global.
+func TestPlannedGitCorpus_ConcurrentSearches(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// concurrent_seek_marker\n")
+	paths, plan := planGitTestCorpus(t, dir)
 
 	const goroutines = 8
 	var wg sync.WaitGroup
@@ -892,7 +845,7 @@ func TestIntegration_ConcurrentSeekInvocations(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			files, err := runSeekInRepo(t, dir, "concurrent_seek_marker")
+			files, err := runSeekInPlannedGitCorpus(context.Background(), "concurrent_seek_marker", paths, plan)
 			if err != nil {
 				errors <- err
 				return
@@ -988,10 +941,7 @@ func TestIntegration_StatusShowUntrackedFilesNo(t *testing.T) {
 		t.Fatalf("search failed: %v", err)
 	}
 	// With showUntrackedFiles=no, the untracked file is invisible to seek.
-	// This documents the current behavior — not necessarily desired.
 	if len(files) != 0 {
-		t.Log("note: untracked file was found despite status.showUntrackedFiles=no")
-	} else {
-		t.Log("confirmed: status.showUntrackedFiles=no hides untracked files from seek")
+		t.Fatalf("status.showUntrackedFiles=no should hide untracked files, got %v", files)
 	}
 }

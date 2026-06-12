@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -277,14 +279,14 @@ func TestStateFile_OverwriteExisting(t *testing.T) {
 	}
 }
 
-// --- readUncommittedFiles tests ---
+// --- collectStreamFilesForTest tests ---
 
-func TestReadUncommittedFiles_RegularFiles(t *testing.T) {
+func TestStreamFiles_RegularFiles(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "a.go"), []byte("package a"), 0o644)
 	_ = os.WriteFile(filepath.Join(dir, "b.go"), []byte("package b"), 0o644)
 
-	results := readUncommittedFiles(dir, []string{"a.go", "b.go"}, 2)
+	results := collectStreamFilesForTest(dir, []string{"a.go", "b.go"}, 2)
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(results))
 	}
@@ -299,28 +301,28 @@ func TestReadUncommittedFiles_RegularFiles(t *testing.T) {
 	}
 }
 
-func TestReadUncommittedFiles_EmptyList(t *testing.T) {
+func TestStreamFiles_EmptyList(t *testing.T) {
 	dir := t.TempDir()
-	results := readUncommittedFiles(dir, nil, 2)
+	results := collectStreamFilesForTest(dir, nil, 2)
 	if len(results) != 0 {
 		t.Errorf("expected 0 results, got %d", len(results))
 	}
 }
 
-func TestReadUncommittedFiles_NonexistentFile(t *testing.T) {
+func TestStreamFiles_NonexistentFile(t *testing.T) {
 	dir := t.TempDir()
-	results := readUncommittedFiles(dir, []string{"does_not_exist.go"}, 1)
+	results := collectStreamFilesForTest(dir, []string{"does_not_exist.go"}, 1)
 	if len(results) != 0 {
 		t.Errorf("expected 0 results for nonexistent file, got %d", len(results))
 	}
 }
 
-func TestReadUncommittedFiles_SkipsDirectories(t *testing.T) {
+func TestStreamFiles_SkipsDirectories(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.Mkdir(filepath.Join(dir, "subdir"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir, "real.go"), []byte("package real"), 0o644)
 
-	results := readUncommittedFiles(dir, []string{"subdir", "real.go"}, 2)
+	results := collectStreamFilesForTest(dir, []string{"subdir", "real.go"}, 2)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result (directory skipped), got %d", len(results))
 	}
@@ -329,13 +331,13 @@ func TestReadUncommittedFiles_SkipsDirectories(t *testing.T) {
 	}
 }
 
-func TestReadUncommittedFiles_SkipsSymlinks(t *testing.T) {
+func TestStreamFiles_SkipsSymlinks(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target.go")
 	_ = os.WriteFile(target, []byte("package target"), 0o644)
 	_ = os.Symlink(target, filepath.Join(dir, "link.go"))
 
-	results := readUncommittedFiles(dir, []string{"link.go", "target.go"}, 2)
+	results := collectStreamFilesForTest(dir, []string{"link.go", "target.go"}, 2)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result (symlink skipped), got %d", len(results))
 	}
@@ -344,12 +346,12 @@ func TestReadUncommittedFiles_SkipsSymlinks(t *testing.T) {
 	}
 }
 
-func TestReadUncommittedFiles_NestedPath(t *testing.T) {
+func TestStreamFiles_NestedPath(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.MkdirAll(filepath.Join(dir, "src", "pkg"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir, "src", "pkg", "main.go"), []byte("package main"), 0o644)
 
-	results := readUncommittedFiles(dir, []string{"src/pkg/main.go"}, 1)
+	results := collectStreamFilesForTest(dir, []string{"src/pkg/main.go"}, 1)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -358,11 +360,11 @@ func TestReadUncommittedFiles_NestedPath(t *testing.T) {
 	}
 }
 
-func TestReadUncommittedFiles_EmptyFile(t *testing.T) {
+func TestStreamFiles_EmptyFile(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "empty.go"), []byte{}, 0o644)
 
-	results := readUncommittedFiles(dir, []string{"empty.go"}, 1)
+	results := collectStreamFilesForTest(dir, []string{"empty.go"}, 1)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -371,11 +373,11 @@ func TestReadUncommittedFiles_EmptyFile(t *testing.T) {
 	}
 }
 
-func TestReadUncommittedFiles_MixedExistingAndMissing(t *testing.T) {
+func TestStreamFiles_MixedExistingAndMissing(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "exists.go"), []byte("yes"), 0o644)
 
-	results := readUncommittedFiles(dir, []string{"exists.go", "gone.go", "also_gone.go"}, 2)
+	results := collectStreamFilesForTest(dir, []string{"exists.go", "gone.go", "also_gone.go"}, 2)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -384,12 +386,12 @@ func TestReadUncommittedFiles_MixedExistingAndMissing(t *testing.T) {
 	}
 }
 
-func TestReadUncommittedFiles_PreservesRelativeName(t *testing.T) {
+func TestStreamFiles_PreservesRelativeName(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.MkdirAll(filepath.Join(dir, "a", "b"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir, "a", "b", "c.go"), []byte("x"), 0o644)
 
-	results := readUncommittedFiles(dir, []string{"a/b/c.go"}, 1)
+	results := collectStreamFilesForTest(dir, []string{"a/b/c.go"}, 1)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -399,12 +401,12 @@ func TestReadUncommittedFiles_PreservesRelativeName(t *testing.T) {
 	}
 }
 
-func TestReadUncommittedFiles_SpacesInPath(t *testing.T) {
+func TestStreamFiles_SpacesInPath(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.MkdirAll(filepath.Join(dir, "my dir"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir, "my dir", "my file.go"), []byte("hello"), 0o644)
 
-	results := readUncommittedFiles(dir, []string{"my dir/my file.go"}, 1)
+	results := collectStreamFilesForTest(dir, []string{"my dir/my file.go"}, 1)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -413,7 +415,7 @@ func TestReadUncommittedFiles_SpacesInPath(t *testing.T) {
 	}
 }
 
-func TestReadUncommittedFiles_Parallelism1(t *testing.T) {
+func TestStreamFiles_Parallelism1(t *testing.T) {
 	dir := t.TempDir()
 	for i := 0; i < 10; i++ {
 		_ = os.WriteFile(filepath.Join(dir, filepath.Base(t.Name())+string(rune('a'+i))+".go"), []byte("x"), 0o644)
@@ -424,7 +426,7 @@ func TestReadUncommittedFiles_Parallelism1(t *testing.T) {
 		files[i] = filepath.Base(t.Name()) + string(rune('a'+i)) + ".go"
 	}
 
-	results := readUncommittedFiles(dir, files, 1)
+	results := collectStreamFilesForTest(dir, files, 1)
 	if len(results) != 10 {
 		t.Errorf("expected 10 results with parallelism=1, got %d", len(results))
 	}
@@ -539,14 +541,14 @@ func TestCheckCtags_DetectsFromPATH(t *testing.T) {
 
 // --- large file skip tests ---
 
-func TestReadUncommittedFiles_LargeFileSkipped(t *testing.T) {
+func TestStreamFiles_LargeFileSkipped(t *testing.T) {
 	dir := t.TempDir()
 	// Create a file just over the limit
-	large := make([]byte, maxUncommittedFileSize+1)
+	large := make([]byte, maxGitDirtyFileSize+1)
 	_ = os.WriteFile(filepath.Join(dir, "large.go"), large, 0o644)
 	_ = os.WriteFile(filepath.Join(dir, "small.go"), []byte("package small"), 0o644)
 
-	results := readUncommittedFiles(dir, []string{"large.go", "small.go"}, 2)
+	results := collectStreamFilesForTest(dir, []string{"large.go", "small.go"}, 2)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result (large file skipped), got %d", len(results))
 	}
@@ -555,24 +557,24 @@ func TestReadUncommittedFiles_LargeFileSkipped(t *testing.T) {
 	}
 }
 
-func TestReadUncommittedFiles_ExactlyMaxSize(t *testing.T) {
+func TestStreamFiles_ExactlyMaxSize(t *testing.T) {
 	dir := t.TempDir()
 	// Exactly at the limit — should NOT be skipped (guard is >)
-	data := make([]byte, maxUncommittedFileSize)
+	data := make([]byte, maxGitDirtyFileSize)
 	_ = os.WriteFile(filepath.Join(dir, "exact.go"), data, 0o644)
 
-	results := readUncommittedFiles(dir, []string{"exact.go"}, 1)
+	results := collectStreamFilesForTest(dir, []string{"exact.go"}, 1)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result (exactly max size should be included), got %d", len(results))
 	}
 }
 
-func TestReadUncommittedFiles_JustOverMaxSize(t *testing.T) {
+func TestStreamFiles_JustOverMaxSize(t *testing.T) {
 	dir := t.TempDir()
-	data := make([]byte, maxUncommittedFileSize+1)
+	data := make([]byte, maxGitDirtyFileSize+1)
 	_ = os.WriteFile(filepath.Join(dir, "over.go"), data, 0o644)
 
-	results := readUncommittedFiles(dir, []string{"over.go"}, 1)
+	results := collectStreamFilesForTest(dir, []string{"over.go"}, 1)
 	if len(results) != 0 {
 		t.Errorf("expected 0 results (just over max size should be skipped), got %d", len(results))
 	}
@@ -621,6 +623,133 @@ func TestComputeStateHash_VersionPrefix(t *testing.T) {
 	h := computeStateHash("# branch.oid abc123\n")
 	if len(h) != 16 {
 		t.Errorf("expected 16-char hex hash, got %d chars: %q", len(h), h)
+	}
+}
+
+func TestIndexBuildOptions_AlignsSharedIndexBudgets(t *testing.T) {
+	opts := indexBuildOptions(t.TempDir(), 3)
+	if opts.SizeMax != maxIndexedDocumentBytes {
+		t.Fatalf("SizeMax=%d, want %d", opts.SizeMax, maxIndexedDocumentBytes)
+	}
+	if maxFolderFileSize != maxIndexedDocumentBytes || maxGitDirtyFileSize != maxIndexedDocumentBytes {
+		t.Fatalf(
+			"read limits must match Zoekt SizeMax: folder=%d gitDirty=%d sizeMax=%d",
+			maxFolderFileSize,
+			maxGitDirtyFileSize,
+			maxIndexedDocumentBytes,
+		)
+	}
+	if maxFolderIndexedBytes != maxCorpusIndexedBytes {
+		t.Fatalf("folder indexed bytes=%d, want shared corpus budget %d", maxFolderIndexedBytes, maxCorpusIndexedBytes)
+	}
+	if !strings.Contains(strings.Join(indexOptionsParts(), "\x00"), "size_max") {
+		t.Fatal("index options must include size_max")
+	}
+}
+
+func requireGit(tb testing.TB) {
+	tb.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		tb.Skip("requires git on PATH")
+	}
+}
+
+func TestGitCommittedIndexBudget_FileCap(t *testing.T) {
+	requireGit(t)
+
+	dir := initGitRepo(t, "app.go", "package main\n// committed_budget_marker\n")
+	budget, err := scanGitCommittedIndexBudget(context.Background(), dir, 0, maxCorpusIndexedBytes)
+	if !errors.Is(err, errGitCapExceeded) {
+		t.Fatalf("expected git cap error, got budget=%+v err=%v", budget, err)
+	}
+	for _, want := range []string{"candidate_files=1", "limit=0"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("git file cap error missing %q in: %v", want, err)
+		}
+	}
+}
+
+func TestGitCommittedIndexBudget_IndexedByteCap(t *testing.T) {
+	requireGit(t)
+
+	dir := initGitRepo(t, "app.go", "package main\n// committed_byte_budget_marker\n")
+	budget, err := scanGitCommittedIndexBudget(context.Background(), dir, maxGitCandidateFiles, 0)
+	if !errors.Is(err, errGitCapExceeded) {
+		t.Fatalf("expected git cap error, got budget=%+v err=%v", budget, err)
+	}
+	if !strings.Contains(err.Error(), "indexed_bytes=") || !strings.Contains(err.Error(), "limit=0") {
+		t.Fatalf("git byte cap error should include measured value and limit, got: %v", err)
+	}
+}
+
+func TestGitCommittedIndexBudget_SkipsOversizeBlobsForByteCap(t *testing.T) {
+	requireGit(t)
+
+	dir := initEmptyGitRepo(t)
+	large := filepath.Join(dir, "large.bin")
+	if err := os.WriteFile(large, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(large, maxIndexedDocumentBytes+1); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, dir, "add", "large.bin")
+	gitRun(t, dir, "commit", "-m", "add large")
+
+	budget, err := scanGitCommittedIndexBudget(context.Background(), dir, maxGitCandidateFiles, 0)
+	if err != nil {
+		t.Fatalf("oversize blob should not consume indexed byte budget, got budget=%+v err=%v", budget, err)
+	}
+	if budget.candidates != 1 {
+		t.Fatalf("expected one candidate blob, got %+v", budget)
+	}
+	if budget.indexedBytes != 0 {
+		t.Fatalf("oversize blob should not count as indexed bytes, got %+v", budget)
+	}
+}
+
+func TestGitDirtyFileBudget_IncludesCorpusContextAndCaps(t *testing.T) {
+	dir := t.TempDir()
+	indexDir := filepath.Join(t.TempDir(), "index")
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := checkGitDirtyFileBudgetWithLimits(dir, indexDir, []string{"a.go"}, maxGitCandidateFiles, 0)
+	if !errors.Is(err, errGitCapExceeded) {
+		t.Fatalf("expected git cap error, got: %v", err)
+	}
+	for _, want := range []string{
+		"git corpus root=" + strconv.Quote(dir),
+		"index=" + strconv.Quote(indexDir),
+		"indexed_bytes=",
+		"limit=0",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("git dirty cap error missing %q in: %v", want, err)
+		}
+	}
+}
+
+func TestGitDirtyFileBudget_SkipsOversizeFilesForByteCap(t *testing.T) {
+	dir := t.TempDir()
+	large := filepath.Join(dir, "large.bin")
+	if err := os.WriteFile(large, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(large, maxGitDirtyFileSize+1); err != nil {
+		t.Fatal(err)
+	}
+
+	err := checkGitDirtyFileBudgetWithLimits(
+		dir,
+		filepath.Join(t.TempDir(), "index"),
+		[]string{"large.bin"},
+		maxGitCandidateFiles,
+		0,
+	)
+	if err != nil {
+		t.Fatalf("oversize dirty file should not consume indexed byte budget: %v", err)
 	}
 }
 
@@ -776,9 +905,9 @@ func TestShardsExist_MixedFiles(t *testing.T) {
 	}
 }
 
-// --- readUncommittedFiles concurrency and edge tests ---
+// --- collectStreamFilesForTest concurrency and edge tests ---
 
-func TestReadUncommittedFiles_HighParallelism(t *testing.T) {
+func TestStreamFiles_HighParallelism(t *testing.T) {
 	dir := t.TempDir()
 	const n = 100
 	files := make([]string, n)
@@ -788,13 +917,13 @@ func TestReadUncommittedFiles_HighParallelism(t *testing.T) {
 		_ = os.WriteFile(filepath.Join(dir, name), []byte(fmt.Sprintf("package f%d", i)), 0o644)
 	}
 
-	results := readUncommittedFiles(dir, files, 16)
+	results := collectStreamFilesForTest(dir, files, 16)
 	if len(results) != n {
 		t.Errorf("expected %d results with high parallelism, got %d", n, len(results))
 	}
 }
 
-func TestReadUncommittedFiles_PermissionDenied(t *testing.T) {
+func TestStreamFiles_PermissionDenied(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("test requires non-root user")
 	}
@@ -805,7 +934,7 @@ func TestReadUncommittedFiles_PermissionDenied(t *testing.T) {
 
 	_ = os.WriteFile(filepath.Join(dir, "ok.go"), []byte("ok"), 0o644)
 
-	results := readUncommittedFiles(dir, []string{"secret.go", "ok.go"}, 2)
+	results := collectStreamFilesForTest(dir, []string{"secret.go", "ok.go"}, 2)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result (permission denied skipped), got %d", len(results))
 	}
@@ -814,13 +943,13 @@ func TestReadUncommittedFiles_PermissionDenied(t *testing.T) {
 	}
 }
 
-func TestReadUncommittedFiles_BinaryContent(t *testing.T) {
+func TestStreamFiles_BinaryContent(t *testing.T) {
 	dir := t.TempDir()
 	// File with null bytes and binary content
 	binary := []byte{0x00, 0x01, 0xFF, 0xFE, 'h', 'e', 'l', 'l', 'o', 0x00}
 	_ = os.WriteFile(filepath.Join(dir, "bin.dat"), binary, 0o644)
 
-	results := readUncommittedFiles(dir, []string{"bin.dat"}, 1)
+	results := collectStreamFilesForTest(dir, []string{"bin.dat"}, 1)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -835,13 +964,13 @@ func TestReadUncommittedFiles_BinaryContent(t *testing.T) {
 	}
 }
 
-func TestReadUncommittedFiles_DuplicateNames(t *testing.T) {
+func TestStreamFiles_DuplicateNames(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "dup.go"), []byte("content"), 0o644)
 
 	// Same file passed twice
-	results := readUncommittedFiles(dir, []string{"dup.go", "dup.go"}, 2)
-	// readUncommittedFiles doesn't deduplicate — both are read.
+	results := collectStreamFilesForTest(dir, []string{"dup.go", "dup.go"}, 2)
+	// collectStreamFilesForTest doesn't deduplicate — both are read.
 	// This is fine because deduplication happens at the formatter level.
 	if len(results) != 2 {
 		t.Errorf("expected 2 results (no dedup at read level), got %d", len(results))
@@ -851,7 +980,7 @@ func TestReadUncommittedFiles_DuplicateNames(t *testing.T) {
 // ---------------------------------------------------------------------------
 // State caching scenarios — tests for post-indexing verification logic
 //
-// The decision matrix in runIndexing (post-indexing verification) determines
+// The decision matrix in runIndexingWithCache (post-indexing verification) determines
 // whether the state file is cached after indexing. These tests verify all branches.
 // ---------------------------------------------------------------------------
 
@@ -869,37 +998,33 @@ func TestStateCaching_BothSucceed_StateStable(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	indexDir := filepath.Join(dir, cacheDir)
-	if err := os.MkdirAll(indexDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	paths, plan := planGitTestCorpus(t, dir)
 
 	state := gitRepoStateIn(ctx, dir)
-	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+	stateHash := gitCorpusStateHash(paths, state)
 
-	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
 	// State file should exist — index is cached
-	cached := readStateFile(indexDir)
+	cached := readStateFile(plan.cacheDir)
 	if cached == "" {
 		t.Fatal("expected state file to be written after successful indexing")
 	}
 
 	// Second run should be a no-op (state matches)
 	state2 := gitRepoStateIn(ctx, dir)
-	stateHash2 := computeStateHash(repoStateFingerprint(dir, state2))
+	stateHash2 := gitCorpusStateHash(paths, state2)
 	if stateHash2 != cached {
-		t.Log("state changed between runs — cannot verify caching (non-deterministic)")
-		return
+		t.Fatalf("state changed between stable runs: cached=%q current=%q", cached, stateHash2)
 	}
-	// runIndexing should short-circuit at the state check in run()
+	// runIndexingWithCache should short-circuit at the state check.
 	// We verify by checking the state file is unchanged
-	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state2, stateHash2); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state2, stateHash2); err != nil {
 		t.Fatalf("second indexing failed: %v", err)
 	}
-	cached2 := readStateFile(indexDir)
+	cached2 := readStateFile(plan.cacheDir)
 	if cached2 != cached {
 		t.Errorf("state file changed after no-op indexing: %q -> %q", cached, cached2)
 	}
@@ -919,14 +1044,11 @@ func TestStateCaching_BothSucceed_DirtyFileDrifted(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	indexDir := filepath.Join(dir, cacheDir)
-	if err := os.MkdirAll(indexDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	paths, plan := planGitTestCorpus(t, dir)
 
 	// Capture pre-state (app.go is dirty → in state.Files)
 	state := gitRepoStateIn(ctx, dir)
-	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+	stateHash := gitCorpusStateHash(paths, state)
 	if len(state.Files) == 0 {
 		t.Fatal("precondition: app.go should be in state.Files")
 	}
@@ -938,59 +1060,72 @@ func TestStateCaching_BothSucceed_DirtyFileDrifted(t *testing.T) {
 
 	// Run indexing with the pre-mutation state.
 	// Post-verification re-stats state.Files and detects the drift.
-	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
 	// State file should NOT be written (drift detected via re-stat)
-	cached := readStateFile(indexDir)
+	cached := readStateFile(plan.cacheDir)
 	if cached != "" {
 		t.Errorf("expected no state file after dirty-file drift, got %q", cached)
+	}
+
+	files, err := runSeekInPlannedGitCorpus(ctx, "second_edit_during_indexing", paths, plan)
+	if err != nil {
+		t.Fatalf("next search after dirty-file drift failed: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("next search should find the final dirty content")
+	}
+	staleFiles, err := runSeekInPlannedGitCorpus(ctx, "first_edit", paths, plan)
+	if err != nil {
+		t.Fatalf("stale dirty marker search failed: %v", err)
+	}
+	if len(staleFiles) != 0 {
+		t.Fatalf("stale dirty content should not remain searchable, got %d results", len(staleFiles))
 	}
 }
 
 // TestStateCaching_BothSucceed_CleanFileBecomesDirty verifies that when
 // a previously clean file becomes dirty during indexing (new mutation not
-// in state.Files), the state file IS written. The next search's
-// gitRepoState() detects the new dirty file and triggers re-indexing.
+// in state.Files), the state file can be written for the stale state, and the
+// next search still refreshes through the normal freshness path.
 func TestStateCaching_BothSucceed_CleanFileBecomesDirty(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// original\n")
 
 	ctx := context.Background()
-	indexDir := filepath.Join(dir, cacheDir)
-	if err := os.MkdirAll(indexDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	paths, plan := planGitTestCorpus(t, dir)
 
 	// Capture pre-state (clean repo, state.Files is empty)
 	state := gitRepoStateIn(ctx, dir)
-	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+	stateHash := gitCorpusStateHash(paths, state)
 
 	// Mutate a file not in state.Files (simulates user editing during indexing)
 	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// mutated\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	deleteStateFiles(indexDir)
-	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
+	deleteStateFiles(plan.cacheDir)
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
 	// State file IS written (mutation not visible to re-stat of empty file list).
-	// This is intentional: the next search's gitRepoState() will detect the
+	// This is intentional: the next search's git status call will detect the
 	// dirty file, produce a different hash, and trigger re-indexing.
-	cached := readStateFile(indexDir)
+	cached := readStateFile(plan.cacheDir)
 	if cached == "" {
 		t.Fatal("expected state file to be written (clean→dirty not detected by restat)")
 	}
 
-	// Verify the next search would detect the mismatch
-	newState := gitRepoStateIn(ctx, dir)
-	newHash := computeStateHash(repoStateFingerprint(dir, newState))
-	if newHash == cached {
-		t.Error("next search should see a different state hash, but got the same")
+	files, err := runSeekInPlannedGitCorpus(ctx, "mutated", paths, plan)
+	if err != nil {
+		t.Fatalf("next search after clean-to-dirty edit failed: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("next search should find the mutated content")
 	}
 }
 
@@ -1002,16 +1137,15 @@ func TestStateCaching_DirtyFileDeleted(t *testing.T) {
 	dir := initGitRepo(t, "app.go", "package main\n// original\n")
 
 	// Create a dirty file
-	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// dirty\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// dirty_deleted_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	ctx := context.Background()
-	indexDir := filepath.Join(dir, cacheDir)
-	_ = os.MkdirAll(indexDir, 0o755)
+	paths, plan := planGitTestCorpus(t, dir)
 
 	state := gitRepoStateIn(ctx, dir)
-	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+	stateHash := gitCorpusStateHash(paths, state)
 	if len(state.Files) == 0 {
 		t.Fatal("precondition: app.go should be dirty")
 	}
@@ -1021,14 +1155,22 @@ func TestStateCaching_DirtyFileDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
-	// Drift should be detected (file deleted → sentinel in fingerprint)
-	cached := readStateFile(indexDir)
+	// Drift should be detected when the previously dirty file disappears.
+	cached := readStateFile(plan.cacheDir)
 	if cached != "" {
 		t.Errorf("expected no state file after file deletion during indexing, got %q", cached)
+	}
+
+	files, err := runSeekInPlannedGitCorpus(ctx, "dirty_deleted_marker", paths, plan)
+	if err != nil {
+		t.Fatalf("next search after dirty-file deletion failed: %v", err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("deleted dirty content should not be searchable, got %d results", len(files))
 	}
 }
 
@@ -1045,11 +1187,10 @@ func TestStateCaching_DirtyFileAtomicReplace(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	indexDir := filepath.Join(dir, cacheDir)
-	_ = os.MkdirAll(indexDir, 0o755)
+	paths, plan := planGitTestCorpus(t, dir)
 
 	state := gitRepoStateIn(ctx, dir)
-	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+	stateHash := gitCorpusStateHash(paths, state)
 
 	// Simulate atomic-write editor: write to tmp, rename over original.
 	// This changes the inode even if mtime/size happen to match.
@@ -1061,14 +1202,22 @@ func TestStateCaching_DirtyFileAtomicReplace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
 	// Drift should be detected (inode changed via rename)
-	cached := readStateFile(indexDir)
+	cached := readStateFile(plan.cacheDir)
 	if cached != "" {
 		t.Errorf("expected no state file after atomic replace, got %q", cached)
+	}
+
+	files, err := runSeekInPlannedGitCorpus(ctx, "atomic_replaced", paths, plan)
+	if err != nil {
+		t.Fatalf("next search after atomic replace failed: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("next search should find the atomically replaced content")
 	}
 }
 
@@ -1084,18 +1233,17 @@ func TestStateCaching_UntouchedDirtyFile(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	indexDir := filepath.Join(dir, cacheDir)
-	_ = os.MkdirAll(indexDir, 0o755)
+	paths, plan := planGitTestCorpus(t, dir)
 
 	state := gitRepoStateIn(ctx, dir)
-	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+	stateHash := gitCorpusStateHash(paths, state)
 
 	// Do NOT modify the file — indexing should detect no drift
-	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
-	cached := readStateFile(indexDir)
+	cached := readStateFile(plan.cacheDir)
 	if cached == "" {
 		t.Fatal("expected state file to be written when dirty file is untouched during indexing")
 	}
@@ -1106,7 +1254,7 @@ func TestStateCaching_UntouchedDirtyFile(t *testing.T) {
 
 // TestStateCaching_HeadChangeDuringIndexing verifies that a HEAD change
 // during indexing (e.g. git commit) is not detected by restat but IS
-// caught by the next search's gitRepoState.
+// caught by the next search's git status call.
 func TestStateCaching_HeadChangeDuringIndexing(t *testing.T) {
 	requireTools(t)
 
@@ -1118,32 +1266,38 @@ func TestStateCaching_HeadChangeDuringIndexing(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	indexDir := filepath.Join(dir, cacheDir)
-	_ = os.MkdirAll(indexDir, 0o755)
+	paths, plan := planGitTestCorpus(t, dir)
 
 	// Capture pre-state (HEAD = commit1, app.go dirty)
 	state := gitRepoStateIn(ctx, dir)
-	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+	stateHash := gitCorpusStateHash(paths, state)
 
 	// Simulate HEAD change: commit the dirty file
 	gitRunIn(t, dir, "add", "app.go")
 	gitRunIn(t, dir, "commit", "-m", "commit during indexing")
 
-	// Run indexing with old state
-	deleteStateFiles(indexDir)
-	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
+	// Run indexing with the captured stale state.
+	deleteStateFiles(plan.cacheDir)
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
 	// Restat doesn't detect HEAD change — state file IS written.
 	// (app.go content on disk is unchanged, only git's view changed.)
-	cached := readStateFile(indexDir)
+	cached := readStateFile(plan.cacheDir)
 
-	// The critical guarantee: next search MUST detect the mismatch.
-	newState := gitRepoStateIn(ctx, dir)
-	newHash := computeStateHash(repoStateFingerprint(dir, newState))
-	if newHash == cached {
-		t.Error("next search should see different state after HEAD change, but hashes match")
+	if cached == "" {
+		t.Fatal("expected state file to be written before next-search correction")
+	}
+	files, err := runSeekInPlannedGitCorpus(ctx, "v2_dirty", paths, plan)
+	if err != nil {
+		t.Fatalf("next search after HEAD change failed: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("next search should find the committed v2 content")
+	}
+	if updated := readStateFile(plan.cacheDir); updated == "" || updated == cached {
+		t.Fatalf("next search should refresh stale state, cached=%q updated=%q", cached, updated)
 	}
 }
 
@@ -1156,31 +1310,34 @@ func TestStateCaching_NewUntrackedFileDuringIndexing(t *testing.T) {
 	dir := initGitRepo(t, "app.go", "package main\n// original\n")
 
 	ctx := context.Background()
-	indexDir := filepath.Join(dir, cacheDir)
-	_ = os.MkdirAll(indexDir, 0o755)
+	paths, plan := planGitTestCorpus(t, dir)
 
 	// Capture pre-state (clean repo)
 	state := gitRepoStateIn(ctx, dir)
-	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+	stateHash := gitCorpusStateHash(paths, state)
 
 	// Simulate: new file appears during indexing
 	if err := os.WriteFile(filepath.Join(dir, "new_file.go"), []byte("package main\n// brand_new\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	deleteStateFiles(indexDir)
-	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
+	deleteStateFiles(plan.cacheDir)
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
 	// Restat doesn't detect new file (not in state.Files) — state IS written
-	cached := readStateFile(indexDir)
+	cached := readStateFile(plan.cacheDir)
 
-	// The critical guarantee: next search detects the new file
-	newState := gitRepoStateIn(ctx, dir)
-	newHash := computeStateHash(repoStateFingerprint(dir, newState))
-	if newHash == cached {
-		t.Error("next search should see different state after new file, but hashes match")
+	if cached == "" {
+		t.Fatal("expected state file to be written before next-search correction")
+	}
+	files, err := runSeekInPlannedGitCorpus(ctx, "brand_new", paths, plan)
+	if err != nil {
+		t.Fatalf("next search after new untracked file failed: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("next search should find the new untracked file")
 	}
 }
 
@@ -1192,18 +1349,15 @@ func TestStateCaching_CommittedFails(t *testing.T) {
 	dir := initGitRepo(t, "app.go", "package main\n// content\n")
 
 	ctx := context.Background()
-	indexDir := filepath.Join(dir, cacheDir)
-	if err := os.MkdirAll(indexDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	paths, plan := planGitTestCorpus(t, dir)
 
 	// Pre-populate a state file to verify it gets deleted
-	if err := writeStateFile(indexDir, "fake_old_state"); err != nil {
+	if err := writeStateFile(plan.cacheDir, "fake_stale_state"); err != nil {
 		t.Fatal(err)
 	}
 
 	state := gitRepoStateIn(ctx, dir)
-	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+	stateHash := gitCorpusStateHash(paths, state)
 
 	// Remove the .git directory to make committed indexing fail
 	// (gitindex.IndexGitRepo needs a valid git repo)
@@ -1211,14 +1365,14 @@ func TestStateCaching_CommittedFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// runIndexing will fail at ctags check or committed indexing.
+	// runIndexingWithCache will fail at ctags check or committed indexing.
 	// The error itself is expected — we only verify state file behavior.
-	err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash)
+	err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash)
 
-	// State file must not retain the old value after a failed indexing run
-	cached := readStateFile(indexDir)
-	if cached == "fake_old_state" {
-		t.Errorf("state file was NOT deleted after committed indexing failure (runIndexing err=%v)", err)
+	// State file must not retain the stale value after a failed indexing run.
+	cached := readStateFile(plan.cacheDir)
+	if cached == "fake_stale_state" {
+		t.Errorf("state file was NOT deleted after committed indexing failure (runIndexingWithCache err=%v)", err)
 	}
 }
 
@@ -1236,30 +1390,27 @@ func TestStateCaching_WithUncommittedFiles_BothSucceed(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	indexDir := filepath.Join(dir, cacheDir)
-	if err := os.MkdirAll(indexDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	paths, plan := planGitTestCorpus(t, dir)
 
 	state := gitRepoStateIn(ctx, dir)
-	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+	stateHash := gitCorpusStateHash(paths, state)
 
 	if len(state.Files) == 0 {
 		t.Fatal("precondition: state should have uncommitted files")
 	}
 
-	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
 	// Both steps succeeded — state file should be cached
-	cached := readStateFile(indexDir)
+	cached := readStateFile(plan.cacheDir)
 	if cached == "" {
 		t.Fatal("expected state file to be written when both indexing steps succeed")
 	}
 
 	// Uncommitted content should be searchable
-	results, err := executeSearch(ctx, indexDir, "uncommitted")
+	results, err := executeUnscopedShardSearchForTest(ctx, plan.indexDir, "uncommitted")
 	if err != nil {
 		t.Fatalf("search failed: %v", err)
 	}
@@ -1276,31 +1427,29 @@ func TestStateCaching_NoUncommittedFiles(t *testing.T) {
 	dir := initGitRepo(t, "app.go", "package main\n// clean_repo\n")
 
 	ctx := context.Background()
-	indexDir := filepath.Join(dir, cacheDir)
-	if err := os.MkdirAll(indexDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	paths, plan := planGitTestCorpus(t, dir)
 
 	state := gitRepoStateIn(ctx, dir)
-	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+	stateHash := gitCorpusStateHash(paths, state)
 
 	if len(state.Files) != 0 {
 		t.Fatalf("precondition: clean repo should have no uncommitted files, got %v", state.Files)
 	}
 
-	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
-	cached := readStateFile(indexDir)
+	cached := readStateFile(plan.cacheDir)
 	if cached == "" {
-		t.Log("state not cached (possible drift during indexing)")
-	} else {
-		t.Logf("state cached correctly for clean repo: %q", cached)
+		t.Fatal("expected clean committed-only indexing to cache state")
+	}
+	if cached != stateHash {
+		t.Fatalf("cached state mismatch: got %q, want %q", cached, stateHash)
 	}
 
 	// Verify search works
-	results, err := executeSearch(ctx, indexDir, "clean_repo")
+	results, err := executeUnscopedShardSearchForTest(ctx, plan.indexDir, "clean_repo")
 	if err != nil {
 		t.Fatalf("search failed: %v", err)
 	}
@@ -1318,32 +1467,29 @@ func TestStateCaching_DoubleCheck_SkipsRedundantIndex(t *testing.T) {
 	dir := initGitRepo(t, "app.go", "package main\n// content\n")
 
 	ctx := context.Background()
-	indexDir := filepath.Join(dir, cacheDir)
-	if err := os.MkdirAll(indexDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	paths, plan := planGitTestCorpus(t, dir)
 
 	state := gitRepoStateIn(ctx, dir)
-	stateHash := computeStateHash(repoStateFingerprint(dir, state))
+	stateHash := gitCorpusStateHash(paths, state)
 
 	// First index
-	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("first indexing failed: %v", err)
 	}
 
 	// Pre-populate state file with the SAME hash we're about to pass
 	// This simulates another process having just indexed
-	if err := writeStateFile(indexDir, stateHash); err != nil {
+	if err := writeStateFile(plan.cacheDir, stateHash); err != nil {
 		t.Fatal(err)
 	}
 
 	// Second index with same state should be a no-op (double-check hit)
-	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("second indexing failed: %v", err)
 	}
 
 	// State file should still contain the same hash
-	cached := readStateFile(indexDir)
+	cached := readStateFile(plan.cacheDir)
 	if cached != stateHash {
 		t.Errorf("state file changed after double-check skip: %q -> %q", stateHash, cached)
 	}
@@ -1354,47 +1500,62 @@ func TestStateCaching_DoubleCheck_SkipsRedundantIndex(t *testing.T) {
 func TestStateCaching_StaleFallback_DoesNotWriteState(t *testing.T) {
 	requireTools(t)
 
-	dir := initGitRepo(t, "app.go", "package main\n// content\n")
+	dir := initGitRepo(t, "app.go", "package main\n// stale_fallback_old\n")
 
 	ctx := context.Background()
-	indexDir := filepath.Join(dir, cacheDir)
-	if err := os.MkdirAll(indexDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	paths, plan := planGitTestCorpus(t, dir)
 
 	// First index to create shards
 	state := gitRepoStateIn(ctx, dir)
-	stateHash := computeStateHash(repoStateFingerprint(dir, state))
-	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
+	stateHash := gitCorpusStateHash(paths, state)
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("initial indexing failed: %v", err)
 	}
 
 	// Delete the state file to force re-indexing attempt
-	deleteStateFiles(indexDir)
+	deleteStateFiles(plan.cacheDir)
 
 	// Hold the lock to trigger stale fallback
-	lockPath := filepath.Join(indexDir, lockFile)
+	lockPath := filepath.Join(plan.cacheDir, lockFile)
 	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		unlockFile(holder)
-		_ = holder.Close()
+		if holder != nil {
+			unlockFile(holder)
+			_ = holder.Close()
+		}
 	})
 	if err := lockFileExclusive(holder); err != nil {
 		t.Fatal(err)
 	}
 
-	// runIndexing should fall back (shards exist, lock held)
-	if err := runIndexing(ctx, fallbackGitPaths(dir), indexDir, state, stateHash); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// stale_fallback_new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// runIndexingWithCache should fall back (shards exist, lock held)
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("stale fallback should not error: %v", err)
 	}
 
 	// State file should NOT be written by the stale fallback path
-	cached := readStateFile(indexDir)
+	cached := readStateFile(plan.cacheDir)
 	if cached != "" {
 		t.Errorf("state file should not be written during stale fallback, got %q", cached)
+	}
+
+	unlockFile(holder)
+	_ = holder.Close()
+	holder = nil
+
+	files, err := runSeekInPlannedGitCorpus(ctx, "stale_fallback_new", paths, plan)
+	if err != nil {
+		t.Fatalf("next search after stale fallback failed: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("next search should find content written during stale fallback")
 	}
 }
 
@@ -1461,9 +1622,7 @@ func TestRepoStateFingerprint_StableWhenUnchanged(t *testing.T) {
 	}
 }
 
-// TestRepoStateFingerprint_InodeInOutput verifies that the fingerprint format
-// includes 4 NUL-separated fields per file: name, mtime, size, inode.
-func TestRepoStateFingerprint_InodeInOutput(t *testing.T) {
+func TestRepoStateFingerprint_ExistingFileAffectsFingerprint(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "f.go"), []byte("x"), 0o644)
 
@@ -1473,63 +1632,36 @@ func TestRepoStateFingerprint_InodeInOutput(t *testing.T) {
 	}
 	fp := repoStateFingerprint(dir, state)
 
-	// Expected format: "raw\x00f.go\x00<mtime>\x00<size>\x00<inode>\x00"
-	// Count NUL separators in the appended part (after "raw")
-	appended := fp[len("raw"):]
-	nuls := strings.Count(appended, "\x00")
-	// With format "\x00name\x00mtime\x00size\x00inode\x00" → 5 NULs per file
-	if nuls != 5 {
-		t.Errorf("expected 5 NUL separators per file (name+mtime+size+inode), got %d in %q", nuls, appended)
+	if fp == state.RawOutput {
+		t.Fatal("expected existing file metadata to contribute to fingerprint")
+	}
+	if computeStateHash(fp) == computeStateHash(state.RawOutput) {
+		t.Fatal("expected existing file metadata to affect the state hash")
 	}
 }
 
-// TestRepoStateFingerprint_DeletedFileNoInode verifies that the deleted-file
-// sentinel does NOT include an inode field (it can't — the file doesn't exist).
-func TestRepoStateFingerprint_DeletedFileNoInode(t *testing.T) {
+func TestRepoStateFingerprint_DeletedAndExistingFileDiffer(t *testing.T) {
 	dir := t.TempDir()
 	state := repoState{
 		RawOutput: "raw",
 		Files:     []string{"gone.go"},
 	}
-	fp := repoStateFingerprint(dir, state)
+	deletedFingerprint := repoStateFingerprint(dir, state)
 
-	expected := "raw\x00gone.go\x00deleted\x00"
-	if fp != expected {
-		t.Errorf("deleted file fingerprint:\n  got:  %q\n  want: %q", fp, expected)
+	if deletedFingerprint == state.RawOutput {
+		t.Fatal("expected deleted file to contribute to fingerprint")
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "gone.go"), []byte("now exists\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	existingFingerprint := repoStateFingerprint(dir, state)
+	if existingFingerprint == deletedFingerprint {
+		t.Fatal("expected deleted and existing file states to fingerprint differently")
 	}
 }
 
-// TestRepoStateFingerprint_InodeChangesHash verifies that different inodes
-// produce different state hashes through the full computeStateHash pipeline.
-func TestRepoStateFingerprint_InodeChangesHash(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "f.go")
-	content := []byte("package f\n")
-	_ = os.WriteFile(path, content, 0o644)
-
-	state := repoState{
-		RawOutput: "# branch.oid abc\x00",
-		Files:     []string{"f.go"},
-	}
-
-	h1 := computeStateHash(repoStateFingerprint(dir, state))
-
-	// Recreate the file (new inode, potentially different mtime)
-	_ = os.Remove(path)
-	_ = os.WriteFile(path, content, 0o644)
-
-	h2 := computeStateHash(repoStateFingerprint(dir, state))
-
-	// Hash should differ because at minimum the inode changed.
-	// (mtime also likely changed, but the inode alone would suffice.)
-	if h1 == h2 {
-		t.Log("hashes matched — inode may have been recycled or mtime+inode both matched (extremely unlikely)")
-	}
-}
-
-// TestRepoStateFingerprint_ManyFilesWithInode verifies the fingerprint works
-// correctly with many files, ensuring the inode field doesn't cause format errors.
-func TestRepoStateFingerprint_ManyFilesWithInode(t *testing.T) {
+func TestRepoStateFingerprint_ManyFilesDeterministicAndSensitive(t *testing.T) {
 	dir := t.TempDir()
 	const n = 100
 	files := make([]string, n)
@@ -1545,24 +1677,22 @@ func TestRepoStateFingerprint_ManyFilesWithInode(t *testing.T) {
 	}
 
 	fp := repoStateFingerprint(dir, state)
-
-	// Verify fingerprint is deterministic
 	fp2 := repoStateFingerprint(dir, state)
 	if fp != fp2 {
 		t.Error("fingerprint not deterministic with 100 files")
 	}
 
-	// Verify each file contributes 5 NULs (leading NUL + name + mtime + size + inode)
-	appended := fp[len(state.RawOutput):]
-	nuls := strings.Count(appended, "\x00")
-	if nuls != n*5 {
-		t.Errorf("expected %d NULs for %d files, got %d", n*5, n, nuls)
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(dir, files[n/2]), []byte("changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	changed := repoStateFingerprint(dir, state)
+	if changed == fp {
+		t.Fatal("expected changing one file among many to change the fingerprint")
 	}
 }
 
-// TestRepoStateFingerprint_MixedDeletedAndExisting verifies that a mix of
-// existing and deleted files produces a valid fingerprint with correct formats.
-func TestRepoStateFingerprint_MixedDeletedAndExisting(t *testing.T) {
+func TestRepoStateFingerprint_MixedDeletedAndExistingIsSensitive(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "exists.go"), []byte("x"), 0o644)
 	// "gone.go" does not exist
@@ -1573,17 +1703,26 @@ func TestRepoStateFingerprint_MixedDeletedAndExisting(t *testing.T) {
 	}
 	fp := repoStateFingerprint(dir, state)
 
-	if !strings.Contains(fp, "\x00gone.go\x00deleted\x00") {
-		t.Error("expected deleted sentinel for gone.go")
-	}
-	if !strings.Contains(fp, "\x00exists.go\x00") {
-		t.Error("expected exists.go in fingerprint")
-	}
-
-	// Hash through the full pipeline — must not panic
 	h := computeStateHash(fp)
 	if len(h) != 16 {
 		t.Errorf("expected 16-char hash, got %d", len(h))
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "gone.go"), []byte("restored\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withRestoredFile := repoStateFingerprint(dir, state)
+	if withRestoredFile == fp {
+		t.Fatal("expected restoring a deleted file to change the fingerprint")
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(dir, "exists.go"), []byte("changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withChangedExistingFile := repoStateFingerprint(dir, state)
+	if withChangedExistingFile == withRestoredFile {
+		t.Fatal("expected changing an existing file to change the fingerprint")
 	}
 }
 
@@ -1635,7 +1774,7 @@ func TestRepoStateFingerprint_SameSizeDifferentContent(t *testing.T) {
 
 // TestRepoStateFingerprint_SymlinkSkippedByLstat verifies that Lstat is used
 // (not Stat), so symlinks are reported as symlinks, not as their targets.
-// This matters because readUncommittedFiles skips symlinks.
+// This matters because collectStreamFilesForTest skips symlinks.
 func TestRepoStateFingerprint_SymlinkInFingerprint(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target.go")
@@ -1675,14 +1814,10 @@ func TestRepoStateFingerprint_EmptyFileName(t *testing.T) {
 		RawOutput: "raw",
 		Files:     []string{""},
 	}
-	// Empty path resolves to the directory itself via filepath.Join(dir, ""),
-	// so Lstat succeeds and produces a normal entry (not a deleted sentinel).
-	// This is fine — git status never produces empty filenames.
 	fp := repoStateFingerprint(dir, state)
-	if !strings.HasPrefix(fp, "raw\x00") {
-		t.Errorf("expected fingerprint to start with RawOutput, got %q", fp)
+	if fp == "" {
+		t.Fatal("expected non-empty fingerprint")
 	}
-	// Must not panic and must produce a valid hash
 	h := computeStateHash(fp)
 	if len(h) != 16 {
 		t.Errorf("expected 16-char hash, got %d", len(h))
@@ -1709,13 +1844,10 @@ func TestRepoStateFingerprint_FileOrderMatters(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// computeStateHash — WriteString equivalence tests
+// computeStateHash representative-input tests
 // ---------------------------------------------------------------------------
 
-// TestComputeStateHash_WriteStringEquivalence verifies that the WriteString
-// optimization produces the same hash as the original Write([]byte()) would.
-// This is a regression test for the refactor.
-func TestComputeStateHash_WriteStringEquivalence(t *testing.T) {
+func TestComputeStateHash_RepresentativeInputs(t *testing.T) {
 	inputs := []string{
 		"",
 		"short",
@@ -1843,6 +1975,20 @@ func TestStreamFiles_BasicFlow(t *testing.T) {
 	}
 }
 
+func TestStreamFiles_OutputChannelUnbuffered(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ch := streamFiles(dir, []string{"a.go"}, 4)
+	if cap(ch) != 0 {
+		t.Fatalf("streamFiles output must be unbuffered, got cap=%d", cap(ch))
+	}
+	for range ch {
+	}
+}
+
 func TestStreamFiles_EmptyFileList(t *testing.T) {
 	dir := t.TempDir()
 
@@ -1871,7 +2017,7 @@ func TestStreamFiles_AllFiltered(t *testing.T) {
 	dir := t.TempDir()
 	// All files are too large — should all be filtered
 	name := "big.dat"
-	data := make([]byte, maxUncommittedFileSize+1)
+	data := make([]byte, maxGitDirtyFileSize+1)
 	if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1910,8 +2056,8 @@ func TestStreamFiles_ParallelismOne(t *testing.T) {
 
 func TestStreamFiles_SingleFileExactlyMaxSize(t *testing.T) {
 	dir := t.TempDir()
-	// File exactly at maxUncommittedFileSize — should be included
-	data := make([]byte, maxUncommittedFileSize)
+	// File exactly at maxGitDirtyFileSize — should be included
+	data := make([]byte, maxGitDirtyFileSize)
 	for i := range data {
 		data[i] = 'x'
 	}
@@ -1923,8 +2069,8 @@ func TestStreamFiles_SingleFileExactlyMaxSize(t *testing.T) {
 	count := 0
 	for fc := range ch {
 		count++
-		if len(fc.content) != maxUncommittedFileSize {
-			t.Errorf("expected content of size %d, got %d", maxUncommittedFileSize, len(fc.content))
+		if len(fc.content) != maxGitDirtyFileSize {
+			t.Errorf("expected content of size %d, got %d", maxGitDirtyFileSize, len(fc.content))
 		}
 	}
 	if count != 1 {
@@ -1978,6 +2124,28 @@ func TestStreamFiles_HighParallelismFewFiles(t *testing.T) {
 	}
 }
 
+func TestFileReadWorkerCount(t *testing.T) {
+	tests := []struct {
+		name        string
+		parallelism int
+		items       int
+		want        int
+	}{
+		{"empty", 4, 0, 0},
+		{"zero_parallelism", 0, 3, 1},
+		{"negative_parallelism", -1, 3, 1},
+		{"more_workers_than_items", 16, 2, 2},
+		{"more_items_than_workers", 4, 10, 4},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := fileReadWorkerCount(tt.parallelism, tt.items); got != tt.want {
+				t.Fatalf("fileReadWorkerCount(%d, %d)=%d, want %d", tt.parallelism, tt.items, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestStreamingMemoryBounded(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping memory stress test in short mode")
@@ -1996,9 +2164,6 @@ func TestStreamingMemoryBounded(t *testing.T) {
 		}
 	}
 
-	// With parallelism=4, at most 2*parallelism files can be in flight
-	// (channel buffer + blocked workers) = 8 × 5MB = 40MB. The old
-	// buffered approach would hold all 250MB at once.
 	tracker := newPeakHeapTracker()
 	for range streamFiles(dir, files, parallelism) {
 	}
@@ -2049,8 +2214,8 @@ func TestStreamingMemoryDoesNotScaleWithInput(t *testing.T) {
 	t.Logf("%d files (%dMB total): peak delta %d MB", smallCount, smallCount*fileSize/(1024*1024), small/(1024*1024))
 	t.Logf("%d files (%dMB total): peak delta %d MB", largeCount, largeCount*fileSize/(1024*1024), large/(1024*1024))
 
-	// 5x more input should NOT cause 5x more heap. With streaming, peak
-	// is bounded by 2*parallelism*fileSize regardless of file count.
+	// 5x more input should NOT cause 5x more heap; peak usage should remain
+	// bounded by streaming backpressure rather than total corpus size.
 	// Two conditions (whichever is stricter):
 	//   - scaling: large must stay under 3× small
 	//   - absolute: large must use at least 33% less than total input
@@ -2074,15 +2239,14 @@ func TestIndexUncommitted_EmptyChannel(t *testing.T) {
 	}
 }
 
-func TestIndexUncommitted_BuilderLazyCreation(t *testing.T) {
+func TestIndexUncommitted_WritesSearchableDocuments(t *testing.T) {
 	requireTools(t)
 
 	indexDir := t.TempDir()
 	repoDir := t.TempDir()
 
-	// Send one file through channel
 	ch := make(chan fileContent, 1)
-	ch <- fileContent{name: "test.go", content: []byte("package main\n")}
+	ch <- fileContent{name: "test.go", content: []byte("package main\n// uncommitted_index_marker\n")}
 	close(ch)
 
 	err := indexUncommitted(context.Background(), repoDir, indexDir, ch, 2)
@@ -2090,41 +2254,20 @@ func TestIndexUncommitted_BuilderLazyCreation(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Verify a shard was created
-	matches, _ := filepath.Glob(filepath.Join(indexDir, repoUncommitted+"_v*.zoekt"))
-	if len(matches) == 0 {
-		t.Error("expected shard to be created when files arrive")
+	results, err := executeUnscopedShardSearchForTest(context.Background(), indexDir, "uncommitted_index_marker")
+	if err != nil {
+		t.Fatalf("search failed: %v", err)
 	}
-}
-
-func TestIndexUncommitted_ChannelDrainedOnError(t *testing.T) {
-	requireTools(t)
-
-	// Use an invalid indexDir so NewBuilder succeeds but writing the shard
-	// fails. We verify the channel is fully consumed (no goroutine leak)
-	// regardless of the outcome.
-	indexDir := t.TempDir()
-	repoDir := t.TempDir()
-
-	ch := make(chan fileContent, 5)
-	for i := range 5 {
-		ch <- fileContent{
-			name:    fmt.Sprintf("f%d.go", i),
-			content: []byte(fmt.Sprintf("package f%d\n", i)),
-		}
+	if len(results) == 0 {
+		t.Fatal("expected indexed uncommitted document to be searchable")
 	}
-	close(ch)
-
-	// Should consume all 5 items from the channel without hanging,
-	// regardless of whether Add/Finish succeeds or fails.
-	_ = indexUncommitted(context.Background(), repoDir, indexDir, ch, 2)
 }
 
 // --- helpers ---
 
-// readUncommittedFiles collects all streamed file contents into a slice.
+// collectStreamFilesForTest collects all streamed file contents into a slice.
 // Test-only helper — production code uses streamFiles directly.
-func readUncommittedFiles(repoDir string, files []string, parallelism int) []fileContent {
+func collectStreamFilesForTest(repoDir string, files []string, parallelism int) []fileContent {
 	var results []fileContent
 	for fc := range streamFiles(repoDir, files, parallelism) {
 		results = append(results, fc)
