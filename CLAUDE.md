@@ -10,6 +10,11 @@ results with context, grouped by file, with symbol tags.
 Usage: `seek [flags] '<query>' [path...]`. Keep query filters in one
 single-quoted argument; tokens after the query are filesystem path operands.
 
+Path operands accept directories or exact files, can be inside or outside the
+current Git worktree, and can be combined in a single invocation (e.g. mix a
+repo subtree with an external notes folder). With no paths, seek searches the
+current Git worktree.
+
 ### Key filters (combine with spaces inside the quotes)
 
 - `sym:Name` — find definitions (functions, classes, methods) via ctags
@@ -26,6 +31,18 @@ seek 'sym:executeParsedSearchScoped'
 
 # Search only selected paths
 seek 'Search' ./cmd/seek
+
+# Multiple paths in one invocation
+seek 'func' ./cmd/seek/searcher.go ./cmd/seek/indexer.go
+
+# Search an exact file
+seek 'package' ./cmd/seek/searcher.go
+
+# Search a folder outside the Git worktree
+seek 'TODO' /tmp/notes
+
+# Mix in-repo and external paths (Git matches tag with [git: ...])
+seek 'sym:Index' ./cmd/seek /tmp/notes
 
 # Find indexing logic, excluding tests
 seek 'sym:Index file:index -file:test'
