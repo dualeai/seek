@@ -473,6 +473,14 @@ func canonicalCorpusPath(path string) string {
 	return filepath.Clean(path)
 }
 
+// corpusHashHexLen is the hex-encoded length of a corpus ID produced by
+// newCorpusID — sha256 truncated to corpusHashBytes bytes, then hex-encoded.
+// Used by the GC enumerator to filter unrelated entries in the corpora dir.
+const (
+	corpusHashBytes  = 16
+	corpusHashHexLen = corpusHashBytes * 2
+)
+
 func hashParts(parts ...string) string {
 	h := sha256.New()
 	for _, part := range parts {
@@ -480,7 +488,7 @@ func hashParts(parts ...string) string {
 		_, _ = h.Write([]byte{0})
 	}
 	sum := h.Sum(nil)
-	return hex.EncodeToString(sum[:16])
+	return hex.EncodeToString(sum[:corpusHashBytes])
 }
 
 func newCorpusID(parts ...string) corpusID {
