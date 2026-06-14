@@ -936,6 +936,20 @@ func appendFolderFingerprintBytes(h *xxhash.Digest, part []byte) {
 	_, _ = h.Write(part)
 }
 
+// streamFolderFiles returns a channel that yields file contents for
+// each folder candidate. The output channel is unbuffered. In-flight
+// memory is bounded by two limits, whichever is tighter:
+//   - the worker count (each worker holds at most one fileContent),
+//   - readSemaphore's maxInFlightBytes byte budget (see caps.go).
+//
+// Each yielded fileContent carries a weight (= candidate.size pre-read)
+// on the readSemaphore. The consumer MUST Release that weight after
+// builder.Finish() returns. Abandoning the channel without draining
+// would hang workers blocked on send until ctx cancellation.
+//
+// Synchronous folder-delta reads via readFolderFile DO NOT go through
+// this entry point and pass fileContent with weight=0; that is by
+// design (those reads are not bounded by readSemaphore today).
 func streamFolderFiles(ctx context.Context, candidates []folderCandidate, parallelism int) <-chan fileContent {
 	workers := fileReadWorkerCount(parallelism, len(candidates))
 	out := make(chan fileContent)
@@ -950,15 +964,7 @@ func streamFolderFiles(ctx context.Context, candidates []folderCandidate, parall
 				if ctx.Err() != nil {
 					continue
 				}
-				content, err := readFolderFile(candidate)
-				if err != nil {
-					continue
-				}
-				select {
-				case out <- fileContent{name: candidate.name, content: content}:
-				case <-ctx.Done():
-					return
-				}
+				readOneFolderFileStreaming(ctx, candidate, out)
 			}
 		}()
 	}
@@ -980,6 +986,53 @@ func streamFolderFiles(ctx context.Context, candidates []folderCandidate, parall
 	}()
 
 	return out
+}
+
+// readOneFolderFileStreaming is the per-file worker body for
+// streamFolderFiles. It Acquires readSemaphore weight against the
+// candidate's pre-read size, reads the file, then transfers Release
+// ownership to the consumer via fileContent.weight on a successful
+// channel send. Failure paths between Acquire and a successful send
+// run the deferred sentinel and Release the weight here.
+func readOneFolderFileStreaming(ctx context.Context, candidate folderCandidate, out chan<- fileContent) {
+	size := candidate.size
+	if size > maxFolderFileSize {
+		// readFolderFile would have rejected this anyway; mirror the
+		// guard here to avoid acquiring weight we cannot honor.
+		return
+	}
+	if size > maxInFlightBytes {
+		// Defensive: caps.go enforces size <= maxFolderFileSize,
+		// and the compile-time invariant guarantees maxFolderFileSize
+		// (= maxIndexedDocumentBytes) <= maxInFlightBytes via
+		// inFlightHeadroomFiles. Guard against future cap drift
+		// hanging Acquire forever (golang/go#59002).
+		slog.Warn("Folder file exceeds in-flight memory ceiling, skipping",
+			"path", candidate.name, "size", size)
+		return
+	}
+
+	weight := size
+	if err := readSemaphore.Acquire(ctx, weight); err != nil {
+		return // ctx cancelled.
+	}
+	released := false
+	defer func() {
+		if !released {
+			readSemaphore.Release(weight)
+		}
+	}()
+
+	content, err := readFolderFile(candidate)
+	if err != nil {
+		return
+	}
+	select {
+	case out <- fileContent{name: candidate.name, content: content, weight: weight}:
+		released = true
+	case <-ctx.Done():
+		return
+	}
 }
 
 func readFolderFile(candidate folderCandidate) ([]byte, error) {

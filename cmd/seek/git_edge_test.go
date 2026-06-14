@@ -361,7 +361,7 @@ func TestStreamFiles_FIFOSkipped(t *testing.T) {
 	// Use a timeout to detect if collectStreamFilesForTest blocks on FIFO
 	done := make(chan []fileContent, 1)
 	go func() {
-		done <- collectStreamFilesForTest(dir, []string{"regular.go", "fifo"}, 2)
+		done <- collectStreamFilesForTest(t.Context(), dir, []string{"regular.go", "fifo"}, 2)
 	}()
 
 	select {
@@ -395,7 +395,7 @@ func TestStreamFiles_HardlinkContent(t *testing.T) {
 		t.Skipf("hardlinks not supported: %v", err)
 	}
 
-	results := collectStreamFilesForTest(dir, []string{"source.go", "hardlink.go"}, 2)
+	results := collectStreamFilesForTest(t.Context(), dir, []string{"source.go", "hardlink.go"}, 2)
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results for hardlinked files, got %d", len(results))
 	}
@@ -706,7 +706,7 @@ func TestStreamFiles_HighConcurrency(t *testing.T) {
 		files[i] = fmt.Sprintf("file_%03d.go", i)
 	}
 
-	results := collectStreamFilesForTest(dir, files, 16)
+	results := collectStreamFilesForTest(t.Context(), dir, files, 16)
 	if len(results) != numFiles {
 		t.Errorf("expected %d results, got %d", numFiles, len(results))
 	}
@@ -746,7 +746,7 @@ func TestStreamFiles_RacyDeletion(t *testing.T) {
 		}
 	}()
 
-	results := collectStreamFilesForTest(dir, fileNames, 4)
+	results := collectStreamFilesForTest(t.Context(), dir, fileNames, 4)
 	wg.Wait()
 
 	// Should not panic; should have between 50 and 100 results depending on timing

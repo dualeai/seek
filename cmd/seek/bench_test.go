@@ -461,7 +461,8 @@ func benchmarkStreamFiles(b *testing.B, numFiles int) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		for range streamFiles(dir, files, 4) {
+		for fc := range streamFiles(b.Context(), dir, files, 4) {
+			readSemaphore.Release(fc.weight)
 		}
 	}
 }

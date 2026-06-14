@@ -286,7 +286,7 @@ func TestStreamFiles_RegularFiles(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(dir, "a.go"), []byte("package a"), 0o644)
 	_ = os.WriteFile(filepath.Join(dir, "b.go"), []byte("package b"), 0o644)
 
-	results := collectStreamFilesForTest(dir, []string{"a.go", "b.go"}, 2)
+	results := collectStreamFilesForTest(t.Context(), dir, []string{"a.go", "b.go"}, 2)
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(results))
 	}
@@ -303,7 +303,7 @@ func TestStreamFiles_RegularFiles(t *testing.T) {
 
 func TestStreamFiles_EmptyList(t *testing.T) {
 	dir := t.TempDir()
-	results := collectStreamFilesForTest(dir, nil, 2)
+	results := collectStreamFilesForTest(t.Context(), dir, nil, 2)
 	if len(results) != 0 {
 		t.Errorf("expected 0 results, got %d", len(results))
 	}
@@ -311,7 +311,7 @@ func TestStreamFiles_EmptyList(t *testing.T) {
 
 func TestStreamFiles_NonexistentFile(t *testing.T) {
 	dir := t.TempDir()
-	results := collectStreamFilesForTest(dir, []string{"does_not_exist.go"}, 1)
+	results := collectStreamFilesForTest(t.Context(), dir, []string{"does_not_exist.go"}, 1)
 	if len(results) != 0 {
 		t.Errorf("expected 0 results for nonexistent file, got %d", len(results))
 	}
@@ -322,7 +322,7 @@ func TestStreamFiles_SkipsDirectories(t *testing.T) {
 	_ = os.Mkdir(filepath.Join(dir, "subdir"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir, "real.go"), []byte("package real"), 0o644)
 
-	results := collectStreamFilesForTest(dir, []string{"subdir", "real.go"}, 2)
+	results := collectStreamFilesForTest(t.Context(), dir, []string{"subdir", "real.go"}, 2)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result (directory skipped), got %d", len(results))
 	}
@@ -337,7 +337,7 @@ func TestStreamFiles_SkipsSymlinks(t *testing.T) {
 	_ = os.WriteFile(target, []byte("package target"), 0o644)
 	_ = os.Symlink(target, filepath.Join(dir, "link.go"))
 
-	results := collectStreamFilesForTest(dir, []string{"link.go", "target.go"}, 2)
+	results := collectStreamFilesForTest(t.Context(), dir, []string{"link.go", "target.go"}, 2)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result (symlink skipped), got %d", len(results))
 	}
@@ -351,7 +351,7 @@ func TestStreamFiles_NestedPath(t *testing.T) {
 	_ = os.MkdirAll(filepath.Join(dir, "src", "pkg"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir, "src", "pkg", "main.go"), []byte("package main"), 0o644)
 
-	results := collectStreamFilesForTest(dir, []string{"src/pkg/main.go"}, 1)
+	results := collectStreamFilesForTest(t.Context(), dir, []string{"src/pkg/main.go"}, 1)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -364,7 +364,7 @@ func TestStreamFiles_EmptyFile(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "empty.go"), []byte{}, 0o644)
 
-	results := collectStreamFilesForTest(dir, []string{"empty.go"}, 1)
+	results := collectStreamFilesForTest(t.Context(), dir, []string{"empty.go"}, 1)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -377,7 +377,7 @@ func TestStreamFiles_MixedExistingAndMissing(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "exists.go"), []byte("yes"), 0o644)
 
-	results := collectStreamFilesForTest(dir, []string{"exists.go", "gone.go", "also_gone.go"}, 2)
+	results := collectStreamFilesForTest(t.Context(), dir, []string{"exists.go", "gone.go", "also_gone.go"}, 2)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -391,7 +391,7 @@ func TestStreamFiles_PreservesRelativeName(t *testing.T) {
 	_ = os.MkdirAll(filepath.Join(dir, "a", "b"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir, "a", "b", "c.go"), []byte("x"), 0o644)
 
-	results := collectStreamFilesForTest(dir, []string{"a/b/c.go"}, 1)
+	results := collectStreamFilesForTest(t.Context(), dir, []string{"a/b/c.go"}, 1)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -406,7 +406,7 @@ func TestStreamFiles_SpacesInPath(t *testing.T) {
 	_ = os.MkdirAll(filepath.Join(dir, "my dir"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir, "my dir", "my file.go"), []byte("hello"), 0o644)
 
-	results := collectStreamFilesForTest(dir, []string{"my dir/my file.go"}, 1)
+	results := collectStreamFilesForTest(t.Context(), dir, []string{"my dir/my file.go"}, 1)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -426,7 +426,7 @@ func TestStreamFiles_Parallelism1(t *testing.T) {
 		files[i] = filepath.Base(t.Name()) + string(rune('a'+i)) + ".go"
 	}
 
-	results := collectStreamFilesForTest(dir, files, 1)
+	results := collectStreamFilesForTest(t.Context(), dir, files, 1)
 	if len(results) != 10 {
 		t.Errorf("expected 10 results with parallelism=1, got %d", len(results))
 	}
@@ -548,7 +548,7 @@ func TestStreamFiles_LargeFileSkipped(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(dir, "large.go"), large, 0o644)
 	_ = os.WriteFile(filepath.Join(dir, "small.go"), []byte("package small"), 0o644)
 
-	results := collectStreamFilesForTest(dir, []string{"large.go", "small.go"}, 2)
+	results := collectStreamFilesForTest(t.Context(), dir, []string{"large.go", "small.go"}, 2)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result (large file skipped), got %d", len(results))
 	}
@@ -563,7 +563,7 @@ func TestStreamFiles_ExactlyMaxSize(t *testing.T) {
 	data := make([]byte, maxGitDirtyFileSize)
 	_ = os.WriteFile(filepath.Join(dir, "exact.go"), data, 0o644)
 
-	results := collectStreamFilesForTest(dir, []string{"exact.go"}, 1)
+	results := collectStreamFilesForTest(t.Context(), dir, []string{"exact.go"}, 1)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result (exactly max size should be included), got %d", len(results))
 	}
@@ -574,7 +574,7 @@ func TestStreamFiles_JustOverMaxSize(t *testing.T) {
 	data := make([]byte, maxGitDirtyFileSize+1)
 	_ = os.WriteFile(filepath.Join(dir, "over.go"), data, 0o644)
 
-	results := collectStreamFilesForTest(dir, []string{"over.go"}, 1)
+	results := collectStreamFilesForTest(t.Context(), dir, []string{"over.go"}, 1)
 	if len(results) != 0 {
 		t.Errorf("expected 0 results (just over max size should be skipped), got %d", len(results))
 	}
@@ -917,7 +917,7 @@ func TestStreamFiles_HighParallelism(t *testing.T) {
 		_ = os.WriteFile(filepath.Join(dir, name), []byte(fmt.Sprintf("package f%d", i)), 0o644)
 	}
 
-	results := collectStreamFilesForTest(dir, files, 16)
+	results := collectStreamFilesForTest(t.Context(), dir, files, 16)
 	if len(results) != n {
 		t.Errorf("expected %d results with high parallelism, got %d", n, len(results))
 	}
@@ -934,7 +934,7 @@ func TestStreamFiles_PermissionDenied(t *testing.T) {
 
 	_ = os.WriteFile(filepath.Join(dir, "ok.go"), []byte("ok"), 0o644)
 
-	results := collectStreamFilesForTest(dir, []string{"secret.go", "ok.go"}, 2)
+	results := collectStreamFilesForTest(t.Context(), dir, []string{"secret.go", "ok.go"}, 2)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result (permission denied skipped), got %d", len(results))
 	}
@@ -949,7 +949,7 @@ func TestStreamFiles_BinaryContent(t *testing.T) {
 	binary := []byte{0x00, 0x01, 0xFF, 0xFE, 'h', 'e', 'l', 'l', 'o', 0x00}
 	_ = os.WriteFile(filepath.Join(dir, "bin.dat"), binary, 0o644)
 
-	results := collectStreamFilesForTest(dir, []string{"bin.dat"}, 1)
+	results := collectStreamFilesForTest(t.Context(), dir, []string{"bin.dat"}, 1)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -969,7 +969,7 @@ func TestStreamFiles_DuplicateNames(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(dir, "dup.go"), []byte("content"), 0o644)
 
 	// Same file passed twice
-	results := collectStreamFilesForTest(dir, []string{"dup.go", "dup.go"}, 2)
+	results := collectStreamFilesForTest(t.Context(), dir, []string{"dup.go", "dup.go"}, 2)
 	// collectStreamFilesForTest doesn't deduplicate — both are read.
 	// This is fine because deduplication happens at the formatter level.
 	if len(results) != 2 {
@@ -1965,7 +1965,7 @@ func TestStreamFiles_BasicFlow(t *testing.T) {
 		}
 	}
 
-	ch := streamFiles(dir, files, 4)
+	ch := streamFiles(t.Context(), dir, files, 4)
 	var got []string
 	for fc := range ch {
 		got = append(got, fc.name)
@@ -1981,7 +1981,7 @@ func TestStreamFiles_OutputChannelUnbuffered(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ch := streamFiles(dir, []string{"a.go"}, 4)
+	ch := streamFiles(t.Context(), dir, []string{"a.go"}, 4)
 	if cap(ch) != 0 {
 		t.Fatalf("streamFiles output must be unbuffered, got cap=%d", cap(ch))
 	}
@@ -1993,7 +1993,7 @@ func TestStreamFiles_EmptyFileList(t *testing.T) {
 	dir := t.TempDir()
 
 	// nil files
-	ch := streamFiles(dir, nil, 4)
+	ch := streamFiles(t.Context(), dir, nil, 4)
 	count := 0
 	for range ch {
 		count++
@@ -2003,7 +2003,7 @@ func TestStreamFiles_EmptyFileList(t *testing.T) {
 	}
 
 	// empty slice
-	ch = streamFiles(dir, []string{}, 4)
+	ch = streamFiles(t.Context(), dir, []string{}, 4)
 	count = 0
 	for range ch {
 		count++
@@ -2022,7 +2022,7 @@ func TestStreamFiles_AllFiltered(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Also include a missing file
-	ch := streamFiles(dir, []string{name, "nonexistent.go"}, 4)
+	ch := streamFiles(t.Context(), dir, []string{name, "nonexistent.go"}, 4)
 	count := 0
 	for range ch {
 		count++
@@ -2044,7 +2044,7 @@ func TestStreamFiles_ParallelismOne(t *testing.T) {
 		}
 	}
 
-	ch := streamFiles(dir, files, 1)
+	ch := streamFiles(t.Context(), dir, files, 1)
 	var got []string
 	for fc := range ch {
 		got = append(got, fc.name)
@@ -2065,7 +2065,7 @@ func TestStreamFiles_SingleFileExactlyMaxSize(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ch := streamFiles(dir, []string{"exact.dat"}, 4)
+	ch := streamFiles(t.Context(), dir, []string{"exact.dat"}, 4)
 	count := 0
 	for fc := range ch {
 		count++
@@ -2094,7 +2094,7 @@ func TestStreamFiles_MixedValidAndInvalid(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ch := streamFiles(dir, []string{"regular.go", "link.go", "subdir", "missing.go"}, 4)
+	ch := streamFiles(t.Context(), dir, []string{"regular.go", "link.go", "subdir", "missing.go"}, 4)
 	var got []string
 	for fc := range ch {
 		got = append(got, fc.name)
@@ -2114,7 +2114,7 @@ func TestStreamFiles_HighParallelismFewFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ch := streamFiles(dir, []string{"a.go", "b.go"}, 16)
+	ch := streamFiles(t.Context(), dir, []string{"a.go", "b.go"}, 16)
 	count := 0
 	for range ch {
 		count++
@@ -2165,7 +2165,11 @@ func TestStreamingMemoryBounded(t *testing.T) {
 	}
 
 	tracker := newPeakHeapTracker()
-	for range streamFiles(dir, files, parallelism) {
+	for fc := range streamFiles(t.Context(), dir, files, parallelism) {
+		// Consumer owns the readSemaphore Release per fileContent.
+		// In production this happens in indexDocuments after Finish;
+		// here the test just discards, so release immediately.
+		readSemaphore.Release(fc.weight)
 	}
 	heapDelta := tracker.stop()
 
@@ -2201,7 +2205,8 @@ func TestStreamingMemoryDoesNotScaleWithInput(t *testing.T) {
 			}
 		}
 		tracker := newPeakHeapTracker()
-		for range streamFiles(dir, files, parallelism) {
+		for fc := range streamFiles(t.Context(), dir, files, parallelism) {
+			readSemaphore.Release(fc.weight)
 		}
 		return tracker.stop()
 	}
@@ -2264,12 +2269,14 @@ func TestIndexDocuments_WritesSearchableDocuments(t *testing.T) {
 // --- helpers ---
 
 // collectStreamFilesForTest collects all streamed file contents into a slice.
-// Test-only helper — production code uses streamFiles directly.
-func collectStreamFilesForTest(repoDir string, files []string, parallelism int) []fileContent {
+// Test-only helper — production code uses streamFiles directly. Releases
+// readSemaphore weight for collected docs so tests don't leak budget.
+func collectStreamFilesForTest(ctx context.Context, repoDir string, files []string, parallelism int) []fileContent {
 	var results []fileContent
-	for fc := range streamFiles(repoDir, files, parallelism) {
+	for fc := range streamFiles(ctx, repoDir, files, parallelism) {
 		results = append(results, fc)
 	}
+	releaseFileContentWeights(results)
 	return results
 }
 
