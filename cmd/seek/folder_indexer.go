@@ -17,7 +17,6 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/sourcegraph/zoekt"
-	"github.com/sourcegraph/zoekt/index"
 	"github.com/sourcegraph/zoekt/query"
 	"golang.org/x/sys/unix"
 )
@@ -612,7 +611,7 @@ func indexFolderDocuments(
 	cachedState string,
 ) (bool, error) {
 	if tryDelta {
-		cleanEmptyFolderShards(ctx, plan.indexDir, repoName)
+		cleanEmptyShards(ctx, plan.indexDir, repoName)
 		shardCount := repositoryShardCount(plan.indexDir, repoName)
 		if shardCount > 0 && shardCount <= maxFolderDeltaShards {
 			indexedAny, err := indexFolderDocumentsDelta(ctx, plan, repoName, selected, parallelism, cachedState)
@@ -647,55 +646,7 @@ func indexFolderDocumentsDelta(
 		return false, fmt.Errorf("folder delta contains only removals")
 	}
 
-	return indexDeltaDocuments(ctx, plan.indexDir, repoName, plan.root, changedDocs, parallelism, changedPaths)
-}
-
-func cleanEmptyFolderShards(ctx context.Context, indexDir, repoName string) {
-	shards := repositoryShardFiles(indexDir, repoName)
-	candidates := shards
-	if len(shards) > 2 {
-		// The base shard and newest delta are normally live. Empty shards are
-		// older deltas that a later delta tombstoned.
-		candidates = shards[1 : len(shards)-1]
-	}
-	for _, shard := range candidates {
-		empty, err := folderShardHasNoLiveDocuments(ctx, shard, repoName)
-		if err != nil || !empty {
-			continue
-		}
-		paths, err := index.IndexFilePaths(shard)
-		if err != nil {
-			continue
-		}
-		for _, path := range paths {
-			_ = os.Remove(path)
-		}
-	}
-}
-
-func folderShardHasNoLiveDocuments(ctx context.Context, shard, repoName string) (bool, error) {
-	searcher, err := openShard(shard)
-	if err != nil {
-		return false, err
-	}
-	defer searcher.Close()
-
-	opts := zoekt.SearchOptions{
-		TotalMaxMatchCount: 1,
-		ShardMaxMatchCount: 1,
-		MaxDocDisplayCount: 1,
-		MaxWallTime:        searchTimeout,
-	}
-	result, err := searcher.Search(ctx, &query.Const{Value: true}, &opts)
-	if err != nil {
-		return false, err
-	}
-	for _, file := range result.Files {
-		if file.Repository == repoName {
-			return false, nil
-		}
-	}
-	return true, nil
+	return indexDeltaDocuments(plan.indexDir, repoName, plan.root, changedDocs, folderDeltaShardMax, changedPaths)
 }
 
 func changedFolderDocumentsSinceCachedState(
@@ -842,6 +793,7 @@ func writeFolderManifest(cacheDir, state string, selected []folderCandidate) err
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
 	}
+	defer func() { _ = os.Remove(tmp) }()
 	return os.Rename(tmp, path)
 }
 
@@ -898,48 +850,6 @@ func folderManifestFileMatchesCandidate(file folderManifestEntry, candidate fold
 		file.Mtime == candidate.mtime &&
 		file.Dev == candidate.dev &&
 		file.Ino == candidate.ino
-}
-
-func indexDeltaDocuments(
-	ctx context.Context,
-	indexDir string,
-	repoName string,
-	source string,
-	files []fileContent,
-	_ int,
-	changedPaths []string,
-) (bool, error) {
-	opts := indexBuildOptions(indexDir, 1)
-	opts.RepositoryDescription.Name = repoName
-	opts.RepositoryDescription.Source = source
-	opts.ShardMax = folderDeltaShardMax
-	opts.IsDelta = true
-
-	builder, err := index.NewBuilder(opts)
-	if err != nil {
-		return false, fmt.Errorf("create delta builder: %w", err)
-	}
-	for _, path := range changedPaths {
-		builder.MarkFileAsChangedOrRemoved(path)
-	}
-
-	var addErr error
-	for _, doc := range files {
-		if addErr == nil {
-			if err := builder.Add(index.Document{
-				Name:    doc.name,
-				Content: doc.content,
-			}); err != nil {
-				addErr = fmt.Errorf("add delta document %s: %w", doc.name, err)
-			}
-		}
-	}
-
-	finishErr := builder.Finish()
-	if addErr != nil {
-		return true, addErr
-	}
-	return true, finishErr
 }
 
 func newFolderCandidate(name, path string, info os.FileInfo) folderCandidate {

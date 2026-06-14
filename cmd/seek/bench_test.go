@@ -676,7 +676,8 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 		if len(state.Files) == 0 {
 			b.Fatal("expected dirty files")
 		}
-		dirtyFiles := state.Files
+		cachedState := readStateFile(plan.cacheDir)
+		preState := gitCorpusStateHash(paths, state)
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; b.Loop(); i++ {
@@ -684,8 +685,10 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 			if err := os.WriteFile(filepath.Join(dir, "app.go"), content, 0o644); err != nil {
 				b.Fatal(err)
 			}
-			fileCh := streamFiles(dir, dirtyFiles, indexParallelism())
-			if err := indexUncommitted(ctx, dir, plan.indexDir, fileCh, indexParallelism()); err != nil {
+			// Reuse the captured state (paths only). statUncommittedCandidates
+			// re-stats each file during indexUncommitted, so the delta path
+			// still sees fresh mtime/size/ino for every iteration.
+			if err := indexUncommitted(ctx, dir, plan.indexDir, plan.cacheDir, state, cachedState, preState, indexParallelism()); err != nil {
 				b.Fatalf("index uncommitted: %v", err)
 			}
 		}
@@ -1139,7 +1142,6 @@ func BenchmarkFolderCorpus_DirtyReindexPhases_1File(b *testing.B) {
 		b.Fatalf("changed docs=%d paths=%d, want 1 each", len(changedDocs), len(changedPaths))
 	}
 	repoName := folderRepoName(plan)
-	parallelism := indexParallelism()
 
 	b.Run("preLockFingerprint", func(b *testing.B) {
 		b.ReportAllocs()
@@ -1189,7 +1191,7 @@ func BenchmarkFolderCorpus_DirtyReindexPhases_1File(b *testing.B) {
 			}
 			copyBenchmarkIndexFiles(b, templatePaths, indexDir)
 			b.StartTimer()
-			if _, err := indexDeltaDocuments(ctx, indexDir, repoName, plan.root, changedDocs, parallelism, changedPaths); err != nil {
+			if _, err := indexDeltaDocuments(indexDir, repoName, plan.root, changedDocs, folderDeltaShardMax, changedPaths); err != nil {
 				b.Fatalf("index delta documents with base shard: %v", err)
 			}
 			b.StopTimer()
@@ -1500,7 +1502,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		if len(state.Files) == 0 {
 			b.Fatal("expected dirty files")
 		}
-		dirtyFiles := state.Files
+		cachedState := readStateFile(plan.cacheDir)
 
 		b.ReportAllocs()
 		b.ResetTimer()
@@ -1509,8 +1511,9 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 			if err := os.WriteFile(target, content, 0o644); err != nil {
 				b.Fatal(err)
 			}
-			fileCh := streamFiles(repoDir, dirtyFiles, indexParallelism())
-			if err := indexUncommitted(ctx, repoDir, plan.indexDir, fileCh, indexParallelism()); err != nil {
+			loopState := gitRepoStateIn(ctx, repoDir)
+			preState := gitCorpusStateHash(paths, loopState)
+			if err := indexUncommitted(ctx, repoDir, plan.indexDir, plan.cacheDir, loopState, cachedState, preState, indexParallelism()); err != nil {
 				b.Fatalf("index uncommitted: %v", err)
 			}
 		}
@@ -1712,6 +1715,186 @@ func assertBenchmarkResultsContainPaths(b *testing.B, repoDir string, targets []
 		rel = filepath.ToSlash(rel)
 		if _, ok := got[rel]; !ok {
 			b.Fatalf("expected dirty search result for edited path %q, got %v", rel, got)
+		}
+	}
+}
+
+// --- Delta-indexing benches (added with the IsDelta migration) ---
+
+// BenchmarkGitCommitted_1CommitAhead measures the steady-state cost of
+// indexing a single committed change. Each iteration writes a new file,
+// commits it, and runs indexCommitted with IsDelta=true. The expected gain
+// vs a hypothetical IsDelta=false build comes from Zoekt's tree-to-tree
+// diff (only the new blob is hashed + ctags-parsed).
+func BenchmarkGitCommitted_1CommitAhead(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping end-to-end benchmark in short mode")
+	}
+	requireTools(b)
+
+	dir := initGitRepo(b, "seed.go", "package main\n// commit_ahead_seed\n")
+	paths, plan := planGitTestCorpus(b, dir)
+	if err := indexCommitted(paths.RepoDir, plan.indexDir, indexParallelism()); err != nil {
+		b.Fatalf("initial commit index: %v", err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; b.Loop(); i++ {
+		name := fmt.Sprintf("step%d.go", i)
+		body := fmt.Appendf(nil, "package main\n// commit_ahead_%d\n", i)
+		if err := os.WriteFile(filepath.Join(dir, name), body, 0o644); err != nil {
+			b.Fatal(err)
+		}
+		gitRunIn(b, dir, "add", ".")
+		gitRunIn(b, dir, "commit", "-m", "delta step")
+		if err := indexCommitted(paths.RepoDir, plan.indexDir, indexParallelism()); err != nil {
+			b.Fatalf("delta commit index: %v", err)
+		}
+	}
+}
+
+// BenchmarkGitUncommitted_RapidEdits_N16 simulates editor-driven saves:
+// rewrite the same file 16 times and measure the cumulative per-iteration
+// indexing cost. With delta on, each cycle should write one tiny shard and
+// tombstone the prior one. Empty-shard cleanup keeps the count bounded.
+func BenchmarkGitUncommitted_RapidEdits_N16(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping end-to-end benchmark in short mode")
+	}
+	requireTools(b)
+
+	dir := initGitRepo(b, "app.go", "package main\n// rapid_edits_baseline\n")
+	ctx := context.Background()
+	paths, plan := planGitTestCorpus(b, dir)
+	// Establish the cachedState baseline by indexing once with no dirty files.
+	state := gitRepoStateIn(ctx, dir)
+	preState := gitCorpusStateHash(paths, state)
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, preState); err != nil {
+		b.Fatalf("baseline index: %v", err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; b.Loop(); i++ {
+		for j := range 16 {
+			body := fmt.Appendf(nil, "package main\n// rapid_edits_%d_%d\n", i, j)
+			if err := os.WriteFile(filepath.Join(dir, "app.go"), body, 0o644); err != nil {
+				b.Fatal(err)
+			}
+			state := gitRepoStateIn(ctx, dir)
+			preState := gitCorpusStateHash(paths, state)
+			if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, preState); err != nil {
+				b.Fatalf("delta cycle %d.%d: %v", i, j, err)
+			}
+		}
+	}
+}
+
+// BenchmarkGitBranch_Switch_Unrelated measures the pathological case: a
+// branch switch that rewrites most of the indexed tree. Delta builds keep
+// emitting tombstones until the shard threshold trips and Zoekt falls back
+// to a full rebuild — the bench reports the combined cost so we can confirm
+// the worst case does not regress vs a hypothetical IsDelta=false build.
+func BenchmarkGitBranch_Switch_Unrelated(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping end-to-end benchmark in short mode")
+	}
+	requireTools(b)
+
+	dir := initGitRepo(b, "main.go", "package main\n// branch_switch_main\n")
+	for i := range 20 {
+		name := fmt.Sprintf("file%d.go", i)
+		body := fmt.Appendf(nil, "package main\n// main_marker_%d\n", i)
+		if err := os.WriteFile(filepath.Join(dir, name), body, 0o644); err != nil {
+			b.Fatal(err)
+		}
+	}
+	gitRunIn(b, dir, "add", ".")
+	gitRunIn(b, dir, "commit", "-m", "main fleet")
+	mainBranch := gitCurrentBranch(&testing.T{}, dir)
+
+	// Create a feature branch that overwrites 80% of the files.
+	gitRunIn(b, dir, "checkout", "-b", "feature")
+	for i := range 16 {
+		name := fmt.Sprintf("file%d.go", i)
+		body := fmt.Appendf(nil, "package main\n// feature_marker_%d\n", i)
+		if err := os.WriteFile(filepath.Join(dir, name), body, 0o644); err != nil {
+			b.Fatal(err)
+		}
+	}
+	gitRunIn(b, dir, "commit", "-am", "feature churn")
+
+	paths, plan := planGitTestCorpus(b, dir)
+	if err := indexCommitted(paths.RepoDir, plan.indexDir, indexParallelism()); err != nil {
+		b.Fatalf("initial index: %v", err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; b.Loop(); i++ {
+		target := mainBranch
+		if i%2 == 1 {
+			target = "feature"
+		}
+		gitRunIn(b, dir, "checkout", target)
+		if err := indexCommitted(paths.RepoDir, plan.indexDir, indexParallelism()); err != nil {
+			b.Fatalf("post-switch index: %v", err)
+		}
+	}
+}
+
+// BenchmarkSearchTombstoneCost measures the search-time penalty of an
+// accumulated delta shard set. After N edit cycles, only the latest content
+// is live; older shards have all docs tombstoned. The bench asserts that
+// search over the multi-shard index returns the expected hit and reports
+// wall time + allocs so regressions in eval.go's tombstone filter show up
+// in CodSpeed walltime mode.
+func BenchmarkSearchTombstoneCost(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping end-to-end benchmark in short mode")
+	}
+	requireTools(b)
+
+	dir := initGitRepo(b, "app.go", "package main\n// tombstone_cost_baseline\n")
+	ctx := context.Background()
+	paths, plan := planGitTestCorpus(b, dir)
+	state := gitRepoStateIn(ctx, dir)
+	preState := gitCorpusStateHash(paths, state)
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, preState); err != nil {
+		b.Fatalf("baseline index: %v", err)
+	}
+
+	// Generate 16 delta cycles on the same file. After cleanup, the live
+	// content lives in one shard and the rest hold tombstones.
+	for i := range 16 {
+		body := fmt.Appendf(nil, "package main\n// tombstone_cost_iter_%d\n", i)
+		if err := os.WriteFile(filepath.Join(dir, "app.go"), body, 0o644); err != nil {
+			b.Fatal(err)
+		}
+		state := gitRepoStateIn(ctx, dir)
+		preState := gitCorpusStateHash(paths, state)
+		if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, preState); err != nil {
+			b.Fatalf("delta cycle %d: %v", i, err)
+		}
+	}
+
+	target := "tombstone_cost_iter_15"
+	if results, err := searchPlannedCorpusForTest(ctx, plan, target); err != nil {
+		b.Fatalf("warm-up search: %v", err)
+	} else if len(results) == 0 {
+		b.Fatal("expected live tombstone-cost marker to be findable")
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		results, err := searchPlannedCorpusForTest(ctx, plan, target)
+		if err != nil {
+			b.Fatalf("search: %v", err)
+		}
+		if len(results) == 0 {
+			b.Fatal("search lost live marker mid-bench")
 		}
 	}
 }

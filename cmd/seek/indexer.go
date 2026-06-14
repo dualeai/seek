@@ -38,7 +38,7 @@ const (
 	emptyGitTreeSHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 	// stateVersion is the prefix used in state hashing to invalidate previous
 	// state formats when the hash algorithm or input format changes.
-	stateVersion = "v5\x00"
+	stateVersion = "v6\x00"
 	// shardMax is the maximum corpus size (in bytes) per zoekt shard.
 	// Smaller shards allow more parallel shard building during cold index.
 	// Default zoekt value is 100MB (3 shards for k8s, ~1.7 cores used).
@@ -283,18 +283,7 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 		return err
 	}
 
-	// Stream uncommitted files through a bounded channel so file reads stay
-	// proportional to the active worker count.
-	var fileCh <-chan fileContent
-	if len(state.Files) > 0 {
-		fileCh = streamFiles(repoDir, state.Files, parallelism)
-		// Ensure the producer goroutine is drained on all exit paths
-		// (including panics) to prevent goroutine leaks.
-		defer func() {
-			for range fileCh {
-			}
-		}()
-	}
+	hasDirty := len(state.Files) > 0
 
 	// Skip committed indexing when HEAD hasn't moved since the last
 	// successful index. This avoids ~560µs of git repo opening + shard
@@ -312,25 +301,24 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	// files (repo name vs "uncommitted" prefix) so when both are needed
 	// they run in parallel. When only one is needed, it runs alone.
 	var committedErr, uncommittedErr error
-	if fileCh != nil && needCommitted {
-		// Both needed — run committed in a goroutine, uncommitted in
-		// the current goroutine (it must drain fileCh).
+	if hasDirty && needCommitted {
 		committedDone := make(chan error, 1)
 		go func() {
 			committedDone <- indexCommitted(repoDir, indexDir, parallelism)
 		}()
-		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, fileCh, parallelism)
+		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, cacheDir, state, cachedState, preState, parallelism)
 		committedErr = <-committedDone
-	} else if fileCh != nil {
-		// Only uncommitted files changed — HEAD is the same.
-		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, fileCh, parallelism)
+	} else if hasDirty {
+		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, cacheDir, state, cachedState, preState, parallelism)
 	} else if needCommitted {
 		committedErr = indexCommitted(repoDir, indexDir, parallelism)
 		cleanUncommittedShards(indexDir)
+		deleteUncommittedManifest(cacheDir)
 	} else {
 		// HEAD unchanged, no dirty files — this shouldn't normally
 		// reach here (state hash would match), but handle defensively.
 		cleanUncommittedShards(indexDir)
+		deleteUncommittedManifest(cacheDir)
 	}
 
 	if committedErr != nil {
@@ -392,13 +380,27 @@ func shardsExist(indexDir string) bool {
 	return err == nil && len(entries) > 0
 }
 
+// maxCommittedDeltaShards bounds delta-stacked committed shards before Zoekt
+// forces a full rebuild. Matches the folder side cap (folder_indexer.go) so
+// search-time tombstone lookup cost stays bounded.
+const maxCommittedDeltaShards = 64
+
 // indexCommitted indexes committed files using gitindex.IndexGitRepo.
+//
+// IsDelta=true makes Zoekt diff the tree between the last indexed commit and
+// the current HEAD, indexing only changed blobs and tombstoning the rest via
+// per-shard .meta sidecars. Zoekt falls back to a full rebuild on its own when
+// the prior commit is gone (force-push, GC), branch set changes, index option
+// hash differs, or the shard count exceeds DeltaShardNumberFallbackThreshold.
 func indexCommitted(repoDir, indexDir string, parallelism int) error {
+	buildOpts := indexBuildOptions(indexDir, parallelism)
+	buildOpts.IsDelta = true
 	opts := gitindex.Options{
-		RepoDir:      repoDir,
-		Incremental:  true,
-		Branches:     []string{"HEAD"},
-		BuildOptions: indexBuildOptions(indexDir, parallelism),
+		RepoDir:                           repoDir,
+		Incremental:                       true,
+		Branches:                          []string{"HEAD"},
+		BuildOptions:                      buildOpts,
+		DeltaShardNumberFallbackThreshold: maxCommittedDeltaShards,
 	}
 	_, err := gitindex.IndexGitRepo(opts)
 	if err != nil {
@@ -505,19 +507,132 @@ func fileReadWorkerCount(parallelism, items int) int {
 	return parallelism
 }
 
-// indexUncommitted indexes uncommitted file contents streamed through fileCh
-// using index.NewBuilder. Old uncommitted shards are not deleted before
-// writing — zoekt's builder.Finish() atomically replaces them (write to
-// .tmp then os.Rename), avoiding a gap where concurrent searchers see no
-// uncommitted shard. The builder is created lazily on the first file to
-// avoid spawning ctags processes when the channel is empty. On NewBuilder
-// error the channel is explicitly drained; on Add error the loop continues
-// consuming remaining items. Both paths prevent goroutine leaks in the
-// producer. Finish is always called when a builder exists (even after Add
-// errors) to ensure cleanup.
-func indexUncommitted(ctx context.Context, repoDir, indexDir string, fileCh <-chan fileContent, parallelism int) error {
+// indexUncommitted indexes the working-tree dirty files for repoDir into the
+// "uncommitted" Zoekt repo.
+//
+// State binding: the manifest is written tagged with preState (the freshly
+// computed state hash for this cycle). On the next cycle, runIndexingWithCache
+// reads .state — which now contains preState — and passes it back as
+// cachedState. tryUncommittedDelta then loads the manifest by matching
+// expectedState == cachedState. This mirrors the folder side at
+// cmd/seek/folder_indexer.go:157-160 where the state file and manifest are
+// written under the same stateHash.
+//
+// When a prior manifest is present and the existing shard count is below
+// maxUncommittedDeltaShards, only files whose (size, mtime, ino) changed are
+// re-read and written into a delta shard; vanished files become tombstones in
+// the .meta sidecars of older shards. Falls back to a full rebuild when the
+// manifest is missing/stale, the shard count exceeds the cap, or the delta
+// path returns an error.
+func indexUncommitted(
+	ctx context.Context,
+	repoDir, indexDir, cacheDir string,
+	state repoState,
+	cachedState, preState string,
+	parallelism int,
+) error {
+	if len(state.Files) == 0 {
+		cleanUncommittedShards(indexDir)
+		deleteUncommittedManifest(cacheDir)
+		return nil
+	}
+
+	candidates := statUncommittedCandidates(repoDir, state.Files)
+	entries := make([]uncommittedManifestEntry, 0, len(candidates))
+	for _, c := range candidates {
+		entries = append(entries, c.manifestEntry())
+	}
+
+	if cachedState != "" {
+		cleanEmptyShards(ctx, indexDir, repoUncommitted)
+		shardCount := repositoryShardCount(indexDir, repoUncommitted)
+		if shardCount > 0 && shardCount <= maxUncommittedDeltaShards {
+			if err := tryUncommittedDelta(ctx, repoDir, indexDir, cacheDir, candidates, cachedState, preState, entries); err == nil {
+				return nil
+			} else {
+				slog.Debug("Uncommitted delta indexing failed, falling back to full rebuild", "error", err)
+			}
+		} else if shardCount > maxUncommittedDeltaShards {
+			slog.Debug("Uncommitted delta shard limit reached, falling back to full rebuild", "shards", shardCount)
+		}
+	}
+
+	fileCh := streamFiles(repoDir, state.Files, parallelism)
 	_, err := indexDocuments(ctx, indexDir, repoUncommitted, repoDir, fileCh, parallelism)
-	return err
+	if err != nil {
+		deleteUncommittedManifest(cacheDir)
+		return err
+	}
+	if err := writeUncommittedManifest(cacheDir, preState, entries); err != nil {
+		slog.Debug("Failed to write uncommitted manifest", "error", err)
+	}
+	return nil
+}
+
+// tryUncommittedDelta attempts a delta-only rebuild of the uncommitted shard
+// set. The manifest is looked up by cachedState (the .state value persisted
+// at the end of the previous cycle) and re-written tagged with preState (the
+// new .state value about to be persisted by runIndexingWithCache).
+func tryUncommittedDelta(
+	ctx context.Context,
+	repoDir, indexDir, cacheDir string,
+	candidates []uncommittedCandidate,
+	cachedState, preState string,
+	entries []uncommittedManifestEntry,
+) error {
+	manifest, ok := readUncommittedManifest(cacheDir, cachedState)
+	if !ok {
+		return fmt.Errorf("uncommitted manifest missing or stale")
+	}
+	toRead, changedPaths := diffUncommittedAgainstManifest(candidates, manifest)
+	if len(changedPaths) == 0 {
+		// No file content drifted since the manifest was written — the
+		// state hash must have changed for some other reason (HEAD,
+		// untracked file added then removed, etc.). Refresh the manifest
+		// binding without touching shards.
+		if err := writeUncommittedManifest(cacheDir, preState, entries); err != nil {
+			slog.Debug("Failed to refresh uncommitted manifest", "error", err)
+		}
+		return nil
+	}
+
+	docs, err := readUncommittedCandidates(repoDir, toRead)
+	if err != nil {
+		return err
+	}
+	if len(docs) == 0 && len(changedPaths) > 0 {
+		// Pure tombstone cycle (all changes are removals). Zoekt's
+		// builder rejects empty delta builds with the same error
+		// shape as the folder side; surface that as a fallback signal.
+		return fmt.Errorf("uncommitted delta contains only removals")
+	}
+	if _, err := indexDeltaDocuments(indexDir, repoUncommitted, repoDir, docs, uncommittedDeltaShardMax, changedPaths); err != nil {
+		return err
+	}
+	if err := writeUncommittedManifest(cacheDir, preState, entries); err != nil {
+		slog.Debug("Failed to write uncommitted manifest", "error", err)
+	}
+	return nil
+}
+
+// readUncommittedCandidates loads file contents for the given candidates from
+// the working tree. Missing or non-regular files are skipped silently (same
+// policy as readFilesToChannel) so the caller's tombstone list stays the only
+// signal that drove the removal.
+func readUncommittedCandidates(repoDir string, candidates []uncommittedCandidate) ([]fileContent, error) {
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	files := make([]string, len(candidates))
+	for i, c := range candidates {
+		files[i] = c.name
+	}
+	ch := streamFiles(repoDir, files, fileReadWorkerCount(indexParallelism(), len(files)))
+	docs := make([]fileContent, 0, len(files))
+	for doc := range ch {
+		docs = append(docs, doc)
+	}
+	return docs, nil
 }
 
 func indexDocuments(
