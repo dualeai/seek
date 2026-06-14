@@ -654,7 +654,9 @@ func TestRun_ExternalExactFileDoesNotSearchSibling(t *testing.T) {
 	}
 }
 
-func TestRun_SymlinkPathOperandFails(t *testing.T) {
+func TestRun_SymlinkPathOperandFollowsTarget(t *testing.T) {
+	requireTools(t)
+
 	root := t.TempDir()
 	target := filepath.Join(root, "target.txt")
 	link := filepath.Join(root, "link.txt")
@@ -665,12 +667,130 @@ func TestRun_SymlinkPathOperandFails(t *testing.T) {
 		t.Skipf("symlink unavailable: %v", err)
 	}
 
+	setTestUserCache(t)
 	t.Chdir(t.TempDir())
-	err := run(context.Background(), "symlink_operand_marker", []string{link}, 0, 0)
-	if err == nil {
-		t.Fatal("expected symlink path operand to fail")
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "symlink_operand_marker", []string{link}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("expected symlink path operand to follow target, got err=%v out=%q", err, out)
 	}
-	if !strings.Contains(err.Error(), "unsupported symlink path operand") {
+	if !strings.Contains(out, "## target.txt") {
+		t.Fatalf("expected resolved target file in output, got:\n%s", out)
+	}
+	if !strings.Contains(out, "symlink_operand_marker") {
+		t.Fatalf("expected marker content from resolved target, got:\n%s", out)
+	}
+}
+
+func TestRun_ExternalFolderSymlinkDedupesWithTarget(t *testing.T) {
+	requireTools(t)
+
+	root := t.TempDir()
+	targetDir := filepath.Join(root, "target")
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(targetDir, "marker.txt"),
+		[]byte("symlink_dedup_marker\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(targetDir, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "symlink_dedup_marker", []string{link, targetDir}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if count := strings.Count(out, "## marker.txt"); count != 1 {
+		t.Fatalf("expected exactly one result for symlink-vs-target operands, got count=%d:\n%s", count, out)
+	}
+}
+
+func TestRun_GitScopeSymlinkInsideWorktreeScopes(t *testing.T) {
+	requireTools(t)
+
+	dir := initScopedGitRepo(t, "git_symlink_inside_marker")
+	link := filepath.Join(dir, "a-link")
+	if err := os.Symlink(filepath.Join(dir, "a", "app.go"), link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	setTestUserCache(t)
+	t.Chdir(dir)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "git_symlink_inside_marker", []string{link}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(out, "## a/app.go") {
+		t.Fatalf("expected scoped output to include resolved target a/app.go, got:\n%s", out)
+	}
+	if strings.Contains(out, "## b/app.go") {
+		t.Fatalf("expected scoped output to exclude b/app.go, got:\n%s", out)
+	}
+}
+
+func TestRun_GitScopeSymlinkOutsideWorktreeRoutedExternal(t *testing.T) {
+	requireTools(t)
+
+	dir := initScopedGitRepo(t, "git_symlink_outside_marker")
+
+	external := t.TempDir()
+	externalFile := filepath.Join(external, "outside.txt")
+	if err := os.WriteFile(externalFile, []byte("git_symlink_outside_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "outside-link")
+	if err := os.Symlink(externalFile, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	setTestUserCache(t)
+	t.Chdir(dir)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "git_symlink_outside_marker", []string{link}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(out, "## outside.txt") {
+		t.Fatalf("expected external file header ## outside.txt, got:\n%s", out)
+	}
+	if !strings.Contains(out, "git_symlink_outside_marker") {
+		t.Fatalf("expected output to contain external file marker, got:\n%s", out)
+	}
+}
+
+func TestRun_BrokenSymlinkOperandErrors(t *testing.T) {
+	root := t.TempDir()
+	link := filepath.Join(root, "broken-link")
+	if err := os.Symlink(filepath.Join(root, "does-not-exist"), link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+
+	err := run(context.Background(), "broken_symlink_marker", []string{link}, 0, 0)
+	if err == nil {
+		t.Fatal("expected broken symlink operand to fail")
+	}
+	if !strings.Contains(err.Error(), "read path") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

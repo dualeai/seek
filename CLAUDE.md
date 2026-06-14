@@ -12,8 +12,9 @@ single-quoted argument; tokens after the query are filesystem path operands.
 
 Path operands accept directories or exact files, can be inside or outside the
 current Git worktree, and can be combined in a single invocation (e.g. mix a
-repo subtree with an external notes folder). With no paths, seek searches the
-current Git worktree.
+repo subtree with an external notes folder). Symlinked path operands are
+silently resolved to their targets; symlinks discovered during walks are still
+skipped. With no paths, seek searches the current Git worktree.
 
 ### Key filters (combine with spaces inside the quotes)
 
