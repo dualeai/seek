@@ -51,6 +51,21 @@ func versionString() string {
 }
 
 func main() {
+	// Dispatch `seek gc ...` early — before the search flag parser, which
+	// would otherwise mistake "gc" for a query token.
+	if len(os.Args) >= 2 && os.Args[1] == "gc" {
+		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+		slog.SetDefault(logger)
+		log.SetOutput(io.Discard)
+		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+		defer cancel()
+		if err := runGCCommand(ctx, os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		return
+	}
+
 	opts, err := parseCLIArgs(os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -87,10 +102,17 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
-	if err := run(ctx, opts.query, opts.paths, opts.limit, opts.maxMatches); err != nil {
-		code := exitCodeForError(err)
+	runErr := run(ctx, opts.query, opts.paths, opts.limit, opts.maxMatches)
+
+	// Fire opportunistic GC after results are flushed. Wait up to
+	// gcRunTimeout so eviction completes before exit (helps tests and
+	// observability), but never block longer.
+	fireOpportunisticGC(runOpportunisticGC, gcRunTimeout)
+
+	if runErr != nil {
+		code := exitCodeForError(runErr)
 		if code != 1 {
-			slog.Error(err.Error())
+			slog.Error(runErr.Error())
 		}
 		os.Exit(code)
 	}
@@ -323,6 +345,7 @@ func prepareAndSearchCorpus(
 	}
 
 	if indexState == corpusKnownEmpty {
+		touchUsed(plan.cacheDir)
 		return nil, dirtyFiles, nil
 	}
 
@@ -330,6 +353,7 @@ func prepareAndSearchCorpus(
 	if err != nil {
 		return nil, nil, err
 	}
+	touchUsed(plan.cacheDir)
 	return wrapCorpusResults(plan, files), dirtyFiles, nil
 }
 

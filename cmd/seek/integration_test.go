@@ -234,6 +234,19 @@ func gitRunIn(t testing.TB, dir string, args ...string) {
 	}
 }
 
+// gitOutputIn runs a git command in dir and returns its trimmed stdout.
+// Test/bench helper; fails the test on git error.
+func gitOutputIn(t testing.TB, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %v failed: %v", args, err)
+	}
+	return strings.TrimRight(string(out), "\n\r")
+}
+
 func gitCurrentBranch(t *testing.T, dir string) string {
 	t.Helper()
 	cmd := exec.Command("git", "symbolic-ref", "--quiet", "--short", "HEAD")

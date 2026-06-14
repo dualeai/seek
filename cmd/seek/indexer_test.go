@@ -616,8 +616,8 @@ func TestStateFile_ReadOnlyDir(t *testing.T) {
 func TestComputeStateHash_VersionPrefix(t *testing.T) {
 	// Guard against accidental stateVersion changes — bumping the version
 	// invalidates all user caches, so it should be intentional.
-	if stateVersion != "v5\x00" {
-		t.Errorf("stateVersion changed unexpectedly: got %q, want %q — update this test if intentional", stateVersion, "v5\x00")
+	if stateVersion != "v6\x00" {
+		t.Errorf("stateVersion changed unexpectedly: got %q, want %q — update this test if intentional", stateVersion, "v6\x00")
 	}
 
 	h := computeStateHash("# branch.oid abc123\n")
@@ -2228,18 +2228,17 @@ func TestStreamingMemoryDoesNotScaleWithInput(t *testing.T) {
 	}
 }
 
-func TestIndexUncommitted_EmptyChannel(t *testing.T) {
+func TestIndexDocuments_EmptyChannel(t *testing.T) {
 	dir := t.TempDir()
 	ch := make(chan fileContent)
-	close(ch) // empty channel
+	close(ch)
 
-	err := indexUncommitted(context.Background(), t.TempDir(), dir, ch, 2)
-	if err != nil {
+	if _, err := indexDocuments(context.Background(), dir, repoUncommitted, t.TempDir(), ch, 2); err != nil {
 		t.Fatalf("unexpected error for empty channel: %v", err)
 	}
 }
 
-func TestIndexUncommitted_WritesSearchableDocuments(t *testing.T) {
+func TestIndexDocuments_WritesSearchableDocuments(t *testing.T) {
 	requireTools(t)
 
 	indexDir := t.TempDir()
@@ -2249,8 +2248,7 @@ func TestIndexUncommitted_WritesSearchableDocuments(t *testing.T) {
 	ch <- fileContent{name: "test.go", content: []byte("package main\n// uncommitted_index_marker\n")}
 	close(ch)
 
-	err := indexUncommitted(context.Background(), repoDir, indexDir, ch, 2)
-	if err != nil {
+	if _, err := indexDocuments(context.Background(), indexDir, repoUncommitted, repoDir, ch, 2); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
