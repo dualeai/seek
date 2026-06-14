@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sync/semaphore"
 )
 
 // makeFileContent fabricates a fileContent that mimics a reader-side
@@ -237,30 +239,21 @@ func TestReader_ContextCancelled_NoLeak(t *testing.T) {
 		defer wg.Done()
 		readFilesToChannel(ctx, dir, files, 4, out)
 	}()
-	// Drain whatever races through (a few may have Acquired before cancel
-	// propagated). Release those weights so the accounting balances.
+	// Drain whatever races through (a few may have Acquired before
+	// cancel propagated). Release those weights so the accounting
+	// balances. By the time the outer wg.Wait returns, all
+	// readFilesToChannel inner workers have exited and their deferred
+	// Releases have fired — no settle delay needed.
 	for fc := range out {
 		readSemaphore.Release(fc.weight)
 	}
 	wg.Wait()
-	// Small settle delay so worker defers run before we observe.
-	time.Sleep(10 * time.Millisecond)
 }
 
-// TestReader_OpenFails_NoLeak — files that pass Lstat but fail Open
-// (or fail Read) must release their Acquired weight via the worker
-// sentinel. We list filenames that exist, then delete them after
-// Lstat resolves but before Open runs by … actually, controlling
-// that race is fragile. Instead, exercise the no-data path: an empty
-// file with size 0 short-circuits before Acquire, so it doesn't test
-// the sentinel. A file that becomes nonexistent reliably: use a
-// directory entry name that points to a file we never create.
-//
-// readFilesToChannel skips files where Lstat fails (no Acquire
-// happens) — so to hit the sentinel we need Lstat to succeed and
-// Open to fail. Easiest reliable trigger: create a regular file,
-// then chmod it 0 (unreadable). Linux + macOS both honor this for
-// non-root processes.
+// TestReader_OpenFails_NoLeak — a file that passes Lstat but fails
+// Open must Release its Acquired weight via the worker sentinel.
+// Reliable trigger: a regular file chmod-ed to 0 (unreadable for
+// non-root processes on Linux and macOS).
 func TestReader_OpenFails_NoLeak(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("chmod 0 cannot block root; skipping unreadable-file test")
@@ -314,29 +307,39 @@ func TestReader_SymlinkRejected_NoLeak(t *testing.T) {
 }
 
 // TestSemaphore_Saturation_AllFilesEventuallyIndexed — concurrent
-// in-flight bytes exceed the 64 MiB readSemaphore budget. The
-// semaphore must queue Acquires so every file is eventually
-// delivered: no deadlock, no leak, no file dropped.
+// in-flight bytes exceed the readSemaphore budget. The semaphore
+// must queue Acquires so every file is eventually delivered: no
+// deadlock, no leak, no file dropped, and observable peak concurrent
+// in-flight files is bounded by budget / fileSize.
 //
-// Forcing real queueing requires worker_count × file_size > budget,
-// AND the consumer must hold each fileContent long enough that
-// concurrent in-flight bytes actually pile up. With 16 workers × 6
-// MiB = 96 MiB > 64 MiB AND a 5 ms hold per doc, at least two
-// Acquires must block waiting for prior Releases.
+// Uses a TEST-LOCAL semaphore (swapReadSemaphoreForTest) with a
+// small budget so we can force queueing without writing hundreds of
+// MiB to disk. Spawns parallel consumers — a single sleeping
+// consumer would serialize the downstream and make the peak counter
+// meaningless (workers all block on unbuffered send, peak=1 always).
+//
+// All bounds derive from `testBudget` and `fileSize` so the
+// assertions remain self-consistent if these constants are tuned.
 func TestSemaphore_Saturation_AllFilesEventuallyIndexed(t *testing.T) {
 	if testing.Short() {
-		t.Skip("saturation test allocates ~150 MiB; skipped in -short")
+		t.Skip("saturation test writes ~64 MiB to disk; skipped in -short")
 	}
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
 	}
-	_, done := withReadSemLock(t)
-	defer done()
+	testReadSemMu.Lock()
+	defer testReadSemMu.Unlock()
 
-	const numFiles = 24
-	const fileSize = 6 * 1024 * 1024 // 6 MiB
-	const parallelism = 16           // 16 × 6 = 96 MiB > 64 MiB budget
-	const consumerHold = 5 * time.Millisecond
+	const testBudget = 16 * 1024 * 1024 // 16 MiB
+	const fileSize = 4 * 1024 * 1024    // 4 MiB → budget/file = 4
+	const expectedPeakLimit = testBudget / fileSize
+	const parallelism = 2 * expectedPeakLimit  // 8 → forces queueing
+	const numConsumers = parallelism            // match readers
+	const numFiles = 4 * expectedPeakLimit      // 16 → multiple rounds
+	const consumerHold = 3 * time.Millisecond
+
+	restore := swapReadSemaphoreForTest(testBudget)
+	defer restore()
 
 	dir := t.TempDir()
 	files := make([]string, numFiles)
@@ -352,45 +355,58 @@ func TestSemaphore_Saturation_AllFilesEventuallyIndexed(t *testing.T) {
 		}
 	}
 
-	// Use the reader directly + manual release per doc so we measure
-	// only the semaphore behavior (end-to-end Zoekt would dominate).
 	out := make(chan fileContent)
-	var indexed int32
-	var maxConcurrent int32
-	var concurrent int32
-
 	go readFilesToChannel(t.Context(), dir, files, parallelism, out)
-	for fc := range out {
-		// Track peak concurrency to assert the semaphore actually
-		// bounded it — otherwise the test reduces to a trivial
-		// fan-in and proves nothing about back-pressure.
-		cur := atomic.AddInt32(&concurrent, 1)
-		for {
-			prev := atomic.LoadInt32(&maxConcurrent)
-			if cur <= prev || atomic.CompareAndSwapInt32(&maxConcurrent, prev, cur) {
-				break
+
+	var indexed, concurrent, maxConcurrent int32
+	var wg sync.WaitGroup
+	for range numConsumers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for fc := range out {
+				cur := atomic.AddInt32(&concurrent, 1)
+				for {
+					prev := atomic.LoadInt32(&maxConcurrent)
+					if cur <= prev || atomic.CompareAndSwapInt32(&maxConcurrent, prev, cur) {
+						break
+					}
+				}
+				time.Sleep(consumerHold)
+				atomic.AddInt32(&concurrent, -1)
+				atomic.AddInt32(&indexed, 1)
+				readSemaphore.Release(fc.weight)
 			}
-		}
-		time.Sleep(consumerHold)
-		atomic.AddInt32(&concurrent, -1)
-		atomic.AddInt32(&indexed, 1)
-		readSemaphore.Release(fc.weight)
+		}()
 	}
+	wg.Wait()
 
 	if got := atomic.LoadInt32(&indexed); got != numFiles {
 		t.Fatalf("saturation: expected %d files indexed, got %d", numFiles, got)
 	}
 	peak := atomic.LoadInt32(&maxConcurrent)
-	// 64 MiB budget / 6 MiB per file = floor(10) = 10 simultaneous max
-	// on the consumer side (workers also hold weight, so effective
-	// consumer peak is usually < 10). If the semaphore is bypassed,
-	// we'd see up to parallelism (16) docs concurrent here.
-	if peak > 10 {
-		t.Fatalf("semaphore violated: peak in-flight=%d > 10 (budget=64MiB / file=6MiB)", peak)
+	if peak > int32(expectedPeakLimit) {
+		t.Fatalf("semaphore violated: peak in-flight=%d > expected %d (budget=%d B / file=%d B)",
+			peak, expectedPeakLimit, testBudget, fileSize)
 	}
-	if peak >= parallelism {
-		t.Fatalf("no queueing observed: peak=%d == parallelism=%d — test failed to exercise back-pressure", peak, parallelism)
+	// Sanity: under genuine saturation, peak should sit between 2 and
+	// expectedPeakLimit. peak < 2 means the workload never queued any
+	// concurrent Acquires — the test ran too fast or the scheduler
+	// serialized everything — and proves nothing about back-pressure.
+	if peak < 2 {
+		t.Fatalf("no queueing observed: peak=%d — test failed to saturate the semaphore", peak)
 	}
+}
+
+// swapReadSemaphoreForTest replaces the package-level readSemaphore
+// with a fresh one of the given budget for the test's lifetime.
+// Caller MUST hold testReadSemMu so the swap is observed atomically
+// by sequential accounting tests. Returns the restore function the
+// caller defers.
+func swapReadSemaphoreForTest(budget int64) func() {
+	old := readSemaphore
+	readSemaphore = semaphore.NewWeighted(budget)
+	return func() { readSemaphore = old }
 }
 
 // TestFolderReader_FileGrew_NoLeak — when readFolderFile detects the

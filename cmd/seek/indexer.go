@@ -483,10 +483,12 @@ func readOneDirtyFile(ctx context.Context, repoDir, f string, out chan<- fileCon
 		slog.Warn("Skipping large uncommitted file", "path", f, "size_mb", size/(1024*1024))
 		return
 	}
-	// Defensive: caps already enforce size <= maxIndexedDocumentBytes
-	// (10 MiB) < maxInFlightBytes (64 MiB). The explicit guard makes
-	// the invariant audit-friendly and prevents a future cap drift
-	// from hanging Acquire forever when ctx is context.Background()
+	// Defensive: caps.go enforces size <= maxIndexedDocumentBytes,
+	// and the compile-time invariant in caps.go guarantees
+	// maxIndexedDocumentBytes <= maxInFlightBytes (via
+	// inFlightHeadroomFiles). The explicit runtime guard keeps the
+	// invariant audit-friendly and prevents a future cap drift from
+	// hanging Acquire forever when ctx is context.Background()
 	// (golang/go#59002).
 	if size > maxInFlightBytes {
 		slog.Warn("File exceeds in-flight memory ceiling, skipping", "path", f, "size", size)
@@ -523,10 +525,10 @@ func readOneDirtyFile(ctx context.Context, repoDir, f string, out chan<- fileCon
 		return
 	}
 
-	// Transfer Release ownership to the consumer atomically before the
-	// send. If the send panics (e.g. closed channel race), the deferred
-	// sentinel will not double-release because we set released=true only
-	// after a successful send via select with ctx cancellation.
+	// Transfer Release ownership to the consumer. The select unblocks
+	// on ctx cancel so an abandoned consumer cannot wedge the worker
+	// holding semaphore weight indefinitely. released stays false on
+	// the ctx.Done path so the deferred sentinel returns the weight.
 	select {
 	case out <- fileContent{name: f, content: buf[:n], weight: weight}:
 		released = true
@@ -535,14 +537,17 @@ func readOneDirtyFile(ctx context.Context, repoDir, f string, out chan<- fileCon
 	}
 }
 
-// streamFiles returns a channel that yields file contents read from the
-// working tree. The output channel is unbuffered because Zoekt's public
-// Builder API accepts []byte documents, not io.Reader streams. This keeps
-// seek-side buffering to at most the active reader workers instead of queueing
-// already-read file contents.
+// streamFiles returns a channel that yields file contents read from
+// the working tree. The output channel is unbuffered because Zoekt's
+// public Builder API accepts []byte documents, not io.Reader streams.
+// In-flight memory is bounded by two limits, whichever is tighter:
+//   - the worker count (each worker holds at most one fileContent),
+//   - readSemaphore's maxInFlightBytes byte budget (see caps.go).
 //
-// Each yielded fileContent carries a non-zero weight that the consumer
-// MUST Release on readSemaphore after builder.Finish() returns.
+// Each yielded fileContent carries a weight (= file size at Lstat) on
+// the readSemaphore. The consumer MUST Release that weight after
+// builder.Finish() returns. Abandoning the channel without draining
+// would hang workers blocked on send until ctx cancellation.
 func streamFiles(ctx context.Context, repoDir string, files []string, parallelism int) <-chan fileContent {
 	out := make(chan fileContent)
 	go readFilesToChannel(ctx, repoDir, files, parallelism, out)
@@ -694,6 +699,21 @@ func readUncommittedCandidates(ctx context.Context, repoDir string, candidates [
 	return docs, nil
 }
 
+// indexDocuments consumes fileContent from fileCh, feeds each Content
+// to a lazily-created Zoekt builder, and finalizes the shard set with
+// builder.Finish(). Returns (indexed, err) where indexed=true means a
+// builder was created (Finish ran). On any path — empty channel,
+// NewBuilder error, Add error, Finish error — the function still
+// drains the channel and releases readSemaphore weight for every
+// received doc.
+//
+// readSemaphore lifetime contract: every received fileContent.weight
+// is summed into totalWeight, and Release(totalWeight) fires STRICTLY
+// after builder.Finish() returns. Finish synchronously joins all
+// shard-writer goroutines via b.building.Wait() (zoekt/index/
+// builder.go:659-667), so post-Finish no goroutine still holds a
+// Content slice reference. Releasing earlier would re-publish bytes
+// to the semaphore that Zoekt is still reading.
 func indexDocuments(
 	ctx context.Context,
 	indexDir string,
@@ -705,10 +725,10 @@ func indexDocuments(
 	var builder *index.Builder
 	var addErr error
 
-	// totalWeight tracks readSemaphore weight to release after Finish.
-	// recordWeight runs for EVERY received doc — including drained-after-
-	// error and drained-after-NewBuilder-failure paths — because the
-	// reader Acquired the weight and the consumer owns the Release.
+	// totalWeight accumulates readSemaphore weight for EVERY received
+	// doc — including those drained after an Add error and those
+	// drained after a NewBuilder failure — because the reader
+	// Acquired the weight and the consumer owns the Release.
 	var totalWeight int64
 
 	for doc := range fileCh {

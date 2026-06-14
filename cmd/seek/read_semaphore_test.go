@@ -34,14 +34,15 @@ func availableWeight(sem *semaphore.Weighted) int64 {
 	return lo
 }
 
-// TestReader_SizeOverCeiling exercises the defensive guard in
-// readOneFolderFileStreaming against future cap drift: a synthetic
-// candidate larger than maxInFlightBytes must be skipped without ever
-// touching the semaphore. The Lstat-cap guard in the production
-// readers normally rejects such files before this branch runs; the
-// branch exists so a future cap change can't silently hang Acquire
-// forever under context.Background() (golang/go#59002).
-func TestReader_SizeOverCeiling(t *testing.T) {
+// TestReader_OversizeCandidate_NoSemaphoreTouch — a synthetic
+// candidate larger than every per-file cap must be skipped without
+// ever touching the semaphore. Under current derivation
+// (`maxInFlightBytes = inFlightHeadroomFiles * maxIndexedDocumentBytes`,
+// `maxFolderFileSize = maxIndexedDocumentBytes`), the
+// maxFolderFileSize guard fires first; the maxInFlightBytes branch
+// is defense-in-depth against future drift. Either branch must
+// leave the semaphore untouched.
+func TestReader_OversizeCandidate_NoSemaphoreTouch(t *testing.T) {
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
@@ -49,6 +50,9 @@ func TestReader_SizeOverCeiling(t *testing.T) {
 	ctx := t.Context()
 	out := make(chan fileContent, 1)
 
+	// Larger than the in-flight ceiling. Production also rejects via
+	// the maxFolderFileSize guard, which fires first; either branch
+	// must skip the file without Acquiring weight.
 	c := folderCandidate{
 		name: "huge",
 		path: "/nonexistent/huge",

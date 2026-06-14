@@ -936,6 +936,20 @@ func appendFolderFingerprintBytes(h *xxhash.Digest, part []byte) {
 	_, _ = h.Write(part)
 }
 
+// streamFolderFiles returns a channel that yields file contents for
+// each folder candidate. The output channel is unbuffered. In-flight
+// memory is bounded by two limits, whichever is tighter:
+//   - the worker count (each worker holds at most one fileContent),
+//   - readSemaphore's maxInFlightBytes byte budget (see caps.go).
+//
+// Each yielded fileContent carries a weight (= candidate.size pre-read)
+// on the readSemaphore. The consumer MUST Release that weight after
+// builder.Finish() returns. Abandoning the channel without draining
+// would hang workers blocked on send until ctx cancellation.
+//
+// Synchronous folder-delta reads via readFolderFile DO NOT go through
+// this entry point and pass fileContent with weight=0; that is by
+// design (those reads are not bounded by readSemaphore today).
 func streamFolderFiles(ctx context.Context, candidates []folderCandidate, parallelism int) <-chan fileContent {
 	workers := fileReadWorkerCount(parallelism, len(candidates))
 	out := make(chan fileContent)
@@ -988,9 +1002,11 @@ func readOneFolderFileStreaming(ctx context.Context, candidate folderCandidate, 
 		return
 	}
 	if size > maxInFlightBytes {
-		// Defensive: caps already enforce size <= maxFolderFileSize
-		// (10 MiB) < maxInFlightBytes (64 MiB). Guard against future
-		// drift hanging Acquire forever (golang/go#59002).
+		// Defensive: caps.go enforces size <= maxFolderFileSize,
+		// and the compile-time invariant guarantees maxFolderFileSize
+		// (= maxIndexedDocumentBytes) <= maxInFlightBytes via
+		// inFlightHeadroomFiles. Guard against future cap drift
+		// hanging Acquire forever (golang/go#59002).
 		slog.Warn("Folder file exceeds in-flight memory ceiling, skipping",
 			"path", candidate.name, "size", size)
 		return
