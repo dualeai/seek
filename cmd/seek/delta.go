@@ -18,6 +18,11 @@ import (
 // The builder always Finishes (even on Add errors) so prior shards are not
 // left with partial tombstone updates. Concurrent searchers keep the old .meta
 // view until the atomic rename lands (see Zoekt index/builder.go:706-780).
+//
+// readSemaphore weights carried on files (from streamFolderFiles or
+// streamFiles) are Released exactly once after builder.Finish() returns —
+// the same lifetime contract as indexDocuments. Synchronous folder-delta
+// reads pass files with weight=0; Release then contributes nothing.
 func indexDeltaDocuments(
 	indexDir string,
 	repoName string,
@@ -36,6 +41,9 @@ func indexDeltaDocuments(
 
 	builder, err := index.NewBuilder(opts)
 	if err != nil {
+		// NewBuilder failed before any Add: Zoekt holds no Content refs,
+		// safe to release immediately.
+		releaseFileContentWeights(files)
 		return false, fmt.Errorf("create delta builder: %w", err)
 	}
 	for _, path := range changedPaths {
@@ -55,6 +63,11 @@ func indexDeltaDocuments(
 	}
 
 	finishErr := builder.Finish()
+
+	// ONLY now is it safe to release readSemaphore weight: Zoekt no
+	// longer reads any of the doc.content slices.
+	releaseFileContentWeights(files)
+
 	if addErr != nil {
 		return true, addErr
 	}

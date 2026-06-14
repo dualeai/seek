@@ -950,15 +950,7 @@ func streamFolderFiles(ctx context.Context, candidates []folderCandidate, parall
 				if ctx.Err() != nil {
 					continue
 				}
-				content, err := readFolderFile(candidate)
-				if err != nil {
-					continue
-				}
-				select {
-				case out <- fileContent{name: candidate.name, content: content}:
-				case <-ctx.Done():
-					return
-				}
+				readOneFolderFileStreaming(ctx, candidate, out)
 			}
 		}()
 	}
@@ -980,6 +972,51 @@ func streamFolderFiles(ctx context.Context, candidates []folderCandidate, parall
 	}()
 
 	return out
+}
+
+// readOneFolderFileStreaming is the per-file worker body for
+// streamFolderFiles. It Acquires readSemaphore weight against the
+// candidate's pre-read size, reads the file, then transfers Release
+// ownership to the consumer via fileContent.weight on a successful
+// channel send. Failure paths between Acquire and a successful send
+// run the deferred sentinel and Release the weight here.
+func readOneFolderFileStreaming(ctx context.Context, candidate folderCandidate, out chan<- fileContent) {
+	size := candidate.size
+	if size > maxFolderFileSize {
+		// readFolderFile would have rejected this anyway; mirror the
+		// guard here to avoid acquiring weight we cannot honor.
+		return
+	}
+	if size > maxInFlightBytes {
+		// Defensive: caps already enforce size <= maxFolderFileSize
+		// (10 MiB) < maxInFlightBytes (64 MiB). Guard against future
+		// drift hanging Acquire forever (golang/go#59002).
+		slog.Warn("Folder file exceeds in-flight memory ceiling, skipping",
+			"path", candidate.name, "size", size)
+		return
+	}
+
+	weight := size
+	if err := readSemaphore.Acquire(ctx, weight); err != nil {
+		return // ctx cancelled.
+	}
+	released := false
+	defer func() {
+		if !released {
+			readSemaphore.Release(weight)
+		}
+	}()
+
+	content, err := readFolderFile(candidate)
+	if err != nil {
+		return
+	}
+	select {
+	case out <- fileContent{name: candidate.name, content: content, weight: weight}:
+		released = true
+	case <-ctx.Done():
+		return
+	}
 }
 
 func readFolderFile(candidate folderCandidate) ([]byte, error) {
