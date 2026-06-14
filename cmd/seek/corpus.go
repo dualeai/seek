@@ -144,12 +144,9 @@ func collectExternalOperands(ctx context.Context, paths *gitPaths, operands []st
 		if err != nil {
 			return result, fmt.Errorf("resolve path %q: %w", operand, err)
 		}
-		info, err := os.Lstat(abs)
+		info, err := os.Stat(abs)
 		if err != nil {
 			return result, fmt.Errorf("read path %q: %w", operand, err)
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return result, fmt.Errorf("unsupported symlink path operand: %s", operand)
 		}
 
 		canonical := canonicalCorpusPath(abs)
@@ -336,12 +333,9 @@ func buildCurrentGitScope(root string, operands []string) (query.Q, error) {
 		if err != nil {
 			return nil, fmt.Errorf("resolve path %q: %w", operand, err)
 		}
-		info, err := os.Lstat(abs)
+		info, err := os.Stat(abs)
 		if err != nil {
 			return nil, fmt.Errorf("read path %q: %w", operand, err)
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return nil, fmt.Errorf("unsupported symlink path operand: %s", operand)
 		}
 
 		canonical := canonicalCorpusPath(abs)
