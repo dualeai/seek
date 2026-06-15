@@ -17,7 +17,7 @@ import (
 //
 // The builder always Finishes (even on Add errors) so prior shards are not
 // left with partial tombstone updates. Concurrent searchers keep the old .meta
-// view until the atomic rename lands (see Zoekt index/builder.go:706-780).
+// view until Zoekt's atomic tmp→final rename lands inside Builder.Finish.
 //
 // readSemaphore weights carried on files (from streamFolderFiles or
 // streamFiles) are Released exactly once after builder.Finish() returns —
@@ -77,13 +77,12 @@ func indexDeltaDocuments(
 // cleanEmptyShards removes prior shards for repoName whose live document count
 // is zero (every document has been tombstoned by a later delta).
 //
-// Zoekt requires contiguous shard numbering: its FindAllShards iterates
-// sequentially from shard 0 and stops at the first gap (Zoekt
-// index/builder.go:507-528 + index/read.go:507-528), so any deleted shard
-// below a live one would orphan the live shards from the delta builder's
-// view. To stay safe we only delete the TRAILING suffix of empty shards,
-// stopping at the first live shard (or at shard 0 unconditionally — the base
-// must remain to anchor the numbering).
+// Zoekt requires contiguous shard numbering: FindAllShards iterates
+// sequentially from shard 0 and stops at the first gap, so any deleted
+// shard below a live one would orphan the live shards from the delta
+// builder's view. To stay safe we only delete the TRAILING suffix of
+// empty shards, stopping at the first live shard (or at shard 0
+// unconditionally — the base must remain to anchor the numbering).
 //
 // In practice the newest shard is almost always live (it was just written by
 // the prior cycle), so this is effectively a no-op for rapid-edit chains.

@@ -444,6 +444,12 @@ func coveredByAnyDir(name string, dirs []string) bool {
 }
 
 func seekUserCacheRoot() (string, error) {
+	// SEEK_CACHE_DIR overrides the default user-cache location.
+	// Primary use case: benchmarks and tests that need a sandboxed
+	// cache so they don't wipe the developer's dev cache.
+	if dir := os.Getenv("SEEK_CACHE_DIR"); dir != "" {
+		return dir, nil
+	}
 	dir, err := os.UserCacheDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve user cache directory: %w", err)

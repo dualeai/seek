@@ -1000,7 +1000,7 @@ func BenchmarkChangedFolderDocumentsFromManifest_1000Files_1Changed(b *testing.B
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		changedDocs, changedPaths := changedFolderDocumentsFromManifest(selected, manifest)
+		changedDocs, changedPaths, _ := changedFolderDocumentsFromManifest(selected, manifest)
 		if len(changedDocs) != 1 || len(changedPaths) != 1 {
 			b.Fatalf("changed docs=%d paths=%d, want 1 each", len(changedDocs), len(changedPaths))
 		}
@@ -1140,7 +1140,7 @@ func BenchmarkFolderCorpus_DirtyReindexPhases_1File(b *testing.B) {
 	if err != nil {
 		b.Fatalf("folder state: %v", err)
 	}
-	changedDocs, changedPaths := changedFolderDocumentsFromManifest(selected, manifest)
+	changedDocs, changedPaths, _ := changedFolderDocumentsFromManifest(selected, manifest)
 	if len(changedDocs) != 1 || len(changedPaths) != 1 {
 		b.Fatalf("changed docs=%d paths=%d, want 1 each", len(changedDocs), len(changedPaths))
 	}
@@ -1175,7 +1175,7 @@ func BenchmarkFolderCorpus_DirtyReindexPhases_1File(b *testing.B) {
 	b.Run("changedDocumentsFromManifest", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			docs, paths := changedFolderDocumentsFromManifest(selected, manifest)
+			docs, paths, _ := changedFolderDocumentsFromManifest(selected, manifest)
 			if len(docs) != 1 || len(paths) != 1 {
 				b.Fatalf("changed docs=%d paths=%d, want 1 each", len(docs), len(paths))
 			}
@@ -1589,7 +1589,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			_ = acquireSearchLock(ctx, f)
+			_ = acquireSearchLock(ctx, filepath.Dir(f.Name()), f)
 			unlockFile(f)
 			_ = f.Close()
 		}
@@ -2085,6 +2085,79 @@ func BenchmarkGC_DryRun_Render_N20(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		if err := reportGCPlan(io.Discard, root, entries, cutoff); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// Windowed-indexer-fix benchmarks: rotation cost + manifest streaming.
+
+// BenchmarkFolderCorpus_ColdIndex_LargeRotation forces multi-window
+// rotation by shrinking the test-local readSemaphore budget so the
+// window threshold drops to ~2 MiB. Synthesised payload spans many
+// windows; ns/op surfaces the rotation overhead the production fix
+// trades for bounded peak memory.
+func BenchmarkFolderCorpus_ColdIndex_LargeRotation(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping rotation benchmark in -short")
+	}
+	requireTools(b)
+	ctx := context.Background()
+
+	testReadSemMu.Lock()
+	defer testReadSemMu.Unlock()
+	const testBudget int64 = 4 * 1024 * 1024
+	restore := swapReadSemaphoreForTest(testBudget)
+	defer restore()
+
+	for b.Loop() {
+		b.StopTimer()
+		root := b.TempDir()
+		const fileCount = 24
+		const fileSize = 512 * 1024 // 12 MiB → ~6 windows
+		payload := make([]byte, fileSize-len("package x\n"))
+		for i := range payload {
+			payload[i] = byte('a' + i%26)
+		}
+		for i := 0; i < fileCount; i++ {
+			name := filepath.Join(root, fmt.Sprintf("f%03d.go", i))
+			if err := os.WriteFile(name, append([]byte("package x\n"), payload...), 0o644); err != nil {
+				b.Fatal(err)
+			}
+		}
+		plan := planFolderTestCorpus(b, root)
+		b.StartTimer()
+		if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
+			b.Fatalf("ensureFolderCorpusFresh: %v", err)
+		}
+	}
+}
+
+// BenchmarkWriteFolderManifest_100k surfaces the streaming-JSON
+// encoder peak-allocation claim: bufio working set (~32 KiB) instead
+// of json.Marshal's ~2× payload buffer. ReportAllocs makes regressions
+// one-glance visible. 100k entries chosen as the largest realistic
+// folder-manifest size.
+func BenchmarkWriteFolderManifest_100k(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping manifest benchmark in -short")
+	}
+	const count = 100_000
+	selected := make([]folderCandidate, count)
+	for i := range selected {
+		selected[i] = folderCandidate{
+			name:  fmt.Sprintf("path/to/file_%06d.go", i),
+			size:  int64(i % 4096),
+			mtime: int64(i),
+			dev:   1,
+			ino:   uint64(i),
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		dir := b.TempDir()
+		if err := writeFolderManifest(dir, "state-x", selected); err != nil {
 			b.Fatal(err)
 		}
 	}

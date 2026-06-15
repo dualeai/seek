@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/sourcegraph/zoekt v0.0.0-20260325124901-a0f5789d25cb
+	go.uber.org/goleak v1.3.0
 	golang.org/x/sync v0.20.0
 	golang.org/x/sys v0.41.0
 )

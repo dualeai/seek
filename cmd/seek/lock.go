@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"os"
 	"syscall"
@@ -66,8 +67,14 @@ func acquireLock(ctx context.Context, indexDir, lockPath string) (*os.File, bool
 		return f, true, nil
 	}
 
-	// Lock held by another process — use stale shards if available
+	// Lock held by another process — use stale shards if available.
+	//
+	// Warn (not Debug) because a wedged indexer holding the flock
+	// silently degrades subsequent searches to stale shards forever
+	// until the holder is killed; without this signal the operator
+	// has no clue why fresh content is missing from results.
 	if shardsExist(indexDir) {
+		slog.Warn("Indexer lock held by another process; searching stale shards", "lock", lockPath)
 		_ = f.Close()
 		return nil, false, nil
 	}
@@ -94,8 +101,18 @@ func releaseLock(f *os.File) {
 // acquireSearchLock acquires a shared lock with a timeout, polling with
 // exponential backoff plus jitter. Uses non-blocking LOCK_SH to avoid
 // goroutine/fd-reuse races.
-func acquireSearchLock(ctx context.Context, f *os.File) error {
+//
+// If the lock is held by a running indexer AND shards exist in
+// indexDir, returns nil without acquiring — caller proceeds against
+// stale shards (mirror of acquireLock's same fallback). Search
+// results may be slightly behind the current state but never torn:
+// shard files are atomically renamed inside Zoekt's Builder.Finish.
+func acquireSearchLock(ctx context.Context, indexDir string, f *os.File) error {
 	if err := lockFileSharedNB(f); err == nil {
+		return nil
+	}
+	if shardsExist(indexDir) {
+		slog.Warn("Indexer lock contended; searching stale shards", "index_dir", indexDir)
 		return nil
 	}
 	if err := pollLock(ctx, func() error { return lockFileSharedNB(f) }, 50*time.Millisecond, 500*time.Millisecond, 60*time.Second); err != nil {

@@ -275,7 +275,22 @@ func run(ctx context.Context, pattern string, pathOperands []string, limit, maxM
 	dirtyByCorpus := make(dirtyFilesByCorpus)
 
 	for _, plan := range plans {
-		results, dirtyFiles, err := prepareAndSearchCorpus(ctx, plan, paths, userQ)
+		// Per-plan cancellation so any stray goroutine wedged inside
+		// prepareAndSearchCorpus (e.g. an indexer blocked on a shared
+		// process resource) is signalled to unwind before plan N+1
+		// starts. Defense in depth — windowed indexDocuments already
+		// prevents the historical semaphore deadlock, but a per-plan
+		// cancel keeps a future regression from leaking budget across
+		// plans (readSemaphore is a process-global).
+		//
+		// Wrapped in a func + defer cancelPlan so a panic in
+		// prepareAndSearchCorpus still releases the context — an
+		// unwrapped cancelPlan() at the bottom would leak on panic.
+		results, dirtyFiles, err := func() ([]corpusSearchResult, dirtyFileSet, error) {
+			planCtx, cancelPlan := context.WithCancel(ctx)
+			defer cancelPlan()
+			return prepareAndSearchCorpus(planCtx, plan, paths, userQ)
+		}()
 		if err != nil {
 			return err
 		}
@@ -491,7 +506,7 @@ func searchPlannedCorpusParsed(ctx context.Context, plan corpusPlan, userQ query
 		unlockFile(searchLockFd)
 		_ = searchLockFd.Close()
 	}()
-	if err := acquireSearchLock(ctx, searchLockFd); err != nil {
+	if err := acquireSearchLock(ctx, plan.indexDir, searchLockFd); err != nil {
 		return nil, fmt.Errorf("acquire search lock: %w", err)
 	}
 

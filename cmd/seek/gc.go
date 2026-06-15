@@ -253,6 +253,13 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 		if ctx.Err() != nil {
 			break
 		}
+		// Sweep orphan tmp manifest files (folder + uncommitted) older
+		// than 1 hour. SIGKILL between os.WriteFile and os.Rename in
+		// writeFolderManifest / writeUncommittedManifest can leave these
+		// behind; no live process ever reads them again. Best-effort —
+		// errors are silent because the user does not need to act.
+		sweepOrphanManifestTmps(e.path, now.Add(-1*time.Hour))
+
 		// Capture size + display info BEFORE eviction — once the dir is
 		// renamed to .trash the original path is gone and corpusDirSize
 		// would return 0, corpusDisplayName would return [empty].
@@ -367,6 +374,50 @@ func shouldRunGC(cacheRoot string, interval time.Duration) bool {
 		return true
 	}
 	return time.Since(st.ModTime()) >= interval
+}
+
+// sweepOrphanManifestTmps removes leftover .tmp manifest files in a
+// corpus cache directory whose mtime is older than threshold. Both the
+// folder manifest writer (folder_indexer.go:771-797) and the
+// uncommitted manifest writer (uncommitted_manifest.go) write to a
+// tmp path and then Rename — on SIGKILL between the WriteFile and the
+// Rename, the tmp persists forever. They are not picked up by any
+// reader (manifest readers open the canonical filename), but they
+// accumulate disk usage and confuse manual cache inspection.
+//
+// Conservatively only sweeps known suffixes so we never collide with a
+// legitimate in-flight write.
+func sweepOrphanManifestTmps(cacheDir string, before time.Time) {
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return
+	}
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		name := ent.Name()
+		if !isOrphanManifestTmpName(name) {
+			continue
+		}
+		info, err := ent.Info()
+		if err != nil {
+			continue
+		}
+		if !info.ModTime().Before(before) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(cacheDir, name))
+	}
+}
+
+func isOrphanManifestTmpName(name string) bool {
+	switch name {
+	case folderManifestFileName + ".tmp",
+		uncommittedManifestFileName + ".tmp":
+		return true
+	}
+	return false
 }
 
 func enumerateCorpusDirs(corporaPath string) ([]corpusDirEntry, error) {

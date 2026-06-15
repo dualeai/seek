@@ -104,7 +104,7 @@ func TestFix_SharedLockBlocksSearchDuringIndexing(t *testing.T) {
 			_ = f.Close()
 		}()
 		// This polls until LOCK_EX is released
-		if err := acquireSearchLock(context.Background(), f); err != nil {
+		if err := acquireSearchLock(context.Background(), filepath.Dir(f.Name()), f); err != nil {
 			return
 		}
 		sharedAcquiredAt.Store(time.Now().UnixNano())

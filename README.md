@@ -314,25 +314,37 @@ Indexes are stored centrally in the user cache, never inside searched folders:
 Standard folder indexing walks regular files and only prunes `.git` metadata
 directories. Dependency, build, cache, and vendor directories are not skipped by
 name in standard folder mode. Git ignore semantics are handled only for Git
-roots, including external Git roots. Files larger than 10 MiB are skipped, and
+roots, including external Git roots. Files larger than 100 MiB are skipped, and
 standard folder indexing stops at 1,000,000 candidate files or 5 GiB of indexed
 bytes.
 
-Benchmarks on Apple M1 Max:
+Field benchmarks on Apple M1 Max (covers Git repos AND non-Git folder
+indexing, with PR-scale dirty re-index at 1% and 10% mutation):
 
-| Repo | Files | Cold index | Warm search | Dirty re-index |
-|------|-------|------------|-------------|----------------|
-| spf13/cobra | 66 | 0.4s | 75ms | 89ms |
-| prometheus/prometheus | 1,583 | 1.4s | 82ms | 96ms |
-| kubernetes/kubernetes | 29,179 | 7.5s | 132ms | 145ms |
-| torvalds/linux | 93,016 | 59s | 295ms | 301ms |
+| Kind | Workload | Files | Cold index | Warm search | Dirty 1% | Dirty 10% |
+|------|----------|-------|------------|-------------|----------|-----------|
+| git | spf13/cobra | 66 | 350ms | 80ms | 110ms | 120ms |
+| git | prometheus/prometheus | 1,633 | 1.9s | 90ms | 170ms | 360ms |
+| git | kubernetes/kubernetes | 30,507 | 14.5s | 230ms | 670ms | 5.7s |
+| folder | synthetic-10k | 10,000 | 7.6s | 120ms | 270ms | 850ms |
+| folder | synthetic-100k | 100,000 | 38.2s | 420ms | 1.6s | 8.4s |
+
+Field benchmark is a single sample per workload; expect ~10–20% run-to-run
+variance. Micro-benchmarks (`make test-bench`) show ~18% geomean speed-up
+across the indexing + search code paths since the windowed-rotation fix
+(largest wins: cold folder index −41%, search path −53%).
 
 Cold index runs once. Every subsequent search hits the warm or dirty path.
-Reproduce with:
+Dirty 1%/10% mutate that fraction of files in place before re-indexing —
+approximates a small PR vs a large refactor.
+
+Reproduce in one shot (self-contained — clones repos, synthesizes folder
+fixtures, emits Markdown table to stdout):
 
 ```bash
-git clone --depth=1 https://github.com/kubernetes/kubernetes /tmp/k8s
-make test-bench-repo SEEK_BENCH_REPO=/tmp/k8s
+./cicd/bench-field.sh                    # all workloads (~10 min, requires linux clone)
+./cicd/bench-field.sh --no-linux         # ~3 min
+./cicd/bench-field.sh --keep             # retain workdir for re-runs
 ```
 
 ### Parallel Safety

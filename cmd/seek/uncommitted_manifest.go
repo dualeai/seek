@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -72,19 +73,31 @@ func writeUncommittedManifest(cacheDir, state string, entries []uncommittedManif
 		State:   state,
 		Files:   sorted,
 	}
-	data, err := json.Marshal(manifest)
-	if err != nil {
-		return err
-	}
 	path := filepath.Join(cacheDir, uncommittedManifestFileName)
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	// Stream via json.Encoder + bufio.Writer instead of json.Marshal +
+	// WriteFile so peak transient allocation stays bounded for large
+	// dirty diffs. Matches writeFolderManifest pattern.
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
 		return err
 	}
 	// On Rename success the tmp path is consumed; the Remove below is a
 	// no-op. On Rename failure (ENOSPC, EBUSY, etc.) we'd otherwise leave a
 	// `.tmp` orphan that future readers might trip over.
 	defer func() { _ = os.Remove(tmp) }()
+	bw := bufio.NewWriter(f)
+	if err := json.NewEncoder(bw).Encode(manifest); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := bw.Flush(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
 	return os.Rename(tmp, path)
 }
 

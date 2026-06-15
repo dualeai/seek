@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc64"
 	"io"
@@ -20,6 +22,7 @@ import (
 	"github.com/sourcegraph/zoekt/query"
 	"golang.org/x/sys/unix"
 )
+
 
 const (
 	// Folder deltas are usually tiny. A smaller shard target reduces Zoekt's
@@ -618,7 +621,13 @@ func indexFolderDocuments(
 			if err == nil {
 				return indexedAny, nil
 			}
-			slog.Debug("Folder delta indexing failed, falling back to full rebuild", "error", err)
+			// Distinguish "delta too large → route to windowed rebuild"
+			// from "Zoekt failed mid-Add" for log clarity.
+			if errors.Is(err, errDeltaPayloadExceedsWindow) {
+				slog.Debug("Folder delta payload exceeds window threshold; full rebuild", "error", err)
+			} else {
+				slog.Debug("Folder delta indexing failed, falling back to full rebuild", "error", err)
+			}
 		} else if shardCount > maxFolderDeltaShards {
 			slog.Debug("Folder delta shard limit reached, falling back to full rebuild", "shards", shardCount)
 		}
@@ -645,7 +654,10 @@ func indexFolderDocumentsDelta(
 	if len(changedDocs) == 0 {
 		return false, fmt.Errorf("folder delta contains only removals")
 	}
-
+	// Note: changedFolderDocumentsFromManifest already short-circuits
+	// on cumulative lstat size >= indexWindowBytes BEFORE any read,
+	// so by here the payload is safe to drive through the single-
+	// builder bulk-Release contract of indexDeltaDocuments.
 	return indexDeltaDocuments(plan.indexDir, repoName, plan.root, changedDocs, folderDeltaShardMax, changedPaths)
 }
 
@@ -657,8 +669,7 @@ func changedFolderDocumentsSinceCachedState(
 	cachedState string,
 ) ([]fileContent, []string, error) {
 	if manifest, ok := readFolderManifest(plan.cacheDir, cachedState); ok {
-		changedDocs, changedPaths := changedFolderDocumentsFromManifest(selected, manifest)
-		return changedDocs, changedPaths, nil
+		return changedFolderDocumentsFromManifest(selected, manifest)
 	}
 
 	oldChecksums, err := enumerateIndexedFolderChecksums(ctx, plan.indexDir, repoName)
@@ -784,26 +795,56 @@ func writeFolderManifest(cacheDir, state string, selected []folderCandidate) err
 			Ino:   candidate.ino,
 		}
 	}
-	data, err := json.Marshal(manifest)
+	path := filepath.Join(cacheDir, folderManifestFileName)
+	tmp := path + ".tmp"
+	// Stream via json.Encoder into bufio.Writer instead of json.Marshal
+	// + WriteFile. For a 1M-entry manifest json.Marshal allocates ~2×
+	// payload (~150 MB) as a single bytes.Buffer; the streaming form
+	// holds at most one bufio (32 KiB) plus per-entry marshal scratch.
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(cacheDir, folderManifestFileName)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	defer func() { _ = os.Remove(tmp) }()
+	bw := bufio.NewWriter(f)
+	if err := json.NewEncoder(bw).Encode(manifest); err != nil {
+		_ = f.Close()
 		return err
 	}
-	defer func() { _ = os.Remove(tmp) }()
+	if err := bw.Flush(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
 	return os.Rename(tmp, path)
 }
 
-func changedFolderDocumentsFromManifest(selected []folderCandidate, manifest folderManifest) ([]fileContent, []string) {
+// changedFolderDocumentsFromManifest diffs selected against manifest
+// and reads only the changed files. Returns errDeltaPayloadExceedsWindow
+// when cumulative lstat size of read candidates reaches indexWindowBytes
+// — caller falls back to the windowed full rebuild.
+func changedFolderDocumentsFromManifest(selected []folderCandidate, manifest folderManifest) ([]fileContent, []string, error) {
 	// Both slices are in scanner order: root entries are sorted, subdirectories
 	// are sorted, and manifests preserve the selected list order.
 	changedDocs := make([]fileContent, 0, 1)
 	changedPaths := make([]string, 0, 1)
 	selectedIndex := 0
 	manifestIndex := 0
+	var estContent int64
+
+	readCandidate := func(candidate folderCandidate) bool {
+		estContent += candidate.size
+		if estContent >= indexWindowBytes {
+			return false
+		}
+		changedPaths = append(changedPaths, candidate.name)
+		if content, err := readFolderFile(candidate); err == nil {
+			changedDocs = append(changedDocs, fileContent{name: candidate.name, content: content})
+		}
+		return true
+	}
 
 	for selectedIndex < len(selected) && manifestIndex < len(manifest.Files) {
 		candidate := selected[selectedIndex]
@@ -811,17 +852,15 @@ func changedFolderDocumentsFromManifest(selected []folderCandidate, manifest fol
 		switch {
 		case candidate.name == old.Name:
 			if !folderManifestFileMatchesCandidate(old, candidate) {
-				changedPaths = append(changedPaths, candidate.name)
-				if content, err := readFolderFile(candidate); err == nil {
-					changedDocs = append(changedDocs, fileContent{name: candidate.name, content: content})
+				if !readCandidate(candidate) {
+					return nil, nil, errDeltaPayloadExceedsWindow
 				}
 			}
 			selectedIndex++
 			manifestIndex++
 		case candidate.name < old.Name:
-			changedPaths = append(changedPaths, candidate.name)
-			if content, err := readFolderFile(candidate); err == nil {
-				changedDocs = append(changedDocs, fileContent{name: candidate.name, content: content})
+			if !readCandidate(candidate) {
+				return nil, nil, errDeltaPayloadExceedsWindow
 			}
 			selectedIndex++
 		default:
@@ -831,17 +870,15 @@ func changedFolderDocumentsFromManifest(selected []folderCandidate, manifest fol
 	}
 
 	for ; selectedIndex < len(selected); selectedIndex++ {
-		candidate := selected[selectedIndex]
-		changedPaths = append(changedPaths, candidate.name)
-		if content, err := readFolderFile(candidate); err == nil {
-			changedDocs = append(changedDocs, fileContent{name: candidate.name, content: content})
+		if !readCandidate(selected[selectedIndex]) {
+			return nil, nil, errDeltaPayloadExceedsWindow
 		}
 	}
 
 	for ; manifestIndex < len(manifest.Files); manifestIndex++ {
 		changedPaths = append(changedPaths, manifest.Files[manifestIndex].Name)
 	}
-	return changedDocs, changedPaths
+	return changedDocs, changedPaths, nil
 }
 
 func folderManifestFileMatchesCandidate(file folderManifestEntry, candidate folderCandidate) bool {
@@ -944,7 +981,9 @@ func appendFolderFingerprintBytes(h *xxhash.Digest, part []byte) {
 //
 // Each yielded fileContent carries a weight (= candidate.size pre-read)
 // on the readSemaphore. The consumer MUST Release that weight after
-// builder.Finish() returns. Abandoning the channel without draining
+// the builder.Finish() that buffered the doc returns — see fileContent's
+// doc in indexer.go for the per-window vs per-call Release contract.
+// Abandoning the channel without draining
 // would hang workers blocked on send until ctx cancellation.
 //
 // Synchronous folder-delta reads via readFolderFile DO NOT go through
@@ -1001,17 +1040,6 @@ func readOneFolderFileStreaming(ctx context.Context, candidate folderCandidate, 
 		// guard here to avoid acquiring weight we cannot honor.
 		return
 	}
-	if size > maxInFlightBytes {
-		// Defensive: caps.go enforces size <= maxFolderFileSize,
-		// and the compile-time invariant guarantees maxFolderFileSize
-		// (= maxIndexedDocumentBytes) <= maxInFlightBytes via
-		// inFlightHeadroomFiles. Guard against future cap drift
-		// hanging Acquire forever (golang/go#59002).
-		slog.Warn("Folder file exceeds in-flight memory ceiling, skipping",
-			"path", candidate.name, "size", size)
-		return
-	}
-
 	weight := size
 	if err := readSemaphore.Acquire(ctx, weight); err != nil {
 		return // ctx cancelled.

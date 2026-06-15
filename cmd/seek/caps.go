@@ -33,36 +33,46 @@ const (
 	maxFolderFileSize     = maxIndexedDocumentBytes
 	maxFolderIndexedBytes = maxCorpusIndexedBytes
 
-	// inFlightHeadroomFiles sets how many max-sized files may be resident
-	// in reader buffers concurrently. The readSemaphore budget is derived
-	// from this so bumping maxIndexedDocumentBytes automatically scales
-	// the in-flight ceiling.
-	//
-	// 6 means at most six max-sized reads can sit between the reader
-	// pool and Zoekt's builder. Smaller → tighter ceiling, more Acquire
-	// blocks under bursts of large files. Larger → looser ceiling, more
-	// peak RSS under those bursts.
-	inFlightHeadroomFiles = 6
-
 	// maxInFlightBytes bounds total bytes resident in reader buffers
-	// across all reader workers (Git dirty + folder candidates). Acquire
-	// on the reader side; release in the consumer (indexDocuments /
-	// indexDeltaDocuments) strictly after builder.Finish() returns,
-	// because Zoekt's async shard writers retain Content references
-	// until then (zoekt/index/builder.go:659-667 — Finish calls
-	// b.building.Wait() before returning).
-	maxInFlightBytes = inFlightHeadroomFiles * maxIndexedDocumentBytes
+	// across all reader workers. Acquired in readers, Released by the
+	// consumer after the Builder.Finish() that buffered the doc — see
+	// fileContent for the per-doc Release contract.
+	maxInFlightBytes = 6 * maxIndexedDocumentBytes
+
+	// defaultIndexWindowBytes caps doc weight per windowed rotation in
+	// indexDocuments. Half of maxInFlightBytes leaves headroom for one
+	// max-sized reader Acquire to fit alongside a fully-pending window.
+	defaultIndexWindowBytes = maxInFlightBytes / 2
 )
 
-// Compile-time invariant: a single max-sized file must fit within the
-// in-flight budget, otherwise Acquire(maxIndexedDocumentBytes) would
-// block forever under a non-cancellable context (golang/go#59002). The
-// cast to uint underflows at compile time if the difference is negative.
+// indexWindowBytes is the live rotation threshold consumed by
+// indexDocuments. Var (not const) so tests can shrink it via
+// swapIndexWindowBytesForTest under testReadSemMu — production
+// callers treat as read-only.
+var indexWindowBytes int64 = defaultIndexWindowBytes
+
+// Compile-time invariant: a single max-sized file fits within the
+// in-flight budget. Without this, a max-sized Acquire could block
+// forever on a non-cancellable context (golang/go#59002). The uint
+// cast underflows at compile time if the difference is negative.
 const _ = uint(maxInFlightBytes - maxIndexedDocumentBytes)
+
+// Compile-time windowed-fit invariant: the consumer's pending window
+// plus the tipping doc plus one in-rotation reader Acquire (= 2 ×
+// maxIndexedDocumentBytes) must fit within maxInFlightBytes,
+// otherwise the reader wedges while the consumer is in Finish.
+const _ = uint(maxInFlightBytes - (defaultIndexWindowBytes + 2*maxIndexedDocumentBytes))
 
 var (
 	errGitCapExceeded    = errors.New("git cap exceeded")
 	errFolderCapExceeded = errors.New("folder cap exceeded")
+
+	// errDeltaPayloadExceedsWindow fires when a delta (working-tree
+	// dirty set OR folder-manifest changed set) would exceed
+	// indexWindowBytes. Both sites route through a windowed full
+	// rebuild via indexDocuments rather than holding the whole payload
+	// in indexDeltaDocuments's single terminal Finish.
+	errDeltaPayloadExceedsWindow = errors.New("delta payload exceeds window threshold")
 )
 
 type indexCapExceededError struct {

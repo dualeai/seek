@@ -36,6 +36,7 @@ func withReadSemLock(t *testing.T) (before int64, finalize func()) {
 	testReadSemMu.Lock()
 	before = availableWeight(readSemaphore)
 	finalize = func() {
+		t.Helper()
 		defer testReadSemMu.Unlock()
 		after := availableWeight(readSemaphore)
 		if after != before {
@@ -181,8 +182,14 @@ func TestIndexDeltaDocuments_BuilderInitFail_ReleasesWeight(t *testing.T) {
 }
 
 // TestIndexDocuments_StressNoLeakUnderRace — race-detector load test:
-// hammer the reader→consumer pipeline with many small files and
-// assert the semaphore returns to its starting available weight.
+// hammer the reader→consumer pipeline with many files whose cumulative
+// content exceeds a test-local semaphore budget so back-pressure is
+// actually exercised (the original 200 × 12 B fixture sat 400 000×
+// below the production ceiling and never tripped the wedge).
+//
+// Uses swapReadSemaphoreForTest so the test stays cheap (~12 MiB of
+// payload) while still driving Acquire queueing through the real
+// production consumer (indexDocuments).
 func TestIndexDocuments_StressNoLeakUnderRace(t *testing.T) {
 	if testing.Short() {
 		t.Skip("stress test skipped in -short")
@@ -190,16 +197,26 @@ func TestIndexDocuments_StressNoLeakUnderRace(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
 	}
-	_, done := withReadSemLock(t)
-	defer done()
+	testReadSemMu.Lock()
+	defer testReadSemMu.Unlock()
 
-	const numFiles = 200
+	const testBudget int64 = 4 * 1024 * 1024 // 4 MiB
+	const fileSize = 256 * 1024              // 256 KiB → 12 MiB total > budget
+	const numFiles = 48
+	restore := swapReadSemaphoreForTest(testBudget)
+	defer restore()
+	defer goroutineLeakGuard(t, 60*time.Second)()
+
 	dir := t.TempDir()
 	files := make([]string, numFiles)
+	payload := make([]byte, fileSize)
+	for i := range payload {
+		payload[i] = byte('a' + i%26)
+	}
 	for i := range numFiles {
 		name := testFileName("f", i)
 		files[i] = name
-		if err := os.WriteFile(filepath.Join(dir, name), []byte("package x\n"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, name), payload, 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -208,6 +225,9 @@ func TestIndexDocuments_StressNoLeakUnderRace(t *testing.T) {
 	indexDir := t.TempDir()
 	if _, err := indexDocuments(t.Context(), indexDir, "stress_repo", dir, fileCh, 8); err != nil {
 		t.Fatalf("indexDocuments: %v", err)
+	}
+	if got := availableWeight(readSemaphore); got != testBudget {
+		t.Fatalf("semaphore leak: got=%d want=%d", got, testBudget)
 	}
 }
 
@@ -306,11 +326,17 @@ func TestReader_SymlinkRejected_NoLeak(t *testing.T) {
 	}
 }
 
-// TestSemaphore_Saturation_AllFilesEventuallyIndexed — concurrent
-// in-flight bytes exceed the readSemaphore budget. The semaphore
-// must queue Acquires so every file is eventually delivered: no
-// deadlock, no leak, no file dropped, and observable peak concurrent
-// in-flight files is bounded by budget / fileSize.
+// TestReader_BackPressureQueuesAcquires — focused unit on
+// readFilesToChannel's contract: when concurrent in-flight bytes
+// exceed the budget, the reader pool queues Acquires correctly and
+// every file eventually delivered through the channel pipeline. The
+// CONSUMER here is a fake fan-out pool that Releases per-doc — NOT
+// the production indexDocuments consumer (which Releases per shard
+// window). Don't confuse this for an end-to-end semaphore test.
+//
+// For full reader → production consumer coverage under back-pressure,
+// see TestEnsureFolderCorpusFresh_ManySmallFilesOverBudget (E2E) and
+// TestIndexDocuments_StallsHoldingMoreThanBudget (consumer-only).
 //
 // Uses a TEST-LOCAL semaphore (swapReadSemaphoreForTest) with a
 // small budget so we can force queueing without writing hundreds of
@@ -320,7 +346,7 @@ func TestReader_SymlinkRejected_NoLeak(t *testing.T) {
 //
 // All bounds derive from `testBudget` and `fileSize` so the
 // assertions remain self-consistent if these constants are tuned.
-func TestSemaphore_Saturation_AllFilesEventuallyIndexed(t *testing.T) {
+func TestReader_BackPressureQueuesAcquires(t *testing.T) {
 	if testing.Short() {
 		t.Skip("saturation test writes ~64 MiB to disk; skipped in -short")
 	}
@@ -400,13 +426,72 @@ func TestSemaphore_Saturation_AllFilesEventuallyIndexed(t *testing.T) {
 
 // swapReadSemaphoreForTest replaces the package-level readSemaphore
 // with a fresh one of the given budget for the test's lifetime.
-// Caller MUST hold testReadSemMu so the swap is observed atomically
-// by sequential accounting tests. Returns the restore function the
-// caller defers.
+// Caller MUST hold testReadSemMu — both for accounting comparisons
+// AND for the swap itself: production goroutines reading readSemaphore
+// concurrently with this reassignment would be a data race. Tests
+// that use this helper are serialized by the lock by convention.
+//
+// Also shrinks indexWindowBytes proportionally so shardWindow rotation
+// in indexDocuments triggers at the new (smaller) budget. Without
+// this, rotation would not fire until defaultIndexWindowBytes of weight
+// accumulated and tests using small synthesised budgets would still
+// deadlock.
 func swapReadSemaphoreForTest(budget int64) func() {
+	mustHoldTestReadSemMu()
 	old := readSemaphore
 	readSemaphore = semaphore.NewWeighted(budget)
-	return func() { readSemaphore = old }
+	restoreWindow := swapIndexWindowBytesForTest(budget / 2)
+	return func() {
+		restoreWindow()
+		readSemaphore = old
+	}
+}
+
+// mustHoldTestReadSemMu panics if testReadSemMu is not held by some
+// goroutine. Catches the "forgot the lock" bug that would silently
+// race readSemaphore swaps with concurrent production reads if a
+// future test added t.Parallel(). TryLock is reverse-logic: success
+// means nobody held the lock when we tried.
+func mustHoldTestReadSemMu() {
+	if testReadSemMu.TryLock() {
+		testReadSemMu.Unlock()
+		panic("swap helpers require testReadSemMu held by caller")
+	}
+}
+
+// swapIndexWindowBytesForTest sets the windowed-indexer rotation
+// threshold for the duration of a test. Pair with swapReadSemaphoreForTest
+// so the invariant indexWindowBytes + maxIndexedDocumentBytes <=
+// semaphore budget still holds in the test scope.
+//
+// Caller MUST hold testReadSemMu for the entire swap → action → restore
+// sequence.
+func swapIndexWindowBytesForTest(window int64) func() {
+	mustHoldTestReadSemMu()
+	old := indexWindowBytes
+	indexWindowBytes = window
+	return func() { indexWindowBytes = old }
+}
+
+// setupPressureTest bundles the boilerplate every pressure test repeats:
+// require ctags, hold testReadSemMu, swap the readSemaphore + window
+// budget, arm the goroutine-leak watchdog. Returns the restore func to
+// defer. Use:
+//
+//	defer setupPressureTest(t, testBudget, 60*time.Second)()
+func setupPressureTest(t *testing.T, budget int64, leakDeadline time.Duration) func() {
+	t.Helper()
+	if err := checkCtagsCached(); err != nil {
+		t.Skipf("ctags required: %v", err)
+	}
+	testReadSemMu.Lock()
+	restoreSem := swapReadSemaphoreForTest(budget)
+	guardCleanup := goroutineLeakGuard(t, leakDeadline)
+	return func() {
+		guardCleanup()
+		restoreSem()
+		testReadSemMu.Unlock()
+	}
 }
 
 // TestFolderReader_FileGrew_NoLeak — when readFolderFile detects the

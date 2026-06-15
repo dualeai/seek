@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -162,14 +163,46 @@ func executeParsedSearchScoped(ctx context.Context, indexDir string, userQ query
 		return cloneFileMatches(result.Files), nil
 	}
 
-	// Multiple shards: search each and merge results.
+	// Multiple shards: fan out across goroutines bounded by NumCPU.
+	// Sequential iteration cost grows linearly with shard count, which
+	// the windowed indexer's rotation can drive into the hundreds for
+	// multi-GiB corpora. Parallel dispatch turns the per-shard query
+	// cost from sum-of-shards into max-of-shards (up to GOMAXPROCS).
+	parallelism := runtime.NumCPU()
+	if parallelism < 1 {
+		parallelism = 1
+	}
+	if parallelism > len(searchers) {
+		parallelism = len(searchers)
+	}
+	type shardResult struct {
+		files []zoekt.FileMatch
+		err   error
+	}
+	results := make([]shardResult, len(searchers))
+	sem := make(chan struct{}, parallelism)
+	var wg sync.WaitGroup
+	for i, s := range searchers {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, s zoekt.Searcher) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			r, err := s.Search(ctx, q, &searchOpts)
+			if err != nil {
+				results[i] = shardResult{err: err}
+				return
+			}
+			results[i] = shardResult{files: r.Files}
+		}(i, s)
+	}
+	wg.Wait()
 	var allFiles []zoekt.FileMatch
-	for _, s := range searchers {
-		result, err := s.Search(ctx, q, &searchOpts)
-		if err != nil {
-			return nil, fmt.Errorf("search: %w", err)
+	for _, r := range results {
+		if r.err != nil {
+			return nil, fmt.Errorf("search: %w", r.err)
 		}
-		allFiles = append(allFiles, result.Files...)
+		allFiles = append(allFiles, r.files...)
 	}
 	return cloneFileMatches(allFiles), nil
 }
