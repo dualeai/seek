@@ -8,6 +8,12 @@ import (
 	"time"
 )
 
+// defaultLeakTimeout is the watchdog budget used by light-weight pool
+// tests (no real indexing, no real corpus pressure). Tests that
+// exercise indexing, semaphore pressure, or large fixtures pass an
+// explicit longer duration directly.
+const defaultLeakTimeout = 10 * time.Second
+
 // goroutineLeakGuard arms a deadlock watchdog and a goroutine-leak
 // checker around a streaming test.
 //

@@ -145,7 +145,7 @@ func fireOpportunisticGC(runFn func(context.Context), timeout time.Duration) {
 func runOpportunisticGC(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Warn("gc panic", "err", r)
+			slog.Warn("gc panic", "error", r)
 		}
 	}()
 	cfg := gcConfigFromEnv()
@@ -171,7 +171,7 @@ func runOpportunisticGC(ctx context.Context) {
 func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 	cacheRoot, err := seekUserCacheRoot()
 	if err != nil {
-		slog.Debug("gc skipped: cannot resolve cache root", "err", err)
+		slog.Debug("gc skipped: cannot resolve cache root", "error", err)
 		return
 	}
 
@@ -183,7 +183,7 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 	}
 
 	if err := os.MkdirAll(cacheRoot, 0o755); err != nil {
-		slog.Debug("gc skipped: cannot create cache root", "err", err)
+		slog.Debug("gc skipped: cannot create cache root", "error", err)
 		return
 	}
 
@@ -195,7 +195,7 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 	gcLockPath := filepath.Join(cacheRoot, gcLockFile)
 	lockFd, err := os.OpenFile(gcLockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		slog.Debug("gc skipped: cannot open gc lock", "err", err)
+		slog.Debug("gc skipped: cannot open gc lock", "error", err)
 		return
 	}
 	defer func() {
@@ -216,7 +216,7 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 	corporaPath := filepath.Join(cacheRoot, corporaDir)
 	trashPath := filepath.Join(corporaPath, gcTrashDir)
 	if err := os.MkdirAll(trashPath, 0o755); err != nil {
-		slog.Warn("gc cannot create trash dir", "err", err)
+		slog.Warn("gc cannot create trash dir", "error", err)
 		return
 	}
 
@@ -227,7 +227,7 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 
 	entries, err := enumerateCorpusDirs(corporaPath)
 	if err != nil {
-		slog.Warn("gc cannot enumerate corpora", "err", err)
+		slog.Warn("gc cannot enumerate corpora", "error", err)
 		// Still update stamp to throttle next attempt.
 		touchStamp(cacheRoot)
 		return
@@ -277,9 +277,9 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 		}
 		switch res.action {
 		case actionFailed:
-			slog.Warn("gc eviction failed", "corpus", e.name, "err", res.err)
+			slog.Warn("gc eviction failed", "corpus", e.name, "error", res.err)
 		case actionTrashed:
-			slog.Warn("gc partial eviction", "corpus", e.name, "err", res.err)
+			slog.Warn("gc partial eviction", "corpus", e.name, "error", res.err)
 		}
 		if streaming {
 			renderGCRow(opts.writer, e, info, size, now, res.String())
@@ -600,7 +600,7 @@ func drainTrash(trashDir string) {
 	}
 	for _, ent := range entries {
 		if err := os.RemoveAll(filepath.Join(trashDir, ent.Name())); err != nil {
-			slog.Warn("gc drain trash entry", "entry", ent.Name(), "err", err)
+			slog.Warn("gc drain trash entry", "entry", ent.Name(), "error", err)
 		}
 	}
 }
@@ -630,6 +630,6 @@ func touchUsed(cacheDir string) {
 	// File missing (or chtimes failed): create via atomic tmp+rename so
 	// concurrent touches don't trample each other.
 	if err := writeCacheFile(cacheDir, usedFile, ""); err != nil {
-		slog.Debug("touch used failed", "cache_dir", cacheDir, "err", err)
+		slog.Debug("touch used failed", "cache_dir", cacheDir, "error", err)
 	}
 }

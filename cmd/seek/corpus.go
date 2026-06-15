@@ -29,8 +29,13 @@ const (
 	rootTypeDirectory rootType = "directory"
 	rootTypeFile      rootType = "file"
 
-	seekIndexGeneration       = "v2"
-	seekCacheLayoutVersion    = "v2"
+	seekIndexGeneration = "v2"
+	// v3 bumped when the "git-boundary" namespace marker landed: it
+	// changes the folder state-hash formula for any parent containing
+	// nested git repos. Without the bump, users upgrading would inherit
+	// a stale state file and miss discovery's effect on the indexed
+	// byte budget.
+	seekCacheLayoutVersion    = "v3"
 	seekDocumentNamingVersion = "slash-relative-v1"
 	zoektCompatibilityVersion = "zoekt-a0f5789d25cb"
 )
@@ -45,6 +50,18 @@ type corpusPlan struct {
 	indexDir    string
 	scope       query.Q
 	gitPaths    *gitPaths
+	// userExplicit distinguishes plans the user asked for on the CLI
+	// (failure is fatal) from plans the folder walker discovered via
+	// nested-git detection (failure is logged + skipped). The pool
+	// worker wrapper honours the policy at corpus_pool.go:Enqueue.
+	userExplicit bool
+	// discover is the dynamic-enqueue callback the corpusPool installs
+	// on folder plans before invoking the worker. The walker calls
+	// discover(boundary) when detectGitBoundary confirms a nested git
+	// repo; the callback returns true when the boundary was accepted
+	// into the pool (false on dedup, cap, or build failure). nil means
+	// discovery is disabled for this plan.
+	discover func(gitBoundary) bool
 }
 
 type corpusSearchResult struct {
@@ -70,6 +87,7 @@ func planCorpora(ctx context.Context, paths *gitPaths, operands []string) ([]cor
 		if err != nil {
 			return nil, err
 		}
+		plan.userExplicit = true
 		return []corpusPlan{plan}, nil
 	}
 
@@ -110,6 +128,12 @@ func planCorpora(ctx context.Context, paths *gitPaths, operands []string) ([]cor
 
 	if len(plans) == 0 {
 		return nil, fmt.Errorf("no searchable corpus")
+	}
+	// Every plan that flows out of planCorpora was explicitly requested
+	// on the CLI; failures must abort the search. planDiscoveredGitCorpus
+	// deliberately leaves userExplicit=false on walker-discovered plans.
+	for i := range plans {
+		plans[i].userExplicit = true
 	}
 	return plans, nil
 }
@@ -180,6 +204,13 @@ func resolveExternalGitOperand(ctx context.Context, canonical string, info os.Fi
 	if !info.IsDir() {
 		dir = filepath.Dir(canonical)
 	}
+	if b, status := detectGitBoundary(dir, ""); status == boundaryConfirmed {
+		paths := b.toGitPaths()
+		if pathWithin(canonicalCorpusPath(paths.RepoDir), canonical) {
+			return paths, true
+		}
+		return gitPaths{}, false
+	}
 	paths, err := resolveGitPaths(ctx, dir)
 	if err != nil {
 		return gitPaths{}, false
@@ -243,17 +274,47 @@ func coveredByExternalDir(path string, roots []externalRoot) bool {
 	return false
 }
 
-func planCurrentGitCorpus(paths gitPaths) (corpusPlan, error) {
-	root := canonicalCorpusPath(paths.RepoDir)
-	commonDir := canonicalCorpusPath(paths.CommonDir)
-	plan, err := newCorpusPlan(
+// buildGitCorpusPlan is the shared constructor for both the
+// explicit-operand path (planCurrentGitCorpus) and the walker-discovery
+// path (planDiscoveredGitCorpus). Both flows mint a corpus with the
+// same identity (kind, root, dev:ino) so the same physical repo
+// reached via multiple paths — e.g. CLI operand AND walker
+// discovery — collapses to one cache dir.
+//
+// rootTypeWorktree is the convention regardless of the on-disk
+// layout: the corpus models the working tree, not the .git layout.
+// Using gitBoundary.Mode (which can be rootTypeDirectory for a normal
+// .git/ repo) would mint a different corpusID and defeat dedup.
+func buildGitCorpusPlan(repoDir, commonDir string) (corpusPlan, error) {
+	root := canonicalCorpusPath(repoDir)
+	cdir := canonicalCorpusPath(commonDir)
+	return newCorpusPlan(
 		corpusKindGit,
 		rootTypeWorktree,
 		root,
 		"git",
 		"git_worktree", root,
-		"git_common_dir", commonDir,
+		"git_common_dir", cdir,
 	)
+}
+
+// planDiscoveredGitCorpus builds a plan for a repo the folder walker
+// found mid-flight via detectGitBoundary. userExplicit stays at zero
+// value (false) so the pool's worker wrapper logs and swallows failures
+// instead of aborting the user's search. gitPaths is derived from the
+// boundary without a subprocess.
+func planDiscoveredGitCorpus(b gitBoundary) (corpusPlan, error) {
+	plan, err := buildGitCorpusPlan(b.RepoDir, b.CommonDir)
+	if err != nil {
+		return corpusPlan{}, err
+	}
+	paths := b.toGitPaths()
+	plan.gitPaths = &paths
+	return plan, nil
+}
+
+func planCurrentGitCorpus(paths gitPaths) (corpusPlan, error) {
+	plan, err := buildGitCorpusPlan(paths.RepoDir, paths.CommonDir)
 	if err != nil {
 		return corpusPlan{}, err
 	}

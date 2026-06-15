@@ -127,7 +127,7 @@ func FuzzReadOneFolderFileStreaming_Sizes(f *testing.F) {
 			readSemaphore.Release(fc.weight)
 		}
 		switch {
-		case size > int64(maxFolderFileSize):
+		case size > int64(maxIndexedDocumentBytes):
 			if sent != 0 {
 				t.Fatalf("oversize candidate must be skipped, got sent=%d", sent)
 			}

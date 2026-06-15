@@ -271,33 +271,12 @@ func run(ctx context.Context, pattern string, pathOperands []string, limit, maxM
 		return err
 	}
 
-	var allResults []corpusSearchResult
-	dirtyByCorpus := make(dirtyFilesByCorpus)
-
-	for _, plan := range plans {
-		// Per-plan cancellation so any stray goroutine wedged inside
-		// prepareAndSearchCorpus (e.g. an indexer blocked on a shared
-		// process resource) is signalled to unwind before plan N+1
-		// starts. Defense in depth — windowed indexDocuments already
-		// prevents the historical semaphore deadlock, but a per-plan
-		// cancel keeps a future regression from leaking budget across
-		// plans (readSemaphore is a process-global).
-		//
-		// Wrapped in a func + defer cancelPlan so a panic in
-		// prepareAndSearchCorpus still releases the context — an
-		// unwrapped cancelPlan() at the bottom would leak on panic.
-		results, dirtyFiles, err := func() ([]corpusSearchResult, dirtyFileSet, error) {
-			planCtx, cancelPlan := context.WithCancel(ctx)
-			defer cancelPlan()
-			return prepareAndSearchCorpus(planCtx, plan, paths, userQ)
-		}()
-		if err != nil {
-			return err
-		}
-		if len(dirtyFiles) > 0 {
-			dirtyByCorpus[plan.id] = dirtyFiles
-		}
-		allResults = append(allResults, results...)
+	worker := func(wctx context.Context, plan corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
+		return prepareAndSearchCorpus(wctx, plan, paths, userQ)
+	}
+	allResults, dirtyByCorpus, err := runCorpusPool(ctx, plans, worker)
+	if err != nil {
+		return err
 	}
 
 	if len(allResults) == 0 {
@@ -306,8 +285,15 @@ func run(ctx context.Context, pattern string, pathOperands []string, limit, maxM
 
 	// Formatting returns "" when all results were stale committed
 	// matches for dirty files — treat as no match (exit code 1).
+	//
+	// Show corpus context when results come from more than one source.
+	// Counting seeded plans alone misses corpora that the folder walker
+	// discovered dynamically (nested git repos), so users searching a
+	// single parent dir would see relative paths with no clue which
+	// nested repo each match came from. Count unique corpusIDs in the
+	// merged result set instead.
 	displayMode := hideCorpusContext
-	if len(plans) > 1 {
+	if len(plans) > 1 || corporaInResults(allResults) > 1 {
 		displayMode = showCorpusContext
 	}
 	output := formatCorpusResultsWithContext(allResults, dirtyByCorpus, limit, maxMatches, displayMode)
@@ -370,6 +356,22 @@ func prepareAndSearchCorpus(
 	}
 	touchUsed(plan.cacheDir)
 	return wrapCorpusResults(plan, files), dirtyFiles, nil
+}
+
+// corporaInResults counts the distinct corpusIDs represented in the
+// merged result set. Used to decide whether to render corpus-context
+// prefixes — when discovery surfaces multiple nested git corpora under
+// a single seeded folder operand, len(plans) alone reports 1 but the
+// user still sees matches from N sources and needs them disambiguated.
+func corporaInResults(results []corpusSearchResult) int {
+	if len(results) == 0 {
+		return 0
+	}
+	seen := make(map[corpusID]struct{}, 4)
+	for _, r := range results {
+		seen[r.corpusID] = struct{}{}
+	}
+	return len(seen)
 }
 
 func dirtyFileSetFromState(state repoState) dirtyFileSet {

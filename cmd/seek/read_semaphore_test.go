@@ -62,12 +62,10 @@ func availableWeight(sem *semaphore.Weighted) int64 {
 
 // TestReader_OversizeCandidate_NoSemaphoreTouch — a synthetic
 // candidate larger than every per-file cap must be skipped without
-// ever touching the semaphore. Under current derivation
-// (`maxInFlightBytes = inFlightHeadroomFiles * maxIndexedDocumentBytes`,
-// `maxFolderFileSize = maxIndexedDocumentBytes`), the
-// maxFolderFileSize guard fires first; the maxInFlightBytes branch
-// is defense-in-depth against future drift. Either branch must
-// leave the semaphore untouched.
+// ever touching the semaphore. The maxIndexedDocumentBytes guard
+// fires first; the maxInFlightBytes branch is defense-in-depth
+// against future drift. Either branch must leave the semaphore
+// untouched.
 func TestReader_OversizeCandidate_NoSemaphoreTouch(t *testing.T) {
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
@@ -77,7 +75,7 @@ func TestReader_OversizeCandidate_NoSemaphoreTouch(t *testing.T) {
 	out := make(chan fileContent, 1)
 
 	// Larger than the in-flight ceiling. Production also rejects via
-	// the maxFolderFileSize guard, which fires first; either branch
+	// the maxIndexedDocumentBytes guard, which fires first; either branch
 	// must skip the file without Acquiring weight.
 	c := folderCandidate{
 		name: "huge",

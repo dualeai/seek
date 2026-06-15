@@ -631,10 +631,9 @@ func TestIndexBuildOptions_AlignsSharedIndexBudgets(t *testing.T) {
 	if opts.SizeMax != maxIndexedDocumentBytes {
 		t.Fatalf("SizeMax=%d, want %d", opts.SizeMax, maxIndexedDocumentBytes)
 	}
-	if maxFolderFileSize != maxIndexedDocumentBytes || maxGitDirtyFileSize != maxIndexedDocumentBytes {
+	if maxGitDirtyFileSize != maxIndexedDocumentBytes {
 		t.Fatalf(
-			"read limits must match Zoekt SizeMax: folder=%d gitDirty=%d sizeMax=%d",
-			maxFolderFileSize,
+			"git-dirty read limit must match Zoekt SizeMax: gitDirty=%d sizeMax=%d",
 			maxGitDirtyFileSize,
 			maxIndexedDocumentBytes,
 		)

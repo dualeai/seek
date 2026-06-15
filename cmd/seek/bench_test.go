@@ -2162,3 +2162,80 @@ func BenchmarkWriteFolderManifest_100k(b *testing.B) {
 		}
 	}
 }
+
+// --- Detector hot-path benchmarks (PR1 walker-overhead regression gates) ---
+
+func benchSetupValidGitDir(b *testing.B, root string) {
+	b.Helper()
+	gitDir := filepath.Join(root, ".git")
+	for _, sub := range []string{"objects", "refs"} {
+		if err := os.MkdirAll(filepath.Join(gitDir, sub), 0o755); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		b.Fatal(err)
+	}
+}
+
+// BenchmarkDetectGitBoundary_NotBoundary measures the walker hot path:
+// detection on a directory that contains no `.git` entry. This is the
+// common case (most subdirs are NOT repos). Allocs/op must stay low —
+// regression gate per plan §J'.
+func BenchmarkDetectGitBoundary_NotBoundary(b *testing.B) {
+	root := b.TempDir()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, status := detectGitBoundary(root, root)
+		if status != notBoundary {
+			b.Fatalf("status=%v", status)
+		}
+	}
+}
+
+// BenchmarkDetectGitBoundary_DirForm measures L1+L2a confirmed path:
+// dir-form `.git/` with valid HEAD+objects+refs triad.
+func BenchmarkDetectGitBoundary_DirForm(b *testing.B) {
+	root := b.TempDir()
+	benchSetupValidGitDir(b, root)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, status := detectGitBoundary(root, root)
+		if status != boundaryConfirmed {
+			b.Fatalf("status=%v", status)
+		}
+	}
+}
+
+// BenchmarkDetectGitBoundary_WorktreeFile measures L2b path: streaming
+// `.git` file parse + commondir lookup.
+func BenchmarkDetectGitBoundary_WorktreeFile(b *testing.B) {
+	root := b.TempDir()
+	realGitDir := filepath.Join(root, "real-git")
+	gitDir := realGitDir
+	for _, sub := range []string{"objects", "refs"} {
+		if err := os.MkdirAll(filepath.Join(gitDir, sub), 0o755); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		b.Fatal(err)
+	}
+	worktree := filepath.Join(root, "wt")
+	if err := os.MkdirAll(worktree, 0o755); err != nil {
+		b.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: "+realGitDir+"\n"), 0o644); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, status := detectGitBoundary(worktree, root)
+		if status != boundaryConfirmed {
+			b.Fatalf("status=%v", status)
+		}
+	}
+}

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -42,5 +44,44 @@ func FuzzExtractV2Path(f *testing.F) {
 		}
 		// Must never panic
 		_ = extractV2Path(entry, skipFields)
+	})
+}
+
+// FuzzDetectGitBoundary feeds random bytes as the contents of a `.git`
+// worktree pointer file. detectGitBoundary must never panic and must never
+// OOM regardless of input. The fixture filesystem is reused across fuzz
+// inputs to amortize setup cost.
+func FuzzDetectGitBoundary(f *testing.F) {
+	f.Add([]byte("gitdir: ./real-git\n"))
+	f.Add([]byte("gitdir: /absolute/path\n"))
+	f.Add([]byte("gitdir: ./real-git\r\n"))
+	f.Add([]byte(""))
+	f.Add([]byte("not-a-pointer"))
+	f.Add([]byte("gitdir:\n"))
+	f.Add([]byte("\x00\x00\x00"))
+	f.Add([]byte("gitdir:    ../with-spaces   \n"))
+
+	f.Fuzz(func(t *testing.T, payload []byte) {
+		root := t.TempDir()
+		realGitDir := filepath.Join(root, "real-git")
+		// Build a valid triad so a well-formed pointer can resolve.
+		if err := os.MkdirAll(filepath.Join(realGitDir, "objects"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(realGitDir, "refs"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(realGitDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		worktree := filepath.Join(root, "wt")
+		if err := os.MkdirAll(worktree, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(worktree, ".git"), payload, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = detectGitBoundary(worktree, root)
 	})
 }

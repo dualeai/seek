@@ -297,9 +297,6 @@ func TestResolveGitPaths_Worktree(t *testing.T) {
 	if paths.CommonDir != filepath.Join(resolvedRepoDir, ".git") {
 		t.Fatalf("expected common git dir %q, got %q", filepath.Join(resolvedRepoDir, ".git"), paths.CommonDir)
 	}
-	if !strings.HasSuffix(paths.ExcludePath, "/info/exclude") {
-		t.Fatalf("expected git exclude path, got %q", paths.ExcludePath)
-	}
 	if paths.ConfigPath != filepath.Join(resolvedRepoDir, ".git", "config") {
 		t.Fatalf("expected shared config path %q, got %q", filepath.Join(resolvedRepoDir, ".git", "config"), paths.ConfigPath)
 	}
@@ -1060,8 +1057,8 @@ func TestRun_ExternalFolderCapErrorDoesNotSearchStaleShards(t *testing.T) {
 		t.Fatalf("initial run: %v", err)
 	}
 
-	size := int64(maxFolderFileSize)
-	count := maxFolderIndexedBytes/maxFolderFileSize + 1
+	size := int64(maxIndexedDocumentBytes)
+	count := maxFolderIndexedBytes/maxIndexedDocumentBytes + 1
 	for i := range count {
 		path := filepath.Join(folder, fmt.Sprintf("large_%03d.bin", i))
 		if err := os.WriteFile(path, nil, 0o644); err != nil {
@@ -1389,5 +1386,97 @@ func TestIntegration_Worktree_DirtyFile(t *testing.T) {
 	}
 	if len(files) == 0 {
 		t.Fatal("FRESHNESS VIOLATION: uncommitted edit inside worktree not found")
+	}
+}
+
+// TestRun_NestedRepoVenvNotLeakedToParent — end-to-end regression
+// guard for the .venv leak bug (95156aa). User searches a PARENT
+// folder containing a nested git repo whose .gitignore excludes
+// `.venv/`. The walker must discover the nested repo as a boundary
+// and carve out its subtree from the parent folder corpus; the
+// nested git corpus must respect .gitignore (gitindex.IndexGitRepo
+// only indexes tracked files). Net: search must NOT match anything
+// inside .venv.
+//
+// Pre-fix bug: walker descended into the nested repo on the second
+// pass (state pass, after fingerprint pass had already enqueued the
+// boundary), and the parent folder corpus ate the whole working tree
+// including .venv content. Today's TestDedupHitMustSuppressDescent
+// catches it at the mid-layer (newTestPool + scanFolderCorpus); this
+// test exercises the same contract through the production run() path
+// so a regression in main.go's pool wiring or in the walker's
+// fingerprint-vs-state-pass interplay surfaces here.
+func TestRun_NestedRepoVenvNotLeakedToParent(t *testing.T) {
+	parent := t.TempDir()
+	nested := filepath.Join(parent, "nested-repo")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Real git init + commit so the boundary detector confirms.
+	gitRunIn(t, nested, "init", "-q")
+	gitRunIn(t, nested, "config", "user.email", "test@example.com")
+	gitRunIn(t, nested, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(nested, ".gitignore"), []byte(".venv/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "src.go"), []byte("package main\n// regular src\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, nested, "add", ".")
+	gitRunIn(t, nested, "commit", "-q", "-m", "initial")
+
+	// Plant gitignored content with a unique marker that we will
+	// search for. If the walker descends into nested-repo under the
+	// PARENT corpus, this file gets indexed and the search will hit.
+	venvDir := filepath.Join(nested, ".venv")
+	if err := os.MkdirAll(venvDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const marker = "zzz_venv_leak_marker_zzz"
+	if err := os.WriteFile(filepath.Join(venvDir, "leaked.py"), []byte("# "+marker+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Parent-level file so the parent folder corpus has at least one
+	// selected entry after the carve-out — otherwise it's classified
+	// corpusKnownEmpty and the cached state file would short-circuit
+	// the second run's walker before the bug can fire.
+	if err := os.WriteFile(filepath.Join(parent, "parent-marker.txt"), []byte("seed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	setTestUserCache(t)
+	t.Chdir(parent)
+
+	// First run: cold cache. Walker discovers nested boundary,
+	// enqueues git corpus, parent folder corpus carves out the subtree.
+	if _, err := captureStdout(t, func() error {
+		return run(context.Background(), marker, []string{parent}, 0, 0)
+	}); err != nil && !errors.Is(err, errNoMatch) {
+		t.Fatalf("first run: %v", err)
+	}
+
+	// Mutate parent-level content so the second run's fingerprint
+	// pass MUST diverge from the cached value, forcing
+	// ensureFolderCorpusFresh past its line-62 cache-hit short-circuit
+	// into the state pass where the dedup-rejection-descent bug
+	// manifests.
+	if err := os.WriteFile(filepath.Join(parent, "parent-marker.txt"), []byte("seed\nedit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second run: warm cache + mismatch. ensureFolderCorpusFresh runs
+	// walker twice (fingerprint pass + state pass). PRE-fix the second
+	// pass hit pool dedup → returned false → walker descended → .venv
+	// indexed → search returned matches. POST-fix dedup returns true
+	// → descent suppressed → no match.
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), marker, []string{parent}, 0, 0)
+	})
+	if err != nil && !errors.Is(err, errNoMatch) {
+		t.Fatalf("second run: %v", err)
+	}
+	if strings.Contains(out, marker) {
+		t.Fatalf("nested .venv content leaked into parent folder corpus on second search; got output containing %q:\n%s", marker, out)
 	}
 }
