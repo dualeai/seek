@@ -4,14 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"log"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"syscall"
 
@@ -51,71 +48,53 @@ func versionString() string {
 }
 
 func main() {
-	// Dispatch `seek gc ...` early — before the search flag parser, which
-	// would otherwise mistake "gc" for a query token.
-	if len(os.Args) >= 2 && os.Args[1] == "gc" {
-		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-		slog.SetDefault(logger)
-		log.SetOutput(io.Discard)
-		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-		defer cancel()
-		if err := runGCCommand(ctx, os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(2)
-		}
-		return
-	}
-
-	opts, err := parseCLIArgs(os.Args[1:])
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		writeUsage(os.Stderr, os.Args[0])
-		os.Exit(2)
-	}
-
-	if opts.showVersion {
-		fmt.Println(versionString())
-		return
-	}
-
-	if opts.query == "" {
-		writeUsage(os.Stderr, os.Args[0])
-		os.Exit(2)
-	}
-
-	// Configure logging: warn+ by default, debug+ with -verbose.
-	logLevel := slog.LevelWarn
-	if opts.verbose {
-		logLevel = slog.LevelDebug
-	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel}))
-	slog.SetDefault(logger)
-
-	// Silence zoekt's log.Printf output by default; bridge to slog when verbose.
-	if opts.verbose {
-		log.SetOutput(newSlogWriter(logger))
-		log.SetFlags(0)
-	} else {
-		log.SetOutput(io.Discard)
-	}
-
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
-	runErr := run(ctx, opts.query, opts.paths, opts.limit, opts.maxMatches)
+	// Pre-scan os.Args for -v / --verbose so flag-time errors are
+	// formatted under the verbose contract too. PersistentPreRunE only
+	// fires AFTER pflag parses successfully, so without this pre-scan a
+	// `seek -v --unknown foo` would print plain `seek: <err>` instead of
+	// the structured slog ERROR record the user asked for.
+	verbose := hasVerboseArg(os.Args[1:])
+
+	err := executeCLI(ctx)
 
 	// Fire opportunistic GC after results are flushed. Wait up to
 	// gcRunTimeout so eviction completes before exit (helps tests and
 	// observability), but never block longer.
 	fireOpportunisticGC(runOpportunisticGC, gcRunTimeout)
 
-	if runErr != nil {
-		code := exitCodeForError(runErr)
+	if err != nil {
+		code := exitCodeForError(err)
 		if code != 1 {
-			slog.Error(runErr.Error())
+			// Plain `seek: <err>` line. The structured slog ERROR
+			// output (time=... level=ERROR msg=...) is reserved for
+			// verbose mode where the operator wants the full record.
+			if verbose {
+				slog.Error(err.Error())
+			} else {
+				fmt.Fprintf(os.Stderr, "seek: %s\n", err)
+			}
 		}
 		os.Exit(code)
 	}
+}
+
+// hasVerboseArg scans raw os.Args for -v / --verbose without consulting
+// Cobra. Used by main() to decide error formatting BEFORE the cobra
+// flag parser has run — a `seek -v --unknown` typo still needs the
+// verbose contract honoured.
+func hasVerboseArg(args []string) bool {
+	for _, a := range args {
+		if a == "--" {
+			return false
+		}
+		if a == "-v" || a == "--verbose" || a == "-verbose" {
+			return true
+		}
+	}
+	return false
 }
 
 func exitCodeForError(err error) int {
@@ -127,109 +106,6 @@ func exitCodeForError(err error) int {
 	default:
 		return 2
 	}
-}
-
-type cliOptions struct {
-	showVersion bool
-	verbose     bool
-	limit       int
-	maxMatches  int
-	query       string
-	paths       []string
-}
-
-func writeUsage(w io.Writer, prog string) {
-	_, _ = fmt.Fprintf(w, "Usage: %s [flags] <query> [path...]\n\n", prog)
-	_, _ = fmt.Fprintln(w, "Flags:")
-	_, _ = fmt.Fprintln(w, "  -v, --verbose              enable debug logging")
-	_, _ = fmt.Fprintln(w, "      --version              print version and exit")
-	_, _ = fmt.Fprintln(w, "  -n, --limit N              maximum number of files to display")
-	_, _ = fmt.Fprintln(w, "  -m, --max-matches N        maximum matches per file")
-}
-
-func parseCLIArgs(args []string) (cliOptions, error) {
-	var opts cliOptions
-
-	for i := 0; i < len(args); {
-		arg := args[i]
-		if arg == "--" {
-			i++
-			if i < len(args) {
-				opts.query = args[i]
-				opts.paths = cloneStringSlice(args[i+1:])
-			}
-			return opts, nil
-		}
-
-		if !strings.HasPrefix(arg, "-") || arg == "-" {
-			opts.query = arg
-			opts.paths = cloneStringSlice(args[i+1:])
-			return opts, nil
-		}
-
-		name, value, hasValue := strings.Cut(arg, "=")
-		switch name {
-		case "-v", "--verbose", "-verbose":
-			if hasValue {
-				return opts, fmt.Errorf("%s does not accept a value", name)
-			}
-			opts.verbose = true
-			i++
-		case "--version", "-version":
-			if hasValue {
-				return opts, fmt.Errorf("%s does not accept a value", name)
-			}
-			opts.showVersion = true
-			i++
-		case "-n", "--limit", "-limit":
-			n, next, err := parseFlagInt(args, i, name, value, hasValue)
-			if err != nil {
-				return opts, err
-			}
-			opts.limit = n
-			i = next
-		case "-m", "--max-matches", "-max-matches":
-			n, next, err := parseFlagInt(args, i, name, value, hasValue)
-			if err != nil {
-				return opts, err
-			}
-			opts.maxMatches = n
-			i = next
-		default:
-			opts.query = arg
-			opts.paths = cloneStringSlice(args[i+1:])
-			return opts, nil
-		}
-	}
-
-	return opts, nil
-}
-
-func parseFlagInt(args []string, idx int, name, value string, hasValue bool) (int, int, error) {
-	if !hasValue {
-		if idx+1 >= len(args) {
-			return 0, idx, fmt.Errorf("%s requires a value", name)
-		}
-		value = args[idx+1]
-		idx += 2
-	} else {
-		idx++
-	}
-
-	n, err := strconv.Atoi(value)
-	if err != nil {
-		return 0, idx, fmt.Errorf("%s requires an integer value", name)
-	}
-	return n, idx, nil
-}
-
-func cloneStringSlice(values []string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	out := make([]string, len(values))
-	copy(out, values)
-	return out
 }
 
 // slogWriter bridges Go's standard log package to slog. Each log.Printf call
@@ -252,6 +128,15 @@ func (w *slogWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func cloneStringSlice(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, len(values))
+	copy(out, values)
+	return out
+}
+
 func run(ctx context.Context, pattern string, pathOperands []string, limit, maxMatches int) error {
 	userQ, err := parseSearchQuery(pattern)
 	if err != nil {
@@ -263,7 +148,10 @@ func run(ctx context.Context, pattern string, pathOperands []string, limit, maxM
 	if gitErr == nil {
 		paths = &resolvedPaths
 	} else if len(pathOperands) == 0 {
-		return fmt.Errorf("not a git repository: %w", gitErr)
+		// gitErr from `git rev-parse` typically reads `exit status 128`,
+		// which leaks an internal status code. Wrap with a hint at the
+		// only useful remedy: pass a path operand.
+		return fmt.Errorf("not in a git repository; specify a path to search (e.g. 'seek %q .')", pattern)
 	}
 
 	plans, err := planCorpora(ctx, paths, pathOperands)

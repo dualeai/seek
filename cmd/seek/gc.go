@@ -179,6 +179,12 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 	// stat() on .last-gc and skips the MkdirAll + Statfs that would
 	// otherwise fire on every seek invocation.
 	if !opts.skipThrottle && !shouldRunGC(cacheRoot, interval) {
+		// Opportunistic path (writer nil) silently no-ops; manual
+		// `seek gc` callers (writer != nil) get a one-line hint so
+		// they know nothing ran AND how to force.
+		if opts.writer != nil {
+			_, _ = fmt.Fprintln(opts.writer, "seek gc: throttled — pass --force to run anyway")
+		}
 		return
 	}
 

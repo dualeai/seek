@@ -19,44 +19,26 @@ type gcCmdOptions struct {
 	all    bool
 }
 
-func writeGCUsage(w io.Writer) {
-	_, _ = fmt.Fprintln(w, "Usage: seek gc [--force] [--dry-run] [--all]")
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "Flags:")
-	_, _ = fmt.Fprintln(w, "      --force       bypass throttle gate (.last-gc)")
-	_, _ = fmt.Fprintln(w, "      --dry-run     print plan, evict nothing")
-	_, _ = fmt.Fprintln(w, "      --all         evict every corpus not actively locked (TTL=0)")
-}
-
-func parseGCFlags(args []string) (gcCmdOptions, error) {
-	var opts gcCmdOptions
-	for _, arg := range args {
-		switch arg {
-		case "--force", "-force":
-			opts.force = true
-		case "--dry-run", "-dry-run":
-			opts.dryRun = true
-		case "--all", "-all":
-			opts.all = true
-		case "-h", "--help", "-help":
-			writeGCUsage(os.Stdout)
-			os.Exit(0)
-		default:
-			return opts, fmt.Errorf("unknown flag: %s", arg)
-		}
-	}
-	return opts, nil
-}
-
-// runGCCommand implements `seek gc ...`. Returns an error for invalid flags;
-// every other failure is logged + swallowed (exit 0).
+// runGCCommand is the test-facing entry point that mirrors the
+// pre-Cobra signature. It instantiates the gc cobra command, feeds it
+// raw args, and runs it. Production callers go through newGCCmd /
+// rootCmd.Execute; this wrapper exists so the existing gc_test.go
+// table doesn't need a full rewrite of every `runGCCommand(ctx, []string{...})`
+// call site.
 func runGCCommand(ctx context.Context, args []string) error {
-	opts, err := parseGCFlags(args)
-	if err != nil {
-		writeGCUsage(os.Stderr)
-		return err
-	}
+	cmd := newGCCmd()
+	cmd.SilenceErrors = true
+	cmd.SilenceUsage = true
+	cmd.SetArgs(args)
+	cmd.SetOut(os.Stdout)
+	cmd.SetErr(io.Discard)
+	return cmd.ExecuteContext(ctx)
+}
 
+// runGCCommandCmd implements `seek gc`. Flags are parsed by Cobra and
+// passed in via opts; every failure inside this body is logged +
+// swallowed (exit 0) to match historical behavior.
+func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 	cacheRoot, err := seekUserCacheRoot()
 	if err != nil {
 		return fmt.Errorf("resolve cache root: %w", err)
