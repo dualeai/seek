@@ -105,7 +105,10 @@ func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexS
 		if selectedCount == 0 {
 			return corpusKnownEmpty, nil
 		}
-		if shardsExist(plan.indexDir) {
+		// Re-read shardsExist post-lock acquisition so a concurrent
+		// indexer's shards are picked up; the pre-lock hasShards captured
+		// at line 52 may be stale by now.
+		if hasShards || shardsExist(plan.indexDir) {
 			return corpusSearchable, nil
 		}
 	} else if latestState != cachedState {
@@ -131,7 +134,7 @@ func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexS
 		if selectedCount == 0 {
 			return corpusKnownEmpty, nil
 		}
-		if shardsExist(plan.indexDir) {
+		if hasShards || shardsExist(plan.indexDir) {
 			return corpusSearchable, nil
 		}
 	}
@@ -346,10 +349,11 @@ func (s *folderCorpusScanner) walkDirectory(dir, relBase string) error {
 			rel = relBase + "/" + name
 		}
 		if entry.IsDir() {
-			path := dir + separator + name
+			// Skip .git, .gitkeep etc. before building the path string.
 			if isFolderMetadataDir(name) {
 				continue
 			}
+			path := dir + separator + name
 			if s.tryDiscoverBoundary(path, rel) {
 				continue
 			}
@@ -660,7 +664,11 @@ func scanFolderRootEntriesParallel(
 	discoveryEnabled := discoveryEnabledForPlan(plan)
 
 	workers := fileReadWorkerCount(maxFolderFingerprintWorkers, len(entries))
-	jobs := make(chan int, workers)
+	// Size jobs to len(entries) so the feeder loop (lines 690-698)
+	// drains the index sequence in one non-blocking pass. With a
+	// workers-sized buffer the feeder would block after `workers` sends
+	// and wait for consumers, serializing the dispatch path.
+	jobs := make(chan int, len(entries))
 	pieces := make([]folderFingerprintPiece, len(entries))
 	errCh := make(chan error, 1)
 	var wg sync.WaitGroup
@@ -709,6 +717,19 @@ func scanFolderRootEntriesParallel(
 	var selectedCount int
 	var indexedBytes int64
 	var selected []folderCandidate
+	if collectSelected {
+		// Single-pass capacity computation avoids the 15-20 reallocations
+		// the append-driven growth path takes on large trees (each doubling
+		// triggers a memcpy of the running slice). Trivial overhead vs the
+		// alloc + memcpy churn it eliminates.
+		capEst := 0
+		for _, p := range pieces {
+			if p.present {
+				capEst += len(p.selectedCandidates)
+			}
+		}
+		selected = make([]folderCandidate, 0, capEst)
+	}
 	var numBuf [20]byte
 	for _, piece := range pieces {
 		if !piece.present {
@@ -803,6 +824,13 @@ func fingerprintRootEntry(
 			selectedCandidates: scanner.selected,
 			present:            scanner.candidateCount > 0,
 		}, nil
+	}
+	// Short-circuit non-regular files before entry.Info(). DirEntry.Type()
+	// on Linux/Darwin returns the readdir d_type field with no syscall;
+	// only regular files have Type()==0. Skipping symlinks, devices,
+	// sockets, etc. here avoids one Lstat per non-regular root entry.
+	if entry.Type() != 0 {
+		return folderFingerprintPiece{}, nil
 	}
 	info, err := entry.Info()
 	if err != nil {

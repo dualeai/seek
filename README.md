@@ -323,16 +323,13 @@ indexing, with PR-scale dirty re-index at 1% and 10% mutation):
 
 | Kind | Workload | Files | Cold index | Warm search | Dirty 1% | Dirty 10% |
 |------|----------|-------|------------|-------------|----------|-----------|
-| git | spf13/cobra | 66 | 350ms | 80ms | 110ms | 120ms |
-| git | prometheus/prometheus | 1,633 | 1.9s | 90ms | 170ms | 360ms |
-| git | kubernetes/kubernetes | 30,507 | 14.5s | 230ms | 670ms | 5.7s |
-| folder | synthetic-10k | 10,000 | 7.6s | 120ms | 270ms | 850ms |
-| folder | synthetic-100k | 100,000 | 38.2s | 420ms | 1.6s | 8.4s |
+| git | spf13/cobra | 66 | 470ms | 80ms | 120ms | 130ms |
+| git | prometheus/prometheus | 1,635 | 1.8s | 90ms | 150ms | 380ms |
+| git | kubernetes/kubernetes | 30,507 | 11.0s | 180ms | 700ms | 4.3s |
+| folder | synthetic-10k | 10,000 | 6.0s | 100ms | 250ms | 750ms |
+| folder | synthetic-100k | 100,000 | 33.5s | 250ms | 1.3s | 7.8s |
 
-Field benchmark is a single sample per workload; expect ~10–20% run-to-run
-variance. Micro-benchmarks (`make test-bench`) show ~18% geomean speed-up
-across the indexing + search code paths since the windowed-rotation fix
-(largest wins: cold folder index −41%, search path −53%).
+Single sample per workload; expect ~10–20% run-to-run variance.
 
 Cold index runs once. Every subsequent search hits the warm or dirty path.
 Dirty 1%/10% mutate that fraction of files in place before re-indexing —
