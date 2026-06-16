@@ -73,7 +73,7 @@ func TestFolderCorpusState_OversizeSkippedFileChangesFingerprint(t *testing.T) {
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Truncate(path, maxFolderFileSize+1); err != nil {
+	if err := os.Truncate(path, maxIndexedDocumentBytes+1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -94,7 +94,7 @@ func TestFolderCorpusState_OversizeSkippedFileChangesFingerprint(t *testing.T) {
 		t.Fatalf("expected oversize file to be skipped, got %d selected", len(selected))
 	}
 
-	if err := os.Truncate(path, maxFolderFileSize+2); err != nil {
+	if err := os.Truncate(path, maxIndexedDocumentBytes+2); err != nil {
 		t.Fatal(err)
 	}
 	second, selected, err := folderCorpusState(context.Background(), plan)
@@ -111,8 +111,8 @@ func TestFolderCorpusState_OversizeSkippedFileChangesFingerprint(t *testing.T) {
 
 func TestFolderCorpusState_IndexedByteCapFailsClosed(t *testing.T) {
 	root := t.TempDir()
-	size := int64(maxFolderFileSize)
-	count := maxFolderIndexedBytes/maxFolderFileSize + 1
+	size := int64(maxIndexedDocumentBytes)
+	count := maxFolderIndexedBytes/maxIndexedDocumentBytes + 1
 	for i := range count {
 		path := filepath.Join(root, fmt.Sprintf("file_%03d.bin", i))
 		if err := os.WriteFile(path, nil, 0o644); err != nil {

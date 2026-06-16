@@ -19,11 +19,10 @@ type repoState struct {
 }
 
 type gitPaths struct {
-	RepoDir     string
-	GitDir      string
-	CommonDir   string
-	ExcludePath string
-	ConfigPath  string
+	RepoDir    string
+	GitDir     string
+	CommonDir  string
+	ConfigPath string
 }
 
 // gitCmd creates an exec.Cmd for git with graceful shutdown.
@@ -32,6 +31,20 @@ type gitPaths struct {
 // prevents lock contention on .git/index, it also prevents git from
 // refreshing its stat cache, which can cause same-second edits to be
 // invisible (same mtime + same size = git thinks file is unchanged).
+//
+// TODO(perf/scale): there is no process-wide cap on concurrent `git`
+// subprocesses today. At corpusWorkerCap=4 with each corpus running
+// up to indexParallelism()=min(NumCPU,16) builders, plus ctags per
+// builder, plus this gitCmd path for every L3 resolve / status
+// invocation, peak subprocess concurrency can reach ~64+ on a large
+// machine. macOS default RLIMIT_NOFILE is 256 and Linux is 1024 —
+// comfortable today, but a future feature that
+// fans out many subprocesses concurrently could push past it. Revisit
+// IF a user reports EMFILE / ENOMEM under load, OR IF corpusWorkerCap
+// grows: add a `golang.org/x/sync/semaphore` weighted to NumCPU()
+// around exec.Command, acquired before Start and released on Wait
+// completion. Defer for now because the gain is bounded by a hard
+// OS-level fd budget we have not actually been observed hitting.
 func gitCmd(ctx context.Context, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Cancel = func() error {
@@ -41,10 +54,12 @@ func gitCmd(ctx context.Context, args ...string) *exec.Cmd {
 	return cmd
 }
 
-// resolveGitPathsFromCWD resolves git paths from the current working directory.
-// For the common non-worktree case, it walks up the directory tree to find
-// .git, avoiding a ~5-10ms subprocess call. Falls back to git rev-parse for
-// worktrees (where .git is a file, not a directory) and edge cases.
+// resolveGitPathsFromCWD resolves git paths from the current working
+// directory. The fast path (fastResolveGitPaths → detectGitBoundary)
+// handles both `.git` dirs AND worktree-form `.git` files without a
+// subprocess. Falls back to git rev-parse only when CWD is unreadable,
+// no `.git` exists in any ancestor, or a structurally invalid `.git`
+// triggers ambiguous detection (corrupt or partially-initialized repo).
 func resolveGitPathsFromCWD(ctx context.Context) (gitPaths, error) {
 	if paths, ok := fastResolveGitPaths(); ok {
 		return paths, nil
@@ -53,28 +68,21 @@ func resolveGitPathsFromCWD(ctx context.Context) (gitPaths, error) {
 }
 
 // fastResolveGitPaths attempts to resolve git paths without spawning a
-// subprocess. Walks up from CWD looking for a .git directory. Returns false
-// when .git is a file (worktree), CWD cannot be determined, or no .git is
-// found, causing the caller to fall back to git rev-parse.
+// subprocess. Walks up from CWD calling detectGitBoundary at each level so
+// both `.git` directories AND worktree-form `.git` files are handled
+// without falling back to `git rev-parse`. Returns false only when CWD is
+// unreadable, no `.git` exists in any ancestor, or detection is ambiguous.
 func fastResolveGitPaths() (gitPaths, bool) {
 	dir, err := os.Getwd()
 	if err != nil {
 		return gitPaths{}, false
 	}
 	for {
-		gitPath := filepath.Join(dir, ".git")
-		fi, err := os.Lstat(gitPath)
-		if err == nil {
-			if fi.IsDir() {
-				return gitPaths{
-					RepoDir:     dir,
-					GitDir:      gitPath,
-					CommonDir:   gitPath,
-					ExcludePath: filepath.Join(gitPath, "info", "exclude"),
-					ConfigPath:  filepath.Join(gitPath, "config"),
-				}, true
-			}
-			// .git is a file → worktree or submodule; fall back
+		b, status := detectGitBoundary(dir, "")
+		if status == boundaryConfirmed {
+			return b.toGitPaths(), true
+		}
+		if status == ambiguous {
 			return gitPaths{}, false
 		}
 		parent := filepath.Dir(dir)
@@ -92,7 +100,6 @@ func resolveGitPaths(ctx context.Context, dir string) (gitPaths, error) {
 		"--show-toplevel",
 		"--git-dir",
 		"--git-common-dir",
-		"--git-path", "info/exclude",
 		"--git-path", "config",
 	)
 	if dir != "" {
@@ -104,16 +111,15 @@ func resolveGitPaths(ctx context.Context, dir string) (gitPaths, error) {
 	}
 
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) != 5 {
+	if len(lines) != 4 {
 		return gitPaths{}, fmt.Errorf("unexpected git rev-parse output: got %d lines", len(lines))
 	}
 
 	paths := gitPaths{
-		RepoDir:     strings.TrimSpace(lines[0]),
-		GitDir:      strings.TrimSpace(lines[1]),
-		CommonDir:   strings.TrimSpace(lines[2]),
-		ExcludePath: strings.TrimSpace(lines[3]),
-		ConfigPath:  strings.TrimSpace(lines[4]),
+		RepoDir:    strings.TrimSpace(lines[0]),
+		GitDir:     strings.TrimSpace(lines[1]),
+		CommonDir:  strings.TrimSpace(lines[2]),
+		ConfigPath: strings.TrimSpace(lines[3]),
 	}
 	return paths, nil
 }

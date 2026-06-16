@@ -3,8 +3,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"slices"
-	"strings"
 	"testing"
 )
 
@@ -40,127 +38,33 @@ func TestExitCodeForError(t *testing.T) {
 	}
 }
 
-func TestParseCLIArgs_QueryOnly(t *testing.T) {
-	got, err := parseCLIArgs([]string{"needle"})
-	if err != nil {
-		t.Fatalf("parseCLIArgs: %v", err)
+// TestCorporaInResults_DistinctIDsCount — display-mode regression
+// guard. When folder-walker discovery surfaces nested git corpora,
+// len(plans) reports the seed count (often 1) but the merged results
+// span N corpora. The displayMode predicate must flip on the actual
+// produced-from count so users see source disambiguation.
+func TestCorporaInResults_DistinctIDsCount(t *testing.T) {
+	if got := corporaInResults(nil); got != 0 {
+		t.Errorf("nil results: got=%d, want 0", got)
 	}
-	want := cliOptions{query: "needle"}
-	assertCLIOptions(t, got, want)
-}
-
-func TestParseCLIArgs_FlagsBeforeQuery(t *testing.T) {
-	got, err := parseCLIArgs([]string{
-		"-v",
-		"--limit=5",
-		"--max-matches",
-		"2",
-		"lang:go needle",
-		"./cmd",
-		"-literal-path",
-	})
-	if err != nil {
-		t.Fatalf("parseCLIArgs: %v", err)
+	if got := corporaInResults([]corpusSearchResult{}); got != 0 {
+		t.Errorf("empty results: got=%d, want 0", got)
 	}
-
-	want := cliOptions{
-		verbose:    true,
-		limit:      5,
-		maxMatches: 2,
-		query:      "lang:go needle",
-		paths:      []string{"./cmd", "-literal-path"},
+	one := []corpusSearchResult{
+		{corpusID: "a"},
+		{corpusID: "a"},
+		{corpusID: "a"},
 	}
-	assertCLIOptions(t, got, want)
-}
-
-func TestParseCLIArgs_QueryMayStartWithDash(t *testing.T) {
-	got, err := parseCLIArgs([]string{"-file:test", "./cmd"})
-	if err != nil {
-		t.Fatalf("parseCLIArgs: %v", err)
+	if got := corporaInResults(one); got != 1 {
+		t.Errorf("single corpus, 3 matches: got=%d, want 1", got)
 	}
-
-	want := cliOptions{query: "-file:test", paths: []string{"./cmd"}}
-	assertCLIOptions(t, got, want)
-}
-
-func TestParseCLIArgs_DoubleDashBeforeQuery(t *testing.T) {
-	got, err := parseCLIArgs([]string{"--", "-file:test", "./cmd"})
-	if err != nil {
-		t.Fatalf("parseCLIArgs: %v", err)
+	mixed := []corpusSearchResult{
+		{corpusID: "parent-folder"},
+		{corpusID: "nested-git-A"},
+		{corpusID: "nested-git-A"},
+		{corpusID: "nested-git-B"},
 	}
-
-	want := cliOptions{query: "-file:test", paths: []string{"./cmd"}}
-	assertCLIOptions(t, got, want)
-}
-
-func TestParseCLIArgs_VersionWithoutQuery(t *testing.T) {
-	got, err := parseCLIArgs([]string{"--version"})
-	if err != nil {
-		t.Fatalf("parseCLIArgs: %v", err)
-	}
-
-	want := cliOptions{showVersion: true}
-	assertCLIOptions(t, got, want)
-}
-
-func TestParseCLIArgs_KnownFlagMissingValue(t *testing.T) {
-	_, err := parseCLIArgs([]string{"--limit"})
-	if err == nil {
-		t.Fatal("expected missing value error")
-	}
-	if !strings.Contains(err.Error(), "--limit requires a value") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestParseCLIArgs_KnownFlagDoubleDashIsBadValue(t *testing.T) {
-	_, err := parseCLIArgs([]string{"--limit", "--", "needle"})
-	if err == nil {
-		t.Fatal("expected bad value error")
-	}
-	if !strings.Contains(err.Error(), "--limit requires an integer value") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestParseCLIArgs_KnownFlagBadValue(t *testing.T) {
-	_, err := parseCLIArgs([]string{"--max-matches=nope"})
-	if err == nil {
-		t.Fatal("expected bad value error")
-	}
-	if !strings.Contains(err.Error(), "--max-matches requires an integer value") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestParseCLIArgs_UnknownDashBeforeQueryIsQuery(t *testing.T) {
-	got, err := parseCLIArgs([]string{"--unknown", "path"})
-	if err != nil {
-		t.Fatalf("parseCLIArgs: %v", err)
-	}
-
-	want := cliOptions{query: "--unknown", paths: []string{"path"}}
-	assertCLIOptions(t, got, want)
-}
-
-func assertCLIOptions(t *testing.T, got, want cliOptions) {
-	t.Helper()
-	if got.showVersion != want.showVersion {
-		t.Fatalf("showVersion: got %v, want %v", got.showVersion, want.showVersion)
-	}
-	if got.verbose != want.verbose {
-		t.Fatalf("verbose: got %v, want %v", got.verbose, want.verbose)
-	}
-	if got.limit != want.limit {
-		t.Fatalf("limit: got %d, want %d", got.limit, want.limit)
-	}
-	if got.maxMatches != want.maxMatches {
-		t.Fatalf("maxMatches: got %d, want %d", got.maxMatches, want.maxMatches)
-	}
-	if got.query != want.query {
-		t.Fatalf("query: got %q, want %q", got.query, want.query)
-	}
-	if !slices.Equal(got.paths, want.paths) {
-		t.Fatalf("paths: got %#v, want %#v", got.paths, want.paths)
+	if got := corporaInResults(mixed); got != 3 {
+		t.Errorf("3 corpora mixed: got=%d, want 3", got)
 	}
 }

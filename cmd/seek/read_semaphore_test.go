@@ -3,6 +3,7 @@ package main
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/sync/semaphore"
 )
@@ -15,6 +16,31 @@ import (
 // Tests that only use a LOCAL semaphore (constructed in-test) don't
 // need this lock.
 var testReadSemMu sync.Mutex
+
+// waitUntilSemaphoreBelow polls availableWeight every 10 ms until it
+// drops below `threshold` or the deadline expires. Used by
+// cancellation tests as a sync mechanism robust to CI scheduling
+// jitter — replaces fixed time.Sleep "wait for producers to start"
+// patterns.
+func waitUntilSemaphoreBelow(t *testing.T, sem *semaphore.Weighted, threshold int64, deadline time.Duration) {
+	t.Helper()
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		if availableWeight(sem) < threshold {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("waitUntilSemaphoreBelow: %v deadline exceeded (still at %d, threshold %d)",
+		deadline, availableWeight(sem), threshold)
+}
+
+// defaultReadSemBudget returns the live readSemaphore budget — the
+// value either set by swapReadSemaphoreForTest or production default.
+// Acquire-all-then-Release probe via TryAcquire is too disruptive; we
+// snapshot the available weight under the assumption that no other
+// test holds weight at call time (caller MUST hold testReadSemMu).
+func defaultReadSemBudget() int64 { return availableWeight(readSemaphore) }
 
 // availableWeight returns the currently-available weight on sem by
 // binary-search via TryAcquire/Release. Callers touching the shared
@@ -36,12 +62,10 @@ func availableWeight(sem *semaphore.Weighted) int64 {
 
 // TestReader_OversizeCandidate_NoSemaphoreTouch — a synthetic
 // candidate larger than every per-file cap must be skipped without
-// ever touching the semaphore. Under current derivation
-// (`maxInFlightBytes = inFlightHeadroomFiles * maxIndexedDocumentBytes`,
-// `maxFolderFileSize = maxIndexedDocumentBytes`), the
-// maxFolderFileSize guard fires first; the maxInFlightBytes branch
-// is defense-in-depth against future drift. Either branch must
-// leave the semaphore untouched.
+// ever touching the semaphore. The maxIndexedDocumentBytes guard
+// fires first; the maxInFlightBytes branch is defense-in-depth
+// against future drift. Either branch must leave the semaphore
+// untouched.
 func TestReader_OversizeCandidate_NoSemaphoreTouch(t *testing.T) {
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
@@ -51,7 +75,7 @@ func TestReader_OversizeCandidate_NoSemaphoreTouch(t *testing.T) {
 	out := make(chan fileContent, 1)
 
 	// Larger than the in-flight ceiling. Production also rejects via
-	// the maxFolderFileSize guard, which fires first; either branch
+	// the maxIndexedDocumentBytes guard, which fires first; either branch
 	// must skip the file without Acquiring weight.
 	c := folderCandidate{
 		name: "huge",

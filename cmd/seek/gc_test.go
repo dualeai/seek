@@ -64,6 +64,55 @@ func resetNFSCheck(tb testing.TB) {
 	})
 }
 
+// captureStdoutGC swaps os.Stdout with a pipe, runs fn, and returns
+// everything fn wrote. Restores os.Stdout on return — including if fn
+// panics, so a failing test does not poison stdout for the rest of the
+// suite. NOT safe for t.Parallel: mutates the process-wide os.Stdout.
+func captureStdoutGC(tb testing.TB, fn func()) (out string) {
+	tb.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		tb.Fatalf("pipe: %v", err)
+	}
+	orig := os.Stdout
+	os.Stdout = w
+	done := make(chan struct{})
+	var buf bytes.Buffer
+	go func() {
+		_, _ = buf.ReadFrom(r)
+		close(done)
+	}()
+	// Defer must run after fn() so a panic still restores stdout and
+	// drains the reader before the value is read back into `out`.
+	defer func() {
+		os.Stdout = orig
+		_ = w.Close()
+		<-done
+		out = buf.String()
+	}()
+	fn()
+	return
+}
+
+// requireRow asserts the captured table output contains a row for the given
+// corpus (matched by its truncated hash) ending in the expected action token.
+// Substring match is robust to column-width tweaks.
+func requireRow(tb testing.TB, out, hash, action string) {
+	tb.Helper()
+	short := truncateHash(corpusID(hash))
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, short) {
+			continue
+		}
+		if strings.HasSuffix(strings.TrimSpace(line), action) {
+			return
+		}
+		tb.Fatalf("row for %s found but action mismatch: %q (want suffix %q)\nfull output:\n%s",
+			short, line, action, out)
+	}
+	tb.Fatalf("no row for corpus %s (action %q) in output:\n%s", short, action, out)
+}
+
 func TestGC_ThrottleGate_SkipsWhenStampFresh(t *testing.T) {
 	root := cacheRootForTest(t)
 	dir := seedCorpus(t, root, fakeCorpusHash(1), time.Now().Add(-30*24*time.Hour))
@@ -272,12 +321,9 @@ func TestGC_TOCTOU_RefreshedUsedUnderLock_SkipsEvict(t *testing.T) {
 	if err := os.MkdirAll(trashDir, 0o755); err != nil {
 		t.Fatalf("mkdir trash: %v", err)
 	}
-	evicted, err := evictCorpus(entry, trashDir, time.Now().Add(-defaultGCMaxAge))
-	if err != nil {
-		t.Fatalf("evictCorpus: %v", err)
-	}
-	if evicted {
-		t.Fatalf("eviction should be skipped after .used refresh under lock")
+	res := evictCorpus(entry, trashDir, time.Now().Add(-defaultGCMaxAge))
+	if res.action != actionKept {
+		t.Fatalf("expected actionKept after .used refresh under lock, got %s err=%v", res.String(), res.err)
 	}
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("corpus should remain after TOCTOU skip: %v", err)
@@ -395,28 +441,36 @@ func TestGCCmd_DryRun_NoEvictions(t *testing.T) {
 
 func TestGCCmd_Force_BypassesThrottle(t *testing.T) {
 	root := cacheRootForTest(t)
-	dir := seedCorpus(t, root, fakeCorpusHash(17), time.Now().Add(-30*24*time.Hour))
+	hash := fakeCorpusHash(17)
+	dir := seedCorpus(t, root, hash, time.Now().Add(-30*24*time.Hour))
 	if err := os.WriteFile(filepath.Join(root, gcStampFile), nil, 0o644); err != nil {
 		t.Fatalf("write stamp: %v", err)
 	}
 
-	if err := runGCCommand(context.Background(), []string{"--force"}); err != nil {
-		t.Fatalf("runGCCommand: %v", err)
-	}
+	out := captureStdoutGC(t, func() {
+		if err := runGCCommand(context.Background(), []string{"--force"}); err != nil {
+			t.Fatalf("runGCCommand: %v", err)
+		}
+	})
 
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("--force should bypass throttle and evict: err=%v", err)
 	}
+	requireRow(t, out, hash, "evicted")
 }
 
 func TestGCCmd_All_EvictsEverything(t *testing.T) {
 	root := cacheRootForTest(t)
-	stale := seedCorpus(t, root, fakeCorpusHash(18), time.Now().Add(-30*24*time.Hour))
-	fresh := seedCorpus(t, root, fakeCorpusHash(19), time.Now())
+	staleHash := fakeCorpusHash(18)
+	freshHash := fakeCorpusHash(19)
+	stale := seedCorpus(t, root, staleHash, time.Now().Add(-30*24*time.Hour))
+	fresh := seedCorpus(t, root, freshHash, time.Now())
 
-	if err := runGCCommand(context.Background(), []string{"--all", "--force"}); err != nil {
-		t.Fatalf("runGCCommand: %v", err)
-	}
+	out := captureStdoutGC(t, func() {
+		if err := runGCCommand(context.Background(), []string{"--all", "--force"}); err != nil {
+			t.Fatalf("runGCCommand: %v", err)
+		}
+	})
 
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Fatalf("stale corpus should evict under --all: err=%v", err)
@@ -424,21 +478,178 @@ func TestGCCmd_All_EvictsEverything(t *testing.T) {
 	if _, err := os.Stat(fresh); !os.IsNotExist(err) {
 		t.Fatalf("fresh corpus should also evict under --all: err=%v", err)
 	}
+	requireRow(t, out, staleHash, "evicted")
+	requireRow(t, out, freshHash, "evicted")
 }
 
 // TestGCCmd_All_BypassesThrottle covers the audit fix: `seek gc --all`
 // (without --force) must wipe even when .last-gc is fresh.
 func TestGCCmd_All_BypassesThrottle(t *testing.T) {
 	root := cacheRootForTest(t)
-	dir := seedCorpus(t, root, fakeCorpusHash(20), time.Now().Add(-1*time.Hour))
+	hash := fakeCorpusHash(20)
+	dir := seedCorpus(t, root, hash, time.Now().Add(-1*time.Hour))
 	if err := os.WriteFile(filepath.Join(root, gcStampFile), nil, 0o644); err != nil {
 		t.Fatalf("write stamp: %v", err)
 	}
-	if err := runGCCommand(context.Background(), []string{"--all"}); err != nil {
-		t.Fatalf("runGCCommand: %v", err)
-	}
+	out := captureStdoutGC(t, func() {
+		if err := runGCCommand(context.Background(), []string{"--all"}); err != nil {
+			t.Fatalf("runGCCommand: %v", err)
+		}
+	})
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("--all must bypass throttle and evict: err=%v", err)
+	}
+	requireRow(t, out, hash, "evicted")
+}
+
+// TestGCCmd_Force_PrintsLiveTable confirms the manual `seek gc --force` path
+// streams a banner + header + summary to stdout. Prevents regression to the
+// pre-fix silent behavior where users saw nothing.
+func TestGCCmd_Force_PrintsLiveTable(t *testing.T) {
+	root := cacheRootForTest(t)
+	hash := fakeCorpusHash(40)
+	seedCorpus(t, root, hash, time.Now().Add(-30*24*time.Hour))
+
+	out := captureStdoutGC(t, func() {
+		if err := runGCCommand(context.Background(), []string{"--force"}); err != nil {
+			t.Fatalf("runGCCommand: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "seek gc: cache root") {
+		t.Fatalf("live table missing banner; got:\n%s", out)
+	}
+	if !strings.Contains(out, "CORPUS") || !strings.Contains(out, "ACTION") {
+		t.Fatalf("live table missing column header; got:\n%s", out)
+	}
+	if !strings.Contains(out, "evicted (") {
+		t.Fatalf("live table missing summary line; got:\n%s", out)
+	}
+	requireRow(t, out, hash, "evicted")
+}
+
+// TestGCCmd_LiveTable_ShowsLockedAction confirms a corpus whose per-corpus
+// .lock is held by an indexer/searcher shows up in the live table with
+// ACTION=locked rather than being silently skipped.
+func TestGCCmd_LiveTable_ShowsLockedAction(t *testing.T) {
+	root := cacheRootForTest(t)
+	hash := fakeCorpusHash(41)
+	dir := seedCorpus(t, root, hash, time.Now().Add(-30*24*time.Hour))
+
+	holder, err := os.OpenFile(filepath.Join(dir, lockFile), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open corpus lock: %v", err)
+	}
+	defer func() { unlockFile(holder); _ = holder.Close() }()
+	if err := lockFileExclusive(holder); err != nil {
+		t.Fatalf("hold corpus lock: %v", err)
+	}
+
+	out := captureStdoutGC(t, func() {
+		if err := runGCCommand(context.Background(), []string{"--force"}); err != nil {
+			t.Fatalf("runGCCommand: %v", err)
+		}
+	})
+
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("locked corpus must survive: %v", err)
+	}
+	requireRow(t, out, hash, "locked")
+}
+
+// TestGCCmd_LiveTable_NoCorpora confirms a fresh cache with zero corpora
+// still prints the banner and a friendly "no corpora" line — not silence.
+func TestGCCmd_LiveTable_NoCorpora(t *testing.T) {
+	cacheRootForTest(t)
+	out := captureStdoutGC(t, func() {
+		if err := runGCCommand(context.Background(), []string{"--force"}); err != nil {
+			t.Fatalf("runGCCommand: %v", err)
+		}
+	})
+	if !strings.Contains(out, "seek gc: cache root") {
+		t.Fatalf("expected banner even with empty cache; got:\n%s", out)
+	}
+	if !strings.Contains(out, "no corpora") {
+		t.Fatalf("expected 'no corpora' line; got:\n%s", out)
+	}
+}
+
+// TestGCCmd_OpportunisticPath_StaysSilent guards the contract that the
+// post-search opportunistic GC (invoked by main) never writes to stdout —
+// only the manual `seek gc` path does.
+func TestGCCmd_OpportunisticPath_StaysSilent(t *testing.T) {
+	root := cacheRootForTest(t)
+	seedCorpus(t, root, fakeCorpusHash(42), time.Now().Add(-30*24*time.Hour))
+
+	out := captureStdoutGC(t, func() {
+		runOpportunisticGC(context.Background())
+	})
+	if out != "" {
+		t.Fatalf("opportunistic GC must stay silent on stdout; got:\n%s", out)
+	}
+}
+
+// TestGCCmd_LockContention_PrintsSkipMessage confirms the manual `seek gc
+// --force` path surfaces gc.lock contention to the user (instead of
+// returning silently — pre-fix UX bug where the user could not tell whether
+// the command did anything).
+func TestGCCmd_LockContention_PrintsSkipMessage(t *testing.T) {
+	root := cacheRootForTest(t)
+	seedCorpus(t, root, fakeCorpusHash(60), time.Now().Add(-30*24*time.Hour))
+
+	lockFd, err := os.OpenFile(filepath.Join(root, gcLockFile), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open gc.lock: %v", err)
+	}
+	defer func() { unlockFile(lockFd); _ = lockFd.Close() }()
+	if err := lockFileExclusive(lockFd); err != nil {
+		t.Fatalf("hold gc.lock: %v", err)
+	}
+
+	out := captureStdoutGC(t, func() {
+		if err := runGCCommand(context.Background(), []string{"--force"}); err != nil {
+			t.Fatalf("runGCCommand: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "another gc is already running") {
+		t.Fatalf("expected contention message; got:\n%s", out)
+	}
+}
+
+// TestGCCmd_CtxCanceled_SummaryUsesProcessedCount confirms a pre-canceled
+// context breaks the loop before any eviction or sizing. Asserts both the
+// observable side effect (all stale corpus dirs survive on disk — the
+// strong behavior contract) and that the summary line does not claim work
+// that did not happen (regression guard for the pre-fix bug where the
+// summary used `len(entries)` instead of processedCount).
+func TestGCCmd_CtxCanceled_SummaryUsesProcessedCount(t *testing.T) {
+	root := cacheRootForTest(t)
+	dirs := make([]string, 5)
+	for i := 0; i < 5; i++ {
+		dirs[i] = seedCorpus(t, root, fakeCorpusHash(70+i), time.Now().Add(-30*24*time.Hour))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	out := captureStdoutGC(t, func() {
+		if err := runGCCommand(ctx, []string{"--force"}); err != nil {
+			t.Fatalf("runGCCommand: %v", err)
+		}
+	})
+
+	// Strong contract: stale corpora must survive when ctx pre-canceled.
+	for i, dir := range dirs {
+		if _, err := os.Stat(dir); err != nil {
+			t.Fatalf("ctx pre-cancel should have prevented eviction of corpus %d: %v", i, err)
+		}
+	}
+	// Regression guard on the summary line wording.
+	if strings.Contains(out, "5 corpora") {
+		t.Fatalf("summary must not name unprocessed corpora; got:\n%s", out)
+	}
+	if strings.Contains(out, "0 corpora") {
+		t.Fatalf("summary line should be omitted when processedCount==0; got:\n%s", out)
 	}
 }
 

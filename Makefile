@@ -36,10 +36,19 @@ test-bench-repo:
 	@if [ -z "$(SEEK_BENCH_REPO)" ]; then echo "Usage: make test-bench-repo SEEK_BENCH_REPO=/path/to/repo"; exit 1; fi
 	SEEK_BENCH_REPO=$(SEEK_BENCH_REPO) go test ./cmd/seek/ -bench=BenchmarkLargeRepo -benchmem -count=3 -timeout=600s
 
+# Compare two benchmark runs using golang.org/x/perf/cmd/benchstat.
+# Workflow:
+#   git stash && make test-bench > baseline.txt && git stash pop
+#   make test-bench > after.txt
+#   BASE=baseline.txt NEW=after.txt make test-bench-compare
+test-bench-compare:
+	@if [ -z "$(BASE)" ] || [ -z "$(NEW)" ]; then echo "Usage: BASE=baseline.txt NEW=after.txt make test-bench-compare"; exit 1; fi
+	go run golang.org/x/perf/cmd/benchstat@latest $(BASE) $(NEW)
+
 lint:
 	golangci-lint run --fix ./...
 
 release:
 	VERSION=$$($(MAKE) -s version-full) goreleaser release --clean
 
-.PHONY: install upgrade build test test-static test-unit test-bench test-bench-repo lint release
+.PHONY: install upgrade build test test-static test-unit test-bench test-bench-repo test-bench-compare lint release

@@ -44,6 +44,22 @@ const (
 	// Default zoekt value is 100MB (3 shards for k8s, ~1.7 cores used).
 	// 10MB produces ~23 shards for k8s, utilizing ~5 cores → 2.7x faster.
 	// No measurable impact on warm search latency.
+	//
+	// TODO(perf): shard rotation is content-byte-driven only. A corpus
+	// of 100k tiny files (e.g. ~50 B each) totalling < shardMax never
+	// rotates → one shard → single goroutine → no parallelism on cold
+	// index. Real-world Go/k8s/linux repos have 5-20 KB avg file size
+	// and hit shardMax naturally, so this degenerate case is rare.
+	// If we ever see lots-of-tiny-files workloads in the wild, options:
+	//   (a) Secondary file-count threshold (e.g. flush every ~5000
+	//       files regardless of bytes).
+	//   (b) Lower shardMax further. Trade-off: more shards at search
+	//       time → more open fds, marginally more shard-open cost.
+	//   (c) Plan-time dynamic shardMax = min(shardMax, totalContent /
+	//       parallelism). Complexity but optimal per workload.
+	// Validation: cicd/bench-field.sh used to ship a 43 B-per-file
+	// synth fixture that landed in 1 shard and skewed numbers 80%
+	// vs realistic ~250 B files. Fixed in that script.
 	shardMax = 10 * 1024 * 1024 // 10 MB
 )
 
@@ -409,32 +425,40 @@ func indexCommitted(repoDir, indexDir string, parallelism int) error {
 	return nil
 }
 
-// fileContent holds a file's path and content read from the working tree.
+// fileContent carries one file's content from reader to consumer.
 //
-// weight is the byte count Acquired from readSemaphore at read time. The
-// consumer (indexDocuments / indexDeltaDocuments) must Release(weight)
-// exactly once per received doc, strictly after builder.Finish() returns,
-// because Zoekt's async shard writers retain Content references until
-// then. Zero means the reader did not Acquire (synchronous folder-delta
-// reads); Release of zero is a no-op.
+// weight is the byte count Acquired from readSemaphore at read time.
+// Zoekt's Builder.Add buffers Content into b.todo and the per-shard
+// goroutines spawned by flush keep referencing it until
+// b.building.Wait returns inside Finish. So Release MUST happen
+// strictly after that Finish:
+//
+//   - indexDocuments runs a sequence of windowed Builders. Each doc's
+//     weight feeds the current window's pendingWeight ledger and is
+//     Released when the window's Finish returns.
+//   - indexDeltaDocuments runs a single Builder. The full doc set is
+//     Released via releaseFileContentWeights after the terminal Finish.
+//
+// Zero weight means the reader did not Acquire (synchronous folder-
+// delta reads via readFolderFile bypass the semaphore by design).
+// Release of zero is a no-op.
 type fileContent struct {
 	name    string
 	content []byte
 	weight  int64
 }
 
-// readFilesToChannel reads files from the working tree using a bounded worker
-// pool and sends them to out. Files larger than maxGitDirtyFileSize,
-// symlinks, and directories are skipped. Individual file failures are
-// non-fatal since files may be deleted or modified between git status and
-// read. The channel is closed after all workers finish.
+// readFilesToChannel reads files from the working tree using a bounded
+// worker pool and sends them to out. Skips files larger than
+// maxGitDirtyFileSize, symlinks, and directories. Individual file
+// failures are non-fatal (files may be deleted or modified between
+// git status and read). The channel is closed after all workers exit.
 //
-// Each per-file read acquires the corresponding byte weight from
-// readSemaphore before opening, and transfers ownership of the Release to
-// the consumer via fileContent.weight on a successful channel send. On
-// any failure path between Acquire and a successful send, the deferred
-// `released` sentinel releases the weight. The consumer must Release the
-// weight after builder.Finish() returns.
+// Each per-file read Acquires byte weight from readSemaphore before
+// opening, then transfers Release ownership to the consumer via
+// fileContent.weight on successful send. On any failure path between
+// Acquire and successful send, the deferred `released` sentinel
+// Releases. See fileContent for the consumer's Release contract.
 func readFilesToChannel(ctx context.Context, repoDir string, files []string, parallelism int, out chan<- fileContent) {
 	workers := fileReadWorkerCount(parallelism, len(files))
 	ch := make(chan string, workers)
@@ -451,7 +475,18 @@ func readFilesToChannel(ctx context.Context, repoDir string, files []string, par
 	}
 
 	for _, f := range files {
-		ch <- f
+		select {
+		case ch <- f:
+		case <-ctx.Done():
+			// Symmetry with streamFolderFiles (folder_indexer.go:974-978):
+			// stop feeding workers on cancellation so the producer never
+			// outlives the consumers. Workers exit their range loop on
+			// close(ch) below.
+			close(ch)
+			wg.Wait()
+			close(out)
+			return
+		}
 	}
 	close(ch)
 	wg.Wait()
@@ -483,18 +518,6 @@ func readOneDirtyFile(ctx context.Context, repoDir, f string, out chan<- fileCon
 		slog.Warn("Skipping large uncommitted file", "path", f, "size_mb", size/(1024*1024))
 		return
 	}
-	// Defensive: caps.go enforces size <= maxIndexedDocumentBytes,
-	// and the compile-time invariant in caps.go guarantees
-	// maxIndexedDocumentBytes <= maxInFlightBytes (via
-	// inFlightHeadroomFiles). The explicit runtime guard keeps the
-	// invariant audit-friendly and prevents a future cap drift from
-	// hanging Acquire forever when ctx is context.Background()
-	// (golang/go#59002).
-	if size > maxInFlightBytes {
-		slog.Warn("File exceeds in-flight memory ceiling, skipping", "path", f, "size", size)
-		return
-	}
-
 	weight := size
 	if err := readSemaphore.Acquire(ctx, weight); err != nil {
 		return // ctx cancelled or done; semaphore not Acquired.
@@ -609,6 +632,8 @@ func indexUncommitted(
 		if shardCount > 0 && shardCount <= maxUncommittedDeltaShards {
 			if err := tryUncommittedDelta(ctx, repoDir, indexDir, cacheDir, candidates, cachedState, preState, entries); err == nil {
 				return nil
+			} else if errors.Is(err, errDeltaPayloadExceedsWindow) {
+				slog.Debug("Uncommitted delta payload exceeds window threshold; full rebuild", "error", err)
 			} else {
 				slog.Debug("Uncommitted delta indexing failed, falling back to full rebuild", "error", err)
 			}
@@ -658,7 +683,8 @@ func tryUncommittedDelta(
 
 	docs, err := readUncommittedCandidates(ctx, repoDir, toRead)
 	if err != nil {
-		releaseFileContentWeights(docs)
+		// readUncommittedCandidates returns (nil, errDeltaPayloadExceedsWindow)
+		// after releasing all weights internally — no further work here.
 		return err
 	}
 	if len(docs) == 0 && len(changedPaths) > 0 {
@@ -679,41 +705,81 @@ func tryUncommittedDelta(
 	return nil
 }
 
-// readUncommittedCandidates loads file contents for the given candidates from
-// the working tree. Missing or non-regular files are skipped silently (same
-// policy as readFilesToChannel) so the caller's tombstone list stays the only
-// signal that drove the removal.
+// readUncommittedCandidates loads file contents for the given
+// candidates from the working tree. Missing or non-regular files are
+// skipped silently (same policy as readFilesToChannel).
+//
+// Two guards prevent a synchronous drain >= indexWindowBytes from
+// wedging the global readSemaphore:
+//   - Pre-flight: sum candidate.size (lstat already populated). If
+//     it already exceeds the window threshold, return immediately
+//     without spawning any reader — saves up to indexWindowBytes of
+//     wasted read I/O.
+//   - Bounded drain: if cumulative weight reaches the threshold
+//     mid-drain, cancel the inner context so workers unwind via
+//     Acquire's ctx-aware abort, then drain-and-release the remainder.
+//
+// Both paths return errDeltaPayloadExceedsWindow. Caller
+// indexUncommitted catches via errors.Is and falls back to the
+// windowed full rebuild (streamFiles → indexDocuments).
 func readUncommittedCandidates(ctx context.Context, repoDir string, candidates []uncommittedCandidate) ([]fileContent, error) {
 	if len(candidates) == 0 {
 		return nil, nil
+	}
+	var preSum int64
+	for _, c := range candidates {
+		preSum += c.size
+		if preSum >= indexWindowBytes {
+			return nil, errDeltaPayloadExceedsWindow
+		}
 	}
 	files := make([]string, len(candidates))
 	for i, c := range candidates {
 		files[i] = c.name
 	}
-	ch := streamFiles(ctx, repoDir, files, fileReadWorkerCount(indexParallelism(), len(files)))
+	innerCtx, cancelInner := context.WithCancel(ctx)
+	defer cancelInner()
+	ch := streamFiles(innerCtx, repoDir, files, fileReadWorkerCount(indexParallelism(), len(files)))
 	docs := make([]fileContent, 0, len(files))
+	var cumulative int64
+	exceeded := false
 	for doc := range ch {
+		if exceeded {
+			// Drain the rest releasing inline so workers (still holding
+			// weight on Acquired-but-not-yet-cancelled reads) and the
+			// producer goroutine can exit cleanly.
+			if doc.weight > 0 {
+				readSemaphore.Release(doc.weight)
+			}
+			continue
+		}
 		docs = append(docs, doc)
+		cumulative += doc.weight
+		if cumulative >= indexWindowBytes {
+			exceeded = true
+			cancelInner()
+		}
+	}
+	if exceeded {
+		releaseFileContentWeights(docs)
+		return nil, errDeltaPayloadExceedsWindow
 	}
 	return docs, nil
 }
 
-// indexDocuments consumes fileContent from fileCh, feeds each Content
-// to a lazily-created Zoekt builder, and finalizes the shard set with
-// builder.Finish(). Returns (indexed, err) where indexed=true means a
-// builder was created (Finish ran). On any path — empty channel,
-// NewBuilder error, Add error, Finish error — the function still
-// drains the channel and releases readSemaphore weight for every
-// received doc.
+// indexDocuments consumes fileContent from fileCh and feeds each
+// Content into a rotating series of *index.Builder windows. Each
+// window accumulates up to indexWindowBytes of doc weight before
+// builder.Finish() runs and the window's pending weight is released
+// to readSemaphore. See fileContent for the per-doc Release contract.
 //
-// readSemaphore lifetime contract: every received fileContent.weight
-// is summed into totalWeight, and Release(totalWeight) fires STRICTLY
-// after builder.Finish() returns. Finish synchronously joins all
-// shard-writer goroutines via b.building.Wait() (zoekt/index/
-// builder.go:659-667), so post-Finish no goroutine still holds a
-// Content slice reference. Releasing earlier would re-publish bytes
-// to the semaphore that Zoekt is still reading.
+// Window 0 opens with IsDelta=false so Zoekt's Finish prunes stale
+// shards from prior runs via FindAllShards. Windows 1..N open with
+// IsDelta=true + nil changedPaths: shard deletion + tombstone writes
+// are skipped, and shard numbering resumes from FindAllShards so new
+// shards do not collide with prior ones.
+//
+// Returns (indexed, err); indexed=true means a builder was opened.
 func indexDocuments(
 	ctx context.Context,
 	indexDir string,
@@ -722,72 +788,112 @@ func indexDocuments(
 	fileCh <-chan fileContent,
 	parallelism int,
 ) (bool, error) {
-	var builder *index.Builder
+	var current *index.Builder
+	var pendingWeight int64
 	var addErr error
+	indexedAny := false
+	openedWindows := 0
 
-	// totalWeight accumulates readSemaphore weight for EVERY received
-	// doc — including those drained after an Add error and those
-	// drained after a NewBuilder failure — because the reader
-	// Acquired the weight and the consumer owns the Release.
-	var totalWeight int64
+	openWindow := func(isDelta bool) error {
+		opts := indexBuildOptions(indexDir, parallelism)
+		opts.RepositoryDescription.Name = repoName
+		opts.RepositoryDescription.Source = source
+		opts.IsDelta = isDelta
+		b, err := index.NewBuilder(opts)
+		if err != nil {
+			return fmt.Errorf("create builder: %w", err)
+		}
+		current = b
+		openedWindows++
+		indexedAny = true
+		return nil
+	}
+
+	// finishWindow Finishes the current builder and Releases pending
+	// weight. Always Releases even on Finish error: Finish's
+	// b.building.Wait() has joined the shard goroutines (or aborted
+	// them via b.buildError) before returning, so no goroutine retains
+	// any doc.Content past this point.
+	finishWindow := func() error {
+		if current == nil {
+			return nil
+		}
+		err := current.Finish()
+		if pendingWeight > 0 {
+			readSemaphore.Release(pendingWeight)
+			pendingWeight = 0
+		}
+		current = nil
+		return err
+	}
+
+	drainRemaining := func() {
+		for d := range fileCh {
+			if d.weight > 0 {
+				readSemaphore.Release(d.weight)
+			}
+		}
+	}
 
 	for doc := range fileCh {
-		totalWeight += doc.weight
+		if err := ctx.Err(); err != nil {
+			if doc.weight > 0 {
+				readSemaphore.Release(doc.weight)
+			}
+			drainRemaining()
+			_ = finishWindow()
+			return indexedAny, err
+		}
+		if addErr != nil {
+			if doc.weight > 0 {
+				readSemaphore.Release(doc.weight)
+			}
+			continue
+		}
 
-		if builder == nil {
-			opts := indexBuildOptions(indexDir, parallelism)
-			opts.RepositoryDescription.Name = repoName
-			opts.RepositoryDescription.Source = source
-
-			var err error
-			builder, err = index.NewBuilder(opts)
-			if err != nil {
-				// Drain remaining items to unblock producer goroutines.
-				// Each drained doc still contributes its weight.
-				for d := range fileCh {
-					totalWeight += d.weight
+		if current == nil {
+			if err := openWindow(openedWindows > 0); err != nil {
+				if doc.weight > 0 {
+					readSemaphore.Release(doc.weight)
 				}
-				if totalWeight > 0 {
-					readSemaphore.Release(totalWeight)
-				}
-				return false, fmt.Errorf("create builder: %w", err)
+				drainRemaining()
+				return indexedAny, err
 			}
 		}
 
-		if addErr == nil {
-			if err := builder.Add(index.Document{
-				Name:    doc.name,
-				Content: doc.content,
-			}); err != nil {
-				addErr = fmt.Errorf("add document %s: %w", doc.name, err)
-				// Continue draining the channel to unblock producer goroutines.
+		// Zoekt's Builder.Add buffers doc into b.todo before any error
+		// return, so doc.weight stays the window's responsibility either
+		// way and is Released by finishWindow.
+		pendingWeight += doc.weight
+		if err := current.Add(index.Document{Name: doc.name, Content: doc.content}); err != nil {
+			addErr = fmt.Errorf("add document %s: %w", doc.name, err)
+			continue
+		}
+
+		if pendingWeight >= indexWindowBytes {
+			if err := finishWindow(); err != nil {
+				drainRemaining()
+				return indexedAny, err
 			}
 		}
 	}
 
-	if builder == nil {
-		// No files arrived — clean stale shards from a previous run.
+	if current != nil {
+		if err := finishWindow(); err != nil {
+			if addErr != nil {
+				return true, addErr
+			}
+			return true, err
+		}
+	} else if !indexedAny {
 		cleanRepositoryShards(indexDir, repoName)
-		// totalWeight is zero (no docs received); Release would be a no-op.
 		return false, nil
-	}
-
-	// Always call Finish to ensure cleanup (safe to call even after errors).
-	// Finish synchronously joins all shard-writer goroutines via
-	// b.building.Wait() (zoekt/index/builder.go:659-667), so once it
-	// returns no goroutine still holds Content refs.
-	finishErr := builder.Finish()
-
-	// ONLY now is it safe to release readSemaphore weight: Zoekt no
-	// longer reads any of the doc.content slices.
-	if totalWeight > 0 {
-		readSemaphore.Release(totalWeight)
 	}
 
 	if addErr != nil {
 		return true, addErr
 	}
-	return true, finishErr
+	return true, nil
 }
 
 // cleanUncommittedShards removes stale uncommitted shard files.

@@ -18,7 +18,17 @@ const (
 	// maxCorpusIndexedBytes is the shared selected-content budget per
 	// planned corpus index. Bounds foreground indexing work for both Git
 	// and standard folder corpora.
-	maxCorpusIndexedBytes = 5 * 1024 * 1024 * 1024 // 5 GiB
+	//
+	// Bumped from 5 GiB to 10 GiB to give dev-parent folder corpora more
+	// headroom after nested-git discovery carves out per-repo subtrees.
+	// Discovery is the primary fix for the cap-exhausted UX; the 10 GiB
+	// ceiling is a belt-and-suspenders cushion for pathological folders
+	// whose remaining non-git content still exceeds 5 GiB.
+	//
+	// Peak RSS during indexing is independently bounded by
+	// maxInFlightBytes (600 MiB × corpusWorkerCap) — raising this cap
+	// does NOT change peak memory, only total content admitted.
+	maxCorpusIndexedBytes = 10 * 1024 * 1024 * 1024 // 10 GiB
 
 	// Git has a higher file-count budget than raw folders because Git
 	// provides the file universe and ignore semantics. Standard folders
@@ -27,42 +37,77 @@ const (
 	maxGitCandidateFiles    = 10_000_000
 	maxFolderCandidateFiles = 1_000_000
 
-	// Per-file limits. Both reader paths honor maxIndexedDocumentBytes so
-	// the same cap propagates everywhere via one source of truth.
+	// Per-file limits. Both reader paths honor maxIndexedDocumentBytes
+	// directly so there's one source of truth.
 	maxGitDirtyFileSize   = maxIndexedDocumentBytes
-	maxFolderFileSize     = maxIndexedDocumentBytes
 	maxFolderIndexedBytes = maxCorpusIndexedBytes
 
-	// inFlightHeadroomFiles sets how many max-sized files may be resident
-	// in reader buffers concurrently. The readSemaphore budget is derived
-	// from this so bumping maxIndexedDocumentBytes automatically scales
-	// the in-flight ceiling.
-	//
-	// 6 means at most six max-sized reads can sit between the reader
-	// pool and Zoekt's builder. Smaller → tighter ceiling, more Acquire
-	// blocks under bursts of large files. Larger → looser ceiling, more
-	// peak RSS under those bursts.
-	inFlightHeadroomFiles = 6
+	// corpusWorkerCap bounds the number of corpus indexers that may run
+	// concurrently. 4 balances wall-clock vs peak memory: empirical
+	// benchmarks showed ~50% reduction on multi-corpus workloads while
+	// keeping the peak in-flight budget at 2.4 GiB (4 × 6 × 100 MiB).
+	// Increasing further yields diminishing returns because per-corpus
+	// indexing already saturates min(NumCPU, 16) builders internally
+	// (indexer.go:indexParallelism).
+	corpusWorkerCap = 4
 
 	// maxInFlightBytes bounds total bytes resident in reader buffers
-	// across all reader workers (Git dirty + folder candidates). Acquire
-	// on the reader side; release in the consumer (indexDocuments /
-	// indexDeltaDocuments) strictly after builder.Finish() returns,
-	// because Zoekt's async shard writers retain Content references
-	// until then (zoekt/index/builder.go:659-667 — Finish calls
-	// b.building.Wait() before returning).
-	maxInFlightBytes = inFlightHeadroomFiles * maxIndexedDocumentBytes
+	// across all reader workers. Per-worker budget is 600 MiB (six
+	// max-sized 100 MiB files) — empirical headroom that keeps the
+	// windowed-fit invariant satisfied at any corpusWorkerCap ≥ 1.
+	// Acquired in readers, Released by the consumer after the
+	// Builder.Finish() that buffered the doc — see fileContent for the
+	// per-doc Release contract.
+	maxInFlightBytes = 6 * maxIndexedDocumentBytes * corpusWorkerCap
+
+	// maxDiscoveredCorpora bounds the number of nested git corpora a
+	// single folder walker may auto-enqueue. Protects against
+	// pathological monorepo trees with thousands of submodules
+	// inflating peak memory + indexing time. 64 is generous for typical
+	// dev parents (1-20 repos) while keeping worst-case bounded.
+	maxDiscoveredCorpora = 64
+
+	// defaultIndexWindowBytes caps doc weight per windowed rotation in
+	// indexDocuments. Each of corpusWorkerCap concurrent consumers may
+	// accumulate up to this much pending weight before rotating; the
+	// global semaphore must accommodate every consumer's window plus
+	// one in-rotation max-sized reader Acquire concurrently. The
+	// formula keeps N*window + 2*doc ≤ budget for any N ≥ 1; the
+	// compile-time guard below pins this invariant and
+	// caps_invariant_test.go asserts it at runtime.
+	defaultIndexWindowBytes = (maxInFlightBytes - 2*maxIndexedDocumentBytes) / (2 * corpusWorkerCap)
 )
 
-// Compile-time invariant: a single max-sized file must fit within the
-// in-flight budget, otherwise Acquire(maxIndexedDocumentBytes) would
-// block forever under a non-cancellable context (golang/go#59002). The
-// cast to uint underflows at compile time if the difference is negative.
+// indexWindowBytes is the live rotation threshold consumed by
+// indexDocuments. Var (not const) so tests can shrink it via
+// swapIndexWindowBytesForTest under testReadSemMu — production
+// callers treat as read-only.
+var indexWindowBytes int64 = defaultIndexWindowBytes
+
+// Compile-time invariant: a single max-sized file fits within the
+// in-flight budget. Without this, a max-sized Acquire could block
+// forever on a non-cancellable context (golang/go#59002). The uint
+// cast underflows at compile time if the difference is negative.
 const _ = uint(maxInFlightBytes - maxIndexedDocumentBytes)
+
+// Compile-time windowed-fit invariant: N concurrent consumers each
+// accumulating up to defaultIndexWindowBytes plus one in-rotation
+// max-sized reader Acquire (= 2 × maxIndexedDocumentBytes for the
+// in-flight tip + the new reader) must fit within maxInFlightBytes.
+// Otherwise readers wedge while consumers are in Finish — the original
+// 3-way deadlock at N=1 scales to an N+1-way deadlock at N>1.
+const _ = uint(maxInFlightBytes - (corpusWorkerCap*defaultIndexWindowBytes + 2*maxIndexedDocumentBytes))
 
 var (
 	errGitCapExceeded    = errors.New("git cap exceeded")
 	errFolderCapExceeded = errors.New("folder cap exceeded")
+
+	// errDeltaPayloadExceedsWindow fires when a delta (working-tree
+	// dirty set OR folder-manifest changed set) would exceed
+	// indexWindowBytes. Both sites route through a windowed full
+	// rebuild via indexDocuments rather than holding the whole payload
+	// in indexDeltaDocuments's single terminal Finish.
+	errDeltaPayloadExceedsWindow = errors.New("delta payload exceeds window threshold")
 )
 
 type indexCapExceededError struct {

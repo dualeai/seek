@@ -19,44 +19,26 @@ type gcCmdOptions struct {
 	all    bool
 }
 
-func writeGCUsage(w io.Writer) {
-	_, _ = fmt.Fprintln(w, "Usage: seek gc [--force] [--dry-run] [--all]")
-	_, _ = fmt.Fprintln(w)
-	_, _ = fmt.Fprintln(w, "Flags:")
-	_, _ = fmt.Fprintln(w, "      --force       bypass throttle gate (.last-gc)")
-	_, _ = fmt.Fprintln(w, "      --dry-run     print plan, evict nothing")
-	_, _ = fmt.Fprintln(w, "      --all         evict every corpus not actively locked (TTL=0)")
-}
-
-func parseGCFlags(args []string) (gcCmdOptions, error) {
-	var opts gcCmdOptions
-	for _, arg := range args {
-		switch arg {
-		case "--force", "-force":
-			opts.force = true
-		case "--dry-run", "-dry-run":
-			opts.dryRun = true
-		case "--all", "-all":
-			opts.all = true
-		case "-h", "--help", "-help":
-			writeGCUsage(os.Stdout)
-			os.Exit(0)
-		default:
-			return opts, fmt.Errorf("unknown flag: %s", arg)
-		}
-	}
-	return opts, nil
-}
-
-// runGCCommand implements `seek gc ...`. Returns an error for invalid flags;
-// every other failure is logged + swallowed (exit 0).
+// runGCCommand is the test-facing entry point that mirrors the
+// pre-Cobra signature. It instantiates the gc cobra command, feeds it
+// raw args, and runs it. Production callers go through newGCCmd /
+// rootCmd.Execute; this wrapper exists so the existing gc_test.go
+// table doesn't need a full rewrite of every `runGCCommand(ctx, []string{...})`
+// call site.
 func runGCCommand(ctx context.Context, args []string) error {
-	opts, err := parseGCFlags(args)
-	if err != nil {
-		writeGCUsage(os.Stderr)
-		return err
-	}
+	cmd := newGCCmd()
+	cmd.SilenceErrors = true
+	cmd.SilenceUsage = true
+	cmd.SetArgs(args)
+	cmd.SetOut(os.Stdout)
+	cmd.SetErr(io.Discard)
+	return cmd.ExecuteContext(ctx)
+}
 
+// runGCCommandCmd implements `seek gc`. Flags are parsed by Cobra and
+// passed in via opts; every failure inside this body is logged +
+// swallowed (exit 0) to match historical behavior.
+func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 	cacheRoot, err := seekUserCacheRoot()
 	if err != nil {
 		return fmt.Errorf("resolve cache root: %w", err)
@@ -94,8 +76,33 @@ func runGCCommand(ctx context.Context, args []string) error {
 	// Live eviction: reuse runGC for trash drain + lock + per-corpus
 	// rename/RemoveAll. `--force` and `--all` both bypass the throttle
 	// gate — `--all` is an explicit user wipe, not subject to .last-gc.
-	runGC(ctx, gcOptions{maxAge: maxAge, skipThrottle: opts.force || opts.all}, cfg.interval)
+	// writer is non-nil → runGC streams the per-corpus table to stdout
+	// (same shape as `--dry-run`, ACTION column shows real outcome).
+	runGC(ctx, gcOptions{
+		maxAge:       maxAge,
+		skipThrottle: opts.force || opts.all,
+		writer:       os.Stdout,
+	}, cfg.interval)
 	return nil
+}
+
+// gcTableHeader is the column row shared by `seek gc --dry-run` and live
+// `seek gc --force`. Widths align with the format string in renderGCRow.
+const gcTableHeader = "  CORPUS      ROOT                                                  AGE     SIZE    ACTION"
+
+// renderGCRow prints one corpus row using the column layout in gcTableHeader.
+// Display info is passed in (not computed here) so live callers can capture
+// it BEFORE eviction — once the dir moves to .trash, corpusDisplayName
+// returns [empty].
+func renderGCRow(w io.Writer, e corpusDirEntry, info corpusDisplayInfo, size int64, now time.Time, action string) {
+	age := now.Sub(e.usedAt)
+	_, _ = fmt.Fprintf(w, "  %-10s  %-52s  %-6s  %-6s  %s\n",
+		truncateHash(e.name),
+		formatRoot(info, 52),
+		humanDuration(age),
+		humanBytes(size),
+		action,
+	)
 }
 
 // reportGCPlan prints the dry-run table. No filesystem mutation. Display
@@ -104,37 +111,37 @@ func runGCCommand(ctx context.Context, args []string) error {
 // without shards display as "[empty]"; corpora whose source root has been
 // deleted on disk show as "[gone] <path>".
 //
+// Vocab is past tense (`kept`/`evicted`) — same words as the live path
+// (`seek gc --force`), interpreted as "what would happen". The live path
+// (runGC streaming) uses the same renderGCRow + column layout, so dry-run
+// and live output stay byte-aligned across columns.
+//
 // Per-row cost is dominated by corpusDirSize (filepath.WalkDir subtree walk
-// per corpus). For typical caches (<50 corpora) wall time is sub-second.
-// If we ever see caches with 500+ corpora, parallelizing the per-row work
-// with a bounded errgroup is the straightforward fix.
+// per corpus) plus corpusDisplayName (one zoekt shard metadata read). For
+// typical caches (<50 corpora) wall time is sub-second. The same per-row
+// cost applies to the live path. If we ever see caches with 500+ corpora,
+// parallelizing the per-row work with a bounded errgroup is the
+// straightforward fix in both paths.
 func reportGCPlan(w io.Writer, cacheRoot string, entries []corpusDirEntry, cutoff time.Time) error {
 	_, _ = fmt.Fprintf(w, "seek gc: cache root %s\n", cacheRoot)
 	if len(entries) == 0 {
 		_, _ = fmt.Fprintln(w, "  no corpora")
 		return nil
 	}
-	_, _ = fmt.Fprintln(w, "  CORPUS      ROOT                                                  AGE     SIZE    ACTION")
+	_, _ = fmt.Fprintln(w, gcTableHeader)
 	now := time.Now()
 	var totalBytes, evictBytes int64
 	var evictCount int
 	for _, e := range entries {
 		size := corpusDirSize(e.path)
 		totalBytes += size
-		action := "keep"
+		action := "kept"
 		if !e.usedAt.After(cutoff) {
-			action = "evict"
+			action = "evicted"
 			evictBytes += size
 			evictCount++
 		}
-		age := now.Sub(e.usedAt)
-		_, _ = fmt.Fprintf(w, "  %-10s  %-52s  %-6s  %-6s  %s\n",
-			truncateHash(e.name),
-			formatRoot(corpusDisplayName(e.path), 52),
-			humanDuration(age),
-			humanBytes(size),
-			action,
-		)
+		renderGCRow(w, e, corpusDisplayName(e.path), size, now, action)
 	}
 	_, _ = fmt.Fprintf(w, "%d corpora, %s total, %d evictable (%s).\n",
 		len(entries), humanBytes(totalBytes), evictCount, humanBytes(evictBytes))

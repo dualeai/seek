@@ -8,6 +8,46 @@ import (
 	"testing"
 )
 
+// TestPlanDiscoveredGitCorpus_MatchesExplicitID — a discovered plan
+// for the same physical repo as an explicit operand must produce the
+// same corpusID so dedup works without coordinating through user-facing
+// state. corpusID is keyed on (kind, root_type, root, dev:ino, …).
+func TestPlanDiscoveredGitCorpus_MatchesExplicitID(t *testing.T) {
+	root := t.TempDir()
+	setTestUserCache(t)
+	// Build a triad-satisfying .git/ so detectGitBoundary confirms.
+	gitDir := filepath.Join(root, ".git")
+	for _, sub := range []string{"objects", "refs"} {
+		if err := os.MkdirAll(filepath.Join(gitDir, sub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	b, status := detectGitBoundary(root, root)
+	if status != boundaryConfirmed {
+		t.Fatalf("status=%v, want boundaryConfirmed", status)
+	}
+	discovered, err := planDiscoveredGitCorpus(b)
+	if err != nil {
+		t.Fatalf("planDiscoveredGitCorpus: %v", err)
+	}
+	explicit, err := planCurrentGitCorpus(b.toGitPaths())
+	if err != nil {
+		t.Fatalf("planCurrentGitCorpus: %v", err)
+	}
+	// Discovered plan's userExplicit must be zero-value (false).
+	if discovered.userExplicit {
+		t.Fatal("discovered plan must not be userExplicit")
+	}
+	// IDs must match — same root, same dev:ino, same versioning.
+	if discovered.id != explicit.id {
+		t.Fatalf("ID mismatch: discovered=%q explicit=%q", discovered.id, explicit.id)
+	}
+}
+
 func TestPlanCurrentGitCorpus_UserCacheLayout(t *testing.T) {
 	root := t.TempDir()
 	setTestUserCache(t)
@@ -154,10 +194,9 @@ func fakeGitPathsForPlanTest(repoDir string) gitPaths {
 	}
 	gitDir := filepath.Join(absRepoDir, ".git")
 	return gitPaths{
-		RepoDir:     absRepoDir,
-		GitDir:      gitDir,
-		CommonDir:   gitDir,
-		ExcludePath: filepath.Join(gitDir, "info", "exclude"),
-		ConfigPath:  filepath.Join(gitDir, "config"),
+		RepoDir:    absRepoDir,
+		GitDir:     gitDir,
+		CommonDir:  gitDir,
+		ConfigPath: filepath.Join(gitDir, "config"),
 	}
 }
