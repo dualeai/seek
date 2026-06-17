@@ -27,24 +27,28 @@ seek 'needle' ./src/server.go        # exact file
 
 ```
 ## src/server.go (Go)
-  12
-  13 // handleRequest processes incoming HTTP requests.
-  14 // It validates auth and delegates to the appropriate handler.
-  15 [func] func handleRequest(w http.ResponseWriter, r *http.Request) {
-  16     ctx := r.Context()
-  17     log.Info("handling request")
-  18     validateAuth(ctx, r)
+12
+13 // handleRequest processes incoming HTTP requests.
+14 // It validates auth and delegates to the appropriate handler.
+15 [func] func handleRequest(w http.ResponseWriter, r *http.Request) {
+16     ctx := r.Context()
+17     log.Info("handling request")
+18     validateAuth(ctx, r)
 
-  40     }
-  41     // dispatch to handler
-  42     go handleRequest(w, r)
-  43     return nil
-  44 }
+40     }
+41     // dispatch to handler
+42     go handleRequest(w, r)
+43     return nil
+44 }
 ```
 
 Results are grouped by file and sorted by relevance. Each match includes 3
 lines of surrounding context. Symbol tags like `[func]`, `[class]`, and
-`[function]` show metadata from ctags.
+`[function]` show metadata from ctags. On a terminal the file name, line
+numbers, and matched tokens are colored; when output is piped (agents, CI, or
+`| cat`) it is plain text with no escape codes. Set `NO_COLOR` to force plain
+output on a terminal. Across multiple search roots, file headers show the
+absolute path so each match is directly openable.
 
 ## Highlights
 
@@ -153,6 +157,9 @@ Examples:
 
 Output: ranked by BM25 relevance, grouped by file, 3 lines of context.
 Symbol lines tagged [func], [class], etc. Modified files tagged [uncommitted].
+Plain text when piped (agents/CI get no color); colored only on a terminal,
+and NO_COLOR is honored. When results were capped by -n/-m, a "N more files/
+matches" line says how many were hidden.
 
 Exit codes: 0 = matches found, 1 = no matches, 2 = error.
 
@@ -315,7 +322,7 @@ Standard folder indexing walks regular files and only prunes `.git` metadata
 directories. Dependency, build, cache, and vendor directories are not skipped by
 name in standard folder mode. Git ignore semantics are handled only for Git
 roots, including external Git roots. Files larger than 100 MiB are skipped, and
-standard folder indexing stops at 1,000,000 candidate files or 5 GiB of indexed
+standard folder indexing stops at 1,000,000 candidate files or 10 GiB of indexed
 bytes.
 
 Field benchmarks on Apple M1 Max (covers Git repos AND non-Git folder

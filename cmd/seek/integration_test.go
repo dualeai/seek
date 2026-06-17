@@ -954,8 +954,40 @@ func TestRun_MultiCorpusShowsContextEvenWhenOnlyOneCorpusMatches(t *testing.T) {
 		t.Fatalf("run: %v", err)
 	}
 	wantRoot := canonicalCorpusPath(matching)
-	if !strings.Contains(out, "[folder: "+wantRoot+"]") {
+	if !strings.Contains(out, "## "+filepath.Join(wantRoot, "note.txt")) ||
+		!strings.Contains(out, "[folder]") {
 		t.Fatalf("expected corpus context for multi-corpus search, got:\n%s", out)
+	}
+}
+
+// TestRun_PipedOutputHasNoANSI is the load-bearing guarantee for the agent-first
+// design: captureStdout replaces os.Stdout with a pipe (not a TTY), so the color
+// gate must yield plain, escape-free text end-to-end through run().
+func TestRun_PipedOutputHasNoANSI(t *testing.T) {
+	requireTools(t)
+
+	folder := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(folder, "probe.go"),
+		[]byte("package x\n// ansi_probe_marker here\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "ansi_probe_marker", []string{folder}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(out, "ansi_probe_marker") {
+		t.Fatalf("expected the match in output, got:\n%q", out)
+	}
+	if strings.ContainsRune(out, '\x1b') {
+		t.Fatalf("piped output must be ANSI-free for agents/CI, got:\n%q", out)
 	}
 }
 
