@@ -8,7 +8,45 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
+
+// TestFlagTablesMatchCobraFlags guards a real footgun: splicePassthroughSeparator
+// distinguishes a Zoekt query (`-file:test`) from a real flag using the
+// knownFlagTokens / flagTakesValue tables. If a flag is added to cobra but not
+// to those tables, the single-dash passthrough silently misparses (e.g. a new
+// value-flag's value gets spliced as a positional). This keeps them in sync.
+func TestFlagTablesMatchCobraFlags(t *testing.T) {
+	cmd := newRootCmd()
+	seen := map[string]bool{}
+	check := func(f *pflag.Flag) {
+		if seen[f.Name] {
+			return
+		}
+		seen[f.Name] = true
+
+		if long := "--" + f.Name; !isKnownFlagToken(long) {
+			t.Errorf("flag %q is registered on cobra but missing from knownFlagTokens; "+
+				"single-dash query passthrough will misparse", long)
+		}
+		if f.Shorthand != "" && !isKnownFlagToken("-"+f.Shorthand) {
+			t.Errorf("shorthand -%s missing from knownFlagTokens", f.Shorthand)
+		}
+
+		// A value-consuming flag (non-bool) must be in flagTakesValue, or the
+		// splicer treats its space-separated value as a splice candidate.
+		if f.Value.Type() != "bool" {
+			if long := "--" + f.Name; !flagTakesValue(long) {
+				t.Errorf("value-flag %q missing from flagTakesValue", long)
+			}
+			if f.Shorthand != "" && !flagTakesValue("-"+f.Shorthand) {
+				t.Errorf("value-flag shorthand -%s missing from flagTakesValue", f.Shorthand)
+			}
+		}
+	}
+	cmd.Flags().VisitAll(check)
+	cmd.PersistentFlags().VisitAll(check)
+}
 
 // TestSplicePassthroughSeparator locks the contract that determines
 // when an unknown leading `-token` is a Zoekt query (must pass through

@@ -1,13 +1,13 @@
 # seek
 
-Ranked local search for AI coding agents. Search the current Git worktree,
-selected paths, external folders, or exact files. Single binary, no server, no
-API key.
+Ranked local search for AI coding agents. `seek` indexes anything you point it
+at — a Git worktree, arbitrary folders, external checkouts, generated files,
+docs — and returns the best matches first, with symbols and context. Single
+binary, no server, no API key.
 
-AI coding agents need local context from code, docs, specs, generated files,
-notes, and neighboring checkouts. `seek` lets them query the files you point at
-and get the best matches first, with symbols and surrounding context included.
-It works as a tool call in any agent loop or as a shell command.
+Built for how agents search: token-efficient output, an index that stays fresh
+incrementally, and resource-bounded concurrency for fleets of agents. Works as a
+tool call in any agent loop or a shell command.
 
 <!-- Status -->
 [![CI](https://github.com/dualeai/seek/actions/workflows/ci.yml/badge.svg)](https://github.com/dualeai/seek/actions/workflows/ci.yml)
@@ -52,21 +52,24 @@ absolute path so each match is directly openable.
 
 ## Highlights
 
-- **Search the local working set** -- current Git worktree by default; pass
-  paths to search selected files, selected folders, or folders outside Git
-- **Best match first** -- results are ranked by BM25 relevance, not file-path
-  order
-- **Find definitions, not mentions** -- `sym:` search uses universal-ctags for
-  functions, classes, methods, and types
-- **Context included** -- every match includes 3 surrounding lines, so agents
-  can act without an extra read step
-- **Filters that cut noise** -- `lang:python`, `file:api`, `-file:test`, and
-  `content:regex` narrow a query in one step
-- **Sees Git changes** -- modified, staged, and untracked files are indexed
-  alongside committed code and tagged `[uncommitted]`
-- **Safe for parallel agents** -- concurrent searches use flock-based locking
-- **Fast after the first index** -- measured on kubernetes (29k files): cold
-  index ~8s, warm search ~145ms including dirty-file re-indexing
+- **Index anything** -- Git worktree by default; pass paths for files, non-Git
+  folders, external repos, or generated artifacts. Git ignore applies to Git
+  roots; plain folders index every file under a size/count cap.
+- **Best match first** -- ranked by BM25 relevance, not file-path order
+- **Find definitions, not mentions** -- `sym:` search via universal-ctags
+- **Token-efficient output** -- dense gutter, no padding; long lines windowed
+  around the match (`…+N bytes`) so one minified file can't blow the context;
+  control bytes and bidi overrides stripped; plain when piped, color on a TTY
+- **Context included** -- 3 surrounding lines per match, no extra read step
+- **Filters that cut noise** -- `lang:python`, `file:api`, `-file:test`,
+  `content:regex` in one query
+- **Sees Git changes** -- committed, staged, and untracked indexed together,
+  tagged `[uncommitted]`; only changed files re-indexed between searches
+- **Built for parallel fleets** -- concurrent searches share read locks
+  (`flock` LOCK_SH); a read semaphore caps in-flight bytes; one query fans out
+  across roots
+- **Fast after the first index** -- one-time build, then warm searches in
+  milliseconds (benchmarks below)
 
 ## Install
 
