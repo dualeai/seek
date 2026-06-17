@@ -40,7 +40,7 @@ func TestGitCorpusFormatting_BasicFileMatch(t *testing.T) {
 	}
 
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
-	expected := "## src/main.go (Go)\n  5 func main() {"
+	expected := "## src/main.go (Go)\n5 func main() {"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -63,7 +63,7 @@ func TestGitCorpusFormatting_UncommittedTag(t *testing.T) {
 	}
 
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
-	expected := "## lib/utils.py (Python) [uncommitted]\n  10 def helper():"
+	expected := "## lib/utils.py (Python) [uncommitted]\n10 def helper():"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -155,7 +155,7 @@ func TestGitCorpusFormatting_SymbolKind(t *testing.T) {
 	}
 
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
-	expected := "## router.go (Go)\n  15 [function] func CoreRouter() {"
+	expected := "## router.go (Go)\n15 [function] func CoreRouter() {"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -369,11 +369,11 @@ func TestGitCorpusFormatting_ContextLines_BeforeAndAfter(t *testing.T) {
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## server.go (Go)",
-		"  13 ",
-		"  14 // handleRequest processes incoming HTTP requests.",
-		"  15 [function] func handleRequest(w http.ResponseWriter, r *http.Request) {",
-		`  16     ctx := r.Context()`,
-		`  17     log.Info("handling request")`,
+		"13 ",
+		"14 // handleRequest processes incoming HTTP requests.",
+		"15 [function] func handleRequest(w http.ResponseWriter, r *http.Request) {",
+		`16     ctx := r.Context()`,
+		`17     log.Info("handling request")`,
 	}, "\n")
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -398,7 +398,7 @@ func TestGitCorpusFormatting_ContextLines_NoContext(t *testing.T) {
 	}
 
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
-	expected := "## main.go (Go)\n  5 func main() {"
+	expected := "## main.go (Go)\n5 func main() {"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -432,9 +432,9 @@ func TestGitCorpusFormatting_ContextLines_OverlappingContext(t *testing.T) {
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
-		"  10 first match",
-		"  11 line eleven",
-		"  12 second match",
+		"10 first match",
+		"11 line eleven",
+		"12 second match",
 	}, "\n")
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -467,11 +467,11 @@ func TestGitCorpusFormatting_ContextLines_NonContiguousRegions(t *testing.T) {
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
-		"   5 first match",
-		"   6 after first",
+		"5 first match",
+		"6 after first",
 		"",
-		"  49 before second",
-		"  50 second match",
+		"49 before second",
+		"50 second match",
 	}, "\n")
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -504,8 +504,8 @@ func TestGitCorpusFormatting_ContextLines_AdjacentMatches(t *testing.T) {
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
-		"  10 line one",
-		"  11 line two match",
+		"10 line one",
+		"11 line two match",
 	}, "\n")
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -534,13 +534,13 @@ func TestGitCorpusFormatting_ContextLines_ThreeContextLines(t *testing.T) {
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## main.go (Go)",
-		"  17 ctx line 17",
-		"  18 ctx line 18",
-		"  19 ctx line 19",
-		"  20     target line",
-		"  21 ctx line 21",
-		"  22 ctx line 22",
-		"  23 ctx line 23",
+		"17 ctx line 17",
+		"18 ctx line 18",
+		"19 ctx line 19",
+		"20     target line",
+		"21 ctx line 21",
+		"22 ctx line 22",
+		"23 ctx line 23",
 	}, "\n")
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -568,8 +568,8 @@ func TestGitCorpusFormatting_ContextLines_MatchOnLine1(t *testing.T) {
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## main.go (Go)",
-		"  1 package main",
-		"  2 import \"fmt\"",
+		"1 package main",
+		"2 import \"fmt\"",
 	}, "\n")
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -601,10 +601,10 @@ func TestGitCorpusFormatting_ContextLines_MatchOnLine1_ExcessBefore(t *testing.T
 	if strings.Contains(result, "phantom") {
 		t.Errorf("expected excess Before lines to be dropped, got:\n%s", result)
 	}
-	if strings.Contains(result, "  0 ") || strings.Contains(result, "  -") {
+	if strings.Contains(result, "0 ") || strings.Contains(result, "  -") {
 		t.Errorf("expected no zero or negative line numbers, got:\n%s", result)
 	}
-	if !strings.Contains(result, "  1 package main") {
+	if !strings.Contains(result, "1 package main") {
 		t.Errorf("expected match line to still be present, got:\n%s", result)
 	}
 }
@@ -630,8 +630,8 @@ func TestGitCorpusFormatting_ContextLines_MatchOnLine2_PartialBefore(t *testing.
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## main.go (Go)",
-		"  1 package main",
-		"  2 import \"fmt\"",
+		"1 package main",
+		"2 import \"fmt\"",
 	}, "\n")
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -670,11 +670,11 @@ func TestGitCorpusFormatting_ContextLines_ThreeConsecutiveMatches(t *testing.T) 
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
-		"  10 match A",
-		"  11 between AB",
-		"  12 match B",
-		"  13 between BC",
-		"  14 match C",
+		"10 match A",
+		"11 between AB",
+		"12 match B",
+		"13 between BC",
+		"14 match C",
 	}, "\n")
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -702,8 +702,8 @@ func TestGitCorpusFormatting_ContextLines_OnlyBefore(t *testing.T) {
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
-		"   99 penultimate",
-		"  100 last line",
+		"99 penultimate",
+		"100 last line",
 	}, "\n")
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -731,8 +731,8 @@ func TestGitCorpusFormatting_ContextLines_OnlyAfter(t *testing.T) {
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
-		"  1 first line",
-		"  2 second line",
+		"1 first line",
+		"2 second line",
 	}, "\n")
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -761,12 +761,12 @@ func TestGitCorpusFormatting_ContextLines_EmptyLinesInContext(t *testing.T) {
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
-		"  2 import \"fmt\"",
-		"  3 ",
-		"  4 ",
-		"  5 func main() {",
-		"  6 ",
-		"  7     fmt.Println()",
+		"2 import \"fmt\"",
+		"3 ",
+		"4 ",
+		"5 func main() {",
+		"6 ",
+		"7     fmt.Println()",
 	}, "\n")
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -793,7 +793,7 @@ func TestGitCorpusFormatting_ContextLines_EmptyByteSlice(t *testing.T) {
 	}
 
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
-	expected := "## app.go (Go)\n  5 match"
+	expected := "## app.go (Go)\n5 match"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -820,9 +820,9 @@ func TestGitCorpusFormatting_ContextLines_BeforeNoTrailingNewline(t *testing.T) 
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
-		"  1 line one",
-		"  2 line two",
-		"  3 match",
+		"1 line one",
+		"2 line two",
+		"3 match",
 	}, "\n")
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -992,7 +992,7 @@ func TestGitCorpusFormatting_LineNumber_MaxUint32(t *testing.T) {
 	}
 }
 
-func TestGitCorpusFormatting_GlobalAlignment_CrossFile(t *testing.T) {
+func TestGitCorpusFormatting_LineNumbers_NoPaddingNoIndent(t *testing.T) {
 	files := []zoekt.FileMatch{
 		{
 			FileName: "shallow.go", Repository: "repo", Language: "Go", Score: 10,
@@ -1008,12 +1008,13 @@ func TestGitCorpusFormatting_GlobalAlignment_CrossFile(t *testing.T) {
 		},
 	}
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
-	// Both should be padded to width 3 (len("100") == 3)
-	if !strings.Contains(result, "    5 near top") {
-		t.Errorf("expected shallow match padded to width 3, got:\n%s", result)
+	// Dense gutter: line numbers are flush-left with a single space, never
+	// indented or right-aligned to a shared cross-file width.
+	if !strings.Contains(result, "\n5 near top") || !strings.Contains(result, "\n100 far down") {
+		t.Errorf("expected flush-left line numbers, got:\n%s", result)
 	}
-	if !strings.Contains(result, "  100 far down") {
-		t.Errorf("expected deep match at width 3, got:\n%s", result)
+	if strings.Contains(result, "\n 5 near top") {
+		t.Errorf("line numbers must not be padded/indented, got:\n%s", result)
 	}
 }
 
@@ -1057,12 +1058,13 @@ func TestGitCorpusFormatting_Limit_TopN(t *testing.T) {
 		}
 	}
 	result := formatGitCorpusResultsForTest(files, nil, 3, 0)
-	for _, want := range []string{"file_09.go", "file_08.go", "file_07.go"} {
+	// Anchor on the "## " header so e.g. "file_09.go" can't alias "file_900.go".
+	for _, want := range []string{"## file_09.go", "## file_08.go", "## file_07.go"} {
 		if !strings.Contains(result, want) {
 			t.Errorf("expected %s in limited output", want)
 		}
 	}
-	for _, noWant := range []string{"file_06.go", "file_05.go", "file_00.go"} {
+	for _, noWant := range []string{"## file_06.go", "## file_05.go", "## file_00.go"} {
 		if strings.Contains(result, noWant) {
 			t.Errorf("did not expect %s in limited output", noWant)
 		}
@@ -1410,13 +1412,13 @@ func TestFormatCorpusResults_SameRelativePathDifferentCorpora(t *testing.T) {
 		},
 	}
 
-	out := formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext)
-	if strings.Count(out, "## same.txt") != 2 {
-		t.Fatalf("expected two same-path headers, got:\n%s", out)
+	out := formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext, plainPalette)
+	if !strings.Contains(out, "## /tmp/a/same.txt") ||
+		!strings.Contains(out, "## /tmp/b/same.txt") {
+		t.Fatalf("expected absolute same-path headers, got:\n%s", out)
 	}
-	if !strings.Contains(out, "[folder: /tmp/a]") ||
-		!strings.Contains(out, "[folder: /tmp/b]") {
-		t.Fatalf("expected folder corpus context, got:\n%s", out)
+	if strings.Count(out, "[folder]") != 2 {
+		t.Fatalf("expected folder corpus tags, got:\n%s", out)
 	}
 }
 
@@ -1438,10 +1440,13 @@ func TestFormatCorpusResults_GitCorpusContext(t *testing.T) {
 		},
 	}
 
-	out := formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext)
-	if !strings.Contains(out, "[git: /tmp/repo-a]") ||
-		!strings.Contains(out, "[git: /tmp/repo-b]") {
-		t.Fatalf("expected git corpus context, got:\n%s", out)
+	out := formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext, plainPalette)
+	if !strings.Contains(out, "## /tmp/repo-a/same.go") ||
+		!strings.Contains(out, "## /tmp/repo-b/same.go") {
+		t.Fatalf("expected absolute git paths, got:\n%s", out)
+	}
+	if strings.Count(out, "[git]") != 2 {
+		t.Fatalf("expected git corpus tags, got:\n%s", out)
 	}
 }
 
@@ -1459,7 +1464,7 @@ func TestFormatCorpusResults_DirtySuppressionIsCorpusScoped(t *testing.T) {
 		"git": testDirtyFileSet("same.go"),
 	}
 
-	out := formatCorpusResultsWithContext(results, dirtyByCorpus, 0, 0, showCorpusContext)
+	out := formatCorpusResultsWithContext(results, dirtyByCorpus, 0, 0, showCorpusContext, plainPalette)
 	if out == "" {
 		t.Fatal("external result should not be suppressed by Git dirty state")
 	}
@@ -1486,8 +1491,8 @@ func TestFormatCorpusResults_LimitAppliesAfterMerge(t *testing.T) {
 		},
 	}
 
-	out := formatCorpusResultsWithContext(results, nil, 1, 0, showCorpusContext)
-	if !strings.Contains(out, "## high.txt") || strings.Contains(out, "## low.txt") {
+	out := formatCorpusResultsWithContext(results, nil, 1, 0, showCorpusContext, plainPalette)
+	if !strings.Contains(out, "## /tmp/high/high.txt") || strings.Contains(out, "low.txt") {
 		t.Fatalf("expected limit after merged sort, got:\n%s", out)
 	}
 }

@@ -262,7 +262,39 @@ func BenchmarkCorpusFormatting_1File_1Match(b *testing.B) {
 	results := benchmarkGitResults(files)
 	b.ReportAllocs()
 	for b.Loop() {
-		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext)
+		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
+	}
+}
+
+// BenchmarkCorpusFormatting_LongLineWindowed exercises the match-aware
+// windowing path (line >> maxLineBytes with a deep match + truncation markers).
+func BenchmarkCorpusFormatting_LongLineWindowed(b *testing.B) {
+	line := strings.Repeat("x", 2000) + "NEEDLE" + strings.Repeat("y", 2000) + "\n"
+	files := []zoekt.FileMatch{{
+		FileName: "min.js", Repository: "repo", Language: "JavaScript", Score: 10,
+		LineMatches: []zoekt.LineMatch{
+			{Line: []byte(line), LineNumber: 1, LineFragments: []zoekt.LineFragmentMatch{{LineOffset: 2000, MatchLength: 6}}},
+		},
+	}}
+	results := benchmarkGitResults(files)
+	b.ReportAllocs()
+	for b.Loop() {
+		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
+	}
+}
+
+// BenchmarkCorpusFormatting_SanitizedControlChars exercises the rune-by-rune
+// sanitize slow path (C0 ESC + C1 control bytes interleaved with text).
+func BenchmarkCorpusFormatting_SanitizedControlChars(b *testing.B) {
+	line := "func x() { " + strings.Repeat("a\x1bb\u009c", 50) + " }\n"
+	files := []zoekt.FileMatch{{
+		FileName: "a.go", Repository: "repo", Language: "Go", Score: 10,
+		LineMatches: []zoekt.LineMatch{{Line: []byte(line), LineNumber: 1}},
+	}}
+	results := benchmarkGitResults(files)
+	b.ReportAllocs()
+	for b.Loop() {
+		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
 	}
 }
 
@@ -282,7 +314,7 @@ func BenchmarkCorpusFormatting_10Files_3Matches(b *testing.B) {
 	results := benchmarkGitResults(files)
 	b.ReportAllocs()
 	for b.Loop() {
-		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext)
+		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
 	}
 }
 
@@ -291,7 +323,7 @@ func BenchmarkCorpusFormatting_100Files_WithDedup(b *testing.B) {
 	results := benchmarkGitResults(files)
 	b.ReportAllocs()
 	for b.Loop() {
-		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext)
+		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
 	}
 }
 
@@ -316,7 +348,7 @@ func BenchmarkCorpusFormatting_WithSymbols(b *testing.B) {
 	results := benchmarkGitResults(files)
 	b.ReportAllocs()
 	for b.Loop() {
-		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext)
+		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
 	}
 }
 
@@ -359,7 +391,7 @@ func BenchmarkCorpusFormatting_FileLimit(b *testing.B) {
 		b.Run(name, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				formatCorpusResultsWithContext(results, nil, limit, 0, hideCorpusContext)
+				formatCorpusResultsWithContext(results, nil, limit, 0, hideCorpusContext, plainPalette)
 			}
 		})
 	}
@@ -376,7 +408,7 @@ func BenchmarkCorpusFormatting_MatchLimit(b *testing.B) {
 		b.Run(name, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				formatCorpusResultsWithContext(results, nil, 0, maxMatches, hideCorpusContext)
+				formatCorpusResultsWithContext(results, nil, 0, maxMatches, hideCorpusContext, plainPalette)
 			}
 		})
 	}
@@ -396,7 +428,7 @@ func BenchmarkCorpusFormatting_Combined(b *testing.B) {
 		b.Run(tc.name, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				formatCorpusResultsWithContext(results, nil, tc.limit, tc.maxMatches, hideCorpusContext)
+				formatCorpusResultsWithContext(results, nil, tc.limit, tc.maxMatches, hideCorpusContext, plainPalette)
 			}
 		})
 	}
@@ -924,7 +956,7 @@ func BenchmarkMultiCorpus_WarmSearchAndFormat(b *testing.B) {
 			b.Fatalf("search corpus B: %v", err)
 		}
 		results := append(resultsA, resultsB...)
-		benchmarkStringSink = formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext)
+		benchmarkStringSink = formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext, plainPalette)
 	}
 }
 
@@ -950,7 +982,7 @@ func BenchmarkFormatCorpusResults_Dedupe(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		benchmarkStringSink = formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext)
+		benchmarkStringSink = formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext, plainPalette)
 	}
 }
 
@@ -1310,6 +1342,64 @@ func benchmarkFileMatch(name string, score float64) zoekt.FileMatch {
 	}
 }
 
+// benchmarkRealisticFiles builds n files with representative content rather than
+// the trivial fixtures above: tab-indented source, a symbol match with a
+// multibyte comment in its context, and a long minified line whose match sits
+// deep enough to trigger windowing. Exercises the sanitize, windowing, symbol
+// and (with ansiPalette) coloring paths together.
+func benchmarkRealisticFiles(n int) []zoekt.FileMatch {
+	long := "const blob = \"" + strings.Repeat("x", 3000) + "needle" + strings.Repeat("y", 1500) + "\"\n"
+	files := make([]zoekt.FileMatch, n)
+	for i := range n {
+		files[i] = zoekt.FileMatch{
+			FileName: fmt.Sprintf("pkg/service%d/handler.go", i), Repository: "bench",
+			Language: "Go", Score: float64(n - i),
+			LineMatches: []zoekt.LineMatch{
+				{
+					Line:       []byte("\tfunc (s *Service) HandleRequest(ctx context.Context) error {\n"),
+					LineNumber: 42,
+					Before:     []byte("\t// HandleRequest validates the café ☕ then dispatches.\n"),
+					After:      []byte("\t\treturn s.dispatch(ctx)\n"),
+					LineFragments: []zoekt.LineFragmentMatch{
+						// "HandleRequest" begins at byte 19 of "\tfunc (s *Service) ".
+						{LineOffset: 19, MatchLength: 13, SymbolInfo: &zoekt.Symbol{Kind: "method"}},
+					},
+				},
+				{
+					Line:          []byte(long),
+					LineNumber:    200,
+					LineFragments: []zoekt.LineFragmentMatch{{LineOffset: 3014, MatchLength: 6}},
+				},
+			},
+		}
+	}
+	return files
+}
+
+// BenchmarkCorpusFormatting_Palettes covers BOTH the plain and the colored emit
+// paths (the rest of the suite only measures plainPalette, leaving the color
+// wrapping + visibility scan unbenchmarked) and reports out_B — the size of the
+// produced output, the agent-facing quality metric the formatter optimizes for.
+// Track out_B across changes to catch token/byte regressions in Go bench too.
+func BenchmarkCorpusFormatting_Palettes(b *testing.B) {
+	results := benchmarkGitResults(benchmarkRealisticFiles(20))
+	for _, pc := range []struct {
+		name string
+		pal  palette
+	}{
+		{"plain", plainPalette},
+		{"ansi", ansiPalette},
+	} {
+		b.Run(pc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				benchmarkStringSink = formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, pc.pal)
+			}
+			b.ReportMetric(float64(len(benchmarkStringSink)), "out_B")
+		})
+	}
+}
+
 // --- Large-repo benchmarks ---
 // Set SEEK_BENCH_REPO to a git repo path (e.g. a kubernetes checkout) to
 // enable these. They measure real-world indexing and search latency on a
@@ -1619,7 +1709,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
-			formatCorpusResultsWithContext(corpusResults, nil, 0, 0, hideCorpusContext)
+			formatCorpusResultsWithContext(corpusResults, nil, 0, 0, hideCorpusContext, plainPalette)
 		}
 	})
 
@@ -1644,7 +1734,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
-			formatCorpusResultsWithContext(corpusResults, dirtyByCorpus, 0, 0, hideCorpusContext)
+			formatCorpusResultsWithContext(corpusResults, dirtyByCorpus, 0, 0, hideCorpusContext, plainPalette)
 		}
 	})
 }

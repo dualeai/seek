@@ -42,7 +42,8 @@ seek 'package' ./cmd/seek/searcher.go
 # Search a folder outside the Git worktree
 seek 'TODO' /tmp/notes
 
-# Mix in-repo and external paths (Git matches tag with [git: ...])
+# Mix in-repo and external paths (across roots, headers show the absolute
+# path and a [git]/[folder] tag so each match is directly openable)
 seek 'sym:Index' ./cmd/seek /tmp/notes
 
 # Find indexing logic, excluding tests

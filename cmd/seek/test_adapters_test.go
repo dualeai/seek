@@ -17,7 +17,7 @@ func formatGitCorpusResultsForTest(files []zoekt.FileMatch, dirtyFiles dirtyFile
 	if dirtyFiles != nil {
 		dirtyByCorpus[testGitCorpusPlan.id] = dirtyFiles
 	}
-	return formatCorpusResultsWithContext(results, dirtyByCorpus, limit, maxMatches, hideCorpusContext)
+	return formatCorpusResultsWithContext(results, dirtyByCorpus, limit, maxMatches, hideCorpusContext, plainPalette)
 }
 
 func executeUnscopedShardSearchForTest(ctx context.Context, indexDir, pattern string) ([]zoekt.FileMatch, error) {

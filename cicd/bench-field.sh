@@ -96,6 +96,29 @@ fmt_dur() {
   }'
 }
 
+# count_tokens QUERY DIR: token count of seek's output for QUERY over DIR.
+# Lets us track whether formatter changes shrink what an agent ingests.
+#
+# Notes:
+#   - Output is PIPED (not a TTY) so seek emits plain, color-free text —
+#     exactly what an agent/CI sees. ANSI never contaminates the count.
+#   - o200k_base (GPT-4o/Codex) is a PROXY, not Claude's tokenizer. Relative
+#     %-deltas transfer well for whitespace/ASCII-structural changes (±5%);
+#     absolute counts are not Claude's. Treat <5% deltas as marginal.
+#   - Deterministic only on the SAME machine + SAME corpus snapshot. The repos
+#     are shallow-cloned (see clone_repo) so upstream HEAD drifts day-to-day;
+#     for stable cross-day deltas pin commits or compare the synthetic folders.
+#   - Requires uv (https://docs.astral.sh/uv/); tiktoken is pulled into an
+#     ephemeral env via `--with`, so nothing needs pre-installing. Echoes "n/a"
+#     when uv is absent. Data stays on stdin; the script is passed via -c.
+#   - Pipeline tolerates seek's exit-1 on no-match (`|| true`) under pipefail.
+count_tokens() {
+  command -v uv >/dev/null 2>&1 || { echo "n/a"; return; }
+  { seek "$1" "$2" 2>/dev/null || true; } \
+    | uv run --quiet --no-project --with tiktoken python -c \
+      'import sys,tiktoken; print(len(tiktoken.get_encoding("o200k_base").encode(sys.stdin.read())))'
+}
+
 count_files() {
   find "$1" \( -name .git -prune \) -o -type f -print | wc -l | tr -d ' '
 }
@@ -202,7 +225,12 @@ for entry in "${WORKLOADS[@]}"; do
   d1_ns=$(bench_dirty_reindex "$dir" 1)
   d10_ns=$(bench_dirty_reindex "$dir" 10)
 
-  results+=("$kind|$label|$files|$cold_ns|$warm_ns|$d1_ns|$d10_ns")
+  # Token columns: a content query and a symbol query exercise distinct
+  # formatter paths (context/match lines vs the [kind] symbol tag).
+  tok_content=$(count_tokens 'package' "$dir")
+  tok_sym=$(count_tokens 'sym:.*' "$dir")
+
+  results+=("$kind|$label|$files|$cold_ns|$warm_ns|$d1_ns|$d10_ns|$tok_content|$tok_sym")
 done
 
 echo
@@ -211,13 +239,14 @@ echo
 echo "Machine: $(uname -sm) — $(date -u +%Y-%m-%d)"
 echo "Seek: $(seek --version 2>/dev/null || echo unknown)"
 echo
-echo "| Kind | Workload | Files | Cold index | Warm search | Dirty 1% | Dirty 10% |"
-echo "|------|----------|-------|------------|-------------|----------|-----------|"
+echo "| Kind | Workload | Files | Cold index | Warm search | Dirty 1% | Dirty 10% | Tok(content) | Tok(sym) |"
+echo "|------|----------|-------|------------|-------------|----------|-----------|--------------|----------|"
 for row in "${results[@]}"; do
-  IFS='|' read -r kind label files cold warm d1 d10 <<<"$row"
-  printf "| %s | %s | %s | %s | %s | %s | %s |\n" \
+  IFS='|' read -r kind label files cold warm d1 d10 tokc toks <<<"$row"
+  printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s |\n" \
     "$kind" "$label" "$files" \
     "$(fmt_dur "$cold")" "$(fmt_dur "$warm")" \
-    "$(fmt_dur "$d1")" "$(fmt_dur "$d10")"
+    "$(fmt_dur "$d1")" "$(fmt_dur "$d10")" \
+    "$tokc" "$toks"
 done
 echo

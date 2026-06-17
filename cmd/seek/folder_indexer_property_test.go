@@ -38,8 +38,10 @@ func TestEnsureFolderCorpusFresh_RandomDistribution(t *testing.T) {
 	// back-pressure without unsatisfiable Acquires.
 	const perFileCap = testBudget / 4
 	// Total corpus cap = a multiple of testBudget so rotation fires
-	// multiple times across the run.
-	const totalCap = 16 * testBudget
+	// multiple times across the run. Kept modest (8×) because each iteration
+	// does a real zoekt index build; under -race + coverage this test is the
+	// suite's slowest, so larger volumes risk the package test timeout.
+	const totalCap = 8 * testBudget
 
 	check := func(seed uint64, n uint8, maxSize uint32) bool {
 		if n == 0 || maxSize == 0 {
@@ -69,7 +71,9 @@ func TestEnsureFolderCorpusFresh_RandomDistribution(t *testing.T) {
 		return availableWeight(readSemaphore) == testBudget
 	}
 
-	cfg := &quick.Config{MaxCount: 20}
+	// 10 random distributions exercise the back-pressure property without
+	// making this real-indexing test a multi-minute outlier under -race.
+	cfg := &quick.Config{MaxCount: 10}
 	if err := quick.Check(check, cfg); err != nil {
 		t.Fatal(err)
 	}

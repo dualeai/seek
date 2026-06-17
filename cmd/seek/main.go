@@ -14,6 +14,7 @@ import (
 
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/query"
+	"golang.org/x/term"
 )
 
 // errNoMatch is returned by run when the query executed successfully but
@@ -184,13 +185,36 @@ func run(ctx context.Context, pattern string, pathOperands []string, limit, maxM
 	if len(plans) > 1 || corporaInResults(allResults) > 1 {
 		displayMode = showCorpusContext
 	}
-	output := formatCorpusResultsWithContext(allResults, dirtyByCorpus, limit, maxMatches, displayMode)
+	pal := plainPalette
+	if useColor(os.Stdout) {
+		pal = ansiPalette
+	}
+	output := formatCorpusResultsWithContext(allResults, dirtyByCorpus, limit, maxMatches, displayMode, pal)
 	if output == "" {
 		return errNoMatch
 	}
 
 	_, _ = os.Stdout.WriteString(output)
 	return nil
+}
+
+// useColor decides whether to emit ANSI color on the given stream. Color is ON
+// by default and disabled only by constraints, in precedence order: NO_COLOR
+// (present and non-empty) forces off; CLICOLOR_FORCE (present, any value)
+// forces on even through a pipe (e.g. `… | less -R`, CI); otherwise color is
+// used only when the stream is a real terminal and TERM is set and not "dumb".
+// Piped output (agents, CI, `| cat`) is therefore plain with zero config.
+func useColor(f *os.File) bool {
+	if v, ok := os.LookupEnv("NO_COLOR"); ok && v != "" {
+		return false
+	}
+	if _, ok := os.LookupEnv("CLICOLOR_FORCE"); ok {
+		return true
+	}
+	if t := os.Getenv("TERM"); t == "" || t == "dumb" {
+		return false
+	}
+	return term.IsTerminal(int(f.Fd()))
 }
 
 func prepareAndSearchCorpus(

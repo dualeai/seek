@@ -25,9 +25,10 @@ test-static:
 	golangci-lint run ./...
 
 JUNIT_XML ?= junit.xml
+COVERPROFILE ?= cover.out
 
 test-unit:
-	gotestsum --junitfile $(JUNIT_XML) -- ./... -v -race
+	gotestsum --junitfile $(JUNIT_XML) -- ./... -v -race -timeout 18m -covermode=atomic -coverprofile=$(COVERPROFILE)
 
 test-bench:
 	go test ./cmd/seek/ -bench=. -benchmem -count=5
