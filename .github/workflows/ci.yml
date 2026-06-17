@@ -17,7 +17,12 @@ concurrency:
 
 jobs:
   test-static:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 10
+    # ubuntu-26.04 preview lacks the gold linker; CGO_ENABLED=0 keeps the
+    # pure-Go toolchain (golangci-lint, vet) off the broken external linker.
+    env:
+      CGO_ENABLED: "0"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
@@ -26,39 +31,114 @@ jobs:
       - run: make install
       - run: make test-static
 
-  test-unit:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04                        # Linux x86_64
-            name: linux-amd64
-          - os: ubuntu-24.04-arm                    # Linux arm64
-            name: linux-arm64
-          - os: macos-26                            # macOS arm64 (Tahoe)
-            name: macos-26-arm64
-          - os: macos-15                            # macOS arm64 (Sequoia)
-            name: macos-15-arm64
-    runs-on: ${{ matrix.os }}
+  vuln:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
     env:
-      JUNIT_XML: junit-${{ matrix.name }}.xml
+      GOVULNCHECK_VERSION: v1.3.0
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
           go-version-file: go.mod
+      - name: Cache Go tool binaries
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/go/bin
+          key: ${{ runner.os }}-${{ runner.arch }}-gotools-govulncheck-${{ env.GOVULNCHECK_VERSION }}-${{ hashFiles('go.mod') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-gotools-govulncheck-${{ env.GOVULNCHECK_VERSION }}-
+            ${{ runner.os }}-${{ runner.arch }}-gotools-govulncheck-
+      - name: Run govulncheck
+        run: |
+          gobin="$(go env GOPATH)/bin"
+          export PATH="$gobin:$PATH"
+          go install golang.org/x/vuln/cmd/govulncheck@"${GOVULNCHECK_VERSION}"
+          govulncheck -format sarif ./... > vuln.raw.sarif || true
+          # govulncheck emits duplicate items in rule tags; GitHub's SARIF
+          # validator rejects dups, so dedupe each tags array.
+          jq '(.runs[]?.tool.driver.rules[]?.properties.tags) |= (. // [] | unique)' \
+            vuln.raw.sarif > vuln.sarif
+      - name: Upload SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        with:
+          sarif_file: vuln.sarif
+          category: govulncheck
+
+  test-unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04                        # Linux x86_64 (Noble)
+            name: linux-amd64-2404
+          - os: ubuntu-24.04-arm                    # Linux arm64 (Noble)
+            name: linux-arm64-2404
+          - os: ubuntu-26.04                        # Linux x86_64 (preview)
+            name: linux-amd64-2604
+          - os: ubuntu-26.04-arm                    # Linux arm64 (preview)
+            name: linux-arm64-2604
+          - os: macos-26                            # macOS arm64 (Tahoe)
+            name: macos-26-arm64
+          - os: macos-15                            # macOS arm64 (Sequoia)
+            name: macos-15-arm64
+          - os: macos-26-intel                      # macOS x86_64 (Tahoe)
+            name: macos-26-amd64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      JUNIT_XML: junit-${{ matrix.name }}.xml
+      COVERPROFILE: cover-${{ matrix.name }}.out
+      GOTESTSUM_VERSION: v1.13.0
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+      # ubuntu-26.04 preview ships gcc defaulting to -fuse-ld=gold, but the
+      # gold linker is absent, breaking -race (cgo external link). Ensure bfd
+      # ld is installed and force it via extldflags. Harmless on 24.04.
+      - name: Fix external linker (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils
+          echo "GOFLAGS=-ldflags=-extldflags=-fuse-ld=bfd" >> "$GITHUB_ENV"
       - name: Install universal-ctags (macOS)
         if: runner.os == 'macOS'
         run: brew install universal-ctags
       - name: Install universal-ctags (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y universal-ctags
+      - name: Cache Go tool binaries
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/go/bin
+          key: ${{ runner.os }}-${{ runner.arch }}-gotools-gotestsum-${{ env.GOTESTSUM_VERSION }}-${{ hashFiles('go.mod') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-gotools-gotestsum-${{ env.GOTESTSUM_VERSION }}-
+            ${{ runner.os }}-${{ runner.arch }}-gotools-gotestsum-
       - name: Install gotestsum
-        run: go install gotest.tools/gotestsum@latest
+        run: |
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          go install gotest.tools/gotestsum@"${GOTESTSUM_VERSION}"
       - name: Run unit tests
         run: make test-unit
-        env:
-          JUNIT_XML: ${{ env.JUNIT_XML }}
+      - name: Coverage summary
+        if: always()
+        run: |
+          if [ -f "$COVERPROFILE" ]; then
+            {
+              echo "### Coverage (${{ matrix.name }})"
+              echo '```'
+              go tool cover -func="$COVERPROFILE" | tail -1
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -66,21 +146,35 @@ jobs:
           name: junit-${{ matrix.name }}
           path: ${{ env.JUNIT_XML }}
           if-no-files-found: ignore
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: coverage-${{ matrix.name }}
+          path: ${{ env.COVERPROFILE }}
+          if-no-files-found: ignore
 
   build:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04                        # Linux x86_64
-            name: linux-amd64
-          - os: ubuntu-24.04-arm                    # Linux arm64
-            name: linux-arm64
+          - os: ubuntu-24.04                        # Linux x86_64 (Noble)
+            name: linux-amd64-2404
+          - os: ubuntu-24.04-arm                    # Linux arm64 (Noble)
+            name: linux-arm64-2404
+          - os: ubuntu-26.04                        # Linux x86_64 (preview)
+            name: linux-amd64-2604
+          - os: ubuntu-26.04-arm                    # Linux arm64 (preview)
+            name: linux-arm64-2604
           - os: macos-26                            # macOS arm64 (Tahoe)
             name: macos-26-arm64
           - os: macos-15                            # macOS arm64 (Sequoia)
             name: macos-15-arm64
+          - os: macos-26-intel                      # macOS x86_64 (Tahoe)
+            name: macos-26-amd64
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     needs: [test-static, test-unit]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -92,3 +186,20 @@ jobs:
         with:
           name: seek-${{ matrix.name }}
           path: seek
+
+  # Submit the Go module graph to GitHub's dependency graph so Dependabot
+  # alerts work. Push-only: forked-PR runs lack write permission.
+  dependency-submission:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/go-dependency-submission@f35d5c9af13ce9cc32f7930b171e315e878f6921 # v2.0.3
+        with:
+          go-mod-path: go.mod
