@@ -89,7 +89,7 @@ jobs:
           - os: macos-26-intel                      # macOS x86_64 (Tahoe)
             name: macos-26-amd64
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       JUNIT_XML: junit-${{ matrix.name }}.xml
       COVERPROFILE: cover-${{ matrix.name }}.out
@@ -127,6 +127,10 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           go install gotest.tools/gotestsum@"${GOTESTSUM_VERSION}"
       - name: Run unit tests
+        # Step backstop sits above the Go test -timeout (18m, which fires first
+        # with a goroutine dump) and below the job timeout, so a hung test is
+        # bounded without GH hard-killing before Go can report.
+        timeout-minutes: 20
         run: make test-unit
       - name: Coverage summary
         if: always()

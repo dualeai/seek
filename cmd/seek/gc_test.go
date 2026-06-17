@@ -1213,27 +1213,50 @@ func TestGC_RunGC_CtxCancelMidLoop(t *testing.T) {
 	resetNFSCheck(t)
 	root := cacheRootForTest(t)
 	stale := time.Now().Add(-30 * 24 * time.Hour)
-	for i := 0; i < 100; i++ {
+	const seeded = 100
+	for i := 0; i < seeded; i++ {
 		seedCorpus(t, root, fakeCorpusHash(i), stale)
 	}
+	corporaPath := filepath.Join(root, corporaDir)
 	ctx, cancel := context.WithCancel(context.Background())
-	// Schedule cancellation a few ms in — too short for full 100-eviction
-	// completion (~80ms in benchmarks), long enough to let the loop start.
-	time.AfterFunc(5*time.Millisecond, cancel)
+	defer cancel()
 
-	runGC(ctx, gcOptions{maxAge: defaultGCMaxAge, skipThrottle: true}, defaultGCInterval)
-	cancel() // safe to call twice
+	// Cancel deterministically on the FIRST observed eviction instead of
+	// racing a wall-clock timer. A fixed delay is consumed by GC setup on a
+	// loaded runner (lock, drainTrash, enumerate, sort), so it can evict
+	// nothing before firing. Polling real progress (corpora count dropping
+	// below the seeded total) guarantees the partial-completion property at
+	// any machine speed — the tight spin observes the drop within microseconds,
+	// long before the ~100 filesystem renames a full sweep would take.
+	done := make(chan struct{})
+	go func() {
+		runGC(ctx, gcOptions{maxAge: defaultGCMaxAge, skipThrottle: true}, defaultGCInterval)
+		close(done)
+	}()
+poll:
+	for {
+		select {
+		case <-done:
+			break poll
+		default:
+			if entries, _ := enumerateCorpusDirs(corporaPath); len(entries) < seeded {
+				cancel()
+				break poll
+			}
+		}
+	}
+	<-done
 
-	entries, err := enumerateCorpusDirs(filepath.Join(root, corporaDir))
+	entries, err := enumerateCorpusDirs(corporaPath)
 	if err != nil {
 		t.Fatalf("enumerate: %v", err)
 	}
-	// Some evicted (loop made progress), some survived (loop broke).
-	// Allow wide bounds — timing-sensitive but the property is clear.
+	// All seeded corpora are stale, so an uncancelled run evicts everything;
+	// cancelling on the first eviction must spare the remainder.
 	if len(entries) == 0 {
 		t.Fatalf("mid-loop cancel should leave some corpora intact; all evicted")
 	}
-	if len(entries) == 100 {
+	if len(entries) == seeded {
 		t.Fatalf("mid-loop cancel should evict at least some; none evicted")
 	}
 }
