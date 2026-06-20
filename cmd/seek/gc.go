@@ -268,12 +268,12 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 
 		// Capture size + display info BEFORE eviction — once the dir is
 		// renamed to .trash the original path is gone and corpusDirSize
-		// would return 0, corpusDisplayName would return [empty].
+		// would return 0, readCorpusDisplayInfo would return [empty].
 		var size int64
 		var info corpusDisplayInfo
 		if streaming {
 			size = corpusDirSize(e.path)
-			info = corpusDisplayName(e.path)
+			info = readCorpusDisplayInfo(e.path)
 		}
 		var res gcRowResult
 		if e.usedAt.After(cutoff) {
@@ -541,8 +541,9 @@ func evictCorpus(e corpusDirEntry, trashDir string, cutoff time.Time) gcRowResul
 }
 
 // pickDisplayShard chooses which shard's metadata to read for display.
-// Prefers a non-uncommitted shard so Repository.Name carries the real repo
-// identity when callers want it. Zoekt's shard filename pattern is
+// Prefers a non-uncommitted shard so Repository.Source comes from the committed
+// corpus when available. Repository.Name may be an opaque fallback for local
+// repos without remote metadata. Zoekt's shard filename pattern is
 // `<urlencoded-name>_v<format>.<seq>.zoekt`, so an exact prefix match against
 // `uncommitted_` is reliable; a substring match on `uncommitted` would
 // false-positive on real repo names like `github.com/foo/uncommitted-tool`.
@@ -568,14 +569,14 @@ type corpusDisplayInfo struct {
 	gone   bool
 }
 
-// corpusDisplayName reads the first non-uncommitted shard's Repository.Source
-// to recover the original root path. Zero new schema — the data was already
-// persisted by every index cycle (indexer.go:653, folder_indexer.go:627/649,
-// zoekt gitindex sets Source = repoDir).
+// readCorpusDisplayInfo reads the first non-uncommitted shard's
+// Repository.Source to recover the original root path. Zero new schema — the
+// data was already persisted by every index cycle (indexer.go:653,
+// folder_indexer.go:627/649, zoekt gitindex sets Source = repoDir).
 //
 // Returns zero corpusDisplayInfo when no shards exist (empty corpus, crashed
 // indexer) — callers should fall back to the hash.
-func corpusDisplayName(corpusDir string) corpusDisplayInfo {
+func readCorpusDisplayInfo(corpusDir string) corpusDisplayInfo {
 	indexDir := filepath.Join(corpusDir, "index")
 	shards, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
 	if err != nil || len(shards) == 0 {

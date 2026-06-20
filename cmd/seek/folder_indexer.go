@@ -23,7 +23,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-
 const (
 	// Folder deltas are usually tiny. A smaller shard target reduces Zoekt's
 	// per-builder map sizing without changing the shard compatibility hash.
@@ -276,6 +275,7 @@ func scanFolderCorpus(ctx context.Context, plan corpusPlan, collectSelected bool
 		stateHasher:       stateHasher,
 		collectSelected:   collectSelected,
 		scanRoot:          plan.root,
+		excludeRoots:      plan.excludeRoots,
 		enqueueDiscovered: plan.discover,
 		discoveryEnabled:  discoveryEnabledForPlan(plan),
 	}
@@ -310,6 +310,7 @@ type folderCorpusScanner struct {
 	// workloads where the same subtree is reached from two roots in
 	// one invocation.
 	scanRoot          string
+	excludeRoots      []string
 	discoveryEnabled  bool
 	enqueueDiscovered func(gitBoundary) bool
 }
@@ -354,6 +355,9 @@ func (s *folderCorpusScanner) walkDirectory(dir, relBase string) error {
 				continue
 			}
 			path := dir + separator + name
+			if s.tryExcludeRoot(path, rel) {
+				continue
+			}
 			if s.tryDiscoverBoundary(path, rel) {
 				continue
 			}
@@ -374,6 +378,25 @@ func (s *folderCorpusScanner) walkDirectory(dir, relBase string) error {
 		}
 	}
 	return nil
+}
+
+func (s *folderCorpusScanner) tryExcludeRoot(path, rel string) bool {
+	if !isExcludedRoot(path, s.excludeRoots) {
+		return false
+	}
+	appendFolderFingerprintPart(s.stateHasher, "excluded-root")
+	appendFolderFingerprintPart(s.stateHasher, rel)
+	appendFolderFingerprintPart(s.stateHasher, canonicalCorpusPath(path))
+	return true
+}
+
+func isExcludedRoot(path string, excludeRoots []string) bool {
+	for _, root := range excludeRoots {
+		if path == root {
+			return true
+		}
+	}
+	return false
 }
 
 func openSortedDirectory(dir string) (*os.File, []os.DirEntry, error) {
@@ -801,8 +824,15 @@ func fingerprintRootEntry(
 			stateHasher:       &h,
 			collectSelected:   collectSelected,
 			scanRoot:          plan.root,
+			excludeRoots:      plan.excludeRoots,
 			enqueueDiscovered: plan.discover,
 			discoveryEnabled:  discoveryEnabled,
+		}
+		if scanner.tryExcludeRoot(path, name) {
+			return folderFingerprintPiece{
+				hash:    h.Sum64(),
+				present: true,
+			}, nil
 		}
 		// Root-level boundary case: the entry IS a nested git repo at
 		// the immediate child level. Same semantics as deeper

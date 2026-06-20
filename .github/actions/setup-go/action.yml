@@ -1,0 +1,19 @@
+name: Setup Go
+description: Set up the repository Go toolchain and Linux linker hardening.
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+      with:
+        go-version-file: go.mod
+
+    # ubuntu-26.04 preview ships gcc defaulting to -fuse-ld=gold, but the
+    # gold linker is absent, breaking cgo external links. Harmless on 24.04.
+    - name: Fix external linker (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y binutils
+        echo "GOFLAGS=-ldflags=-extldflags=-fuse-ld=bfd" >> "$GITHUB_ENV"

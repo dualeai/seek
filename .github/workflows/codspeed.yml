@@ -24,11 +24,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
-        with:
-          go-version-file: go.mod
+      - uses: ./.github/actions/setup-go
       - name: Run benchmarks
-        uses: CodSpeedHQ/action@1c8ae4843586d3ba879736b7f6b7b0c990757fab # v4.12.1
+        uses: CodSpeedHQ/action@445899b9a91a42b54d787dc415eceb208810a31d # v4.17.6
         with:
           mode: walltime
           run: go test ./cmd/seek/ -bench=. -benchtime=5s -run='^$' -short

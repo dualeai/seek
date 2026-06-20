@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"os"
-	"sync"
 	"testing"
 	"time"
 )
@@ -109,11 +108,7 @@ func TestIndexDeltaDocuments_BlocksConcurrentReader(t *testing.T) {
 		changed[i] = name
 	}
 
-	var (
-		deltaReturned time.Time
-		acquireDone   time.Time
-		wg            sync.WaitGroup
-	)
+	acquireDone := make(chan error, 1)
 
 	// Background concurrent Acquire — wants 2 MiB. The makeFileContent
 	// calls above already pre-Acquired 3 MiB, so the remaining budget
@@ -126,16 +121,14 @@ func TestIndexDeltaDocuments_BlocksConcurrentReader(t *testing.T) {
 	// goroutine record acquireDone BEFORE the main goroutine records
 	// deltaReturned even if Release fired during Finish.
 	goroutineStarted := make(chan struct{})
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		close(goroutineStarted)
 		if err := readSemaphore.Acquire(t.Context(), 2*1024*1024); err != nil {
-			t.Errorf("concurrent Acquire: %v", err)
+			acquireDone <- err
 			return
 		}
-		acquireDone = time.Now()
 		readSemaphore.Release(2 * 1024 * 1024)
+		acquireDone <- nil
 	}()
 	<-goroutineStarted
 	// Ensure the Acquire is actively pending (semaphore exhausted by
@@ -145,11 +138,42 @@ func TestIndexDeltaDocuments_BlocksConcurrentReader(t *testing.T) {
 	// false-pass the timing assertion.
 	waitUntilSemaphoreBelow(t, readSemaphore, 1, 5*time.Second)
 
-	if _, err := indexDeltaDocuments(indexDir, "delta_pressure_repo", source, docs, shardMax, changed); err != nil {
-		t.Fatalf("indexDeltaDocuments: %v", err)
+	deltaDone := make(chan error, 1)
+	go func() {
+		_, err := indexDeltaDocuments(indexDir, "delta_pressure_repo", source, docs, shardMax, changed)
+		deltaDone <- err
+	}()
+
+	select {
+	case err := <-acquireDone:
+		if err != nil {
+			t.Fatalf("concurrent Acquire: %v", err)
+		}
+		select {
+		case err := <-deltaDone:
+			if err != nil {
+				t.Fatalf("indexDeltaDocuments: %v", err)
+			}
+		default:
+			err := <-deltaDone
+			if err != nil {
+				t.Fatalf("indexDeltaDocuments: %v", err)
+			}
+			t.Fatal("concurrent Acquire completed while delta indexing was still running")
+		}
+	case err := <-deltaDone:
+		if err != nil {
+			t.Fatalf("indexDeltaDocuments: %v", err)
+		}
+		select {
+		case err := <-acquireDone:
+			if err != nil {
+				t.Fatalf("concurrent Acquire: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("concurrent Acquire did not complete after delta returned its weight")
+		}
 	}
-	deltaReturned = time.Now()
-	wg.Wait()
 
 	if got := availableWeight(readSemaphore); got != testBudget {
 		t.Fatalf("semaphore leak after delta: got=%d want=%d", got, testBudget)
@@ -158,15 +182,13 @@ func TestIndexDeltaDocuments_BlocksConcurrentReader(t *testing.T) {
 	// indexDeltaDocuments uses bulk-Release-after-Finish by design (the
 	// payload size is bounded by the delta guards upstream). Therefore
 	// a concurrent Acquire that exceeds the remaining budget MUST wait
-	// for the delta to return its weight. Hard assertion: acquireDone
-	// is at or after deltaReturned.
+	// for the delta to return its weight. The select above allows the
+	// legitimate edge where Release happens after Finish but just before
+	// the delta goroutine sends deltaDone; it fails only if Acquire wins
+	// while delta indexing is still running.
 	//
 	// If indexDeltaDocuments is ever refactored to streaming-Release,
-	// flip this assertion to `acquireDone.Before(deltaReturned)`.
-	if acquireDone.Before(deltaReturned) {
-		t.Fatalf("concurrent Acquire completed BEFORE delta returned (acquire=%v delta=%v) — bulk-Release contract broken or test miscalibrated",
-			acquireDone, deltaReturned)
-	}
+	// this test should move to an explicit early-unblock assertion.
 }
 
 // TestIndexDeltaDocuments_ReleasesOnNewBuilderError — when NewBuilder

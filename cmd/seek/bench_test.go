@@ -2143,7 +2143,7 @@ func BenchmarkGC_DryRun_Render_N20(b *testing.B) {
 	requireTools(b)
 	resetNFSCheck(b)
 
-	// One real corpus so corpusDisplayName has actual shard metadata to
+	// One real corpus so readCorpusDisplayInfo has actual shard metadata to
 	// read on at least one row — exercises ReadMetadataPath + [gone]/
 	// [empty] branches together.
 	repo := initGitRepo(b, "app.go", "package main\n// bench_dry_run\n")

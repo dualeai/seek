@@ -25,9 +25,7 @@ jobs:
       CGO_ENABLED: "0"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
-        with:
-          go-version-file: go.mod
+      - uses: ./.github/actions/setup-go
       - run: make install
       - run: make test-static
 
@@ -41,9 +39,7 @@ jobs:
       GOVULNCHECK_VERSION: v1.3.0
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
-        with:
-          go-version-file: go.mod
+      - uses: ./.github/actions/setup-go
       - name: Cache Go tool binaries
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
@@ -96,18 +92,7 @@ jobs:
       GOTESTSUM_VERSION: v1.13.0
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
-        with:
-          go-version-file: go.mod
-      # ubuntu-26.04 preview ships gcc defaulting to -fuse-ld=gold, but the
-      # gold linker is absent, breaking -race (cgo external link). Ensure bfd
-      # ld is installed and force it via extldflags. Harmless on 24.04.
-      - name: Fix external linker (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y binutils
-          echo "GOFLAGS=-ldflags=-extldflags=-fuse-ld=bfd" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/setup-go
       - name: Install universal-ctags (macOS)
         if: runner.os == 'macOS'
         run: brew install universal-ctags
@@ -182,9 +167,7 @@ jobs:
     needs: [test-static, test-unit]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
-        with:
-          go-version-file: go.mod
+      - uses: ./.github/actions/setup-go
       - run: make build
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -201,9 +184,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
-        with:
-          go-version-file: go.mod
+      - uses: ./.github/actions/setup-go
       - uses: actions/go-dependency-submission@f35d5c9af13ce9cc32f7930b171e315e878f6921 # v2.0.3
         with:
           go-mod-path: go.mod

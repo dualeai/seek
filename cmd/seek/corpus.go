@@ -50,6 +50,11 @@ type corpusPlan struct {
 	indexDir    string
 	scope       query.Q
 	gitPaths    *gitPaths
+	// excludeRoots are explicit child owners that a folder plan must not
+	// descend into. This is separate from dynamic nested-git discovery:
+	// explicit child Git roots must stay carved out even when discovery is
+	// disabled or capped.
+	excludeRoots []string
 	// userExplicit distinguishes plans the user asked for on the CLI
 	// (failure is fatal) from plans the folder walker discovered via
 	// nested-git detection (failure is logged + skipped). The pool
@@ -91,27 +96,14 @@ func planCorpora(ctx context.Context, paths *gitPaths, operands []string) ([]cor
 		return []corpusPlan{plan}, nil
 	}
 
-	var gitOperands []string
-	external, err := collectExternalOperands(ctx, paths, operands)
+	external, err := collectExternalOperands(ctx, operands)
 	if err != nil {
 		return nil, err
 	}
-	gitOperands = external.gitOperands
 
 	plans := make([]corpusPlan, 0, 1+len(external.gitRoots)+len(external.roots))
-	if len(gitOperands) > 0 {
-		if paths == nil {
-			return nil, fmt.Errorf("not a git repository")
-		}
-		plan, err := planCurrentGitCorpusWithOperands(*paths, gitOperands)
-		if err != nil {
-			return nil, err
-		}
-		plans = append(plans, plan)
-	}
-
 	for _, externalGit := range external.gitRoots {
-		plan, err := planCurrentGitCorpusWithOperands(externalGit.paths, externalGit.operands)
+		plan, err := planCurrentGitCorpusWithExclusions(externalGit.paths, externalGit.operands, externalGit.excludes)
 		if err != nil {
 			return nil, err
 		}
@@ -119,7 +111,7 @@ func planCorpora(ctx context.Context, paths *gitPaths, operands []string) ([]cor
 	}
 
 	for _, root := range external.roots {
-		plan, err := planFolderCorpus(root.path, root.info)
+		plan, err := planFolderCorpusWithExclusions(root.path, root.info, root.excludes)
 		if err != nil {
 			return nil, err
 		}
@@ -139,27 +131,24 @@ func planCorpora(ctx context.Context, paths *gitPaths, operands []string) ([]cor
 }
 
 type plannedExternalOperands struct {
-	gitOperands []string
-	gitRoots    []externalGitRoot
-	roots       []externalRoot
+	gitRoots []externalGitRoot
+	roots    []externalRoot
 }
 
 type externalGitRoot struct {
 	paths    gitPaths
 	operands []string
+	excludes []string
 }
 
 type externalRoot struct {
-	path string
-	info os.FileInfo
+	path     string
+	info     os.FileInfo
+	excludes []string
 }
 
-func collectExternalOperands(ctx context.Context, paths *gitPaths, operands []string) (plannedExternalOperands, error) {
+func collectExternalOperands(ctx context.Context, operands []string) (plannedExternalOperands, error) {
 	var result plannedExternalOperands
-	root := ""
-	if paths != nil {
-		root = canonicalCorpusPath(paths.RepoDir)
-	}
 
 	external := make(map[string]externalRoot)
 	externalGit := make(map[string]*externalGitRoot)
@@ -174,51 +163,51 @@ func collectExternalOperands(ctx context.Context, paths *gitPaths, operands []st
 		}
 
 		canonical := canonicalCorpusPath(abs)
-		if root != "" && pathWithin(root, canonical) {
-			result.gitOperands = append(result.gitOperands, operand)
-			continue
-		}
-		if gitPaths, ok := resolveExternalGitOperand(ctx, canonical, info); ok {
-			gitRoot := canonicalCorpusPath(gitPaths.RepoDir)
-			group := externalGit[gitRoot]
-			if group == nil {
-				group = &externalGitRoot{paths: gitPaths}
-				externalGit[gitRoot] = group
-			}
-			group.operands = append(group.operands, canonical)
-			continue
-		}
 		if !info.IsDir() && !info.Mode().IsRegular() {
 			return result, fmt.Errorf("unsupported path operand: %s", operand)
+		}
+		if info.IsDir() {
+			if gitPaths, ok := resolveGitRootOperand(ctx, canonical); ok {
+				addExternalGitOperand(externalGit, gitPaths, canonical)
+				continue
+			}
 		}
 		external[canonical] = externalRoot{path: canonical, info: info}
 	}
 
 	result.gitRoots = sortedExternalGitRoots(externalGit)
 	result.roots = collapseExternalRoots(external)
+	addGitChildExclusions(result.gitRoots, result.roots)
+	addFolderChildExclusions(result.roots, result.gitRoots)
 	return result, nil
 }
 
-func resolveExternalGitOperand(ctx context.Context, canonical string, info os.FileInfo) (gitPaths, bool) {
-	dir := canonical
-	if !info.IsDir() {
-		dir = filepath.Dir(canonical)
-	}
-	if b, status := detectGitBoundary(dir, ""); status == boundaryConfirmed {
+func resolveGitRootOperand(ctx context.Context, canonical string) (gitPaths, bool) {
+	if b, status := detectGitBoundary(canonical, ""); status == boundaryConfirmed {
 		paths := b.toGitPaths()
 		if pathWithin(canonicalCorpusPath(paths.RepoDir), canonical) {
 			return paths, true
 		}
 		return gitPaths{}, false
 	}
-	paths, err := resolveGitPaths(ctx, dir)
+	paths, err := resolveGitPaths(ctx, canonical)
 	if err != nil {
 		return gitPaths{}, false
 	}
-	if !pathWithin(canonicalCorpusPath(paths.RepoDir), canonical) {
+	if canonicalCorpusPath(paths.RepoDir) != canonical {
 		return gitPaths{}, false
 	}
 	return paths, true
+}
+
+func addExternalGitOperand(groups map[string]*externalGitRoot, paths gitPaths, operand string) {
+	gitRoot := canonicalCorpusPath(paths.RepoDir)
+	group := groups[gitRoot]
+	if group == nil {
+		group = &externalGitRoot{paths: paths}
+		groups[gitRoot] = group
+	}
+	group.operands = append(group.operands, operand)
 }
 
 func sortedExternalGitRoots(groups map[string]*externalGitRoot) []externalGitRoot {
@@ -240,6 +229,45 @@ func sortedExternalGitRoots(groups map[string]*externalGitRoot) []externalGitRoo
 	return result
 }
 
+func addGitChildExclusions(gitRoots []externalGitRoot, roots []externalRoot) {
+	for i := range gitRoots {
+		parent := canonicalCorpusPath(gitRoots[i].paths.RepoDir)
+		excludes := make(map[string]struct{})
+		for _, root := range roots {
+			if root.path != parent && pathWithin(parent, root.path) {
+				excludes[root.path] = struct{}{}
+			}
+		}
+		for j := range gitRoots {
+			if i == j {
+				continue
+			}
+			child := canonicalCorpusPath(gitRoots[j].paths.RepoDir)
+			if child != parent && pathWithin(parent, child) {
+				excludes[child] = struct{}{}
+			}
+		}
+		gitRoots[i].excludes = sortedKeys(excludes)
+	}
+}
+
+func addFolderChildExclusions(roots []externalRoot, gitRoots []externalGitRoot) {
+	for i := range roots {
+		if !roots[i].info.IsDir() {
+			continue
+		}
+		parent := roots[i].path
+		excludes := make(map[string]struct{})
+		for _, gitRoot := range gitRoots {
+			child := canonicalCorpusPath(gitRoot.paths.RepoDir)
+			if child != parent && pathWithin(parent, child) {
+				excludes[child] = struct{}{}
+			}
+		}
+		roots[i].excludes = sortedKeys(excludes)
+	}
+}
+
 func collapseExternalRoots(roots map[string]externalRoot) []externalRoot {
 	if len(roots) == 0 {
 		return nil
@@ -254,7 +282,7 @@ func collapseExternalRoots(roots map[string]externalRoot) []externalRoot {
 	selected := make([]externalRoot, 0, len(paths))
 	for _, path := range paths {
 		root := roots[path]
-		if coveredByExternalDir(path, selected) {
+		if coveredByExternalDir(root, selected) {
 			continue
 		}
 		selected = append(selected, root)
@@ -262,14 +290,38 @@ func collapseExternalRoots(roots map[string]externalRoot) []externalRoot {
 	return selected
 }
 
-func coveredByExternalDir(path string, roots []externalRoot) bool {
+func coveredByExternalDir(path externalRoot, roots []externalRoot) bool {
 	for _, root := range roots {
 		if !root.info.IsDir() {
 			continue
 		}
-		if path == root.path || strings.HasPrefix(path, root.path+string(filepath.Separator)) {
+		if path.path == root.path {
 			return true
 		}
+		if strings.HasPrefix(path.path, root.path+string(filepath.Separator)) {
+			if crossesGitBoundary(root.path, path) {
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func crossesGitBoundary(parent string, child externalRoot) bool {
+	dir := child.path
+	if !child.info.IsDir() {
+		dir = filepath.Dir(child.path)
+	}
+	for dir != parent && pathWithin(parent, dir) {
+		if _, status := detectGitBoundary(dir, ""); status == boundaryConfirmed {
+			return true
+		}
+		next := filepath.Dir(dir)
+		if next == dir {
+			break
+		}
+		dir = next
 	}
 	return false
 }
@@ -323,12 +375,27 @@ func planCurrentGitCorpus(paths gitPaths) (corpusPlan, error) {
 }
 
 func planFolderCorpus(root string, info os.FileInfo) (corpusPlan, error) {
+	return planFolderCorpusWithExclusions(root, info, nil)
+}
+
+func planFolderCorpusWithExclusions(root string, info os.FileInfo, excludes []string) (corpusPlan, error) {
 	rt := rootTypeFile
 	if info.IsDir() {
 		rt = rootTypeDirectory
 	}
 
-	return newCorpusPlan(corpusKindFolder, rt, root, "folder")
+	excludes = sortedCanonicalRoots(excludes)
+	extraIDParts := []string(nil)
+	if len(excludes) > 0 {
+		extraIDParts = append(extraIDParts, "folder_exclude_roots")
+		extraIDParts = append(extraIDParts, excludes...)
+	}
+	plan, err := newCorpusPlan(corpusKindFolder, rt, root, "folder", extraIDParts...)
+	if err != nil {
+		return corpusPlan{}, err
+	}
+	plan.excludeRoots = excludes
+	return plan, nil
 }
 
 func newCorpusPlan(kind corpusKind, rt rootType, root, statSubject string, extraIDParts ...string) (corpusPlan, error) {
@@ -369,19 +436,35 @@ func newCorpusPlan(kind corpusKind, rt rootType, root, statSubject string, extra
 }
 
 func planCurrentGitCorpusWithOperands(paths gitPaths, operands []string) (corpusPlan, error) {
+	return planCurrentGitCorpusWithExclusions(paths, operands, nil)
+}
+
+func planCurrentGitCorpusWithExclusions(paths gitPaths, operands, excludes []string) (corpusPlan, error) {
 	plan, err := planCurrentGitCorpus(paths)
 	if err != nil {
 		return corpusPlan{}, err
 	}
-	if len(operands) == 0 {
-		return plan, nil
-	}
-	scope, err := buildCurrentGitScope(plan.root, operands)
+	includeScope, err := buildCurrentGitScope(plan.root, operands)
 	if err != nil {
 		return corpusPlan{}, err
 	}
-	plan.scope = scope
+	excludeScope, err := buildCurrentGitScope(plan.root, excludes)
+	if err != nil {
+		return corpusPlan{}, err
+	}
+	plan.scope = combineGitScope(includeScope, excludeScope)
 	return plan, nil
+}
+
+func combineGitScope(includeScope, excludeScope query.Q) query.Q {
+	if excludeScope == nil {
+		return includeScope
+	}
+	notExcluded := &query.Not{Child: excludeScope}
+	if includeScope == nil {
+		return notExcluded
+	}
+	return query.Simplify(query.NewAnd(includeScope, notExcluded))
 }
 
 func buildCurrentGitScope(root string, operands []string) (query.Q, error) {
@@ -464,6 +547,24 @@ func sortedKeys(values map[string]struct{}) []string {
 	out := make([]string, 0, len(values))
 	for value := range values {
 		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedCanonicalRoots(roots []string) []string {
+	if len(roots) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(roots))
+	seen := make(map[string]struct{}, len(roots))
+	for _, root := range roots {
+		root = canonicalCorpusPath(root)
+		if _, ok := seen[root]; ok {
+			continue
+		}
+		seen[root] = struct{}{}
+		out = append(out, root)
 	}
 	sort.Strings(out)
 	return out

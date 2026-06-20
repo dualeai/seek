@@ -150,7 +150,118 @@ func TestPlanCorpora_ExternalGitRepoPathUsesGitCorpus(t *testing.T) {
 	}
 }
 
-func TestPlanCorpora_ExternalGitRootAndNestedOperandsCollapseToUnscopedPlan(t *testing.T) {
+func TestPlanCorpora_FileAndDirectoryOperandsUseFolderCorpus(t *testing.T) {
+	requireGit(t)
+	setTestUserCache(t)
+
+	currentRepo := initGitRepo(t, "current.go", "package current\n")
+	currentPaths, err := resolveGitPaths(context.Background(), currentRepo)
+	if err != nil {
+		t.Fatalf("resolve current git paths: %v", err)
+	}
+	cases := []struct {
+		name         string
+		target       func(t *testing.T) string
+		wantRootType rootType
+	}{
+		{
+			name: "current git exact file",
+			target: func(t *testing.T) string {
+				target := filepath.Join(currentRepo, "nested", "file.go")
+				if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(target, []byte("package nested\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return target
+			},
+			wantRootType: rootTypeFile,
+		},
+		{
+			name: "current git non-root directory",
+			target: func(t *testing.T) string {
+				target := filepath.Join(currentRepo, "nested-dir")
+				if err := os.MkdirAll(target, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				return target
+			},
+			wantRootType: rootTypeDirectory,
+		},
+		{
+			name: "external git exact file",
+			target: func(t *testing.T) string {
+				externalRepo := initGitRepo(t, "external.go", "package external\n")
+				return filepath.Join(externalRepo, "external.go")
+			},
+			wantRootType: rootTypeFile,
+		},
+		{
+			name: "external git non-root directory",
+			target: func(t *testing.T) string {
+				externalRepo := initGitRepo(t, "external.go", "package external\n")
+				target := filepath.Join(externalRepo, "nested")
+				if err := os.MkdirAll(target, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				return target
+			},
+			wantRootType: rootTypeDirectory,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := tc.target(t)
+			plans, err := planCorpora(context.Background(), &currentPaths, []string{target})
+			if err != nil {
+				t.Fatalf("planCorpora: %v", err)
+			}
+			if len(plans) != 1 {
+				t.Fatalf("expected one folder plan, got %d: %#v", len(plans), plans)
+			}
+			plan := plans[0]
+			if plan.kind != corpusKindFolder {
+				t.Fatalf("operand should use folder corpus, got kind=%q root=%q", plan.kind, plan.root)
+			}
+			if plan.rootType != tc.wantRootType {
+				t.Fatalf("root type mismatch: got %q want %q", plan.rootType, tc.wantRootType)
+			}
+			if plan.root != canonicalCorpusPath(target) {
+				t.Fatalf("root mismatch: got %q want %q", plan.root, canonicalCorpusPath(target))
+			}
+		})
+	}
+}
+
+func TestPlanCorpora_CurrentGitNestedGitRootUsesChildGitCorpus(t *testing.T) {
+	requireGit(t)
+	setTestUserCache(t)
+
+	currentRepo := initGitRepo(t, "current.go", "package current\n")
+	currentPaths, err := resolveGitPaths(context.Background(), currentRepo)
+	if err != nil {
+		t.Fatalf("resolve current git paths: %v", err)
+	}
+	nestedRepo := initGitRepoNoRemoteAt(t, filepath.Join(currentRepo, "nested"), "nested.go", "package nested\n")
+
+	plans, err := planCorpora(context.Background(), &currentPaths, []string{nestedRepo})
+	if err != nil {
+		t.Fatalf("planCorpora: %v", err)
+	}
+	if len(plans) != 1 {
+		t.Fatalf("expected one nested Git plan, got %d: %#v", len(plans), plans)
+	}
+	plan := plans[0]
+	if plan.kind != corpusKindGit {
+		t.Fatalf("nested Git root should use Git corpus, got kind=%q root=%q", plan.kind, plan.root)
+	}
+	if plan.root != canonicalCorpusPath(nestedRepo) {
+		t.Fatalf("nested Git root mismatch: got %q want %q", plan.root, canonicalCorpusPath(nestedRepo))
+	}
+}
+
+func TestPlanCorpora_ExternalGitRootAndNestedOperandsKeepChildFolderOwner(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
 
@@ -173,15 +284,36 @@ func TestPlanCorpora_ExternalGitRootAndNestedOperandsCollapseToUnscopedPlan(t *t
 	if err != nil {
 		t.Fatalf("planCorpora: %v", err)
 	}
-	if len(plans) != 1 {
-		t.Fatalf("expected one external git plan, got %d: %#v", len(plans), plans)
+	if len(plans) != 2 {
+		t.Fatalf("expected external git root plus child folder plan, got %d: %#v", len(plans), plans)
 	}
-	plan := plans[0]
-	if plan.kind != corpusKindGit {
-		t.Fatalf("external Git repo should use Git corpus, got %q", plan.kind)
+
+	var gitPlan, folderPlan *corpusPlan
+	for i := range plans {
+		switch plans[i].kind {
+		case corpusKindGit:
+			gitPlan = &plans[i]
+		case corpusKindFolder:
+			folderPlan = &plans[i]
+		}
 	}
-	if plan.scope != nil {
-		t.Fatalf("repo root operand should cover nested operands, got scope %#v", plan.scope)
+	if gitPlan == nil {
+		t.Fatalf("expected external Git root plan, got %#v", plans)
+	}
+	if gitPlan.root != canonicalCorpusPath(externalRepo) {
+		t.Fatalf("external Git root mismatch: got %q want %q", gitPlan.root, canonicalCorpusPath(externalRepo))
+	}
+	if gitPlan.scope == nil {
+		t.Fatal("expected parent Git plan to exclude explicit child folder owner")
+	}
+	if folderPlan == nil {
+		t.Fatalf("expected child folder plan, got %#v", plans)
+	}
+	if folderPlan.rootType != rootTypeDirectory {
+		t.Fatalf("child folder should use directory root type, got %q", folderPlan.rootType)
+	}
+	if folderPlan.root != canonicalCorpusPath(nested) {
+		t.Fatalf("child folder root mismatch: got %q want %q", folderPlan.root, canonicalCorpusPath(nested))
 	}
 }
 

@@ -314,8 +314,10 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	}
 
 	// Run committed and uncommitted indexing. They write different shard
-	// files (repo name vs "uncommitted" prefix) so when both are needed
-	// they run in parallel. When only one is needed, it runs alone.
+	// files (the committed repo name vs "uncommitted" prefix) so when
+	// both are needed they run in parallel. The committed repo name may
+	// come from Zoekt config/origin metadata, or from seek's opaque
+	// fallback for local repos with no remote.
 	var committedErr, uncommittedErr error
 	if hasDirty && needCommitted {
 		committedDone := make(chan error, 1)
@@ -369,6 +371,15 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 		if errors.Is(uncommittedErr, errGitCapExceeded) {
 			return uncommittedErr
 		}
+		// On a cold cache, surface the real indexer failure instead of
+		// letting the later search path collapse it into "no index shards".
+		// Once any shard exists, preserve the stale/partial fallback.
+		if !shardsExist(indexDir) {
+			if committedErr != nil {
+				return committedErr
+			}
+			return uncommittedErr
+		}
 		slog.Warn("Index incomplete, will re-index on next search")
 		return nil
 	}
@@ -408,9 +419,14 @@ const maxCommittedDeltaShards = 64
 // per-shard .meta sidecars. Zoekt falls back to a full rebuild on its own when
 // the prior commit is gone (force-push, GC), branch set changes, index option
 // hash differs, or the shard count exceeds DeltaShardNumberFallbackThreshold.
+//
+// The fallback repository name gives Zoekt a non-empty shard namespace for
+// local repos with no remote.origin.url and no [zoekt] name. Zoekt still
+// overwrites it when repo config or origin metadata provides a real name.
 func indexCommitted(repoDir, indexDir string, parallelism int) error {
 	buildOpts := indexBuildOptions(indexDir, parallelism)
 	buildOpts.IsDelta = true
+	buildOpts.RepositoryDescription.Name = fallbackGitRepositoryName(repoDir)
 	opts := gitindex.Options{
 		RepoDir:                           repoDir,
 		Incremental:                       true,
@@ -423,6 +439,13 @@ func indexCommitted(repoDir, indexDir string, parallelism int) error {
 		return gitCorpusError(repoDir, indexDir, err)
 	}
 	return nil
+}
+
+// fallbackGitRepositoryName returns a stable opaque name for Git committed
+// shards when Zoekt cannot derive one from repo metadata. It is intentionally
+// not based on basename: "uncommitted" is reserved for dirty-file shards.
+func fallbackGitRepositoryName(repoDir string) string {
+	return "git-" + hashParts("git_repository_name", canonicalCorpusPath(repoDir))
 }
 
 // fileContent carries one file's content from reader to consumer.

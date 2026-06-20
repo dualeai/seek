@@ -32,14 +32,27 @@ func requireTools(tb testing.TB) {
 
 func initEmptyGitRepo(tb testing.TB) string {
 	tb.Helper()
-	dir := tb.TempDir()
+	dir := initEmptyGitRepoNoRemote(tb)
+	// zoekt's gitindex.IndexGitRepo derives the repo name from the remote URL.
+	// Most tests keep this remote so committed shard prefixes stay stable.
+	gitRunIn(tb, dir, "remote", "add", "origin", "https://github.com/test/repo.git")
+	return dir
+}
 
+func initEmptyGitRepoNoRemote(tb testing.TB) string {
+	tb.Helper()
+	dir := tb.TempDir()
+	return initEmptyGitRepoNoRemoteAt(tb, dir)
+}
+
+func initEmptyGitRepoNoRemoteAt(tb testing.TB, dir string) string {
+	tb.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		tb.Fatal(err)
+	}
 	gitRunIn(tb, dir, "init")
 	gitRunIn(tb, dir, "config", "user.email", "test@test.com")
 	gitRunIn(tb, dir, "config", "user.name", "Test")
-	// zoekt's gitindex.IndexGitRepo derives the repo name from the remote URL.
-	// Without a remote, it fails with "builder: must set Name".
-	gitRunIn(tb, dir, "remote", "add", "origin", "https://github.com/test/repo.git")
 	return dir
 }
 
@@ -56,6 +69,28 @@ func initGitRepo(tb testing.TB, fileName, content string) string {
 	gitRunIn(tb, dir, "add", ".")
 	gitRunIn(tb, dir, "commit", "-m", "initial")
 
+	return dir
+}
+
+func initGitRepoNoRemote(tb testing.TB, fileName, content string) string {
+	tb.Helper()
+	dir := initEmptyGitRepoNoRemote(tb)
+	if err := os.WriteFile(filepath.Join(dir, fileName), []byte(content), 0o644); err != nil {
+		tb.Fatal(err)
+	}
+	gitRunIn(tb, dir, "add", ".")
+	gitRunIn(tb, dir, "commit", "-m", "initial")
+	return dir
+}
+
+func initGitRepoNoRemoteAt(tb testing.TB, dir, fileName, content string) string {
+	tb.Helper()
+	initEmptyGitRepoNoRemoteAt(tb, dir)
+	if err := os.WriteFile(filepath.Join(dir, fileName), []byte(content), 0o644); err != nil {
+		tb.Fatal(err)
+	}
+	gitRunIn(tb, dir, "add", ".")
+	gitRunIn(tb, dir, "commit", "-m", "initial")
 	return dir
 }
 
@@ -210,10 +245,10 @@ func assertScopedRunIncludesOnly(t *testing.T, query, operand string) {
 func assertScopedOutputIncludesOnlyA(t *testing.T, out string) {
 	t.Helper()
 
-	if !strings.Contains(out, "## a/app.go") {
-		t.Fatalf("expected scoped output to include a/app.go, got:\n%s", out)
+	if !strings.Contains(out, "## a/app.go") && !strings.Contains(out, "## app.go") {
+		t.Fatalf("expected scoped output to include app.go from a/, got:\n%s", out)
 	}
-	if strings.Contains(out, "## b/app.go") {
+	if strings.Contains(out, "## b/app.go") || strings.Contains(out, "package b") {
 		t.Fatalf("expected scoped output to exclude b/app.go, got:\n%s", out)
 	}
 }
@@ -396,6 +431,56 @@ func TestRun_CurrentRepoRootPathOperandSearchesWholeRepo(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("expected root operand output to include %s, got:\n%s", want, out)
 		}
+	}
+}
+
+func TestRun_GitRootAndChildOperandsDoNotDuplicateChildResults(t *testing.T) {
+	requireTools(t)
+
+	cases := []struct {
+		name    string
+		operand func(dir, childDir string) string
+	}{
+		{
+			name: "directory",
+			operand: func(_, childDir string) string {
+				return childDir
+			},
+		},
+		{
+			name: "file",
+			operand: func(_, childDir string) string {
+				return filepath.Join(childDir, "out.go")
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			marker := "root_child_" + tc.name + "_overlap_marker"
+			dir := initGitRepo(t, "seed.go", "package seed\n")
+			childDir := filepath.Join(dir, "generated")
+			if err := os.MkdirAll(childDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(childDir, "out.go"), []byte("package generated\n// "+marker+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gitRun(t, dir, "add", ".")
+			gitRun(t, dir, "commit", "-m", "add generated file")
+
+			setTestUserCache(t)
+			t.Chdir(t.TempDir())
+
+			out, err := captureStdout(t, func() error {
+				return run(context.Background(), marker, []string{dir, tc.operand(dir, childDir)}, 0, 0)
+			})
+			if err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			if count := strings.Count(out, marker); count != 1 {
+				t.Fatalf("expected child result once, got %d occurrences:\n%s", count, out)
+			}
+		})
 	}
 }
 
@@ -631,6 +716,292 @@ func TestRun_ExternalGitExactFilePathScopesSearch(t *testing.T) {
 	assertScopedOutputIncludesOnlyA(t, out)
 }
 
+func TestRun_CurrentGitExactIgnoredFileOperandSearchesLiteralFile(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "app.go", "package main\n// visible\n")
+	if err := os.WriteFile(filepath.Join(repo, ".gitignore"), []byte("ignored/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", ".gitignore")
+	gitRunIn(t, repo, "commit", "-m", "add gitignore")
+	ignoredDir := filepath.Join(repo, "ignored")
+	if err := os.MkdirAll(ignoredDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(ignoredDir, "target.txt")
+	if err := os.WriteFile(target, []byte("literal_ignored_file_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ignoredDir, "sibling.txt"), []byte("literal_ignored_file_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	setTestUserCache(t)
+	t.Chdir(repo)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "literal_ignored_file_marker", []string{target}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(out, "target.txt") {
+		t.Fatalf("expected exact ignored file result, got:\n%s", out)
+	}
+	if strings.Contains(out, "sibling.txt") {
+		t.Fatalf("exact ignored file search should not include sibling, got:\n%s", out)
+	}
+}
+
+func TestRun_ExternalGitExactIgnoredFileOperandSearchesLiteralFile(t *testing.T) {
+	requireTools(t)
+
+	externalRepo := initGitRepo(t, "app.go", "package main\n// visible\n")
+	if err := os.WriteFile(filepath.Join(externalRepo, ".gitignore"), []byte("ignored/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, externalRepo, "add", ".gitignore")
+	gitRunIn(t, externalRepo, "commit", "-m", "add gitignore")
+	ignoredDir := filepath.Join(externalRepo, "ignored")
+	if err := os.MkdirAll(ignoredDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(ignoredDir, "target.txt")
+	if err := os.WriteFile(target, []byte("external_literal_ignored_file_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ignoredDir, "sibling.txt"), []byte("external_literal_ignored_file_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "external_literal_ignored_file_marker", []string{target}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(out, "target.txt") {
+		t.Fatalf("expected exact ignored file result, got:\n%s", out)
+	}
+	if strings.Contains(out, "sibling.txt") {
+		t.Fatalf("exact ignored file search should not include sibling, got:\n%s", out)
+	}
+}
+
+func TestRun_CurrentGitIgnoredDirectoryOperandUsesFolderCorpus(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "app.go", "package main\n// visible\n")
+	if err := os.WriteFile(filepath.Join(repo, ".gitignore"), []byte("scratch/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", ".gitignore")
+	gitRunIn(t, repo, "commit", "-m", "add gitignore")
+	scratch := filepath.Join(repo, "scratch")
+	if err := os.MkdirAll(scratch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scratch, "note.txt"), []byte("literal_ignored_dir_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	setTestUserCache(t)
+	t.Chdir(repo)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "literal_ignored_dir_marker", []string{scratch}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(out, "literal_ignored_dir_marker") {
+		t.Fatalf("expected ignored directory operand to be searched literally, got:\n%s", out)
+	}
+}
+
+func TestRun_ExternalGitNonRootDirectoryOperandUsesFolderCorpus(t *testing.T) {
+	requireTools(t)
+
+	externalRepo := initGitRepo(t, "app.go", "package main\n// visible\n")
+	if err := os.WriteFile(filepath.Join(externalRepo, ".gitignore"), []byte("scratch/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, externalRepo, "add", ".gitignore")
+	gitRunIn(t, externalRepo, "commit", "-m", "add gitignore")
+	scratch := filepath.Join(externalRepo, "scratch")
+	if err := os.MkdirAll(scratch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scratch, "note.txt"), []byte("external_literal_ignored_dir_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "external_literal_ignored_dir_marker", []string{scratch}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(out, "external_literal_ignored_dir_marker") {
+		t.Fatalf("expected ignored directory operand to be searched literally, got:\n%s", out)
+	}
+}
+
+func TestRun_IgnoredFolderContainingNestedGitDiscoversNestedGit(t *testing.T) {
+	requireTools(t)
+
+	parent := initGitRepo(t, "app.go", "package main\n// visible\n")
+	if err := os.WriteFile(filepath.Join(parent, ".gitignore"), []byte("scratch/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, parent, "add", ".gitignore")
+	gitRunIn(t, parent, "commit", "-m", "add gitignore")
+
+	scratch := filepath.Join(parent, "scratch")
+	if err := os.MkdirAll(scratch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scratch, "plain.txt"), []byte("scratch_plain_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	nested := filepath.Join(scratch, "nested")
+	initGitRepoNoRemoteAt(t, nested, "src.go", "package nested\n// nested_committed_marker\n")
+	if err := os.WriteFile(filepath.Join(nested, ".gitignore"), []byte(".venv/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, nested, "add", ".gitignore")
+	gitRunIn(t, nested, "commit", "-m", "add gitignore")
+	venv := filepath.Join(nested, ".venv")
+	if err := os.MkdirAll(venv, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(venv, "secret.py"), []byte("# nested_ignored_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	setTestUserCache(t)
+	t.Chdir(parent)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "scratch_plain_marker", []string{scratch}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("plain marker run: %v", err)
+	}
+	if !strings.Contains(out, "scratch_plain_marker") {
+		t.Fatalf("expected parent folder content, got:\n%s", out)
+	}
+
+	out, err = captureStdout(t, func() error {
+		return run(context.Background(), "nested_committed_marker", []string{scratch}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("nested marker run: %v", err)
+	}
+	if !strings.Contains(out, "nested_committed_marker") {
+		t.Fatalf("expected nested git content, got:\n%s", out)
+	}
+
+	out, err = captureStdout(t, func() error {
+		return run(context.Background(), "nested_ignored_marker", []string{scratch}, 0, 0)
+	})
+	if !errors.Is(err, errNoMatch) {
+		t.Fatalf("nested git ignored file should not match, got err=%v out=%q", err, out)
+	}
+	if strings.Contains(out, "nested_ignored_marker") {
+		t.Fatalf("nested ignored content leaked through folder search, got:\n%s", out)
+	}
+}
+
+func TestRun_ParentFolderAndExplicitNestedGitRootDoNotDuplicateOrLeak(t *testing.T) {
+	requireTools(t)
+
+	parent := t.TempDir()
+	nested := initGitRepoNoRemoteAt(t, filepath.Join(parent, "nested"), "src.go", "package nested\n// explicit_nested_marker\n")
+	if err := os.WriteFile(filepath.Join(nested, ".gitignore"), []byte(".venv/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, nested, "add", ".gitignore")
+	gitRunIn(t, nested, "commit", "-m", "add gitignore")
+	venv := filepath.Join(nested, ".venv")
+	if err := os.MkdirAll(venv, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(venv, "secret.py"), []byte("# explicit_nested_ignored_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "explicit_nested_marker", []string{parent, nested}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("nested marker run: %v", err)
+	}
+	if count := strings.Count(out, "explicit_nested_marker"); count != 1 {
+		t.Fatalf("expected explicit nested Git result once, got %d occurrences:\n%s", count, out)
+	}
+
+	out, err = captureStdout(t, func() error {
+		return run(context.Background(), "explicit_nested_ignored_marker", []string{parent, nested}, 0, 0)
+	})
+	if !errors.Is(err, errNoMatch) {
+		t.Fatalf("nested ignored file should not match, got err=%v out=%q", err, out)
+	}
+	if strings.Contains(out, "explicit_nested_ignored_marker") {
+		t.Fatalf("nested ignored content leaked through parent folder search, got:\n%s", out)
+	}
+}
+
+func TestRun_ParentFolderAndNestedGitExactIgnoredFileKeepsFileOwner(t *testing.T) {
+	requireTools(t)
+
+	parent := t.TempDir()
+	nested := initGitRepoNoRemoteAt(t, filepath.Join(parent, "nested"), "src.go", "package nested\n// visible\n")
+	if err := os.WriteFile(filepath.Join(nested, ".gitignore"), []byte("ignored/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, nested, "add", ".gitignore")
+	gitRunIn(t, nested, "commit", "-m", "add gitignore")
+	ignoredDir := filepath.Join(nested, "ignored")
+	if err := os.MkdirAll(ignoredDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(ignoredDir, "target.txt")
+	if err := os.WriteFile(target, []byte("parent_nested_exact_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ignoredDir, "sibling.txt"), []byte("parent_nested_exact_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "parent_nested_exact_marker", []string{parent, target}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(out, "target.txt") {
+		t.Fatalf("expected exact file owner to survive parent folder operand, got:\n%s", out)
+	}
+	if strings.Contains(out, "sibling.txt") {
+		t.Fatalf("exact nested file search should not include sibling, got:\n%s", out)
+	}
+}
+
 func TestRun_ExternalExactFileDoesNotSearchSibling(t *testing.T) {
 	requireTools(t)
 
@@ -728,7 +1099,37 @@ func TestRun_ExternalFolderSymlinkDedupesWithTarget(t *testing.T) {
 	}
 }
 
-func TestRun_GitScopeSymlinkInsideWorktreeScopes(t *testing.T) {
+func TestRun_ExternalFolderWalkSkipsDiscoveredSymlinks(t *testing.T) {
+	requireTools(t)
+
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	link := filepath.Join(root, "link.txt")
+	if err := os.WriteFile(target, []byte("folder_walk_symlink_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "folder_walk_symlink_marker", []string{root}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(out, "## target.txt") {
+		t.Fatalf("expected target file result, got:\n%s", out)
+	}
+	if strings.Contains(out, "## link.txt") {
+		t.Fatalf("folder walk should skip discovered symlink, got:\n%s", out)
+	}
+}
+
+func TestRun_SymlinkInsideWorktreeSearchesResolvedFile(t *testing.T) {
 	requireTools(t)
 
 	dir := initScopedGitRepo(t, "git_symlink_inside_marker")
@@ -746,10 +1147,10 @@ func TestRun_GitScopeSymlinkInsideWorktreeScopes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if !strings.Contains(out, "## a/app.go") {
-		t.Fatalf("expected scoped output to include resolved target a/app.go, got:\n%s", out)
+	if !strings.Contains(out, "## app.go") {
+		t.Fatalf("expected scoped output to include resolved target file, got:\n%s", out)
 	}
-	if strings.Contains(out, "## b/app.go") {
+	if strings.Contains(out, "## b/app.go") || strings.Contains(out, "package b") {
 		t.Fatalf("expected scoped output to exclude b/app.go, got:\n%s", out)
 	}
 }
@@ -813,6 +1214,31 @@ func TestRun_CurrentRepoExactFilePathOperandScopesSearch(t *testing.T) {
 	t.Chdir(dir)
 
 	assertScopedRunIncludesOnly(t, "exact_scope_marker", "a/app.go")
+}
+
+func TestRun_CurrentGitExactDirtyFileOperandUsesLiteralPipeline(t *testing.T) {
+	requireTools(t)
+
+	dir := initGitRepo(t, "app.go", "package main\n// clean\n")
+	target := filepath.Join(dir, "app.go")
+	if err := os.WriteFile(target, []byte("package main\n// current_exact_dirty_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	setTestUserCache(t)
+	t.Chdir(dir)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "current_exact_dirty_marker", []string{target}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run current exact dirty file: %v", err)
+	}
+	if !strings.Contains(out, "current_exact_dirty_marker") {
+		t.Fatalf("expected dirty exact file content, got:\n%s", out)
+	}
+	if strings.Contains(out, "[uncommitted]") {
+		t.Fatalf("current exact file should use literal file semantics, got:\n%s", out)
+	}
 }
 
 func TestRun_ExternalGitMetadataOnlyFolderReturnsNoMatch(t *testing.T) {
@@ -896,7 +1322,92 @@ func TestRun_WarmGitSearchDoesNotRequireCtags(t *testing.T) {
 	}
 }
 
-func TestRun_GitNoUsableShardFailsWhenIndexingFails(t *testing.T) {
+func TestRun_GitRepoWithoutRemoteIndexesCommittedContent(t *testing.T) {
+	requireTools(t)
+
+	dir := initGitRepoNoRemote(t, "app.go", "package main\n// no_remote_committed_marker\n")
+	setTestUserCache(t)
+	t.Chdir(dir)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "no_remote_committed_marker", nil, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run without remote: %v", err)
+	}
+	if !strings.Contains(out, "no_remote_committed_marker") {
+		t.Fatalf("expected committed content from no-remote repo, got:\n%s", out)
+	}
+}
+
+func TestRun_ExternalGitExactFileWithoutRemoteUsesLiteralPipeline(t *testing.T) {
+	requireTools(t)
+
+	dir := initGitRepoNoRemote(t, "app.go", "package main\n// external_no_remote_marker\n")
+	dirtyPath := filepath.Join(dir, "dirty.go")
+	if err := os.WriteFile(dirtyPath, []byte("package main\n// external_no_remote_dirty_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "external_no_remote_marker", []string{filepath.Join(dir, "app.go")}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run external no-remote file: %v", err)
+	}
+	if !strings.Contains(out, "external_no_remote_marker") {
+		t.Fatalf("expected committed content from external no-remote repo, got:\n%s", out)
+	}
+
+	dirtyOut, err := captureStdout(t, func() error {
+		return run(context.Background(), "external_no_remote_dirty_marker", []string{dirtyPath}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run external no-remote dirty file: %v", err)
+	}
+	if !strings.Contains(dirtyOut, "external_no_remote_dirty_marker") {
+		t.Fatalf("expected dirty content from external no-remote repo, got:\n%s", dirtyOut)
+	}
+	if strings.Contains(dirtyOut, "[uncommitted]") {
+		t.Fatalf("external exact file should use literal file semantics, got:\n%s", dirtyOut)
+	}
+}
+
+func TestRun_GitRepoNamedUncommittedWithoutRemoteLabelsOnlyDirtyResultUncommitted(t *testing.T) {
+	requireTools(t)
+
+	dir := initGitRepoNoRemoteAt(t, filepath.Join(t.TempDir(), repoUncommitted), "clean.go", "package main\n// repo_named_uncommitted_clean\n")
+	if err := os.WriteFile(filepath.Join(dir, "dirty.go"), []byte("package main\n// repo_named_uncommitted_dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	setTestUserCache(t)
+	t.Chdir(dir)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "repo_named_uncommitted", nil, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run repo named %q without remote: %v", repoUncommitted, err)
+	}
+	for _, want := range []string{
+		"repo_named_uncommitted_clean",
+		"repo_named_uncommitted_dirty",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in output, got:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "## clean.go (Go) [uncommitted]") {
+		t.Fatalf("committed file should not be tagged uncommitted, got:\n%s", out)
+	}
+	if !strings.Contains(out, "## dirty.go (Go) [uncommitted]") {
+		t.Fatalf("dirty file should be tagged uncommitted, got:\n%s", out)
+	}
+}
+
+func TestRun_GitColdCacheNoShardFailsWhenIndexingFails(t *testing.T) {
 	dir := initGitRepo(t, "app.go", "package main\n// git_no_usable_shard_marker\n")
 	setTestUserCache(t)
 	t.Chdir(dir)
@@ -906,7 +1417,7 @@ func TestRun_GitNoUsableShardFailsWhenIndexingFails(t *testing.T) {
 		return run(context.Background(), "git_no_usable_shard_marker", nil, 0, 0)
 	})
 	if err == nil {
-		t.Fatal("expected Git indexing failure without usable shards")
+		t.Fatal("expected Git indexing failure without shards")
 	}
 	if errors.Is(err, errNoMatch) {
 		t.Fatalf("expected hard error, got no-match: %v", err)
@@ -925,6 +1436,29 @@ func TestRun_GitNoUsableShardFailsWhenIndexingFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "missing-ctags") {
 		t.Fatalf("expected ctags indexing failure, got: %v", err)
+	}
+}
+
+func TestRun_GitColdCacheNoShardSurfacesCommittedIndexerFailure(t *testing.T) {
+	dir := initGitRepo(t, "app.go", "package main\n// git_no_usable_shard_committed_marker\n")
+	setTestUserCache(t)
+	t.Chdir(dir)
+	forceFailingCtags(t)
+
+	_, err := captureStdout(t, func() error {
+		return run(context.Background(), "git_no_usable_shard_committed_marker", nil, 0, 0)
+	})
+	if err == nil {
+		t.Fatal("expected committed indexing failure without shards")
+	}
+	if errors.Is(err, errNoMatch) {
+		t.Fatalf("expected hard error, got no-match: %v", err)
+	}
+	if strings.Contains(err.Error(), "no index shards") {
+		t.Fatalf("expected committed indexing failure, got search fallback error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "exit status 7") {
+		t.Fatalf("expected committed indexer failure cause, got: %v", err)
 	}
 }
 
@@ -1160,6 +1694,22 @@ func forceMissingCtags(t *testing.T) {
 	t.Helper()
 
 	t.Setenv("CTAGS_COMMAND", filepath.Join(t.TempDir(), "missing-ctags"))
+	ctagsOnce = sync.Once{}
+	ctagsErr = nil
+	t.Cleanup(func() {
+		ctagsOnce = sync.Once{}
+		ctagsErr = nil
+	})
+}
+
+func forceFailingCtags(t *testing.T) {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "failing-ctags")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 7\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CTAGS_COMMAND", path)
 	ctagsOnce = sync.Once{}
 	ctagsErr = nil
 	t.Cleanup(func() {

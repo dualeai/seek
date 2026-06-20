@@ -92,7 +92,7 @@ const gcTableHeader = "  CORPUS      ROOT                                       
 
 // renderGCRow prints one corpus row using the column layout in gcTableHeader.
 // Display info is passed in (not computed here) so live callers can capture
-// it BEFORE eviction — once the dir moves to .trash, corpusDisplayName
+// it BEFORE eviction — once the dir moves to .trash, readCorpusDisplayInfo
 // returns [empty].
 func renderGCRow(w io.Writer, e corpusDirEntry, info corpusDisplayInfo, size int64, now time.Time, action string) {
 	age := now.Sub(e.usedAt)
@@ -107,7 +107,7 @@ func renderGCRow(w io.Writer, e corpusDirEntry, info corpusDisplayInfo, size int
 
 // reportGCPlan prints the dry-run table. No filesystem mutation. Display
 // path is recovered from each corpus's first zoekt shard
-// (Repository.Source) — see corpusDisplayName. Empty / crashed corpora
+// (Repository.Source) — see readCorpusDisplayInfo. Empty / crashed corpora
 // without shards display as "[empty]"; corpora whose source root has been
 // deleted on disk show as "[gone] <path>".
 //
@@ -117,7 +117,7 @@ func renderGCRow(w io.Writer, e corpusDirEntry, info corpusDisplayInfo, size int
 // and live output stay byte-aligned across columns.
 //
 // Per-row cost is dominated by corpusDirSize (filepath.WalkDir subtree walk
-// per corpus) plus corpusDisplayName (one zoekt shard metadata read). For
+// per corpus) plus readCorpusDisplayInfo (one zoekt shard metadata read). For
 // typical caches (<50 corpora) wall time is sub-second. The same per-row
 // cost applies to the live path. If we ever see caches with 500+ corpora,
 // parallelizing the per-row work with a bounded errgroup is the
@@ -141,7 +141,7 @@ func reportGCPlan(w io.Writer, cacheRoot string, entries []corpusDirEntry, cutof
 			evictBytes += size
 			evictCount++
 		}
-		renderGCRow(w, e, corpusDisplayName(e.path), size, now, action)
+		renderGCRow(w, e, readCorpusDisplayInfo(e.path), size, now, action)
 	}
 	_, _ = fmt.Fprintf(w, "%d corpora, %s total, %d evictable (%s).\n",
 		len(entries), humanBytes(totalBytes), evictCount, humanBytes(evictBytes))
@@ -232,4 +232,3 @@ func corpusDirSize(path string) int64 {
 	})
 	return total
 }
-
