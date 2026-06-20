@@ -156,7 +156,19 @@ func autoDiscoverySwallow(plan corpusPlan, kind string, err error) error {
 // opportunistic auto-indexing — the alternative (mutex-guarded
 // check-then-increment) would serialize walker callbacks.
 func (p *corpusPool) discoverNestedGit(b gitBoundary) bool {
+	plan, err := planDiscoveredGitCorpus(b)
+	if err != nil {
+		slog.Debug("planDiscoveredGitCorpus failed; skipping",
+			"root", b.RepoDir, "error", err)
+		return false
+	}
+	if _, loaded := p.seen.Load(plan.id); loaded {
+		return true
+	}
 	if p.discoveredCount.Load() >= maxDiscoveredCorpora {
+		if _, loaded := p.seen.Load(plan.id); loaded {
+			return true
+		}
 		// One default-visible Warn per query; per-boundary Debug logs
 		// surface individual rejections under -v / SEEK_DEBUG.
 		p.capWarned.Do(func() {
@@ -166,12 +178,6 @@ func (p *corpusPool) discoverNestedGit(b gitBoundary) bool {
 		})
 		slog.Debug("nested git discovery cap reached; skipping",
 			"cap", maxDiscoveredCorpora, "root", b.RepoDir)
-		return false
-	}
-	plan, err := planDiscoveredGitCorpus(b)
-	if err != nil {
-		slog.Debug("planDiscoveredGitCorpus failed; skipping",
-			"root", b.RepoDir, "error", err)
 		return false
 	}
 	if p.Enqueue(plan) {

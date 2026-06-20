@@ -106,7 +106,7 @@ Paste this prompt into your AI coding agent (Claude Code, Codex, Cursor, Amp, et
 ```
 Install and configure `seek` for this project. seek is ranked local search for
 AI coding agents. It searches the current Git worktree by default, and can also
-search selected paths, external folders, and exact files.
+search selected files and folders, including external Git worktrees.
 
 Step 1 -- Install
 
@@ -221,12 +221,16 @@ The query is the first positional argument. Optional paths after the query
 restrict the search to those files or directories.
 
 - No paths: search the current Git worktree.
-- Paths inside the current repo: search only those files or folders.
-- External Git repos: use the Git-aware pipeline from the user cache, including
-  Git ignore semantics.
-- Other external files or folders: index and search them from the user cache as
-  standard filesystem corpora.
-- Exact non-Git external files search only that file, not sibling files.
+- Git worktree directories: use Git rules, including Git ignore and
+  `[uncommitted]` handling.
+- Exact files: search only that file, not sibling files, even when the file is
+  inside a Git worktree.
+- Normal folders: search that folder with filesystem rules. If the folder
+  contains Git worktrees, those child worktrees use Git rules and are searched
+  once.
+- Files or folders ignored by an enclosing Git worktree are ignored when you
+  search that Git worktree. If you pass them directly, seek searches them as
+  normal files or folders.
 
 Flags must come before the query:
 
@@ -234,8 +238,9 @@ Flags must come before the query:
 seek -n 5 -m 3 "handleRequest" ./src
 ```
 
-Path operands must exist and cannot be symlinks. Invalid paths exit with code
-2.
+Path operands must exist. Symlink operands are resolved to their targets;
+broken symlinks and invalid paths exit with code 2. Symlinks discovered during
+folder walks are skipped.
 Filters such as `file:api` still live inside the query string.
 
 ## Query Syntax
@@ -306,8 +311,11 @@ seek works alongside ripgrep -- use ripgrep for ad-hoc regex, seek when you want
 
 ## How It Works
 
-1. **Plan search roots** -- no paths means the current Git worktree. Paths are
-   split into current-repo scopes and external file/folder roots.
+1. **Plan search roots** -- no paths means the current Git worktree. A path
+   keeps the meaning you pass: Git worktree directories use Git rules, exact
+   files search only that file, and normal folders use filesystem rules.
+   Nested Git worktrees are indexed separately, and explicitly passed child
+   files or folders keep their file/folder behavior.
 2. **State check** -- Git roots use `git status`, HEAD SHA, and dirty file
    metadata. Standard folders use a bounded metadata walk.
 3. **Index** -- Git roots use the Git-aware pipeline for committed and

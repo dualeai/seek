@@ -192,6 +192,34 @@ func TestNFSGateDisablesDiscovery(t *testing.T) {
 	}
 }
 
+func TestExplicitFolderExcludeSuppressesDescentWhenDiscoveryDisabled(t *testing.T) {
+	root := canonTempDir(t)
+	nested := filepath.Join(root, "repo")
+	writeMinimalGitRepo(t, nested)
+	if err := os.WriteFile(filepath.Join(nested, "leaked.txt"), []byte("secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := planFolderCorpusWithExclusions(root, info, []string{nested})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.discover = nil
+
+	_, selected, _, err := scanFolderCorpus(t.Context(), plan, true)
+	if err != nil {
+		t.Fatalf("scanFolderCorpus: %v", err)
+	}
+	for _, candidate := range selected {
+		if strings.Contains(candidate.name, "leaked.txt") {
+			t.Fatalf("explicit excluded child Git root leaked into parent folder corpus: %q", candidate.name)
+		}
+	}
+}
+
 // TestCapExhaustionFallsBackToPlainDescent — when the discover
 // callback rejects a boundary (cap full / dedup / build failure), the
 // walker must descend into the subtree as a plain folder rather than
@@ -331,4 +359,3 @@ func TestBrokenSubmoduleGracefulSkip(t *testing.T) {
 		t.Fatalf("discovered=%d, want 0 (broken submodule must be skipped)", len(discovered))
 	}
 }
-

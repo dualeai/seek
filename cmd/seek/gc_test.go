@@ -830,7 +830,7 @@ func TestGC_DisplayName_EmptyCorpus(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "index"), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	info := corpusDisplayName(dir)
+	info := readCorpusDisplayInfo(dir)
 	if info.source != "" || info.gone {
 		t.Fatalf("empty corpus: want zero, got %+v", info)
 	}
@@ -851,7 +851,7 @@ func TestGC_DisplayName_ReadsRepositorySourceFromShard(t *testing.T) {
 		t.Fatalf("runSeekInPlannedGitCorpus: %v", err)
 	}
 
-	info := corpusDisplayName(plan.cacheDir)
+	info := readCorpusDisplayInfo(plan.cacheDir)
 	if info.source == "" {
 		t.Fatalf("Repository.Source not recovered from shard")
 	}
@@ -946,7 +946,7 @@ func TestGC_DisplayName_GoneFlag(t *testing.T) {
 	}
 
 	// Capture source before removing.
-	infoBefore := corpusDisplayName(plan.cacheDir)
+	infoBefore := readCorpusDisplayInfo(plan.cacheDir)
 	if infoBefore.source == "" {
 		t.Fatalf("precondition: source must be readable")
 	}
@@ -955,7 +955,7 @@ func TestGC_DisplayName_GoneFlag(t *testing.T) {
 		t.Fatalf("rm repo: %v", err)
 	}
 
-	infoAfter := corpusDisplayName(plan.cacheDir)
+	infoAfter := readCorpusDisplayInfo(plan.cacheDir)
 	if !infoAfter.gone {
 		t.Fatalf("gone flag should be set after repo dir removed: %+v", infoAfter)
 	}
@@ -1263,7 +1263,7 @@ poll:
 
 // TestGC_Integration_DryRunShowsRealPath wires reportGCPlan against a real
 // corpus and asserts the recovered Repository.Source appears in the output.
-// Without this, a mutation that replaces formatRoot(corpusDisplayName(...))
+// Without this, a mutation that replaces formatRoot(readCorpusDisplayInfo(...))
 // with truncateHash(e.name) (regressing to hash-only display) would silently
 // pass every other test in the file.
 func TestGC_Integration_DryRunShowsRealPath(t *testing.T) {

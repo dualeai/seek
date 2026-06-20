@@ -301,12 +301,16 @@ func wrapCorpusResults(plan corpusPlan, files []zoekt.FileMatch) []corpusSearchR
 	if len(files) == 0 {
 		return nil
 	}
+	displayRoot := plan.displayRoot
+	if plan.kind == corpusKindFolder && plan.rootType == rootTypeFile {
+		displayRoot = filepath.Dir(displayRoot)
+	}
 	results := make([]corpusSearchResult, len(files))
 	for i, file := range files {
 		results[i] = corpusSearchResult{
 			corpusID:    plan.id,
 			kind:        plan.kind,
-			displayRoot: plan.displayRoot,
+			displayRoot: displayRoot,
 			file:        file,
 		}
 	}

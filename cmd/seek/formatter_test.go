@@ -1422,6 +1422,39 @@ func TestFormatCorpusResults_SameRelativePathDifferentCorpora(t *testing.T) {
 	}
 }
 
+func TestFormatCorpusResults_FileCorpusContextUsesExactRoot(t *testing.T) {
+	fileResults := wrapCorpusResults(corpusPlan{
+		id:          corpusID("file-corpus"),
+		kind:        corpusKindFolder,
+		rootType:    rootTypeFile,
+		displayRoot: "/tmp/exact.txt",
+	}, []zoekt.FileMatch{{
+		FileName: "exact.txt", Language: "Text", Score: 10,
+		LineMatches: []zoekt.LineMatch{{Line: []byte("needle\n"), LineNumber: 1}},
+	}})
+	folderResults := wrapCorpusResults(corpusPlan{
+		id:          corpusID("folder-corpus"),
+		kind:        corpusKindFolder,
+		rootType:    rootTypeDirectory,
+		displayRoot: "/tmp/folder",
+	}, []zoekt.FileMatch{{
+		FileName: "note.txt", Language: "Text", Score: 9,
+		LineMatches: []zoekt.LineMatch{{Line: []byte("needle\n"), LineNumber: 1}},
+	}})
+	results := append(fileResults, folderResults...)
+
+	out := formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext, plainPalette)
+	if !strings.Contains(out, "## /tmp/exact.txt") {
+		t.Fatalf("expected exact file root header, got:\n%s", out)
+	}
+	if strings.Contains(out, "/tmp/exact.txt/exact.txt") {
+		t.Fatalf("file corpus header joined basename twice:\n%s", out)
+	}
+	if !strings.Contains(out, "## /tmp/folder/note.txt") {
+		t.Fatalf("expected directory corpus header to join relative file name, got:\n%s", out)
+	}
+}
+
 func TestFormatCorpusResults_GitCorpusContext(t *testing.T) {
 	results := []corpusSearchResult{
 		{

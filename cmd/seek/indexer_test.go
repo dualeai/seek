@@ -39,6 +39,43 @@ func TestComputeStateHash_DifferentInputs(t *testing.T) {
 	}
 }
 
+func TestFallbackGitRepositoryName_StableOpaqueAndShardSafe(t *testing.T) {
+	root := filepath.Join(t.TempDir(), repoUncommitted)
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	name := fallbackGitRepositoryName(root)
+	if name != fallbackGitRepositoryName(root) {
+		t.Fatal("fallback Git repository name must be deterministic")
+	}
+	if name == "" {
+		t.Fatal("fallback name must not be empty")
+	}
+	if name == repoUncommitted {
+		t.Fatalf("fallback name must not collide with %q pseudo-repo", repoUncommitted)
+	}
+	if strings.ContainsAny(name, `/\`) {
+		t.Fatalf("fallback name should be shard-safe, got %q", name)
+	}
+
+	other := filepath.Join(t.TempDir(), repoUncommitted)
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if name == fallbackGitRepositoryName(other) {
+		t.Fatalf("different roots should not share fallback name %q", name)
+	}
+
+	link := filepath.Join(t.TempDir(), "repo-link")
+	if err := os.Symlink(root, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if got := fallbackGitRepositoryName(link); got != name {
+		t.Fatalf("fallback name should use canonical path: symlink=%q root=%q", got, name)
+	}
+}
+
 func TestComputeStateHash_Length(t *testing.T) {
 	h := computeStateHash("# branch.oid abc123\n")
 	if len(h) != 16 {
