@@ -225,9 +225,39 @@ func TestDetectGitBoundary_WorktreeEscapeRejected(t *testing.T) {
 	}
 }
 
-func TestDetectGitBoundary_WorktreeEscapeAcceptedWithEmptyScope(t *testing.T) {
-	// CLI/operand callers pass scanRoot="" and should accept absolute
-	// pointers (the subprocess fallback handles deeper validation).
+func TestDetectGitBoundary_WorktreeSymlinkEscapeRejected(t *testing.T) {
+	scanRoot := t.TempDir()
+	outside := t.TempDir()
+	realGitDir := filepath.Join(outside, "real-git")
+	writeGitTriadAt(t, realGitDir)
+
+	linkDir := filepath.Join(scanRoot, "links")
+	if err := os.MkdirAll(linkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(linkDir, "outside")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	worktree := filepath.Join(scanRoot, "wt")
+	if err := os.MkdirAll(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: ../links/outside/real-git\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, status := detectGitBoundary(worktree, scanRoot)
+	if status != ambiguous {
+		t.Fatalf("status=%v, want ambiguous (symlink pointer escape)", status)
+	}
+}
+
+func TestDetectGitBoundary_WorktreeEscapeAmbiguousWithEmptyScope(t *testing.T) {
+	// CLI/operand callers pass scanRoot="", but the fast detector should not
+	// blindly trust arbitrary external pointers. Ambiguous lets those callers
+	// fall back to git rev-parse for validation.
 	root := t.TempDir()
 	realGitDir := filepath.Join(root, "real-git")
 	writeGitTriadAt(t, realGitDir)
@@ -241,8 +271,8 @@ func TestDetectGitBoundary_WorktreeEscapeAcceptedWithEmptyScope(t *testing.T) {
 	}
 
 	_, status := detectGitBoundary(worktree, "")
-	if status != boundaryConfirmed {
-		t.Fatalf("status=%v, want boundaryConfirmed (empty scope)", status)
+	if status != ambiguous {
+		t.Fatalf("status=%v, want ambiguous (empty scope external pointer)", status)
 	}
 }
 
@@ -460,21 +490,8 @@ func TestDetectGitBoundary_CommonDirRead(t *testing.T) {
 	parentGit := filepath.Join(root, "parent.git")
 	writeGitTriadAt(t, parentGit)
 
-	wtGit := filepath.Join(parentGit, "worktrees", "feature")
-	if err := os.MkdirAll(filepath.Join(wtGit, "objects"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(wtGit, "refs"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(wtGit, "HEAD"), []byte("ref: refs/heads/feature\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(wtGit, "commondir"), []byte("../..\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
 	worktree := filepath.Join(root, "feature-wt")
+	wtGit := writeLinkedWorktreeAdmin(t, parentGit, worktree, "feature")
 	if err := os.MkdirAll(worktree, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -491,5 +508,137 @@ func TestDetectGitBoundary_CommonDirRead(t *testing.T) {
 	}
 	if b.CommonDir != parentGit {
 		t.Errorf("CommonDir=%q, want %q (resolved from commondir file)", b.CommonDir, parentGit)
+	}
+}
+
+func TestDetectGitBoundary_LinkedWorktreeBackrefAcceptedOutsideScanRoot(t *testing.T) {
+	scanRoot := t.TempDir()
+	outside := t.TempDir()
+	parentGit := filepath.Join(outside, "parent.git")
+	writeGitTriadAt(t, parentGit)
+
+	worktree := filepath.Join(scanRoot, "feature-wt")
+	wtGit := writeLinkedWorktreeAdmin(t, parentGit, worktree, "feature")
+	if err := os.MkdirAll(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: "+wtGit+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	b, status := detectGitBoundary(worktree, scanRoot)
+	if status != boundaryConfirmed {
+		t.Fatalf("status=%v, want boundaryConfirmed", status)
+	}
+	if b.GitDir != wtGit {
+		t.Errorf("GitDir=%q, want %q", b.GitDir, wtGit)
+	}
+	if b.CommonDir != parentGit {
+		t.Errorf("CommonDir=%q, want %q", b.CommonDir, parentGit)
+	}
+}
+
+func TestDetectGitBoundary_LinkedWorktreeMissingBackrefRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		parentInsideScan bool
+	}{
+		{name: "outside scan root"},
+		{name: "inside scan root", parentInsideScan: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scanRoot := t.TempDir()
+			parentRoot := t.TempDir()
+			if tc.parentInsideScan {
+				parentRoot = scanRoot
+			}
+			parentGit := filepath.Join(parentRoot, "parent.git")
+			writeGitTriadAt(t, parentGit)
+
+			worktree := filepath.Join(scanRoot, "feature-wt")
+			wtGit := writeLinkedWorktreeAdmin(t, parentGit, worktree, "feature")
+			if err := os.Remove(filepath.Join(wtGit, "gitdir")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(worktree, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: "+wtGit+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, status := detectGitBoundary(worktree, scanRoot); status != ambiguous {
+				t.Fatalf("status=%v, want ambiguous (missing linked-worktree backref)", status)
+			}
+		})
+	}
+}
+
+func TestDetectGitBoundary_LinkedWorktreeWrongBackrefRejected(t *testing.T) {
+	scanRoot := t.TempDir()
+	outside := t.TempDir()
+	parentGit := filepath.Join(outside, "parent.git")
+	writeGitTriadAt(t, parentGit)
+
+	worktree := filepath.Join(scanRoot, "feature-wt")
+	otherWorktree := filepath.Join(scanRoot, "other-wt")
+	wtGit := writeLinkedWorktreeAdmin(t, parentGit, otherWorktree, "feature")
+	if err := os.MkdirAll(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: "+wtGit+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, status := detectGitBoundary(worktree, scanRoot); status != ambiguous {
+		t.Fatalf("status=%v, want ambiguous (wrong linked-worktree backref)", status)
+	}
+}
+
+func writeLinkedWorktreeAdmin(t testing.TB, commonDir, worktree, name string) string {
+	t.Helper()
+	wtGit := filepath.Join(commonDir, "worktrees", name)
+	if err := os.MkdirAll(filepath.Join(wtGit, "refs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtGit, "HEAD"), []byte("ref: refs/heads/"+name+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtGit, "commondir"), []byte("../..\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtGit, "gitdir"), []byte(filepath.Join(worktree, ".git")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return wtGit
+}
+
+func TestDetectGitBoundary_CommonDirEscapeRejected(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	outsideGit := filepath.Join(outside, "parent.git")
+	writeGitTriadAt(t, outsideGit)
+
+	wtGit := filepath.Join(root, "gitdir")
+	if err := os.MkdirAll(filepath.Join(wtGit, "refs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtGit, "HEAD"), []byte("ref: refs/heads/feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtGit, "commondir"), []byte(outsideGit+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	worktree := filepath.Join(root, "feature-wt")
+	if err := os.MkdirAll(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: "+wtGit+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, status := detectGitBoundary(worktree, root); status != ambiguous {
+		t.Fatalf("status=%v, want ambiguous (commondir escape)", status)
 	}
 }

@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -72,6 +72,8 @@ const maxGitFileBytes = 1024
 // treated as ambiguous (with a debug log at the call site).
 func detectGitBoundary(absDir, scanRoot string) (gitBoundary, detectStatus) {
 	gitPath := filepath.Join(absDir, ".git")
+	absDirReal := ""
+	scanRootReal := ""
 	fi, err := os.Lstat(gitPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -106,13 +108,41 @@ func detectGitBoundary(absDir, scanRoot string) (gitBoundary, detectStatus) {
 		if err != nil {
 			return gitBoundary{}, ambiguous
 		}
-		if !pointerWithinScope(resolved, absDir, scanRoot) {
+		resolvedReal, err := filepath.EvalSymlinks(resolved)
+		if err != nil {
 			return gitBoundary{}, ambiguous
 		}
-		if !hasGitTriad(resolved) {
-			return gitBoundary{}, ambiguous
+		if absDirReal == "" {
+			absDirReal = realOrClean(absDir)
+		}
+		if scanRoot != "" && scanRootReal == "" {
+			scanRootReal = realOrClean(scanRoot)
+		}
+		if pointerWithinScopeReal(resolvedReal, absDirReal, scanRootReal) && !commonDirFileMaybePresent(resolvedReal) {
+			if !hasGitTriad(resolvedReal) {
+				return gitBoundary{}, ambiguous
+			}
+			return gitBoundary{
+				RepoDir:   absDir,
+				GitDir:    resolved,
+				CommonDir: resolved,
+				Mode:      rootTypeWorktree,
+			}, boundaryConfirmed
 		}
 		commonDir := readCommonDir(resolved)
+		commonDirReal := resolvedReal
+		if commonDir != resolved {
+			commonDirReal, err = filepath.EvalSymlinks(commonDir)
+			if err != nil {
+				return gitBoundary{}, ambiguous
+			}
+		}
+		if !trustedGitPointerTargetReal(resolvedReal, commonDirReal, absDirReal, scanRootReal) {
+			return gitBoundary{}, ambiguous
+		}
+		if !hasGitWorktreeTriad(resolvedReal, commonDirReal) {
+			return gitBoundary{}, ambiguous
+		}
 		return gitBoundary{
 			RepoDir:   absDir,
 			GitDir:    resolved,
@@ -144,6 +174,22 @@ func hasGitTriad(gitDir string) bool {
 	return true
 }
 
+func hasGitWorktreeTriad(gitDir, commonDir string) bool {
+	head, err := os.Lstat(filepath.Join(gitDir, "HEAD"))
+	if err != nil || !head.Mode().IsRegular() {
+		return false
+	}
+	refs, err := os.Lstat(filepath.Join(gitDir, "refs"))
+	if err != nil || !refs.IsDir() {
+		return false
+	}
+	objects, err := os.Lstat(filepath.Join(commonDir, "objects"))
+	if err != nil || !objects.IsDir() {
+		return false
+	}
+	return true
+}
+
 // detectBareRepoAt reports whether absDir is a bare git repository
 // (HEAD + objects/ + refs/ at the directory itself, no `.git` child).
 // Callers — typically the corpus-root entry point of a folder scan —
@@ -167,8 +213,8 @@ func openNoFollow(path string) (*os.File, error) {
 }
 
 // parseGitFilePointer reads a worktree-form `.git` file and returns the
-// resolved absolute gitdir. Streaming: io.LimitReader(1KiB) + first-line
-// scan, so a pathological multi-GB `.git` file cannot OOM seek.
+// resolved absolute gitdir. Bounded to one fixed 1 KiB read, so a
+// pathological multi-GB `.git` file cannot OOM seek.
 //
 // Spec: a single line of the form `gitdir: <path>\n`. Path may be relative
 // (resolved against the directory holding the `.git` file) or absolute.
@@ -197,7 +243,7 @@ func parseGitFilePointer(gitFile, parentDir string) (string, error) {
 
 // readFirstLineNoFollow opens `path` with O_NOFOLLOW (defense against
 // a TOCTOU Lstat→Open symlink swap on `.git`-name entries) and reads
-// at most maxGitFileBytes via io.LimitReader so a pathological
+// at most maxGitFileBytes into a fixed stack buffer, so a pathological
 // multi-GB file cannot OOM seek. Returns the first line trimmed of
 // trailing \r\n + whitespace. Empty string is returned on any read
 // error so callers can branch: parseGitFilePointer treats it as
@@ -211,40 +257,81 @@ func readFirstLineNoFollow(path string) (string, error) {
 		return "", err
 	}
 	defer func() { _ = f.Close() }()
-	br := bufio.NewReaderSize(io.LimitReader(f, maxGitFileBytes), maxGitFileBytes)
-	line, err := br.ReadString('\n')
-	if err != nil && err != io.EOF {
+	var buf [maxGitFileBytes]byte
+	n, err := io.ReadFull(f, buf[:])
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		return "", err
 	}
-	return strings.TrimRight(line, "\r\n \t"), nil
+	line := buf[:n]
+	if end := bytes.IndexByte(line, '\n'); end >= 0 {
+		line = line[:end]
+	}
+	return strings.TrimRight(string(line), "\r\n \t"), nil
 }
 
-// pointerWithinScope rejects worktree pointers that resolve outside any
-// trustworthy location. Accepted scopes:
+func commonDirFileMaybePresent(gitDir string) bool {
+	_, err := os.Lstat(filepath.Join(gitDir, "commondir"))
+	return err == nil || !os.IsNotExist(err)
+}
+
+// pointerWithinScopeReal reports whether a worktree pointer resolves inside a
+// trustworthy in-scan location. Accepted scopes:
 //
 //   - inside the repo's own subtree (absDir, the directory holding `.git`)
 //   - inside scanRoot (the corpus scan root passed by the caller)
 //
-// The normal worktree layout where `.git` file points at
-// `<parentRepo>/.git/worktrees/<name>` is admitted via the scanRoot check
-// (the parent repo's working tree is a subtree of scanRoot).
+// Normal linked worktrees where `.git` points at
+// `<parentRepo>/.git/worktrees/<name>` are admitted by
+// trustedGitPointerTargetReal after verifying Git's back-reference.
 //
-// scanRoot may be empty for CLI/operand callers that don't have a scan
-// bound; in that case any absolute path is accepted (the subprocess
-// fallback at L3 will provide further validation).
-func pointerWithinScope(resolved, absDir, scanRoot string) bool {
-	if scanRoot == "" {
+// scanRoot may be empty for CLI/operand callers that don't have a scan bound;
+// in that case only pointers inside the worktree subtree are accepted by this
+// helper. Out-of-tree pointers must prove they are real linked worktrees via
+// trustedGitPointerTargetReal; otherwise detectGitBoundary returns ambiguous and
+// CLI callers can fall back to git rev-parse.
+func pointerWithinScopeReal(resolvedReal, absDirReal, scanRootReal string) bool {
+	if pathWithin(absDirReal, resolvedReal) {
 		return true
 	}
-	scanRoot = filepath.Clean(scanRoot)
-	absDir = filepath.Clean(absDir)
-	if pathWithin(absDir, resolved) {
-		return true
+	if scanRootReal == "" {
+		return false
 	}
-	if pathWithin(scanRoot, resolved) {
+	if pathWithin(scanRootReal, resolvedReal) {
 		return true
 	}
 	return false
+}
+
+func trustedGitPointerTargetReal(resolvedReal, commonDirReal, absDirReal, scanRootReal string) bool {
+	if resolvedReal != commonDirReal {
+		return hasLinkedWorktreeBackrefReal(resolvedReal, commonDirReal, filepath.Join(absDirReal, ".git"))
+	}
+	return pointerWithinScopeReal(resolvedReal, absDirReal, scanRootReal)
+}
+
+func hasLinkedWorktreeBackrefReal(gitDir, commonDir, gitFileReal string) bool {
+	if gitDir == commonDir {
+		return false
+	}
+	worktreesDir := filepath.Join(commonDir, "worktrees")
+	if gitDir == worktreesDir || !pathWithin(worktreesDir, gitDir) {
+		return false
+	}
+	line, err := readFirstLineNoFollow(filepath.Join(gitDir, "gitdir"))
+	if err != nil || line == "" || strings.ContainsRune(line, 0) {
+		return false
+	}
+	if !filepath.IsAbs(line) {
+		line = filepath.Join(gitDir, line)
+	}
+	return realOrClean(line) == gitFileReal
+}
+
+func realOrClean(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return filepath.Clean(path)
 }
 
 // readCommonDir reads <gitDir>/commondir (a single short line containing

@@ -89,6 +89,21 @@ func acquireLock(ctx context.Context, indexDir, lockPath string) (*os.File, bool
 	return f, true, nil
 }
 
+func acquireLockStrict(ctx context.Context, lockPath string) (*os.File, error) {
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open lock file: %w", err)
+	}
+	if err := lockFileExclusive(f); err == nil {
+		return f, nil
+	}
+	if err := pollLock(ctx, func() error { return lockFileExclusive(f) }, 100*time.Millisecond, 2*time.Second, 60*time.Second); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("indexer lock held >60s")
+	}
+	return f, nil
+}
+
 // releaseLock releases the flock and closes the file.
 func releaseLock(f *os.File) {
 	if f == nil {
@@ -113,6 +128,16 @@ func acquireSearchLock(ctx context.Context, indexDir string, f *os.File) error {
 	}
 	if shardsExist(indexDir) {
 		slog.Warn("Indexer lock contended; searching stale shards", "index_dir", indexDir)
+		return nil
+	}
+	if err := pollLock(ctx, func() error { return lockFileSharedNB(f) }, 50*time.Millisecond, 500*time.Millisecond, 60*time.Second); err != nil {
+		return fmt.Errorf("timeout waiting for indexer to finish (60s)")
+	}
+	return nil
+}
+
+func acquireSearchLockStrict(ctx context.Context, f *os.File) error {
+	if err := lockFileSharedNB(f); err == nil {
 		return nil
 	}
 	if err := pollLock(ctx, func() error { return lockFileSharedNB(f) }, 50*time.Millisecond, 500*time.Millisecond, 60*time.Second); err != nil {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -47,11 +48,26 @@ type gitPaths struct {
 // OS-level fd budget we have not actually been observed hitting.
 func gitCmd(ctx context.Context, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Env = sanitizedGitEnv(os.Environ())
 	cmd.Cancel = func() error {
 		return cmd.Process.Signal(gitCancelSignal())
 	}
 	cmd.WaitDelay = 3 * time.Second
 	return cmd
+}
+
+func sanitizedGitEnv(env []string) []string {
+	filtered := env[:0]
+	for _, kv := range env {
+		name, _, _ := strings.Cut(kv, "=")
+		switch name {
+		case "GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS":
+			continue
+		default:
+			filtered = append(filtered, kv)
+		}
+	}
+	return filtered
 }
 
 // resolveGitPathsFromCWD resolves git paths from the current working
@@ -127,13 +143,61 @@ func resolveGitPaths(ctx context.Context, dir string) (gitPaths, error) {
 // gitRepoStateIn returns the repository state for a specific directory.
 // Used when the CWD may not be inside the target repository.
 func gitRepoStateIn(ctx context.Context, dir string) repoState {
-	cmd := gitCmd(ctx, "status", "--porcelain=v2", "--branch", "--no-renames", "--no-ahead-behind", "-z")
+	cmd := gitCmd(ctx, "status", "--porcelain=v2", "--branch", "--no-renames", "--no-ahead-behind", "--untracked-files=all", "-z")
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
 		return repoState{HeadSHA: "no-head"}
 	}
 	return parseGitStatusV2(string(out))
+}
+
+func gitRepoStateInScope(ctx context.Context, dir string, scope *gitDirtyScope) (repoState, error) {
+	if scope == nil {
+		return gitRepoStateIn(ctx, dir), nil
+	}
+	args := []string{
+		"status",
+		"--porcelain=v2",
+		"--branch",
+		"--no-renames",
+		"--no-ahead-behind",
+		"--untracked-files=all",
+		"-z",
+		"--",
+	}
+	args = append(args, scope.gitPathspecs()...)
+	cmd := gitCmd(ctx, args...)
+	cmd.Dir = dir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return repoState{}, fmt.Errorf("git scoped status: %w: %s", err, msg)
+		}
+		return repoState{}, fmt.Errorf("git scoped status: %w", err)
+	}
+	return repoStateForDirtyScope(parseGitStatusV2(string(out)), scope), nil
+}
+
+func gitHeadTreeish(ctx context.Context, dir string) (string, error) {
+	cmd := gitCmd(ctx, "rev-parse", "--verify", "HEAD^{commit}")
+	cmd.Dir = dir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" || strings.Contains(msg, "Needed a single revision") {
+			return "no-head", nil
+		}
+		return "", fmt.Errorf("git rev-parse HEAD: %w: %s", err, msg)
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // parseGitStatusV2 parses git status --porcelain=v2 --branch --no-renames -z output.

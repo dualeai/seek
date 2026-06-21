@@ -99,6 +99,7 @@ func setTestUserCache(tb testing.TB) string {
 	home := tb.TempDir()
 	tb.Setenv("HOME", home)
 	tb.Setenv("XDG_CACHE_HOME", filepath.Join(home, "xdg-cache"))
+	tb.Setenv("SEEK_CACHE_DIR", "")
 	tb.Setenv(testUserCacheMarkerEnv, "1")
 	return home
 }
@@ -184,6 +185,15 @@ func formattedOutputFileNamesForTest(output string) []string {
 		}
 	}
 	return fileNames
+}
+
+func mustGlob(t *testing.T, pattern string) []string {
+	t.Helper()
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		t.Fatalf("glob %q: %v", pattern, err)
+	}
+	return matches
 }
 
 // runSeekInPlannedGitCorpus is a white-box helper for tests and benchmarks that
@@ -792,7 +802,7 @@ func TestRun_ExternalGitExactIgnoredFileOperandSearchesLiteralFile(t *testing.T)
 	}
 }
 
-func TestRun_CurrentGitIgnoredDirectoryOperandUsesFolderCorpus(t *testing.T) {
+func TestRun_CurrentGitIgnoredDirectoryOperandUsesGitScope(t *testing.T) {
 	requireTools(t)
 
 	repo := initGitRepo(t, "app.go", "package main\n// visible\n")
@@ -815,15 +825,15 @@ func TestRun_CurrentGitIgnoredDirectoryOperandUsesFolderCorpus(t *testing.T) {
 	out, err := captureStdout(t, func() error {
 		return run(context.Background(), "literal_ignored_dir_marker", []string{scratch}, 0, 0)
 	})
-	if err != nil {
-		t.Fatalf("run: %v", err)
+	if !errors.Is(err, errNoMatch) {
+		t.Fatalf("ignored directory operand should honor Git ignore, got err=%v out=%q", err, out)
 	}
-	if !strings.Contains(out, "literal_ignored_dir_marker") {
-		t.Fatalf("expected ignored directory operand to be searched literally, got:\n%s", out)
+	if strings.Contains(out, "literal_ignored_dir_marker") {
+		t.Fatalf("ignored directory content leaked through Git-scoped search, got:\n%s", out)
 	}
 }
 
-func TestRun_ExternalGitNonRootDirectoryOperandUsesFolderCorpus(t *testing.T) {
+func TestRun_ExternalGitNonRootDirectoryOperandUsesGitScope(t *testing.T) {
 	requireTools(t)
 
 	externalRepo := initGitRepo(t, "app.go", "package main\n// visible\n")
@@ -846,15 +856,1033 @@ func TestRun_ExternalGitNonRootDirectoryOperandUsesFolderCorpus(t *testing.T) {
 	out, err := captureStdout(t, func() error {
 		return run(context.Background(), "external_literal_ignored_dir_marker", []string{scratch}, 0, 0)
 	})
-	if err != nil {
-		t.Fatalf("run: %v", err)
+	if !errors.Is(err, errNoMatch) {
+		t.Fatalf("ignored directory operand should honor Git ignore, got err=%v out=%q", err, out)
 	}
-	if !strings.Contains(out, "external_literal_ignored_dir_marker") {
-		t.Fatalf("expected ignored directory operand to be searched literally, got:\n%s", out)
+	if strings.Contains(out, "external_literal_ignored_dir_marker") {
+		t.Fatalf("ignored directory content leaked through Git-scoped search, got:\n%s", out)
 	}
 }
 
-func TestRun_IgnoredFolderContainingNestedGitDiscoversNestedGit(t *testing.T) {
+func TestRun_GitSubdirOperandDoesNotBudgetIgnoredFolderArtifacts(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "seed.go", "package seed\n")
+	scope := filepath.Join(repo, "platform")
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scope, "app.go"), []byte("package platform\n// scoped_visible_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scope, ".gitignore"), []byte(".data/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", "platform")
+	gitRunIn(t, repo, "commit", "-m", "add scoped platform")
+
+	ignoredData := filepath.Join(scope, ".data")
+	if err := os.MkdirAll(ignoredData, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	size := int64(maxIndexedDocumentBytes)
+	count := maxFolderIndexedBytes/maxIndexedDocumentBytes + 1
+	for i := range count {
+		path := filepath.Join(ignoredData, fmt.Sprintf("artifact_%03d.bin", i))
+		if err := os.WriteFile(path, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Truncate(path, size); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "scoped_visible_marker", []string{scope}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("Git-scoped subdir should ignore large artifacts, got err=%v out=%q", err, out)
+	}
+	if !strings.Contains(out, "scoped_visible_marker") {
+		t.Fatalf("expected tracked scoped result, got:\n%s", out)
+	}
+}
+
+func TestRun_GitSubdirOperandDoesNotBudgetUnignoredSiblingDirtyArtifacts(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "seed.go", "package seed\n")
+	scope := filepath.Join(repo, "platform")
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scope, "app.go"), []byte("package platform\n// scoped_dirty_visible_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", "platform")
+	gitRunIn(t, repo, "commit", "-m", "add scoped platform")
+
+	sibling := filepath.Join(repo, "other")
+	if err := os.MkdirAll(sibling, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	size := int64(maxIndexedDocumentBytes)
+	count := maxFolderIndexedBytes/maxIndexedDocumentBytes + 1
+	for i := range count {
+		path := filepath.Join(sibling, fmt.Sprintf("artifact_%03d.bin", i))
+		if err := os.WriteFile(path, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Truncate(path, size); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "scoped_dirty_visible_marker", []string{scope}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("Git-scoped subdir should ignore out-of-scope dirty artifacts, got err=%v out=%q", err, out)
+	}
+	if !strings.Contains(out, "scoped_dirty_visible_marker") {
+		t.Fatalf("expected tracked scoped result, got:\n%s", out)
+	}
+}
+
+func TestRun_GitSubdirOperandDoesNotBudgetTrackedSiblingArtifacts(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "seed.go", "package seed\n")
+	scope := filepath.Join(repo, "platform")
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inScopeContent := "package platform\n// scoped_tracked_visible_marker\n"
+	if err := os.WriteFile(filepath.Join(scope, "app.go"), []byte(inScopeContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sibling := filepath.Join(repo, "other")
+	if err := os.MkdirAll(sibling, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sibling, "large.go"), []byte(strings.Repeat("x", len(inScopeContent)*4)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", ".")
+	gitRunIn(t, repo, "commit", "-m", "add scoped and sibling tracked files")
+
+	oldLimit := gitCorpusIndexedByteLimit
+	gitCorpusIndexedByteLimit = int64(len(inScopeContent) + 8)
+	defer func() { gitCorpusIndexedByteLimit = oldLimit }()
+
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "scoped_tracked_visible_marker", []string{scope}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("Git-scoped subdir should ignore out-of-scope tracked artifacts, got err=%v out=%q", err, out)
+	}
+	if !strings.Contains(out, "scoped_tracked_visible_marker") {
+		t.Fatalf("expected tracked scoped result, got:\n%s", out)
+	}
+	if strings.Contains(out, "other/large.go") {
+		t.Fatalf("out-of-scope tracked sibling leaked, got:\n%s", out)
+	}
+}
+
+func TestEnsureGitDirtyLayerFresh_CachesDeletedOnlyScope(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "seed.go", "package seed\n")
+	scope := filepath.Join(repo, "platform")
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	deleted := filepath.Join(scope, "deleted.go")
+	if err := os.WriteFile(deleted, []byte("package platform\n// deleted_only_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", "platform")
+	gitRunIn(t, repo, "commit", "-m", "add deleted scope file")
+	if err := os.Remove(deleted); err != nil {
+		t.Fatal(err)
+	}
+
+	setTestUserCache(t)
+	paths, err := resolveGitPaths(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	plans, err := planCorpora(context.Background(), &paths, []string{scope})
+	if err != nil {
+		t.Fatalf("plan scoped corpus: %v", err)
+	}
+	if len(plans) != 1 || plans[0].dirtyScope == nil {
+		t.Fatalf("expected one scoped Git plan, got %#v", plans)
+	}
+	state, err := gitRepoStateInScope(context.Background(), paths.RepoDir, plans[0].dirtyScope)
+	if err != nil {
+		t.Fatalf("scoped state: %v", err)
+	}
+	if len(state.Files) != 1 || state.Files[0] != "platform/deleted.go" {
+		t.Fatalf("expected deleted file in scoped dirty state, got %#v", state.Files)
+	}
+
+	first, err := ensureGitDirtyLayerFresh(context.Background(), plans[0], paths, state)
+	if err != nil {
+		t.Fatalf("first dirty refresh: %v", err)
+	}
+	if first != corpusKnownEmpty {
+		t.Fatalf("deleted-only dirty overlay should be known empty, got %v", first)
+	}
+	cachedState := readStateFile(plans[0].dirtyCacheDir)
+	if cachedState == "" {
+		t.Fatal("deleted-only dirty overlay should cache its empty state")
+	}
+	if got := readEmptyStateFile(plans[0].dirtyCacheDir); got != cachedState {
+		t.Fatalf("deleted-only dirty overlay should cache an explicit empty marker, got %q want %q", got, cachedState)
+	}
+	if shardsExist(plans[0].dirtyIndexDir) {
+		t.Fatalf("deleted-only dirty overlay should not create shards in %s", plans[0].dirtyIndexDir)
+	}
+
+	second, err := ensureGitDirtyLayerFresh(context.Background(), plans[0], paths, state)
+	if err != nil {
+		t.Fatalf("second dirty refresh: %v", err)
+	}
+	if second != corpusKnownEmpty {
+		t.Fatalf("cached deleted-only dirty overlay should stay known empty, got %v", second)
+	}
+}
+
+func TestEnsureGitCommittedLayerFresh_RebuildsMissingShardsWithoutEmptyMarker(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "seed.go", "package seed\n")
+	scope := filepath.Join(repo, "platform")
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scope, "app.go"), []byte("package platform\n// committed_layer_rebuild_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", "platform")
+	gitRunIn(t, repo, "commit", "-m", "add scoped platform")
+
+	setTestUserCache(t)
+	paths, err := resolveGitPaths(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	plans, err := planCorpora(context.Background(), &paths, []string{scope})
+	if err != nil {
+		t.Fatalf("plan scoped corpus: %v", err)
+	}
+	if len(plans) != 1 || plans[0].dirtyScope == nil {
+		t.Fatalf("expected one scoped Git plan, got %#v", plans)
+	}
+	state, err := gitRepoStateInScope(context.Background(), paths.RepoDir, plans[0].dirtyScope)
+	if err != nil {
+		t.Fatalf("scoped state: %v", err)
+	}
+	first, err := ensureGitCommittedLayerFresh(context.Background(), plans[0], paths, state.HeadSHA)
+	if err != nil {
+		t.Fatalf("first committed refresh: %v", err)
+	}
+	if first != corpusSearchable || !shardsExist(plans[0].committedIndexDir) {
+		t.Fatalf("expected searchable committed layer with shards, got state=%v index=%s", first, plans[0].committedIndexDir)
+	}
+	for _, shard := range mustGlob(t, filepath.Join(plans[0].committedIndexDir, "*.zoekt")) {
+		if err := os.Remove(shard); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if readEmptyStateFile(plans[0].committedCacheDir) != "" {
+		t.Fatal("non-empty committed layer should not have an empty marker")
+	}
+
+	second, err := ensureGitCommittedLayerFresh(context.Background(), plans[0], paths, state.HeadSHA)
+	if err != nil {
+		t.Fatalf("second committed refresh: %v", err)
+	}
+	if second != corpusSearchable || !shardsExist(plans[0].committedIndexDir) {
+		t.Fatalf("missing shards should rebuild instead of caching empty, got state=%v index=%s", second, plans[0].committedIndexDir)
+	}
+}
+
+func TestEnsureGitCommittedLayerFresh_DetectsHeadDriftBeforeStateWrite(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "seed.go", "package seed\n")
+	scope := filepath.Join(repo, "platform")
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scope, "app.go"), []byte("package platform\n// committed_head_a_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", "platform")
+	gitRunIn(t, repo, "commit", "-m", "add scoped platform")
+
+	setTestUserCache(t)
+	paths, err := resolveGitPaths(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	plans, err := planCorpora(context.Background(), &paths, []string{scope})
+	if err != nil {
+		t.Fatalf("plan scoped corpus: %v", err)
+	}
+	state, err := gitRepoStateInScope(context.Background(), paths.RepoDir, plans[0].dirtyScope)
+	if err != nil {
+		t.Fatalf("scoped state: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(scope, "next.go"), []byte("package platform\n// committed_head_b_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", "platform/next.go")
+	gitRunIn(t, repo, "commit", "-m", "move scoped head")
+
+	_, err = ensureGitCommittedLayerFresh(context.Background(), plans[0], paths, state.HeadSHA)
+	if !errors.Is(err, errScopedLayerStateChanged) {
+		t.Fatalf("expected scoped layer drift error, got %v", err)
+	}
+	if got := readStateFile(plans[0].committedCacheDir); got != "" {
+		t.Fatalf("committed state should not be written after head drift, got %q", got)
+	}
+}
+
+func TestEnsureGitCommittedLayerFresh_ReusesLayerAfterOutOfScopeCommit(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "seed.go", "package seed\n")
+	scope := filepath.Join(repo, "platform")
+	sibling := filepath.Join(repo, "infra")
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(sibling, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scope, "app.go"), []byte("package platform\n// out_of_scope_reuse_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sibling, "infra.go"), []byte("package infra\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", ".")
+	gitRunIn(t, repo, "commit", "-m", "add scoped platform and sibling")
+
+	setTestUserCache(t)
+	paths, err := resolveGitPaths(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	plans, err := planCorpora(context.Background(), &paths, []string{scope})
+	if err != nil {
+		t.Fatalf("plan scoped corpus: %v", err)
+	}
+	state, err := gitRepoStateInScope(context.Background(), paths.RepoDir, plans[0].dirtyScope)
+	if err != nil {
+		t.Fatalf("scoped state: %v", err)
+	}
+	if got, err := ensureGitCommittedLayerFresh(context.Background(), plans[0], paths, state.HeadSHA); err != nil {
+		t.Fatalf("first committed refresh: %v", err)
+	} else if got != corpusSearchable {
+		t.Fatalf("first committed refresh=%v, want searchable", got)
+	}
+	shards := mustGlob(t, filepath.Join(plans[0].committedIndexDir, "*.zoekt"))
+	if len(shards) == 0 {
+		t.Fatal("first committed refresh should create shards")
+	}
+	shardModTimes := make(map[string]int64, len(shards))
+	for _, shard := range shards {
+		info, err := os.Stat(shard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		shardModTimes[filepath.Base(shard)] = info.ModTime().UnixNano()
+	}
+
+	if err := os.WriteFile(filepath.Join(sibling, "outside.go"), []byte("package infra\n// out of scope\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", "infra/outside.go")
+	gitRunIn(t, repo, "commit", "-m", "commit outside scoped path")
+	nextState, err := gitRepoStateInScope(context.Background(), paths.RepoDir, plans[0].dirtyScope)
+	if err != nil {
+		t.Fatalf("next scoped state: %v", err)
+	}
+	if nextState.HeadSHA == state.HeadSHA {
+		t.Fatal("expected HEAD to change after out-of-scope commit")
+	}
+	if got, err := ensureGitCommittedLayerFresh(context.Background(), plans[0], paths, nextState.HeadSHA); err != nil {
+		t.Fatalf("second committed refresh: %v", err)
+	} else if got != corpusSearchable {
+		t.Fatalf("second committed refresh=%v, want searchable", got)
+	}
+	if got := readHeadFile(plans[0].committedCacheDir); got != nextState.HeadSHA {
+		t.Fatalf("committed head=%q, want %q", got, nextState.HeadSHA)
+	}
+	if got, want := readStateFile(plans[0].committedCacheDir), scopedCommittedLayerStateHash(paths, plans[0].dirtyScope, nextState.HeadSHA); got != want {
+		t.Fatalf("committed state=%q, want %q", got, want)
+	}
+	for _, shard := range mustGlob(t, filepath.Join(plans[0].committedIndexDir, "*.zoekt")) {
+		info, err := os.Stat(shard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := info.ModTime().UnixNano(), shardModTimes[filepath.Base(shard)]; got != want {
+			t.Fatalf("out-of-scope commit should reuse shard %s, mtime got %d want %d", shard, got, want)
+		}
+	}
+	matches, err := executeUnscopedShardSearchForTest(context.Background(), plans[0].committedIndexDir, "out_of_scope_reuse_marker")
+	if err != nil {
+		t.Fatalf("search reused committed shard: %v", err)
+	}
+	if len(matches) != 1 || matches[0].FileName != "platform/app.go" {
+		t.Fatalf("expected reused committed shard result, got %#v", matches)
+	}
+}
+
+func TestEnsureGitCommittedLayerFresh_PathspecEnvCannotHideScopedChange(t *testing.T) {
+	requireTools(t)
+	t.Setenv("GIT_LITERAL_PATHSPECS", "1")
+
+	repo := initGitRepo(t, "seed.go", "package seed\n")
+	scope := filepath.Join(repo, "scope[1]")
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scope, "app.go"), []byte("package scope\n// pathspec_env_old_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", "scope[1]")
+	gitRunIn(t, repo, "commit", "-m", "add scoped literal path")
+
+	setTestUserCache(t)
+	paths, err := resolveGitPaths(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	plans, err := planCorpora(context.Background(), &paths, []string{scope})
+	if err != nil {
+		t.Fatalf("plan scoped corpus: %v", err)
+	}
+	state, err := gitRepoStateInScope(context.Background(), paths.RepoDir, plans[0].dirtyScope)
+	if err != nil {
+		t.Fatalf("scoped state: %v", err)
+	}
+	if got, err := ensureGitCommittedLayerFresh(context.Background(), plans[0], paths, state.HeadSHA); err != nil {
+		t.Fatalf("first committed refresh: %v", err)
+	} else if got != corpusSearchable {
+		t.Fatalf("first committed refresh=%v, want searchable", got)
+	}
+
+	if err := os.WriteFile(filepath.Join(scope, "app.go"), []byte("package scope\n// pathspec_env_new_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", "scope[1]/app.go")
+	gitRunIn(t, repo, "commit", "-m", "change scoped literal path")
+	nextState, err := gitRepoStateInScope(context.Background(), paths.RepoDir, plans[0].dirtyScope)
+	if err != nil {
+		t.Fatalf("next scoped state: %v", err)
+	}
+	if got, err := ensureGitCommittedLayerFresh(context.Background(), plans[0], paths, nextState.HeadSHA); err != nil {
+		t.Fatalf("second committed refresh: %v", err)
+	} else if got != corpusSearchable {
+		t.Fatalf("second committed refresh=%v, want searchable", got)
+	}
+
+	oldMatches, err := executeUnscopedShardSearchForTest(context.Background(), plans[0].committedIndexDir, "pathspec_env_old_marker")
+	if err != nil {
+		t.Fatalf("search old marker: %v", err)
+	}
+	if len(oldMatches) != 0 {
+		t.Fatalf("old scoped content should not survive in reused shard, got %#v", oldMatches)
+	}
+	newMatches, err := executeUnscopedShardSearchForTest(context.Background(), plans[0].committedIndexDir, "pathspec_env_new_marker")
+	if err != nil {
+		t.Fatalf("search new marker: %v", err)
+	}
+	if len(newMatches) != 1 || newMatches[0].FileName != "scope[1]/app.go" {
+		t.Fatalf("expected reindexed scoped content under pathspec env, got %#v", newMatches)
+	}
+}
+
+func TestEnsureGitCommittedLayerFresh_UnbornRepoKnownEmpty(t *testing.T) {
+	requireGit(t)
+
+	repo := initEmptyGitRepoNoRemote(t)
+	scope := filepath.Join(repo, "platform")
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	setTestUserCache(t)
+	paths, err := resolveGitPaths(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	plans, err := planCorpora(context.Background(), &paths, []string{scope})
+	if err != nil {
+		t.Fatalf("plan scoped corpus: %v", err)
+	}
+	state, err := gitRepoStateInScope(context.Background(), paths.RepoDir, plans[0].dirtyScope)
+	if err != nil {
+		t.Fatalf("scoped state: %v", err)
+	}
+	got, err := ensureGitCommittedLayerFresh(context.Background(), plans[0], paths, state.HeadSHA)
+	if err != nil {
+		t.Fatalf("unborn committed refresh: %v", err)
+	}
+	if got != corpusKnownEmpty {
+		t.Fatalf("unborn committed layer should be known empty, got %v", got)
+	}
+}
+
+func TestSearchPlannedScopedCorpusRejectsLayerStateMismatch(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "seed.go", "package seed\n")
+	scope := filepath.Join(repo, "platform")
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scope, "app.go"), []byte("package platform\n// state_mismatch_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", "platform")
+	gitRunIn(t, repo, "commit", "-m", "add scoped platform")
+
+	setTestUserCache(t)
+	paths, err := resolveGitPaths(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	plans, err := planCorpora(context.Background(), &paths, []string{scope})
+	if err != nil {
+		t.Fatalf("plan scoped corpus: %v", err)
+	}
+	_, ready, err := ensureGitCorpusFresh(context.Background(), plans[0], paths)
+	if err != nil {
+		t.Fatalf("ensure scoped corpus: %v", err)
+	}
+	if ready != corpusSearchable {
+		t.Fatalf("expected searchable corpus, got %v", ready)
+	}
+	plans[0].committedStateHash = readStateFile(plans[0].committedCacheDir)
+	if plans[0].committedStateHash == "" {
+		t.Fatal("expected committed layer to persist state before mismatch check")
+	}
+	plans[0].dirtyStateHash = readStateFile(plans[0].dirtyCacheDir)
+	if plans[0].dirtyStateHash == "" {
+		t.Fatal("expected dirty layer to persist state before mismatch check")
+	}
+	plans[0].committedStateHash = "0000000000000000"
+
+	q, err := parseSearchQuery("state_mismatch_marker")
+	if err != nil {
+		t.Fatalf("parse query: %v", err)
+	}
+	_, err = searchPlannedCorpusParsed(context.Background(), plans[0], q)
+	if !errors.Is(err, errScopedLayerStateChanged) {
+		t.Fatalf("expected scoped layer state mismatch, got %v", err)
+	}
+}
+
+func TestRun_GitDirectoryOperandTreatsPathspecMetacharactersLiterally(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "seed.go", "package seed\n")
+	scope := filepath.Join(repo, "scope[1]")
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scope, "committed.go"), []byte("package scope\n// literal_pathspec_committed_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", "scope[1]")
+	gitRunIn(t, repo, "commit", "-m", "add literal pathspec scope")
+	if err := os.WriteFile(filepath.Join(scope, "dirty.go"), []byte("package scope\n// literal_pathspec_dirty_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	setTestUserCache(t)
+	t.Chdir(repo)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "literal_pathspec_committed_marker", []string{scope}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run committed literal pathspec marker: %v", err)
+	}
+	if !strings.Contains(out, "scope[1]/committed.go") {
+		t.Fatalf("expected literal pathspec committed result, got:\n%s", out)
+	}
+
+	out, err = captureStdout(t, func() error {
+		return run(context.Background(), "literal_pathspec_dirty_marker", []string{scope}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run dirty literal pathspec marker: %v", err)
+	}
+	if !strings.Contains(out, "scope[1]/dirty.go") {
+		t.Fatalf("expected literal pathspec dirty result, got:\n%s", out)
+	}
+}
+
+func TestRun_GitDirectoryOperandDiscoversVisibleNestedGit(t *testing.T) {
+	requireTools(t)
+
+	parent := initGitRepo(t, "app.go", "package main\n// parent_visible_marker\n")
+	scope := filepath.Join(parent, "scope")
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scope, "app.go"), []byte("package scope\n// scope_visible_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, parent, "add", "scope")
+	gitRunIn(t, parent, "commit", "-m", "add scope")
+
+	nested := filepath.Join(scope, "nested")
+	initGitRepoNoRemoteAt(t, nested, "src.go", "package nested\n// visible_nested_git_marker\n")
+	if err := os.WriteFile(filepath.Join(nested, ".gitignore"), []byte(".venv/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, nested, "add", ".gitignore")
+	gitRunIn(t, nested, "commit", "-m", "add gitignore")
+	venv := filepath.Join(nested, ".venv")
+	if err := os.MkdirAll(venv, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(venv, "secret.py"), []byte("# visible_nested_ignored_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	outsideNested := initGitRepoNoRemoteAt(t, filepath.Join(parent, "outside", "nested"), "src.go", "package outside\n// visible_nested_git_marker\n")
+	_ = outsideNested
+
+	setTestUserCache(t)
+	t.Chdir(parent)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "visible_nested_git_marker", []string{scope}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run nested marker: %v", err)
+	}
+	if !strings.Contains(out, "scope/nested/src.go") {
+		t.Fatalf("expected visible nested Git content under scoped directory, got:\n%s", out)
+	}
+	if count := strings.Count(out, "visible_nested_git_marker"); count != 1 {
+		t.Fatalf("expected visible nested Git result once, got %d occurrences:\n%s", count, out)
+	}
+	if strings.Contains(out, "outside/nested/src.go") {
+		t.Fatalf("out-of-scope nested Git content leaked, got:\n%s", out)
+	}
+
+	out, err = captureStdout(t, func() error {
+		return run(context.Background(), "visible_nested_ignored_marker", []string{scope}, 0, 0)
+	})
+	if !errors.Is(err, errNoMatch) {
+		t.Fatalf("nested Git ignore should be honored, got err=%v out=%q", err, out)
+	}
+	if strings.Contains(out, "visible_nested_ignored_marker") {
+		t.Fatalf("nested ignored content leaked, got:\n%s", out)
+	}
+}
+
+func TestRun_GitDirectoryOperandDiscoversNestedSubmoduleRecursively(t *testing.T) {
+	requireTools(t)
+
+	grandSrc := initGitRepoNoRemote(t, "grand.go", "package grand\n// recursive_submodule_marker\n")
+	nestedSrc := initGitRepoNoRemote(t, "nested.go", "package nested\n")
+	gitRunIn(t, nestedSrc, "-c", "protocol.file.allow=always", "submodule", "add", grandSrc, "grand")
+	gitRunIn(t, nestedSrc, "commit", "-m", "add grand submodule")
+
+	parent := initGitRepo(t, "app.go", "package main\n")
+	scope := filepath.Join(parent, "scope")
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scope, "app.go"), []byte("package scope\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, parent, "add", "scope")
+	gitRunIn(t, parent, "commit", "-m", "add scope")
+	gitRunIn(t, parent, "-c", "protocol.file.allow=always", "submodule", "add", nestedSrc, filepath.Join("scope", "nested"))
+	gitRunIn(t, parent, "commit", "-m", "add nested submodule")
+	gitRunIn(t, filepath.Join(parent, "scope", "nested"), "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+
+	setTestUserCache(t)
+	t.Chdir(parent)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "recursive_submodule_marker", []string{scope}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run recursive submodule marker: %v", err)
+	}
+	if !strings.Contains(out, "scope/nested/grand/grand.go") {
+		t.Fatalf("expected recursively discovered submodule content, got:\n%s", out)
+	}
+	if count := strings.Count(out, "recursive_submodule_marker"); count != 1 {
+		t.Fatalf("expected recursive submodule result once, got %d occurrences:\n%s", count, out)
+	}
+}
+
+func TestRun_FolderOperandDiscoversNestedSubmoduleRecursively(t *testing.T) {
+	requireTools(t)
+
+	grandSrc := initGitRepoNoRemote(t, "grand.go", "package grand\n// folder_recursive_submodule_marker\n")
+	parent := t.TempDir()
+	nested := initGitRepoNoRemoteAt(t, filepath.Join(parent, "nested"), "nested.go", "package nested\n")
+	gitRunIn(t, nested, "-c", "protocol.file.allow=always", "submodule", "add", grandSrc, "grand")
+	gitRunIn(t, nested, "commit", "-m", "add grand submodule")
+	gitRunIn(t, nested, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive")
+
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "folder_recursive_submodule_marker", []string{parent}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run folder recursive submodule marker: %v", err)
+	}
+	if !strings.Contains(out, "grand.go") {
+		t.Fatalf("expected folder-discovered recursive submodule content, got:\n%s", out)
+	}
+	if count := strings.Count(out, "folder_recursive_submodule_marker"); count != 1 {
+		t.Fatalf("expected folder recursive submodule result once, got %d occurrences:\n%s", count, out)
+	}
+}
+
+func TestRun_FolderOperandDiscoversLinkedWorktree(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepoNoRemote(t, "base.go", "package base\n")
+	gitRunIn(t, repo, "branch", "linked")
+	parent := t.TempDir()
+	linked := filepath.Join(parent, "linked")
+	gitRunIn(t, repo, "worktree", "add", linked, "linked")
+	if err := os.WriteFile(filepath.Join(linked, ".gitignore"), []byte(".cache/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(linked, "linked.go"), []byte("package linked\n// folder_linked_worktree_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, linked, "add", ".gitignore", "linked.go")
+	gitRunIn(t, linked, "commit", "-m", "add linked marker")
+	cacheDir := filepath.Join(linked, ".cache")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cacheDir, "secret.txt"), []byte("folder_linked_worktree_ignored_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "folder_linked_worktree_marker", []string{parent}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run folder linked worktree marker: %v", err)
+	}
+	if !strings.Contains(out, "linked.go") {
+		t.Fatalf("expected folder-discovered linked worktree content, got:\n%s", out)
+	}
+	if count := strings.Count(out, "folder_linked_worktree_marker"); count != 1 {
+		t.Fatalf("expected linked worktree result once, got %d occurrences:\n%s", count, out)
+	}
+
+	out, err = captureStdout(t, func() error {
+		return run(context.Background(), "folder_linked_worktree_ignored_marker", []string{parent}, 0, 0)
+	})
+	if !errors.Is(err, errNoMatch) {
+		t.Fatalf("linked worktree ignored file should not match through folder parent, got err=%v out=%q", err, out)
+	}
+	if strings.Contains(out, "folder_linked_worktree_ignored_marker") {
+		t.Fatalf("linked worktree ignored content leaked, got:\n%s", out)
+	}
+}
+
+func TestRun_GitDirectoryOperandDiscoversLinkedWorktree(t *testing.T) {
+	requireTools(t)
+
+	parent := initGitRepo(t, "app.go", "package main\n")
+	scope := filepath.Join(parent, "scope")
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scope, "app.go"), []byte("package scope\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, parent, "add", "scope")
+	gitRunIn(t, parent, "commit", "-m", "add scope")
+
+	gitRunIn(t, parent, "branch", "linked")
+	linked := filepath.Join(scope, "linked")
+	gitRunIn(t, parent, "worktree", "add", linked, "linked")
+	if err := os.WriteFile(filepath.Join(linked, ".gitignore"), []byte(".cache/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(linked, "linked.go"), []byte("package linked\n// git_scope_linked_worktree_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, linked, "add", ".gitignore", "linked.go")
+	gitRunIn(t, linked, "commit", "-m", "add linked marker")
+	cacheDir := filepath.Join(linked, ".cache")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cacheDir, "secret.txt"), []byte("git_scope_linked_worktree_ignored_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	setTestUserCache(t)
+	t.Chdir(parent)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "git_scope_linked_worktree_marker", []string{scope}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run scoped linked worktree marker: %v", err)
+	}
+	if !strings.Contains(out, "scope/linked/linked.go") {
+		t.Fatalf("expected linked worktree content under scoped directory, got:\n%s", out)
+	}
+	if count := strings.Count(out, "git_scope_linked_worktree_marker"); count != 1 {
+		t.Fatalf("expected linked worktree result once, got %d occurrences:\n%s", count, out)
+	}
+
+	out, err = captureStdout(t, func() error {
+		return run(context.Background(), "git_scope_linked_worktree_ignored_marker", []string{scope}, 0, 0)
+	})
+	if !errors.Is(err, errNoMatch) {
+		t.Fatalf("linked worktree ignored file should not match through scoped Git parent, got err=%v out=%q", err, out)
+	}
+	if strings.Contains(out, "git_scope_linked_worktree_ignored_marker") {
+		t.Fatalf("linked worktree ignored content leaked, got:\n%s", out)
+	}
+}
+
+func TestRun_GitDirectoryOperandDiscoversSubmoduleGitlink(t *testing.T) {
+	requireTools(t)
+
+	parent := initGitRepo(t, "app.go", "package main\n// parent_visible_marker\n")
+	scope := filepath.Join(parent, "scope")
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scope, "app.go"), []byte("package scope\n// scope_visible_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, parent, "add", "scope")
+	gitRunIn(t, parent, "commit", "-m", "add scope")
+
+	subSrc := initGitRepoNoRemote(t, "sub.go", "package sub\n// submodule_scope_marker\n")
+	gitRunIn(t, parent, "-c", "protocol.file.allow=always", "submodule", "add", subSrc, filepath.Join("scope", "sub"))
+	gitRunIn(t, parent, "commit", "-m", "add submodule")
+
+	setTestUserCache(t)
+	t.Chdir(parent)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "submodule_scope_marker", []string{scope}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run submodule marker: %v", err)
+	}
+	if !strings.Contains(out, "scope/sub/sub.go") {
+		t.Fatalf("expected submodule content under scoped directory, got:\n%s", out)
+	}
+	if count := strings.Count(out, "submodule_scope_marker"); count != 1 {
+		t.Fatalf("expected submodule result once, got %d occurrences:\n%s", count, out)
+	}
+}
+
+func TestRun_GitDirectoryOperandDoesNotDiscoverIgnoredNestedGit(t *testing.T) {
+	requireTools(t)
+
+	parent := initGitRepo(t, "app.go", "package main\n// parent_visible_marker\n")
+	scope := filepath.Join(parent, "scope")
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scope, "app.go"), []byte("package scope\n// scope_visible_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, ".gitignore"), []byte("scope/vendor/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, parent, "add", ".gitignore", "scope")
+	gitRunIn(t, parent, "commit", "-m", "add scope and ignore")
+
+	nested := filepath.Join(scope, "vendor", "nested")
+	initGitRepoNoRemoteAt(t, nested, "src.go", "package nested\n// parent_ignored_nested_marker\n")
+
+	setTestUserCache(t)
+	t.Chdir(parent)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "parent_ignored_nested_marker", []string{scope}, 0, 0)
+	})
+	if !errors.Is(err, errNoMatch) {
+		t.Fatalf("parent-ignored nested Git should not match through scoped parent, got err=%v out=%q", err, out)
+	}
+	if strings.Contains(out, "parent_ignored_nested_marker") {
+		t.Fatalf("parent-ignored nested Git content leaked, got:\n%s", out)
+	}
+
+	out, err = captureStdout(t, func() error {
+		return run(context.Background(), "parent_ignored_nested_marker", []string{nested}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("explicit ignored nested Git should still work: %v", err)
+	}
+	if !strings.Contains(out, "parent_ignored_nested_marker") {
+		t.Fatalf("expected explicit ignored nested Git content, got:\n%s", out)
+	}
+}
+
+func TestRun_GitDirectoryAndExactFileOperandDoNotDuplicateExactFile(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "seed.go", "package seed\n")
+	scope := filepath.Join(repo, "scope")
+	if err := os.MkdirAll(scope, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(scope, "target.go")
+	if err := os.WriteFile(target, []byte("package scope\n// git_dir_exact_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "outside.go"), []byte("package outside\n// git_dir_exact_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", ".")
+	gitRunIn(t, repo, "commit", "-m", "add scoped and outside files")
+
+	setTestUserCache(t)
+	t.Chdir(repo)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "git_dir_exact_marker", []string{scope, target}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if count := strings.Count(out, "git_dir_exact_marker"); count != 1 {
+		t.Fatalf("expected exact file result once, got %d occurrences:\n%s", count, out)
+	}
+	if !strings.Contains(out, "scope/target.go") {
+		t.Fatalf("expected target file result, got:\n%s", out)
+	}
+	if strings.Contains(out, "outside.go") {
+		t.Fatalf("out-of-scope file leaked, got:\n%s", out)
+	}
+}
+
+func TestRun_CurrentGitDefaultDiscoversVisibleNestedGit(t *testing.T) {
+	requireTools(t)
+
+	parent := initGitRepo(t, "app.go", "package main\n// parent_visible_marker\n")
+	nested := filepath.Join(parent, "nested")
+	initGitRepoNoRemoteAt(t, nested, "src.go", "package nested\n// default_visible_nested_marker\n")
+
+	setTestUserCache(t)
+	t.Chdir(parent)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "default_visible_nested_marker", nil, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run nested marker: %v", err)
+	}
+	if !strings.Contains(out, "nested/src.go") {
+		t.Fatalf("expected default search to include visible nested Git content, got:\n%s", out)
+	}
+	if count := strings.Count(out, "default_visible_nested_marker"); count != 1 {
+		t.Fatalf("expected default nested Git result once, got %d occurrences:\n%s", count, out)
+	}
+}
+
+func TestRun_GitRootOperandDiscoversSubmoduleGitlink(t *testing.T) {
+	requireTools(t)
+
+	parent := initGitRepo(t, "app.go", "package main\n// parent_visible_marker\n")
+	subSrc := initGitRepoNoRemote(t, "sub.go", "package sub\n// root_submodule_marker\n")
+	gitRunIn(t, parent, "-c", "protocol.file.allow=always", "submodule", "add", subSrc, "sub")
+	gitRunIn(t, parent, "commit", "-m", "add submodule")
+
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "root_submodule_marker", []string{parent}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run submodule marker: %v", err)
+	}
+	if !strings.Contains(out, "sub/sub.go") {
+		t.Fatalf("expected Git root operand to include submodule content, got:\n%s", out)
+	}
+	if count := strings.Count(out, "root_submodule_marker"); count != 1 {
+		t.Fatalf("expected root submodule result once, got %d occurrences:\n%s", count, out)
+	}
+}
+
+func TestRun_CurrentGitDefaultDoesNotDiscoverIgnoredNestedGit(t *testing.T) {
+	requireTools(t)
+
+	parent := initGitRepo(t, "app.go", "package main\n// parent_visible_marker\n")
+	if err := os.WriteFile(filepath.Join(parent, ".gitignore"), []byte("vendor/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, parent, "add", ".gitignore")
+	gitRunIn(t, parent, "commit", "-m", "add gitignore")
+	nested := filepath.Join(parent, "vendor", "nested")
+	initGitRepoNoRemoteAt(t, nested, "src.go", "package nested\n// default_ignored_nested_marker\n")
+
+	setTestUserCache(t)
+	t.Chdir(parent)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "default_ignored_nested_marker", nil, 0, 0)
+	})
+	if !errors.Is(err, errNoMatch) {
+		t.Fatalf("parent-ignored nested Git should not match through default search, got err=%v out=%q", err, out)
+	}
+	if strings.Contains(out, "default_ignored_nested_marker") {
+		t.Fatalf("parent-ignored nested Git content leaked, got:\n%s", out)
+	}
+
+	out, err = captureStdout(t, func() error {
+		return run(context.Background(), "default_ignored_nested_marker", []string{nested}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("explicit ignored nested Git should still work: %v", err)
+	}
+	if !strings.Contains(out, "default_ignored_nested_marker") {
+		t.Fatalf("expected explicit ignored nested Git content, got:\n%s", out)
+	}
+}
+
+func TestRun_GitIgnoredFolderOperandHonorsGitIgnoreAndExplicitNestedGitStillWorks(t *testing.T) {
 	requireTools(t)
 
 	parent := initGitRepo(t, "app.go", "package main\n// visible\n")
@@ -893,25 +1921,35 @@ func TestRun_IgnoredFolderContainingNestedGitDiscoversNestedGit(t *testing.T) {
 	out, err := captureStdout(t, func() error {
 		return run(context.Background(), "scratch_plain_marker", []string{scratch}, 0, 0)
 	})
-	if err != nil {
-		t.Fatalf("plain marker run: %v", err)
+	if !errors.Is(err, errNoMatch) {
+		t.Fatalf("ignored folder marker should not match through Git scope, got err=%v out=%q", err, out)
 	}
-	if !strings.Contains(out, "scratch_plain_marker") {
-		t.Fatalf("expected parent folder content, got:\n%s", out)
+	if strings.Contains(out, "scratch_plain_marker") {
+		t.Fatalf("ignored folder content leaked through Git scope, got:\n%s", out)
 	}
 
 	out, err = captureStdout(t, func() error {
 		return run(context.Background(), "nested_committed_marker", []string{scratch}, 0, 0)
 	})
-	if err != nil {
-		t.Fatalf("nested marker run: %v", err)
+	if !errors.Is(err, errNoMatch) {
+		t.Fatalf("nested Git inside ignored folder should not match through parent Git scope, got err=%v out=%q", err, out)
 	}
-	if !strings.Contains(out, "nested_committed_marker") {
-		t.Fatalf("expected nested git content, got:\n%s", out)
+	if strings.Contains(out, "nested_committed_marker") {
+		t.Fatalf("nested Git content leaked through ignored parent scope, got:\n%s", out)
 	}
 
 	out, err = captureStdout(t, func() error {
-		return run(context.Background(), "nested_ignored_marker", []string{scratch}, 0, 0)
+		return run(context.Background(), "nested_committed_marker", []string{nested}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("explicit nested marker run: %v", err)
+	}
+	if !strings.Contains(out, "nested_committed_marker") {
+		t.Fatalf("expected explicit nested git content, got:\n%s", out)
+	}
+
+	out, err = captureStdout(t, func() error {
+		return run(context.Background(), "nested_ignored_marker", []string{nested}, 0, 0)
 	})
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("nested git ignored file should not match, got err=%v out=%q", err, out)
@@ -999,6 +2037,30 @@ func TestRun_ParentFolderAndNestedGitExactIgnoredFileKeepsFileOwner(t *testing.T
 	}
 	if strings.Contains(out, "sibling.txt") {
 		t.Fatalf("exact nested file search should not include sibling, got:\n%s", out)
+	}
+}
+
+func TestRun_ParentFolderAndNestedGitExactTrackedFileKeepsFileOwner(t *testing.T) {
+	requireTools(t)
+
+	parent := t.TempDir()
+	nested := initGitRepoNoRemoteAt(t, filepath.Join(parent, "nested"), "src.go", "package nested\n// parent_nested_tracked_exact_marker\n")
+	target := filepath.Join(nested, "src.go")
+
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "parent_nested_tracked_exact_marker", []string{parent, target}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(out, "src.go") {
+		t.Fatalf("expected exact tracked file owner to survive parent folder operand, got:\n%s", out)
+	}
+	if count := strings.Count(out, "parent_nested_tracked_exact_marker"); count != 1 {
+		t.Fatalf("expected exact tracked file result once, got %d occurrences:\n%s", count, out)
 	}
 }
 
@@ -1968,6 +3030,31 @@ func TestIntegration_Worktree_DirtyFile(t *testing.T) {
 	}
 	if len(files) == 0 {
 		t.Fatal("FRESHNESS VIOLATION: uncommitted edit inside worktree not found")
+	}
+}
+
+func TestIntegration_Worktree_NestedUntrackedFileWithStatusConfig(t *testing.T) {
+	requireTools(t)
+
+	_, worktreeDir := initGitWorktree(t, "wt.go", `package main
+// worktree_base_marker
+`)
+	gitRunIn(t, worktreeDir, "config", "status.showUntrackedFiles", "no")
+
+	nested := filepath.Join(worktreeDir, "a", "b", "c")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "new.go"), []byte("package main\n// worktree_nested_untracked_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := runSeekInRepo(t, worktreeDir, "worktree_nested_untracked_marker")
+	if err != nil {
+		t.Fatalf("search failed: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("status.showUntrackedFiles=no should not hide nested untracked files in linked worktrees")
 	}
 }
 

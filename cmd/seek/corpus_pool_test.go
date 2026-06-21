@@ -302,17 +302,13 @@ func TestRunCorpusPool_NWayConcurrent(t *testing.T) {
 	}
 }
 
-// TestDiscoveryCapExceeded — pool's discoveredCount must stop
-// accepting new boundaries once maxDiscoveredCorpora is reached.
-// Pool-level test (not walker) because the cap counter + capWarned
-// live on corpusPool; the walker simply forwards every boundary to
-// the discover callback.
-func TestDiscoveryCapExceeded(t *testing.T) {
-	pool, g := newTestPool(t, noopPoolWorker, maxDiscoveredCorpora+10)
+func TestDiscoveryAcceptsManyNestedGitCorpora(t *testing.T) {
+	const repoCount = corpusWorkerCap*2 + 1
+	pool, g := newTestPool(t, noopPoolWorker, repoCount)
 	defer func() { _ = g.Wait(); close(pool.resultsCh) }()
 	root := canonTempDir(t)
 	accepted := 0
-	for i := 0; i < maxDiscoveredCorpora+5; i++ {
+	for i := 0; i < repoCount; i++ {
 		repo := filepath.Join(root, fmt.Sprintf("r%d", i))
 		writeMinimalGitRepo(t, repo)
 		b := gitBoundary{
@@ -325,16 +321,31 @@ func TestDiscoveryCapExceeded(t *testing.T) {
 			accepted++
 		}
 	}
-	if accepted > maxDiscoveredCorpora {
-		t.Fatalf("accepted=%d exceeds cap=%d", accepted, maxDiscoveredCorpora)
-	}
-	if accepted < maxDiscoveredCorpora {
-		t.Fatalf("accepted=%d below cap=%d (should fully consume cap before rejecting)", accepted, maxDiscoveredCorpora)
+	if accepted != repoCount {
+		t.Fatalf("accepted=%d, want %d", accepted, repoCount)
 	}
 }
 
-func TestDiscoverNestedGitDedupSuppressesDescentWhenCapFull(t *testing.T) {
-	pool, g := newTestPool(t, noopPoolWorker, maxDiscoveredCorpora+1)
+func TestRunCorpusPoolDrainsResultsWhileWorkersRun(t *testing.T) {
+	const n = corpusWorkerCap*3 + 1
+	plans := make([]corpusPlan, n)
+	for i := range plans {
+		plans[i] = corpusPlan{id: corpusID(fmt.Sprintf("plan-%02d", i)), userExplicit: true}
+	}
+	worker := func(_ context.Context, plan corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
+		return []corpusSearchResult{{corpusID: plan.id}}, nil, nil
+	}
+	results, _, err := runCorpusPool(t.Context(), plans, worker)
+	if err != nil {
+		t.Fatalf("runCorpusPool: %v", err)
+	}
+	if len(results) != n {
+		t.Fatalf("results=%d, want %d", len(results), n)
+	}
+}
+
+func TestDiscoverNestedGitDedupSuppressesDescentWhenAlreadyCovered(t *testing.T) {
+	pool, g := newTestPool(t, noopPoolWorker, 2)
 	defer func() { _ = g.Wait(); close(pool.resultsCh) }()
 
 	repo := filepath.Join(canonTempDir(t), "repo")
@@ -352,10 +363,9 @@ func TestDiscoverNestedGitDedupSuppressesDescentWhenCapFull(t *testing.T) {
 	if !pool.Enqueue(plan) {
 		t.Fatal("initial explicit-equivalent enqueue must accept")
 	}
-	pool.discoveredCount.Store(maxDiscoveredCorpora)
 
 	if !pool.discoverNestedGit(b) {
-		t.Fatal("covered boundary must suppress descent even when discovery cap is full")
+		t.Fatal("covered boundary must suppress descent")
 	}
 }
 

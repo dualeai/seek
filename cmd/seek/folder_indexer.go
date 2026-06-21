@@ -298,8 +298,8 @@ type folderCorpusScanner struct {
 	// scanRoot bounds pointer-escape detection inside detectGitBoundary.
 	// discoveryEnabled gates the boundary check; when false the walker
 	// recurses without classifying. enqueueDiscovered receives confirmed
-	// boundaries; the bool return reports fresh-vs-deduped and feeds the
-	// pool's cap accounting.
+	// boundaries; true means a corpus owns the subtree, false means the
+	// walker should descend as plain folder.
 	//
 	// TODO(perf): a `sync.Map[parent_dev_ino]struct{}` memoizer would
 	// short-circuit "no nested .git here" probes when the same physical
@@ -530,12 +530,9 @@ func isFolderMetadataDir(name string) bool {
 // false when the caller should descend as plain folder.
 //
 // Important: only emits the "git-boundary" fingerprint marker when the
-// enqueue succeeded. If the pool rejected the boundary (cap full, plan
-// build failure), the walker falls through to plain-folder descent so
+// enqueue succeeded. If the callback rejects the boundary (for example,
+// plan build failure), the walker falls through to plain-folder descent so
 // the subtree's content is NOT silently lost from the indexed set.
-// The cap-exhaustion case logs a default-visible Warn so the user can
-// act (narrow the search root or bump SEEK_MAX_DISCOVERED_CORPORA when
-// that env var lands).
 func (s *folderCorpusScanner) tryDiscoverBoundary(path, rel string) bool {
 	if !s.discoveryEnabled {
 		return false
@@ -557,12 +554,9 @@ func (s *folderCorpusScanner) tryDiscoverBoundary(path, rel string) bool {
 	}
 	if s.enqueueDiscovered != nil {
 		if !s.enqueueDiscovered(b) {
-			// Cap/dedup/build rejected the plan. Fall back to plain
-			// recursion so the subtree's content isn't dropped. The
-			// pool's discoverNestedGit logs the rejection reason at
-			// Warn (cap) / Debug (build error). Walker logs the
-			// per-path descent so user can trace what content ended
-			// up under the parent corpus.
+			// The callback rejected the boundary, so no corpus owns
+			// this subtree. Fall back to plain recursion so content is
+			// not dropped.
 			slog.Debug("discovery: boundary rejected by pool, descending as plain folder",
 				"path", path, "repo", b.RepoDir)
 			return false
@@ -680,10 +674,8 @@ func scanFolderRootEntriesParallel(
 		return stateHash, selectedCount, selected, err
 	}
 
-	// Compute discovery gate ONCE per scan. discoveryEnabledForPlan
-	// hits isOnNFS which is a statfs syscall; calling it per entry
-	// inside fingerprintRootEntry burned ~M syscalls for the same
-	// answer.
+	// Compute discovery gate once per scan. The answer is plan-wide and
+	// fingerprintRootEntry runs once per root entry.
 	discoveryEnabled := discoveryEnabledForPlan(plan)
 
 	workers := fileReadWorkerCount(maxFolderFingerprintWorkers, len(entries))
@@ -781,20 +773,12 @@ func scanFolderRootEntriesParallel(
 }
 
 // discoveryEnabledForPlan gates walker discovery on a per-plan basis.
-// Discovery requires (a) the pool installed a dynamic-enqueue callback
-// (only folder plans get one) and (b) the root is not on a network
-// filesystem where per-subdir Lstat-for-boundary would be a round-trip
-// amplifier. NFS plans fall through to the legacy isFolderMetadataDir
-// behavior.
+// Discovery requires the pool to install a dynamic-enqueue callback; only
+// folder plans get one.
 func discoveryEnabledForPlan(plan corpusPlan) bool {
 	if plan.discover == nil {
 		slog.Debug("discovery: disabled — plan.discover is nil (non-folder plan or pool bypass)",
 			"root", plan.root, "kind", plan.kind)
-		return false
-	}
-	if isOnNFS(plan.root) {
-		slog.Debug("discovery: disabled — root is on NFS, falling back to legacy name-skip",
-			"root", plan.root)
 		return false
 	}
 	return true

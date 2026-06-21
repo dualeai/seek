@@ -744,6 +744,124 @@ func TestGitCommittedIndexBudget_SkipsOversizeBlobsForByteCap(t *testing.T) {
 	}
 }
 
+func TestGitCommittedScopeBudget_IgnoresTrackedSibling(t *testing.T) {
+	requireGit(t)
+
+	dir := initEmptyGitRepo(t)
+	platform := filepath.Join(dir, "platform")
+	other := filepath.Join(dir, "other")
+	if err := os.MkdirAll(platform, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(platform, "empty.go"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, "large.go"), []byte("package other\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, dir, "add", ".")
+	gitRun(t, dir, "commit", "-m", "add scoped and sibling files")
+
+	scope, err := buildGitDirtyScope(dir, []string{platform}, nil)
+	if err != nil {
+		t.Fatalf("build scope: %v", err)
+	}
+	budget, selected, err := scanGitCommittedScopeBudgetAt(context.Background(), dir, "HEAD", scope, maxGitCandidateFiles, 0)
+	if err != nil {
+		t.Fatalf("out-of-scope tracked sibling should not consume scoped byte budget, got budget=%+v err=%v", budget, err)
+	}
+	if selected != 1 || budget.candidates != 1 {
+		t.Fatalf("expected one in-scope committed blob, got selected=%d budget=%+v", selected, budget)
+	}
+}
+
+func TestGitCommittedScopeBudgetAtUsesCapturedTreeish(t *testing.T) {
+	requireGit(t)
+
+	dir := initEmptyGitRepo(t)
+	platform := filepath.Join(dir, "platform")
+	if err := os.MkdirAll(platform, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(platform, "empty.go"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, dir, "add", ".")
+	gitRun(t, dir, "commit", "-m", "add zero byte scoped file")
+	capturedHead := gitOutputIn(t, dir, "rev-parse", "HEAD")
+
+	if err := os.WriteFile(filepath.Join(platform, "large.go"), []byte("package platform\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, dir, "add", ".")
+	gitRun(t, dir, "commit", "-m", "add live head sibling")
+
+	scope, err := buildGitDirtyScope(dir, []string{platform}, nil)
+	if err != nil {
+		t.Fatalf("build scope: %v", err)
+	}
+	budget, selected, err := scanGitCommittedScopeBudgetAt(context.Background(), dir, capturedHead, scope, maxGitCandidateFiles, 0)
+	if err != nil {
+		t.Fatalf("captured treeish budget should ignore later live HEAD files, got budget=%+v err=%v", budget, err)
+	}
+	if selected != 1 || budget.candidates != 1 || budget.indexedBytes != 0 {
+		t.Fatalf("expected only captured zero-byte file, got selected=%d budget=%+v", selected, budget)
+	}
+}
+
+func TestIndexScopedCommittedUsesCapturedTreeish(t *testing.T) {
+	requireTools(t)
+
+	dir := initEmptyGitRepo(t)
+	platform := filepath.Join(dir, "platform")
+	if err := os.MkdirAll(platform, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(platform, "app.go"), []byte("package platform\n// captured_treeish_old_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, dir, "add", ".")
+	gitRun(t, dir, "commit", "-m", "add old scoped file")
+	capturedHead := gitOutputIn(t, dir, "rev-parse", "HEAD")
+
+	if err := os.WriteFile(filepath.Join(platform, "app.go"), []byte("package platform\n// captured_treeish_live_head_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, dir, "add", ".")
+	gitRun(t, dir, "commit", "-m", "replace scoped file")
+
+	scope, err := buildGitDirtyScope(dir, []string{platform}, nil)
+	if err != nil {
+		t.Fatalf("build scope: %v", err)
+	}
+	indexDir := filepath.Join(t.TempDir(), "index")
+	indexedAny, err := indexScopedCommitted(context.Background(), dir, indexDir, capturedHead, scope, indexParallelism())
+	if err != nil {
+		t.Fatalf("index captured treeish: %v", err)
+	}
+	if !indexedAny {
+		t.Fatal("captured treeish should produce a searchable scoped shard")
+	}
+
+	oldMatches, err := executeUnscopedShardSearchForTest(context.Background(), indexDir, "captured_treeish_old_marker")
+	if err != nil {
+		t.Fatalf("search old marker: %v", err)
+	}
+	if len(oldMatches) != 1 || oldMatches[0].FileName != "platform/app.go" {
+		t.Fatalf("expected captured treeish content, got %#v", oldMatches)
+	}
+	liveMatches, err := executeUnscopedShardSearchForTest(context.Background(), indexDir, "captured_treeish_live_head_marker")
+	if err != nil {
+		t.Fatalf("search live marker: %v", err)
+	}
+	if len(liveMatches) != 0 {
+		t.Fatalf("live HEAD content should not be indexed for captured treeish, got %#v", liveMatches)
+	}
+}
+
 func TestGitDirtyFileBudget_IncludesCorpusContextAndCaps(t *testing.T) {
 	dir := t.TempDir()
 	indexDir := filepath.Join(t.TempDir(), "index")

@@ -40,3 +40,31 @@ func TestLoadShards_FailsClosedOnPartialCorruptShard(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestExecuteParsedSearchScopedDirs_IgnoresEmptyOptionalDir(t *testing.T) {
+	requireTools(t)
+
+	indexDir := t.TempDir()
+	docs := make(chan fileContent, 1)
+	docs <- fileContent{name: "good.go", content: []byte("package good\n// optional_empty_dir_marker\n")}
+	close(docs)
+
+	indexedAny, err := indexDocuments(context.Background(), indexDir, "test", t.TempDir(), docs, 1)
+	if err != nil {
+		t.Fatalf("indexDocuments: %v", err)
+	}
+	if !indexedAny {
+		t.Fatal("expected a valid shard")
+	}
+	q, err := parseSearchQuery("optional_empty_dir_marker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	results, err := executeParsedSearchScopedDirs(context.Background(), []string{indexDir, t.TempDir()}, q, nil)
+	if err != nil {
+		t.Fatalf("search with empty optional dir: %v", err)
+	}
+	if len(results) != 1 || results[0].FileName != "good.go" {
+		t.Fatalf("expected result from non-empty shard dir only, got %#v", results)
+	}
+}

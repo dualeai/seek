@@ -13,24 +13,24 @@ import (
 // discoverNestedGit testing. Caller supplies the worker (production
 // callers use prepareAndSearchCorpus via a closure; tests typically
 // pass a no-op or assertion-emitting body). bufferSize sizes the
-// resultsCh; pass maxDiscoveredCorpora+N for tests that exercise
-// near-cap enqueue volumes.
+// resultsCh. Direct pool tests should size it for the plans they enqueue;
+// production runCorpusPool drains concurrently while workers run.
 func newTestPool(t *testing.T, worker corpusWorkerFunc, bufferSize int) (*corpusPool, *errgroup.Group) {
 	t.Helper()
 	g, gctx := errgroup.WithContext(t.Context())
-	g.SetLimit(corpusWorkerCap)
 	pool := &corpusPool{
-		g:         g,
-		gctx:      gctx,
-		resultsCh: make(chan corpusPoolResult, bufferSize),
-		worker:    worker,
+		g:           g,
+		gctx:        gctx,
+		resultsCh:   make(chan corpusPoolResult, bufferSize),
+		worker:      worker,
+		workerSlots: make(chan struct{}, corpusWorkerCap),
 	}
 	return pool, g
 }
 
 // noopPoolWorker is the most common test worker: returns no results,
 // no dirty set, no error. Used by tests that exercise pool plumbing
-// (Enqueue, dedup, cap, panic isolation) rather than indexing.
+// (Enqueue, dedup, panic isolation) rather than indexing.
 func noopPoolWorker(_ context.Context, _ corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
 	return nil, nil, nil
 }
@@ -43,7 +43,7 @@ func noopPoolWorker(_ context.Context, _ corpusPlan) ([]corpusSearchResult, dirt
 // Hermetic by design — no calls into the git binary, no temp files
 // outside `gitDir`. The caller decides whether `gitDir` is a top-level
 // path (bare-repo shape) or `<somewhere>/.git` (regular-repo shape).
-func writeGitTriadAt(t *testing.T, gitDir string) {
+func writeGitTriadAt(t testing.TB, gitDir string) {
 	t.Helper()
 	if err := os.MkdirAll(gitDir, 0o755); err != nil {
 		t.Fatalf("mkdir gitDir: %v", err)
