@@ -42,6 +42,7 @@ func seedCorpus(tb testing.TB, cacheRoot, hash string, usedAt time.Time) string 
 
 func cacheRootForTest(tb testing.TB) string {
 	tb.Helper()
+	clearGCEnvForTest(tb)
 	setTestUserCache(tb)
 	root, err := seekUserCacheRoot()
 	if err != nil {
@@ -51,6 +52,12 @@ func cacheRootForTest(tb testing.TB) string {
 		tb.Fatalf("mkdir cache root: %v", err)
 	}
 	return root
+}
+
+func clearGCEnvForTest(tb testing.TB) {
+	tb.Helper()
+	tb.Setenv(envGCMaxAge, "")
+	tb.Setenv(envGCInterval, "")
 }
 
 func resetNFSCheck(tb testing.TB) {

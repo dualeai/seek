@@ -26,21 +26,26 @@ test-static:
 
 JUNIT_XML ?= junit.xml
 COVERPROFILE ?= cover.out
+BENCH_COUNT ?= 10
+BENCH_REPO_COUNT ?= 3
 
 test-unit:
 	gotestsum --junitfile $(JUNIT_XML) -- ./... -v -race -timeout 18m -covermode=atomic -coverprofile=$(COVERPROFILE)
 
 test-bench:
-	go test ./cmd/seek/ -bench=. -benchmem -count=5
+	SEEK_BENCH_REPO= go test ./cmd/seek/ -run='^$$' -bench=. -benchmem -count=$(BENCH_COUNT)
 
 test-bench-repo:
 	@if [ -z "$(SEEK_BENCH_REPO)" ]; then echo "Usage: make test-bench-repo SEEK_BENCH_REPO=/path/to/repo"; exit 1; fi
-	SEEK_BENCH_REPO=$(SEEK_BENCH_REPO) go test ./cmd/seek/ -bench=BenchmarkLargeRepo -benchmem -count=3 -timeout=600s
+	SEEK_BENCH_REPO="$(SEEK_BENCH_REPO)" go test ./cmd/seek/ -run='^$$' -bench=BenchmarkLargeRepo -benchmem -count=$(BENCH_REPO_COUNT) -timeout=600s
 
 # Compare two benchmark runs using golang.org/x/perf/cmd/benchstat.
 # Workflow:
-#   git stash && make test-bench > baseline.txt && git stash pop
-#   make test-bench > after.txt
+#   # Use the same normalized command on both revisions.
+#   git switch baseline-revision
+#   SEEK_BENCH_REPO= go test ./cmd/seek/ -run='^$' -bench=. -benchmem -count=10 > baseline.txt
+#   git switch feature-revision
+#   SEEK_BENCH_REPO= go test ./cmd/seek/ -run='^$' -bench=. -benchmem -count=10 > after.txt
 #   BASE=baseline.txt NEW=after.txt make test-bench-compare
 test-bench-compare:
 	@if [ -z "$(BASE)" ] || [ -z "$(NEW)" ]; then echo "Usage: BASE=baseline.txt NEW=after.txt make test-bench-compare"; exit 1; fi

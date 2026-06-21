@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -30,6 +31,10 @@ const (
 	// avoiding ~560µs of git repo opening + shard metadata checks and
 	// eliminating CPU contention when running alongside uncommitted indexing.
 	headFile = ".head"
+	// emptyFile stores the state hash for a layer that is known to have
+	// no indexable shards. This prevents a missing/corrupt shard directory
+	// from being confused with an intentionally empty scoped layer.
+	emptyFile = ".empty"
 	// lockFile is used for mutual exclusion during indexing.
 	lockFile = ".lock"
 	// repoUncommitted is the zoekt repository name for uncommitted file shards.
@@ -168,7 +173,18 @@ func readHeadFile(cacheDir string) string { return readCacheFile(cacheDir, headF
 // writeHeadFile atomically writes the HEAD SHA.
 func writeHeadFile(cacheDir, sha string) error { return writeCacheFile(cacheDir, headFile, sha) }
 
-// deleteStateFiles removes .state, .state.tmp, .head, and .head.tmp.
+func readEmptyStateFile(cacheDir string) string { return readCacheFile(cacheDir, emptyFile) }
+
+func writeEmptyStateFile(cacheDir, state string) error {
+	return writeCacheFile(cacheDir, emptyFile, state)
+}
+
+func deleteEmptyStateFiles(cacheDir string) {
+	_ = os.Remove(filepath.Join(cacheDir, emptyFile))
+	_ = os.Remove(filepath.Join(cacheDir, emptyFile+".tmp"))
+}
+
+// deleteStateFiles removes .state, .head, .empty, and their tmp files.
 // Clearing .head alongside .state ensures that a failed or drifted
 // indexing cycle forces a full re-index (including committed) on the
 // next invocation, rather than relying on a potentially stale .head
@@ -178,6 +194,7 @@ func deleteStateFiles(cacheDir string) {
 	_ = os.Remove(filepath.Join(cacheDir, stateFile+".tmp"))
 	_ = os.Remove(filepath.Join(cacheDir, headFile))
 	_ = os.Remove(filepath.Join(cacheDir, headFile+".tmp"))
+	deleteEmptyStateFiles(cacheDir)
 }
 
 // indexParallelism returns the number of parallel indexing workers.
@@ -307,7 +324,7 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	// contention when running alongside the uncommitted indexer.
 	needCommitted := state.HeadSHA != readHeadFile(cacheDir)
 	if needCommitted {
-		if _, err := scanGitCommittedIndexBudget(ctx, repoDir, maxGitCandidateFiles, maxCorpusIndexedBytes); err != nil {
+		if _, err := scanGitCommittedIndexBudget(ctx, repoDir, gitCandidateFileLimit, gitCorpusIndexedByteLimit); err != nil {
 			deleteStateFiles(cacheDir)
 			return gitCorpusError(repoDir, indexDir, err)
 		}
@@ -439,6 +456,242 @@ func indexCommitted(repoDir, indexDir string, parallelism int) error {
 		return gitCorpusError(repoDir, indexDir, err)
 	}
 	return nil
+}
+
+func indexScopedCommitted(ctx context.Context, repoDir, indexDir, treeish string, scope *gitDirtyScope, parallelism int) (bool, error) {
+	repoName := fallbackGitRepositoryName(repoDir)
+	errCh := make(chan error, 1)
+	fileCh := streamGitTreeBlobs(ctx, repoDir, treeish, scope, errCh)
+	indexedAny, err := indexDocuments(ctx, indexDir, repoName, repoDir, fileCh, parallelism)
+	if err != nil {
+		return indexedAny, err
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			return indexedAny, err
+		}
+	default:
+	}
+	return indexedAny, nil
+}
+
+func streamGitTreeBlobs(ctx context.Context, repoDir, treeish string, scope *gitDirtyScope, errCh chan<- error) <-chan fileContent {
+	out := make(chan fileContent)
+	go func() {
+		defer close(out)
+
+		args := []string{"ls-tree", "-r", "-l", "-z", treeish, "--"}
+		args = append(args, scope.gitIncludePathspecs()...)
+		lsCmd := gitCmd(ctx, args...)
+		lsCmd.Dir = repoDir
+		lsStdout, err := lsCmd.StdoutPipe()
+		if err != nil {
+			sendGitBlobStreamErr(errCh, fmt.Errorf("open git ls-tree stdout: %w", err))
+			return
+		}
+		var lsStderr strings.Builder
+		lsCmd.Stderr = &lsStderr
+		if err := lsCmd.Start(); err != nil {
+			sendGitBlobStreamErr(errCh, fmt.Errorf("start git ls-tree: %w", err))
+			return
+		}
+		abortLs := func() {
+			if lsCmd.Process != nil {
+				_ = lsCmd.Process.Kill()
+			}
+			_ = lsCmd.Wait()
+		}
+
+		var catCmd *exec.Cmd
+		var catStdin io.WriteCloser
+		var catReader *bufio.Reader
+		var catStderr strings.Builder
+		closeCat := func() {
+			if catCmd == nil {
+				return
+			}
+			_ = catStdin.Close()
+			if err := catCmd.Wait(); err != nil {
+				if msg := strings.TrimSpace(catStderr.String()); msg != "" {
+					sendGitBlobStreamErr(errCh, fmt.Errorf("git cat-file: %w: %s", err, msg))
+					return
+				}
+				sendGitBlobStreamErr(errCh, fmt.Errorf("git cat-file: %w", err))
+			}
+		}
+		abortCat := func() {
+			if catCmd == nil {
+				return
+			}
+			if catCmd.Process != nil {
+				_ = catCmd.Process.Kill()
+			}
+			_ = catCmd.Wait()
+			catCmd = nil
+		}
+		defer closeCat()
+		startCat := func() error {
+			if catCmd != nil {
+				return nil
+			}
+			cmd := gitCmd(ctx, "cat-file", "--batch")
+			cmd.Dir = repoDir
+			stdin, err := cmd.StdinPipe()
+			if err != nil {
+				return fmt.Errorf("open git cat-file stdin: %w", err)
+			}
+			catStdout, err := cmd.StdoutPipe()
+			if err != nil {
+				return fmt.Errorf("open git cat-file stdout: %w", err)
+			}
+			cmd.Stderr = &catStderr
+			if err := cmd.Start(); err != nil {
+				return fmt.Errorf("start git cat-file: %w", err)
+			}
+			catCmd = cmd
+			catStdin = stdin
+			catReader = bufio.NewReaderSize(catStdout, 64*1024)
+			return nil
+		}
+
+		lsReader := bufio.NewReaderSize(lsStdout, 64*1024)
+		var longRecord []byte
+		var readErr error
+		for {
+			record, err := lsReader.ReadSlice(0)
+			if errors.Is(err, bufio.ErrBufferFull) {
+				longRecord = append(longRecord, record...)
+				continue
+			}
+			if len(longRecord) > 0 {
+				longRecord = append(longRecord, record...)
+				record = longRecord
+				longRecord = nil
+			}
+			if len(record) > 0 {
+				blob, ok := parseGitTreeBlobRecord(record)
+				if ok && scope.contains(blob.name) && blob.size <= maxIndexedDocumentBytes {
+					if err := ctx.Err(); err != nil {
+						abortLs()
+						abortCat()
+						sendGitBlobStreamErr(errCh, err)
+						return
+					}
+					if err := startCat(); err != nil {
+						abortLs()
+						sendGitBlobStreamErr(errCh, err)
+						return
+					}
+					if _, err := fmt.Fprintln(catStdin, blob.oid); err != nil {
+						abortLs()
+						abortCat()
+						sendGitBlobStreamErr(errCh, fmt.Errorf("write git cat-file request: %w", err))
+						return
+					}
+					content, weight, err := readGitBlobFromCatFile(ctx, catReader, blob)
+					if err != nil {
+						abortLs()
+						abortCat()
+						sendGitBlobStreamErr(errCh, err)
+						return
+					}
+					if content == nil {
+						continue
+					}
+					select {
+					case out <- fileContent{name: blob.name, content: content, weight: weight}:
+					case <-ctx.Done():
+						if weight > 0 {
+							readSemaphore.Release(weight)
+						}
+						abortLs()
+						abortCat()
+						sendGitBlobStreamErr(errCh, ctx.Err())
+						return
+					}
+				}
+			}
+			if err == nil {
+				continue
+			}
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			readErr = err
+			break
+		}
+		if readErr != nil {
+			_ = lsCmd.Process.Kill()
+			_ = lsCmd.Wait()
+			sendGitBlobStreamErr(errCh, fmt.Errorf("read git ls-tree: %w", readErr))
+			return
+		}
+		if err := lsCmd.Wait(); err != nil {
+			if msg := strings.TrimSpace(lsStderr.String()); msg != "" {
+				sendGitBlobStreamErr(errCh, fmt.Errorf("git ls-tree: %w: %s", err, msg))
+				return
+			}
+			sendGitBlobStreamErr(errCh, fmt.Errorf("git ls-tree: %w", err))
+		}
+	}()
+	return out
+}
+
+func readGitBlobFromCatFile(ctx context.Context, reader *bufio.Reader, blob gitTreeBlob) ([]byte, int64, error) {
+	header, err := reader.ReadString('\n')
+	if err != nil {
+		return nil, 0, fmt.Errorf("read git cat-file header for %s: %w", blob.name, err)
+	}
+	fields := strings.Fields(header)
+	if len(fields) < 3 || fields[1] != "blob" {
+		return nil, 0, fmt.Errorf("unexpected git cat-file header for %s: %q", blob.name, strings.TrimSpace(header))
+	}
+	size, err := strconv.ParseInt(fields[2], 10, 64)
+	if err != nil || size < 0 {
+		return nil, 0, fmt.Errorf("parse git cat-file size for %s: %q", blob.name, fields[2])
+	}
+	if size > maxIndexedDocumentBytes {
+		if _, err := io.CopyN(io.Discard, reader, size+1); err != nil {
+			return nil, 0, fmt.Errorf("skip large git blob %s: %w", blob.name, err)
+		}
+		return nil, 0, nil
+	}
+	weight := size
+	if err := readSemaphore.Acquire(ctx, weight); err != nil {
+		return nil, 0, err
+	}
+	content := make([]byte, int(size))
+	if _, err := io.ReadFull(reader, content); err != nil {
+		if weight > 0 {
+			readSemaphore.Release(weight)
+		}
+		return nil, 0, fmt.Errorf("read git blob %s: %w", blob.name, err)
+	}
+	delim, err := reader.ReadByte()
+	if err != nil {
+		if weight > 0 {
+			readSemaphore.Release(weight)
+		}
+		return nil, 0, fmt.Errorf("read git blob delimiter %s: %w", blob.name, err)
+	}
+	if delim != '\n' {
+		if weight > 0 {
+			readSemaphore.Release(weight)
+		}
+		return nil, 0, fmt.Errorf("unexpected git blob delimiter %s: %q", blob.name, delim)
+	}
+	return content, weight, nil
+}
+
+func sendGitBlobStreamErr(errCh chan<- error, err error) {
+	if err == nil {
+		return
+	}
+	select {
+	case errCh <- err:
+	default:
+	}
 }
 
 // fallbackGitRepositoryName returns a stable opaque name for Git committed

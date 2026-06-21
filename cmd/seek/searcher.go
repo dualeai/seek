@@ -71,7 +71,21 @@ func loadShards(indexDir string) ([]zoekt.Searcher, error) {
 	if len(paths) == 0 {
 		return nil, fmt.Errorf("no index shards in %s", indexDir)
 	}
+	return loadShardPaths(indexDir, paths)
+}
 
+func loadShardsOptional(indexDir string) ([]zoekt.Searcher, error) {
+	paths, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
+	if err != nil {
+		return nil, fmt.Errorf("glob shards: %w", err)
+	}
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	return loadShardPaths(indexDir, paths)
+}
+
+func loadShardPaths(indexDir string, paths []string) ([]zoekt.Searcher, error) {
 	// Single shard — skip goroutine overhead.
 	if len(paths) == 1 {
 		s, err := openShard(paths[0])
@@ -138,15 +152,29 @@ func parseSearchQuery(pattern string) (query.Q, error) {
 }
 
 func executeParsedSearchScoped(ctx context.Context, indexDir string, userQ query.Q, scope query.Q) ([]zoekt.FileMatch, error) {
+	return executeParsedSearchScopedDirs(ctx, []string{indexDir}, userQ, scope)
+}
+
+func executeParsedSearchScopedDirs(ctx context.Context, indexDirs []string, userQ query.Q, scope query.Q) ([]zoekt.FileMatch, error) {
 	q := userQ
 	if scope != nil {
 		q = query.NewAnd(q, scope)
 		q = query.Simplify(q)
 	}
 
-	searchers, err := loadShards(indexDir)
-	if err != nil {
-		return nil, fmt.Errorf("load index: %w", err)
+	var searchers []zoekt.Searcher
+	for _, indexDir := range indexDirs {
+		loaded, err := loadShardsOptional(indexDir)
+		if err != nil {
+			for _, s := range searchers {
+				s.Close()
+			}
+			return nil, fmt.Errorf("load index: %w", err)
+		}
+		searchers = append(searchers, loaded...)
+	}
+	if len(searchers) == 0 {
+		return nil, fmt.Errorf("no loadable shards")
 	}
 	defer func() {
 		for _, s := range searchers {

@@ -2,9 +2,9 @@
 #:HELP_BEGIN
 # bench-field.sh — Self-contained field benchmarks for `seek`.
 #
-# Runs cold-index, warm-search, and dirty-reindex (PR-scale mutations)
-# across real Git repos (cobra, prometheus, k8s, optionally linux) and
-# synthetic non-Git folders at 10k and 100k file scales.
+# Runs cold-index, warm-search, dirty-reindex (PR-scale mutations), and
+# token-count probes across real Git repos (cobra, prometheus, k8s, optionally
+# linux) and synthetic non-Git folders at 10k and 100k file scales.
 #
 # Emits a Markdown table on stdout. Cache is sandboxed via SEEK_CACHE_DIR
 # so the script never touches the developer's real ~/Library/Caches/seek.
@@ -15,16 +15,23 @@
 #   ./cicd/bench-field.sh --no-linux     # skip linux (huge clone)
 #   ./cicd/bench-field.sh --keep         # keep workdir for re-runs
 #
-# Requires: git, seek, universal-ctags.
+# Builds this checkout by default. Set SEEK_BIN=/path/to/seek to compare
+# another binary. WORKDIR is scratch-owned; deletes, resets, cleans, and dirty
+# mutations are confined to workload subdirs under it.
+#
+# Requires: git, go (unless SEEK_BIN is set), universal-ctags.
+# Optional for token columns: uv (pulls tiktoken in an ephemeral env).
 # Time budget: ~3-15 min depending on linux inclusion.
 #:HELP_END
 
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKDIR="${TMPDIR:-/tmp}/seek-field-bench"
 KEEP=0
 INCLUDE_LINUX=1
 WARM_SAMPLES=5
+SEEK_BIN="${SEEK_BIN:-}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -67,22 +74,41 @@ trap cleanup EXIT INT TERM
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing tool: $1" >&2; exit 2; }; }
 need git
-need seek
 if ! command -v universal-ctags >/dev/null 2>&1; then
   if ! command -v ctags >/dev/null 2>&1 || ! ctags --version 2>/dev/null | grep -qi 'Universal Ctags'; then
     echo "missing tool: universal-ctags" >&2; exit 2
   fi
 fi
 
+if [ -z "$SEEK_BIN" ]; then
+  need go
+  SEEK_BIN="$WORKDIR/seek-bench-bin"
+  echo "building seek: $SEEK_BIN" >&2
+  (cd "$REPO_ROOT" && go build -trimpath -o "$SEEK_BIN" ./cmd/seek)
+elif [ ! -x "$SEEK_BIN" ]; then
+  echo "SEEK_BIN is not executable: $SEEK_BIN" >&2
+  exit 2
+fi
+
 # time_ns CMD ...: print elapsed nanoseconds. /usr/bin/time -p prints
 # "real X.XX" on stderr. Capture stderr to a tmp file (subshell redirect
 # folding doesn't carry command's stderr correctly with set -e).
-# Tolerates non-zero exit (seek exits 1 on "no match" per POSIX grep).
+# Fails any non-zero status: timed field queries are expected to match.
 time_ns() {
-  local tmp real
+  local tmp real rc
   tmp=$(mktemp)
-  /usr/bin/time -p "$@" >/dev/null 2>"$tmp" || true
+  if /usr/bin/time -p "$@" >/dev/null 2>"$tmp"; then
+    rc=0
+  else
+    rc=$?
+  fi
   real=$(awk '$1=="real"{print $2}' "$tmp")
+  if [ "$rc" -ne 0 ]; then
+    echo "benchmark command failed (exit $rc): $*" >&2
+    awk '$1!="real" && $1!="user" && $1!="sys"{print}' "$tmp" >&2
+    rm -f "$tmp"
+    return "$rc"
+  fi
   rm -f "$tmp"
   awk -v r="${real:-0}" 'BEGIN{printf "%d\n", r * 1000000000}'
 }
@@ -96,31 +122,33 @@ fmt_dur() {
   }'
 }
 
-# count_tokens QUERY DIR: token count of seek's output for QUERY over DIR.
-# Lets us track whether formatter changes shrink what an agent ingests.
-#
-# Notes:
-#   - Output is PIPED (not a TTY) so seek emits plain, color-free text —
-#     exactly what an agent/CI sees. ANSI never contaminates the count.
-#   - o200k_base (GPT-4o/Codex) is a PROXY, not Claude's tokenizer. Relative
-#     %-deltas transfer well for whitespace/ASCII-structural changes (±5%);
-#     absolute counts are not Claude's. Treat <5% deltas as marginal.
-#   - Deterministic only on the SAME machine + SAME corpus snapshot. The repos
-#     are shallow-cloned (see clone_repo) so upstream HEAD drifts day-to-day;
-#     for stable cross-day deltas pin commits or compare the synthetic folders.
-#   - Requires uv (https://docs.astral.sh/uv/); tiktoken is pulled into an
-#     ephemeral env via `--with`, so nothing needs pre-installing. Echoes "n/a"
-#     when uv is absent. Data stays on stdin; the script is passed via -c.
-#   - Pipeline tolerates seek's exit-1 on no-match (`|| true`) under pipefail.
-count_tokens() {
-  command -v uv >/dev/null 2>&1 || { echo "n/a"; return; }
-  { seek "$1" "$2" 2>/dev/null || true; } \
-    | uv run --quiet --no-project --with tiktoken python -c \
-      'import sys,tiktoken; print(len(tiktoken.get_encoding("o200k_base").encode(sys.stdin.read())))'
-}
-
 count_files() {
   find "$1" \( -name .git -prune \) -o -type f -print | wc -l | tr -d ' '
+}
+
+count_tokens() {
+  command -v uv >/dev/null 2>&1 || { echo "n/a"; return; }
+
+  local out rc
+  out=$(mktemp)
+  if "$SEEK_BIN" "$1" "$2" >"$out" 2>/dev/null; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -gt 1 ]; then
+    rm -f "$out"
+    echo "token-count seek command failed (exit $rc): $SEEK_BIN $1 $2" >&2
+    return "$rc"
+  fi
+  if uv run --quiet --no-project --with tiktoken python -c \
+    'import sys,tiktoken; print(len(tiktoken.get_encoding("o200k_base").encode(sys.stdin.read())))' \
+    <"$out"; then
+    rm -f "$out"
+  else
+    rm -f "$out"
+    echo "n/a"
+  fi
 }
 
 # clear_cache wipes the sandboxed cache so cold-index runs honestly.
@@ -131,10 +159,15 @@ clear_cache() {
 
 clone_repo() {
   local url="$1" dst="$2"
+  if [ -e "$dst" ] && [ ! -d "$dst/.git" ]; then
+    rm -rf "$dst"
+  fi
   if [ ! -d "$dst/.git" ]; then
     echo "cloning $url" >&2
     git clone --depth=1 "$url" "$dst" >/dev/null 2>&1
   fi
+  git -C "$dst" reset --hard HEAD >/dev/null 2>&1
+  git -C "$dst" clean -fdx >/dev/null 2>&1
 }
 
 # synth_folder DIR COUNT: generate COUNT Go-ish files under DIR.
@@ -148,7 +181,6 @@ clone_repo() {
 # file) — heredoc spawn cost is multi-minutes at 100k scale.
 synth_folder() {
   local dir="$1" count="$2"
-  [ -d "$dir" ] && [ "$(count_files "$dir")" -eq "$count" ] && return
   rm -rf "$dir"
   mkdir -p "$dir"
   local i d pkg
@@ -168,20 +200,23 @@ mutate_pct() {
   n=$(( $(count_files "$dir") * pct / 100 ))
   [ "$n" -ge 1 ] || n=1
   find "$dir" \( -name .git -prune \) -o -type f -print \
-    | awk 'BEGIN{srand()} {print rand(), $0}' \
+    | sort \
+    | awk -v pct="$pct" 'BEGIN{srand(1 + pct)} {print rand(), $0}' \
     | sort -n | head -n "$n" | cut -d' ' -f2- \
-    | xargs -I{} sh -c 'echo "// mut $$" >> "$1"' _ {}
+    | while IFS= read -r file; do
+        printf '\n// seek bench mut %s\n' "$pct" >> "$file"
+      done
 }
 
 bench_cold() {
   clear_cache
-  time_ns seek 'package' "$1"
+  time_ns "$SEEK_BIN" 'package' "$1"
 }
 
 bench_warm() {
   local root="$1" n="$2" i mid
   mid=$(( (n + 1) / 2 ))
-  { for ((i = 0; i < n; i++)); do time_ns seek 'package' "$root"; done; } \
+  { for ((i = 0; i < n; i++)); do time_ns "$SEEK_BIN" 'package' "$root"; done; } \
     | sort -n | sed -n "${mid}p"
 }
 
@@ -191,9 +226,9 @@ bench_warm() {
 # mutated files, so each measurement still reflects the per-PCT delta.
 bench_dirty_reindex() {
   local root="$1" pct="$2"
-  seek 'package' "$root" >/dev/null 2>&1 || true
+  "$SEEK_BIN" 'package' "$root" >/dev/null
   mutate_pct "$root" "$pct"
-  time_ns seek 'package' "$root"
+  time_ns "$SEEK_BIN" 'package' "$root"
 }
 
 WORKLOADS=(
@@ -213,7 +248,7 @@ for entry in "${WORKLOADS[@]}"; do
   IFS='|' read -r kind label src <<<"$entry"
   dir="$WORKDIR/${label//\//_}"
   case "$kind" in
-    git)    clone_repo "$src" "$dir" ;;
+    git) clone_repo "$src" "$dir" ;;
     folder) echo "synth $label ($src files)" >&2; synth_folder "$dir" "$src" ;;
   esac
 
@@ -224,9 +259,6 @@ for entry in "${WORKLOADS[@]}"; do
   warm_ns=$(bench_warm "$dir" "$WARM_SAMPLES")
   d1_ns=$(bench_dirty_reindex "$dir" 1)
   d10_ns=$(bench_dirty_reindex "$dir" 10)
-
-  # Token columns: a content query and a symbol query exercise distinct
-  # formatter paths (context/match lines vs the [kind] symbol tag).
   tok_content=$(count_tokens 'package' "$dir")
   tok_sym=$(count_tokens 'sym:.*' "$dir")
 
@@ -237,16 +269,16 @@ echo
 echo "## Field benchmarks"
 echo
 echo "Machine: $(uname -sm) — $(date -u +%Y-%m-%d)"
-echo "Seek: $(seek --version 2>/dev/null || echo unknown)"
+echo "Seek: $SEEK_BIN — $("$SEEK_BIN" --version 2>/dev/null || echo unknown)"
 echo
 echo "| Kind | Workload | Files | Cold index | Warm search | Dirty 1% | Dirty 10% | Tok(content) | Tok(sym) |"
 echo "|------|----------|-------|------------|-------------|----------|-----------|--------------|----------|"
 for row in "${results[@]}"; do
-  IFS='|' read -r kind label files cold warm d1 d10 tokc toks <<<"$row"
+  IFS='|' read -r kind label files cold warm d1 d10 tok_content tok_sym <<<"$row"
   printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s |\n" \
     "$kind" "$label" "$files" \
     "$(fmt_dur "$cold")" "$(fmt_dur "$warm")" \
     "$(fmt_dur "$d1")" "$(fmt_dur "$d10")" \
-    "$tokc" "$toks"
+    "$tok_content" "$tok_sym"
 done
 echo

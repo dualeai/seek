@@ -127,8 +127,8 @@ func TestFolderFingerprintStableUnderNestedCommit(t *testing.T) {
 
 // TestFolderWalkerDedupesPhysicalRepo — same repo reached via the
 // canonical path and via a symlink must produce ONE pool plan
-// (corpusID-based dedup). The discovery callback is called twice but
-// the cap counter only fires for genuinely-new repos.
+// (corpusID-based dedup). The discovery callback may see duplicate
+// boundaries, but only genuinely-new repos get new pool plans.
 func TestFolderWalkerDedupesPhysicalRepo(t *testing.T) {
 	root := canonTempDir(t)
 	canonical := filepath.Join(root, "real")
@@ -146,12 +146,10 @@ func TestFolderWalkerDedupesPhysicalRepo(t *testing.T) {
 	}
 }
 
-// TestNFSGateDisablesDiscovery — when isOnNFS returns true,
-// discoveryEnabledForPlan must short-circuit so the walker descends
-// into nested repos rather than emitting boundaries. The test stubs
-// the gate at the per-plan level by leaving plan.discover nil
-// (equivalent semantics: discovery off).
-func TestNFSGateDisablesDiscovery(t *testing.T) {
+// TestNilDiscoverCallbackDisablesDiscovery — when the pool does not install a
+// discover callback, the walker descends into nested repos rather than
+// emitting boundaries. This covers direct scanner use outside runCorpusPool.
+func TestNilDiscoverCallbackDisablesDiscovery(t *testing.T) {
 	root := canonTempDir(t)
 	nested := filepath.Join(root, "repo")
 	writeMinimalGitRepo(t, nested)
@@ -163,12 +161,10 @@ func TestNFSGateDisablesDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// discover=nil simulates the gate: walker treats the nested .git
-	// like any other metadata dir (skipped by name) and descends
-	// through other content. The nested .git is name-skipped at
-	// isFolderMetadataDir, so the working tree files would still be
-	// indexed. Asserting absence of discovery callbacks is the
-	// contract.
+	// discover=nil disables dynamic ownership: walker treats the nested .git
+	// like any other metadata dir (skipped by name) and descends through other
+	// content. The nested .git is name-skipped at isFolderMetadataDir, so the
+	// working tree files are still indexed under the parent folder corpus.
 	plan.discover = nil
 	hash, _, _, err := scanFolderCorpus(t.Context(), plan, false)
 	if err != nil {
@@ -220,13 +216,13 @@ func TestExplicitFolderExcludeSuppressesDescentWhenDiscoveryDisabled(t *testing.
 	}
 }
 
-// TestCapExhaustionFallsBackToPlainDescent — when the discover
-// callback rejects a boundary (cap full / dedup / build failure), the
+// TestDiscoveryRejectionFallsBackToPlainDescent — when the discover
+// callback rejects a boundary (for example, plan build failure), the
 // walker must descend into the subtree as a plain folder rather than
 // silently dropping its content. Defends against the pre-fix bug where
 // tryDiscoverBoundary emitted a marker + suppressed descent regardless
 // of the enqueue result, losing nested content to no corpus.
-func TestCapExhaustionFallsBackToPlainDescent(t *testing.T) {
+func TestDiscoveryRejectionFallsBackToPlainDescent(t *testing.T) {
 	root := canonTempDir(t)
 	nested := filepath.Join(root, "rejected-repo")
 	writeMinimalGitRepo(t, nested)
@@ -234,7 +230,7 @@ func TestCapExhaustionFallsBackToPlainDescent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Discover callback that ALWAYS rejects (simulates cap exhausted).
+	// Discover callback that always rejects, leaving the boundary unowned.
 	rejected := 0
 	info, err := os.Lstat(root)
 	if err != nil {
@@ -266,7 +262,7 @@ func TestCapExhaustionFallsBackToPlainDescent(t *testing.T) {
 		}
 	}
 	if !foundContent {
-		t.Fatal("rejected boundary's content not indexed under parent; cap-exhaustion would silently drop nested repos")
+		t.Fatal("rejected boundary's content not indexed under parent; unowned nested repo would be silently dropped")
 	}
 }
 
@@ -307,7 +303,7 @@ func TestDedupHitMustSuppressDescent(t *testing.T) {
 
 	// Real corpusPool with no-op worker — we only care about the dedup
 	// behavior of pool.discoverNestedGit, not actual indexing.
-	pool, g := newTestPool(t, noopPoolWorker, maxDiscoveredCorpora+4)
+	pool, g := newTestPool(t, noopPoolWorker, 8)
 	plan.discover = pool.discoverNestedGit
 
 	// First walk: pool.seen empty → fresh enqueue → walker suppresses

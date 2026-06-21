@@ -163,9 +163,7 @@ func TestIntegration_NestedDirectoryStructure(t *testing.T) {
 
 	dir := initGitRepo(t, "root.go", "package main\n// root_marker\n")
 
-	// Create deeply nested file and commit it — untracked nested dirs may
-	// appear as a single directory entry in git status (depending on
-	// showUntrackedFiles setting), so committed files are the reliable test.
+	// Create deeply nested file and commit it.
 	nested := filepath.Join(dir, "a", "b", "c", "d", "e")
 	if err := os.MkdirAll(nested, 0o755); err != nil {
 		t.Fatal(err)
@@ -182,6 +180,27 @@ func TestIntegration_NestedDirectoryStructure(t *testing.T) {
 	}
 	if len(files) == 0 {
 		t.Fatal("expected match for deeply nested file")
+	}
+}
+
+func TestIntegration_NestedUntrackedFileSearchable(t *testing.T) {
+	requireTools(t)
+
+	dir := initGitRepo(t, "root.go", "package main\n// root_marker\n")
+	nested := filepath.Join(dir, "a", "b", "c")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "new.go"), []byte("package main\n// nested_untracked_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := runSeekInRepo(t, dir, "nested_untracked_marker")
+	if err != nil {
+		t.Fatalf("search failed: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("expected match for nested untracked file")
 	}
 }
 
@@ -922,9 +941,8 @@ func TestIntegration_CoreQuotePath(t *testing.T) {
 	}
 }
 
-// TestIntegration_StatusShowUntrackedFilesNo verifies behavior when user
-// has status.showUntrackedFiles=no. Untracked files won't appear in
-// git status, so they won't be indexed as uncommitted.
+// TestIntegration_StatusShowUntrackedFilesNo verifies seek's explicit
+// untracked-file mode is not weakened by user Git status configuration.
 func TestIntegration_StatusShowUntrackedFilesNo(t *testing.T) {
 	requireTools(t)
 
@@ -940,8 +958,30 @@ func TestIntegration_StatusShowUntrackedFilesNo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("search failed: %v", err)
 	}
-	// With showUntrackedFiles=no, the untracked file is invisible to seek.
-	if len(files) != 0 {
-		t.Fatalf("status.showUntrackedFiles=no should hide untracked files, got %v", files)
+	if len(files) == 0 {
+		t.Fatal("status.showUntrackedFiles=no should not hide untracked files from seek")
+	}
+}
+
+func TestIntegration_StatusShowUntrackedFilesNoNestedFileSearchable(t *testing.T) {
+	requireTools(t)
+
+	dir := initGitRepo(t, "app.go", "package main\n// committed_marker\n")
+	gitRun(t, dir, "config", "status.showUntrackedFiles", "no")
+
+	nested := filepath.Join(dir, "a", "b", "c")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "new.go"), []byte("package main\n// config_nested_untracked_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := runSeekInRepo(t, dir, "config_nested_untracked_marker")
+	if err != nil {
+		t.Fatalf("search failed: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("status.showUntrackedFiles=no should not hide nested untracked files from seek")
 	}
 }

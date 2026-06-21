@@ -50,10 +50,22 @@ type corpusPlan struct {
 	indexDir    string
 	scope       query.Q
 	gitPaths    *gitPaths
+	dirtyScope  *gitDirtyScope
+	// Scoped Git directory plans use separate committed and dirty layers
+	// keyed by the selected Git pathspecs so tracked or dirty siblings
+	// outside the selected path cannot cap the search.
+	committedCacheDir string
+	committedIndexDir string
+	dirtyCacheDir     string
+	dirtyIndexDir     string
+	// Expected layer state hashes are populated after refresh and
+	// validated under shared search locks before loading scoped shards.
+	committedStateHash string
+	dirtyStateHash     string
 	// excludeRoots are explicit child owners that a folder plan must not
 	// descend into. This is separate from dynamic nested-git discovery:
 	// explicit child Git roots must stay carved out even when discovery is
-	// disabled or capped.
+	// disabled.
 	excludeRoots []string
 	// userExplicit distinguishes plans the user asked for on the CLI
 	// (failure is fatal) from plans the folder walker discovered via
@@ -64,9 +76,24 @@ type corpusPlan struct {
 	// on folder plans before invoking the worker. The walker calls
 	// discover(boundary) when detectGitBoundary confirms a nested git
 	// repo; the callback returns true when the boundary was accepted
-	// into the pool (false on dedup, cap, or build failure). nil means
-	// discovery is disabled for this plan.
+	// into the pool or already covered by another plan. false means no
+	// corpus owns the boundary, so the walker should descend as plain
+	// folder. nil means discovery is disabled for this plan.
 	discover func(gitBoundary) bool
+}
+
+type gitDirtyScope struct {
+	includeDirs  []string
+	includeFiles []string
+	excludeDirs  []string
+	excludeFiles []string
+	key          string
+}
+
+type gitScopeSpec struct {
+	dirs         []string
+	files        []string
+	rootIncluded bool
 }
 
 type corpusSearchResult struct {
@@ -88,12 +115,7 @@ func planCorpora(ctx context.Context, paths *gitPaths, operands []string) ([]cor
 		if paths == nil {
 			return nil, fmt.Errorf("not a git repository")
 		}
-		plan, err := planCurrentGitCorpus(*paths)
-		if err != nil {
-			return nil, err
-		}
-		plan.userExplicit = true
-		return []corpusPlan{plan}, nil
+		return planGitOperands(ctx, *paths, canonicalCorpusPath(paths.RepoDir))
 	}
 
 	external, err := collectExternalOperands(ctx, operands)
@@ -107,6 +129,7 @@ func planCorpora(ctx context.Context, paths *gitPaths, operands []string) ([]cor
 		if err != nil {
 			return nil, err
 		}
+		plan.userExplicit = externalGit.userExplicit
 		plans = append(plans, plan)
 	}
 
@@ -115,17 +138,31 @@ func planCorpora(ctx context.Context, paths *gitPaths, operands []string) ([]cor
 		if err != nil {
 			return nil, err
 		}
+		plan.userExplicit = true
 		plans = append(plans, plan)
 	}
 
 	if len(plans) == 0 {
 		return nil, fmt.Errorf("no searchable corpus")
 	}
-	// Every plan that flows out of planCorpora was explicitly requested
-	// on the CLI; failures must abort the search. planDiscoveredGitCorpus
-	// deliberately leaves userExplicit=false on walker-discovered plans.
-	for i := range plans {
-		plans[i].userExplicit = true
+	return plans, nil
+}
+
+func planGitOperands(ctx context.Context, paths gitPaths, operand string) ([]corpusPlan, error) {
+	externalGit := make(map[string]*externalGitRoot)
+	addExternalGitOperand(externalGit, paths, operand)
+	addVisibleNestedGitOperands(ctx, externalGit, paths, operand)
+	gitRoots := sortedExternalGitRoots(externalGit)
+	addGitChildExclusions(gitRoots, nil)
+
+	plans := make([]corpusPlan, 0, len(gitRoots))
+	for _, externalGit := range gitRoots {
+		plan, err := planCurrentGitCorpusWithExclusions(externalGit.paths, externalGit.operands, externalGit.excludes)
+		if err != nil {
+			return nil, err
+		}
+		plan.userExplicit = externalGit.userExplicit
+		plans = append(plans, plan)
 	}
 	return plans, nil
 }
@@ -136,9 +173,10 @@ type plannedExternalOperands struct {
 }
 
 type externalGitRoot struct {
-	paths    gitPaths
-	operands []string
-	excludes []string
+	paths        gitPaths
+	operands     []string
+	excludes     []string
+	userExplicit bool
 }
 
 type externalRoot struct {
@@ -167,22 +205,61 @@ func collectExternalOperands(ctx context.Context, operands []string) (plannedExt
 			return result, fmt.Errorf("unsupported path operand: %s", operand)
 		}
 		if info.IsDir() {
-			if gitPaths, ok := resolveGitRootOperand(ctx, canonical); ok {
+			if gitPaths, ok := resolveGitDirectoryOperand(ctx, canonical); ok {
 				addExternalGitOperand(externalGit, gitPaths, canonical)
+				addVisibleNestedGitOperands(ctx, externalGit, gitPaths, canonical)
 				continue
 			}
 		}
 		external[canonical] = externalRoot{path: canonical, info: info}
 	}
 
-	result.gitRoots = sortedExternalGitRoots(externalGit)
 	result.roots = collapseExternalRoots(external)
+	addGitRootsForCrossBoundaryFileOwners(ctx, externalGit, result.roots)
+	broadenGitOperandsCoveredByFolders(externalGit, result.roots)
+	addVisibleNestedGitOperandsForGroups(ctx, externalGit)
+	result.gitRoots = sortedExternalGitRoots(externalGit)
 	addGitChildExclusions(result.gitRoots, result.roots)
 	addFolderChildExclusions(result.roots, result.gitRoots)
 	return result, nil
 }
 
-func resolveGitRootOperand(ctx context.Context, canonical string) (gitPaths, bool) {
+func addVisibleNestedGitOperandsForGroups(ctx context.Context, groups map[string]*externalGitRoot) {
+	for {
+		roots := sortedExternalGitRoots(groups)
+		before := len(groups)
+		for _, root := range roots {
+			repoRoot := canonicalCorpusPath(root.paths.RepoDir)
+			for _, operand := range root.operands {
+				if operand == repoRoot {
+					addVisibleNestedGitOperands(ctx, groups, root.paths, repoRoot)
+					break
+				}
+			}
+		}
+		if len(groups) == before {
+			return
+		}
+	}
+}
+
+func addGitRootsForCrossBoundaryFileOwners(ctx context.Context, groups map[string]*externalGitRoot, roots []externalRoot) {
+	for _, root := range roots {
+		if root.info.IsDir() {
+			continue
+		}
+		for _, parent := range roots {
+			if !parent.info.IsDir() || !pathWithin(parent.path, root.path) || !crossesGitBoundary(parent.path, root) {
+				continue
+			}
+			if gitPaths, ok := resolveGitDirectoryOperand(ctx, filepath.Dir(root.path)); ok {
+				addDiscoveredExternalGitOperand(groups, gitPaths, canonicalCorpusPath(gitPaths.RepoDir))
+			}
+		}
+	}
+}
+
+func resolveGitDirectoryOperand(ctx context.Context, canonical string) (gitPaths, bool) {
 	if b, status := detectGitBoundary(canonical, ""); status == boundaryConfirmed {
 		paths := b.toGitPaths()
 		if pathWithin(canonicalCorpusPath(paths.RepoDir), canonical) {
@@ -194,18 +271,29 @@ func resolveGitRootOperand(ctx context.Context, canonical string) (gitPaths, boo
 	if err != nil {
 		return gitPaths{}, false
 	}
-	if canonicalCorpusPath(paths.RepoDir) != canonical {
+	if !pathWithin(canonicalCorpusPath(paths.RepoDir), canonical) {
 		return gitPaths{}, false
 	}
 	return paths, true
 }
 
 func addExternalGitOperand(groups map[string]*externalGitRoot, paths gitPaths, operand string) {
+	addExternalGitOperandWithSource(groups, paths, operand, true)
+}
+
+func addDiscoveredExternalGitOperand(groups map[string]*externalGitRoot, paths gitPaths, operand string) {
+	addExternalGitOperandWithSource(groups, paths, operand, false)
+}
+
+func addExternalGitOperandWithSource(groups map[string]*externalGitRoot, paths gitPaths, operand string, userExplicit bool) {
 	gitRoot := canonicalCorpusPath(paths.RepoDir)
 	group := groups[gitRoot]
 	if group == nil {
 		group = &externalGitRoot{paths: paths}
 		groups[gitRoot] = group
+	}
+	if userExplicit {
+		group.userExplicit = true
 	}
 	group.operands = append(group.operands, operand)
 }
@@ -227,6 +315,155 @@ func sortedExternalGitRoots(groups map[string]*externalGitRoot) []externalGitRoo
 		result = append(result, *group)
 	}
 	return result
+}
+
+func broadenGitOperandsCoveredByFolders(groups map[string]*externalGitRoot, roots []externalRoot) {
+	for _, root := range roots {
+		if !root.info.IsDir() {
+			continue
+		}
+		for gitRoot, group := range groups {
+			if pathWithin(root.path, gitRoot) {
+				// The folder plan will exclude this child Git root, so the
+				// child Git plan must own the whole repo rather than only a
+				// narrower operand below it.
+				group.operands = append(group.operands, gitRoot)
+			}
+		}
+	}
+}
+
+func addVisibleNestedGitOperands(ctx context.Context, groups map[string]*externalGitRoot, paths gitPaths, operand string) {
+	type scan struct {
+		paths   gitPaths
+		operand string
+	}
+	queue := []scan{{paths: paths, operand: operand}}
+	scanned := make(map[string]struct{})
+	queuedRoots := map[string]struct{}{
+		canonicalCorpusPath(paths.RepoDir): {},
+	}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		key := canonicalCorpusPath(current.paths.RepoDir) + "\x00" + canonicalCorpusPath(current.operand)
+		if _, ok := scanned[key]; ok {
+			continue
+		}
+		scanned[key] = struct{}{}
+		for _, child := range addVisibleNestedGitOperandsOnce(ctx, groups, current.paths, current.operand) {
+			childRoot := canonicalCorpusPath(child.RepoDir)
+			if _, ok := queuedRoots[childRoot]; ok {
+				continue
+			}
+			queuedRoots[childRoot] = struct{}{}
+			queue = append(queue, scan{paths: child, operand: childRoot})
+		}
+	}
+}
+
+func addVisibleNestedGitOperandsOnce(ctx context.Context, groups map[string]*externalGitRoot, paths gitPaths, operand string) []gitPaths {
+	repoRoot := canonicalCorpusPath(paths.RepoDir)
+	rel, err := filepath.Rel(repoRoot, operand)
+	if err != nil || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil
+	}
+
+	cmd := gitCmd(ctx,
+		"status",
+		"--porcelain=v2",
+		"--no-renames",
+		"--no-ahead-behind",
+		"--untracked-files=all",
+		"-z",
+		"--",
+		gitLiteralPathspec(rel),
+	)
+	cmd.Dir = paths.RepoDir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	var discovered []gitPaths
+	for _, statusPath := range parseGitStatusV2(string(out)).Files {
+		candidate := canonicalCorpusPath(filepath.Join(repoRoot, filepath.FromSlash(statusPath)))
+		if child, ok := addVisibleNestedGitOperand(groups, repoRoot, paths.CommonDir, operand, candidate, seen); ok {
+			discovered = append(discovered, child)
+		}
+	}
+	discovered = append(discovered, addGitlinkNestedGitOperands(ctx, groups, paths, operand, rel, seen)...)
+	return discovered
+}
+
+func addGitlinkNestedGitOperands(
+	ctx context.Context,
+	groups map[string]*externalGitRoot,
+	paths gitPaths,
+	operand, rel string,
+	seen map[string]struct{},
+) []gitPaths {
+	cmd := gitCmd(ctx, "ls-files", "-z", "--stage", "--", gitLiteralPathspec(rel))
+	cmd.Dir = paths.RepoDir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	repoRoot := canonicalCorpusPath(paths.RepoDir)
+	var discovered []gitPaths
+	for _, record := range strings.Split(string(out), "\x00") {
+		if record == "" || !strings.HasPrefix(record, "160000 ") {
+			continue
+		}
+		tab := strings.IndexByte(record, '\t')
+		if tab < 0 || tab == len(record)-1 {
+			continue
+		}
+		candidate := canonicalCorpusPath(filepath.Join(repoRoot, filepath.FromSlash(record[tab+1:])))
+		if child, ok := addVisibleNestedGitOperand(groups, repoRoot, paths.CommonDir, operand, candidate, seen); ok {
+			discovered = append(discovered, child)
+		}
+	}
+	return discovered
+}
+
+func addVisibleNestedGitOperand(
+	groups map[string]*externalGitRoot,
+	repoRoot, commonDir, operand, candidate string,
+	seen map[string]struct{},
+) (gitPaths, bool) {
+	dir := candidate
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		dir = filepath.Dir(dir)
+	}
+	for pathWithin(operand, dir) {
+		if dir == repoRoot {
+			return gitPaths{}, false
+		}
+		b, status := detectGitBoundary(dir, commonDir)
+		if status == boundaryConfirmed {
+			paths := b.toGitPaths()
+			childRoot := canonicalCorpusPath(paths.RepoDir)
+			if childRoot == repoRoot || !pathWithin(operand, childRoot) {
+				return gitPaths{}, false
+			}
+			if _, ok := seen[childRoot]; ok {
+				return gitPaths{}, false
+			}
+			seen[childRoot] = struct{}{}
+			addDiscoveredExternalGitOperand(groups, paths, childRoot)
+			return paths, true
+		}
+		next := filepath.Dir(dir)
+		if next == dir {
+			return gitPaths{}, false
+		}
+		dir = next
+	}
+	return gitPaths{}, false
 }
 
 func addGitChildExclusions(gitRoots []externalGitRoot, roots []externalRoot) {
@@ -337,17 +574,12 @@ func crossesGitBoundary(parent string, child externalRoot) bool {
 // layout: the corpus models the working tree, not the .git layout.
 // Using gitBoundary.Mode (which can be rootTypeDirectory for a normal
 // .git/ repo) would mint a different corpusID and defeat dedup.
-func buildGitCorpusPlan(repoDir, commonDir string) (corpusPlan, error) {
+func buildGitCorpusPlan(repoDir, commonDir string, extraIDParts ...string) (corpusPlan, error) {
 	root := canonicalCorpusPath(repoDir)
 	cdir := canonicalCorpusPath(commonDir)
-	return newCorpusPlan(
-		corpusKindGit,
-		rootTypeWorktree,
-		root,
-		"git",
-		"git_worktree", root,
-		"git_common_dir", cdir,
-	)
+	idParts := []string{"git_worktree", root, "git_common_dir", cdir}
+	idParts = append(idParts, extraIDParts...)
+	return newCorpusPlan(corpusKindGit, rootTypeWorktree, root, "git", idParts...)
 }
 
 // planDiscoveredGitCorpus builds a plan for a repo the folder walker
@@ -356,11 +588,14 @@ func buildGitCorpusPlan(repoDir, commonDir string) (corpusPlan, error) {
 // instead of aborting the user's search. gitPaths is derived from the
 // boundary without a subprocess.
 func planDiscoveredGitCorpus(b gitBoundary) (corpusPlan, error) {
-	plan, err := buildGitCorpusPlan(b.RepoDir, b.CommonDir)
+	return planDiscoveredGitPaths(b.toGitPaths())
+}
+
+func planDiscoveredGitPaths(paths gitPaths) (corpusPlan, error) {
+	plan, err := buildGitCorpusPlan(paths.RepoDir, paths.CommonDir)
 	if err != nil {
 		return corpusPlan{}, err
 	}
-	paths := b.toGitPaths()
 	plan.gitPaths = &paths
 	return plan, nil
 }
@@ -453,6 +688,31 @@ func planCurrentGitCorpusWithExclusions(paths gitPaths, operands, excludes []str
 		return corpusPlan{}, err
 	}
 	plan.scope = combineGitScope(includeScope, excludeScope)
+	dirtyScope, err := buildGitDirtyScope(plan.root, operands, excludes)
+	if err != nil {
+		return corpusPlan{}, err
+	}
+	if dirtyScope != nil {
+		plan, err = buildGitCorpusPlan(paths.RepoDir, paths.CommonDir, "git_search_scope", dirtyScope.key)
+		if err != nil {
+			return corpusPlan{}, err
+		}
+		plan.gitPaths = &paths
+		plan.scope = combineGitScope(includeScope, excludeScope)
+		plan.dirtyScope = dirtyScope
+		committed, err := buildGitCorpusPlan(paths.RepoDir, paths.CommonDir, "git_layer", "committed", "git_scope", dirtyScope.key)
+		if err != nil {
+			return corpusPlan{}, err
+		}
+		dirty, err := buildGitCorpusPlan(paths.RepoDir, paths.CommonDir, "git_layer", "dirty", "git_dirty_scope", dirtyScope.key)
+		if err != nil {
+			return corpusPlan{}, err
+		}
+		plan.committedCacheDir = committed.cacheDir
+		plan.committedIndexDir = committed.indexDir
+		plan.dirtyCacheDir = dirty.cacheDir
+		plan.dirtyIndexDir = dirty.indexDir
+	}
 	return plan, nil
 }
 
@@ -468,54 +728,16 @@ func combineGitScope(includeScope, excludeScope query.Q) query.Q {
 }
 
 func buildCurrentGitScope(root string, operands []string) (query.Q, error) {
-	root = canonicalCorpusPath(root)
-
-	fileSet := make(map[string]struct{})
-	dirSet := make(map[string]struct{})
-	for _, operand := range operands {
-		abs, err := filepath.Abs(operand)
-		if err != nil {
-			return nil, fmt.Errorf("resolve path %q: %w", operand, err)
-		}
-		info, err := os.Stat(abs)
-		if err != nil {
-			return nil, fmt.Errorf("read path %q: %w", operand, err)
-		}
-
-		canonical := canonicalCorpusPath(abs)
-		if !pathWithin(root, canonical) {
-			return nil, fmt.Errorf("path outside current git worktree: %s", operand)
-		}
-
-		rel, err := filepath.Rel(root, canonical)
-		if err != nil {
-			return nil, fmt.Errorf("scope path %q: %w", operand, err)
-		}
-		if rel == "." {
-			return nil, nil
-		}
-		name := filepath.ToSlash(rel)
-		if info.IsDir() {
-			dirSet[name] = struct{}{}
-			continue
-		}
-		if !info.Mode().IsRegular() {
-			return nil, fmt.Errorf("unsupported path operand: %s", operand)
-		}
-		fileSet[name] = struct{}{}
+	spec, err := buildGitScopeSpec(root, operands)
+	if err != nil || spec.rootIncluded {
+		return nil, err
 	}
 
-	dirs := sortedKeys(dirSet)
-	dirs = collapseDirectoryScopes(dirs)
-
-	files := sortedKeys(fileSet)
-	files = dropFilesCoveredByDirs(files, dirs)
-
-	queries := make([]query.Q, 0, 1+len(dirs))
-	if len(files) > 0 {
-		queries = append(queries, query.NewFileNameSet(files...))
+	queries := make([]query.Q, 0, 1+len(spec.dirs))
+	if len(spec.files) > 0 {
+		queries = append(queries, query.NewFileNameSet(spec.files...))
 	}
-	for _, dir := range dirs {
+	for _, dir := range spec.dirs {
 		dirQ, err := query.RegexpQuery("^"+regexp.QuoteMeta(dir)+"/", false, true)
 		if err != nil {
 			return nil, fmt.Errorf("build directory scope %q: %w", dir, err)
@@ -531,6 +753,125 @@ func buildCurrentGitScope(root string, operands []string) (query.Q, error) {
 	default:
 		return query.NewOr(queries...), nil
 	}
+}
+
+func buildGitDirtyScope(root string, operands, excludes []string) (*gitDirtyScope, error) {
+	include, err := buildGitScopeSpec(root, operands)
+	if err != nil || include.rootIncluded {
+		return nil, err
+	}
+	if len(include.dirs) == 0 && len(include.files) == 0 {
+		return nil, nil
+	}
+	exclude, err := buildGitScopeSpec(root, excludes)
+	if err != nil {
+		return nil, err
+	}
+	scope := &gitDirtyScope{
+		includeDirs:  include.dirs,
+		includeFiles: include.files,
+		excludeDirs:  exclude.dirs,
+		excludeFiles: exclude.files,
+	}
+	scope.key = hashParts(
+		"git_dirty_scope_v1",
+		"include_dirs", strings.Join(scope.includeDirs, "\x00"),
+		"include_files", strings.Join(scope.includeFiles, "\x00"),
+		"exclude_dirs", strings.Join(scope.excludeDirs, "\x00"),
+		"exclude_files", strings.Join(scope.excludeFiles, "\x00"),
+	)
+	return scope, nil
+}
+
+func buildGitScopeSpec(root string, operands []string) (gitScopeSpec, error) {
+	root = canonicalCorpusPath(root)
+	fileSet := make(map[string]struct{})
+	dirSet := make(map[string]struct{})
+	for _, operand := range operands {
+		abs, err := filepath.Abs(operand)
+		if err != nil {
+			return gitScopeSpec{}, fmt.Errorf("resolve path %q: %w", operand, err)
+		}
+		info, err := os.Stat(abs)
+		if err != nil {
+			return gitScopeSpec{}, fmt.Errorf("read path %q: %w", operand, err)
+		}
+		canonical := canonicalCorpusPath(abs)
+		if !pathWithin(root, canonical) {
+			return gitScopeSpec{}, fmt.Errorf("path outside current git worktree: %s", operand)
+		}
+		rel, err := filepath.Rel(root, canonical)
+		if err != nil {
+			return gitScopeSpec{}, fmt.Errorf("scope path %q: %w", operand, err)
+		}
+		if rel == "." {
+			return gitScopeSpec{rootIncluded: true}, nil
+		}
+		name := filepath.ToSlash(rel)
+		if info.IsDir() {
+			dirSet[name] = struct{}{}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return gitScopeSpec{}, fmt.Errorf("unsupported path operand: %s", operand)
+		}
+		fileSet[name] = struct{}{}
+	}
+	dirs := collapseDirectoryScopes(sortedKeys(dirSet))
+	files := dropFilesCoveredByDirs(sortedKeys(fileSet), dirs)
+	return gitScopeSpec{dirs: dirs, files: files}, nil
+}
+
+func (s *gitDirtyScope) contains(name string) bool {
+	name = filepath.ToSlash(name)
+	if coveredByAnyDir(name, s.excludeDirs) || containsString(s.excludeFiles, name) {
+		return false
+	}
+	return coveredByAnyDir(name, s.includeDirs) || containsString(s.includeFiles, name)
+}
+
+func (s *gitDirtyScope) gitPathspecs() []string {
+	if s == nil {
+		return nil
+	}
+	pathspecs := s.gitIncludePathspecs()
+	for _, dir := range s.excludeDirs {
+		pathspecs = append(pathspecs, gitLiteralExcludePathspec(dir))
+	}
+	for _, file := range s.excludeFiles {
+		pathspecs = append(pathspecs, gitLiteralExcludePathspec(file))
+	}
+	return pathspecs
+}
+
+func (s *gitDirtyScope) gitIncludePathspecs() []string {
+	if s == nil {
+		return nil
+	}
+	pathspecs := make([]string, 0, len(s.includeDirs)+len(s.includeFiles))
+	for _, dir := range s.includeDirs {
+		pathspecs = append(pathspecs, gitLiteralPathspec(dir))
+	}
+	for _, file := range s.includeFiles {
+		pathspecs = append(pathspecs, gitLiteralPathspec(file))
+	}
+	return pathspecs
+}
+
+func gitLiteralPathspec(name string) string {
+	if name == "." {
+		return "."
+	}
+	return ":(top,literal)" + name
+}
+
+func gitLiteralExcludePathspec(name string) string {
+	return ":(top,literal,exclude)" + name
+}
+
+func containsString(values []string, value string) bool {
+	i := sort.SearchStrings(values, value)
+	return i < len(values) && values[i] == value
 }
 
 func pathWithin(root, path string) bool {

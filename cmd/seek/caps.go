@@ -60,13 +60,6 @@ const (
 	// per-doc Release contract.
 	maxInFlightBytes = 6 * maxIndexedDocumentBytes * corpusWorkerCap
 
-	// maxDiscoveredCorpora bounds the number of nested git corpora a
-	// single folder walker may auto-enqueue. Protects against
-	// pathological monorepo trees with thousands of submodules
-	// inflating peak memory + indexing time. 64 is generous for typical
-	// dev parents (1-20 repos) while keeping worst-case bounded.
-	maxDiscoveredCorpora = 64
-
 	// defaultIndexWindowBytes caps doc weight per windowed rotation in
 	// indexDocuments. Each of corpusWorkerCap concurrent consumers may
 	// accumulate up to this much pending weight before rotating; the
@@ -83,6 +76,11 @@ const (
 // swapIndexWindowBytesForTest under testReadSemMu — production
 // callers treat as read-only.
 var indexWindowBytes int64 = defaultIndexWindowBytes
+
+var (
+	gitCandidateFileLimit     int64 = maxGitCandidateFiles
+	gitCorpusIndexedByteLimit int64 = maxCorpusIndexedBytes
+)
 
 // Compile-time invariant: a single max-sized file fits within the
 // in-flight budget. Without this, a max-sized Acquire could block
