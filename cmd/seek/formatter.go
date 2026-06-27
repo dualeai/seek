@@ -184,12 +184,19 @@ func formatCorpusFileMatch(sb *strings.Builder, result corpusSearchResult, displ
 	// File header. In multi-corpus mode emit the absolute, directly-openable
 	// path (displayRoot joined to the corpus-relative FileName) so an agent
 	// never has to reconstruct it; the corpus tag then only marks the kind.
+	// In single-corpus mode emit the operand-relative displayName, which
+	// collapses an explicitly-selected file to its basename so the output
+	// reads as the file the user selected.
 	showRoot := displayMode == showCorpusContext && result.displayRoot != ""
 	sb.WriteString("## ")
 	if showRoot {
 		writeColoredSanitized(sb, pal.file, pal.reset, []byte(filepath.Join(result.displayRoot, fm.FileName)))
 	} else {
-		writeColoredSanitized(sb, pal.file, pal.reset, []byte(fm.FileName))
+		name := result.displayName
+		if name == "" {
+			name = fm.FileName
+		}
+		writeColoredSanitized(sb, pal.file, pal.reset, []byte(name))
 	}
 	sb.WriteString(" (")
 	writeSanitized(sb, []byte(lang))

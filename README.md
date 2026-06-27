@@ -137,7 +137,7 @@ search. With no paths, seek searches the current repo. Folders inside Git repos
 use Git ignore and include local changes. Exact files search only that file.
 Folders outside Git use filesystem rules. Nested Git repos inside selected
 folders are searched once. Ignored folders inside a selected repo stay ignored;
-pass an exact ignored file to search that file. Use single quotes to avoid shell
+pass an exact ignored file or folder to search it. Use single quotes to avoid shell
 interpretation of |, (, ).
 
 Filters (combine with spaces inside the quotes):
@@ -229,7 +229,7 @@ The query comes first. Paths after the query choose where to search.
 - Nested Git repos inside selected folders are searched once with their own Git
   rules.
 - Files or folders ignored by Git stay ignored when you search that repo or a
-  folder inside it. Passing an exact ignored file still searches that file.
+  folder inside it. Passing an exact ignored file or folder still searches it.
 
 Flags must come before the query:
 

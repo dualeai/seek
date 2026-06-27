@@ -1424,10 +1424,11 @@ func TestFormatCorpusResults_SameRelativePathDifferentCorpora(t *testing.T) {
 
 func TestFormatCorpusResults_FileCorpusContextUsesExactRoot(t *testing.T) {
 	fileResults := wrapCorpusResults(corpusPlan{
-		id:          corpusID("file-corpus"),
-		kind:        corpusKindFolder,
-		rootType:    rootTypeFile,
-		displayRoot: "/tmp/exact.txt",
+		id:            corpusID("file-corpus"),
+		kind:          corpusKindFolder,
+		rootType:      rootTypeFile,
+		displayRoot:   "/tmp",
+		selectedFiles: []string{"exact.txt"},
 	}, []zoekt.FileMatch{{
 		FileName: "exact.txt", Language: "Text", Score: 10,
 		LineMatches: []zoekt.LineMatch{{Line: []byte("needle\n"), LineNumber: 1}},

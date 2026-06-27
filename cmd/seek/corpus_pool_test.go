@@ -197,12 +197,22 @@ func TestRunCorpusPool_PanicIsolation(t *testing.T) {
 		{id: corpusID("plan-good-2"), userExplicit: true},
 	}
 
+	// The panic worker waits until BOTH good workers have finished before
+	// panicking. This makes the isolation deterministic: without it, the
+	// panic's first-error gctx cancellation can skip not-yet-started
+	// siblings (runPlan's gctx.Done() select arm), so "a good worker ran"
+	// is racy. corpusWorkerCap (4) >= 3 plans, so all three hold slots
+	// concurrently — the blocked panic worker cannot deadlock the goods.
 	var completed int32
+	goodDone := make(chan struct{}, 2)
 	worker := func(_ context.Context, plan corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
 		if plan.id == "plan-panic" {
+			<-goodDone
+			<-goodDone
 			panic("synthetic worker panic")
 		}
 		atomic.AddInt32(&completed, 1)
+		goodDone <- struct{}{}
 		return nil, nil, nil
 	}
 
@@ -216,11 +226,10 @@ func TestRunCorpusPool_PanicIsolation(t *testing.T) {
 	if !strings.Contains(err.Error(), "synthetic worker panic") {
 		t.Fatalf("err=%v, want original panic value", err)
 	}
-	// errgroup's first non-nil error cancels gctx; whether plan-good-2
-	// observed the cancellation in time is racy. Assert at least one
-	// good worker completed (panic didn't crash plan-good-1 either).
-	if atomic.LoadInt32(&completed) == 0 {
-		t.Fatal("no good worker completed; panic crashed siblings")
+	// Both good workers completed before the isolated panic — the panic was
+	// contained to its own worker and did not crash the siblings.
+	if got := atomic.LoadInt32(&completed); got != 2 {
+		t.Fatalf("completed=%d, want 2 (both good workers must finish before the isolated panic)", got)
 	}
 }
 

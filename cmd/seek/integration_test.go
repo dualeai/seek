@@ -802,7 +802,7 @@ func TestRun_ExternalGitExactIgnoredFileOperandSearchesLiteralFile(t *testing.T)
 	}
 }
 
-func TestRun_CurrentGitIgnoredDirectoryOperandUsesGitScope(t *testing.T) {
+func TestRun_CurrentGitIgnoredDirectoryOperandSearchesContent(t *testing.T) {
 	requireTools(t)
 
 	repo := initGitRepo(t, "app.go", "package main\n// visible\n")
@@ -825,15 +825,15 @@ func TestRun_CurrentGitIgnoredDirectoryOperandUsesGitScope(t *testing.T) {
 	out, err := captureStdout(t, func() error {
 		return run(context.Background(), "literal_ignored_dir_marker", []string{scratch}, 0, 0)
 	})
-	if !errors.Is(err, errNoMatch) {
-		t.Fatalf("ignored directory operand should honor Git ignore, got err=%v out=%q", err, out)
+	if err != nil {
+		t.Fatalf("explicitly selected ignored directory should be searched as a folder, got err=%v", err)
 	}
-	if strings.Contains(out, "literal_ignored_dir_marker") {
-		t.Fatalf("ignored directory content leaked through Git-scoped search, got:\n%s", out)
+	if !strings.Contains(out, "literal_ignored_dir_marker") {
+		t.Fatalf("explicitly selected ignored directory content should be searched, got:\n%s", out)
 	}
 }
 
-func TestRun_ExternalGitNonRootDirectoryOperandUsesGitScope(t *testing.T) {
+func TestRun_ExternalGitIgnoredDirectoryOperandSearchesContent(t *testing.T) {
 	requireTools(t)
 
 	externalRepo := initGitRepo(t, "app.go", "package main\n// visible\n")
@@ -856,11 +856,11 @@ func TestRun_ExternalGitNonRootDirectoryOperandUsesGitScope(t *testing.T) {
 	out, err := captureStdout(t, func() error {
 		return run(context.Background(), "external_literal_ignored_dir_marker", []string{scratch}, 0, 0)
 	})
-	if !errors.Is(err, errNoMatch) {
-		t.Fatalf("ignored directory operand should honor Git ignore, got err=%v out=%q", err, out)
+	if err != nil {
+		t.Fatalf("explicitly selected ignored directory should be searched as a folder, got err=%v", err)
 	}
-	if strings.Contains(out, "external_literal_ignored_dir_marker") {
-		t.Fatalf("ignored directory content leaked through Git-scoped search, got:\n%s", out)
+	if !strings.Contains(out, "external_literal_ignored_dir_marker") {
+		t.Fatalf("explicitly selected ignored directory content should be searched, got:\n%s", out)
 	}
 }
 
@@ -1882,7 +1882,7 @@ func TestRun_CurrentGitDefaultDoesNotDiscoverIgnoredNestedGit(t *testing.T) {
 	}
 }
 
-func TestRun_GitIgnoredFolderOperandHonorsGitIgnoreAndExplicitNestedGitStillWorks(t *testing.T) {
+func TestRun_IgnoredFolderOperandSearchesContentAndDiscoversNestedGit(t *testing.T) {
 	requireTools(t)
 
 	parent := initGitRepo(t, "app.go", "package main\n// visible\n")
@@ -1918,24 +1918,28 @@ func TestRun_GitIgnoredFolderOperandHonorsGitIgnoreAndExplicitNestedGitStillWork
 	setTestUserCache(t)
 	t.Chdir(parent)
 
+	// An explicitly selected ignored folder is searched as a plain folder
+	// corpus, so its own content is found.
 	out, err := captureStdout(t, func() error {
 		return run(context.Background(), "scratch_plain_marker", []string{scratch}, 0, 0)
 	})
-	if !errors.Is(err, errNoMatch) {
-		t.Fatalf("ignored folder marker should not match through Git scope, got err=%v out=%q", err, out)
+	if err != nil {
+		t.Fatalf("explicitly selected ignored folder should be searched, got err=%v", err)
 	}
-	if strings.Contains(out, "scratch_plain_marker") {
-		t.Fatalf("ignored folder content leaked through Git scope, got:\n%s", out)
+	if !strings.Contains(out, "scratch_plain_marker") {
+		t.Fatalf("expected ignored folder content to be searched, got:\n%s", out)
 	}
 
+	// A nested Git repo under that folder is still discovered and indexed
+	// as its own corpus, so committed nested content is found.
 	out, err = captureStdout(t, func() error {
 		return run(context.Background(), "nested_committed_marker", []string{scratch}, 0, 0)
 	})
-	if !errors.Is(err, errNoMatch) {
-		t.Fatalf("nested Git inside ignored folder should not match through parent Git scope, got err=%v out=%q", err, out)
+	if err != nil {
+		t.Fatalf("nested Git under selected folder should be discovered, got err=%v out=%q", err, out)
 	}
-	if strings.Contains(out, "nested_committed_marker") {
-		t.Fatalf("nested Git content leaked through ignored parent scope, got:\n%s", out)
+	if !strings.Contains(out, "nested_committed_marker") {
+		t.Fatalf("expected nested Git content discovered under folder search, got:\n%s", out)
 	}
 
 	out, err = captureStdout(t, func() error {
@@ -2278,7 +2282,7 @@ func TestRun_CurrentRepoExactFilePathOperandScopesSearch(t *testing.T) {
 	assertScopedRunIncludesOnly(t, "exact_scope_marker", "a/app.go")
 }
 
-func TestRun_CurrentGitExactDirtyFileOperandUsesLiteralPipeline(t *testing.T) {
+func TestRun_CurrentGitExactDirtyFileOperandUsesGitDirtyLayer(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// clean\n")
@@ -2298,8 +2302,8 @@ func TestRun_CurrentGitExactDirtyFileOperandUsesLiteralPipeline(t *testing.T) {
 	if !strings.Contains(out, "current_exact_dirty_marker") {
 		t.Fatalf("expected dirty exact file content, got:\n%s", out)
 	}
-	if strings.Contains(out, "[uncommitted]") {
-		t.Fatalf("current exact file should use literal file semantics, got:\n%s", out)
+	if !strings.Contains(out, "[uncommitted]") {
+		t.Fatalf("dirty tracked file should be searched via the Git dirty layer, got:\n%s", out)
 	}
 }
 
@@ -2402,7 +2406,7 @@ func TestRun_GitRepoWithoutRemoteIndexesCommittedContent(t *testing.T) {
 	}
 }
 
-func TestRun_ExternalGitExactFileWithoutRemoteUsesLiteralPipeline(t *testing.T) {
+func TestRun_ExternalGitExactFileWithoutRemoteUsesGitDirtyLayer(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepoNoRemote(t, "app.go", "package main\n// external_no_remote_marker\n")
@@ -2432,8 +2436,8 @@ func TestRun_ExternalGitExactFileWithoutRemoteUsesLiteralPipeline(t *testing.T) 
 	if !strings.Contains(dirtyOut, "external_no_remote_dirty_marker") {
 		t.Fatalf("expected dirty content from external no-remote repo, got:\n%s", dirtyOut)
 	}
-	if strings.Contains(dirtyOut, "[uncommitted]") {
-		t.Fatalf("external exact file should use literal file semantics, got:\n%s", dirtyOut)
+	if !strings.Contains(dirtyOut, "[uncommitted]") {
+		t.Fatalf("dirty tracked file should be searched via the Git dirty layer, got:\n%s", dirtyOut)
 	}
 }
 
@@ -3147,5 +3151,143 @@ func TestRun_NestedRepoVenvNotLeakedToParent(t *testing.T) {
 	}
 	if strings.Contains(out, marker) {
 		t.Fatalf("nested .venv content leaked into parent folder corpus on second search; got output containing %q:\n%s", marker, out)
+	}
+}
+
+// I6 (split case) — a tracked file and a gitignored file of the SAME repo,
+// passed together, are searched by exactly one corpus each: the tracked file
+// via the git index, the ignored file via a folder fallback. Both contents
+// are found and neither file is duplicated.
+func TestRun_TrackedAndIgnoredFileOperandsBothSearchedOnce(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "tracked.go", "package main\n// splitneedle tracked\n")
+	writeIgnoredFile(t, repo, "secret.txt", "splitneedle ignored\n")
+	setTestUserCache(t)
+	t.Chdir(repo)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "splitneedle", []string{
+			filepath.Join(repo, "tracked.go"), filepath.Join(repo, "secret.txt"),
+		}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("run tracked+ignored split: %v", err)
+	}
+	if !strings.Contains(out, "splitneedle tracked") {
+		t.Fatalf("tracked file content missing (git index), got:\n%s", out)
+	}
+	if !strings.Contains(out, "splitneedle ignored") {
+		t.Fatalf("ignored file content missing (folder fallback), got:\n%s", out)
+	}
+	// Multi-corpus mode renders absolute headers; the file names appear only
+	// in headers (not in the content), so a single occurrence each proves
+	// neither file is searched by two corpora.
+	if n := strings.Count(out, "tracked.go"); n != 1 {
+		t.Fatalf("tracked.go should appear once, got %d:\n%s", n, out)
+	}
+	if n := strings.Count(out, "secret.txt"); n != 1 {
+		t.Fatalf("secret.txt should appear once, got %d:\n%s", n, out)
+	}
+}
+
+// On a case-insensitive filesystem, a file operand typed with different case
+// than git stored must still be found (routed to the git index with the scope
+// corrected to the real on-disk byte name), not silently missed.
+func TestRun_CaseMismatchedFileOperandStillFound(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "readme.md", "MARKER_CASE_FIX\n")
+	// The bug only exists on case/normalization-insensitive filesystems, so
+	// this regression coverage rides on the CI macOS (APFS) legs; on a
+	// case-sensitive FS the mistyped name is a genuinely different file.
+	if _, err := os.Stat(filepath.Join(repo, "README.md")); err != nil {
+		t.Skip("case-sensitive filesystem; mistyped operand cannot resolve")
+	}
+	setTestUserCache(t)
+	t.Chdir(repo)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "MARKER_CASE_FIX", []string{filepath.Join(repo, "README.md")}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("case-mismatched file operand should be found via the git index: %v", err)
+	}
+	if !strings.Contains(out, "MARKER_CASE_FIX") {
+		t.Fatalf("expected content via case-corrected git scope, got:\n%s", out)
+	}
+}
+
+// Run-level twin for the untracked-NEW (`??`) visibility branch: a never-
+// committed file passed as an operand must be searched via the git dirty
+// layer (distinct from the modified-tracked ` M` branch covered elsewhere).
+func TestRun_CurrentGitUntrackedFileOperandSearchesContent(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "committed.go", "package main\n")
+	fresh := writeUntrackedFile(t, repo, "fresh.go", "package main\n// UNTRACKED_NEW_MARKER\n")
+	setTestUserCache(t)
+	t.Chdir(repo)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "UNTRACKED_NEW_MARKER", []string{fresh}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("untracked-new file operand should be searched via the git dirty layer: %v", err)
+	}
+	if !strings.Contains(out, "UNTRACKED_NEW_MARKER") {
+		t.Fatalf("expected untracked-new file content via the dirty layer, got:\n%s", out)
+	}
+	if !strings.Contains(out, "[uncommitted]") {
+		t.Fatalf("untracked-new file should be tagged [uncommitted], got:\n%s", out)
+	}
+}
+
+// Run-level symptom for the leading-colon bug: an ignored file whose name
+// starts with ':' must fall back to a folder corpus and have its content
+// searched. Pre-fix it was misparsed as a pathspec, classified visGit, and
+// silently missed (routed to the git index that excludes it).
+func TestRun_LeadingColonIgnoredFileOperandSearchesContent(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "a.go", "package main\n")
+	colon := writeIgnoredFile(t, repo, ":weird", "COLON_IGNORED_MARKER\n")
+	setTestUserCache(t)
+	t.Chdir(repo)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "COLON_IGNORED_MARKER", []string{colon}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("leading-colon ignored file operand should be searched via folder fallback: %v", err)
+	}
+	if !strings.Contains(out, "COLON_IGNORED_MARKER") {
+		t.Fatalf("expected colon-named ignored file content via folder fallback, got:\n%s", out)
+	}
+}
+
+// Run-level twin for the composed symlink→ignored path: a symlink resolving
+// to a gitignored in-worktree file must fall back to a folder corpus and
+// still surface the target's content.
+func TestRun_SymlinkToIgnoredFileSearchesContent(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "a.go", "package main\n")
+	target := writeIgnoredFile(t, repo, "secret.txt", "SYMLINK_IGNORED_MARKER\n")
+	link := filepath.Join(repo, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	setTestUserCache(t)
+	t.Chdir(repo)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "SYMLINK_IGNORED_MARKER", []string{link}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("symlink to an ignored file should search content via folder fallback: %v", err)
+	}
+	if !strings.Contains(out, "SYMLINK_IGNORED_MARKER") {
+		t.Fatalf("expected resolved ignored-target content via folder fallback, got:\n%s", out)
 	}
 }
