@@ -256,16 +256,40 @@ func prepareAndSearchCorpusOnce(
 		if planPaths == nil {
 			return nil, nil, fmt.Errorf("not a git repository")
 		}
-		state, readyState, err := ensureGitCorpusFresh(ctx, plan, *planPaths)
-		if err != nil {
-			return nil, nil, err
+		var state repoState
+		var readyState corpusIndexState
+		if plan.dirtyScope != nil {
+			var committed committedLayerResolution
+			var err error
+			state, committed, readyState, err = ensureScopedGitCorpusFresh(ctx, plan, *planPaths)
+			if err != nil {
+				return nil, nil, err
+			}
+			// Point the plan at the committed layer that was actually resolved
+			// (shared whole-repo index, or the per-scope fallback when the repo
+			// is over the index caps) so search/lock/validate use it.
+			plan.committedCacheDir = committed.cacheDir
+			plan.committedIndexDir = committed.indexDir
+			plan.committedStateHash = committed.stateHash
+			if len(state.Files) > 0 {
+				plan.dirtyStateHash = gitCorpusStateHash(*planPaths, state)
+			} else {
+				// Clean in-scope tree: ensureScopedGitCorpusFresh elided the
+				// dirty layer (no dir created). Drop the dirty paths so the
+				// search/lock/validate sites skip the non-existent layer and
+				// leave dirtyStateHash empty so validation skips it too.
+				plan.dirtyCacheDir = ""
+				plan.dirtyIndexDir = ""
+			}
+		} else {
+			var err error
+			state, readyState, err = ensureGitCorpusFresh(ctx, plan, *planPaths)
+			if err != nil {
+				return nil, nil, err
+			}
 		}
 		indexState = readyState
 		dirtyFiles = dirtyFileSetFromState(state)
-		if plan.dirtyScope != nil {
-			plan.committedStateHash = scopedCommittedLayerStateHash(*planPaths, plan.dirtyScope, state.HeadSHA)
-			plan.dirtyStateHash = gitCorpusStateHash(*planPaths, state)
-		}
 	case corpusKindFolder:
 		readyState, err := ensureFolderCorpusFresh(ctx, plan)
 		if err != nil {
@@ -297,8 +321,14 @@ func prepareAndSearchCorpusOnce(
 
 func touchPlanUsed(plan corpusPlan) {
 	if plan.dirtyScope != nil {
-		touchUsed(plan.committedCacheDir)
-		touchUsed(plan.dirtyCacheDir)
+		if plan.committedCacheDir != "" {
+			touchUsed(plan.committedCacheDir)
+		}
+		// dirtyCacheDir is "" when the dirty layer was elided (clean in-scope
+		// tree); guard so filepath.Join("", ".used") doesn't write in CWD.
+		if plan.dirtyCacheDir != "" {
+			touchUsed(plan.dirtyCacheDir)
+		}
 		return
 	}
 	touchUsed(plan.cacheDir)
@@ -361,7 +391,15 @@ func wrapCorpusResults(plan corpusPlan, files []zoekt.FileMatch) []corpusSearchR
 
 func ensureGitCorpusFresh(ctx context.Context, plan corpusPlan, paths gitPaths) (repoState, corpusIndexState, error) {
 	if plan.dirtyScope != nil {
-		return ensureScopedGitCorpusFresh(ctx, plan, paths)
+		// The scoped path's committed-layer resolution is consumed directly by
+		// prepareAndSearchCorpusOnce; this dispatch is for non-resolution
+		// callers and discards it. WARNING: it therefore does NOT repoint the
+		// plan's committed layer or zero the dirty paths on a clean-tree
+		// elision. A caller that searches the returned plan must do that itself
+		// (see prepareAndSearchCorpusOnce); otherwise search/lock would target
+		// the resolved-away committed dir or a never-created dirty dir.
+		state, _, indexState, err := ensureScopedGitCorpusFresh(ctx, plan, paths)
+		return state, indexState, err
 	}
 	// Check for existing index state. If present, the cache directory
 	// exists and one-time setup (ensureUntrackedCache,
@@ -410,34 +448,194 @@ func ensureGitCorpusFresh(ctx context.Context, plan corpusPlan, paths gitPaths) 
 	return state, corpusSearchable, nil
 }
 
-func ensureScopedGitCorpusFresh(ctx context.Context, plan corpusPlan, paths gitPaths) (repoState, corpusIndexState, error) {
-	if plan.committedCacheDir == "" || plan.committedIndexDir == "" || plan.dirtyCacheDir == "" || plan.dirtyIndexDir == "" {
-		return repoState{}, corpusSearchable, fmt.Errorf("scoped git corpus missing layer paths")
+func ensureScopedGitCorpusFresh(ctx context.Context, plan corpusPlan, paths gitPaths) (repoState, committedLayerResolution, corpusIndexState, error) {
+	if plan.committedCacheDir == "" || plan.committedIndexDir == "" || plan.dirtyCacheDir == "" || plan.dirtyIndexDir == "" ||
+		plan.sharedCommittedCacheDir == "" || plan.sharedCommittedIndexDir == "" {
+		return repoState{}, committedLayerResolution{}, corpusSearchable, fmt.Errorf("scoped git corpus missing layer paths")
 	}
 
-	if readStateFile(plan.committedCacheDir) == "" && readStateFile(plan.dirtyCacheDir) == "" {
+	if readStateFile(plan.sharedCommittedCacheDir) == "" && readStateFile(plan.committedCacheDir) == "" && readStateFile(plan.dirtyCacheDir) == "" {
 		ensureUntrackedCache(ctx, paths)
 		ensureFSMonitor(ctx, paths)
 	}
 	state, err := gitRepoStateInScope(ctx, paths.RepoDir, plan.dirtyScope)
 	if err != nil {
-		return repoState{}, corpusSearchable, err
+		return repoState{}, committedLayerResolution{}, corpusSearchable, err
 	}
-	committedState, err := ensureGitCommittedLayerFresh(ctx, plan, paths, state.HeadSHA)
+	committed, committedState, err := resolveCommittedLayer(ctx, plan, paths, state.HeadSHA)
 	if err != nil {
-		return repoState{}, corpusSearchable, err
+		return repoState{}, committedLayerResolution{}, corpusSearchable, err
 	}
-	dirtyState, err := ensureGitDirtyLayerFresh(ctx, plan, paths, state)
-	if err != nil {
-		return repoState{}, corpusSearchable, err
+	// Elide the dirty layer entirely when the in-scope working tree is clean:
+	// there is nothing to index, so skip the MkdirAll + state-file writes that
+	// would otherwise mint an empty per-scope dirty corpus dir on every scoped
+	// search. prepareAndSearchCorpusOnce drops the dirty paths so search/lock
+	// skip the non-existent layer.
+	dirtyState := corpusKnownEmpty
+	if len(state.Files) > 0 {
+		dirtyState, err = ensureGitDirtyLayerFresh(ctx, plan, paths, state)
+		if err != nil {
+			return repoState{}, committedLayerResolution{}, corpusSearchable, err
+		}
 	}
 	if committedState == corpusKnownEmpty && dirtyState == corpusKnownEmpty {
-		return state, corpusKnownEmpty, nil
+		return state, committed, corpusKnownEmpty, nil
 	}
-	return state, corpusSearchable, nil
+	return state, committed, corpusSearchable, nil
 }
 
-func ensureGitCommittedLayerFresh(ctx context.Context, plan corpusPlan, paths gitPaths, headSHA string) (corpusIndexState, error) {
+// committedLayerResolution names which committed layer a scoped search should
+// load: the shared whole-repo index when it fits the caps, otherwise the
+// per-scope fallback. The caller searches indexDir and validates stateHash.
+type committedLayerResolution struct {
+	cacheDir  string
+	indexDir  string
+	stateHash string
+	shared    bool
+}
+
+// resolveCommittedLayer resolves the committed layer for a scoped search. It
+// prefers the shared whole-repo committed index (one per repo, reused across
+// scopes; filtered at search time via plan.scope) and falls back to the
+// per-scope committed layer when the whole repo exceeds the index caps — so a
+// huge tracked sibling cannot cap a small scope.
+func resolveCommittedLayer(ctx context.Context, plan corpusPlan, paths gitPaths, headSHA string) (committedLayerResolution, corpusIndexState, error) {
+	treeish := normalizeCommittedTreeish(headSHA)
+	// Use the shared index unless a cap marker records that the whole repo is
+	// over budget for THIS HEAD *and* the current cap limits; a HEAD change or
+	// a cap change invalidates the marker so the budget is re-evaluated.
+	if readGitCapMarker(plan.sharedCommittedCacheDir) != gitCapMarkerValue(treeish) {
+		state, shared, err := ensureSharedCommittedLayerFresh(ctx, plan, paths, treeish)
+		if err != nil {
+			return committedLayerResolution{}, corpusSearchable, err
+		}
+		if shared {
+			return committedLayerResolution{
+				cacheDir:  plan.sharedCommittedCacheDir,
+				indexDir:  plan.sharedCommittedIndexDir,
+				stateHash: sharedCommittedLayerStateHash(paths, treeish),
+				shared:    true,
+			}, state, nil
+		}
+	}
+	state, err := ensureScopedCommittedLayerFresh(ctx, plan, paths, headSHA)
+	if err != nil {
+		return committedLayerResolution{}, corpusSearchable, err
+	}
+	return committedLayerResolution{
+		cacheDir:  plan.committedCacheDir,
+		indexDir:  plan.committedIndexDir,
+		stateHash: scopedCommittedLayerStateHash(paths, plan.dirtyScope, treeish),
+		shared:    false,
+	}, state, nil
+}
+
+// ensureSharedCommittedLayerFresh builds/reuses the whole-repo committed index.
+// Returns shared=false (after recording a cap marker) when the repo exceeds
+// the index caps, signalling the caller to use the per-scope fallback.
+func ensureSharedCommittedLayerFresh(ctx context.Context, plan corpusPlan, paths gitPaths, treeish string) (corpusIndexState, bool, error) {
+	cacheDir := plan.sharedCommittedCacheDir
+	indexDir := plan.sharedCommittedIndexDir
+	currentState := sharedCommittedLayerStateHash(paths, treeish)
+
+	cachedState := readStateFile(cacheDir)
+	hasShards := shardsExist(indexDir)
+	if currentState == cachedState {
+		if hasShards {
+			return corpusSearchable, true, nil
+		}
+		if readEmptyStateFile(cacheDir) == currentState {
+			return corpusKnownEmpty, true, nil
+		}
+	}
+
+	if err := os.MkdirAll(indexDir, 0o755); err != nil {
+		return corpusSearchable, false, fmt.Errorf("create shared committed index directory: %w", err)
+	}
+
+	lockPath := filepath.Join(cacheDir, lockFile)
+	lockFd, err := acquireLockStrict(ctx, lockPath)
+	if err != nil {
+		return corpusSearchable, false, err
+	}
+	defer releaseLock(lockFd)
+	defer func() {
+		_ = os.Remove(filepath.Join(cacheDir, stateTmpFile))
+	}()
+
+	cachedState = readStateFile(cacheDir)
+	hasShards = shardsExist(indexDir)
+	if currentState == cachedState {
+		if hasShards {
+			return corpusSearchable, true, nil
+		}
+		if readEmptyStateFile(cacheDir) == currentState {
+			return corpusKnownEmpty, true, nil
+		}
+	}
+
+	repoName := fallbackGitRepositoryName(paths.RepoDir)
+	if treeish == "no-head" {
+		if err := validateCommittedHead(ctx, cacheDir, paths, treeish); err != nil {
+			return corpusSearchable, false, err
+		}
+		cleanRepositoryShards(indexDir, repoName)
+		if err := writeCommittedLayerState(cacheDir, treeish, currentState, true); err != nil {
+			return corpusSearchable, false, err
+		}
+		return corpusKnownEmpty, true, nil
+	}
+
+	if _, err := scanGitCommittedIndexBudget(ctx, paths.RepoDir, gitCandidateFileLimit, gitCorpusIndexedByteLimit); err != nil {
+		if errors.Is(err, errGitCapExceeded) {
+			// The budget scan reads live HEAD; confirm HEAD still equals the
+			// treeish we captured before pinning an over-cap verdict to it. A
+			// HEAD move during the scan returns errScopedLayerStateChanged so
+			// the refresh retries against the new HEAD instead of recording a
+			// cap marker for the wrong treeish (which would persistently lose
+			// the shared-index optimization until the next HEAD change).
+			if verr := validateCommittedHead(ctx, cacheDir, paths, treeish); verr != nil {
+				return corpusSearchable, false, verr
+			}
+			// Whole repo over budget: clear any stale shared shards, record the
+			// cap for this HEAD, and let the caller use the per-scope layer.
+			cleanRepositoryShards(indexDir, repoName)
+			deleteStateFiles(cacheDir)
+			if markErr := writeGitCapMarker(cacheDir, gitCapMarkerValue(treeish)); markErr != nil {
+				// The cap marker is a best-effort optimization cache; failing to
+				// write it (read-only / full cache dir) must not fail a search
+				// the per-scope fallback can serve. Log and fall through.
+				slog.Warn("write git cap marker", "error", markErr, "dir", cacheDir)
+			}
+			return corpusSearchable, false, nil
+		}
+		return corpusSearchable, false, gitCorpusError(paths.RepoDir, indexDir, err)
+	}
+	if err := checkCtagsCached(); err != nil {
+		deleteStateFiles(cacheDir)
+		return corpusSearchable, false, gitCorpusError(paths.RepoDir, indexDir, err)
+	}
+	if err := indexCommitted(paths.RepoDir, indexDir, indexParallelism()); err != nil {
+		deleteStateFiles(cacheDir)
+		return corpusSearchable, false, gitCorpusError(paths.RepoDir, indexDir, err)
+	}
+	if err := validateCommittedHead(ctx, cacheDir, paths, treeish); err != nil {
+		return corpusSearchable, false, err
+	}
+	removeGitCapMarker(cacheDir)
+	if !shardsExist(indexDir) {
+		if err := writeCommittedLayerState(cacheDir, treeish, currentState, true); err != nil {
+			return corpusSearchable, false, err
+		}
+		return corpusKnownEmpty, true, nil
+	}
+	if err := writeCommittedLayerState(cacheDir, treeish, currentState, false); err != nil {
+		return corpusSearchable, false, err
+	}
+	return corpusSearchable, true, nil
+}
+
+func ensureScopedCommittedLayerFresh(ctx context.Context, plan corpusPlan, paths gitPaths, headSHA string) (corpusIndexState, error) {
 	treeish := normalizeCommittedTreeish(headSHA)
 	currentState := scopedCommittedLayerStateHash(paths, plan.dirtyScope, treeish)
 	cachedState := readStateFile(plan.committedCacheDir)
@@ -495,7 +693,7 @@ func ensureGitCommittedLayerFresh(ctx context.Context, plan corpusPlan, paths gi
 			return corpusSearchable, err
 		}
 		cleanRepositoryShards(plan.committedIndexDir, repoName)
-		if err := writeScopedCommittedLayerState(plan, treeish, currentState, true); err != nil {
+		if err := writeCommittedLayerState(plan.committedCacheDir, treeish, currentState, true); err != nil {
 			return corpusSearchable, err
 		}
 		return corpusKnownEmpty, nil
@@ -511,7 +709,7 @@ func ensureGitCommittedLayerFresh(ctx context.Context, plan corpusPlan, paths gi
 			return corpusSearchable, err
 		}
 		cleanRepositoryShards(plan.committedIndexDir, repoName)
-		if err := writeScopedCommittedLayerState(plan, treeish, currentState, true); err != nil {
+		if err := writeCommittedLayerState(plan.committedCacheDir, treeish, currentState, true); err != nil {
 			return corpusSearchable, err
 		}
 		return corpusKnownEmpty, nil
@@ -529,12 +727,12 @@ func ensureGitCommittedLayerFresh(ctx context.Context, plan corpusPlan, paths gi
 		return corpusSearchable, err
 	}
 	if !indexedAny {
-		if err := writeScopedCommittedLayerState(plan, treeish, currentState, true); err != nil {
+		if err := writeCommittedLayerState(plan.committedCacheDir, treeish, currentState, true); err != nil {
 			return corpusSearchable, err
 		}
 		return corpusKnownEmpty, nil
 	}
-	if err := writeScopedCommittedLayerState(plan, treeish, currentState, false); err != nil {
+	if err := writeCommittedLayerState(plan.committedCacheDir, treeish, currentState, false); err != nil {
 		return corpusSearchable, err
 	}
 	return corpusSearchable, nil
@@ -570,7 +768,7 @@ func reuseScopedCommittedLayerAfterOutOfScopeCommit(
 	if err := validateScopedCommittedHead(ctx, plan, paths, treeish); err != nil {
 		return corpusSearchable, false, err
 	}
-	if err := writeScopedCommittedLayerState(plan, treeish, currentState, cachedEmpty); err != nil {
+	if err := writeCommittedLayerState(plan.committedCacheDir, treeish, currentState, cachedEmpty); err != nil {
 		return corpusSearchable, false, err
 	}
 	if cachedEmpty {
@@ -603,23 +801,26 @@ func scopedCommittedTreeUnchanged(ctx context.Context, repoDir, oldTreeish, newT
 	return false, fmt.Errorf("git scoped committed diff-tree: %w", err)
 }
 
-func writeScopedCommittedLayerState(plan corpusPlan, treeish, stateHash string, empty bool) error {
+// writeCommittedLayerState persists the head + state (+ optional empty marker)
+// for a committed layer's cache dir, shared by the shared whole-repo and the
+// per-scope committed builders.
+func writeCommittedLayerState(cacheDir, treeish, stateHash string, empty bool) error {
 	if treeish == "no-head" {
-		_ = os.Remove(filepath.Join(plan.committedCacheDir, headFile))
-		_ = os.Remove(filepath.Join(plan.committedCacheDir, headFile+".tmp"))
-	} else if err := writeHeadFile(plan.committedCacheDir, treeish); err != nil {
+		_ = os.Remove(filepath.Join(cacheDir, headFile))
+		_ = os.Remove(filepath.Join(cacheDir, headFile+".tmp"))
+	} else if err := writeHeadFile(cacheDir, treeish); err != nil {
 		return fmt.Errorf("write committed head file: %w", err)
 	}
-	if err := writeStateFile(plan.committedCacheDir, stateHash); err != nil {
+	if err := writeStateFile(cacheDir, stateHash); err != nil {
 		return fmt.Errorf("write committed state file: %w", err)
 	}
 	if empty {
-		if err := writeEmptyStateFile(plan.committedCacheDir, stateHash); err != nil {
+		if err := writeEmptyStateFile(cacheDir, stateHash); err != nil {
 			return fmt.Errorf("write committed empty marker: %w", err)
 		}
 		return nil
 	}
-	deleteEmptyStateFiles(plan.committedCacheDir)
+	deleteEmptyStateFiles(cacheDir)
 	return nil
 }
 
@@ -636,6 +837,52 @@ func scopedCommittedLayerStateHash(paths gitPaths, scope *gitDirtyScope, headSHA
 	return gitCorpusStateHash(paths, committedState)
 }
 
+// sharedCommittedLayerStateHash keys the whole-repo committed index by HEAD
+// only (no scope), so every scope of one repo shares a single committed dir.
+func sharedCommittedLayerStateHash(paths gitPaths, headSHA string) string {
+	treeish := normalizeCommittedTreeish(headSHA)
+	return gitCorpusStateHash(paths, repoState{
+		HeadSHA: treeish,
+		RawOutput: stringsJoinNUL(
+			"git-shared-committed-layer-v1",
+			"head", treeish,
+		),
+	})
+}
+
+// gitCapMarkerFile records, in the shared committed cache dir, that the
+// whole-repo tree exceeded the index caps. Its payload (gitCapMarkerValue) is
+// the committed treeish plus the cap limits in effect. While the marker matches
+// the current HEAD *and* the current cap limits, scoped searches skip the
+// shared index (and its budget re-scan) and use the per-scope committed layer,
+// so a huge repo cannot cap a small scope. A HEAD change *or* a cap-limit
+// change makes the marker stale and the budget is re-evaluated.
+const gitCapMarkerFile = ".git_cap_exceeded"
+
+func readGitCapMarker(cacheDir string) string {
+	if cacheDir == "" {
+		return ""
+	}
+	return readCacheFile(cacheDir, gitCapMarkerFile)
+}
+
+func writeGitCapMarker(cacheDir, value string) error {
+	return writeCacheFile(cacheDir, gitCapMarkerFile, value)
+}
+
+// gitCapMarkerValue is the cap-marker payload: the committed treeish plus the
+// cap limits that produced the over-cap verdict. Folding the limits in means a
+// later cap change (e.g. a new binary with a larger compiled limit) no longer
+// matches a stale marker, so the shared index is re-evaluated instead of
+// staying pinned to the per-scope fallback at that HEAD.
+func gitCapMarkerValue(treeish string) string {
+	return fmt.Sprintf("%s\x00%d\x00%d", treeish, gitCandidateFileLimit, gitCorpusIndexedByteLimit)
+}
+
+func removeGitCapMarker(cacheDir string) {
+	_ = os.Remove(filepath.Join(cacheDir, gitCapMarkerFile))
+}
+
 func normalizeCommittedTreeish(headSHA string) string {
 	if headSHA == "" || headSHA == "no-head" || headSHA == "(initial)" {
 		return "no-head"
@@ -644,13 +891,20 @@ func normalizeCommittedTreeish(headSHA string) string {
 }
 
 func validateScopedCommittedHead(ctx context.Context, plan corpusPlan, paths gitPaths, expectedTreeish string) error {
+	return validateCommittedHead(ctx, plan.committedCacheDir, paths, expectedTreeish)
+}
+
+// validateCommittedHead is the TOCTOU guard shared by the per-scope and
+// whole-repo committed builds: HEAD must still equal the treeish indexed,
+// else the just-written shards are stale and its state files are deleted.
+func validateCommittedHead(ctx context.Context, cacheDir string, paths gitPaths, expectedTreeish string) error {
 	currentTreeish, err := gitHeadTreeish(ctx, paths.RepoDir)
 	if err != nil {
-		deleteStateFiles(plan.committedCacheDir)
+		deleteStateFiles(cacheDir)
 		return err
 	}
 	if normalizeCommittedTreeish(currentTreeish) != normalizeCommittedTreeish(expectedTreeish) {
-		deleteStateFiles(plan.committedCacheDir)
+		deleteStateFiles(cacheDir)
 		return errScopedLayerStateChanged
 	}
 	return nil
