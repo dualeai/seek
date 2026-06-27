@@ -195,7 +195,7 @@ func TestPlanCorpora_CurrentGitDefaultDiscoversVisibleNestedGit(t *testing.T) {
 	}
 }
 
-func TestPlanCorpora_ExactFilesUseFolderAndGitDirectoriesUseScopedGitCorpus(t *testing.T) {
+func TestPlanCorpora_ExactFilesAndDirectoriesUseScopedGitCorpus(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
 
@@ -213,7 +213,7 @@ func TestPlanCorpora_ExactFilesUseFolderAndGitDirectoriesUseScopedGitCorpus(t *t
 		wantScope   bool
 	}{
 		{
-			name: "current git exact file",
+			name: "current git exact tracked file",
 			target: func(t *testing.T) string {
 				target := filepath.Join(currentRepo, "nested", "file.go")
 				if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
@@ -222,11 +222,14 @@ func TestPlanCorpora_ExactFilesUseFolderAndGitDirectoriesUseScopedGitCorpus(t *t
 				if err := os.WriteFile(target, []byte("package nested\n"), 0o644); err != nil {
 					t.Fatal(err)
 				}
+				gitRunIn(t, currentRepo, "add", ".")
+				gitRunIn(t, currentRepo, "commit", "-m", "nested")
 				return target
 			},
-			wantKind:    corpusKindFolder,
-			wantRoot:    func(target string) string { return canonicalCorpusPath(target) },
-			wantRootTyp: rootTypeFile,
+			wantKind:    corpusKindGit,
+			wantRoot:    func(string) string { return canonicalCorpusPath(currentRepo) },
+			wantRootTyp: rootTypeWorktree,
+			wantScope:   true,
 		},
 		{
 			name: "current git non-root directory",
@@ -243,14 +246,21 @@ func TestPlanCorpora_ExactFilesUseFolderAndGitDirectoriesUseScopedGitCorpus(t *t
 			wantScope:   true,
 		},
 		{
-			name: "external git exact file",
+			name: "external git exact tracked file",
 			target: func(t *testing.T) string {
 				externalRepo := initGitRepo(t, "external.go", "package external\n")
 				return filepath.Join(externalRepo, "external.go")
 			},
-			wantKind:    corpusKindFolder,
-			wantRoot:    func(target string) string { return canonicalCorpusPath(target) },
-			wantRootTyp: rootTypeFile,
+			wantKind: corpusKindGit,
+			wantRoot: func(target string) string {
+				paths, err := resolveGitPaths(context.Background(), filepath.Dir(target))
+				if err != nil {
+					t.Fatalf("resolve external git paths: %v", err)
+				}
+				return canonicalCorpusPath(paths.RepoDir)
+			},
+			wantRootTyp: rootTypeWorktree,
+			wantScope:   true,
 		},
 		{
 			name: "external git non-root directory",
@@ -701,7 +711,7 @@ func TestPlanCorpora_CurrentGitNestedGitRootUsesChildGitCorpus(t *testing.T) {
 	}
 }
 
-func TestPlanCorpora_ExternalGitRootAndNestedOperandsKeepExactFileOwner(t *testing.T) {
+func TestPlanCorpora_ExternalGitRootAndNestedOperandsCollapseToSingleGitPlan(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
 
@@ -720,40 +730,26 @@ func TestPlanCorpora_ExternalGitRootAndNestedOperandsKeepExactFileOwner(t *testi
 		t.Fatal(err)
 	}
 
+	// The repo root, a nested directory, and a nested file of the SAME repo
+	// all route to one git corpus. The repo-root operand widens the scope to
+	// the whole worktree (rootIncluded), so a single unscoped git plan owns
+	// everything — no separate per-file corpus.
 	plans, err := planCorpora(context.Background(), &currentPaths, []string{nestedFile, externalRepo, nested})
 	if err != nil {
 		t.Fatalf("planCorpora: %v", err)
 	}
-	if len(plans) != 2 {
-		t.Fatalf("expected external git root plus exact file plan, got %d: %#v", len(plans), plans)
+	if len(plans) != 1 {
+		t.Fatalf("expected one collapsed git plan, got %d: %#v", len(plans), plans)
 	}
-
-	var gitPlan, filePlan *corpusPlan
-	for i := range plans {
-		switch plans[i].kind {
-		case corpusKindGit:
-			gitPlan = &plans[i]
-		case corpusKindFolder:
-			filePlan = &plans[i]
-		}
+	plan := plans[0]
+	if plan.kind != corpusKindGit {
+		t.Fatalf("expected git corpus, got %q", plan.kind)
 	}
-	if gitPlan == nil {
-		t.Fatalf("expected external Git root plan, got %#v", plans)
+	if plan.root != canonicalCorpusPath(externalRepo) {
+		t.Fatalf("external Git root mismatch: got %q want %q", plan.root, canonicalCorpusPath(externalRepo))
 	}
-	if gitPlan.root != canonicalCorpusPath(externalRepo) {
-		t.Fatalf("external Git root mismatch: got %q want %q", gitPlan.root, canonicalCorpusPath(externalRepo))
-	}
-	if gitPlan.scope == nil {
-		t.Fatal("expected parent Git plan to exclude explicit exact file owner")
-	}
-	if filePlan == nil {
-		t.Fatalf("expected exact file plan, got %#v", plans)
-	}
-	if filePlan.rootType != rootTypeFile {
-		t.Fatalf("exact file should use file root type, got %q", filePlan.rootType)
-	}
-	if filePlan.root != canonicalCorpusPath(nestedFile) {
-		t.Fatalf("exact file root mismatch: got %q want %q", filePlan.root, canonicalCorpusPath(nestedFile))
+	if plan.scope != nil {
+		t.Fatalf("expected whole-repo scope (nil) when the repo root is an operand, got %#v", plan.scope)
 	}
 }
 

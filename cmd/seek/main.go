@@ -335,16 +335,24 @@ func wrapCorpusResults(plan corpusPlan, files []zoekt.FileMatch) []corpusSearchR
 	if len(files) == 0 {
 		return nil
 	}
-	displayRoot := plan.displayRoot
-	if plan.kind == corpusKindFolder && plan.rootType == rootTypeFile {
-		displayRoot = filepath.Dir(displayRoot)
+	var selected map[string]struct{}
+	if len(plan.selectedFiles) > 0 {
+		selected = make(map[string]struct{}, len(plan.selectedFiles))
+		for _, name := range plan.selectedFiles {
+			selected[name] = struct{}{}
+		}
 	}
 	results := make([]corpusSearchResult, len(files))
 	for i, file := range files {
+		displayName := file.FileName
+		if _, ok := selected[file.FileName]; ok {
+			displayName = filepath.Base(file.FileName)
+		}
 		results[i] = corpusSearchResult{
 			corpusID:    plan.id,
 			kind:        plan.kind,
-			displayRoot: displayRoot,
+			displayRoot: plan.displayRoot,
+			displayName: displayName,
 			file:        file,
 		}
 	}
