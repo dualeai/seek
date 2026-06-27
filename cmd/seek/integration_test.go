@@ -1063,7 +1063,7 @@ func TestEnsureGitDirtyLayerFresh_CachesDeletedOnlyScope(t *testing.T) {
 	}
 }
 
-func TestEnsureGitCommittedLayerFresh_RebuildsMissingShardsWithoutEmptyMarker(t *testing.T) {
+func TestEnsureScopedCommittedLayerFresh_RebuildsMissingShardsWithoutEmptyMarker(t *testing.T) {
 	requireTools(t)
 
 	repo := initGitRepo(t, "seed.go", "package seed\n")
@@ -1093,7 +1093,7 @@ func TestEnsureGitCommittedLayerFresh_RebuildsMissingShardsWithoutEmptyMarker(t 
 	if err != nil {
 		t.Fatalf("scoped state: %v", err)
 	}
-	first, err := ensureGitCommittedLayerFresh(context.Background(), plans[0], paths, state.HeadSHA)
+	first, err := ensureScopedCommittedLayerFresh(context.Background(), plans[0], paths, state.HeadSHA)
 	if err != nil {
 		t.Fatalf("first committed refresh: %v", err)
 	}
@@ -1109,7 +1109,7 @@ func TestEnsureGitCommittedLayerFresh_RebuildsMissingShardsWithoutEmptyMarker(t 
 		t.Fatal("non-empty committed layer should not have an empty marker")
 	}
 
-	second, err := ensureGitCommittedLayerFresh(context.Background(), plans[0], paths, state.HeadSHA)
+	second, err := ensureScopedCommittedLayerFresh(context.Background(), plans[0], paths, state.HeadSHA)
 	if err != nil {
 		t.Fatalf("second committed refresh: %v", err)
 	}
@@ -1118,7 +1118,7 @@ func TestEnsureGitCommittedLayerFresh_RebuildsMissingShardsWithoutEmptyMarker(t 
 	}
 }
 
-func TestEnsureGitCommittedLayerFresh_DetectsHeadDriftBeforeStateWrite(t *testing.T) {
+func TestEnsureScopedCommittedLayerFresh_DetectsHeadDriftBeforeStateWrite(t *testing.T) {
 	requireTools(t)
 
 	repo := initGitRepo(t, "seed.go", "package seed\n")
@@ -1152,7 +1152,7 @@ func TestEnsureGitCommittedLayerFresh_DetectsHeadDriftBeforeStateWrite(t *testin
 	gitRunIn(t, repo, "add", "platform/next.go")
 	gitRunIn(t, repo, "commit", "-m", "move scoped head")
 
-	_, err = ensureGitCommittedLayerFresh(context.Background(), plans[0], paths, state.HeadSHA)
+	_, err = ensureScopedCommittedLayerFresh(context.Background(), plans[0], paths, state.HeadSHA)
 	if !errors.Is(err, errScopedLayerStateChanged) {
 		t.Fatalf("expected scoped layer drift error, got %v", err)
 	}
@@ -1161,7 +1161,7 @@ func TestEnsureGitCommittedLayerFresh_DetectsHeadDriftBeforeStateWrite(t *testin
 	}
 }
 
-func TestEnsureGitCommittedLayerFresh_ReusesLayerAfterOutOfScopeCommit(t *testing.T) {
+func TestEnsureScopedCommittedLayerFresh_ReusesLayerAfterOutOfScopeCommit(t *testing.T) {
 	requireTools(t)
 
 	repo := initGitRepo(t, "seed.go", "package seed\n")
@@ -1195,7 +1195,7 @@ func TestEnsureGitCommittedLayerFresh_ReusesLayerAfterOutOfScopeCommit(t *testin
 	if err != nil {
 		t.Fatalf("scoped state: %v", err)
 	}
-	if got, err := ensureGitCommittedLayerFresh(context.Background(), plans[0], paths, state.HeadSHA); err != nil {
+	if got, err := ensureScopedCommittedLayerFresh(context.Background(), plans[0], paths, state.HeadSHA); err != nil {
 		t.Fatalf("first committed refresh: %v", err)
 	} else if got != corpusSearchable {
 		t.Fatalf("first committed refresh=%v, want searchable", got)
@@ -1225,7 +1225,7 @@ func TestEnsureGitCommittedLayerFresh_ReusesLayerAfterOutOfScopeCommit(t *testin
 	if nextState.HeadSHA == state.HeadSHA {
 		t.Fatal("expected HEAD to change after out-of-scope commit")
 	}
-	if got, err := ensureGitCommittedLayerFresh(context.Background(), plans[0], paths, nextState.HeadSHA); err != nil {
+	if got, err := ensureScopedCommittedLayerFresh(context.Background(), plans[0], paths, nextState.HeadSHA); err != nil {
 		t.Fatalf("second committed refresh: %v", err)
 	} else if got != corpusSearchable {
 		t.Fatalf("second committed refresh=%v, want searchable", got)
@@ -1254,7 +1254,7 @@ func TestEnsureGitCommittedLayerFresh_ReusesLayerAfterOutOfScopeCommit(t *testin
 	}
 }
 
-func TestEnsureGitCommittedLayerFresh_PathspecEnvCannotHideScopedChange(t *testing.T) {
+func TestEnsureScopedCommittedLayerFresh_PathspecEnvCannotHideScopedChange(t *testing.T) {
 	requireTools(t)
 	t.Setenv("GIT_LITERAL_PATHSPECS", "1")
 
@@ -1282,7 +1282,7 @@ func TestEnsureGitCommittedLayerFresh_PathspecEnvCannotHideScopedChange(t *testi
 	if err != nil {
 		t.Fatalf("scoped state: %v", err)
 	}
-	if got, err := ensureGitCommittedLayerFresh(context.Background(), plans[0], paths, state.HeadSHA); err != nil {
+	if got, err := ensureScopedCommittedLayerFresh(context.Background(), plans[0], paths, state.HeadSHA); err != nil {
 		t.Fatalf("first committed refresh: %v", err)
 	} else if got != corpusSearchable {
 		t.Fatalf("first committed refresh=%v, want searchable", got)
@@ -1297,7 +1297,7 @@ func TestEnsureGitCommittedLayerFresh_PathspecEnvCannotHideScopedChange(t *testi
 	if err != nil {
 		t.Fatalf("next scoped state: %v", err)
 	}
-	if got, err := ensureGitCommittedLayerFresh(context.Background(), plans[0], paths, nextState.HeadSHA); err != nil {
+	if got, err := ensureScopedCommittedLayerFresh(context.Background(), plans[0], paths, nextState.HeadSHA); err != nil {
 		t.Fatalf("second committed refresh: %v", err)
 	} else if got != corpusSearchable {
 		t.Fatalf("second committed refresh=%v, want searchable", got)
@@ -1319,7 +1319,7 @@ func TestEnsureGitCommittedLayerFresh_PathspecEnvCannotHideScopedChange(t *testi
 	}
 }
 
-func TestEnsureGitCommittedLayerFresh_UnbornRepoKnownEmpty(t *testing.T) {
+func TestEnsureScopedCommittedLayerFresh_UnbornRepoKnownEmpty(t *testing.T) {
 	requireGit(t)
 
 	repo := initEmptyGitRepoNoRemote(t)
@@ -1341,7 +1341,7 @@ func TestEnsureGitCommittedLayerFresh_UnbornRepoKnownEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scoped state: %v", err)
 	}
-	got, err := ensureGitCommittedLayerFresh(context.Background(), plans[0], paths, state.HeadSHA)
+	got, err := ensureScopedCommittedLayerFresh(context.Background(), plans[0], paths, state.HeadSHA)
 	if err != nil {
 		t.Fatalf("unborn committed refresh: %v", err)
 	}
@@ -1350,7 +1350,7 @@ func TestEnsureGitCommittedLayerFresh_UnbornRepoKnownEmpty(t *testing.T) {
 	}
 }
 
-func TestSearchPlannedScopedCorpusRejectsLayerStateMismatch(t *testing.T) {
+func TestSearchPlannedScopedCorpus_RejectsLayerStateMismatch(t *testing.T) {
 	requireTools(t)
 
 	repo := initGitRepo(t, "seed.go", "package seed\n")
@@ -1363,6 +1363,11 @@ func TestSearchPlannedScopedCorpusRejectsLayerStateMismatch(t *testing.T) {
 	}
 	gitRunIn(t, repo, "add", "platform")
 	gitRunIn(t, repo, "commit", "-m", "add scoped platform")
+	// Leave an in-scope uncommitted file so the dirty layer materializes; a
+	// clean in-scope tree now elides the dirty layer entirely.
+	if err := os.WriteFile(filepath.Join(scope, "dirty.go"), []byte("package platform\n// dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	setTestUserCache(t)
 	paths, err := resolveGitPaths(context.Background(), repo)
@@ -1380,9 +1385,13 @@ func TestSearchPlannedScopedCorpusRejectsLayerStateMismatch(t *testing.T) {
 	if ready != corpusSearchable {
 		t.Fatalf("expected searchable corpus, got %v", ready)
 	}
-	plans[0].committedStateHash = readStateFile(plans[0].committedCacheDir)
+	// A small under-cap repo resolves to the shared whole-repo committed layer,
+	// so the committed search targets the shared dir, not the per-scope one.
+	plans[0].committedCacheDir = plans[0].sharedCommittedCacheDir
+	plans[0].committedIndexDir = plans[0].sharedCommittedIndexDir
+	plans[0].committedStateHash = readStateFile(plans[0].sharedCommittedCacheDir)
 	if plans[0].committedStateHash == "" {
-		t.Fatal("expected committed layer to persist state before mismatch check")
+		t.Fatal("expected shared committed layer to persist state before mismatch check")
 	}
 	plans[0].dirtyStateHash = readStateFile(plans[0].dirtyCacheDir)
 	if plans[0].dirtyStateHash == "" {
@@ -3290,4 +3299,320 @@ func TestRun_SymlinkToIgnoredFileSearchesContent(t *testing.T) {
 	if !strings.Contains(out, "SYMLINK_IGNORED_MARKER") {
 		t.Fatalf("expected resolved ignored-target content via folder fallback, got:\n%s", out)
 	}
+}
+
+// A scoped search over a CLEAN in-scope tree must mint only the committed
+// layer (one corpus dir) — the empty dirty layer is elided. Result is found
+// and not tagged [uncommitted].
+func TestRun_CleanScopedSearchElidesDirtyLayer(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "committed.go", "package main\n")
+	writeTrackedFile(t, repo, filepath.Join("sub", "x.go"), "package sub\n// CLEANSCOPE_MARKER\n")
+	setTestUserCache(t)
+	t.Chdir(repo)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "CLEANSCOPE_MARKER", []string{filepath.Join(repo, "sub")}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("clean scoped search: %v", err)
+	}
+	if !strings.Contains(out, "CLEANSCOPE_MARKER") {
+		t.Fatalf("expected committed content, got:\n%s", out)
+	}
+	if strings.Contains(out, "[uncommitted]") {
+		t.Fatalf("clean scope must not be tagged uncommitted, got:\n%s", out)
+	}
+	if n := countCorpora(t); n != 1 {
+		t.Fatalf("clean scoped search must mint 1 corpus (committed only, dirty elided), got %d", n)
+	}
+}
+
+// A scoped search with an in-scope uncommitted file materializes the dirty
+// layer (two corpus dirs) and tags the result [uncommitted].
+func TestRun_DirtyScopedSearchMintsDirtyLayer(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "committed.go", "package main\n")
+	writeTrackedFile(t, repo, filepath.Join("sub", "x.go"), "package sub\n")
+	if err := os.WriteFile(filepath.Join(repo, "sub", "x.go"), []byte("package sub\n// DIRTYSCOPE_MARKER\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	setTestUserCache(t)
+	t.Chdir(repo)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "DIRTYSCOPE_MARKER", []string{filepath.Join(repo, "sub")}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("dirty scoped search: %v", err)
+	}
+	if !strings.Contains(out, "[uncommitted]") {
+		t.Fatalf("dirty scope must tag uncommitted, got:\n%s", out)
+	}
+	if n := countCorpora(t); n != 2 {
+		t.Fatalf("dirty scoped search must mint 2 corpora (committed + dirty), got %d", n)
+	}
+}
+
+// Two clean scoped searches of different subtrees of one under-cap repo must
+// resolve to a SINGLE shared whole-repo committed index (collapse), while
+// search-time scope filtering still excludes the sibling subtree.
+func TestRun_ScopedSearchesShareCommittedIndex(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "root.go", "package main\n")
+	writeTrackedFile(t, repo, filepath.Join("aaa", "x.go"), "package aaa\n// SHARED_MARKER\n")
+	writeTrackedFile(t, repo, filepath.Join("bbb", "y.go"), "package bbb\n// SHARED_MARKER\n")
+	setTestUserCache(t)
+	t.Chdir(repo)
+
+	sibling := map[string]string{"aaa": "bbb", "bbb": "aaa"}
+	for _, dir := range []string{"aaa", "bbb"} {
+		out, err := captureStdout(t, func() error {
+			return run(context.Background(), "SHARED_MARKER", []string{filepath.Join(repo, dir)}, 0, 0)
+		})
+		if err != nil {
+			t.Fatalf("scoped search %s: %v", dir, err)
+		}
+		if !strings.Contains(out, dir+"/") {
+			t.Fatalf("expected in-scope %s match, got:\n%s", dir, out)
+		}
+		if strings.Contains(out, sibling[dir]+"/") {
+			t.Fatalf("sibling %s leaked into %s scope:\n%s", sibling[dir], dir, out)
+		}
+	}
+	if n := countCorpora(t); n != 1 {
+		t.Fatalf("two clean scoped searches of one under-cap repo must share 1 committed corpus, got %d", n)
+	}
+}
+
+// When the whole repo exceeds the index caps, a scoped search of a small
+// in-budget subtree must fall back to the per-scope committed layer and still
+// succeed (budget isolation), recording a cap marker on the shared layer.
+func TestRun_OverCapScopedSearchFallsBackToPerScope(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "seed.go", "package seed\n")
+	inScope := "package small\n// OVERCAP_MARKER\n"
+	writeTrackedFile(t, repo, filepath.Join("small", "a.go"), inScope)
+	writeTrackedFile(t, repo, filepath.Join("big", "huge.go"), "package big\n"+strings.Repeat("x", len(inScope)*8))
+
+	oldLimit := gitCorpusIndexedByteLimit
+	gitCorpusIndexedByteLimit = int64(len(inScope) + 8) // whole repo over cap; small/ fits
+	defer func() { gitCorpusIndexedByteLimit = oldLimit }()
+
+	setTestUserCache(t)
+	t.Chdir(repo)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "OVERCAP_MARKER", []string{filepath.Join(repo, "small")}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("over-cap scoped search must fall back to per-scope, got err=%v out=%q", err, out)
+	}
+	if !strings.Contains(out, "OVERCAP_MARKER") {
+		t.Fatalf("expected in-scope match via per-scope fallback, got:\n%s", out)
+	}
+	if strings.Contains(out, "big/") {
+		t.Fatalf("out-of-scope sibling leaked under fallback, got:\n%s", out)
+	}
+}
+
+// The shared committed index is HEAD-keyed; a new commit must rebuild it. A
+// stale (non-rebuilt) index would not contain the new content.
+func TestRun_SharedCommittedIndexRebuildsOnHeadChange(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "root.go", "package main\n")
+	writeTrackedFile(t, repo, filepath.Join("sub", "x.go"), "package sub\n// SHARED_V1MARKER\n")
+	setTestUserCache(t)
+	t.Chdir(repo)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "SHARED_V1MARKER", []string{filepath.Join(repo, "sub")}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("v1 scoped search: %v", err)
+	}
+	if !strings.Contains(out, "SHARED_V1MARKER") {
+		t.Fatalf("expected v1 committed content, got:\n%s", out)
+	}
+
+	// Replace the in-scope content in a new commit (new HEAD).
+	if err := os.WriteFile(filepath.Join(repo, "sub", "x.go"), []byte("package sub\n// SHARED_V2MARKER\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", "sub/x.go")
+	gitRunIn(t, repo, "commit", "-m", "v2")
+
+	out2, err := captureStdout(t, func() error {
+		return run(context.Background(), "SHARED_V2MARKER", []string{filepath.Join(repo, "sub")}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("v2 scoped search: %v", err)
+	}
+	if !strings.Contains(out2, "SHARED_V2MARKER") {
+		t.Fatalf("shared committed index did not rebuild on HEAD change, got:\n%s", out2)
+	}
+}
+
+// The over-cap cap marker is keyed by treeish: it must go stale on a HEAD
+// change (re-pinned when still over cap) and be cleared once the repo fits
+// under the cap and the shared index builds. Guards the budget-isolation gate.
+func TestEnsureCommittedLayer_CapMarkerRevalidatesOnHeadChange(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "seed.go", "package seed\n")
+	writeTrackedFile(t, repo, filepath.Join("small", "a.go"), "package small\n")
+	writeTrackedFile(t, repo, filepath.Join("big", "huge.go"), "package big\n"+strings.Repeat("x", 256))
+	setTestUserCache(t)
+
+	scope := filepath.Join(repo, "small")
+	paths, err := resolveGitPaths(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	plans, err := planCorpora(context.Background(), &paths, []string{scope})
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	plan := plans[0]
+
+	oldLimit := gitCorpusIndexedByteLimit
+	gitCorpusIndexedByteLimit = 48 // whole repo over cap; small/ fits
+	defer func() { gitCorpusIndexedByteLimit = oldLimit }()
+
+	resolveAt := func() (committedLayerResolution, string) {
+		t.Helper()
+		state, err := gitRepoStateInScope(context.Background(), paths.RepoDir, plan.dirtyScope)
+		if err != nil {
+			t.Fatalf("repo state: %v", err)
+		}
+		res, _, err := resolveCommittedLayer(context.Background(), plan, paths, state.HeadSHA)
+		if err != nil {
+			t.Fatalf("resolveCommittedLayer: %v", err)
+		}
+		return res, normalizeCommittedTreeish(state.HeadSHA)
+	}
+
+	// v1: over cap -> per-scope fallback, cap marker pinned to v1.
+	res1, v1 := resolveAt()
+	if res1.shared {
+		t.Fatal("over-cap repo must fall back to the per-scope committed layer")
+	}
+	if got, want := readGitCapMarker(plan.sharedCommittedCacheDir), gitCapMarkerValue(v1); got != want {
+		t.Fatalf("expected cap marker pinned to v1=%q, got %q", want, got)
+	}
+
+	// New HEAD, still over cap: the v1 marker is stale and must re-pin to v2.
+	if err := os.WriteFile(filepath.Join(repo, "small", "a.go"), []byte("package small\n// changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", "small/a.go")
+	gitRunIn(t, repo, "commit", "-m", "v2")
+	res2, v2 := resolveAt()
+	if v1 == v2 {
+		t.Fatal("HEAD did not change")
+	}
+	if res2.shared {
+		t.Fatal("still over cap, expected per-scope fallback")
+	}
+	if got, want := readGitCapMarker(plan.sharedCommittedCacheDir), gitCapMarkerValue(v2); got != want {
+		t.Fatalf("cap marker should re-pin to v2=%q after HEAD change, got %q", want, got)
+	}
+
+	// Restore the cap and move HEAD: the stale marker must not block the shared
+	// index; budget is re-evaluated, now under cap -> shared used, marker cleared.
+	gitCorpusIndexedByteLimit = oldLimit
+	if err := os.WriteFile(filepath.Join(repo, "small", "a.go"), []byte("package small\n// final\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", "small/a.go")
+	gitRunIn(t, repo, "commit", "-m", "v3")
+	res3, _ := resolveAt()
+	if !res3.shared {
+		t.Fatal("under cap after HEAD change, expected the shared committed layer")
+	}
+	if got := readGitCapMarker(plan.sharedCommittedCacheDir); got != "" {
+		t.Fatalf("cap marker should be cleared once the shared layer builds, got %q", got)
+	}
+}
+
+// The cap marker folds in the cap limits, so raising the cap re-evaluates the
+// shared index even when HEAD does not move (e.g. a new binary with a larger
+// compiled limit reading a marker an older binary wrote).
+func TestEnsureCommittedLayer_CapMarkerRevalidatesOnCapChange(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "seed.go", "package seed\n")
+	writeTrackedFile(t, repo, filepath.Join("small", "a.go"), "package small\n")
+	writeTrackedFile(t, repo, filepath.Join("big", "huge.go"), "package big\n"+strings.Repeat("x", 256))
+	setTestUserCache(t)
+
+	scope := filepath.Join(repo, "small")
+	paths, err := resolveGitPaths(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	plans, err := planCorpora(context.Background(), &paths, []string{scope})
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	plan := plans[0]
+
+	state, err := gitRepoStateInScope(context.Background(), paths.RepoDir, plan.dirtyScope)
+	if err != nil {
+		t.Fatalf("repo state: %v", err)
+	}
+	resolve := func() committedLayerResolution {
+		t.Helper()
+		res, _, err := resolveCommittedLayer(context.Background(), plan, paths, state.HeadSHA)
+		if err != nil {
+			t.Fatalf("resolveCommittedLayer: %v", err)
+		}
+		return res
+	}
+
+	oldLimit := gitCorpusIndexedByteLimit
+	defer func() { gitCorpusIndexedByteLimit = oldLimit }()
+
+	// Over cap -> per-scope fallback, marker pinned to (HEAD, small cap).
+	gitCorpusIndexedByteLimit = 48
+	if resolve().shared {
+		t.Fatal("over-cap repo must fall back to per-scope")
+	}
+
+	// Raise the cap WITHOUT moving HEAD: the marker (which encodes the old cap)
+	// must go stale so the shared index is re-evaluated and now used.
+	gitCorpusIndexedByteLimit = oldLimit
+	if !resolve().shared {
+		t.Fatal("cap raised on the same HEAD must re-evaluate the marker and use the shared layer")
+	}
+	if got := readGitCapMarker(plan.sharedCommittedCacheDir); got != "" {
+		t.Fatalf("cap marker should be cleared once the shared layer builds, got %q", got)
+	}
+}
+
+func countCorpora(tb testing.TB) int {
+	tb.Helper()
+	root, err := seekUserCacheRoot()
+	if err != nil {
+		tb.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, corporaDir))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		tb.Fatal(err)
+	}
+	n := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			n++
+		}
+	}
+	return n
 }

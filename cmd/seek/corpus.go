@@ -58,8 +58,15 @@ type corpusPlan struct {
 	// outside the selected path cannot cap the search.
 	committedCacheDir string
 	committedIndexDir string
-	dirtyCacheDir     string
-	dirtyIndexDir     string
+	// sharedCommitted* is the whole-repo committed index: one per repo,
+	// HEAD-keyed (no scope in its id), shared across every scope of the repo.
+	// Scoped searches prefer it and filter at search time via plan.scope,
+	// falling back to the per-scope committed* layer above only when the whole
+	// repo exceeds the index caps (so a huge sibling can't cap a small scope).
+	sharedCommittedCacheDir string
+	sharedCommittedIndexDir string
+	dirtyCacheDir           string
+	dirtyIndexDir           string
 	// Expected layer state hashes are populated after refresh and
 	// validated under shared search locks before loading scoped shards.
 	committedStateHash string
@@ -748,8 +755,14 @@ func planCurrentGitCorpusWithExclusions(paths gitPaths, operands, excludes []str
 		if err != nil {
 			return corpusPlan{}, err
 		}
+		sharedCommitted, err := buildGitCorpusPlan(paths.RepoDir, paths.CommonDir, "git_layer", "committed_shared")
+		if err != nil {
+			return corpusPlan{}, err
+		}
 		plan.committedCacheDir = committed.cacheDir
 		plan.committedIndexDir = committed.indexDir
+		plan.sharedCommittedCacheDir = sharedCommitted.cacheDir
+		plan.sharedCommittedIndexDir = sharedCommitted.indexDir
 		plan.dirtyCacheDir = dirty.cacheDir
 		plan.dirtyIndexDir = dirty.indexDir
 	}
