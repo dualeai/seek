@@ -647,10 +647,7 @@ func BenchmarkGitPathScoped_ColdIndexWithTrackedSibling(b *testing.B) {
 	if err != nil {
 		b.Fatalf("plan scoped corpus: %v", err)
 	}
-	if err := os.RemoveAll(scopedPlan.committedCacheDir); err != nil {
-		b.Fatal(err)
-	}
-	if err := os.RemoveAll(scopedPlan.dirtyCacheDir); err != nil {
+	if err := os.RemoveAll(scopedPlan.cacheDir); err != nil {
 		b.Fatal(err)
 	}
 	if results, err := runSeekInPlannedGitCorpus(ctx, "scoped_cold_marker", paths, scopedPlan); err != nil {
@@ -663,10 +660,7 @@ func BenchmarkGitPathScoped_ColdIndexWithTrackedSibling(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		b.StopTimer()
-		if err := os.RemoveAll(scopedPlan.committedCacheDir); err != nil {
-			b.Fatal(err)
-		}
-		if err := os.RemoveAll(scopedPlan.dirtyCacheDir); err != nil {
+		if err := os.RemoveAll(scopedPlan.cacheDir); err != nil {
 			b.Fatal(err)
 		}
 		b.StartTimer()
@@ -859,7 +853,7 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(b, dir)
 
-	if _, _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
+	if _, _, err := ensureGitCorpusFresh(ctx, &plan, paths); err != nil {
 		b.Fatalf("initial indexing: %v", err)
 	}
 
@@ -1674,7 +1668,7 @@ func setupLargeRepoBench(b *testing.B) (repoDir string, paths gitPaths, plan cor
 	paths, plan = planGitTestCorpus(b, repoDir)
 
 	ctx := context.Background()
-	if _, _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
+	if _, _, err := ensureGitCorpusFresh(ctx, &plan, paths); err != nil {
 		b.Fatalf("initial indexing failed: %v", err)
 	}
 	return repoDir, paths, plan
@@ -1686,7 +1680,7 @@ func setupScratchLargeRepoBench(b *testing.B) (repoDir string, paths gitPaths, p
 	paths, plan = planGitTestCorpus(b, repoDir)
 
 	ctx := context.Background()
-	if _, _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
+	if _, _, err := ensureGitCorpusFresh(ctx, &plan, paths); err != nil {
 		b.Fatalf("initial indexing failed: %v", err)
 	}
 	return repoDir, paths, plan
@@ -1947,7 +1941,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			_ = acquireSearchLock(ctx, filepath.Dir(f.Name()), f)
+			_ = acquireReadLock(ctx, filepath.Dir(f.Name()), f)
 			unlockFile(f)
 			_ = f.Close()
 		}

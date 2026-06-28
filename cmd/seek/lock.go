@@ -2,13 +2,141 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"os"
+	"path/filepath"
 	"syscall"
 	"time"
 )
+
+// errCorpusEvicted is returned by acquirePublishLock when the corpus dir no
+// longer exists (gc evicted it during a lock-free build). The caller must
+// discard its temp build and let the next search cold-rebuild — never recreate
+// the lock file (which would resurrect a phantom, shard-less corpus).
+var errCorpusEvicted = errors.New("corpus evicted during build")
+
+// Two-lock protocol (single-flight build + brief publish, non-blocking reads):
+//
+//   - acquireBuildLock: LOCK_EX on cacheDir/.build.lock, held across the WHOLE
+//     build. Serializes builders (single-flight). Readers never take it, so a
+//     long build never blocks a search.
+//   - acquirePublishLock: LOCK_EX on cacheDir/.lock, held only for the ms-scale
+//     swap. O_RDWR without O_CREATE so an evicted corpus surfaces as
+//     errCorpusEvicted instead of resurrecting the lock file.
+//   - acquireReadLock: LOCK_SH on cacheDir/.lock, held across the reader's full
+//     glob+open+search, so a concurrent publish (LOCK_EX) can never interleave
+//     and tear the shard set. Bounded wait, then a stale-serve valve only if a
+//     swap is wedged.
+
+// acquireBuildLock takes the single-flight build lock (LOCK_EX on
+// cacheDir/.build.lock), held across the whole build. Returns (fd, acquired,
+// error). When another builder holds it AND a usable index already exists,
+// returns (nil, false, nil): the caller SKIPS building and serves the current
+// shards (the active builder will publish fresh ones) — readers are never
+// blocked on a peer's long build. Only a cold corpus (no shards) polls/waits, so
+// the first build is not skipped.
+func acquireBuildLock(ctx context.Context, cacheDir, indexDir string) (*os.File, bool, error) {
+	lockPath := filepath.Join(cacheDir, buildLockFile)
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, false, fmt.Errorf("open build lock file: %w", err)
+	}
+	if err := lockFileExclusive(f); err != nil {
+		if shardsExist(indexDir) {
+			_ = f.Close()
+			return nil, false, nil
+		}
+		if perr := pollLock(ctx, func() error { return lockFileExclusive(f) }, 100*time.Millisecond, 2*time.Second, lockPollTimeout); perr != nil {
+			_ = f.Close()
+			return nil, false, fmt.Errorf("build lock held >%v: %w", lockPollTimeout, perr)
+		}
+	}
+	// Ensure the publish lock file exists so acquirePublishLock (which opens it
+	// without O_CREATE) can distinguish a first build (file present, lockable)
+	// from a gc-evicted corpus (file gone → errCorpusEvicted).
+	if lf, lerr := os.OpenFile(filepath.Join(cacheDir, lockFile), os.O_CREATE|os.O_RDWR, 0o644); lerr == nil {
+		_ = lf.Close()
+	}
+	// Mark the corpus in-use at build START so a concurrent gc does not evict it
+	// in the window between the build releasing this lock and the search
+	// re-opening the corpus's publish lock (which would ENOENT on the just-
+	// trashed dir). gc's readUsedAt > cutoff check then keeps it (gc.go).
+	touchUsed(cacheDir)
+	return f, true, nil
+}
+
+// tryBuildLock attempts a NON-blocking LOCK_EX on cacheDir/.build.lock. Returns
+// (fd, true, nil) when acquired, (nil, false, nil) when a builder holds it. Used
+// by gc to skip a corpus whose lock-free build is in progress.
+func tryBuildLock(cacheDir string) (*os.File, bool, error) {
+	lockPath := filepath.Join(cacheDir, buildLockFile)
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, false, fmt.Errorf("open build lock file: %w", err)
+	}
+	if err := lockFileExclusive(f); err != nil {
+		_ = f.Close()
+		return nil, false, nil
+	}
+	return f, true, nil
+}
+
+// acquirePublishLock takes the brief publish lock (LOCK_EX on cacheDir/.lock).
+// O_RDWR without O_CREATE: a missing lock file means the corpus was evicted, so
+// it returns errCorpusEvicted rather than resurrecting a phantom corpus.
+func acquirePublishLock(ctx context.Context, cacheDir string) (*os.File, error) {
+	lockPath := filepath.Join(cacheDir, lockFile)
+	f, err := os.OpenFile(lockPath, os.O_RDWR, 0o644)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, errCorpusEvicted
+		}
+		return nil, fmt.Errorf("open publish lock file: %w", err)
+	}
+	if err := lockFileExclusive(f); err == nil {
+		return f, nil
+	}
+	if err := pollLock(ctx, func() error { return lockFileExclusive(f) }, 20*time.Millisecond, 500*time.Millisecond, lockPollTimeout); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("publish lock held >%v: %w", lockPollTimeout, err)
+	}
+	return f, nil
+}
+
+// acquireReadLock takes the shared read lock (LOCK_SH on the already-open f =
+// cacheDir/.lock) and holds it across the caller's full glob+open+search. It
+// polls a bounded time; if a swap is wedged past the bound AND shards exist, it
+// degrades to a lock-free stale read (liveness valve) rather than failing.
+func acquireReadLock(ctx context.Context, indexDir string, f *os.File) error {
+	if err := lockFileSharedNB(f); err == nil {
+		return nil
+	}
+	// A publish swap is ms-scale; poll briefly for it to finish.
+	if err := pollLock(ctx, func() error { return lockFileSharedNB(f) }, 20*time.Millisecond, 500*time.Millisecond, readLockTimeout); err != nil {
+		// Wedged swap: serve stale rather than hang, but only if a usable index
+		// is present. This is the sole remaining unlocked read path and fires
+		// only on the degenerate wedged-mid-swap case.
+		if shardsExist(indexDir) {
+			slog.Warn("Publish lock contended past timeout; searching stale shards", "index_dir", indexDir)
+			return nil
+		}
+		return fmt.Errorf("timeout waiting for indexer to finish (%v)", readLockTimeout)
+	}
+	return nil
+}
+
+// readLockTimeout bounds how long a search waits for an in-progress publish swap
+// before degrading to a stale read. The swap is ms-scale, so this is generous.
+// A var (not const) so tests can shrink the wedged-swap valve wait.
+var readLockTimeout = 10 * time.Second
+
+// lockPollTimeout bounds how long the build/publish lock acquisitions poll for a
+// held lock before giving up. Named so the value and the ">Ns" error messages
+// stay in sync.
+const lockPollTimeout = 60 * time.Second
 
 // lockFileExclusive attempts a non-blocking exclusive lock on f.
 func lockFileExclusive(f *os.File) error {
@@ -43,6 +171,11 @@ func pollLock(ctx context.Context, lockFn func() error, initialBackoff, maxBacko
 		select {
 		case <-timeoutCtx.Done():
 			timer.Stop()
+			// Distinguish parent-context cancellation (e.g. Ctrl-C) from the
+			// poll deadline so callers can errors.Is(err, context.Canceled).
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return fmt.Errorf("lock poll timeout (%v)", timeout)
 		case <-timer.C:
 		}
@@ -54,56 +187,6 @@ func pollLock(ctx context.Context, lockFn func() error, initialBackoff, maxBacko
 	}
 }
 
-// acquireLock tries to acquire an exclusive flock on the lock file.
-// Returns (fd, acquired, error).
-func acquireLock(ctx context.Context, indexDir, lockPath string) (*os.File, bool, error) {
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, false, fmt.Errorf("open lock file: %w", err)
-	}
-
-	// Try non-blocking lock first
-	if err := lockFileExclusive(f); err == nil {
-		return f, true, nil
-	}
-
-	// Lock held by another process — use stale shards if available.
-	//
-	// Warn (not Debug) because a wedged indexer holding the flock
-	// silently degrades subsequent searches to stale shards forever
-	// until the holder is killed; without this signal the operator
-	// has no clue why fresh content is missing from results.
-	if shardsExist(indexDir) {
-		slog.Warn("Indexer lock held by another process; searching stale shards", "lock", lockPath)
-		_ = f.Close()
-		return nil, false, nil
-	}
-
-	// No shards exist (first run) — poll until lock is acquired.
-	// Uses non-blocking attempts to prevent fd-reuse races when the
-	// timeout fires and closes the file.
-	if err := pollLock(ctx, func() error { return lockFileExclusive(f) }, 100*time.Millisecond, 2*time.Second, 60*time.Second); err != nil {
-		_ = f.Close()
-		return nil, false, fmt.Errorf("indexer lock held >60s")
-	}
-	return f, true, nil
-}
-
-func acquireLockStrict(ctx context.Context, lockPath string) (*os.File, error) {
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("open lock file: %w", err)
-	}
-	if err := lockFileExclusive(f); err == nil {
-		return f, nil
-	}
-	if err := pollLock(ctx, func() error { return lockFileExclusive(f) }, 100*time.Millisecond, 2*time.Second, 60*time.Second); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("indexer lock held >60s")
-	}
-	return f, nil
-}
-
 // releaseLock releases the flock and closes the file.
 func releaseLock(f *os.File) {
 	if f == nil {
@@ -111,37 +194,4 @@ func releaseLock(f *os.File) {
 	}
 	unlockFile(f)
 	_ = f.Close()
-}
-
-// acquireSearchLock acquires a shared lock with a timeout, polling with
-// exponential backoff plus jitter. Uses non-blocking LOCK_SH to avoid
-// goroutine/fd-reuse races.
-//
-// If the lock is held by a running indexer AND shards exist in
-// indexDir, returns nil without acquiring — caller proceeds against
-// stale shards (mirror of acquireLock's same fallback). Search
-// results may be slightly behind the current state but never torn:
-// shard files are atomically renamed inside Zoekt's Builder.Finish.
-func acquireSearchLock(ctx context.Context, indexDir string, f *os.File) error {
-	if err := lockFileSharedNB(f); err == nil {
-		return nil
-	}
-	if shardsExist(indexDir) {
-		slog.Warn("Indexer lock contended; searching stale shards", "index_dir", indexDir)
-		return nil
-	}
-	if err := pollLock(ctx, func() error { return lockFileSharedNB(f) }, 50*time.Millisecond, 500*time.Millisecond, 60*time.Second); err != nil {
-		return fmt.Errorf("timeout waiting for indexer to finish (60s)")
-	}
-	return nil
-}
-
-func acquireSearchLockStrict(ctx context.Context, f *os.File) error {
-	if err := lockFileSharedNB(f); err == nil {
-		return nil
-	}
-	if err := pollLock(ctx, func() error { return lockFileSharedNB(f) }, 50*time.Millisecond, 500*time.Millisecond, 60*time.Second); err != nil {
-		return fmt.Errorf("timeout waiting for indexer to finish (60s)")
-	}
-	return nil
 }

@@ -309,11 +309,11 @@ func TestClosestSubcommand(t *testing.T) {
 		input string
 		want  string
 	}{
-		{"gc", ""},                      // exact match → no suggestion
-		{"garbage-collect", ""},         // exact alias match
-		{"gcc", "gc"},                   // distance 1
+		{"gc", ""},                            // exact match → no suggestion
+		{"garbage-collect", ""},               // exact alias match
+		{"gcc", "gc"},                         // distance 1
 		{"garbage-colect", "garbage-collect"}, // distance 1
-		{"zzzzzzzz", ""},                // distance ≥ 3 → no suggestion
+		{"zzzzzzzz", ""},                      // distance ≥ 3 → no suggestion
 	}
 	for _, tc := range cases {
 		t.Run(tc.input, func(t *testing.T) {

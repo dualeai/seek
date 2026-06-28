@@ -221,6 +221,11 @@ func corpusDirSize(path string) int64 {
 			return nil
 		}
 		if d.IsDir() {
+			// Skip in-progress temp build dirs so the SIZE column reports the
+			// honest steady-state footprint, not a transient 2x during a build.
+			if strings.HasPrefix(d.Name(), buildDirPrefix) {
+				return fs.SkipDir
+			}
 			return nil
 		}
 		info, err := d.Info()

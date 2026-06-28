@@ -777,14 +777,14 @@ func TestStreamFiles_RacyDeletion(t *testing.T) {
 	}
 }
 
-// TestAcquireLock_ContextCancellation verifies that lock acquisition
-// respects context cancellation during the polling loop.
-func TestAcquireLock_ContextCancellation(t *testing.T) {
+// TestAcquireBuildLock_ContextCancellation verifies that build-lock acquisition
+// respects context cancellation during the polling loop (cold path, no shards).
+func TestAcquireBuildLock_ContextCancellation(t *testing.T) {
 	dir := t.TempDir()
-	lockPath := filepath.Join(dir, "test.lock")
+	indexDir := filepath.Join(dir, "index")
 
-	// Hold exclusive lock
-	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	// Hold the build lock so a second acquire must poll.
+	holder, err := os.OpenFile(filepath.Join(dir, buildLockFile), os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -796,16 +796,16 @@ func TestAcquireLock_ContextCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// No shards — acquireLock will poll
+	// No shards — acquireBuildLock will poll (not skip).
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
 	start := time.Now()
-	_, acquired, err := acquireLock(ctx, dir, lockPath)
+	_, acquired, err := acquireBuildLock(ctx, dir, indexDir)
 	elapsed := time.Since(start)
 
 	if acquired {
-		t.Error("should not have acquired lock while held")
+		t.Error("should not have acquired build lock while held")
 	}
 	if err == nil {
 		t.Error("expected error on timeout")

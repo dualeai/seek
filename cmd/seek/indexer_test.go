@@ -1406,10 +1406,12 @@ func TestStateCaching_UntouchedDirtyFile(t *testing.T) {
 	}
 }
 
-// TestStateCaching_HeadChangeDuringIndexing verifies that a HEAD change
-// during indexing (e.g. git commit) is not detected by restat but IS
-// caught by the next search's git status call.
-func TestStateCaching_HeadChangeDuringIndexing(t *testing.T) {
+// TestStateCaching_HeadChangeDuringIndexingDiscardsStaleBuild verifies the
+// Phase 2 validate-before-publish guarantee (gap-e closure): a HEAD change
+// during the (lock-free temp) committed build is detected before publish, so
+// the stale-HEAD build is DISCARDED — no state is written and no torn shards
+// are published. The next search rebuilds at the new HEAD and finds the content.
+func TestStateCaching_HeadChangeDuringIndexingDiscardsStaleBuild(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// v1\n")
@@ -1426,23 +1428,23 @@ func TestStateCaching_HeadChangeDuringIndexing(t *testing.T) {
 	state := gitRepoStateIn(ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 
-	// Simulate HEAD change: commit the dirty file
+	// Simulate HEAD change: commit the dirty file (HEAD now != captured state).
 	gitRunIn(t, dir, "add", "app.go")
 	gitRunIn(t, dir, "commit", "-m", "commit during indexing")
 
-	// Run indexing with the captured stale state.
+	// Run indexing with the captured STALE state. validate-before-publish must
+	// notice HEAD moved and discard the build.
 	deleteStateFiles(plan.cacheDir)
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
-	// Restat doesn't detect HEAD change — state file IS written.
-	// (app.go content on disk is unchanged, only git's view changed.)
-	cached := readStateFile(plan.cacheDir)
-
-	if cached == "" {
-		t.Fatal("expected state file to be written before next-search correction")
+	// gap-e closed: the stale-HEAD build is discarded → no state written.
+	if cached := readStateFile(plan.cacheDir); cached != "" {
+		t.Fatalf("stale-HEAD build must be discarded, not published; got state %q", cached)
 	}
+
+	// Next search rebuilds at the new HEAD and finds the committed v2 content.
 	files, err := runSeekInPlannedGitCorpus(ctx, "v2_dirty", paths, plan)
 	if err != nil {
 		t.Fatalf("next search after HEAD change failed: %v", err)
@@ -1450,8 +1452,8 @@ func TestStateCaching_HeadChangeDuringIndexing(t *testing.T) {
 	if len(files) == 0 {
 		t.Fatal("next search should find the committed v2 content")
 	}
-	if updated := readStateFile(plan.cacheDir); updated == "" || updated == cached {
-		t.Fatalf("next search should refresh stale state, cached=%q updated=%q", cached, updated)
+	if updated := readStateFile(plan.cacheDir); updated == "" {
+		t.Fatalf("next search should write fresh state after rebuild, got empty")
 	}
 }
 
@@ -1649,8 +1651,9 @@ func TestStateCaching_DoubleCheck_SkipsRedundantIndex(t *testing.T) {
 	}
 }
 
-// TestStateCaching_StaleFallback_DoesNotWriteState verifies that when
-// the lock can't be acquired (stale fallback), the state file is NOT written.
+// TestStateCaching_StaleFallback_DoesNotWriteState verifies that when another
+// builder holds the build lock AND a usable index exists, runIndexingWithCache
+// SKIPS the build (serving current shards) and does NOT write state.
 func TestStateCaching_StaleFallback_DoesNotWriteState(t *testing.T) {
 	requireTools(t)
 
@@ -1669,8 +1672,9 @@ func TestStateCaching_StaleFallback_DoesNotWriteState(t *testing.T) {
 	// Delete the state file to force re-indexing attempt
 	deleteStateFiles(plan.cacheDir)
 
-	// Hold the lock to trigger stale fallback
-	lockPath := filepath.Join(plan.cacheDir, lockFile)
+	// Hold the BUILD lock to simulate a concurrent builder (the new single-flight
+	// lock); with shards present, a second build must skip rather than block.
+	lockPath := filepath.Join(plan.cacheDir, buildLockFile)
 	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		t.Fatal(err)

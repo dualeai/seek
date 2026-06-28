@@ -152,35 +152,6 @@ func gitRepoStateIn(ctx context.Context, dir string) repoState {
 	return parseGitStatusV2(string(out))
 }
 
-func gitRepoStateInScope(ctx context.Context, dir string, scope *gitDirtyScope) (repoState, error) {
-	if scope == nil {
-		return gitRepoStateIn(ctx, dir), nil
-	}
-	args := []string{
-		"status",
-		"--porcelain=v2",
-		"--branch",
-		"--no-renames",
-		"--no-ahead-behind",
-		"--untracked-files=all",
-		"-z",
-		"--",
-	}
-	args = append(args, scope.gitPathspecs()...)
-	cmd := gitCmd(ctx, args...)
-	cmd.Dir = dir
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return repoState{}, fmt.Errorf("git scoped status: %w: %s", err, msg)
-		}
-		return repoState{}, fmt.Errorf("git scoped status: %w", err)
-	}
-	return repoStateForDirtyScope(parseGitStatusV2(string(out)), scope), nil
-}
-
 func gitHeadTreeish(ctx context.Context, dir string) (string, error) {
 	cmd := gitCmd(ctx, "rev-parse", "--verify", "HEAD^{commit}")
 	cmd.Dir = dir

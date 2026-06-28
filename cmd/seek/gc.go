@@ -265,6 +265,13 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 		// behind; no live process ever reads them again. Best-effort —
 		// errors are silent because the user does not need to act.
 		sweepOrphanManifestTmps(e.path, now.Add(-1*time.Hour))
+		// Only sweep temp build dirs when no build holds the build lock, so a
+		// genuinely-stalled-but-live builder (mtime older than the bound) is not
+		// pulled out from under itself. Same guard evictCorpus uses.
+		if bf, ok, _ := tryBuildLock(e.path); ok {
+			releaseLock(bf)
+			sweepOrphanBuildDirs(filepath.Join(e.path, "index"), now.Add(-buildTmpMaxAge))
+		}
 
 		// Capture size + display info BEFORE eviction — once the dir is
 		// renamed to .trash the original path is gone and corpusDirSize
@@ -393,6 +400,32 @@ func shouldRunGC(cacheRoot string, interval time.Duration) bool {
 //
 // Conservatively only sweeps known suffixes so we never collide with a
 // legitimate in-flight write.
+// buildTmpMaxAge is the age past which a leftover temp build dir is considered
+// orphaned (its builder crashed). A live builder writes shards continuously, so
+// its temp dir's mtime stays fresh well within this bound even for a large cold
+// build.
+const buildTmpMaxAge = time.Hour
+
+// sweepOrphanBuildDirs removes leftover .build-* temp index dirs (from a crashed
+// or killed builder) whose mtime is older than `before`. A still-running build's
+// temp dir has a recent mtime and is skipped.
+func sweepOrphanBuildDirs(indexDir string, before time.Time) {
+	entries, err := os.ReadDir(indexDir)
+	if err != nil {
+		return
+	}
+	for _, ent := range entries {
+		if !ent.IsDir() || !strings.HasPrefix(ent.Name(), buildDirPrefix) {
+			continue
+		}
+		info, err := ent.Info()
+		if err != nil || !info.ModTime().Before(before) {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(indexDir, ent.Name()))
+	}
+}
+
 func sweepOrphanManifestTmps(cacheDir string, before time.Time) {
 	entries, err := os.ReadDir(cacheDir)
 	if err != nil {
@@ -513,6 +546,18 @@ func evictCorpus(e corpusDirEntry, trashDir string, cutoff time.Time) gcRowResul
 		return gcRowResult{action: actionLocked}
 	}
 
+	// A temp-swap build runs lock-free, holding only the build lock (not the
+	// publish/read lock above). Skip eviction while a build is in progress so it
+	// is not pulled out from under the builder mid-build.
+	bf, ok, bErr := tryBuildLock(e.path)
+	if bErr != nil {
+		return gcRowResult{action: actionFailed, err: fmt.Errorf("try build lock: %w", bErr)}
+	}
+	if !ok {
+		return gcRowResult{action: actionLocked}
+	}
+	releaseLock(bf)
+
 	if used, ok := readUsedAt(e.path); ok && used.After(cutoff) {
 		return gcRowResult{action: actionKept}
 	}
@@ -543,16 +588,11 @@ func evictCorpus(e corpusDirEntry, trashDir string, cutoff time.Time) gcRowResul
 // pickDisplayShard chooses which shard's metadata to read for display.
 // Prefers a non-uncommitted shard so Repository.Source comes from the committed
 // corpus when available. Repository.Name may be an opaque fallback for local
-// repos without remote metadata. Zoekt's shard filename pattern is
-// `<urlencoded-name>_v<format>.<seq>.zoekt`, so an exact prefix match against
-// `uncommitted_` is reliable; a substring match on `uncommitted` would
-// false-positive on real repo names like `github.com/foo/uncommitted-tool`.
-// Returns shards[0] when all shards are uncommitted (their Source is still
-// the repo path).
+// repos without remote metadata. Returns shards[0] when all shards are
+// uncommitted (their Source is still the repo path).
 func pickDisplayShard(shards []string) string {
-	uncommittedPrefix := repoUncommitted + "_"
 	for _, s := range shards {
-		if !strings.HasPrefix(filepath.Base(s), uncommittedPrefix) {
+		if !isUncommittedShard(filepath.Base(s)) {
 			return s
 		}
 	}

@@ -56,7 +56,12 @@ func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexS
 	stateReady := false
 	selectedLoaded := false
 
-	if cachedState != "" {
+	// A leftover .swapping marker means a prior publish was interrupted and the
+	// shards may be torn; skip the warm fast path so the build lock + recovery
+	// run below.
+	swapPending := readCacheFile(plan.cacheDir, swappingMarkerFile) != ""
+
+	if cachedState != "" && !swapPending {
 		var err error
 		stateHash, selectedCount, err = folderCorpusFingerprint(ctx, plan)
 		if err != nil {
@@ -77,19 +82,22 @@ func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexS
 		return corpusSearchable, folderCorpusError(plan, fmt.Errorf("create folder index directory: %w", err))
 	}
 
-	lockPath := filepath.Join(plan.cacheDir, lockFile)
-	lockFd, acquired, err := acquireLock(ctx, plan.indexDir, lockPath)
+	buildFd, acquired, err := acquireBuildLock(ctx, plan.cacheDir, plan.indexDir)
 	if err != nil {
 		return corpusSearchable, folderCorpusError(plan, err)
 	}
 	if !acquired {
-		slog.Warn("Another process is indexing, using existing index")
+		// Another builder active and a usable index exists — serve current.
+		slog.Debug("Another process is indexing; serving current index")
 		return corpusSearchable, nil
 	}
-	defer releaseLock(lockFd)
+	defer releaseLock(buildFd)
 	defer func() {
 		_ = os.Remove(filepath.Join(plan.cacheDir, stateTmpFile))
 	}()
+
+	// Repair a crash that left a half-published swap before trusting state.
+	recoverIncompleteSwap(plan.cacheDir, plan.indexDir)
 
 	if !stateReady {
 		var err error
@@ -139,32 +147,55 @@ func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexS
 	}
 
 	repoName := folderRepoName(plan)
-	if selectedCount == 0 {
-		cleanRepositoryShards(plan.indexDir, repoName)
-		if err := writeStateFile(plan.cacheDir, stateHash); err != nil {
-			return corpusSearchable, folderCorpusError(plan, fmt.Errorf("write folder state file: %w", err))
-		}
-		return corpusKnownEmpty, nil
-	}
+	isDelta := cachedState != "" && hasShards
 
-	if err := checkCtagsCached(); err != nil {
-		deleteStateFiles(plan.cacheDir)
-		return corpusSearchable, folderCorpusError(plan, err)
-	}
-
-	parallelism := indexParallelism()
-	indexedAny, err := indexFolderDocuments(ctx, plan, repoName, selected, parallelism, cachedState != "" && hasShards, cachedState)
+	// Build into a temp dir, then publish atomically. A delta build needs the
+	// prior shards present, so seed them (hardlinks); a full build ignores them.
+	buildDir, err := newBuildDir(plan.indexDir)
 	if err != nil {
-		deleteStateFiles(plan.cacheDir)
 		return corpusSearchable, folderCorpusError(plan, err)
 	}
-	if err := writeStateFile(plan.cacheDir, stateHash); err != nil {
-		return corpusSearchable, folderCorpusError(plan, fmt.Errorf("write folder state file: %w", err))
+	defer discardBuildDir(buildDir)
+	if isDelta {
+		if err := seedFamily(plan.indexDir, buildDir, familyAll); err != nil {
+			return corpusSearchable, folderCorpusError(plan, err)
+		}
 	}
-	if err := writeFolderManifest(plan.cacheDir, stateHash, selected); err != nil {
-		slog.Debug("Failed to write folder manifest", "error", err)
+	bp := plan
+	bp.indexDir = buildDir // shards → buildDir; manifest stays in plan.cacheDir
+
+	indexedAny := false
+	if selectedCount > 0 {
+		if err := checkCtagsCached(); err != nil {
+			deleteStateFiles(plan.cacheDir)
+			return corpusSearchable, folderCorpusError(plan, err)
+		}
+		indexedAny, err = indexFolderDocuments(ctx, bp, repoName, selected, indexParallelism(), isDelta, cachedState)
+		if err != nil {
+			deleteStateFiles(plan.cacheDir)
+			return corpusSearchable, folderCorpusError(plan, err)
+		}
 	}
-	if !indexedAny {
+
+	// Publish atomically — shards + state under one publish-lock hold.
+	// selectedCount==0 → empty buildDir → the swap removes the live shards
+	// (known-empty).
+	if err := publishGeneration(ctx, plan.cacheDir, plan.indexDir, buildDir, familyAll, func() error {
+		return writeStateFile(plan.cacheDir, stateHash)
+	}); err != nil {
+		if errors.Is(err, errCorpusEvicted) {
+			return corpusSearchable, nil
+		}
+		return corpusSearchable, folderCorpusError(plan, err)
+	}
+	// The manifest is read only by the next build (under the build lock), not by
+	// searchers, so it is fine to write outside the publish lock.
+	if selectedCount > 0 {
+		if err := writeFolderManifest(plan.cacheDir, stateHash, selected); err != nil {
+			slog.Debug("Failed to write folder manifest", "error", err)
+		}
+	}
+	if selectedCount == 0 || !indexedAny {
 		return corpusKnownEmpty, nil
 	}
 	return corpusSearchable, nil

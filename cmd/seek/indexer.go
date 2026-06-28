@@ -35,8 +35,21 @@ const (
 	// no indexable shards. This prevents a missing/corrupt shard directory
 	// from being confused with an intentionally empty scoped layer.
 	emptyFile = ".empty"
-	// lockFile is used for mutual exclusion during indexing.
+	// lockFile is the publish/read lock: readers take it LOCK_SH across their
+	// whole glob+open+search; a temp-swap publish takes it LOCK_EX briefly.
 	lockFile = ".lock"
+	// buildLockFile is the single-flight build lock: a builder holds it LOCK_EX
+	// across the entire (possibly multi-minute) build. Readers NEVER take it, so
+	// a long build does not block searches — only the brief publish swap does.
+	buildLockFile = ".build.lock"
+	// swappingMarkerFile records, while present, that a temp-swap publish was
+	// interrupted mid-rename; the named shard family may be torn and must be
+	// cleaned + fully rebuilt on the next build (see recoverIncompleteSwap).
+	swappingMarkerFile = ".swapping"
+	// buildDirPrefix names per-build temp index dirs (cacheDir/index/.build-*).
+	// Dot-prefixed so gc enumeration / shardsExist / size walks ignore them.
+	// Reaped by sweepOrphanBuildDirs after buildTmpMaxAge (gc.go).
+	buildDirPrefix = ".build-"
 	// repoUncommitted is the zoekt repository name for uncommitted file shards.
 	repoUncommitted = "uncommitted"
 	// emptyGitTreeSHA is Git's canonical SHA-1 for the empty tree.
@@ -273,8 +286,21 @@ func checkCtags() error {
 	return fmt.Errorf("universal-ctags required but not found.\n  macOS:  brew install universal-ctags\n  Linux:  sudo apt-get install universal-ctags\n  Or set CTAGS_COMMAND=/path/to/ctags")
 }
 
-// runIndexingWithCache orchestrates committed and uncommitted indexing with
-// corpus metadata in cacheDir and Zoekt shards in indexDir.
+// runIndexingWithCache makes the combined committed+uncommitted git index
+// current using the single-flight temp-swap protocol:
+//
+//   - .build.lock (acquireBuildLock) serializes builders and is held across the
+//     whole build; readers never take it, so a long build never blocks search.
+//   - The committed family (the multi-minute case) is built lock-free into a
+//     temp dir seeded with the current shards (hardlinks, for zoekt's delta
+//     baseline), HEAD is re-validated BEFORE publish (closes gap-e), then it is
+//     swapped into the live dir under the brief publish lock.
+//   - The uncommitted family is fast and carries a cacheDir manifest, so it is
+//     rebuilt in-place under that same brief publish lock (readers excluded for
+//     its sub-second build), avoiding a temp/manifest desync.
+//
+// Readers hold the publish lock LOCK_SH across their whole glob+open, so they
+// observe exactly the pre- or post-swap shard set — never torn.
 func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDir string, state repoState, preState string) error {
 	repoDir := paths.RepoDir
 	// Fail fast if ctags is missing. Uses sync.Once cache so the PATH
@@ -284,26 +310,29 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 		return gitCorpusError(repoDir, indexDir, err)
 	}
 
-	lockPath := filepath.Join(cacheDir, lockFile)
-
-	// Ensure partial temp files are cleaned up on all exit paths
+	// Ensure partial temp files are cleaned up on all exit paths.
 	defer func() {
 		_ = os.Remove(filepath.Join(cacheDir, stateTmpFile))
 		_ = os.Remove(filepath.Join(cacheDir, headFile+".tmp"))
 	}()
 
-	lockFd, acquired, err := acquireLock(ctx, indexDir, lockPath)
+	buildFd, acquired, err := acquireBuildLock(ctx, cacheDir, indexDir)
 	if err != nil {
 		return err
 	}
 	if !acquired {
-		// Lock not acquired but shards exist — use stale index
-		slog.Warn("Another process is indexing, using existing index")
+		// Another builder is active and a usable index exists — serve current
+		// shards; the active builder publishes the fresh ones.
+		slog.Debug("Another process is indexing; serving current index")
 		return nil
 	}
-	defer releaseLock(lockFd)
+	defer releaseLock(buildFd)
 
-	// Double-check state after acquiring lock
+	// Repair a crash that left a half-published swap before trusting state.
+	recoverIncompleteSwap(cacheDir, indexDir)
+
+	// Double-check state after acquiring the build lock (a peer may have just
+	// published this generation).
 	cachedState := readStateFile(cacheDir)
 	if cachedState == preState {
 		return nil
@@ -317,84 +346,98 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	}
 
 	hasDirty := len(state.Files) > 0
-
-	// Skip committed indexing when HEAD hasn't moved since the last
-	// successful index. This avoids ~560µs of git repo opening + shard
-	// metadata reads on the incremental no-op path, and eliminates CPU
-	// contention when running alongside the uncommitted indexer.
+	// Skip committed indexing when HEAD hasn't moved since the last successful
+	// index (cheap incremental no-op path).
 	needCommitted := state.HeadSHA != readHeadFile(cacheDir)
+
+	// --- Committed family: lock-free build into a seeded temp dir. ---
+	var buildDir string
 	if needCommitted {
 		if _, err := scanGitCommittedIndexBudget(ctx, repoDir, gitCandidateFileLimit, gitCorpusIndexedByteLimit); err != nil {
 			deleteStateFiles(cacheDir)
 			return gitCorpusError(repoDir, indexDir, err)
 		}
+		buildDir, err = newBuildDir(indexDir)
+		if err != nil {
+			return err
+		}
+		defer discardBuildDir(buildDir)
+		if err := seedFamily(indexDir, buildDir, familyCommitted); err != nil {
+			return err
+		}
+		if cErr := indexCommitted(repoDir, buildDir, parallelism); cErr != nil {
+			slog.Warn("Committed indexing failed", "error", cErr)
+			if errors.Is(cErr, errGitCapExceeded) {
+				deleteStateFiles(cacheDir)
+				return cErr
+			}
+			// Cold cache with no usable shards anywhere — surface the failure.
+			if !shardsExist(buildDir) && !shardsExist(indexDir) {
+				deleteStateFiles(cacheDir)
+				return cErr
+			}
+			// Partial committed build: discard it, keep the live shards.
+			return nil
+		}
+		// validate-before-publish (gap-e): HEAD must still equal what we indexed,
+		// else the build is torn (indexed across two HEADs). Discard it; the live
+		// shards are untouched. This is the across-call bounded retry: the caller
+		// re-derives fresh state each search, so the next invocation rebuilds at
+		// the now-current HEAD — converging once HEAD stabilizes, with warm repos
+		// serving the prior consistent generation in the meantime.
+		if cur, hErr := gitHeadTreeish(ctx, repoDir); hErr != nil ||
+			normalizeCommittedTreeish(cur) != normalizeCommittedTreeish(state.HeadSHA) {
+			slog.Warn("HEAD moved during committed index; will re-index on next search")
+			return nil // discard build; live shards untouched
+		}
 	}
 
-	// Run committed and uncommitted indexing. They write different shard
-	// files (the committed repo name vs "uncommitted" prefix) so when
-	// both are needed they run in parallel. The committed repo name may
-	// come from Zoekt config/origin metadata, or from seek's opaque
-	// fallback for local repos with no remote.
-	var committedErr, uncommittedErr error
-	if hasDirty && needCommitted {
-		committedDone := make(chan error, 1)
-		go func() {
-			committedDone <- indexCommitted(repoDir, indexDir, parallelism)
-		}()
+	// --- Publish: brief EX covering the committed swap + in-place uncommitted
+	// build + the state/head write below, so readers (SH) observe one consistent
+	// epoch. INVARIANT: writeStateFile/writeHeadFile (below) MUST stay inside
+	// this pub-lock hold (it is released by the deferred releaseLock at function
+	// return) — the same shards-then-state atomicity publishGeneration documents.
+	// Moving the state write out of the lock would let a reader observe new
+	// shards with a stale-matching state label (the torn-state bug). ---
+	pub, err := acquirePublishLock(ctx, cacheDir)
+	if err != nil {
+		if errors.Is(err, errCorpusEvicted) {
+			return nil // corpus gc-evicted during build; next search rebuilds
+		}
+		return err
+	}
+	defer releaseLock(pub)
+	if _, sErr := os.Stat(indexDir); sErr != nil {
+		return nil // evicted; discard
+	}
+
+	if needCommitted {
+		if err := publishShardFamilyLocked(cacheDir, indexDir, buildDir, familyCommitted); err != nil {
+			return fmt.Errorf("publish committed shards: %w", err)
+		}
+	}
+
+	var uncommittedErr error
+	if hasDirty {
 		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, cacheDir, state, cachedState, preState, parallelism)
-		committedErr = <-committedDone
-	} else if hasDirty {
-		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, cacheDir, state, cachedState, preState, parallelism)
-	} else if needCommitted {
-		committedErr = indexCommitted(repoDir, indexDir, parallelism)
-		cleanUncommittedShards(indexDir)
-		deleteUncommittedManifest(cacheDir)
+		if uncommittedErr != nil {
+			slog.Warn("Uncommitted indexing failed", "error", uncommittedErr)
+		}
 	} else {
-		// HEAD unchanged, no dirty files — this shouldn't normally
-		// reach here (state hash would match), but handle defensively.
 		cleanUncommittedShards(indexDir)
 		deleteUncommittedManifest(cacheDir)
 	}
 
-	if committedErr != nil {
-		slog.Warn("Committed indexing failed", "error", committedErr)
-	}
-	if uncommittedErr != nil {
-		slog.Warn("Uncommitted indexing failed", "error", uncommittedErr)
-	}
-
-	// Post-indexing verification — re-stat the known dirty files to detect
-	// changes made during the indexing window. This replaces a full
-	// gitRepoStateIn call (~250-450ms on large repos) with cheap Lstat
-	// calls (~0.004ms) on only the files we just indexed.
-	//
-	// What this catches: any dirty file modified, deleted, or atomically
-	// replaced during indexing (mtime, size, or inode change).
-	//
-	// What this defers to the next search: new untracked files appearing
-	// or HEAD changes during the indexing window. Both are caught by the
-	// next invocation's git status call in run(), which always runs
-	// a full git status.
+	// Re-stat the dirty files to detect changes during the (sub-second)
+	// uncommitted build window.
 	postState := gitCorpusStateHash(paths, state)
 
-	if committedErr != nil || uncommittedErr != nil {
-		// Don't cache state when either indexing step failed — forces
-		// re-index on next search so transient failures don't leave
-		// uncommitted content permanently invisible.
+	if uncommittedErr != nil {
 		deleteStateFiles(cacheDir)
-		if errors.Is(committedErr, errGitCapExceeded) {
-			return committedErr
-		}
 		if errors.Is(uncommittedErr, errGitCapExceeded) {
 			return uncommittedErr
 		}
-		// On a cold cache, surface the real indexer failure instead of
-		// letting the later search path collapse it into "no index shards".
-		// Once any shard exists, preserve the stale/partial fallback.
 		if !shardsExist(indexDir) {
-			if committedErr != nil {
-				return committedErr
-			}
 			return uncommittedErr
 		}
 		slog.Warn("Index incomplete, will re-index on next search")
@@ -405,8 +448,7 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 		if err := writeStateFile(cacheDir, preState); err != nil {
 			return fmt.Errorf("write state file: %w", err)
 		}
-		// Persist the HEAD SHA so subsequent runs with only working tree
-		// changes can skip the committed indexer entirely.
+		// Persist HEAD so working-tree-only changes skip the committed indexer.
 		if err := writeHeadFile(cacheDir, state.HeadSHA); err != nil {
 			slog.Warn("Failed to write head file", "error", err)
 		}

@@ -18,8 +18,8 @@ import (
 // through os.Truncate. Lstat.Size drives the Acquire weight, so
 // behaviour matches dense files.
 func TestEnsureFolderCorpusFresh_BeyondInFlightBudget(t *testing.T) {
-	const testBudget int64 = 4 * 1024 * 1024 // 4 MiB
-	const fileSize int64 = 512 * 1024        // 512 KiB
+	const testBudget int64 = 4 * 1024 * 1024  // 4 MiB
+	const fileSize int64 = 512 * 1024         // 512 KiB
 	const totalBytes int64 = 12 * 1024 * 1024 // 12 MiB > budget
 	defer setupPressureTest(t, testBudget, 60*time.Second)()
 
@@ -67,7 +67,7 @@ func TestEnsureFolderCorpusFresh_BeyondInFlightBudget(t *testing.T) {
 // side. Beacon search proves cross-window searchability.
 func TestEnsureFolderCorpusFresh_AtBudgetBoundary(t *testing.T) {
 	const testBudget int64 = 4 * 1024 * 1024
-	const fileSize int64 = 1024 * 1024 // 1 MiB
+	const fileSize int64 = 1024 * 1024       // 1 MiB
 	const totalBytes int64 = 8 * 1024 * 1024 // 2× budget
 	defer setupPressureTest(t, testBudget, 60*time.Second)()
 
@@ -173,4 +173,3 @@ func TestEnsureFolderCorpusFresh_SparseFiles(t *testing.T) {
 		t.Fatal("sparse beacon not found post-index; shards may be corrupt")
 	}
 }
-

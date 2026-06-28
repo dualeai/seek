@@ -8,88 +8,6 @@ import (
 	"time"
 )
 
-// TestAcquireSearchLock_StaleShardFallback verifies the new fallback
-// branch in lock.go:115-118. Pre-existing shards in indexDir +
-// LOCK_EX held by another goroutine → acquireSearchLock returns nil
-// without polling, so search proceeds against stale shards instead of
-// blocking 60s. Mirrors acquireLock's stale-shard fallback.
-func TestAcquireSearchLock_StaleShardFallback(t *testing.T) {
-	dir := t.TempDir()
-	indexDir := dir
-	// Create a fake shard file so shardsExist returns true.
-	if err := os.WriteFile(filepath.Join(indexDir, "fakerepo_v17.00000.zoekt"), []byte{0}, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	lockPath := filepath.Join(dir, ".lock")
-	// Holder: take LOCK_EX and keep it for the duration of the test.
-	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { unlockFile(holder); _ = holder.Close() })
-	if err := lockFileExclusive(holder); err != nil {
-		t.Fatalf("holder lock: %v", err)
-	}
-
-	// Search side: open a fresh fd on the same lockfile, attempt
-	// acquireSearchLock. Must return nil within ms (no poll).
-	searchFd, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = searchFd.Close() })
-
-	start := time.Now()
-	if err := acquireSearchLock(context.Background(), indexDir, searchFd); err != nil {
-		t.Fatalf("acquireSearchLock: %v", err)
-	}
-	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
-		t.Fatalf("acquireSearchLock took %v; expected <200ms (stale-fallback should not poll)", elapsed)
-	}
-}
-
-// TestAcquireSearchLock_NoShardsPolls verifies the OTHER branch — no
-// shards exist + LOCK_EX held → poll the lock with 60s timeout. Uses
-// a holder that releases after 100ms so the poll succeeds before the
-// timeout.
-func TestAcquireSearchLock_NoShardsPolls(t *testing.T) {
-	dir := t.TempDir()
-	indexDir := dir // empty
-
-	lockPath := filepath.Join(dir, ".lock")
-	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := lockFileExclusive(holder); err != nil {
-		t.Fatalf("holder lock: %v", err)
-	}
-	// Unlocker goroutine — synchronized via channel so Cleanup runs
-	// only after the goroutine exits (avoids -race fd-state race).
-	unlockerDone := make(chan struct{})
-	go func() {
-		defer close(unlockerDone)
-		time.Sleep(100 * time.Millisecond)
-		unlockFile(holder)
-	}()
-	t.Cleanup(func() { <-unlockerDone; _ = holder.Close() })
-
-	searchFd, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = searchFd.Close() })
-
-	start := time.Now()
-	if err := acquireSearchLock(context.Background(), indexDir, searchFd); err != nil {
-		t.Fatalf("acquireSearchLock: %v", err)
-	}
-	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
-		t.Fatalf("acquireSearchLock returned in %v; expected to have polled the lock", elapsed)
-	}
-}
-
 func TestLockFileExclusive_Basic(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".lock")
@@ -161,124 +79,147 @@ func TestLockFileExclusive_ReleaseAndReacquire(t *testing.T) {
 	unlockFile(f)
 }
 
-func TestAcquireLock_Immediate(t *testing.T) {
+func TestAcquireBuildLock_SingleFlight(t *testing.T) {
 	dir := t.TempDir()
-	lockPath := filepath.Join(dir, ".lock")
-
-	fd, acquired, err := acquireLock(context.Background(), dir, lockPath)
+	indexDir := filepath.Join(dir, "index")
+	first, acquired, err := acquireBuildLock(context.Background(), dir, indexDir)
+	if err != nil || !acquired {
+		t.Fatalf("first acquireBuildLock: acquired=%v err=%v", acquired, err)
+	}
+	// A second builder must NOT acquire while the first holds it.
+	f2, ok, err := tryBuildLock(dir)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("tryBuildLock: %v", err)
 	}
-	if !acquired {
-		t.Fatal("expected lock to be acquired")
+	if ok {
+		releaseLock(f2)
+		t.Fatal("tryBuildLock acquired while build lock held by first")
 	}
-	if fd == nil {
-		t.Fatal("expected non-nil fd")
+	// With shards present, a second builder SKIPS (acquired=false) instead of
+	// blocking on the peer's build.
+	if err := os.MkdirAll(indexDir, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	releaseLock(fd)
+	if err := os.WriteFile(filepath.Join(indexDir, "x_v16.00000.zoekt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f4, ok4, err := acquireBuildLock(context.Background(), dir, indexDir)
+	if err != nil {
+		t.Fatalf("second acquireBuildLock: %v", err)
+	}
+	if ok4 {
+		releaseLock(f4)
+		t.Fatal("second acquireBuildLock should skip (false) when held + shards exist")
+	}
+	releaseLock(first)
+	// After release, the slot is free again.
+	f3, ok, err := tryBuildLock(dir)
+	if err != nil || !ok {
+		t.Fatalf("tryBuildLock after release: ok=%v err=%v", ok, err)
+	}
+	releaseLock(f3)
 }
 
-func TestAcquireLock_StaleFallback(t *testing.T) {
+func TestAcquirePublishLock_EvictedReturnsErrCorpusEvicted(t *testing.T) {
 	dir := t.TempDir()
-	lockPath := filepath.Join(dir, ".lock")
+	// No .lock file exists (simulating an evicted corpus dir).
+	_, err := acquirePublishLock(context.Background(), dir)
+	if err != errCorpusEvicted {
+		t.Fatalf("expected errCorpusEvicted for missing lock file, got %v", err)
+	}
+	// With the lock file present, it acquires.
+	if err := os.WriteFile(filepath.Join(dir, lockFile), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := acquirePublishLock(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("acquirePublishLock with lock file present: %v", err)
+	}
+	releaseLock(f)
+}
 
-	// Create a shard so the stale fallback path is taken
-	_ = os.WriteFile(filepath.Join(dir, "repo_v16.00000.zoekt"), []byte{}, 0o644)
+func TestAcquireReadLock_SharedConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, lockFile)
+	indexDir := filepath.Join(dir, "index")
+	if err := os.MkdirAll(indexDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	open := func() *os.File {
+		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	a, b := open(), open()
+	defer releaseLock(a)
+	defer releaseLock(b)
+	if err := acquireReadLock(context.Background(), indexDir, a); err != nil {
+		t.Fatalf("first read lock: %v", err)
+	}
+	// A second shared read lock must also succeed concurrently.
+	if err := acquireReadLock(context.Background(), indexDir, b); err != nil {
+		t.Fatalf("second concurrent read lock: %v", err)
+	}
+}
 
-	// Hold the lock from another fd
+func TestAcquireReadLock_WedgedSwapStaleValve(t *testing.T) {
+	old := readLockTimeout
+	readLockTimeout = 150 * time.Millisecond
+	defer func() { readLockTimeout = old }()
+
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, lockFile)
+	indexDir := filepath.Join(dir, "index")
+	if err := os.MkdirAll(indexDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Shards present so the stale valve is allowed.
+	if err := os.WriteFile(filepath.Join(indexDir, "x_v16.00000.zoekt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Hold EX (a wedged swap) on a separate fd.
 	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = holder.Close() })
 	if err := lockFileExclusive(holder); err != nil {
-		t.Fatal(err)
+		t.Fatalf("hold EX: %v", err)
 	}
+	defer releaseLock(holder)
 
-	// acquireLock should return (nil, false, nil) — stale fallback
-	fd, acquired, err := acquireLock(context.Background(), dir, lockPath)
-	if err != nil {
-		t.Fatalf("expected no error on stale fallback, got %v", err)
-	}
-	if acquired {
-		t.Fatal("expected lock NOT to be acquired (stale fallback)")
-	}
-	if fd != nil {
-		t.Fatal("expected nil fd on stale fallback")
-	}
-
-	unlockFile(holder)
-}
-
-func TestAcquireLock_PollAndAcquire(t *testing.T) {
-	dir := t.TempDir()
-	lockPath := filepath.Join(dir, ".lock")
-	// No shards — this forces the poll path
-
-	// Hold the lock from another fd
-	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	reader, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	if err := lockFileExclusive(holder); err != nil {
-		t.Fatal(err)
-	}
-
-	// Release after 300ms
-	go func() {
-		time.Sleep(300 * time.Millisecond)
-		unlockFile(holder)
-		_ = holder.Close()
-	}()
-
-	start := time.Now()
-	fd, acquired, err := acquireLock(context.Background(), dir, lockPath)
-	elapsed := time.Since(start)
-
-	if err != nil {
-		t.Fatalf("expected eventual success, got %v", err)
-	}
-	if !acquired {
-		t.Fatal("expected lock to be acquired after polling")
-	}
-	if fd == nil {
-		t.Fatal("expected non-nil fd")
-	}
-	releaseLock(fd)
-
-	if elapsed < 200*time.Millisecond {
-		t.Errorf("expected polling delay, but acquired in %v", elapsed)
+	defer func() { _ = reader.Close() }()
+	// EX wedged + shards exist → after the bounded wait, degrade to stale read.
+	if err := acquireReadLock(context.Background(), indexDir, reader); err != nil {
+		t.Fatalf("wedged-swap stale valve should return nil, got %v", err)
 	}
 }
 
-func TestAcquireLock_Timeout(t *testing.T) {
+// TestAcquireBuildLock_TouchesUsedAtStart covers FIX B: a build bumps the
+// corpus .used at start so a concurrent gc cannot evict it in the window between
+// the build releasing the lock and the search re-opening the corpus.
+func TestAcquireBuildLock_TouchesUsedAtStart(t *testing.T) {
 	dir := t.TempDir()
-	lockPath := filepath.Join(dir, ".lock")
-	// No shards — forces poll path
+	indexDir := filepath.Join(dir, "index")
+	if err := os.MkdirAll(indexDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f, ok, err := acquireBuildLock(context.Background(), dir, indexDir)
+	if err != nil || !ok {
+		t.Fatalf("acquireBuildLock: ok=%v err=%v", ok, err)
+	}
+	defer releaseLock(f)
 
-	// Hold the lock forever
-	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	info, err := os.Stat(filepath.Join(dir, usedFile))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf(".used must be created at build start: %v", err)
 	}
-	t.Cleanup(func() {
-		unlockFile(holder)
-		_ = holder.Close()
-	})
-	if err := lockFileExclusive(holder); err != nil {
-		t.Fatal(err)
-	}
-
-	// Use a short timeout via context
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-
-	_, acquired, err := acquireLock(ctx, dir, lockPath)
-	if err == nil {
-		t.Fatal("expected timeout error")
-	}
-	if acquired {
-		t.Fatal("should not acquire lock on timeout")
+	if d := time.Since(info.ModTime()); d > 30*time.Second {
+		t.Fatalf(".used should be fresh after build-start touch, age=%v", d)
 	}
 }

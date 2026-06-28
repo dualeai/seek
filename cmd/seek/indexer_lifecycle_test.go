@@ -359,9 +359,9 @@ func TestReader_BackPressureQueuesAcquires(t *testing.T) {
 	const testBudget = 16 * 1024 * 1024 // 16 MiB
 	const fileSize = 4 * 1024 * 1024    // 4 MiB → budget/file = 4
 	const expectedPeakLimit = testBudget / fileSize
-	const parallelism = 2 * expectedPeakLimit  // 8 → forces queueing
-	const numConsumers = parallelism            // match readers
-	const numFiles = 4 * expectedPeakLimit      // 16 → multiple rounds
+	const parallelism = 2 * expectedPeakLimit // 8 → forces queueing
+	const numConsumers = parallelism          // match readers
+	const numFiles = 4 * expectedPeakLimit    // 16 → multiple rounds
 	const consumerHold = 3 * time.Millisecond
 
 	restore := swapReadSemaphoreForTest(testBudget)
