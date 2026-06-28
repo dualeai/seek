@@ -53,17 +53,21 @@ type corpusPlan struct {
 	// scope is the search-time And() filter for a scoped Git search. Both
 	// scoped and unscoped searches of one repo resolve to the SAME combined
 	// whole-repo index (cacheDir/indexDir); scope just restricts which loaded
-	// docs match, so committed+dirty share one shard set (one BM25 avgdl) and
-	// a scoped result set equals the unscoped result set intersected with it.
-	scope      query.Q
-	gitPaths   *gitPaths
+	// docs match. Because a scoped search reads the exact same shards as the
+	// unscoped one, each matched doc gets the identical (per-shard) BM25 score,
+	// so a scoped result set equals the unscoped result set intersected with it.
+	scope    query.Q
+	gitPaths *gitPaths
+	// dirtyScope is the Git pathspec defining a scoped search (nil = unscoped).
+	// Retained only to key/build the over-cap fallback below.
 	dirtyScope *gitDirtyScope
 	// scoped* is the over-cap fallback: a single per-scope COMBINED index
-	// (committed+dirty in one dir, keyed by dirtyScope.key) built ONLY when
-	// the whole repo exceeds the index caps, so a huge sibling cannot cap a
-	// small scope. Empty on unscoped plans and on under-cap scoped searches;
-	// scopedStateHash != "" means the fallback was built and must be searched
-	// (and validated) instead of the combined index.
+	// (committed+dirty in one dir) built ONLY when the whole repo exceeds the
+	// index caps, so a huge sibling cannot cap a small scope. The dir is keyed
+	// by dirtyScope.key; the generation (scopedStateHash) by HEAD + scope +
+	// in-scope working tree. Empty on unscoped plans and on under-cap scoped
+	// searches; scopedStateHash != "" means the fallback was built and must be
+	// searched (and validated) instead of the combined index.
 	scopedCacheDir  string
 	scopedIndexDir  string
 	scopedStateHash string
@@ -600,7 +604,7 @@ func crossesGitBoundary(parent string, child externalRoot) bool {
 
 // buildGitCorpusPlan is the shared constructor for both the
 // explicit-operand path (planCurrentGitCorpus) and the walker-discovery
-// path (planDiscoveredGitCorpus). Both flows mint a corpus with the
+// path (planDiscoveredGitPaths). Both flows mint a corpus with the
 // same identity (kind, root, dev:ino) so the same physical repo
 // reached via multiple paths — e.g. CLI operand AND walker
 // discovery — collapses to one cache dir.

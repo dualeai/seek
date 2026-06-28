@@ -25,7 +25,8 @@ import (
 //   - readSemaphore returns to its starting balance at the end.
 //
 // Run path:
-//   SEEK_SOAK=1 go test -tags=soak ./cmd/seek -run TestSoak_LargeFolderForFiveMinutes -timeout=15m
+//
+//	SEEK_SOAK=1 go test -tags=soak ./cmd/seek -run TestSoak_LargeFolderForFiveMinutes -timeout=15m
 func TestSoak_LargeFolderForFiveMinutes(t *testing.T) {
 	if os.Getenv("SEEK_SOAK") != "1" {
 		t.Skip("set SEEK_SOAK=1 to run soak test")

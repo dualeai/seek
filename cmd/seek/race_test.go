@@ -104,7 +104,7 @@ func TestFix_SharedLockBlocksSearchDuringIndexing(t *testing.T) {
 			_ = f.Close()
 		}()
 		// This polls until LOCK_EX is released
-		if err := acquireSearchLock(context.Background(), filepath.Dir(f.Name()), f); err != nil {
+		if err := acquireReadLock(context.Background(), filepath.Dir(f.Name()), f); err != nil {
 			return
 		}
 		sharedAcquiredAt.Store(time.Now().UnixNano())
@@ -244,5 +244,90 @@ func TestFix_ConcurrentSearchDuringReindex_Stress(t *testing.T) {
 	}
 	if len(latestFiles) == 0 {
 		t.Fatalf("latest dirty marker should be searchable after contention settles")
+	}
+}
+
+// TestFix_ConcurrentSearchDuringCommittedSwap forces the committed-family
+// temp-swap (delete-live-then-rename) to overlap live searches by COMMITTING a
+// new file each builder iteration (HEAD moves → needCommitted → committed swap
+// every cycle). A stable committed marker must be found on EVERY concurrent
+// search — proving the publish EX lock excludes readers from the non-atomic
+// swap window. The existing TestFix_* only edit the working tree (HEAD fixed),
+// so they never exercise this path.
+func TestFix_ConcurrentSearchDuringCommittedSwap(t *testing.T) {
+	requireTools(t)
+	dir := initGitRepo(t, "stable.go", "package main\n// always_committed_marker\n")
+	ctx := context.Background()
+	paths, plan := planGitTestCorpus(t, dir)
+
+	st := gitRepoStateIn(ctx, dir)
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, st, gitCorpusStateHash(paths, st)); err != nil {
+		t.Fatalf("initial committed index: %v", err)
+	}
+
+	var missed, searchErr atomic.Int64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 20; i++ {
+			writeTrackedFile(t, dir, fmt.Sprintf("c_%d.go", i), fmt.Sprintf("package main\n// commit_%d\n", i))
+			s := gitRepoStateIn(ctx, dir)
+			_ = runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, s, gitCorpusStateHash(paths, s))
+		}
+	}()
+
+	for r := 0; r < 24; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 10; i++ {
+				res, err := searchPlannedCorpusForTest(ctx, plan, "always_committed_marker")
+				if err != nil {
+					searchErr.Add(1)
+					return
+				}
+				if len(res) == 0 {
+					missed.Add(1)
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if missed.Load() > 0 {
+		t.Errorf("committed shard gap during swap: %d misses (reader saw no committed shards mid-swap)", missed.Load())
+	}
+	if searchErr.Load() > 0 {
+		t.Errorf("%d search errors during committed swap", searchErr.Load())
+	}
+}
+
+// TestGC_SkipsCorpusWithBuildInProgress covers the Phase 2 gc guard: a lock-free
+// temp-swap build holds only .build.lock (not .lock), so evictCorpus must also
+// try .build.lock and skip eviction while a build is in progress.
+func TestGC_SkipsCorpusWithBuildInProgress(t *testing.T) {
+	root := cacheRootForTest(t)
+	dir := seedCorpus(t, root, fakeCorpusHash(91), time.Now().Add(-30*24*time.Hour))
+
+	// Simulate an in-flight builder holding the build lock.
+	bf, err := os.OpenFile(filepath.Join(dir, buildLockFile), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { unlockFile(bf); _ = bf.Close() }()
+	if err := lockFileExclusive(bf); err != nil {
+		t.Fatalf("hold build lock: %v", err)
+	}
+
+	runGC(context.Background(), gcOptions{maxAge: defaultGCMaxAge}, defaultGCInterval)
+
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("corpus with build in progress must survive gc, got %v", err)
 	}
 }

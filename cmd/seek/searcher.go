@@ -16,7 +16,7 @@ import (
 
 const (
 	// searchTimeout is the maximum wall-clock time for a single search.
-	// Matches the lock acquisition timeout in acquireLock.
+	// Matches the pollLock timeout used by the lock acquisition helpers.
 	searchTimeout = 60 * time.Second
 	// searchContextLines is the number of context lines included before and
 	// after each match.

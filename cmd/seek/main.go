@@ -389,7 +389,7 @@ func ensureGitCorpusFresh(ctx context.Context, plan *corpusPlan, paths gitPaths)
 			if markErr := writeGitCapMarker(plan.cacheDir, gitCapMarkerValue(treeish)); markErr != nil {
 				// Best-effort optimization cache; a read-only/full cache dir must
 				// not fail a search the fallback can serve. Log and continue.
-				slog.Warn("write git cap marker", "error", markErr, "dir", plan.cacheDir)
+				slog.Warn("Failed to write git cap marker", "error", markErr, "cache_dir", plan.cacheDir)
 			}
 			return ensureScopedGitCorpusFallback(ctx, plan, paths, state)
 		}
@@ -420,6 +420,11 @@ func ensureCombinedGitCorpus(ctx context.Context, plan corpusPlan, paths gitPath
 
 	currentState := gitCorpusStateHash(paths, state)
 	hasShards := shardsExist(plan.indexDir)
+	// A leftover .swapping marker means a prior publish was interrupted and the
+	// shards may be torn; force the build path so recoverIncompleteSwap runs even
+	// when state otherwise looks current.
+	swapPending := readCacheFile(plan.cacheDir, swappingMarkerFile) != ""
+	needBuild := currentState != cachedState || !hasShards || swapPending
 	if (currentState != cachedState || !hasShards) && gitCorpusKnownEmpty(ctx, paths, state) {
 		if cachedState == currentState && !hasShards {
 			return corpusKnownEmpty, nil
@@ -433,7 +438,7 @@ func ensureCombinedGitCorpus(ctx context.Context, plan corpusPlan, paths gitPath
 		}
 	}
 
-	if currentState != cachedState || !hasShards {
+	if needBuild {
 		if err := os.MkdirAll(plan.indexDir, 0o755); err != nil {
 			return corpusSearchable, fmt.Errorf("create index directory: %w", err)
 		}
@@ -471,31 +476,54 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 		ensureFSMonitor(ctx, paths)
 	}
 
-	// Fast path: state matches and shards (or an empty marker) are present.
-	if st, ok := scopedFallbackCached(cacheDir, indexDir, currentState); ok {
-		plan.scopedStateHash = currentState
-		return state, st, nil
+	// Fast path: state matches and shards (or an empty marker) are present. A
+	// leftover .swapping marker means a prior publish was interrupted and the
+	// family may be torn — skip the fast path so the build lock + recovery run.
+	if readCacheFile(cacheDir, swappingMarkerFile) == "" {
+		if st, ok := scopedFallbackCached(cacheDir, indexDir, currentState); ok {
+			plan.scopedStateHash = currentState
+			return state, st, nil
+		}
 	}
 
 	if err := os.MkdirAll(indexDir, 0o755); err != nil {
 		return repoState{}, corpusSearchable, fmt.Errorf("create scoped fallback index directory: %w", err)
 	}
-	lockFd, err := acquireLockStrict(ctx, filepath.Join(cacheDir, lockFile))
+	buildFd, acquired, err := acquireBuildLock(ctx, cacheDir, indexDir)
 	if err != nil {
 		return repoState{}, corpusSearchable, err
 	}
-	defer releaseLock(lockFd)
+	if !acquired {
+		// Another builder is active and a usable fallback index exists — serve
+		// the currently published generation (route search to the fallback dir
+		// by reporting its on-disk state).
+		slog.Debug("Another process is indexing; serving current index")
+		onDisk := readStateFile(cacheDir)
+		if onDisk == "" {
+			onDisk = currentState
+		}
+		plan.scopedStateHash = onDisk
+		return state, corpusSearchable, nil
+	}
+	defer releaseLock(buildFd)
 	defer func() { _ = os.Remove(filepath.Join(cacheDir, stateTmpFile)) }()
 
-	// Re-check under the lock (another process may have built it).
+	recoverIncompleteSwap(cacheDir, indexDir)
+
+	// Re-check under the build lock (another process may have built it).
 	if st, ok := scopedFallbackCached(cacheDir, indexDir, currentState); ok {
 		plan.scopedStateHash = currentState
 		return state, st, nil
 	}
 
-	// Wholesale rebuild: drop every shard (committed git-* and uncommitted_*)
-	// then rebuild both passes into the one dir.
-	cleanAllShards(indexDir)
+	// Wholesale rebuild into a temp dir (committed git-* + uncommitted_*), then
+	// publish atomically. The fallback always force-rebuilds uncommitted
+	// (cachedState ""), so there is no delta baseline to seed.
+	buildDir, err := newBuildDir(indexDir)
+	if err != nil {
+		return repoState{}, corpusSearchable, err
+	}
+	defer discardBuildDir(buildDir)
 
 	if treeish != "no-head" {
 		_, selected, err := scanGitCommittedScopeBudgetAt(ctx, paths.RepoDir, treeish, plan.dirtyScope, gitCandidateFileLimit, gitCorpusIndexedByteLimit)
@@ -508,7 +536,7 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 				deleteStateFiles(cacheDir)
 				return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, indexDir, err)
 			}
-			if _, err := indexScopedCommitted(ctx, paths.RepoDir, indexDir, treeish, plan.dirtyScope, indexParallelism()); err != nil {
+			if _, err := indexScopedCommitted(ctx, paths.RepoDir, buildDir, treeish, plan.dirtyScope, indexParallelism()); err != nil {
 				deleteStateFiles(cacheDir)
 				return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, indexDir, err)
 			}
@@ -516,7 +544,7 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 	}
 
 	if len(scopedState.Files) > 0 {
-		if err := checkGitDirtyFileBudget(paths.RepoDir, indexDir, scopedState.Files); err != nil {
+		if err := checkGitDirtyFileBudget(paths.RepoDir, buildDir, scopedState.Files); err != nil {
 			deleteStateFiles(cacheDir)
 			return repoState{}, corpusSearchable, err
 		}
@@ -524,28 +552,33 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 			deleteStateFiles(cacheDir)
 			return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, indexDir, err)
 		}
-		if err := indexUncommitted(ctx, paths.RepoDir, indexDir, cacheDir, scopedState, "", currentState, indexParallelism()); err != nil {
+		if err := indexUncommitted(ctx, paths.RepoDir, buildDir, cacheDir, scopedState, "", currentState, indexParallelism()); err != nil {
 			deleteStateFiles(cacheDir)
 			return repoState{}, corpusSearchable, err
 		}
 	}
 
-	// TOCTOU: HEAD must still equal the treeish the committed pass indexed.
+	// validate-before-publish: HEAD must still equal the treeish indexed.
 	if err := validateCommittedHead(ctx, cacheDir, paths, treeish); err != nil {
+		return repoState{}, corpusSearchable, err // discard (defer)
+	}
+
+	// Publish the whole fallback generation atomically — shards + state under one
+	// publish-lock hold (see publishGeneration: avoids serving new shards with a
+	// stale-matching state label after a crash + content revert).
+	if err := publishGeneration(ctx, cacheDir, indexDir, buildDir, familyAll, func() error {
+		return writeCommittedLayerState(cacheDir, treeish, currentState, !shardsExist(indexDir))
+	}); err != nil {
+		if errors.Is(err, errCorpusEvicted) {
+			return state, corpusSearchable, nil
+		}
 		return repoState{}, corpusSearchable, err
 	}
 
+	plan.scopedStateHash = currentState
 	if !shardsExist(indexDir) {
-		if err := writeCommittedLayerState(cacheDir, treeish, currentState, true); err != nil {
-			return repoState{}, corpusSearchable, err
-		}
-		plan.scopedStateHash = currentState
 		return state, corpusKnownEmpty, nil
 	}
-	if err := writeCommittedLayerState(cacheDir, treeish, currentState, false); err != nil {
-		return repoState{}, corpusSearchable, err
-	}
-	plan.scopedStateHash = currentState
 	return state, corpusSearchable, nil
 }
 
@@ -579,8 +612,7 @@ func scopedFallbackStateHash(paths gitPaths, scope *gitDirtyScope, state repoSta
 }
 
 // writeCommittedLayerState persists the head + state (+ optional empty marker)
-// for a committed layer's cache dir, shared by the shared whole-repo and the
-// per-scope committed builders.
+// for the over-cap per-scope fallback's cache dir.
 func writeCommittedLayerState(cacheDir, treeish, stateHash string, empty bool) error {
 	if treeish == "no-head" {
 		_ = os.Remove(filepath.Join(cacheDir, headFile))
@@ -601,13 +633,13 @@ func writeCommittedLayerState(cacheDir, treeish, stateHash string, empty bool) e
 	return nil
 }
 
-// gitCapMarkerFile records, in the shared committed cache dir, that the
+// gitCapMarkerFile records, in the combined corpus cache dir, that the
 // whole-repo tree exceeded the index caps. Its payload (gitCapMarkerValue) is
 // the committed treeish plus the cap limits in effect. While the marker matches
 // the current HEAD *and* the current cap limits, scoped searches skip the
-// shared index (and its budget re-scan) and use the per-scope committed layer,
-// so a huge repo cannot cap a small scope. A HEAD change *or* a cap-limit
-// change makes the marker stale and the budget is re-evaluated.
+// combined index (and its budget re-scan) and use the per-scope combined
+// fallback, so a huge repo cannot cap a small scope. A HEAD change *or* a
+// cap-limit change makes the marker stale and the budget is re-evaluated.
 const gitCapMarkerFile = ".git_cap_exceeded"
 
 func readGitCapMarker(cacheDir string) string {
@@ -716,18 +748,32 @@ func markGitCorpusKnownEmpty(ctx context.Context, plan corpusPlan, state repoSta
 		return false, fmt.Errorf("create index directory: %w", err)
 	}
 
-	lockPath := filepath.Join(plan.cacheDir, lockFile)
-	lockFd, acquired, err := acquireLock(ctx, plan.indexDir, lockPath)
+	buildFd, acquired, err := acquireBuildLock(ctx, plan.cacheDir, plan.indexDir)
 	if err != nil {
 		return false, err
 	}
 	if !acquired {
-		slog.Warn("Another process is indexing, using existing index")
+		slog.Debug("Another process is indexing; serving current index")
 		return false, nil
 	}
-	defer releaseLock(lockFd)
+	defer releaseLock(buildFd)
+
+	// Clear shards under the publish lock so readers (SH) never see the empty
+	// dir mid-clean.
+	pub, err := acquirePublishLock(ctx, plan.cacheDir)
+	if err != nil {
+		if errors.Is(err, errCorpusEvicted) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer releaseLock(pub)
 
 	cleanAllShards(plan.indexDir)
+	// cleanAllShards already removed any torn shards a prior interrupted swap
+	// left, so a lingering .swapping marker would only force needless rebuilds
+	// of this now-known-empty corpus — clear it.
+	removeCacheFile(plan.cacheDir, swappingMarkerFile)
 	if state.HeadSHA == "no-head" {
 		_ = os.Remove(filepath.Join(plan.cacheDir, headFile))
 		_ = os.Remove(filepath.Join(plan.cacheDir, headFile+".tmp"))
@@ -741,10 +787,11 @@ func markGitCorpusKnownEmpty(ctx context.Context, plan corpusPlan, state repoSta
 }
 
 func searchPlannedCorpusParsed(ctx context.Context, plan corpusPlan, userQ query.Q) ([]zoekt.FileMatch, error) {
-	// Execute search with LOCK_SH so concurrent indexers (which hold LOCK_EX)
-	// finish before we read shards. Multiple searchers can hold LOCK_SH
-	// simultaneously — no contention between readers. Uses non-blocking
-	// poll with timeout to prevent indefinite hang if an indexer is stuck.
+	// Hold LOCK_SH (the publish/read lock) across the entire glob+open+search so
+	// a concurrent temp-swap publish (brief LOCK_EX) can never interleave and
+	// tear the shard set — readers observe exactly the pre- or post-swap
+	// generation. A long build holds only the separate .build.lock, so it never
+	// blocks a reader; only the ms-scale publish does.
 	targets := searchLockTargets(plan)
 	locks := make([]*os.File, 0, len(targets))
 	for _, target := range targets {
@@ -754,17 +801,7 @@ func searchPlannedCorpusParsed(ctx context.Context, plan corpusPlan, userQ query
 			closeSearchLocks(locks)
 			return nil, fmt.Errorf("open search lock: %w", err)
 		}
-		var lockErr error
-		if plan.scopedStateHash != "" {
-			// Over-cap fallback: wait for its builder — a partial fallback would
-			// under-report the scope, so no stale-serve here.
-			lockErr = acquireSearchLockStrict(ctx, searchLockFd)
-		} else {
-			// Combined index: stale-serve so a concurrent rebuild never blocks a
-			// reader (matches the long-standing unscoped behavior).
-			lockErr = acquireSearchLock(ctx, target.indexDir, searchLockFd)
-		}
-		if lockErr != nil {
+		if lockErr := acquireReadLock(ctx, target.indexDir, searchLockFd); lockErr != nil {
 			_ = searchLockFd.Close()
 			closeSearchLocks(locks)
 			return nil, fmt.Errorf("acquire search lock: %w", lockErr)

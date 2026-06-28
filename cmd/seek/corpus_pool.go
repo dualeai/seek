@@ -148,7 +148,7 @@ func (p *corpusPool) discoverNestedGit(b gitBoundary) bool {
 func (p *corpusPool) discoverNestedGitPaths(paths gitPaths) bool {
 	plans, err := p.planDiscoveredGitSubtree(paths)
 	if err != nil {
-		slog.Debug("planDiscoveredGitCorpus failed; skipping",
+		slog.Debug("planDiscoveredGitSubtree failed; skipping",
 			"root", paths.RepoDir, "error", err)
 		return false
 	}

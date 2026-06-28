@@ -1941,7 +1941,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			_ = acquireSearchLock(ctx, filepath.Dir(f.Name()), f)
+			_ = acquireReadLock(ctx, filepath.Dir(f.Name()), f)
 			unlockFile(f)
 			_ = f.Close()
 		}

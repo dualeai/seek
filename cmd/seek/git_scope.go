@@ -159,7 +159,6 @@ func (s *gitDirtyScope) contains(name string) bool {
 	return coveredByAnyDir(name, s.includeDirs) || containsString(s.includeFiles, name)
 }
 
-
 func (s *gitDirtyScope) gitIncludePathspecs() []string {
 	if s == nil {
 		return nil
