@@ -50,27 +50,23 @@ type corpusPlan struct {
 	selectedFiles []string
 	cacheDir      string
 	indexDir      string
-	scope         query.Q
-	gitPaths      *gitPaths
-	dirtyScope    *gitDirtyScope
-	// Scoped Git directory plans use separate committed and dirty layers
-	// keyed by the selected Git pathspecs so tracked or dirty siblings
-	// outside the selected path cannot cap the search.
-	committedCacheDir string
-	committedIndexDir string
-	// sharedCommitted* is the whole-repo committed index: one per repo,
-	// HEAD-keyed (no scope in its id), shared across every scope of the repo.
-	// Scoped searches prefer it and filter at search time via plan.scope,
-	// falling back to the per-scope committed* layer above only when the whole
-	// repo exceeds the index caps (so a huge sibling can't cap a small scope).
-	sharedCommittedCacheDir string
-	sharedCommittedIndexDir string
-	dirtyCacheDir           string
-	dirtyIndexDir           string
-	// Expected layer state hashes are populated after refresh and
-	// validated under shared search locks before loading scoped shards.
-	committedStateHash string
-	dirtyStateHash     string
+	// scope is the search-time And() filter for a scoped Git search. Both
+	// scoped and unscoped searches of one repo resolve to the SAME combined
+	// whole-repo index (cacheDir/indexDir); scope just restricts which loaded
+	// docs match, so committed+dirty share one shard set (one BM25 avgdl) and
+	// a scoped result set equals the unscoped result set intersected with it.
+	scope      query.Q
+	gitPaths   *gitPaths
+	dirtyScope *gitDirtyScope
+	// scoped* is the over-cap fallback: a single per-scope COMBINED index
+	// (committed+dirty in one dir, keyed by dirtyScope.key) built ONLY when
+	// the whole repo exceeds the index caps, so a huge sibling cannot cap a
+	// small scope. Empty on unscoped plans and on under-cap scoped searches;
+	// scopedStateHash != "" means the fallback was built and must be searched
+	// (and validated) instead of the combined index.
+	scopedCacheDir  string
+	scopedIndexDir  string
+	scopedStateHash string
 	// excludeRoots are explicit child owners that a folder plan must not
 	// descend into. This is separate from dynamic nested-git discovery:
 	// explicit child Git roots must stay carved out even when discovery is
@@ -740,31 +736,18 @@ func planCurrentGitCorpusWithExclusions(paths gitPaths, operands, excludes []str
 		return corpusPlan{}, err
 	}
 	if dirtyScope != nil {
-		plan, err = buildGitCorpusPlan(paths.RepoDir, paths.CommonDir, "git_search_scope", dirtyScope.key)
-		if err != nil {
-			return corpusPlan{}, err
-		}
-		plan.gitPaths = &paths
-		plan.scope = combineGitScope(includeScope, excludeScope)
+		// Path C: a scoped search reuses the SAME combined whole-repo index as
+		// an unscoped search (plan.id stays the base repo id) and filters via
+		// plan.scope at search time. dirtyScope is retained only to build/key
+		// the over-cap fallback — a sibling corpus, never the main id, used only
+		// when the whole repo exceeds the index caps.
 		plan.dirtyScope = dirtyScope
-		committed, err := buildGitCorpusPlan(paths.RepoDir, paths.CommonDir, "git_layer", "committed", "git_scope", dirtyScope.key)
+		fallback, err := buildGitCorpusPlan(paths.RepoDir, paths.CommonDir, "git_scope_fallback", dirtyScope.key)
 		if err != nil {
 			return corpusPlan{}, err
 		}
-		dirty, err := buildGitCorpusPlan(paths.RepoDir, paths.CommonDir, "git_layer", "dirty", "git_dirty_scope", dirtyScope.key)
-		if err != nil {
-			return corpusPlan{}, err
-		}
-		sharedCommitted, err := buildGitCorpusPlan(paths.RepoDir, paths.CommonDir, "git_layer", "committed_shared")
-		if err != nil {
-			return corpusPlan{}, err
-		}
-		plan.committedCacheDir = committed.cacheDir
-		plan.committedIndexDir = committed.indexDir
-		plan.sharedCommittedCacheDir = sharedCommitted.cacheDir
-		plan.sharedCommittedIndexDir = sharedCommitted.indexDir
-		plan.dirtyCacheDir = dirty.cacheDir
-		plan.dirtyIndexDir = dirty.indexDir
+		plan.scopedCacheDir = fallback.cacheDir
+		plan.scopedIndexDir = fallback.indexDir
 	}
 	spec, err := buildGitScopeSpec(plan.root, operands)
 	if err != nil {

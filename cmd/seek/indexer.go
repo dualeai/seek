@@ -275,6 +275,28 @@ func checkCtags() error {
 
 // runIndexingWithCache orchestrates committed and uncommitted indexing with
 // corpus metadata in cacheDir and Zoekt shards in indexDir.
+//
+// DEFERRED — single-flight temp-swap. A reworked builder could index into a
+// temp dir, validate HEAD, then swap shards in under a brief EX lock (ms)
+// instead of holding the lock across the multi-minute build, and would
+// validate-before-publish to close gap-e (below). It was scoped, then deferred:
+// the Path C collapse removed the c0b4326 shared-committed layer whose
+// acquireLockStrict-across-the-whole-build was the repo-wide chokepoint that
+// motivated it. This path already degrades gracefully — acquireLock below
+// returns "use existing index" to a second builder, and combined search uses
+// acquireSearchLock (stale-serve), so a concurrent rebuild never blocks a
+// reader. The only strict locks left are the rare over-cap fallback
+// (ensureScopedGitCorpusFallback), where waiting beats serving a partial scope.
+// Implementing temp-swap is a wide-blast-radius change (this func backs every
+// git AND folder corpus) for marginal gain; revisit only if a new long-held EX
+// lock on a hot corpus appears, profiling shows cold-build/HEAD-churn blocking
+// searches, or gap-e produces an observed stale result.
+//
+// gap-e (residual, pre-existing): indexCommitted reads LIVE HEAD over a
+// multi-minute window, and the post-index re-stat below only re-checks dirty
+// files, not committed HEAD — so a HEAD A→B→A excursion mid-build can publish
+// briefly-torn shards. Bounded: the next search's git status sees the new HEAD,
+// recomputes the state hash, and rebuilds; worst case is one stale search.
 func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDir string, state repoState, preState string) error {
 	repoDir := paths.RepoDir
 	// Fail fast if ctags is missing. Uses sync.Once cache so the PATH

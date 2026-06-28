@@ -41,15 +41,33 @@ func combineGitScope(includeScope, excludeScope query.Q) query.Q {
 	return query.Simplify(query.NewAnd(includeScope, notExcluded))
 }
 
+// maxRegexpFileOperands bounds how many individual file operands are expanded
+// into anchored filename regexps. Each anchored regexp distills to a filename
+// trigram lookup (index-assisted), far cheaper than FileNameSet's O(numDocs)
+// per-shard scan over a whole-repo combined index. Above this many operands the
+// Or of that many regexp match-trees costs more than one FileNameSet map, so we
+// fall back to the set. A var (not const) so tests can force either path.
+var maxRegexpFileOperands = 64
+
 func buildCurrentGitScope(root string, operands []string) (query.Q, error) {
 	spec, err := buildGitScopeSpec(root, operands)
 	if err != nil || spec.rootIncluded {
 		return nil, err
 	}
 
-	queries := make([]query.Q, 0, 1+len(spec.dirs))
-	if len(spec.files) > 0 {
+	queries := make([]query.Q, 0, len(spec.files)+len(spec.dirs))
+	if n := len(spec.files); n > maxRegexpFileOperands {
 		queries = append(queries, query.NewFileNameSet(spec.files...))
+	} else if n > 0 {
+		// Anchored exact-path filename regexps are trigram-assisted on the
+		// combined whole-repo index; FileNameSet would scan every doc.
+		for _, file := range spec.files {
+			fileQ, err := query.RegexpQuery("^"+regexp.QuoteMeta(file)+"$", false, true)
+			if err != nil {
+				return nil, fmt.Errorf("build file scope %q: %w", file, err)
+			}
+			queries = append(queries, fileQ)
+		}
 	}
 	for _, dir := range spec.dirs {
 		dirQ, err := query.RegexpQuery("^"+regexp.QuoteMeta(dir)+"/", false, true)
@@ -141,19 +159,6 @@ func (s *gitDirtyScope) contains(name string) bool {
 	return coveredByAnyDir(name, s.includeDirs) || containsString(s.includeFiles, name)
 }
 
-func (s *gitDirtyScope) gitPathspecs() []string {
-	if s == nil {
-		return nil
-	}
-	pathspecs := s.gitIncludePathspecs()
-	for _, dir := range s.excludeDirs {
-		pathspecs = append(pathspecs, gitLiteralExcludePathspec(dir))
-	}
-	for _, file := range s.excludeFiles {
-		pathspecs = append(pathspecs, gitLiteralExcludePathspec(file))
-	}
-	return pathspecs
-}
 
 func (s *gitDirtyScope) gitIncludePathspecs() []string {
 	if s == nil {
@@ -174,10 +179,6 @@ func gitLiteralPathspec(name string) string {
 		return "."
 	}
 	return ":(top,literal)" + name
-}
-
-func gitLiteralExcludePathspec(name string) string {
-	return ":(top,literal,exclude)" + name
 }
 
 func containsString(values []string, value string) bool {

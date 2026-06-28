@@ -324,7 +324,11 @@ func TestPlanCorpora_ExactFilesAndDirectoriesUseScopedGitCorpus(t *testing.T) {
 	}
 }
 
-func TestPlanCorpora_ScopedGitDirectoryUsesDistinctDirtyScopeCache(t *testing.T) {
+// Path C: a scoped Git directory plan reuses the SAME combined corpus ID (and
+// index dir) as the unscoped repo — that sharing is the disk win. It differs
+// only by carrying a scope filter, a dirtyScope (pathspec carrier), and a
+// distinct over-cap fallback dir.
+func TestPlanCorpora_ScopedGitDirectoryReusesCombinedCorpusID(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
 
@@ -355,12 +359,21 @@ func TestPlanCorpora_ScopedGitDirectoryUsesDistinctDirtyScopeCache(t *testing.T)
 	if scoped[0].dirtyScope == nil {
 		t.Fatal("expected scoped Git directory plan to carry dirty scope")
 	}
-	if unscoped[0].id == scoped[0].id {
-		t.Fatalf("scoped dirty cache must not share unscoped corpus ID %q", scoped[0].id)
+	if scoped[0].scope == nil {
+		t.Fatal("expected scoped Git directory plan to carry a search scope filter")
+	}
+	if unscoped[0].id != scoped[0].id {
+		t.Fatalf("scoped search must reuse the unscoped combined corpus ID, got %q vs %q", unscoped[0].id, scoped[0].id)
+	}
+	if scoped[0].scopedIndexDir == "" {
+		t.Fatal("expected scoped plan to carry an over-cap fallback dir")
 	}
 }
 
-func TestPlanCorpora_ScopedGitDirectoriesUseDistinctScopedLayers(t *testing.T) {
+// Path C: distinct scopes of one repo SHARE the single combined whole-repo
+// index (same cacheDir/indexDir) and differ only in plan.scope and in their
+// per-scope over-cap fallback dir (which a huge sibling would force).
+func TestPlanCorpora_ScopedGitDirectoriesShareCombinedIndex(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
 
@@ -390,17 +403,17 @@ func TestPlanCorpora_ScopedGitDirectoriesUseDistinctScopedLayers(t *testing.T) {
 	}
 	platformPlan := platformPlans[0]
 	infraPlan := infraPlans[0]
-	if platformPlan.committedIndexDir == "" || infraPlan.committedIndexDir == "" {
-		t.Fatalf("expected scoped plans to have committed layers, got platform=%#v infra=%#v", platformPlan, infraPlan)
+	if platformPlan.indexDir == "" || infraPlan.indexDir == "" {
+		t.Fatalf("expected scoped plans to have a combined index, got platform=%#v infra=%#v", platformPlan, infraPlan)
 	}
-	if platformPlan.committedIndexDir == infraPlan.committedIndexDir {
-		t.Fatalf("distinct scopes should not share committed layer %q", platformPlan.committedIndexDir)
+	if platformPlan.indexDir != infraPlan.indexDir {
+		t.Fatalf("distinct scopes must share one combined index, got %q vs %q", platformPlan.indexDir, infraPlan.indexDir)
 	}
-	if platformPlan.dirtyIndexDir == "" || infraPlan.dirtyIndexDir == "" {
-		t.Fatalf("expected scoped plans to have dirty layers, got platform=%#v infra=%#v", platformPlan, infraPlan)
+	if platformPlan.scopedIndexDir == "" || infraPlan.scopedIndexDir == "" {
+		t.Fatalf("expected scoped plans to carry an over-cap fallback dir, got platform=%#v infra=%#v", platformPlan, infraPlan)
 	}
-	if platformPlan.dirtyIndexDir == infraPlan.dirtyIndexDir {
-		t.Fatalf("distinct scopes should not share dirty layer %q", platformPlan.dirtyIndexDir)
+	if platformPlan.scopedIndexDir == infraPlan.scopedIndexDir {
+		t.Fatalf("distinct scopes must not share the over-cap fallback dir %q", platformPlan.scopedIndexDir)
 	}
 }
 

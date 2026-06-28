@@ -66,7 +66,7 @@ func BenchmarkLargeRepo_UncommittedRealistic(b *testing.B) {
 	repoDir := cloneBenchRepoAt(b, requireBenchRepo(b), "HEAD")
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(b, repoDir)
-	if _, _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
+	if _, _, err := ensureGitCorpusFresh(ctx, &plan, paths); err != nil {
 		b.Fatalf("initial indexing: %v", err)
 	}
 
