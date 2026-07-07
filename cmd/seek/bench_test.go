@@ -2378,11 +2378,38 @@ func BenchmarkGC_RunGC_FullEvict_N100(b *testing.B) {
 		for i := 0; i < 100; i++ {
 			seedCorpus(b, root, fakeCorpusHash(i), stale)
 		}
-		// Bust throttle so the next call evicts even though stamp is fresh.
-		_ = os.Remove(filepath.Join(root, gcStampFile))
 		b.StartTimer()
 
 		runGC(ctx, gcOptions{maxAge: defaultGCMaxAge, skipThrottle: true}, defaultGCInterval)
+	}
+}
+
+// BenchmarkGC_RunGC_StreamingSorted_N100 pins the manual `seek gc --force
+// --sort=size` shape: the materialize-all + sortGCRows + evict-in-table-order
+// path, including the per-corpus corpusDirSize walk and display-info read
+// that the silent benches above never touch.
+func BenchmarkGC_RunGC_StreamingSorted_N100(b *testing.B) {
+	resetNFSCheck(b)
+	root := cacheRootForTest(b)
+	stale := time.Now().Add(-30 * 24 * time.Hour)
+	ctx := context.Background()
+
+	b.ReportAllocs()
+	for b.Loop() {
+		b.StopTimer()
+		// Recreate the 100 stale corpora each iter — runGC's prior pass
+		// just evicted them.
+		for i := 0; i < 100; i++ {
+			seedCorpus(b, root, fakeCorpusHash(i), stale)
+		}
+		b.StartTimer()
+
+		runGC(ctx, gcOptions{
+			maxAge:       defaultGCMaxAge,
+			skipThrottle: true,
+			writer:       io.Discard,
+			sortKey:      sortBySize,
+		}, defaultGCInterval)
 	}
 }
 
@@ -2438,7 +2465,7 @@ func BenchmarkGC_DryRun_Render_N20(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if err := reportGCPlan(io.Discard, root, entries, cutoff); err != nil {
+		if err := reportGCPlan(ctx, io.Discard, root, entries, cutoff, sortByName); err != nil {
 			b.Fatal(err)
 		}
 	}

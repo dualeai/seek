@@ -120,6 +120,18 @@ func requireRow(tb testing.TB, out, hash, action string) {
 	tb.Fatalf("no row for corpus %s (action %q) in output:\n%s", short, action, out)
 }
 
+// runGCCapture runs `seek gc <args>` and returns everything it wrote to
+// stdout, failing the test if the command errors. Collapses the
+// capture-run-assert boilerplate shared by the gc command tests.
+func runGCCapture(tb testing.TB, args ...string) string {
+	tb.Helper()
+	return captureStdoutGC(tb, func() {
+		if err := runGCCommand(context.Background(), args); err != nil {
+			tb.Fatalf("gc %v: %v", args, err)
+		}
+	})
+}
+
 func TestGC_ThrottleGate_SkipsWhenStampFresh(t *testing.T) {
 	root := cacheRootForTest(t)
 	dir := seedCorpus(t, root, fakeCorpusHash(1), time.Now().Add(-30*24*time.Hour))
@@ -423,26 +435,14 @@ func TestGCCmd_DryRun_NoEvictions(t *testing.T) {
 	root := cacheRootForTest(t)
 	dir := seedCorpus(t, root, fakeCorpusHash(16), time.Now().Add(-30*24*time.Hour))
 
-	// Capture stdout
-	r, w, _ := os.Pipe()
-	origStdout := os.Stdout
-	os.Stdout = w
-	defer func() { os.Stdout = origStdout }()
-
-	go func() {
-		_ = runGCCommand(context.Background(), []string{"--dry-run"})
-		_ = w.Close()
-	}()
-
-	var buf bytes.Buffer
-	_, _ = buf.ReadFrom(r)
-	out := buf.String()
+	out := runGCCapture(t, "--dry-run")
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("dry-run should not evict: %v", err)
 	}
-	if !strings.Contains(out, "evict") {
-		t.Fatalf("dry-run output should mention evict action: %q", out)
+	// Dry-run summary verb is "evictable" (the live path says "evicted").
+	if !strings.Contains(out, "evictable (") {
+		t.Fatalf("dry-run summary should say 'evictable'; got: %q", out)
 	}
 }
 
@@ -454,11 +454,7 @@ func TestGCCmd_Force_BypassesThrottle(t *testing.T) {
 		t.Fatalf("write stamp: %v", err)
 	}
 
-	out := captureStdoutGC(t, func() {
-		if err := runGCCommand(context.Background(), []string{"--force"}); err != nil {
-			t.Fatalf("runGCCommand: %v", err)
-		}
-	})
+	out := runGCCapture(t, "--force")
 
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("--force should bypass throttle and evict: err=%v", err)
@@ -473,11 +469,7 @@ func TestGCCmd_All_EvictsEverything(t *testing.T) {
 	stale := seedCorpus(t, root, staleHash, time.Now().Add(-30*24*time.Hour))
 	fresh := seedCorpus(t, root, freshHash, time.Now())
 
-	out := captureStdoutGC(t, func() {
-		if err := runGCCommand(context.Background(), []string{"--all", "--force"}); err != nil {
-			t.Fatalf("runGCCommand: %v", err)
-		}
-	})
+	out := runGCCapture(t, "--all", "--force")
 
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Fatalf("stale corpus should evict under --all: err=%v", err)
@@ -498,11 +490,7 @@ func TestGCCmd_All_BypassesThrottle(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, gcStampFile), nil, 0o644); err != nil {
 		t.Fatalf("write stamp: %v", err)
 	}
-	out := captureStdoutGC(t, func() {
-		if err := runGCCommand(context.Background(), []string{"--all"}); err != nil {
-			t.Fatalf("runGCCommand: %v", err)
-		}
-	})
+	out := runGCCapture(t, "--all")
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("--all must bypass throttle and evict: err=%v", err)
 	}
@@ -517,11 +505,7 @@ func TestGCCmd_Force_PrintsLiveTable(t *testing.T) {
 	hash := fakeCorpusHash(40)
 	seedCorpus(t, root, hash, time.Now().Add(-30*24*time.Hour))
 
-	out := captureStdoutGC(t, func() {
-		if err := runGCCommand(context.Background(), []string{"--force"}); err != nil {
-			t.Fatalf("runGCCommand: %v", err)
-		}
-	})
+	out := runGCCapture(t, "--force")
 
 	if !strings.Contains(out, "seek gc: cache root") {
 		t.Fatalf("live table missing banner; got:\n%s", out)
@@ -552,11 +536,7 @@ func TestGCCmd_LiveTable_ShowsLockedAction(t *testing.T) {
 		t.Fatalf("hold corpus lock: %v", err)
 	}
 
-	out := captureStdoutGC(t, func() {
-		if err := runGCCommand(context.Background(), []string{"--force"}); err != nil {
-			t.Fatalf("runGCCommand: %v", err)
-		}
-	})
+	out := runGCCapture(t, "--force")
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("locked corpus must survive: %v", err)
@@ -565,19 +545,21 @@ func TestGCCmd_LiveTable_ShowsLockedAction(t *testing.T) {
 }
 
 // TestGCCmd_LiveTable_NoCorpora confirms a fresh cache with zero corpora
-// still prints the banner and a friendly "no corpora" line — not silence.
+// still prints the banner and a friendly "no corpora" line — not silence —
+// AND still stamps .last-gc. The live path ignores printGCTableBanner's
+// return and falls through to touchStamp; a regression that early-returned
+// like the dry-run caller would skip the stamp and re-run GC every search.
 func TestGCCmd_LiveTable_NoCorpora(t *testing.T) {
-	cacheRootForTest(t)
-	out := captureStdoutGC(t, func() {
-		if err := runGCCommand(context.Background(), []string{"--force"}); err != nil {
-			t.Fatalf("runGCCommand: %v", err)
-		}
-	})
+	root := cacheRootForTest(t)
+	out := runGCCapture(t, "--force")
 	if !strings.Contains(out, "seek gc: cache root") {
 		t.Fatalf("expected banner even with empty cache; got:\n%s", out)
 	}
 	if !strings.Contains(out, "no corpora") {
 		t.Fatalf("expected 'no corpora' line; got:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(root, gcStampFile)); err != nil {
+		t.Fatalf("empty-cache live run must still stamp .last-gc: %v", err)
 	}
 }
 
@@ -613,11 +595,7 @@ func TestGCCmd_LockContention_PrintsSkipMessage(t *testing.T) {
 		t.Fatalf("hold gc.lock: %v", err)
 	}
 
-	out := captureStdoutGC(t, func() {
-		if err := runGCCommand(context.Background(), []string{"--force"}); err != nil {
-			t.Fatalf("runGCCommand: %v", err)
-		}
-	})
+	out := runGCCapture(t, "--force")
 
 	if !strings.Contains(out, "another gc is already running") {
 		t.Fatalf("expected contention message; got:\n%s", out)
@@ -1285,18 +1263,7 @@ func TestGC_Integration_DryRunShowsRealPath(t *testing.T) {
 		t.Fatalf("runSeekInRepo: %v", err)
 	}
 
-	r, w, _ := os.Pipe()
-	origStdout := os.Stdout
-	os.Stdout = w
-	defer func() { os.Stdout = origStdout }()
-
-	go func() {
-		_ = runGCCommand(context.Background(), []string{"--dry-run"})
-		_ = w.Close()
-	}()
-	var buf bytes.Buffer
-	_, _ = buf.ReadFrom(r)
-	out := buf.String()
+	out := runGCCapture(t, "--dry-run")
 
 	// Repository.Source is canonicalized; substring on the basename is the
 	// stable comparison surface across macOS /private/var → /var resolution.
