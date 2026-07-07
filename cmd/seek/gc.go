@@ -36,6 +36,13 @@ const (
 	envGCInterval = "SEEK_GC_INTERVAL"
 )
 
+// TODO(gc-size-cap): SEEK_GC_MAX_TOTAL_SIZE — journalctl --vacuum-size style
+// budget: after the TTL sweep, evict LRU by .used (oldest first, never
+// biggest-first — big ≠ unused, and big corpora cost the most to reindex)
+// until the cache is under the cap. Env-only knob, parseByteSize sibling to
+// parseGCDuration (base-1024, matching humanBytes). Must not add size walks
+// to the opportunistic path unguarded — gate on a cheap corpus count first.
+
 type gcConfig struct {
 	maxAge   time.Duration
 	interval time.Duration
@@ -113,11 +120,15 @@ func shortErr(err error) string {
 //   - maxAge is the per-corpus TTL — entries with .used older than now-maxAge
 //     are evicted. `seek gc --all` collapses this to 0.
 //   - writer, when non-nil, makes runGC stream a per-corpus table to it
-//     (manual path). Nil = silent (opportunistic path after every search).
+//     (manual path). Nil = silent (opportunistic path after every run).
+//   - sortKey orders the streamed table (`seek gc --sort`). Only consulted
+//     when writer is non-nil; the zero value keeps the historical hash
+//     order, so the opportunistic path is unaffected.
 type gcOptions struct {
 	skipThrottle bool
 	maxAge       time.Duration
 	writer       io.Writer
+	sortKey      gcSortKey
 }
 
 // fireOpportunisticGC runs runFn in a goroutine bounded by timeout, blocking
@@ -139,9 +150,9 @@ func fireOpportunisticGC(runFn func(context.Context), timeout time.Duration) {
 	}
 }
 
-// runOpportunisticGC is the entry point fired from main() after a successful
-// search. Every failure is logged and swallowed; never returns an error and
-// never affects exit code. Bounded by ctx (gcRunTimeout).
+// runOpportunisticGC is the entry point fired from main() after every run,
+// successful or not. Every failure is logged and swallowed; never returns an
+// error and never affects exit code. Bounded by ctx (gcRunTimeout).
 func runOpportunisticGC(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -153,7 +164,7 @@ func runOpportunisticGC(ctx context.Context) {
 }
 
 // runGC is the shared GC body. Two callers:
-//   - runOpportunisticGC: writer nil → silent eviction sweep, post-search.
+//   - runOpportunisticGC: writer nil → silent eviction sweep, post-run.
 //   - runGCCommand (manual `seek gc --force` / `--all`): writer os.Stdout →
 //     streams the same banner + table + summary as `--dry-run`, with the
 //     ACTION column reflecting the real per-corpus outcome.
@@ -163,10 +174,12 @@ func runOpportunisticGC(ctx context.Context) {
 //  2. NFS detection (auto-GC disabled on NFS)
 //  3. acquire global gc.lock (other gc → skip, surfaced when streaming)
 //  4. drain any leftover trash (idempotent crash recovery)
-//  5. enumerate + sort corpora by hash (deterministic table order)
-//  6. per-entry: capture size+display BEFORE eviction (live row needs it),
-//     then either skip (within TTL) or evictCorpus, then render row +
-//     accumulate counters
+//  5. enumerate + sort corpora by hash (deterministic sweep order)
+//  6. streaming with --sort=age|size: sweep, measure all rows, sort, then
+//     evict + render in table order (cancel semantics: see the sorted-
+//     branch comment). Default name order and the silent path: one
+//     interleaved sweep → measure (streaming only) → evict pass per
+//     entry, rows streaming incrementally.
 //  7. stamp .last-gc to throttle the next opportunistic run
 func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 	cacheRoot, err := seekUserCacheRoot()
@@ -204,10 +217,7 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 		slog.Debug("gc skipped: cannot open gc lock", "error", err)
 		return
 	}
-	defer func() {
-		unlockFile(lockFd)
-		_ = lockFd.Close()
-	}()
+	defer releaseLock(lockFd)
 	if err := lockFileExclusive(lockFd); err != nil {
 		// Surface contention to the manual caller — otherwise `seek gc
 		// --force` would exit silently with no indication another gc
@@ -238,77 +248,61 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 		touchStamp(cacheRoot)
 		return
 	}
-	// Sort by corpus hash so the streamed table matches dry-run ordering;
-	// also gives opportunistic-path eviction a deterministic sweep order.
-	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
 
-	cutoff := time.Now().Add(-opts.maxAge)
 	now := time.Now()
+	cutoff := now.Add(-opts.maxAge)
 	streaming := opts.writer != nil
-	var totalBytes, evictBytes int64
-	var evictCount, processedCount int
 	if streaming {
-		_, _ = fmt.Fprintf(opts.writer, "seek gc: cache root %s\n", cacheRoot)
-		if len(entries) == 0 {
-			_, _ = fmt.Fprintln(opts.writer, "  no corpora")
-		} else {
-			_, _ = fmt.Fprintln(opts.writer, gcTableHeader)
-		}
+		printGCTableBanner(opts.writer, cacheRoot, len(entries))
 	}
-	for _, e := range entries {
-		if ctx.Err() != nil {
-			break
+	stats := &gcTableStats{}
+	if streaming && opts.sortKey != sortByName {
+		// Sorted table (--sort=age|size): sweep, then measure every corpus,
+		// then sort, then evict in table order — ordering needs all rows up
+		// front, and size + display info must be captured before eviction
+		// anyway. Consequences, acceptable for a manual command: eviction
+		// order follows the sort, so a ctx-truncated run evicts a
+		// sort-dependent subset; and a cancel DURING the measurement phase
+		// evicts nothing at all (rerun with --force). Note --sort=age can
+		// show legacy corpora (no .used, dir mtime fallback) as perpetually
+		// young: the manifest-tmp sweep bumps the dir mtime whenever it
+		// removes something.
+		for _, e := range entries {
+			if ctx.Err() != nil {
+				break
+			}
+			sweepCorpusOrphans(e, now)
 		}
-		// Sweep orphan tmp manifest files (folder + uncommitted) older
-		// than 1 hour. SIGKILL between os.WriteFile and os.Rename in
-		// writeFolderManifest / writeUncommittedManifest can leave these
-		// behind; no live process ever reads them again. Best-effort —
-		// errors are silent because the user does not need to act.
-		sweepOrphanManifestTmps(e.path, now.Add(-1*time.Hour))
-		// Only sweep temp build dirs when no build holds the build lock, so a
-		// genuinely-stalled-but-live builder (mtime older than the bound) is not
-		// pulled out from under itself. Same guard evictCorpus uses.
-		if bf, ok, _ := tryBuildLock(e.path); ok {
-			releaseLock(bf)
-			sweepOrphanBuildDirs(filepath.Join(e.path, "index"), now.Add(-buildTmpMaxAge))
+		rows := buildGCRows(ctx, entries)
+		sortGCRows(rows, opts.sortKey)
+		for _, r := range rows {
+			if ctx.Err() != nil {
+				break
+			}
+			emitGCRow(opts.writer, stats, r, now, evictIfExpired(r.entry, trashPath, cutoff))
 		}
-
-		// Capture size + display info BEFORE eviction — once the dir is
-		// renamed to .trash the original path is gone and corpusDirSize
-		// would return 0, readCorpusDisplayInfo would return [empty].
-		var size int64
-		var info corpusDisplayInfo
-		if streaming {
-			size = corpusDirSize(e.path)
-			info = readCorpusDisplayInfo(e.path)
-		}
-		var res gcRowResult
-		if e.usedAt.After(cutoff) {
-			res = gcRowResult{action: actionKept}
-		} else {
-			res = evictCorpus(e, trashPath, cutoff)
-		}
-		switch res.action {
-		case actionFailed:
-			slog.Warn("gc eviction failed", "corpus", e.name, "error", res.err)
-		case actionTrashed:
-			slog.Warn("gc partial eviction", "corpus", e.name, "error", res.err)
-		}
-		if streaming {
-			renderGCRow(opts.writer, e, info, size, now, res.String())
-			totalBytes += size
-			if res.action == actionEvicted || res.action == actionTrashed {
-				evictBytes += size
-				evictCount++
+	} else {
+		// Default name order and the silent opportunistic path: one
+		// interleaved pass per entry — sweep, measure (streaming only),
+		// evict, render. Rows stream incrementally and a Ctrl-C keeps the
+		// already-evicted prefix.
+		for _, e := range entries {
+			if ctx.Err() != nil {
+				break
+			}
+			sweepCorpusOrphans(e, now)
+			if streaming {
+				r := measureGCRow(e)
+				emitGCRow(opts.writer, stats, r, now, evictIfExpired(e, trashPath, cutoff))
+			} else {
+				evictIfExpired(e, trashPath, cutoff)
 			}
 		}
-		processedCount++
 	}
-	if streaming && processedCount > 0 {
-		// processedCount (not len(entries)) — Ctrl-C / ctx cancel may break
+	if streaming && stats.rendered > 0 {
+		// Rendered count (not len(entries)) — Ctrl-C / ctx cancel may break
 		// the loop mid-sweep; summary must describe what we actually saw.
-		_, _ = fmt.Fprintf(opts.writer, "%d corpora, %s total, %d evicted (%s).\n",
-			processedCount, humanBytes(totalBytes), evictCount, humanBytes(evictBytes))
+		stats.summary(opts.writer, "evicted")
 	}
 
 	// Stamp updated last and even on partial failures — prevents retry
@@ -459,6 +453,9 @@ func isOrphanManifestTmpName(name string) bool {
 	return false
 }
 
+// enumerateCorpusDirs returns the cache's corpora hash-sorted, so the
+// streamed live table matches dry-run ordering and opportunistic-path
+// eviction has a deterministic sweep order.
 func enumerateCorpusDirs(corporaPath string) ([]corpusDirEntry, error) {
 	entries, err := os.ReadDir(corporaPath)
 	if err != nil {
@@ -492,6 +489,7 @@ func enumerateCorpusDirs(corporaPath string) ([]corpusDirEntry, error) {
 		}
 		out = append(out, corpusDirEntry{name: corpusID(name), path: path, usedAt: used})
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
 	return out, nil
 }
 
@@ -519,6 +517,41 @@ func readUsedAt(cacheDir string) (time.Time, bool) {
 	return st.ModTime(), true
 }
 
+// sweepCorpusOrphans removes crash leftovers inside one corpus dir:
+//   - orphan .tmp manifest files (folder + uncommitted) older than 1 hour.
+//     SIGKILL between os.WriteFile and os.Rename in writeFolderManifest /
+//     writeUncommittedManifest can leave these behind; no live process ever
+//     reads them again. Best-effort — errors are silent because the user
+//     does not need to act.
+//   - stale .build-* temp index dirs, only when no build holds the build
+//     lock, so a genuinely-stalled-but-live builder (mtime older than the
+//     bound) is not pulled out from under itself. Same guard evictCorpus
+//     uses.
+func sweepCorpusOrphans(e corpusDirEntry, now time.Time) {
+	sweepOrphanManifestTmps(e.path, now.Add(-1*time.Hour))
+	if bf, ok, _ := tryBuildLock(e.path); ok {
+		releaseLock(bf)
+		sweepOrphanBuildDirs(filepath.Join(e.path, "index"), now.Add(-buildTmpMaxAge))
+	}
+}
+
+// evictIfExpired applies the TTL decision for one corpus: kept when .used
+// is within the cutoff, otherwise evictCorpus, with partial and failed
+// outcomes logged. Shared by the streaming and silent runGC loops.
+func evictIfExpired(e corpusDirEntry, trashDir string, cutoff time.Time) gcRowResult {
+	if e.usedAt.After(cutoff) {
+		return gcRowResult{action: actionKept}
+	}
+	res := evictCorpus(e, trashDir, cutoff)
+	switch res.action {
+	case actionFailed:
+		slog.Warn("gc eviction failed", "corpus", e.name, "error", res.err)
+	case actionTrashed:
+		slog.Warn("gc partial eviction", "corpus", e.name, "error", res.err)
+	}
+	return res
+}
+
 // evictCorpus performs a two-phase delete under a non-blocking per-corpus
 // lock. Returns a gcRowResult describing the outcome:
 //   - actionLocked: corpus .lock held by another seek
@@ -536,12 +569,9 @@ func evictCorpus(e corpusDirEntry, trashDir string, cutoff time.Time) gcRowResul
 		}
 		return gcRowResult{action: actionFailed, err: fmt.Errorf("open corpus lock: %w", err)}
 	}
-	defer func() {
-		if f != nil {
-			unlockFile(f)
-			_ = f.Close()
-		}
-	}()
+	// releaseLock is nil-safe, so once f is cleared below (post-rename) the
+	// deferred call is a no-op.
+	defer func() { releaseLock(f) }()
 	if err := lockFileExclusive(f); err != nil {
 		return gcRowResult{action: actionLocked}
 	}
@@ -573,9 +603,8 @@ func evictCorpus(e corpusDirEntry, trashDir string, cutoff time.Time) gcRowResul
 
 	// Release per-corpus lock before RemoveAll. Original path no longer
 	// exists, so no other seek can re-acquire under the old name.
-	unlockFile(f)
-	_ = f.Close()
-	// Prevent the deferred close from operating on a stale fd.
+	releaseLock(f)
+	// Prevent the deferred release from operating on a stale fd.
 	f = nil
 
 	if err := os.RemoveAll(target); err != nil {

@@ -333,6 +333,29 @@ dependency, build, cache, or vendor folders by name. Git ignore rules apply only
 inside Git repos. Files larger than 100 MiB are skipped, and folder scans stop
 at 1,000,000 candidate files or 10 GiB of indexed bytes.
 
+### Cache maintenance
+
+The cache cleans itself: after each run, seek garbage-collects corpora that
+have not been used for 14 days. A corpus counts as used every time it is
+searched or indexed. The automatic pass runs at most once per day and is
+disabled when the cache lives on a network filesystem.
+
+Environment knobs:
+
+- `SEEK_GC_MAX_AGE` -- eviction TTL (default `14d`; accepts `36h`, `7d`, ...)
+- `SEEK_GC_INTERVAL` -- minimum delay between automatic passes (default `24h`)
+
+Manual control:
+
+```sh
+seek gc --dry-run --sort=size   # what is eating my disk? (no changes made)
+seek gc --force                 # run now, ignore the daily throttle
+seek gc --all                   # evict every corpus not actively in use
+```
+
+`--sort` orders the table by `name` (default), `age` (oldest first), or
+`size` (largest first).
+
 ### Benchmarks
 
 Latest field benchmarks, generated on Apple M1 Max / macOS with
