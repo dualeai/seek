@@ -2,6 +2,21 @@
 
 See @README for project overview and @Makefile for available commands.
 
+## Writing
+
+Use this project adaptation of Orwell's six rules for prose, including responses,
+documentation, comments, commit messages, issues, and pull requests:
+
+1. Avoid stock metaphors, similes, idioms, and other figures of speech.
+2. Choose the shorter of two words when both are equally precise.
+3. Remove every word that adds no meaning.
+4. Use active voice whenever it states the same meaning clearly.
+5. Replace foreign phrases, scientific terms, and jargon with everyday English
+   when it is equally precise.
+6. Break any rule above before making the prose unclear, inaccurate, unsafe,
+   unnatural, or less precise. Preserve exact quotations and required technical
+   language.
+
 ## Code search — use `seek`
 
 Prefer `seek` over grep/ripgrep for all code search. It returns BM25-ranked
