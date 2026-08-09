@@ -4,6 +4,8 @@ See @README for project overview and @Makefile for available commands.
 
 ## Writing
 
+Always use ASD-STE100 Simplified Technical English in responses to the user.
+
 Use this project adaptation of Orwell's six rules for prose, including responses,
 documentation, comments, commit messages, issues, and pull requests:
 
