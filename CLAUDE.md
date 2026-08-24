@@ -2,6 +2,23 @@
 
 See @README for project overview and @Makefile for available commands.
 
+## Writing
+
+Always use ASD-STE100 Simplified Technical English in responses to the user.
+
+Use this project adaptation of Orwell's six rules for prose, including responses,
+documentation, comments, commit messages, issues, and pull requests:
+
+1. Avoid stock metaphors, similes, idioms, and other figures of speech.
+2. Choose the shorter of two words when both are equally precise.
+3. Remove every word that adds no meaning.
+4. Use active voice whenever it states the same meaning clearly.
+5. Replace foreign phrases, scientific terms, and jargon with everyday English
+   when it is equally precise.
+6. Break any rule above before making the prose unclear, inaccurate, unsafe,
+   unnatural, or less precise. Preserve exact quotations and required technical
+   language.
+
 ## Code search — use `seek`
 
 Prefer `seek` over grep/ripgrep for all code search. It returns BM25-ranked
@@ -90,3 +107,23 @@ inline version comment. Example:
 
 Never pin to a tag or branch (e.g. `@v4`). Always verify the SHA matches the
 version on GitHub before committing.
+
+## Router plugin
+
+`plugins/seek-router/` ships a PreToolUse hook that rewrites the agent's
+`grep`/`rg`/`git grep` calls into seek searches, plus the `seek-search` skill.
+Load it in this repo with `claude --plugin-dir ./plugins/seek-router`; Codex
+picks it up from `.codex/hooks.json` with no install.
+
+The router is ranked and file-capped, so it answers "where is this", not "every
+occurrence". When you need every hit (rename, refactor, counting call sites):
+
+```sh
+SEEK_ROUTER=off grep -rn 'PATTERN' .
+```
+
+`SEEK_ROUTER=off` in the environment disables routing for a whole session.
+
+Router changes must keep `make test-plugin` green; it feeds recorded hook
+payloads to the script and asserts exit code 0 on every path, because exit 2
+reads as a deny and would break search instead of falling back to grep.
