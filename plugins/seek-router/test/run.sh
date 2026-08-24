@@ -236,6 +236,26 @@ quote_case "backtick in pattern"      "$(bash_payload 'grep -rn \"foo\`id\`\" .'
 quote_case "dollar paren in pattern"  "$(bash_payload 'grep -rn \"foo\$(id)\" .')"
 quote_case "backslash in pattern"     "$(bash_payload 'grep -rn \"foo\\\\\\\\bar\" .')"
 quote_case "newline in pattern"       '{"tool_name":"Bash","tool_input":{"command":"grep -rn \"foo\\nbar\" ."}}'
+
+# --- packaging manifests -----------------------------------------------------
+# Parse-check every manifest the harnesses read. `claude plugin validate` is the
+# real check but needs the CLI, so that one runs by hand at release time.
+
+for m in \
+	"$ROOT/../../.claude-plugin/marketplace.json" \
+	"$ROOT/.claude-plugin/plugin.json" \
+	"$ROOT/plugin.json" \
+	"$ROOT/hooks/hooks.json" \
+	"$ROOT/../../.codex/hooks.json"
+do
+	if sh "$ROOT/test/check_json.sh" "$m" 2>/dev/null; then
+		pass=$((pass + 1))
+	else
+		printf 'FAIL manifest not valid JSON: %s\n' "$m"
+		fail=$((fail + 1))
+	fi
+done
+
 # --- skill manifest ----------------------------------------------------------
 # The skill is the portable half: it ships to harnesses with no hook support,
 # so its frontmatter must stay parseable even when the router does not run.

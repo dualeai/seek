@@ -1,0 +1,11 @@
+{
+  "name": "seek-router",
+  "version": "0.1.0",
+  "description": "Routes agent shell searches (grep, rg, git grep) to seek, a BM25-ranked local code search with ctags symbols.",
+  "author": {
+    "name": "duale.ai",
+    "url": "https://github.com/dualeai"
+  },
+  "homepage": "https://github.com/dualeai/seek",
+  "license": "Apache-2.0"
+}

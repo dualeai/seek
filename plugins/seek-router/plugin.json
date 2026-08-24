@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "seek-router",
+  "version": "0.1.0",
+  "description": "Ranked local code search for coding agents. Ships the seek query skill; on harnesses with pre-tool hooks it also routes grep-style searches to seek.",
+  "skills": [
+    {
+      "name": "seek-search",
+      "path": "./skills/seek-search"
+    }
+  ]
+}
