@@ -111,7 +111,7 @@ claude plugin install seek-router@seek --scope user
 
 ```sh
 codex plugin marketplace add dualeai/seek
-codex plugin add seek-router
+codex plugin add seek-router@seek
 ```
 
 Codex reviews hooks before running them: open `/hooks` and trust `seek-router`
