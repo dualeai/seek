@@ -23,6 +23,13 @@ test:
 test-static:
 	go vet ./...
 	golangci-lint run ./...
+	$(MAKE) test-plugin
+
+# Router fixture tests. The router ships in the plugin, not in the CLI, so it
+# has no Go test to hang off; run.sh feeds recorded hook payloads to the
+# script and asserts both the decision and exit code 0 on every path.
+test-plugin:
+	sh ./plugins/seek-router/test/run.sh
 
 JUNIT_XML ?= junit.xml
 COVERPROFILE ?= cover.out
@@ -57,4 +64,4 @@ lint:
 release:
 	VERSION=$$($(MAKE) -s version-full) goreleaser release --clean
 
-.PHONY: install upgrade build test test-static test-unit test-bench test-bench-repo test-bench-compare lint release
+.PHONY: install upgrade build test test-static test-plugin test-unit test-bench test-bench-repo test-bench-compare lint release
