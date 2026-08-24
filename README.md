@@ -96,122 +96,71 @@ setups. On older Git versions, normal repos still work.
 
 ### Agent Integration
 
-Paste this prompt into your AI coding agent. It installs seek, tests it, and
-writes short project-specific usage notes.
+Install the plugin. It ships two things: a **skill** that teaches the agent
+seek's query syntax, and a **router hook** that turns the agent's own
+`grep` / `rg` / `git grep` calls into seek searches.
 
-<details>
-<summary>Bootstrap prompt -- click to expand, then copy-paste into your agent</summary>
+**Claude Code**
 
-```
-Install and configure `seek` for this project. seek is ranked local search for
-AI coding agents. It searches the current repo by default, and can also search
-selected files, folders, and other repos.
-
-Step 1 -- Install
-
-  curl -sSfL https://raw.githubusercontent.com/dualeai/seek/main/install.sh | sh
-
-If curl is unavailable: go install github.com/dualeai/seek/cmd/seek@latest
-
-universal-ctags is required (used for indexing and symbol search):
-  macOS:  brew install universal-ctags
-  Linux:  sudo apt-get install universal-ctags
-
-Verify: seek --version
-
-Step 2 -- Test
-
-Run in this project:
-
-  seek 'main'
-
-You should see ranked results with file paths, language labels, line numbers,
-and surrounding context.
-
-Step 3 -- Learn the tool
-
-Usage: seek [flags] '<query>' [path...]
-
-The first argument is the query. Optional paths after the query choose where to
-search. With no paths, seek searches the current repo. Folders inside Git repos
-use Git ignore and include local changes. Exact files search only that file.
-Folders outside Git use filesystem rules. Nested Git repos inside selected
-folders are searched once. Ignored folders inside a selected repo stay ignored;
-pass an exact ignored file or folder to search it. Use single quotes to avoid shell
-interpretation of |, (, ).
-
-Filters (combine with spaces inside the quotes):
-  sym:Name        Find definitions: functions, classes, methods, types
-  file:path       Include paths matching substring
-  -file:path      Exclude paths matching substring
-  lang:python     Filter by detected language
-  content:regex   Regex on file content only (bare words match content + filenames)
-  type:file       Return matching file names only
-  case:yes        Force case-sensitive search
-  or, ()          Boolean logic (space = implicit AND)
-
-Examples:
-  seek 'sym:handleRequest'                          # find definition
-  seek 'handleRequest file:api -file:test'          # scoped search
-  seek 'handleRequest' ./src ./cmd                  # search paths
-  seek 'TODO' ../notes                              # search outside Git
-  seek 'needle' ./src/server.go                     # exact file only
-  seek 'content:async def.*handler lang:python'     # regex + language
-  seek '(lang:go or lang:python) ValidationError'   # multi-language
-  seek 'type:file config'                           # find files by name
-
-Output: ranked by relevance, grouped by file, 3 lines of context.
-Symbol lines tagged [func], [class], etc. Modified files tagged [uncommitted].
-Plain text when piped (agents/CI get no color); colored only on a terminal,
-and NO_COLOR is honored. When results were capped by -n/-m, a "N more files/
-matches" line says how many were hidden.
-
-Exit codes: 0 = matches found, 1 = no matches, 2 = error.
-
-Pitfalls:
-  - Query filters stay in ONE argument: seek 'sym:Foo file:bar'
-  - Single quotes to prevent shell expanding |, (, )
-  - Flags must come before the query: seek -n 5 'Foo' ./src
-  - Words after the query are filesystem paths, not extra query filters
-  - Multi-word queries are AND'd substrings, not phrase match: seek 'foo bar'
-    matches files containing both "foo" and "bar" independently
-  - Large output: use -n to limit files (seek -n 5 'q') or -m to limit
-    matches per file (seek -n 5 -m 3 'q')
-
-Step 4 -- Discover project-specific examples
-
-Run a few searches of varying complexity against this project to find examples
-that show where seek helps. Try:
-  - A sym: search for a key class or function in the project
-  - A scoped search using file: and -file:test
-  - A lang: or content: filtered search
-  - A type:file search for a common config or entry point
-
-Keep 3-4 queries that returned useful, ranked results. You will use these as
-examples in the config file (not the generic examples from Step 3).
-
-Step 5 -- Configure this project
-
-Add seek instructions to this project's agent config so future sessions and
-team members use seek automatically:
-  - Claude Code     -> CLAUDE.md
-  - OpenAI Codex    -> AGENTS.md
-  - Cursor          -> .cursor/rules or .cursorrules
-  - Other           -> your agent's instruction file
-
-Write concise, task-oriented instructions (not this entire prompt). Include:
-  1. Prefer seek when an agent needs ranked local context
-  2. Key patterns: sym:, file:, -file:, lang:, content:, paths after the query
-  3. The project-specific examples you found in Step 4 (not generic ones)
-  4. Pitfalls: query filters in one argument, flags before query, paths after
-     query, single quotes
-  5. Install command as fallback if seek is not found
-  6. When spawning sub-agents that don't inherit the config, pass them a
-     one-liner: "Use seek 'pattern' [path...] for code search. Keep query
-     filters in one quoted string. Never use grep/rg."
+```sh
+claude plugin marketplace add dualeai/seek
+claude plugin install seek-router@seek --scope user
 ```
 
-</details>
+**OpenAI Codex**
+
+```sh
+codex plugin marketplace add dualeai/seek
+codex plugin add seek-router
+```
+
+Codex reviews hooks before running them: open `/hooks` and trust `seek-router`
+once. Claude Code has no equivalent step.
+
+Try it without installing: `claude --plugin-dir ./plugins/seek-router`.
+
+#### What the router does
+
+A shell search is rewritten in place to the seek equivalent, and seek runs in
+the agent's own shell:
+
+```
+grep -r "parseToken" --include="*.go" . 2>/dev/null | head -20
+  ->  seek -n 20 'content:parseToken'
+```
+
+Routed: `grep`, `egrep`, `rg`, `ag`, `ack`, `git grep`. A trailing
+`2>/dev/null` or `| head -N` is peeled off first, since neither changes which
+files match; `head -N` tightens seek's file cap when it asks for less.
+
+Left alone: pipe filters (`ls | grep foo`, `go test ./... | grep FAIL`),
+counts, redirects, compound commands, and any flag the router cannot map. When
+in doubt it does nothing and your original command runs.
+
+#### Ranked, not exhaustive
+
+seek ranks by relevance and caps the number of files, so it answers "where is
+this" rather than "every occurrence". For a rename, a refactor, or counting
+call sites, bypass the router:
+
+```sh
+SEEK_ROUTER=off grep -rn 'PATTERN' .
+```
+
+Set `SEEK_ROUTER=off` in the environment to disable routing for a whole
+session. The router also stays out of the way when seek is not installed.
+
+#### Without the plugin
+
+Add a short note to your agent's instruction file (`CLAUDE.md`, `AGENTS.md`,
+`.cursor/rules`) naming seek and its main filters:
+
+```
+Use `seek` for code search, not grep/rg. Usage: seek [flags] '<query>' [path...]
+Filters stay in ONE quoted argument: sym:Name (definitions), content:REGEX,
+file:path, -file:path, lang:go, type:file. Paths come after the query.
+Examples: seek 'sym:ParseToken'   seek 'content:TODO lang:go -file:test' ./cmd
+```
 
 ## Usage
 

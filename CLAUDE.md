@@ -107,3 +107,23 @@ inline version comment. Example:
 
 Never pin to a tag or branch (e.g. `@v4`). Always verify the SHA matches the
 version on GitHub before committing.
+
+## Router plugin
+
+`plugins/seek-router/` ships a PreToolUse hook that rewrites the agent's
+`grep`/`rg`/`git grep` calls into seek searches, plus the `seek-search` skill.
+Load it in this repo with `claude --plugin-dir ./plugins/seek-router`; Codex
+picks it up from `.codex/hooks.json` with no install.
+
+The router is ranked and file-capped, so it answers "where is this", not "every
+occurrence". When you need every hit (rename, refactor, counting call sites):
+
+```sh
+SEEK_ROUTER=off grep -rn 'PATTERN' .
+```
+
+`SEEK_ROUTER=off` in the environment disables routing for a whole session.
+
+Router changes must keep `make test-plugin` green; it feeds recorded hook
+payloads to the script and asserts exit code 0 on every path, because exit 2
+reads as a deny and would break search instead of falling back to grep.
