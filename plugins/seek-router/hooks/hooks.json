@@ -4,12 +4,11 @@
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "if": "Bash(grep *)", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/router.sh\"", "statusMessage": "Routing search to seek" },
-          { "type": "command", "if": "Bash(egrep *)", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/router.sh\"", "statusMessage": "Routing search to seek" },
-          { "type": "command", "if": "Bash(rg *)", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/router.sh\"", "statusMessage": "Routing search to seek" },
-          { "type": "command", "if": "Bash(ag *)", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/router.sh\"", "statusMessage": "Routing search to seek" },
-          { "type": "command", "if": "Bash(ack *)", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/router.sh\"", "statusMessage": "Routing search to seek" },
-          { "type": "command", "if": "Bash(git grep *)", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/router.sh\"", "statusMessage": "Routing search to seek" }
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/router.sh\"",
+            "statusMessage": "Routing search to seek"
+          }
         ]
       }
     ]

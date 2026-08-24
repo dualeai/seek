@@ -180,9 +180,8 @@ END {
 	cmd = json_str_value(payload, "command")
 	if (!ok || cmd == "") exit 0
 
-	# Per-call bypass. Claude Code strips leading variable assignments before
-	# matching an `if` condition, so this hook still runs for a bypassed
-	# command and has to recognise the prefix itself.
+	# Per-call bypass. The Bash matcher is the only gate the hook gets, so it
+	# runs for a bypassed command too and has to recognise the prefix itself.
 	if (cmd ~ /^[ \t]*SEEK_ROUTER=off[ \t]/) exit 0
 
 	# Two suffixes are worth peeling off before the compound-command guard,

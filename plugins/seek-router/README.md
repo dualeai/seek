@@ -27,6 +27,20 @@ single `seek` invocation with one interpolated value. That value is
 shell-quoted: a pattern containing a quote must not be able to close ours and
 leave the rest running as shell.
 
+## One hook entry, not six
+
+The package ships one unconditional entry under the `Bash` matcher.
+
+Claude Code can narrow an entry with an `if` condition, and an earlier version
+used six, one per search command, to keep the router from spawning on shell
+calls that are not searches. Codex has no `if` field, and its matcher group
+does not reject unknown keys, so all six loaded unconditionally and ran the
+router six times per Bash call.
+
+The matcher is the only gate both harnesses read. Re-adding `if` buys Claude
+Code a few skipped spawns and costs Codex one spawn per entry; `router.sh`
+already exits silently on anything it cannot translate.
+
 ## Always exit 0
 
 Claude Code reads exit code 2 as a deny and shows the hook's stderr to the
@@ -39,7 +53,7 @@ including malformed input, and `make test-plugin` asserts it on every fixture.
 ```
 .claude-plugin/plugin.json   Claude Code + Codex manifest
 plugin.json                  Agent Plugins 1.0.0 manifest (skill only)
-hooks/hooks.json             matchers and if-conditions
+hooks/hooks.json             the PreToolUse matcher
 bin/router.sh                the router
 skills/seek-search/SKILL.md  query syntax, ships everywhere
 test/run.sh                  fixture suite, run by make test-plugin
