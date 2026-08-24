@@ -236,6 +236,16 @@ quote_case "backtick in pattern"      "$(bash_payload 'grep -rn \"foo\`id\`\" .'
 quote_case "dollar paren in pattern"  "$(bash_payload 'grep -rn \"foo\$(id)\" .')"
 quote_case "backslash in pattern"     "$(bash_payload 'grep -rn \"foo\\\\\\\\bar\" .')"
 quote_case "newline in pattern"       '{"tool_name":"Bash","tool_input":{"command":"grep -rn \"foo\\nbar\" ."}}'
+# --- skill manifest ----------------------------------------------------------
+# The skill is the portable half: it ships to harnesses with no hook support,
+# so its frontmatter must stay parseable even when the router does not run.
+
+if sh "$ROOT/test/check_skill.sh" "$ROOT/skills/seek-search/SKILL.md" 2>/dev/null; then
+	pass=$((pass + 1))
+else
+	printf 'FAIL SKILL.md frontmatter\n'
+	fail=$((fail + 1))
+fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
