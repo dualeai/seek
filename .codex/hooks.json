@@ -8,7 +8,7 @@
             "type": "command",
             "command": "sh plugins/seek-router/bin/router.sh",
             "statusMessage": "Routing search to seek",
-            "timeoutSec": 10
+            "timeout": 10
           }
         ]
       }
