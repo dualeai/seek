@@ -114,8 +114,12 @@ codex plugin marketplace add dualeai/seek
 codex plugin add seek-router@seek
 ```
 
-Codex reviews hooks before running them: open `/hooks` and trust `seek-router`
-once. Claude Code has no equivalent step.
+Start a new Codex session after each install or update. Open `/hooks` and trust
+`seek-router` once. Claude Code has no equivalent step.
+
+The package does not use an Agent Plugins 1.0 root manifest because that
+standard does not define portable hooks. See the
+[compatibility note](plugins/seek-router/README.md#why-there-is-no-agent-plugins-manifest).
 
 The hook requires `jq` on `PATH`. If `seek` or `jq` is missing, it leaves the
 original command unchanged.

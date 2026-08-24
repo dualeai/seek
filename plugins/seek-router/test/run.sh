@@ -159,17 +159,20 @@ else
 	record_failure "notice teaches direct use and bypass" "text missing"
 fi
 
-# Execute one emitted command with the real seek binary. String comparison
-# alone cannot prove that the generated query parses and returns a real match.
+# Execute one emitted command with the real seek binary. Run it from the plugin
+# root so this test also works after a harness copies only the plugin package.
 if [ -n "$REAL_SEEK" ]; then
-	payload=$(bash_payload 'grep -rn normalizeLineMatches ./cmd/seek')
+	payload=$(bash_payload 'grep -rn seek .')
 	out=$(printf '%s' "$payload" | sh "$ROUTER" 2>/dev/null)
 	got=$(printf '%s' "$out" | jq -er '.hookSpecificOutput.updatedInput.command' 2>/dev/null || :)
 	REAL_SEEK_DIR=$(dirname "$REAL_SEEK")
-	result=$(PATH="$REAL_SEEK_DIR:$ORIGINAL_PATH" sh -c "$got" 2>/dev/null)
+	result=$(
+		CDPATH='' cd -- "$ROOT" &&
+			PATH="$REAL_SEEK_DIR:$ORIGINAL_PATH" sh -c "$got" 2>/dev/null
+	)
 	code=$?
 	case $result in
-	*normalizeLineMatches*) matched=1 ;;
+	*seek*) matched=1 ;;
 	*) matched=0 ;;
 	esac
 	if [ "$code" -eq 0 ] && [ "$matched" -eq 1 ]; then
@@ -301,7 +304,6 @@ fi
 for manifest in \
 	"$ROOT/.claude-plugin/plugin.json" \
 	"$ROOT/.codex-plugin/plugin.json" \
-	"$ROOT/plugin.json" \
 	"$ROOT/hooks/hooks.json"
 do
 	if sh "$ROOT/test/check_json.sh" "$manifest" 2>/dev/null; then
@@ -311,22 +313,15 @@ do
 	fi
 done
 
-# Agent Plugins 1.0 has a closed manifest schema. Skills use the fixed skills/
-# location and must not appear as a top-level manifest field.
-if jq -e '
-	.["$schema"] == "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
-	and (.name | type) == "string"
-	and ((keys - [
-		"$schema", "name", "version", "description", "author", "homepage",
-		"repository", "license", "keywords", "extensions"
-	]) | length == 0)
-' "$ROOT/plugin.json" >/dev/null 2>&1; then
+# A conformant Agent Plugins root manifest takes priority over the Codex
+# manifest in Codex 0.149.1. Codex then skips lifecycle hooks for the package.
+if [ ! -e "$ROOT/plugin.json" ] && [ ! -L "$ROOT/plugin.json" ]; then
 	pass=$((pass + 1))
 else
-	record_failure "Agent Plugins manifest schema" "unsupported top-level field"
+	record_failure "Codex manifest precedence" "root plugin.json disables the plugin hook"
 fi
 
-plugin_version=$(jq -er '.version' "$ROOT/plugin.json" 2>/dev/null || :)
+plugin_version=$(jq -er '.version' "$ROOT/.codex-plugin/plugin.json" 2>/dev/null || :)
 if [ -n "$plugin_version" ] && jq -e --arg version "$plugin_version" '
 	.name == "seek-router"
 	and .version == $version

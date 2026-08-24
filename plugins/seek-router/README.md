@@ -103,16 +103,51 @@ set `CLAUDE_PLUGIN_ROOT`, so the shared hook command can locate the script.
 ```text
 .claude-plugin/plugin.json   Claude Code manifest
 .codex-plugin/plugin.json    Codex manifest
-plugin.json                  Agent Plugins 1.0 manifest
 hooks/hooks.json             shared PreToolUse hook
 bin/router.sh                fail-open command router
 skills/seek-search/SKILL.md  seek query guide
 test/run.sh                  router and packaging tests
 ```
 
-The Agent Plugins manifest uses fixed folder discovery. The Claude Code and
-Codex manifests supply their harness metadata. Codex discovers
-`hooks/hooks.json` by its default plugin path.
+### Why there is no Agent Plugins manifest
+
+[Agent Plugins 1.0](https://agent-plugins.org/specification) standardizes skills
+and MCP servers. It does not standardize hooks. Its closed root manifest has no
+`hooks` field. The specification permits hooks only as a
+[client extension](https://agent-plugins.org/plugin-authors/client-extensions),
+but Codex 0.149.1 does not define or load such an extension.
+
+Codex 0.149.1 selects an Agent Plugins root `plugin.json` before
+`.codex-plugin/plugin.json`, marks the package as an Agent Plugin, and skips all
+lifecycle hooks for that format. It also skips hooks from the Codex overlay.
+See the [manifest selection code](https://github.com/openai/codex/blob/rust-v0.149.1/codex-rs/utils/plugins/src/plugin_namespace.rs#L42-L78)
+and the [Codex 0.149.1 loader](https://github.com/openai/codex/blob/rust-v0.149.1/codex-rs/core-plugins/src/loader.rs#L942-L952).
+The package therefore uses `.codex-plugin/plugin.json` and
+`.claude-plugin/plugin.json`, with no root Agent Plugins manifest.
+
+Codex discovers `hooks/hooks.json` through its
+[default plugin path](https://learn.chatgpt.com/docs/hooks).
+
+## Static test procedure
+
+Run this command from the seek repository root:
+
+```sh
+make test-plugin
+```
+
+This test checks router decisions, fail-open paths, one emitted seek command,
+and the absence of a root `plugin.json`. A copied plugin package must pass the
+same script:
+
+```sh
+sh /path/to/copied/seek-router/test/run.sh
+```
+
+For a host check, install the package and start a new Codex session in a
+repository that has no `.codex/hooks.json`. Open `/hooks`, confirm that
+`seek-router` appears under `PreToolUse`, trust it, and then run a safe static
+`rg` search. The transcript must show the `[seek router] Routed to:` notice.
 
 ## Tool scope
 
