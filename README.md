@@ -25,7 +25,7 @@ seek 'TODO' ../notes                 # folder outside Git
 seek 'needle' ./src/server.go        # exact file
 ```
 
-```
+```text
 ## src/server.go (Go)
 12
 13 // handleRequest processes incoming HTTP requests.
@@ -97,17 +97,17 @@ setups. On older Git versions, normal repos still work.
 ### Agent Integration
 
 Install the plugin. It ships two things: a **skill** that teaches the agent
-seek's query syntax, and a **router hook** that turns the agent's own
-`grep` / `rg` / `git grep` calls into seek searches.
+seek's query syntax, and a **router hook** that rewrites safe static `grep` and
+`rg` calls as seek searches.
 
-**Claude Code**
+#### Claude Code
 
 ```sh
 claude plugin marketplace add dualeai/seek
 claude plugin install seek-router@seek --scope user
 ```
 
-**OpenAI Codex**
+#### OpenAI Codex
 
 ```sh
 codex plugin marketplace add dualeai/seek
@@ -117,6 +117,9 @@ codex plugin add seek-router@seek
 Codex reviews hooks before running them: open `/hooks` and trust `seek-router`
 once. Claude Code has no equivalent step.
 
+The hook requires `jq` on `PATH`. If `seek` or `jq` is missing, it leaves the
+original command unchanged.
+
 Try it without installing: `claude --plugin-dir ./plugins/seek-router`.
 
 #### What the router does
@@ -124,24 +127,22 @@ Try it without installing: `claude --plugin-dir ./plugins/seek-router`.
 A shell search is rewritten in place to the seek equivalent, and seek runs in
 the agent's own shell:
 
-```
-grep -r "parseToken" --include="*.go" . 2>/dev/null | head -20
-  ->  seek -n 20 'content:parseToken'
+```text
+grep -rn "parseToken" ./cmd
+  -> seek -n 20 -m 3 'case:yes content:parseToken' './cmd'
 ```
 
-Routed: `grep`, `egrep`, `rg`, `ag`, `ack`, `git grep`. A trailing
-`2>/dev/null` or `| head -N` is peeled off first, since neither changes which
-files match; `head -N` tightens seek's file cap when it asks for less.
-
-Left alone: pipe filters (`ls | grep foo`, `go test ./... | grep FAIL`),
-counts, redirects, compound commands, and any flag the router cannot map. When
-in doubt it does nothing and your original command runs.
+The router accepts only recursive `grep` with an explicit path, or `rg`, when
+the pattern, paths, and short flags have a direct seek meaning. It leaves regex
+operators, file filters, `git grep`, globs, variables, pipes, redirects,
+compound commands, and unknown flags unchanged. When in doubt, it returns no
+decision and the original command runs.
 
 #### Ranked, not exhaustive
 
-seek ranks by relevance and caps the number of files, so it answers "where is
-this" rather than "every occurrence". For a rename, a refactor, or counting
-call sites, bypass the router:
+The router caps ranked results at 20 files and three matches per file. It
+answers "where is this" rather than "every occurrence". For a rename, a
+refactor, or a call-site count, bypass the router:
 
 ```sh
 SEEK_ROUTER=off grep -rn 'PATTERN' .
@@ -155,7 +156,7 @@ session. The router also stays out of the way when seek is not installed.
 Add a short note to your agent's instruction file (`CLAUDE.md`, `AGENTS.md`,
 `.cursor/rules`) naming seek and its main filters:
 
-```
+```text
 Use `seek` for code search, not grep/rg. Usage: seek [flags] '<query>' [path...]
 Filters stay in ONE quoted argument: sym:Name (definitions), content:REGEX,
 file:path, -file:path, lang:go, type:file. Paths come after the query.

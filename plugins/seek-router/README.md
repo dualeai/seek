@@ -1,81 +1,121 @@
 # seek-router
 
-A PreToolUse hook that turns an agent's `grep` / `rg` / `git grep` calls into
-[seek](https://github.com/dualeai/seek) searches, plus the `seek-search` skill
-that teaches the query syntax.
+`seek-router` adds two parts to Claude Code and Codex:
 
-Install and usage: see the Agent Integration section of the [top-level
-README](../../README.md).
+- the `seek-search` skill, which teaches agents how to query seek;
+- a `PreToolUse` hook, which rewrites a small set of safe shell searches.
 
-## How it decides
+See [Agent Integration](../../README.md#agent-integration) for installation.
 
-`bin/router.sh` reads one hook payload on stdin and prints at most one decision
-on stdout. There are exactly two outcomes:
+## Requirements
 
-| Outcome | When |
+The hook requires `seek` and `jq` on `PATH`. If either command is missing, the
+hook returns no decision and the original shell command runs.
+
+## Routing contract
+
+`bin/router.sh` accepts a hook payload on standard input. It has two results:
+
+| Result | Meaning |
 | --- | --- |
-| `allow` + `updatedInput` | the whole command is a plain file search it can translate |
-| nothing at all | everything else — the original command runs untouched |
+| `allow` with `updatedInput` | Replace the shell command with seek. |
+| No output | Run the original shell command unchanged. |
 
-It rewrites rather than denies. A denial makes the model produce a replacement
-command, and a hook that keeps rejecting the same command can put the model in
-a retry loop; rewriting sidesteps that, and the tool result is not marked as an
-error.
+The router handles only static searches whose meaning it can preserve:
 
-The notice rides along in `additionalContext`, so the rewritten command stays a
-single `seek` invocation with one interpolated value. That value is
-shell-quoted: a pattern containing a quote must not be able to close ours and
-leave the rest running as shell.
+- recursive `grep` with at least one explicit path;
+- `rg` with an optional explicit path;
+- short flags that do not change the result set;
+- an ASCII search atom and ASCII literal paths.
 
-## One hook entry, not six
+For example:
 
-The package ships one unconditional entry under the `Bash` matcher.
+```text
+grep -rni Foo ./cmd
+  -> seek -n 20 -m 3 'case:no content:Foo' './cmd'
 
-Claude Code can narrow an entry with an `if` condition, and an earlier version
-used six, one per search command, to keep the router from spawning on shell
-calls that are not searches. Codex has no `if` field, and its matcher group
-does not reject unknown keys, so all six loaded unconditionally and ran the
-router six times per Bash call.
+rg needleFunc
+  -> seek -n 20 -m 3 'case:yes content:needleFunc' '.'
+```
 
-The matcher is the only gate both harnesses read. Re-adding `if` buys Claude
-Code a few skipped spawns and costs Codex one spawn per entry; `router.sh`
-already exits silently on anything it cannot translate.
+The allowed `grep` short flags are `r`, `n`, `H`, `I`, `F`, `E`, and `i`.
+The allowed `rg` short flags are `n`, `H`, `I`, `F`, and `i`. `-i` becomes
+`case:no`; all other routed searches use `case:yes`.
 
-## Always exit 0
+When `rg` has no path, the rewrite adds `.`. This keeps the search in the
+shell's current directory instead of widening it to the Git worktree root.
 
-Claude Code reads exit code 2 as a deny and shows the hook's stderr to the
-model as the reason. A crashing router would therefore look like a deliberate
-block and break search instead of falling back to grep. Every path exits 0,
-including malformed input, and `make test-plugin` asserts it on every fixture.
+The hook keeps every field in the original `tool_input` object and changes only
+`command`. It adds a short notice that explains the cap and the bypass.
+
+## Why the contract is small
+
+Grep, ripgrep, the shell, and seek have different query and path rules. A broad
+translation can return the wrong files without an error. The router therefore
+leaves these forms unchanged:
+
+- `git grep`, `egrep`, `fgrep`, `ag`, and `ack`;
+- non-recursive `grep` and `grep` that reads standard input;
+- long flags, unknown flags, file filters, counts, file lists, and context
+  flags;
+- regular-expression operators, phrases, non-ASCII patterns, and seek filter
+  syntax;
+- globbing, variables, command substitution, comments, pipes, redirects, and
+  compound shell commands;
+- dynamic or non-ASCII paths.
+
+Use seek directly for richer ranked searches. Use the original search tool
+when exact shell or regular-expression behavior matters.
+
+## Ranked result limits
+
+Every routed command uses `-n 20 -m 3`: at most 20 files and three matches per
+file. This limit keeps broad searches small. It also makes routed results
+nonexhaustive.
+
+For a rename, refactor, count, or complete reference list, bypass the hook:
+
+```sh
+SEEK_ROUTER=off grep -rn 'PATTERN' .
+```
+
+Set `SEEK_ROUTER=off` in the session environment to disable all routing.
+
+## Fail-open behavior
+
+The router always exits with status 0. Invalid JSON, unsupported commands,
+missing dependencies, and internal parsing failures all produce no decision.
+The harness then runs the original command.
+
+The hook rewrites a Bash call instead of denying it. The search runs in the
+agent shell, and the tool result is not a permission denial.
+
+## One hook entry
+
+The package uses one unconditional `Bash` matcher. Claude Code and Codex both
+load it. The script exits quickly for commands outside its contract.
+
+Codex asks the user to trust plugin hooks before it runs them. Both harnesses
+set `CLAUDE_PLUGIN_ROOT`, so the shared hook command can locate the script.
 
 ## Layout
 
+```text
+.claude-plugin/plugin.json   Claude Code manifest
+.codex-plugin/plugin.json    Codex manifest
+plugin.json                  Agent Plugins 1.0 manifest
+hooks/hooks.json             shared PreToolUse hook
+bin/router.sh                fail-open command router
+skills/seek-search/SKILL.md  seek query guide
+test/run.sh                  router and packaging tests
 ```
-.claude-plugin/plugin.json   Claude Code + Codex manifest
-plugin.json                  Agent Plugins 1.0.0 manifest (skill only)
-hooks/hooks.json             the PreToolUse matcher
-bin/router.sh                the router
-skills/seek-search/SKILL.md  query syntax, ships everywhere
-test/run.sh                  fixture suite, run by make test-plugin
-```
 
-## Not built: routing the Grep and Glob tools
+The Agent Plugins manifest uses fixed folder discovery. The Claude Code and
+Codex manifests supply their harness metadata. Codex discovers
+`hooks/hooks.json` by its default plugin path.
 
-Claude Code also exposes `Grep` and `Glob` tools, which this plugin leaves
-alone. `updatedInput` can change a tool's arguments but not which tool runs, so
-routing those means denying the call and returning seek's output in the deny
-reason. That works — the model reads results out of a denial and answers from
-them — but it costs considerably more than the Bash path:
+## Tool scope
 
-- a denial can loop. Nothing caps consecutive PreToolUse blocks the way the
-  `Stop` hook's limit does, so the router would need its own circuit breaker
-  keyed per session and subagent.
-- seek would run inside the hook rather than in the agent's shell, which puts
-  index-build time on the hook's timeout instead of in plain sight.
-- `Grep`'s `output_mode`, `head_limit` and context flags would each need a
-  faithful mapping, and several have none — `count` in particular.
-
-Whether it is worth building depends on how often the model reaches for the
-`Grep` tool rather than shell `grep` in normal permission mode, and on whether
-routing improves an answer rather than merely producing one. Judging that needs
-end-to-end tasks scored on output quality, not a token count.
+The plugin does not replace built-in `Grep` or `Glob` tools. A hook can change
+arguments for one tool, but it cannot turn that call into a Bash call. Doing so
+would require a denial path with different error and retry behavior.
