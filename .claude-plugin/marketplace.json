@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "seek-router",
-      "description": "Routes agent shell searches (grep, rg, git grep) to seek, a BM25-ranked local code search.",
+      "description": "Routes safe static grep and rg searches to seek, a BM25-ranked local code search.",
       "source": "./plugins/seek-router",
       "category": "productivity"
     }

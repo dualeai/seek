@@ -111,18 +111,26 @@ version on GitHub before committing.
 ## Router plugin
 
 `plugins/seek-router/` ships a PreToolUse hook that rewrites the agent's
-`grep`/`rg`/`git grep` calls into seek searches, plus the `seek-search` skill.
+safe static `grep` and `rg` calls into seek searches, plus the `seek-search`
+skill.
 Load it in this repo with `claude --plugin-dir ./plugins/seek-router`; Codex
 picks it up from `.codex/hooks.json` with no install.
 
-The router is ranked and file-capped, so it answers "where is this", not "every
-occurrence". When you need every hit (rename, refactor, counting call sites):
+The router caps ranked results at 20 files and 3 matches per file. It answers
+"where is this", not "every occurrence". When you need every hit for a rename,
+refactor, or call-site count:
 
 ```sh
 SEEK_ROUTER=off grep -rn 'PATTERN' .
 ```
 
 `SEEK_ROUTER=off` in the environment disables routing for a whole session.
+
+The hook requires `jq`. It routes only recursive `grep` with an explicit path,
+or `rg`, when the pattern, paths, and short flags have a direct seek meaning.
+It leaves regex operators, file filters, `git grep`, globs, variables, pipes,
+redirects, compound commands, and unknown flags unchanged. See
+`plugins/seek-router/README.md` for the full contract.
 
 Router changes must keep `make test-plugin` green; it feeds recorded hook
 payloads to the script and asserts exit code 0 on every path, because exit 2

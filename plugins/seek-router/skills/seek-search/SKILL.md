@@ -66,9 +66,10 @@ tag so every match is directly openable.
 
 ## When seek is the wrong tool
 
-seek is ranked and capped: it answers "where is this" well. It is not an
-exhaustive scanner. When you need every single occurrence - a rename, a
-refactor, counting call sites - use grep directly:
+seek ranks results. Its `-n` and `-m` defaults are unlimited, but the router
+uses `-n 20 -m 3` to keep automatic searches small. A routed search is not
+exhaustive. When you need every occurrence, such as for a rename, refactor, or
+call-site count, use grep directly:
 
 ```sh
 SEEK_ROUTER=off grep -rn 'PATTERN' .

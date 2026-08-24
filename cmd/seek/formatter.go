@@ -96,16 +96,13 @@ func formatCorpusResultsWithContext(
 		deduped = deduped[:limit]
 	}
 
-	// Apply per-file match limit (0 or negative = unlimited), recording how
-	// many matches were dropped per file for the "N more matches" notice.
+	// Collapse duplicate lines, apply the per-file match limit, and put the
+	// survivors in line order. Recording how many were dropped feeds the
+	// "N more matches" notice.
 	hiddenMatches := make([]int, len(deduped))
-	if maxMatches > 0 {
-		for i := range deduped {
-			if extra := len(deduped[i].file.LineMatches) - maxMatches; extra > 0 {
-				hiddenMatches[i] = extra
-				deduped[i].file.LineMatches = deduped[i].file.LineMatches[:maxMatches]
-			}
-		}
+	for i := range deduped {
+		deduped[i].file.LineMatches, hiddenMatches[i] =
+			normalizeLineMatches(deduped[i].file.LineMatches, maxMatches)
 	}
 
 	// Pre-size the builder: ~200 bytes per file header + ~80 bytes per match.
@@ -172,6 +169,70 @@ func chooseDedupEntry[K comparable](entries map[K]dedupEntry, key K, idx int, un
 	if !ok || (uncommitted && !existing.uncommitted) {
 		entries[key] = dedupEntry{idx: idx, uncommitted: uncommitted}
 	}
+}
+
+// normalizeLineMatches keeps the best distinct lines, then orders them for
+// display. Current zoekt emits one LineMatch per source line, but duplicate
+// handling keeps this formatter safe for synthetic and future callers.
+//
+// Ranking must select the survivors before line sorting. The render loop also
+// needs ascending lines to suppress overlapping context correctly. The helper
+// never changes the caller's slice.
+func normalizeLineMatches(lms []zoekt.LineMatch, maxMatches int) ([]zoekt.LineMatch, int) {
+	if len(lms) < 2 {
+		return lms, 0
+	}
+
+	strictlyOrdered := true
+	for i := 1; i < len(lms); i++ {
+		if lms[i].LineNumber <= lms[i-1].LineNumber {
+			strictlyOrdered = false
+			break
+		}
+	}
+	if strictlyOrdered {
+		if maxMatches > 0 && len(lms) > maxMatches {
+			return lms[:maxMatches], len(lms) - maxMatches
+		}
+		return lms, 0
+	}
+
+	room := len(lms)
+	if maxMatches > 0 && maxMatches < room {
+		room = maxMatches
+	}
+
+	// Never write through to the caller's slice: it shares backing arrays with
+	// the search result, which the caller may still hold.
+	out := make([]zoekt.LineMatch, 0, room)
+	at := make(map[int]int, len(lms))
+	// Record dropped lines too, so their duplicates do not inflate the hidden
+	// match count. A value of -1 marks a distinct line dropped by the cap.
+	for _, lm := range lms {
+		i, seen := at[lm.LineNumber]
+		if !seen {
+			i = -1
+			if len(out) < room {
+				i = len(out)
+				out = append(out, lm)
+			}
+			at[lm.LineNumber] = i
+			continue
+		}
+		if i < 0 { // duplicate of a line the cap already dropped
+			continue
+		}
+		// Union the fragments so a merged line stays fully colored. Copy
+		// rather than append in place; out[i].LineFragments still aliases the
+		// caller's array at this point.
+		merged := make([]zoekt.LineFragmentMatch, 0, len(out[i].LineFragments)+len(lm.LineFragments))
+		merged = append(merged, out[i].LineFragments...)
+		merged = append(merged, lm.LineFragments...)
+		out[i].LineFragments = merged
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].LineNumber < out[j].LineNumber })
+	return out, len(at) - len(out)
 }
 
 func formatCorpusFileMatch(sb *strings.Builder, result corpusSearchResult, displayMode corpusDisplayMode, hiddenMatches int, pal palette) {
