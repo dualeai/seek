@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1528,5 +1529,91 @@ func TestFormatCorpusResults_LimitAppliesAfterMerge(t *testing.T) {
 	out := formatCorpusResultsWithContext(results, nil, 1, 0, showCorpusContext, plainPalette)
 	if !strings.Contains(out, "## /tmp/high/high.txt") || strings.Contains(out, "low.txt") {
 		t.Fatalf("expected limit after merged sort, got:\n%s", out)
+	}
+}
+
+// --- LineMatch ordering ---------------------------------------------------
+
+func TestNormalizeLineMatches(t *testing.T) {
+	input := []zoekt.LineMatch{
+		{
+			Line:          []byte("line seventy\n"),
+			LineNumber:    70,
+			LineFragments: []zoekt.LineFragmentMatch{{LineOffset: 0, MatchLength: 4}},
+		},
+		{
+			Line:          []byte("line seventy\n"),
+			LineNumber:    70,
+			LineFragments: []zoekt.LineFragmentMatch{{LineOffset: 5, MatchLength: 7}},
+		},
+		{Line: []byte("line ten\n"), LineNumber: 10},
+		{Line: []byte("line thirty\n"), LineNumber: 30},
+		{Line: []byte("line thirty\n"), LineNumber: 30},
+		{Line: []byte("line fifty\n"), LineNumber: 50},
+	}
+	original := append([]zoekt.LineMatch(nil), input...)
+	for i := range original {
+		original[i].LineFragments = append([]zoekt.LineFragmentMatch(nil), input[i].LineFragments...)
+	}
+
+	got, hidden := normalizeLineMatches(input, 2)
+	want := []zoekt.LineMatch{
+		{Line: []byte("line ten\n"), LineNumber: 10},
+		{
+			Line:       []byte("line seventy\n"),
+			LineNumber: 70,
+			LineFragments: []zoekt.LineFragmentMatch{
+				{LineOffset: 0, MatchLength: 4},
+				{LineOffset: 5, MatchLength: 7},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("matches:\n got: %#v\nwant: %#v", got, want)
+	}
+	if hidden != 2 {
+		t.Fatalf("hidden matches = %d, want 2", hidden)
+	}
+	if !reflect.DeepEqual(input, original) {
+		t.Fatalf("normalizeLineMatches changed its input:\n got: %#v\nwant: %#v", input, original)
+	}
+}
+
+func TestGitCorpusFormatting_UnorderedOverlappingContext_NoDuplicateLines(t *testing.T) {
+	// The real-world shape: matches arrive out of order AND their context
+	// windows overlap. Every source line must appear exactly once, ascending.
+	files := []zoekt.FileMatch{
+		{
+			FileName:   "app.go",
+			Repository: "repo",
+			Language:   "Go",
+			Score:      10,
+			LineMatches: []zoekt.LineMatch{
+				{
+					Line:       []byte("second match\n"),
+					LineNumber: 12,
+					Before:     []byte("line ten\nline eleven\n"),
+					After:      []byte("line thirteen\n"),
+				},
+				{
+					Line:       []byte("first match\n"),
+					LineNumber: 10,
+					After:      []byte("line eleven\nsecond match\n"),
+				},
+			},
+		},
+	}
+
+	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	expected := strings.Join([]string{
+		"## app.go (Go)",
+		"10 first match",
+		"11 line eleven",
+		"12 second match",
+		"13 line thirteen",
+	}, "\n")
+	if result != expected {
+		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
 }
