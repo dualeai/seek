@@ -191,6 +191,19 @@ func cloneStringSlice(values []string) []string {
 }
 
 func run(ctx context.Context, pattern string, pathOperands []string, limit, maxMatches int) error {
+	return runWithSearchConfig(ctx, pattern, pathOperands, limit, maxMatches, defaultSearchConfig())
+}
+
+func runWithSearchConfig(
+	ctx context.Context,
+	pattern string,
+	pathOperands []string,
+	limit int,
+	maxMatches int,
+	config searchConfig,
+) error {
+	config.contextMatchLimit = maxMatches
+	config.contextFileLimit = limit
 	userQ, err := parseSearchQuery(pattern)
 	if err != nil {
 		return err
@@ -213,7 +226,7 @@ func run(ctx context.Context, pattern string, pathOperands []string, limit, maxM
 	}
 
 	worker := func(wctx context.Context, plan corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
-		return prepareAndSearchCorpus(wctx, plan, paths, userQ)
+		return prepareAndSearchCorpus(wctx, plan, paths, userQ, config)
 	}
 	allResults, dirtyByCorpus, err := runCorpusPool(ctx, plans, worker)
 	if err != nil {
@@ -274,9 +287,10 @@ func prepareAndSearchCorpus(
 	plan corpusPlan,
 	paths *gitPaths,
 	userQ query.Q,
+	config searchConfig,
 ) ([]corpusSearchResult, dirtyFileSet, error) {
 	for attempt := 0; ; attempt++ {
-		results, dirty, err := prepareAndSearchCorpusOnce(ctx, plan, paths, userQ)
+		results, dirty, err := prepareAndSearchCorpusOnce(ctx, plan, paths, userQ, config)
 		if errors.Is(err, errScopedLayerStateChanged) && plan.dirtyScope != nil && attempt < maxScopedLayerRefreshRetries {
 			slog.Debug("scoped git layer changed during search; retrying", "root", plan.root, "attempt", attempt+1)
 			continue
@@ -290,6 +304,7 @@ func prepareAndSearchCorpusOnce(
 	plan corpusPlan,
 	paths *gitPaths,
 	userQ query.Q,
+	config searchConfig,
 ) ([]corpusSearchResult, dirtyFileSet, error) {
 	var dirtyFiles dirtyFileSet
 	var indexState corpusIndexState
@@ -334,7 +349,9 @@ func prepareAndSearchCorpusOnce(
 		return nil, dirtyFiles, nil
 	}
 
-	files, err := searchPlannedCorpusParsed(ctx, plan, userQ)
+	config.contextGitCorpus = plan.kind == corpusKindGit
+	config.contextDirtyFiles = dirtyFiles
+	files, err := searchPlannedCorpusParsed(ctx, plan, userQ, config)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -834,7 +851,12 @@ func markGitCorpusKnownEmpty(ctx context.Context, plan corpusPlan, state repoSta
 	return true, nil
 }
 
-func searchPlannedCorpusParsed(ctx context.Context, plan corpusPlan, userQ query.Q) ([]zoekt.FileMatch, error) {
+func searchPlannedCorpusParsed(
+	ctx context.Context,
+	plan corpusPlan,
+	userQ query.Q,
+	config searchConfig,
+) ([]zoekt.FileMatch, error) {
 	// Hold LOCK_SH (the publish/read lock) across the entire glob+open+search so
 	// a concurrent temp-swap publish (brief LOCK_EX) can never interleave and
 	// tear the shard set — readers observe exactly the pre- or post-swap
@@ -862,7 +884,7 @@ func searchPlannedCorpusParsed(ctx context.Context, plan corpusPlan, userQ query
 		return nil, err
 	}
 
-	results, err := executeParsedSearchScopedDirs(ctx, searchIndexDirs(plan), userQ, plan.scope)
+	results, err := executeParsedSearchScopedDirs(ctx, searchIndexDirs(plan), userQ, plan.scope, config)
 	if err != nil {
 		return nil, err
 	}

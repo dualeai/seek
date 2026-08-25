@@ -25,7 +25,7 @@ func executeUnscopedShardSearchForTest(ctx context.Context, indexDir, pattern st
 	if err != nil {
 		return nil, err
 	}
-	return executeParsedSearchScoped(ctx, indexDir, q, nil)
+	return executeParsedSearchScoped(ctx, indexDir, q, nil, defaultSearchConfig())
 }
 
 func searchPlannedCorpusForTest(ctx context.Context, plan corpusPlan, pattern string) ([]zoekt.FileMatch, error) {
@@ -33,5 +33,5 @@ func searchPlannedCorpusForTest(ctx context.Context, plan corpusPlan, pattern st
 	if err != nil {
 		return nil, err
 	}
-	return searchPlannedCorpusParsed(ctx, plan, q)
+	return searchPlannedCorpusParsed(ctx, plan, q, defaultSearchConfig())
 }

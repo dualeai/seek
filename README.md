@@ -238,6 +238,8 @@ More [query syntax](https://github.com/sourcegraph/zoekt/blob/main/doc/query_syn
 |------|-------------|
 | `seek -n 5 "query"` | Display at most 5 files (`--limit`) |
 | `seek -m 3 "query"` | Display at most 3 matches per file (`--max-matches`) |
+| `seek -A 5 "query"` | Show 5 lines after each match (`--after-context`) |
+| `seek -C 5 "query"` | Show 5 lines on both sides (`--context`) |
 | `seek -n 5 -m 3 "query"` | Top 5 files, max 3 matches each |
 | `seek -v "query"` | Enable debug logging (`--verbose`) |
 

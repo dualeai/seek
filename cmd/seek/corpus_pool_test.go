@@ -294,7 +294,7 @@ func TestRunCorpusPool_NWayConcurrent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
 	defer cancel()
 	worker := func(wctx context.Context, plan corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
-		return prepareAndSearchCorpus(wctx, plan, nil, userQ)
+		return prepareAndSearchCorpus(wctx, plan, nil, userQ, defaultSearchConfig())
 	}
 	_, _, err = runCorpusPool(ctx, plans, worker)
 	if err != nil {

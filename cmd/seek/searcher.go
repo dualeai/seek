@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"sync"
 	"time"
 
@@ -20,7 +21,8 @@ const (
 	searchTimeout = 60 * time.Second
 	// searchContextLines is the number of context lines included before and
 	// after each match.
-	searchContextLines = 3
+	searchContextLines    = 3
+	maxSearchContextLines = 512
 )
 
 // searchOpts are the zoekt search options used for every search. Defined
@@ -37,6 +39,25 @@ var searchOpts = zoekt.SearchOptions{
 	NumContextLines:    searchContextLines,
 	UseBM25Scoring:     true,
 	MaxWallTime:        searchTimeout,
+}
+
+type searchConfig struct {
+	opts              *zoekt.SearchOptions
+	afterOnly         bool
+	contextMatchLimit int
+	contextFileLimit  int
+	contextGitCorpus  bool
+	contextDirtyFiles dirtyFileSet
+}
+
+func defaultSearchConfig() searchConfig {
+	return searchConfig{opts: &searchOpts}
+}
+
+func explicitSearchConfig(contextLines int, afterOnly bool) searchConfig {
+	opts := searchOpts
+	opts.NumContextLines = contextLines
+	return searchConfig{opts: &opts, afterOnly: afterOnly}
 }
 
 // openShard opens a single .zoekt shard file and returns a Searcher.
@@ -151,11 +172,23 @@ func parseSearchQuery(pattern string) (query.Q, error) {
 	return query.Simplify(q), nil
 }
 
-func executeParsedSearchScoped(ctx context.Context, indexDir string, userQ query.Q, scope query.Q) ([]zoekt.FileMatch, error) {
-	return executeParsedSearchScopedDirs(ctx, []string{indexDir}, userQ, scope)
+func executeParsedSearchScoped(
+	ctx context.Context,
+	indexDir string,
+	userQ query.Q,
+	scope query.Q,
+	config searchConfig,
+) ([]zoekt.FileMatch, error) {
+	return executeParsedSearchScopedDirs(ctx, []string{indexDir}, userQ, scope, config)
 }
 
-func executeParsedSearchScopedDirs(ctx context.Context, indexDirs []string, userQ query.Q, scope query.Q) ([]zoekt.FileMatch, error) {
+func executeParsedSearchScopedDirs(
+	ctx context.Context,
+	indexDirs []string,
+	userQ query.Q,
+	scope query.Q,
+	config searchConfig,
+) ([]zoekt.FileMatch, error) {
 	q := userQ
 	if scope != nil {
 		q = query.NewAnd(q, scope)
@@ -184,11 +217,11 @@ func executeParsedSearchScopedDirs(ctx context.Context, indexDirs []string, user
 
 	// Fast path: single shard avoids intermediate allFiles slice.
 	if len(searchers) == 1 {
-		result, err := searchers[0].Search(ctx, q, &searchOpts)
+		result, err := searchers[0].Search(ctx, q, config.opts)
 		if err != nil {
 			return nil, fmt.Errorf("search: %w", err)
 		}
-		return cloneFileMatches(result.Files), nil
+		return cloneFileMatches(result.Files, config), nil
 	}
 
 	// Multiple shards: fan out across goroutines bounded by NumCPU.
@@ -216,7 +249,7 @@ func executeParsedSearchScopedDirs(ctx context.Context, indexDirs []string, user
 		go func(i int, s zoekt.Searcher) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			r, err := s.Search(ctx, q, &searchOpts)
+			r, err := s.Search(ctx, q, config.opts)
 			if err != nil {
 				results[i] = shardResult{err: err}
 				return
@@ -232,30 +265,94 @@ func executeParsedSearchScopedDirs(ctx context.Context, indexDirs []string, user
 		}
 		allFiles = append(allFiles, r.files...)
 	}
-	return cloneFileMatches(allFiles), nil
+	return cloneFileMatches(allFiles, config), nil
 }
 
-func cloneFileMatches(files []zoekt.FileMatch) []zoekt.FileMatch {
+func cloneFileMatches(files []zoekt.FileMatch, config searchConfig) []zoekt.FileMatch {
 	if len(files) == 0 {
 		return nil
 	}
+	contextFiles := displayedContextFiles(files, config)
 	out := make([]zoekt.FileMatch, len(files))
 	for i := range files {
-		out[i] = cloneFileMatch(files[i])
+		_, keepContext := contextFiles[i]
+		out[i] = cloneFileMatch(
+			files[i],
+			config.contextMatchLimit,
+			config.afterOnly,
+			contextFiles == nil || keepContext,
+		)
 	}
 	return out
 }
 
-func cloneFileMatch(in zoekt.FileMatch) zoekt.FileMatch {
+// displayedContextFiles returns the files from this corpus that can still be
+// shown after the global file limit. Deduplication and dirty-file suppression
+// are corpus-local, so a global top N file must be in its corpus's top N. A
+// nil map means that all context must be copied.
+func displayedContextFiles(files []zoekt.FileMatch, config searchConfig) map[int]struct{} {
+	limit := config.contextFileLimit
+	if limit <= 0 || len(files) <= limit {
+		return nil
+	}
+
+	byPath := make(map[string]dedupEntry, len(files))
+	for i, file := range files {
+		isUncommitted := config.contextGitCorpus && file.Repository == repoUncommitted
+		chooseDedupEntry(byPath, file.FileName, i, isUncommitted)
+	}
+
+	candidates := make([]int, 0, len(byPath))
+	for _, entry := range byPath {
+		file := files[entry.idx]
+		if !entry.uncommitted && config.contextDirtyFiles.contains(file.FileName) {
+			continue
+		}
+		candidates = append(candidates, entry.idx)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		left := files[candidates[i]]
+		right := files[candidates[j]]
+		if left.Score != right.Score {
+			return left.Score > right.Score
+		}
+		return left.FileName < right.FileName
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+
+	selected := make(map[int]struct{}, len(candidates))
+	for _, index := range candidates {
+		selected[index] = struct{}{}
+	}
+	return selected
+}
+
+func cloneFileMatch(
+	in zoekt.FileMatch,
+	contextMatchLimit int,
+	afterOnly bool,
+	keepFileContext bool,
+) zoekt.FileMatch {
 	out := in
 	out.Branches = cloneStringSlice(in.Branches)
 	out.Content = cloneBytes(in.Content)
 	out.Checksum = cloneBytes(in.Checksum)
 
 	if len(in.LineMatches) > 0 {
+		var contextLines map[int]struct{}
+		if keepFileContext {
+			contextLines = displayedContextLines(in.LineMatches, contextMatchLimit)
+		}
 		out.LineMatches = make([]zoekt.LineMatch, len(in.LineMatches))
 		for i := range in.LineMatches {
-			out.LineMatches[i] = cloneLineMatch(in.LineMatches[i])
+			_, keepContext := contextLines[in.LineMatches[i].LineNumber]
+			out.LineMatches[i] = cloneLineMatch(
+				in.LineMatches[i],
+				keepFileContext && (contextLines == nil || keepContext),
+				afterOnly,
+			)
 		}
 	}
 
@@ -269,11 +366,35 @@ func cloneFileMatch(in zoekt.FileMatch) zoekt.FileMatch {
 	return out
 }
 
-func cloneLineMatch(in zoekt.LineMatch) zoekt.LineMatch {
+// displayedContextLines returns the source lines whose context can reach the
+// formatter. A nil map means that all context must be copied. Search results
+// refer to shard memory, so every displayed byte must be copied before close.
+func displayedContextLines(matches []zoekt.LineMatch, limit int) map[int]struct{} {
+	if limit <= 0 || len(matches) <= limit {
+		return nil
+	}
+	displayed, _ := normalizeLineMatches(matches, limit)
+	lines := make(map[int]struct{}, len(displayed))
+	for _, match := range displayed {
+		lines[match.LineNumber] = struct{}{}
+	}
+	return lines
+}
+
+func cloneLineMatch(in zoekt.LineMatch, keepContext, afterOnly bool) zoekt.LineMatch {
 	out := in
 	out.Line = cloneBytes(in.Line)
-	out.Before = cloneBytes(in.Before)
-	out.After = cloneBytes(in.After)
+	if keepContext {
+		if afterOnly {
+			out.Before = nil
+		} else {
+			out.Before = cloneBytes(in.Before)
+		}
+		out.After = cloneBytes(in.After)
+	} else {
+		out.Before = nil
+		out.After = nil
+	}
 	if len(in.LineFragments) > 0 {
 		out.LineFragments = make([]zoekt.LineFragmentMatch, len(in.LineFragments))
 		for i := range in.LineFragments {
