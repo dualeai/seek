@@ -35,8 +35,10 @@ returns files containing both.
 | --- | --- |
 | `-n N` | at most N files (0 = unlimited) |
 | `-m N` | at most N matches per file (0 = unlimited) |
+| `-A N` | N lines after each match (0-512) |
+| `-C N` | N lines before and after each match (0-512) |
 
-Flags go before the query.
+Flags go before the query. Do not combine `-A` and `-C`.
 
 ## Examples
 
@@ -47,6 +49,7 @@ seek 'content:func.*Test lang:go -file:bench'
 seek 'type:file config'                     # config-ish filenames
 seek 'TODO' ./cmd ./docs                    # limit to two subtrees
 seek -n 5 'retry backoff'                   # top 5 files only
+seek -n 5 -m 1 -A 20 'sym:executeParsedSearchScoped' ./cmd/seek
 ```
 
 ## Paths
@@ -77,3 +80,7 @@ SEEK_ROUTER=off grep -rn 'PATTERN' .
 
 The `SEEK_ROUTER=off` prefix matters only when the seek router hook is
 installed; it tells the hook to leave that command alone.
+
+The router supports strict static forms of `grep`, `rg`, `git grep`, `fd`, and
+`find`. Unsupported flags or dynamic shell syntax run unchanged. See the
+plugin README for the exact adapter contract.

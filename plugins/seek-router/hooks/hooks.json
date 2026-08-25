@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}/bin/router.sh\"",
-            "statusMessage": "Routing search to seek"
+            "timeout": 5
           }
         ]
       }

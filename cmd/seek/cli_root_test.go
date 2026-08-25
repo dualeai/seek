@@ -98,6 +98,46 @@ func TestSplicePassthroughSeparator(t *testing.T) {
 			[]string{"--limit=5", "needle"},
 		},
 		{
+			"negative numeric query starting with n",
+			[]string{"-n123"},
+			[]string{"--", "-n123"},
+		},
+		{
+			"negative numeric query starting with m",
+			[]string{"-m123"},
+			[]string{"--", "-m123"},
+		},
+		{
+			"negative numeric query starting with A",
+			[]string{"-A360"},
+			[]string{"--", "-A360"},
+		},
+		{
+			"negative numeric query starting with C",
+			[]string{"-C12"},
+			[]string{"--", "-C12"},
+		},
+		{
+			"negative query starting with n",
+			[]string{"-needle"},
+			[]string{"--", "-needle"},
+		},
+		{
+			"negative query starting with m",
+			[]string{"-main"},
+			[]string{"--", "-main"},
+		},
+		{
+			"negative query starting with A",
+			[]string{"-API"},
+			[]string{"--", "-API"},
+		},
+		{
+			"negative query starting with C",
+			[]string{"-Cplusplus"},
+			[]string{"--", "-Cplusplus"},
+		},
+		{
 			"explicit -- terminator already present",
 			[]string{"--", "-file:test"},
 			[]string{"--", "-file:test"},
@@ -168,6 +208,53 @@ func TestRootCmd_RejectsNegativeLimit(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "must be") {
 		t.Fatalf("err=%v, want 'must be' substring", err)
+	}
+}
+
+func TestSelectSearchConfig(t *testing.T) {
+	cases := []struct {
+		name      string
+		args      []string
+		wantLines int
+		wantAfter bool
+		wantErr   string
+	}{
+		{name: "default", wantLines: searchContextLines},
+		{name: "after", args: []string{"-A", "360"}, wantLines: 360, wantAfter: true},
+		{name: "context", args: []string{"--context=12"}, wantLines: 12},
+		{name: "zero context", args: []string{"-C", "0"}, wantLines: 0},
+		{name: "too much context", args: []string{"-C", "513"}, wantErr: "between 0 and 512"},
+		{name: "negative after", args: []string{"-A=-1"}, wantErr: "between 0 and 512"},
+		{name: "mixed modes", args: []string{"-A", "2", "-C", "3"}, wantErr: "cannot be used together"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			flags := &cliFlags{limit: 20, maxMatches: 1, search: defaultSearchConfig()}
+			cmd := &cobra.Command{}
+			cmd.Flags().IntVarP(&flags.afterContext, "after-context", "A", 0, "")
+			cmd.Flags().IntVarP(&flags.context, "context", "C", 0, "")
+			if err := cmd.Flags().Parse(tc.args); err != nil {
+				t.Fatalf("parse flags: %v", err)
+			}
+
+			err := selectSearchConfig(cmd, flags)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err=%v, want substring %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("selectSearchConfig: %v", err)
+			}
+			if flags.search.opts.NumContextLines != tc.wantLines {
+				t.Fatalf("context lines=%d, want %d", flags.search.opts.NumContextLines, tc.wantLines)
+			}
+			if flags.search.afterOnly != tc.wantAfter {
+				t.Fatalf("afterOnly=%v, want %v", flags.search.afterOnly, tc.wantAfter)
+			}
+		})
 	}
 }
 
@@ -343,6 +430,34 @@ func TestHasVerboseArg(t *testing.T) {
 		if got := hasVerboseArg(tc.args); got != tc.want {
 			t.Errorf("hasVerboseArg(%v)=%v, want %v", tc.args, got, tc.want)
 		}
+	}
+}
+
+func TestShouldRunOpportunisticGC(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "search", args: []string{"needle"}, want: true},
+		{name: "root help", args: []string{"--help"}},
+		{name: "short help", args: []string{"-h"}},
+		{name: "numeric bool help", args: []string{"--help=1"}},
+		{name: "subcommand help", args: []string{"gc", "--help"}},
+		{name: "help command", args: []string{"help"}},
+		{name: "verbose help command", args: []string{"-v", "help", "gc"}},
+		{name: "numeric bool verbose help command", args: []string{"--verbose=0", "help"}},
+		{name: "version", args: []string{"--version"}},
+		{name: "short bool version", args: []string{"--version=t"}},
+		{name: "help path", args: []string{"needle", "help"}, want: true},
+		{name: "help query after separator", args: []string{"--", "--help"}, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldRunOpportunisticGC(tc.args); got != tc.want {
+				t.Fatalf("shouldRunOpportunisticGC(%v)=%v, want %v", tc.args, got, tc.want)
+			}
+		})
 	}
 }
 

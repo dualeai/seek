@@ -16,9 +16,12 @@ import (
 // cliFlags holds the parsed values for the root command. Bound to
 // rootCmd flags via pflag's Var/BoolVarP/IntVarP helpers.
 type cliFlags struct {
-	verbose    bool
-	limit      int
-	maxMatches int
+	verbose      bool
+	limit        int
+	maxMatches   int
+	afterContext int
+	context      int
+	search       searchConfig
 }
 
 // knownFlagTokens enumerates the root command's flag names so
@@ -35,6 +38,8 @@ var knownFlagTokens = []string{
 	"--version",
 	"-n", "--limit",
 	"-m", "--max-matches",
+	"-A", "--after-context",
+	"-C", "--context",
 }
 
 // splicePassthroughSeparator preserves Zoekt-style single-dash queries
@@ -101,7 +106,7 @@ func isKnownFlagToken(name string) bool {
 
 func flagTakesValue(name string) bool {
 	switch name {
-	case "-n", "--limit", "-m", "--max-matches":
+	case "-n", "--limit", "-m", "--max-matches", "-A", "--after-context", "-C", "--context":
 		return true
 	}
 	return false
@@ -110,7 +115,7 @@ func flagTakesValue(name string) bool {
 // newRootCmd builds the seek root command with shared flags, examples,
 // and the search RunE callback. Subcommands attach via AddCommand.
 func newRootCmd() *cobra.Command {
-	flags := &cliFlags{}
+	flags := &cliFlags{search: defaultSearchConfig()}
 	cmd := &cobra.Command{
 		Use:   "seek [flags] <query> [path...]",
 		Short: "BM25-ranked code search with persistent caching",
@@ -140,7 +145,7 @@ once.`,
 			}
 			return nil
 		},
-		PreRunE: func(_ *cobra.Command, args []string) error {
+		PreRunE: func(cmd *cobra.Command, args []string) error {
 			if flags.limit < 0 {
 				return fmt.Errorf("--limit must be ≥ 0, got %d", flags.limit)
 			}
@@ -150,10 +155,20 @@ once.`,
 			if strings.TrimSpace(args[0]) == "" {
 				return fmt.Errorf("query is empty")
 			}
+			if err := selectSearchConfig(cmd, flags); err != nil {
+				return err
+			}
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return run(cmd.Context(), args[0], args[1:], flags.limit, flags.maxMatches)
+			return runWithSearchConfig(
+				cmd.Context(),
+				args[0],
+				args[1:],
+				flags.limit,
+				flags.maxMatches,
+				flags.search,
+			)
 		},
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -162,6 +177,8 @@ once.`,
 	cmd.PersistentFlags().BoolVarP(&flags.verbose, "verbose", "v", false, "enable debug logging")
 	cmd.Flags().IntVarP(&flags.limit, "limit", "n", 0, "maximum number of files to display (≥ 0, 0 = unlimited)")
 	cmd.Flags().IntVarP(&flags.maxMatches, "max-matches", "m", 0, "maximum matches per file (≥ 0, 0 = unlimited)")
+	cmd.Flags().IntVarP(&flags.afterContext, "after-context", "A", 0, "lines to display after each match (0–512)")
+	cmd.Flags().IntVarP(&flags.context, "context", "C", 0, "lines to display before and after each match (0–512)")
 
 	// Version output keeps current format: `seek <ver>` with no doubling.
 	cmd.Version = strings.TrimPrefix(versionString(), "seek ")
@@ -184,6 +201,30 @@ once.`,
 	gc.SetFlagErrorFunc(suggestFlagError)
 	cmd.AddCommand(gc)
 	return cmd
+}
+
+func selectSearchConfig(cmd *cobra.Command, flags *cliFlags) error {
+	afterChanged := cmd.Flags().Changed("after-context")
+	contextChanged := cmd.Flags().Changed("context")
+	if afterChanged && contextChanged {
+		return fmt.Errorf("--after-context and --context cannot be used together")
+	}
+	if afterChanged {
+		if flags.afterContext < 0 || flags.afterContext > maxSearchContextLines {
+			return fmt.Errorf("--after-context must be between 0 and %d, got %d", maxSearchContextLines, flags.afterContext)
+		}
+		flags.search = explicitSearchConfig(flags.afterContext, true)
+		return nil
+	}
+	if contextChanged {
+		if flags.context < 0 || flags.context > maxSearchContextLines {
+			return fmt.Errorf("--context must be between 0 and %d, got %d", maxSearchContextLines, flags.context)
+		}
+		flags.search = explicitSearchConfig(flags.context, false)
+		return nil
+	}
+	flags.search = defaultSearchConfig()
+	return nil
 }
 
 // rootArgsValidator replaces cobra.MinimumNArgs(1) so the no-args path

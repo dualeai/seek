@@ -110,9 +110,9 @@ version on GitHub before committing.
 
 ## Router plugin
 
-`plugins/seek-router/` ships a PreToolUse hook that rewrites the agent's
-safe static `grep` and `rg` calls into seek searches, plus the `seek-search`
-skill.
+`plugins/seek-router/` ships a PreToolUse hook that rewrites the agent's safe
+static `grep`, `rg`, `git grep`, `fd`, and `find` calls into seek searches, plus
+the `seek-search` skill.
 Load it in this repo with `claude --plugin-dir ./plugins/seek-router`; Codex
 picks it up from `.codex/hooks.json` with no install.
 
@@ -126,11 +126,11 @@ SEEK_ROUTER=off grep -rn 'PATTERN' .
 
 `SEEK_ROUTER=off` in the environment disables routing for a whole session.
 
-The hook requires `jq`. It routes only recursive `grep` with an explicit path,
-or `rg`, when the pattern, paths, and short flags have a direct seek meaning.
-It leaves regex operators, file filters, `git grep`, globs, variables, pipes,
-redirects, compound commands, and unknown flags unchanged. See
-`plugins/seek-router/README.md` for the full contract.
+The hook requires `jq` and a POSIX `awk`. Its parser and command adapters stay
+inside the plugin; Seek exposes only its normal public CLI. The hook uses strict
+forms for each supported command and accepts a final `head` for file results.
+It leaves unsupported flags, dynamic shell syntax, and other pipelines
+unchanged. See `plugins/seek-router/README.md` for the full contract.
 
 Router changes must keep `make test-plugin` green; it feeds recorded hook
 payloads to the script and asserts exit code 0 on every path, because exit 2

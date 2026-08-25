@@ -201,7 +201,7 @@ func runSeekInPlannedGitCorpus(
 	if err != nil {
 		return nil, err
 	}
-	results, _, err := prepareAndSearchCorpus(ctx, plan, &paths, query)
+	results, _, err := prepareAndSearchCorpus(ctx, plan, &paths, query, defaultSearchConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -1038,7 +1038,7 @@ func TestSearchPlannedScopedCorpus_RejectsLayerStateMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse query: %v", err)
 	}
-	_, err = searchPlannedCorpusParsed(context.Background(), plans[0], q)
+	_, err = searchPlannedCorpusParsed(context.Background(), plans[0], q, defaultSearchConfig())
 	if !errors.Is(err, errScopedLayerStateChanged) {
 		t.Fatalf("expected scoped layer state mismatch, got %v", err)
 	}

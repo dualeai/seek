@@ -93,12 +93,12 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/setup-go
-      - name: Install universal-ctags (macOS)
+      - name: Install unit test dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install universal-ctags
-      - name: Install universal-ctags (Linux)
+        run: brew install jq universal-ctags
+      - name: Install unit test dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y universal-ctags
+        run: sudo apt-get update && sudo apt-get install -y jq universal-ctags
       - name: Cache Go tool binaries
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:

@@ -976,7 +976,7 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
-				if _, err := executeParsedSearchScopedDirs(ctx, indexDirs, userQ, nil); err != nil {
+				if _, err := executeParsedSearchScopedDirs(ctx, indexDirs, userQ, nil, defaultSearchConfig()); err != nil {
 					b.Fatalf("execute search with one dir: %v", err)
 				}
 			}
@@ -987,7 +987,7 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
-				if _, err := executeParsedSearchScopedDirs(ctx, indexDirs, userQ, nil); err != nil {
+				if _, err := executeParsedSearchScopedDirs(ctx, indexDirs, userQ, nil, defaultSearchConfig()); err != nil {
 					b.Fatalf("execute search with empty optional dir: %v", err)
 				}
 			}
@@ -1188,11 +1188,11 @@ func BenchmarkMultiCorpus_WarmSearchAndFormat(b *testing.B) {
 
 	b.ResetTimer()
 	for b.Loop() {
-		resultsA, _, err := prepareAndSearchCorpus(ctx, planA, nil, userQ)
+		resultsA, _, err := prepareAndSearchCorpus(ctx, planA, nil, userQ, defaultSearchConfig())
 		if err != nil {
 			b.Fatalf("search corpus A: %v", err)
 		}
-		resultsB, _, err := prepareAndSearchCorpus(ctx, planB, nil, userQ)
+		resultsB, _, err := prepareAndSearchCorpus(ctx, planB, nil, userQ, defaultSearchConfig())
 		if err != nil {
 			b.Fatalf("search corpus B: %v", err)
 		}
@@ -1511,7 +1511,7 @@ func BenchmarkFolderCorpus_OneFileZoektShardLowerBound(b *testing.B) {
 		} else if !indexedAny {
 			b.Fatal("expected one-file shard to be indexed")
 		}
-		results, err := executeParsedSearchScoped(ctx, indexDir, userQ, nil)
+		results, err := executeParsedSearchScoped(ctx, indexDir, userQ, nil, defaultSearchConfig())
 		if err != nil {
 			b.Fatalf("search one-file shard: %v", err)
 		}
