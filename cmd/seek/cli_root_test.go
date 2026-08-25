@@ -346,6 +346,34 @@ func TestHasVerboseArg(t *testing.T) {
 	}
 }
 
+func TestShouldRunOpportunisticGC(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "search", args: []string{"needle"}, want: true},
+		{name: "root help", args: []string{"--help"}},
+		{name: "short help", args: []string{"-h"}},
+		{name: "numeric bool help", args: []string{"--help=1"}},
+		{name: "subcommand help", args: []string{"gc", "--help"}},
+		{name: "help command", args: []string{"help"}},
+		{name: "verbose help command", args: []string{"-v", "help", "gc"}},
+		{name: "numeric bool verbose help command", args: []string{"--verbose=0", "help"}},
+		{name: "version", args: []string{"--version"}},
+		{name: "short bool version", args: []string{"--version=t"}},
+		{name: "help path", args: []string{"needle", "help"}, want: true},
+		{name: "help query after separator", args: []string{"--", "--help"}, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldRunOpportunisticGC(tc.args); got != tc.want {
+				t.Fatalf("shouldRunOpportunisticGC(%v)=%v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestLevenshtein dropped: pure algorithm detail. Threshold contract
 // (≤2 → suggest, >2 → silent) is locked by TestSuggestFlagError_*
 // and TestClosestSubcommand which exercise the threshold via the

@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -65,10 +66,12 @@ func main() {
 
 	err := executeCLI(ctx)
 
-	// Fire opportunistic GC after results are flushed. Wait up to
-	// gcRunTimeout so eviction completes before exit (helps tests and
-	// observability), but never block longer.
-	fireOpportunisticGC(runOpportunisticGC, gcRunTimeout)
+	// Informational calls do not touch an index, so they must not wait for cache
+	// maintenance. Search and management calls still run opportunistic GC after
+	// their output is flushed.
+	if shouldRunOpportunisticGC(os.Args[1:]) {
+		fireOpportunisticGC(runOpportunisticGC, gcRunTimeout)
+	}
 
 	if err != nil {
 		code := exitCodeForError(err)
@@ -84,6 +87,51 @@ func main() {
 		}
 		os.Exit(code)
 	}
+}
+
+func shouldRunOpportunisticGC(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return true
+		}
+		for _, name := range []string{"-h", "--help", "--version"} {
+			if value, ok := optionalBoolFlag(arg, name); ok && value {
+				return false
+			}
+		}
+	}
+	for _, arg := range args {
+		if arg == "--" {
+			return true
+		}
+		knownBool := false
+		for _, name := range []string{"-h", "--help", "--version", "-v", "--verbose"} {
+			if _, ok := optionalBoolFlag(arg, name); ok {
+				knownBool = true
+				break
+			}
+		}
+		if knownBool {
+			continue
+		}
+		if arg == "help" {
+			return false
+		}
+		return true
+	}
+	return true
+}
+
+func optionalBoolFlag(arg, name string) (bool, bool) {
+	if arg == name {
+		return true, true
+	}
+	value, found := strings.CutPrefix(arg, name+"=")
+	if !found {
+		return false, false
+	}
+	parsed, err := strconv.ParseBool(value)
+	return parsed, err == nil
 }
 
 // hasVerboseArg scans raw os.Args for -v / --verbose without consulting
