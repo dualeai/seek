@@ -23,20 +23,17 @@ test:
 test-static:
 	go vet ./...
 	golangci-lint run ./...
-	$(MAKE) test-plugin
 
-# Router fixture tests. The router ships in the plugin, not in the CLI, so it
-# has no Go test to hang off; run.sh feeds recorded hook payloads to the
-# script and asserts both the decision and exit code 0 on every path.
-test-plugin:
-	sh ./plugins/seek-router/test/run.sh
+# Plugin tests use the normal build target and exercise only seek's public CLI.
+test-plugin: build
+	PATH="$(CURDIR):$$PATH" sh ./plugins/seek-router/test/run.sh
 
 JUNIT_XML ?= junit.xml
 COVERPROFILE ?= cover.out
 BENCH_COUNT ?= 10
 BENCH_REPO_COUNT ?= 3
 
-test-unit:
+test-unit: test-plugin
 	gotestsum --junitfile $(JUNIT_XML) -- ./... -v -race -timeout 18m -covermode=atomic -coverprofile=$(COVERPROFILE)
 
 test-bench:

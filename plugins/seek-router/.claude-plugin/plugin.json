@@ -1,7 +1,7 @@
 {
   "name": "seek-router",
-  "version": "0.2.1",
-  "description": "Routes safe static grep and rg searches to seek, a BM25-ranked local code search with ctags symbols.",
+  "version": "0.3.0",
+  "description": "Routes supported static grep, rg, git grep, fd, and find searches to seek, a BM25-ranked local code search with ctags symbols.",
   "author": {
     "name": "duale.ai",
     "url": "https://github.com/dualeai"

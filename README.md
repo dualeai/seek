@@ -83,8 +83,8 @@ Or download a pre-built binary from [GitHub Releases](https://github.com/dualeai
 
 ### Prerequisites
 
-[universal-ctags](https://github.com/universal-ctags/ctags) is required for
-`sym:` definition search:
+[Universal Ctags](https://github.com/universal-ctags/ctags) is required for
+indexing and `sym:` definition search:
 
 ```bash
 brew install universal-ctags       # macOS
@@ -97,8 +97,8 @@ setups. On older Git versions, normal repos still work.
 ### Agent Integration
 
 Install the plugin. It ships two things: a **skill** that teaches the agent
-seek's query syntax, and a **router hook** that rewrites safe static `grep` and
-`rg` calls as seek searches.
+seek's query syntax, and a **router hook** that rewrites supported static
+`grep`, `rg`, `git grep`, `fd`, and `find` calls as seek searches.
 
 #### Claude Code
 
@@ -114,6 +114,12 @@ codex plugin marketplace add dualeai/seek
 codex plugin add seek-router@seek
 ```
 
+To update the plugin after a new release:
+
+```sh
+codex plugin marketplace upgrade seek
+```
+
 Start a new Codex session after each install or update. Open `/hooks` and trust
 `seek-router` once. Claude Code has no equivalent step.
 
@@ -121,8 +127,11 @@ The package does not use an Agent Plugins 1.0 root manifest because that
 standard does not define portable hooks. See the
 [compatibility note](plugins/seek-router/README.md#why-there-is-no-agent-plugins-manifest).
 
-The hook requires `jq` on `PATH`. If `seek` or `jq` is missing, it leaves the
-original command unchanged.
+A working plugin installation requires `seek`, `jq`, a POSIX `awk`, and
+Universal Ctags on `PATH`. The router is implemented inside the plugin and
+calls only the public seek CLI. Seek does not contain hook parsing or command
+adapters. If a hook dependency is missing, the hook leaves the original command
+unchanged.
 
 Try it without installing: `claude --plugin-dir ./plugins/seek-router`.
 
@@ -133,14 +142,15 @@ the agent's own shell:
 
 ```text
 grep -rn "parseToken" ./cmd
-  -> seek -n 20 -m 3 'case:yes content:parseToken' './cmd'
+  -> seek -n 20 -m 3 'case:yes content:"parseToken"' './cmd'
 ```
 
-The router accepts only recursive `grep` with an explicit path, or `rg`, when
-the pattern, paths, and short flags have a direct seek meaning. It leaves regex
-operators, file filters, `git grep`, globs, variables, pipes, redirects,
-compound commands, and unknown flags unchanged. When in doubt, it returns no
-decision and the original command runs.
+The router has a strict adapter for each command. It supports recursive `grep`,
+common `rg` location searches, literal `git grep`, ranked-path `fd`, and the
+`find ROOT... -type f -name PATTERN` form in either predicate order. It also
+converts a final `head` limit for file-name results. Unsupported flags and
+dynamic shell syntax stay unchanged. See the
+[full contract](plugins/seek-router/README.md#routing-contract).
 
 #### Ranked, not exhaustive
 

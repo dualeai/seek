@@ -1,359 +1,178 @@
 #!/bin/sh
-# Contract tests for the conservative seek router.
-# shellcheck disable=SC2016
-# Fixture commands contain shell syntax that the test must not expand.
+# Plugin-owned router, wrapper, package, and public seek CLI checks.
 set -u
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 ROUTER="$ROOT/bin/router.sh"
-ORIGINAL_PATH=$PATH
-REAL_SEEK=$(command -v seek 2>/dev/null || :)
+WORK=$(mktemp -d)
+trap 'rm -r "$WORK"' EXIT HUP INT TERM
 
 pass=0
 fail=0
-
-STUB=$(mktemp -d)
-trap 'rm -rf "$STUB"' EXIT INT TERM
-printf '#!/bin/sh\nexit 0\n' >"$STUB/seek"
-chmod +x "$STUB/seek"
-mkdir -p "$STUB/empty"
-PATH="$STUB:$PATH"
-export PATH
-
-bash_payload() {
-	jq -cn --arg command "$1" \
-		'{session_id:"s1",tool_name:"Bash",tool_input:{command:$command,description:"d"}}'
-}
 
 record_failure() {
 	printf 'FAIL %s: %s\n' "$1" "$2"
 	fail=$((fail + 1))
 }
 
-check_route() {
-	name=$1
-	source_command=$2
-	expected=$3
-	payload=$(bash_payload "$source_command")
-	out=$(printf '%s' "$payload" | sh "$ROUTER" 2>/dev/null)
-	code=$?
-	if [ "$code" -ne 0 ]; then
-		record_failure "$name" "exit $code, want 0"
-		return
-	fi
-	got=$(printf '%s' "$out" | jq -er '.hookSpecificOutput.updatedInput.command' 2>/dev/null || :)
-	if [ "$got" != "$expected" ]; then
-		record_failure "$name" "command [$got], want [$expected]"
-		return
-	fi
+record_pass() {
 	pass=$((pass + 1))
 }
 
-check_payload_route() {
-	name=$1
-	payload=$2
-	expected=$3
-	out=$(printf '%s' "$payload" | sh "$ROUTER" 2>/dev/null)
-	code=$?
-	if [ "$code" -ne 0 ]; then
-		record_failure "$name" "exit $code, want 0"
-		return
-	fi
-	got=$(printf '%s' "$out" | jq -er '.hookSpecificOutput.updatedInput.command' 2>/dev/null || :)
-	if [ "$got" != "$expected" ]; then
-		record_failure "$name" "command [$got], want [$expected]"
-		return
-	fi
-	pass=$((pass + 1))
+if ! command -v python3 >/dev/null 2>&1; then
+	printf 'FAIL requirements: python3 is required for plugin tests\n'
+	exit 1
+fi
+if ! command -v jq >/dev/null 2>&1 || ! command -v awk >/dev/null 2>&1; then
+	printf 'FAIL requirements: jq and awk are required for plugin tests\n'
+	exit 1
+fi
+if ! command -v seek >/dev/null 2>&1; then
+	printf 'FAIL requirements: a current seek binary is required for plugin tests\n'
+	exit 1
+fi
+
+bash_payload() {
+	python3 -c 'import json,sys; print(json.dumps({"session_id":"s1","tool_name":"Bash","tool_input":{"command":sys.argv[1],"description":"café","timeout":5000,"run_in_background":False,"custom":{"keep":True}}}))' "$1"
 }
 
-check_passthrough() {
-	name=$1
-	source_command=$2
-	payload=$(bash_payload "$source_command")
-	out=$(printf '%s' "$payload" | sh "$ROUTER" 2>/dev/null)
+check_silent() {
+	silent_name=$1
+	silent_payload=$2
+	out=$(printf '%s' "$silent_payload" | sh "$ROUTER" 2>/dev/null)
 	code=$?
-	if [ "$code" -ne 0 ]; then
-		record_failure "$name" "exit $code, want 0"
-	elif [ -n "$out" ]; then
-		record_failure "$name" "want no decision, got [$out]"
+	if [ "$code" -eq 0 ] && [ -z "$out" ]; then
+		record_pass
 	else
-		pass=$((pass + 1))
+		record_failure "$silent_name" "exit $code, output [$out]"
 	fi
 }
 
-check_payload_passthrough() {
-	name=$1
-	payload=$2
-	out=$(printf '%s' "$payload" | sh "$ROUTER" 2>/dev/null)
-	code=$?
-	if [ "$code" -ne 0 ]; then
-		record_failure "$name" "exit $code, want 0"
-	elif [ -n "$out" ]; then
-		record_failure "$name" "want no decision, got [$out]"
-	else
-		pass=$((pass + 1))
-	fi
-}
-
-# Accepted commands: static atoms, literal paths, and tool-specific short flags.
-check_route "grep recursive" \
-	'grep -rn "zebraQuux" .' \
-	"seek -n 20 -m 3 'case:yes content:zebraQuux' '.'"
-
-check_route "grep two paths" \
-	'grep -rn needleFunc ./cmd ./plugins' \
-	"seek -n 20 -m 3 'case:yes content:needleFunc' './cmd' './plugins'"
-
-check_route "grep safe flag bundle" \
-	'grep -rniHIF Foo ./cmd' \
-	"seek -n 20 -m 3 'case:no content:Foo' './cmd'"
-
-check_route "grep neutral ERE atom" \
-	'grep -rE Runner ./cmd' \
-	"seek -n 20 -m 3 'case:yes content:Runner' './cmd'"
-
-check_route "rg current directory" \
-	'rg needleFunc' \
-	"seek -n 20 -m 3 'case:yes content:needleFunc' '.'"
-
-check_route "rg safe flag bundle" \
-	'rg -niHIF Foo ./cmd' \
-	"seek -n 20 -m 3 'case:no content:Foo' './cmd'"
-
-check_payload_route "valid JSON Unicode escape" \
-	'{"tool_name":"Bash","tool_input":{"command":"grep -rn \u0066oo ."}}' \
-	"seek -n 20 -m 3 'case:yes content:foo' '.'"
-
-# The hook must preserve every Bash input field because updatedInput replaces
-# the complete object.
-payload=$(jq -cn '{
-	tool_name:"Bash",
-	tool_input:{
-		command:"grep -rn Foo .",
-		description:"café",
-		timeout:5000,
-		run_in_background:false,
-		custom:{keep:true}
-	}
-}')
-out=$(printf '%s' "$payload" | sh "$ROUTER" 2>/dev/null)
-if printf '%s' "$out" | jq -e '
-	.hookSpecificOutput.updatedInput
-	| .description == "café"
-	  and .timeout == 5000
-	  and .run_in_background == false
-	  and .custom.keep == true
-' >/dev/null 2>&1; then
-	pass=$((pass + 1))
+if python3 "$ROOT/test/router_test.py"; then
+	record_pass
 else
-	record_failure "preserve complete tool input" "field changed or missing"
+	record_failure "router contract" "plugin-owned contract tests failed"
 fi
 
-if printf '%s' "$out" | jq -e '
-	.hookSpecificOutput.additionalContext
-	| contains("seek directly") and contains("SEEK_ROUTER=off")
-' >/dev/null 2>&1; then
-	pass=$((pass + 1))
-else
-	record_failure "notice teaches direct use and bypass" "text missing"
-fi
-
-# Execute one emitted command with the real seek binary. Run it from the plugin
-# root so this test also works after a harness copies only the plugin package.
-if [ -n "$REAL_SEEK" ]; then
-	payload=$(bash_payload 'grep -rn seek .')
-	out=$(printf '%s' "$payload" | sh "$ROUTER" 2>/dev/null)
-	got=$(printf '%s' "$out" | jq -er '.hookSpecificOutput.updatedInput.command' 2>/dev/null || :)
-	REAL_SEEK_DIR=$(dirname "$REAL_SEEK")
-	result=$(
-		CDPATH='' cd -- "$ROOT" &&
-			PATH="$REAL_SEEK_DIR:$ORIGINAL_PATH" sh -c "$got" 2>/dev/null
-	)
-	code=$?
-	case $result in
-	*seek*) matched=1 ;;
-	*) matched=0 ;;
-	esac
-	if [ "$code" -eq 0 ] && [ "$matched" -eq 1 ]; then
-		pass=$((pass + 1))
-	else
-		record_failure "emitted command runs in seek" "exit $code, output [$result]"
-	fi
-
-	# A pathless rg starts in the shell's current directory. Without the added
-	# dot, seek would widen this probe to the worktree and find seek-router.
-	if [ -d "$ROOT/../../cmd/seek" ]; then
-		payload=$(bash_payload 'rg seek-router')
-		out=$(printf '%s' "$payload" | sh "$ROUTER" 2>/dev/null)
-		got=$(printf '%s' "$out" | jq -er '.hookSpecificOutput.updatedInput.command' 2>/dev/null || :)
-		result=$(
-			CDPATH='' cd -- "$ROOT/../../cmd/seek" &&
-				PATH="$REAL_SEEK_DIR:$ORIGINAL_PATH" sh -c "$got" 2>/dev/null
-		)
-		code=$?
-		if [ "$code" -eq 1 ] && [ -z "$result" ]; then
-			pass=$((pass + 1))
-		else
-			record_failure "pathless rg stays in current directory" "exit $code, output [$result]"
-		fi
-	fi
-fi
-
-# Shell syntax and dynamic expansion stay with the shell.
-check_passthrough "glob path" 'grep -rn foo *'
-check_passthrough "variable pattern" 'grep -rn "$PATTERN" .'
-check_passthrough "variable path" 'grep -rn foo "$SCOPE"'
-check_passthrough "tilde path" 'grep -rn foo ~/src'
-check_passthrough "brace expansion" 'grep -rn foo {src,test}'
-check_passthrough "shell comment" 'grep -rn foo . # locate it'
-check_passthrough "pipeline" 'grep -rn foo . | head -5'
-check_passthrough "redirect" 'grep -rn foo . 2>/dev/null'
-check_passthrough "command substitution" 'grep -rn "$(cat pattern)" .'
-check_passthrough "backslash escape" 'grep -rn foo\ bar .'
-check_passthrough "semicolon" 'grep -rn foo .; echo done'
-check_passthrough "ampersand" 'grep -rn foo . && echo done'
-check_passthrough "newline" 'grep -rn foo .
-echo done'
-
-# Each CLI gets its own small flag grammar.
-check_passthrough "git grep" 'git grep -n foo'
-check_passthrough "egrep" 'egrep -rn foo .'
-check_passthrough "fgrep" 'fgrep -rn foo .'
-check_passthrough "ag" 'ag foo .'
-check_passthrough "ack" 'ack foo .'
-check_passthrough "grep reads stdin" 'grep foo'
-check_passthrough "grep nonrecursive directory" 'grep -n foo .'
-check_passthrough "grep follows symlinks" 'grep -Rn foo .'
-check_passthrough "grep include filter" 'grep -rn foo --include=*.go .'
-check_passthrough "grep exclude filter" 'grep -rn foo --exclude=*.go .'
-check_passthrough "grep word mode" 'grep -rw foo .'
-check_passthrough "grep filenames only" 'grep -rl foo .'
-check_passthrough "grep count" 'grep -rc foo .'
-check_passthrough "grep pattern flag" 'grep -rn -e foo .'
-check_passthrough "grep long flag" 'grep --recursive foo .'
-check_passthrough "rg encoding argument" 'rg -E utf-8 foo .'
-check_passthrough "rg replacement argument" 'rg -r replacement foo .'
-check_passthrough "rg help flag" 'rg -h foo .'
-check_passthrough "rg PCRE mode" 'rg -P foo .'
-check_passthrough "rg long flag" 'rg --ignore-case foo .'
-
-# Only regex-neutral ASCII atoms can enter seek query grammar.
-check_passthrough "empty pattern" 'grep -rn "" .'
-check_passthrough "phrase pattern" 'grep -rn "foo or bar" .'
-check_passthrough "query filter text" 'grep -rn "foo:bar" .'
-check_passthrough "dot regex" 'grep -rn "foo.bar" .'
-check_passthrough "alternation" 'rg "foo|bar" .'
-check_passthrough "parentheses" 'rg "foo(bar)" .'
-check_passthrough "bracket class" 'grep -rn "[a-z]" .'
-check_passthrough "BRE escape" 'grep -rn "a\(b\)" .'
-check_passthrough "non-ASCII pattern" 'grep -rn café .'
-check_passthrough "space in path" 'grep -rn foo "path with space"'
-check_passthrough "path starting dash" 'grep -rn foo -src'
-
-# Non-search commands and malformed payloads always fail open.
-check_passthrough "ordinary Bash" 'echo café'
-check_payload_passthrough "Grep tool" \
-	'{"tool_name":"Grep","tool_input":{"pattern":"foo"}}'
-check_payload_passthrough "metadata command cannot shadow tool input" \
-	'{"tool_name":"Bash","metadata":{"command":"grep -rn wrong ."},"tool_input":{"command":"echo safe"}}'
-check_payload_passthrough "empty input" ''
-check_payload_passthrough "not JSON" 'hello'
-check_payload_passthrough "truncated JSON" \
-	'{"tool_name":"Bash","tool_input":{"command":"grep -rn foo ."}'
-check_payload_passthrough "malformed JSON separator" \
-	'{"tool_name" "Bash","tool_input":{"command":"grep -rn foo ."}}'
-check_payload_passthrough "missing tool input" '{"tool_name":"Bash"}'
-
-payload=$(bash_payload 'SEEK_ROUTER=off grep -rn foo .')
+# Use one observed file-list family to inspect the host response boundary.
+payload=$(bash_payload "rg -l 'seek-router' . | head -n 2")
 out=$(printf '%s' "$payload" | sh "$ROUTER" 2>/dev/null)
 code=$?
-if [ "$code" -eq 0 ] && [ -z "$out" ]; then
-	pass=$((pass + 1))
+if [ "$code" -eq 0 ] && printf '%s' "$out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+h = d["hookSpecificOutput"]
+assert set(h) == {"hookEventName", "permissionDecision", "updatedInput"}
+assert h["hookEventName"] == "PreToolUse"
+assert h["permissionDecision"] == "allow"
+i = h["updatedInput"]
+assert i["description"] == "café"
+assert i["timeout"] == 5000
+assert i["run_in_background"] is False
+assert i["custom"] == {"keep": True}
+assert i["command"].startswith("seek ")
+' 2>/dev/null; then
+	record_pass
 else
-	record_failure "per-call bypass" "router returned [$out]"
+	record_failure "wrapper rewrite" "exit $code, invalid response [$out]"
 fi
 
-payload=$(bash_payload 'grep -rn foo .')
+check_emitted_command() {
+	emitted_name=$1
+	emitted_source=$2
+	emitted_payload=$(bash_payload "$emitted_source")
+	emitted_output=$(printf '%s' "$emitted_payload" | sh "$ROUTER" 2>/dev/null)
+	emitted_code=$?
+	emitted_command=$(
+		printf '%s' "$emitted_output" |
+			python3 -c 'import json,sys; print(json.load(sys.stdin)["hookSpecificOutput"]["updatedInput"]["command"])' \
+				2>/dev/null || :
+	)
+	emitted_result=$(CDPATH='' cd -- "$ROOT" && sh -c "$emitted_command" 2>/dev/null)
+	emitted_run_code=$?
+	case $emitted_result in
+	*"## "*) emitted_match=1 ;;
+	*) emitted_match=0 ;;
+	esac
+	if [ "$emitted_code" -eq 0 ] && [ -n "$emitted_command" ] \
+		&& [ "$emitted_run_code" -eq 0 ] && [ "$emitted_match" -eq 1 ]; then
+		record_pass
+	else
+		record_failure "$emitted_name" \
+			"hook $emitted_code, command [$emitted_command], run $emitted_run_code, output [$emitted_result]"
+	fi
+}
+
+# Each adapter must emit a command that the normal public seek CLI can run.
+check_emitted_command "grep seek execution" "grep -rn router ."
+check_emitted_command "rg seek execution" "rg -l router . | head -n 2"
+check_emitted_command "git grep seek execution" "git grep router -- ."
+check_emitted_command "fd seek execution" "fd router ."
+check_emitted_command "find seek execution" "find . -type f -name '*.awk'"
+check_emitted_command "context seek execution" "rg -A 5 'Route supported' bin/router.sh"
+
+check_silent "malformed payload" '{"tool_name":'
+check_silent "ordinary command" "$(bash_payload 'echo unchanged')"
+
 out=$(printf '%s' "$payload" | SEEK_ROUTER=off sh "$ROUTER" 2>/dev/null)
 code=$?
 if [ "$code" -eq 0 ] && [ -z "$out" ]; then
-	pass=$((pass + 1))
+	record_pass
 else
-	record_failure "session bypass" "router returned [$out]"
+	record_failure "session bypass" "exit $code, output [$out]"
 fi
 
-out=$(printf '%s' "$payload" | PATH="$STUB/empty" /bin/sh "$ROUTER" 2>/dev/null)
+mkdir -p "$WORK/empty"
+out=$(printf '%s' "$payload" | PATH="$WORK/empty" /bin/sh "$ROUTER" 2>/dev/null)
 code=$?
 if [ "$code" -eq 0 ] && [ -z "$out" ]; then
-	pass=$((pass + 1))
+	record_pass
 else
-	record_failure "missing seek" "router returned [$out]"
+	record_failure "missing seek" "exit $code, output [$out]"
 fi
-
-out=$(printf '%s' "$payload" | PATH="$STUB" /bin/sh "$ROUTER" 2>/dev/null)
+repo_root=$(CDPATH='' cd -- "$ROOT/../.." && pwd)
+repo_hook=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["hooks"]["PreToolUse"][0]["hooks"][0]["command"])' "$repo_root/.codex/hooks.json")
+out=$(CDPATH='' cd -- "$repo_root/cmd/seek" && printf '%s' "$payload" | sh -c "$repo_hook" 2>/dev/null)
 code=$?
-if [ "$code" -eq 0 ] && [ -z "$out" ]; then
-	pass=$((pass + 1))
+if [ "$code" -eq 0 ] && printf '%s' "$out" | python3 -c 'import json,sys; assert json.load(sys.stdin)["hookSpecificOutput"]["updatedInput"]["command"].startswith("seek ")' 2>/dev/null; then
+	record_pass
 else
-	record_failure "missing jq" "router returned [$out]"
+	record_failure "repository hook from subdirectory" "exit $code, output [$out]"
 fi
 
-# Plugin-local checks must also pass after a harness copies only this directory
-# into its cache.
-for manifest in \
-	"$ROOT/.claude-plugin/plugin.json" \
-	"$ROOT/.codex-plugin/plugin.json" \
-	"$ROOT/hooks/hooks.json"
-do
-	if sh "$ROOT/test/check_json.sh" "$manifest" 2>/dev/null; then
-		pass=$((pass + 1))
-	else
-		record_failure "manifest JSON" "$manifest"
-	fi
-done
-
-# A conformant Agent Plugins root manifest takes priority over the Codex
-# manifest in Codex 0.149.1. Codex then skips lifecycle hooks for the package.
-if [ ! -e "$ROOT/plugin.json" ] && [ ! -L "$ROOT/plugin.json" ]; then
-	pass=$((pass + 1))
+if python3 -c '
+import json, os, sys
+root = sys.argv[1]
+repo = os.path.abspath(os.path.join(root, "..", ".."))
+codex = json.load(open(os.path.join(root, ".codex-plugin", "plugin.json"), encoding="utf-8"))
+claude = json.load(open(os.path.join(root, ".claude-plugin", "plugin.json"), encoding="utf-8"))
+assert codex["name"] == "seek-router"
+assert codex["version"] == claude["version"] == "0.3.0"
+assert codex["skills"] == "./skills/"
+for manifest in (codex, claude):
+    text = manifest["description"]
+    for name in ("grep", "rg", "git grep", "fd", "find"):
+        assert name in text
+for path in (os.path.join(root, "hooks", "hooks.json"), os.path.join(repo, ".codex", "hooks.json")):
+    data = json.load(open(path, encoding="utf-8"))
+    hook = data["hooks"]["PreToolUse"][0]["hooks"][0]
+    assert hook["type"] == "command"
+    assert hook["timeout"] == 5
+    assert "statusMessage" not in hook
+market = json.load(open(os.path.join(repo, ".claude-plugin", "marketplace.json"), encoding="utf-8"))
+assert market["plugins"][0]["name"] == "seek-router"
+assert not os.path.lexists(os.path.join(root, "plugin.json"))
+' "$ROOT" 2>/dev/null; then
+	record_pass
 else
-	record_failure "Codex manifest precedence" "root plugin.json disables the plugin hook"
-fi
-
-plugin_version=$(jq -er '.version' "$ROOT/.codex-plugin/plugin.json" 2>/dev/null || :)
-if [ -n "$plugin_version" ] && jq -e --arg version "$plugin_version" '
-	.name == "seek-router"
-	and .version == $version
-	and .skills == "./skills/"
-' "$ROOT/.codex-plugin/plugin.json" >/dev/null 2>&1 \
-	&& jq -e --arg version "$plugin_version" '.version == $version' \
-		"$ROOT/.claude-plugin/plugin.json" >/dev/null 2>&1; then
-	pass=$((pass + 1))
-else
-	record_failure "Codex plugin manifest" "unsupported or missing field"
+	record_failure "package metadata" "manifest or hook contract is invalid"
 fi
 
 if sh "$ROOT/test/check_skill.sh" "$ROOT/skills/seek-search/SKILL.md" 2>/dev/null; then
-	pass=$((pass + 1))
+	record_pass
 else
-	record_failure "skill manifest" "invalid frontmatter"
+	record_failure "skill frontmatter" "invalid skill metadata"
 fi
-
-REPO_ROOT=$(CDPATH='' cd -- "$ROOT/../.." && pwd)
-for manifest in \
-	"$REPO_ROOT/.claude-plugin/marketplace.json" \
-	"$REPO_ROOT/.codex/hooks.json"
-do
-	if [ ! -f "$manifest" ]; then
-		continue
-	fi
-	if sh "$ROOT/test/check_json.sh" "$manifest" 2>/dev/null; then
-		pass=$((pass + 1))
-	else
-		record_failure "repository manifest JSON" "$manifest"
-	fi
-done
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
