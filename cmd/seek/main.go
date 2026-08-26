@@ -785,6 +785,7 @@ func markGitCorpusKnownEmpty(ctx context.Context, plan corpusPlan, state repoSta
 	defer releaseLock(pub)
 
 	cleanAllShards(plan.indexDir)
+	deleteUncommittedManifest(plan.cacheDir)
 	// cleanAllShards already removed any torn shards a prior interrupted swap
 	// left, so a lingering .swapping marker would only force needless rebuilds
 	// of this now-known-empty corpus — clear it.

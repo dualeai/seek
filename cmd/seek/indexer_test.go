@@ -474,20 +474,29 @@ func TestStreamFiles_Parallelism1(t *testing.T) {
 
 func TestCleanUncommittedShards_RemovesMatching(t *testing.T) {
 	dir := t.TempDir()
-	// Create shard files matching the pattern
-	_ = os.WriteFile(filepath.Join(dir, "uncommitted_v16.00000.zoekt"), []byte{}, 0o644)
-	_ = os.WriteFile(filepath.Join(dir, "uncommitted_v16.00001.zoekt"), []byte{}, 0o644)
-	// Create a non-matching shard that should be preserved
-	_ = os.WriteFile(filepath.Join(dir, "myrepo_v16.00000.zoekt"), []byte{}, 0o644)
+	for _, name := range []string{
+		"uncommitted_v16.00000.zoekt",
+		"uncommitted_v16.00000.zoekt.meta",
+		"uncommitted_v16.00001.zoekt",
+		"uncommitted_v16.00002.zoekt.meta",
+		"myrepo_v16.00000.zoekt",
+		"myrepo_v16.00000.zoekt.meta",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	cleanUncommittedShards(dir)
 
-	entries, _ := filepath.Glob(filepath.Join(dir, "*.zoekt"))
-	if len(entries) != 1 {
-		t.Errorf("expected 1 remaining shard, got %d: %v", len(entries), entries)
+	entries := familyShardFiles(dir, familyAll)
+	if len(entries) != 2 {
+		t.Fatalf("remaining artifacts=%v, want committed pair", entries)
 	}
-	if filepath.Base(entries[0]) != "myrepo_v16.00000.zoekt" {
-		t.Errorf("wrong shard preserved: %s", entries[0])
+	for _, entry := range entries {
+		if !strings.HasPrefix(filepath.Base(entry), "myrepo_v16.") {
+			t.Errorf("wrong artifact preserved: %s", entry)
+		}
 	}
 }
 

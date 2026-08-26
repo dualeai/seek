@@ -420,6 +420,115 @@ func TestRun_EmptyUnbornRepositoryReturnsNoMatch(t *testing.T) {
 	}
 }
 
+func TestMarkGitCorpusKnownEmptyRemovesArtifactsAndManifest(t *testing.T) {
+	dir := initEmptyGitRepo(t)
+	paths, plan := planGitTestCorpus(t, dir)
+	for _, name := range []string{
+		"repo_v16.00000.zoekt",
+		"repo_v16.00000.zoekt.meta",
+		"orphan_v16.00001.zoekt.meta",
+		"uncommitted_v16.00000.zoekt",
+		"uncommitted_v16.00000.zoekt.meta",
+	} {
+		if err := os.WriteFile(filepath.Join(plan.indexDir, name), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(
+		filepath.Join(plan.cacheDir, uncommittedManifestFileName),
+		[]byte("stale"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	state := mustGitRepoStateIn(t, context.Background(), dir)
+	marked, err := markGitCorpusKnownEmpty(
+		context.Background(),
+		plan,
+		state,
+		gitCorpusStateHash(paths, state),
+	)
+	if err != nil || !marked {
+		t.Fatalf("mark known empty: marked=%v error=%v", marked, err)
+	}
+	if artifacts := familyShardFiles(plan.indexDir, familyAll); len(artifacts) != 0 {
+		t.Fatalf("known-empty corpus retained artifacts: %v", artifacts)
+	}
+	if _, err := os.Stat(filepath.Join(plan.cacheDir, uncommittedManifestFileName)); !os.IsNotExist(err) {
+		t.Fatalf("known-empty corpus retained manifest: %v", err)
+	}
+}
+
+func TestRun_KnownEmptyRemovesCommittedSidecarBeforeShardNameReuse(t *testing.T) {
+	requireTools(t)
+	dir := initGitRepo(t, "same.go", "package same\n// sidecar_first_marker\n")
+	setTestUserCache(t)
+	t.Chdir(dir)
+
+	if _, err := captureStdout(t, func() error {
+		return run(context.Background(), "sidecar_first_marker", nil, 0, 0)
+	}); err != nil {
+		t.Fatalf("warm first commit: %v", err)
+	}
+	paths, err := resolveGitPaths(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("resolve Git paths: %v", err)
+	}
+	plan, err := planCurrentGitCorpus(paths)
+	if err != nil {
+		t.Fatalf("plan Git corpus: %v", err)
+	}
+
+	if err := os.WriteFile(
+		filepath.Join(dir, "same.go"),
+		[]byte("package same\n// sidecar_second_marker\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, dir, "add", "same.go")
+	gitRun(t, dir, "commit", "-m", "second")
+	if _, err := captureStdout(t, func() error {
+		return run(context.Background(), "sidecar_second_marker", nil, 0, 0)
+	}); err != nil {
+		t.Fatalf("index second commit: %v", err)
+	}
+	foundMeta := false
+	for _, artifact := range familyShardFiles(plan.indexDir, familyCommitted) {
+		foundMeta = foundMeta || strings.HasSuffix(artifact, ".zoekt.meta")
+	}
+	if !foundMeta {
+		t.Fatal("second commit did not create a committed sidecar")
+	}
+
+	gitRun(t, dir, "switch", "--orphan", "unborn")
+	if _, err := captureStdout(t, func() error {
+		return run(context.Background(), "sidecar_absent_marker", nil, 0, 0)
+	}); !errors.Is(err, errNoMatch) {
+		t.Fatalf("clear empty unborn repository: %v", err)
+	}
+	if artifacts := familyShardFiles(plan.indexDir, familyAll); len(artifacts) != 0 {
+		t.Fatalf("empty unborn repository retained artifacts: %v", artifacts)
+	}
+
+	if err := os.WriteFile(
+		filepath.Join(dir, "same.go"),
+		[]byte("package same\n// sidecar_third_marker\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, dir, "add", "same.go")
+	gitRun(t, dir, "commit", "-m", "third")
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "sidecar_third_marker", nil, 0, 0)
+	})
+	if err != nil || !strings.Contains(out, "sidecar_third_marker") {
+		t.Fatalf("search recreated path: error=%v output=%q", err, out)
+	}
+}
+
 func TestRun_UnbornRepositoryClearsWarmCommittedIndex(t *testing.T) {
 	requireTools(t)
 	dir := initGitRepo(t, "old.go", "package old\n// unborn_old_marker\n")

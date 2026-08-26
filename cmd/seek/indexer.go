@@ -1253,6 +1253,10 @@ func cleanRepositoryShards(indexDir, repoName string) {
 	for _, m := range repositoryShardFiles(indexDir, repoName) {
 		_ = os.Remove(m)
 	}
+	metas, _ := filepath.Glob(filepath.Join(indexDir, repoName+"_v*.zoekt.meta"))
+	for _, m := range metas {
+		_ = os.Remove(m)
+	}
 }
 
 func repositoryShardCount(indexDir, repoName string) int {
@@ -1268,11 +1272,7 @@ func repositoryShardFiles(indexDir, repoName string) []string {
 }
 
 func cleanAllShards(indexDir string) {
-	matches, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
-	if err != nil {
-		return
-	}
-	for _, m := range matches {
+	for _, m := range familyShardFiles(indexDir, familyAll) {
 		_ = os.Remove(m)
 	}
 }
