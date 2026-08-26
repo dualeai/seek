@@ -28,9 +28,7 @@ func newTestPool(t *testing.T, worker corpusWorkerFunc, bufferSize int) (*corpus
 	return pool, g
 }
 
-// noopPoolWorker is the most common test worker: returns no results,
-// no dirty set, no error. Used by tests that exercise pool plumbing
-// (Enqueue, dedup, panic isolation) rather than indexing.
+// noopPoolWorker lets tests exercise enqueue and deduplication without indexing.
 func noopPoolWorker(_ context.Context, _ corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
 	return nil, nil, nil
 }
