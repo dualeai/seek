@@ -863,7 +863,7 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 	b.Run("gitRepoStateIn", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			gitRepoStateIn(ctx, dir)
+			mustGitRepoStateIn(b, ctx, dir)
 		}
 	})
 
@@ -877,7 +877,7 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 	})
 
 	b.Run("stateHash_clean", func(b *testing.B) {
-		state := gitRepoStateIn(ctx, dir)
+		state := mustGitRepoStateIn(b, ctx, dir)
 		b.ReportAllocs()
 		for b.Loop() {
 			gitCorpusStateHash(paths, state)
@@ -918,7 +918,7 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 		if err := os.WriteFile(filepath.Join(dir, "app.go"), append(original, []byte("\n// dirty\n")...), 0o644); err != nil {
 			b.Fatal(err)
 		}
-		state := gitRepoStateIn(ctx, dir)
+		state := mustGitRepoStateIn(b, ctx, dir)
 		if len(state.Files) == 0 {
 			b.Fatal("expected dirty files")
 		}
@@ -944,7 +944,7 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 		if err := os.WriteFile(filepath.Join(dir, "app.go"), append(original, []byte("\n// restat\n")...), 0o644); err != nil {
 			b.Fatal(err)
 		}
-		dirtyState := gitRepoStateIn(ctx, dir)
+		dirtyState := mustGitRepoStateIn(b, ctx, dir)
 		if len(dirtyState.Files) == 0 {
 			b.Fatal("expected dirty files")
 		}
@@ -1805,12 +1805,12 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 	b.Run("gitRepoStateIn", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			gitRepoStateIn(ctx, repoDir)
+			mustGitRepoStateIn(b, ctx, repoDir)
 		}
 	})
 
 	b.Run("stateHash", func(b *testing.B) {
-		state := gitRepoStateIn(ctx, repoDir)
+		state := mustGitRepoStateIn(b, ctx, repoDir)
 		b.ReportAllocs()
 		for b.Loop() {
 			gitCorpusStateHash(paths, state)
@@ -1853,7 +1853,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		if err := os.WriteFile(target, append(original, []byte("\n// dirty\n")...), 0o644); err != nil {
 			b.Fatal(err)
 		}
-		state := gitRepoStateIn(ctx, repoDir)
+		state := mustGitRepoStateIn(b, ctx, repoDir)
 		if len(state.Files) == 0 {
 			b.Fatal("expected dirty files")
 		}
@@ -1866,7 +1866,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 			if err := os.WriteFile(target, content, 0o644); err != nil {
 				b.Fatal(err)
 			}
-			loopState := gitRepoStateIn(ctx, repoDir)
+			loopState := mustGitRepoStateIn(b, ctx, repoDir)
 			preState := gitCorpusStateHash(paths, loopState)
 			if err := indexUncommitted(ctx, repoDir, plan.indexDir, plan.cacheDir, loopState, cachedState, preState, indexParallelism()); err != nil {
 				b.Fatalf("index uncommitted: %v", err)
@@ -1877,7 +1877,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 	b.Run("postVerify_gitStatus", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			postState := gitRepoStateIn(ctx, repoDir)
+			postState := mustGitRepoStateIn(b, ctx, repoDir)
 			gitCorpusStateHash(paths, postState)
 		}
 	})
@@ -1889,7 +1889,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		if err := os.WriteFile(target, append(original, []byte("\n// dirty_for_restat\n")...), 0o644); err != nil {
 			b.Fatal(err)
 		}
-		dirtyState := gitRepoStateIn(ctx, repoDir)
+		dirtyState := mustGitRepoStateIn(b, ctx, repoDir)
 		if len(dirtyState.Files) == 0 {
 			b.Fatal("expected dirty files")
 		}
@@ -1951,7 +1951,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		if err := os.WriteFile(target, append(original, []byte("\n// dirty_set\n")...), 0o644); err != nil {
 			b.Fatal(err)
 		}
-		dirtyState := gitRepoStateIn(ctx, repoDir)
+		dirtyState := mustGitRepoStateIn(b, ctx, repoDir)
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
@@ -1979,7 +1979,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		if err := os.WriteFile(target, append(original, []byte("\n// dirty_fmt\n")...), 0o644); err != nil {
 			b.Fatal(err)
 		}
-		dirtyState := gitRepoStateIn(ctx, repoDir)
+		dirtyState := mustGitRepoStateIn(b, ctx, repoDir)
 		results, err := executeUnscopedShardSearchForTest(ctx, plan.indexDir, "func main")
 		if err != nil {
 			b.Fatal(err)
@@ -2125,7 +2125,7 @@ func BenchmarkGitUncommitted_RapidEdits_N16(b *testing.B) {
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(b, dir)
 	// Establish the cachedState baseline by indexing once with no dirty files.
-	state := gitRepoStateIn(ctx, dir)
+	state := mustGitRepoStateIn(b, ctx, dir)
 	preState := gitCorpusStateHash(paths, state)
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, preState); err != nil {
 		b.Fatalf("baseline index: %v", err)
@@ -2139,7 +2139,7 @@ func BenchmarkGitUncommitted_RapidEdits_N16(b *testing.B) {
 			if err := os.WriteFile(filepath.Join(dir, "app.go"), body, 0o644); err != nil {
 				b.Fatal(err)
 			}
-			state := gitRepoStateIn(ctx, dir)
+			state := mustGitRepoStateIn(b, ctx, dir)
 			preState := gitCorpusStateHash(paths, state)
 			if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, preState); err != nil {
 				b.Fatalf("delta cycle %d.%d: %v", i, j, err)
@@ -2216,7 +2216,7 @@ func BenchmarkSearchTombstoneCost(b *testing.B) {
 	dir := initGitRepo(b, "app.go", "package main\n// tombstone_cost_baseline\n")
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(b, dir)
-	state := gitRepoStateIn(ctx, dir)
+	state := mustGitRepoStateIn(b, ctx, dir)
 	preState := gitCorpusStateHash(paths, state)
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, preState); err != nil {
 		b.Fatalf("baseline index: %v", err)
@@ -2229,7 +2229,7 @@ func BenchmarkSearchTombstoneCost(b *testing.B) {
 		if err := os.WriteFile(filepath.Join(dir, "app.go"), body, 0o644); err != nil {
 			b.Fatal(err)
 		}
-		state := gitRepoStateIn(ctx, dir)
+		state := mustGitRepoStateIn(b, ctx, dir)
 		preState := gitCorpusStateHash(paths, state)
 		if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, preState); err != nil {
 			b.Fatalf("delta cycle %d: %v", i, err)
@@ -2544,7 +2544,7 @@ func BenchmarkWriteFolderManifest_100k(b *testing.B) {
 	}
 }
 
-// --- Detector hot-path benchmarks (PR1 walker-overhead regression gates) ---
+// --- Detector hot-path benchmarks ---
 
 func benchSetupValidGitDir(b *testing.B, root string) {
 	b.Helper()
@@ -2560,9 +2560,8 @@ func benchSetupValidGitDir(b *testing.B, root string) {
 }
 
 // BenchmarkDetectGitBoundary_NotBoundary measures the walker hot path:
-// detection on a directory that contains no `.git` entry. This is the
-// common case (most subdirs are NOT repos). Allocs/op must stay low —
-// regression gate per plan §J'.
+// detection on a directory that contains no `.git` entry. Most subdirectories
+// use this path, so the benchmark reports allocation changes.
 func BenchmarkDetectGitBoundary_NotBoundary(b *testing.B) {
 	root := b.TempDir()
 	b.ReportAllocs()

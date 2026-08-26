@@ -95,8 +95,7 @@ func TestIndexDocuments_EmptyChannel_NoLeak(t *testing.T) {
 
 // TestIndexDocuments_BuilderInitFail_ReleasesWeight — when NewBuilder
 // fails (indexDir is a regular file), every already-queued doc must
-// still have its weight Released. This is the drain-after-error path
-// identified by the algorithmic review.
+// still have its weight Released.
 //
 // Fatal (not Skip) if NewBuilder unexpectedly succeeds: that would
 // mean Zoekt got more permissive and we lost the precondition that
@@ -181,11 +180,8 @@ func TestIndexDeltaDocuments_BuilderInitFail_ReleasesWeight(t *testing.T) {
 	}
 }
 
-// TestIndexDocuments_StressNoLeakUnderRace — race-detector load test:
-// hammer the reader→consumer pipeline with many files whose cumulative
-// content exceeds a test-local semaphore budget so back-pressure is
-// actually exercised (the original 200 × 12 B fixture sat 400 000×
-// below the production ceiling and never tripped the wedge).
+// TestIndexDocuments_StressNoLeakUnderRace drives the reader and consumer with
+// cumulative content above a test-local semaphore budget.
 //
 // Uses swapReadSemaphoreForTest so the test stays cheap (~12 MiB of
 // payload) while still driving Acquire queueing through the real

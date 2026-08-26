@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -133,15 +133,16 @@ func TestFolderCorpusState_IndexedByteCapFailsClosed(t *testing.T) {
 	}
 
 	_, _, err = folderCorpusState(context.Background(), plan)
-	if err == nil {
-		t.Fatal("expected indexed byte cap error")
+	if !errors.Is(err, errFolderCapExceeded) {
+		t.Fatalf("error=%v, want folder cap", err)
 	}
-	if !strings.Contains(err.Error(), "folder indexed byte cap exceeded") {
-		t.Fatalf("unexpected cap error: %v", err)
+	capErr, ok := errors.AsType[indexCapExceededError](err)
+	if !ok {
+		t.Fatalf("error=%v, want indexCapExceededError", err)
 	}
-	if !strings.Contains(err.Error(), "indexed_bytes=") ||
-		!strings.Contains(err.Error(), "limit=") {
-		t.Fatalf("cap error should include measured value and limit, got: %v", err)
+	wantCurrent := int64(count) * size
+	if capErr.metric != indexCapIndexedBytes || capErr.current != wantCurrent || capErr.limit != maxFolderIndexedBytes {
+		t.Fatalf("cap error=%+v, want metric=%q current=%d limit=%d", capErr, indexCapIndexedBytes, wantCurrent, maxFolderIndexedBytes)
 	}
 }
 

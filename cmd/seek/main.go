@@ -18,16 +18,7 @@ import (
 	"golang.org/x/term"
 )
 
-// errNoMatch is returned by run when the query executed successfully but
-// produced zero results. Following the POSIX grep convention, this maps to
-// exit code 1 — distinguishing "no match" from both success (0) and error (2).
-// This lets callers use seek reliably in shell pipelines and conditionals:
-//
-//	if seek "TODO"; then … fi       # runs body only when matches exist
-//	seek "pattern" || echo "nope"   # "nope" printed only on no-match
-var errNoMatch = errors.New("no match")
-
-var errScopedLayerStateChanged = errors.New("scoped git layer state changed")
+var errGitIndexStateChanged = errors.New("git index state changed")
 
 const maxScopedLayerRefreshRetries = 2
 
@@ -57,34 +48,28 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
-	// Pre-scan os.Args for -v / --verbose so flag-time errors are
+	// Pre-scan the effective arguments for -v / --verbose so flag-time errors are
 	// formatted under the verbose contract too. PersistentPreRunE only
 	// fires AFTER pflag parses successfully, so without this pre-scan a
 	// `seek -v --unknown foo` would print plain `seek: <err>` instead of
 	// the structured slog ERROR record the user asked for.
-	verbose := hasVerboseArg(os.Args[1:])
+	root := newRootCmd()
+	args := splicePassthroughSeparator(os.Args[1:], root.Flags())
+	verbose := hasVerboseArg(args)
 
-	err := executeCLI(ctx)
+	root.SetArgs(args)
+	err := root.ExecuteContext(ctx)
 
 	// Informational calls do not touch an index, so they must not wait for cache
 	// maintenance. Search and management calls still run opportunistic GC after
 	// their output is flushed.
-	if shouldRunOpportunisticGC(os.Args[1:]) {
+	if shouldRunOpportunisticGC(args) {
 		fireOpportunisticGC(runOpportunisticGC, gcRunTimeout)
 	}
 
 	if err != nil {
 		code := exitCodeForError(err)
-		if code != 1 {
-			// Plain `seek: <err>` line. The structured slog ERROR
-			// output (time=... level=ERROR msg=...) is reserved for
-			// verbose mode where the operator wants the full record.
-			if verbose {
-				slog.Error(err.Error())
-			} else {
-				fmt.Fprintf(os.Stderr, "seek: %s\n", err)
-			}
-		}
+		reportCLIError(os.Stderr, err, verbose)
 		os.Exit(code)
 	}
 }
@@ -134,51 +119,24 @@ func optionalBoolFlag(arg, name string) (bool, bool) {
 	return parsed, err == nil
 }
 
-// hasVerboseArg scans raw os.Args for -v / --verbose without consulting
-// Cobra. Used by main() to decide error formatting BEFORE the cobra
+// hasVerboseArg scans effective arguments for -v / --verbose without
+// consulting Cobra. Used by main() to decide error formatting BEFORE the Cobra
 // flag parser has run — a `seek -v --unknown` typo still needs the
 // verbose contract honoured.
 func hasVerboseArg(args []string) bool {
+	verbose := false
 	for _, a := range args {
 		if a == "--" {
-			return false
+			break
 		}
-		if a == "-v" || a == "--verbose" || a == "-verbose" {
-			return true
+		for _, name := range []string{"-v", "--verbose"} {
+			if value, ok := optionalBoolFlag(a, name); ok {
+				verbose = value
+				break
+			}
 		}
 	}
-	return false
-}
-
-func exitCodeForError(err error) int {
-	switch {
-	case err == nil:
-		return 0
-	case errors.Is(err, errNoMatch):
-		return 1
-	default:
-		return 2
-	}
-}
-
-// slogWriter bridges Go's standard log package to slog. Each log.Printf call
-// becomes a single slog.Info message.
-type slogWriter struct {
-	logger *slog.Logger
-}
-
-func newSlogWriter(l *slog.Logger) *slogWriter {
-	return &slogWriter{logger: l}
-}
-
-func (w *slogWriter) Write(p []byte) (int, error) {
-	// Trim trailing newline added by log.Printf
-	msg := string(p)
-	if len(msg) > 0 && msg[len(msg)-1] == '\n' {
-		msg = msg[:len(msg)-1]
-	}
-	w.logger.Info(msg)
-	return len(p), nil
+	return verbose
 }
 
 func cloneStringSlice(values []string) []string {
@@ -209,15 +167,9 @@ func runWithSearchConfig(
 		return err
 	}
 
-	var paths *gitPaths
-	resolvedPaths, gitErr := resolveGitPathsFromCWD(ctx)
-	if gitErr == nil {
-		paths = &resolvedPaths
-	} else if len(pathOperands) == 0 {
-		// gitErr from `git rev-parse` typically reads `exit status 128`,
-		// which leaks an internal status code. Wrap with a hint at the
-		// only useful remedy: pass a path operand.
-		return fmt.Errorf("not in a git repository; specify a path to search (e.g. 'seek %q .')", pattern)
+	paths, err := resolveDefaultSearchRoot(ctx, pathOperands)
+	if err != nil {
+		return err
 	}
 
 	plans, err := planCorpora(ctx, paths, pathOperands)
@@ -291,8 +243,8 @@ func prepareAndSearchCorpus(
 ) ([]corpusSearchResult, dirtyFileSet, error) {
 	for attempt := 0; ; attempt++ {
 		results, dirty, err := prepareAndSearchCorpusOnce(ctx, plan, paths, userQ, config)
-		if errors.Is(err, errScopedLayerStateChanged) && plan.dirtyScope != nil && attempt < maxScopedLayerRefreshRetries {
-			slog.Debug("scoped git layer changed during search; retrying", "root", plan.root, "attempt", attempt+1)
+		if errors.Is(err, errGitIndexStateChanged) && plan.dirtyScope != nil && attempt < maxScopedLayerRefreshRetries {
+			slog.Debug("scoped git index changed during search; retrying", "root", plan.root, "attempt", attempt+1)
 			continue
 		}
 		return results, dirty, err
@@ -337,7 +289,7 @@ func prepareAndSearchCorpusOnce(
 			if !shardsExist(plan.indexDir) {
 				return nil, nil, err
 			}
-			slog.Warn("Indexing failed", "error", err, "root", plan.root)
+			reportStaleIndexWarning(err)
 		}
 		indexState = readyState
 	default:
@@ -431,13 +383,16 @@ func wrapCorpusResults(plan corpusPlan, files []zoekt.FileMatch) []corpusSearchR
 // a small scope). It mutates *plan to point search/lock/validate at the fallback
 // (plan.scopedStateHash != "") when that path is taken.
 func ensureGitCorpusFresh(ctx context.Context, plan *corpusPlan, paths gitPaths) (repoState, corpusIndexState, error) {
-	state := gitRepoStateIn(ctx, paths.RepoDir)
+	state, err := gitRepoStateIn(ctx, paths.RepoDir)
+	if err != nil {
+		return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, plan.indexDir, err)
+	}
 	treeish := normalizeCommittedTreeish(state.HeadSHA)
 
-	// Scoped over-cap fast path: a cap marker for this HEAD + cap limits records
-	// that the whole repo is over budget, so skip the combined build's budget
-	// rescan and serve the per-scope fallback directly. The marker self-
-	// invalidates on a HEAD change or a cap-limit change.
+	// Scoped over-cap fast path: a cap marker for this HEAD and these cap limits
+	// records that the immutable committed tree is over budget. Skip its budget
+	// scan and serve the per-scope fallback directly. A HEAD or cap-limit change
+	// invalidates the marker.
 	if plan.dirtyScope != nil && readGitCapMarker(plan.cacheDir) == gitCapMarkerValue(treeish) {
 		return ensureScopedGitCorpusFallback(ctx, plan, paths, state)
 	}
@@ -445,31 +400,34 @@ func ensureGitCorpusFresh(ctx context.Context, plan *corpusPlan, paths gitPaths)
 	indexState, err := ensureCombinedGitCorpus(ctx, *plan, paths, state)
 	if err != nil {
 		if errors.Is(err, errGitCapExceeded) && plan.dirtyScope != nil {
-			// Confirm HEAD didn't move during the (live-HEAD) budget scan before
-			// pinning an over-cap verdict to this treeish, then record the cap
-			// (best-effort) and serve the per-scope fallback.
-			if verr := validateCommittedHead(ctx, plan.cacheDir, paths, treeish); verr != nil {
-				return repoState{}, corpusSearchable, verr
-			}
-			if markErr := writeGitCapMarker(plan.cacheDir, gitCapMarkerValue(treeish)); markErr != nil {
-				// Best-effort optimization cache; a read-only/full cache dir must
-				// not fail a search the fallback can serve. Log and continue.
-				slog.Warn("Failed to write git cap marker", "error", markErr, "cache_dir", plan.cacheDir)
+			if errors.Is(err, errGitCommittedCapExceeded) {
+				// Confirm HEAD did not move during the committed-tree budget scan
+				// before caching its stable result.
+				if verr := validateCommittedHead(ctx, paths, treeish); verr != nil {
+					return repoState{}, corpusSearchable, verr
+				}
+				if markErr := writeGitCapMarker(plan.cacheDir, gitCapMarkerValue(treeish)); markErr != nil {
+					slog.Warn("Failed to write git cap marker", "error", markErr, "cache_dir", plan.cacheDir)
+				}
+			} else {
+				// A working-tree cap can change without a commit. Recheck the
+				// combined corpus on the next search.
+				removeGitCapMarker(plan.cacheDir)
 			}
 			return ensureScopedGitCorpusFallback(ctx, plan, paths, state)
 		}
 		return repoState{}, corpusSearchable, err
 	}
-	// Under-cap success clears any stale over-cap marker (repo shrank at HEAD).
-	if plan.dirtyScope != nil {
-		removeGitCapMarker(plan.cacheDir)
-	}
+	// Any successful combined-corpus preparation clears a stale marker.
+	removeGitCapMarker(plan.cacheDir)
 	return state, indexState, nil
 }
 
-// ensureCombinedGitCorpus refreshes the single combined committed+dirty
-// whole-repo index that serves both scoped and unscoped searches. Returns
-// errGitCapExceeded when the whole repo is over the index caps.
+// ensureCombinedGitCorpus refreshes the single combined committed and dirty
+// whole-repo index that serves scoped and unscoped searches. Cap failures are
+// always returned so a scoped caller can select its fallback. Other update
+// failures are returned when no shards exist; with published shards, the
+// function warns and leaves the prior generation searchable.
 func ensureCombinedGitCorpus(ctx context.Context, plan corpusPlan, paths gitPaths, state repoState) (corpusIndexState, error) {
 	// Check for existing index state. If present, the cache directory
 	// exists and one-time setup (ensureUntrackedCache, ensureFSMonitor) was
@@ -514,18 +472,17 @@ func ensureCombinedGitCorpus(ctx context.Context, plan corpusPlan, paths gitPath
 			if !shardsExist(plan.indexDir) {
 				return corpusSearchable, err
 			}
-			slog.Warn("Indexing failed", "error", err)
+			reportStaleIndexWarning(err)
 		}
 	}
 	return corpusSearchable, nil
 }
 
 // ensureScopedGitCorpusFallback builds (and selects, via plan.scopedStateHash)
-// the over-cap fallback: a single per-scope index holding the in-scope committed
-// tree (pinned treeish) plus the in-scope dirty working files, in one dir under
-// one lock. Only reached when the whole repo is over the index caps, so a huge
-// tracked sibling cannot cap a small scope. Rebuilt wholesale whenever HEAD, the
-// scope, or the in-scope working tree changes (over-cap is rare; no delta).
+// the over-cap fallback: one per-scope generation holding the in-scope
+// committed tree and dirty working files. The build lock serializes builders;
+// the publish lock covers only publication. The fallback is rebuilt whenever
+// HEAD, the scope, or the in-scope working tree changes.
 func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths gitPaths, state repoState) (repoState, corpusIndexState, error) {
 	if plan.scopedCacheDir == "" || plan.scopedIndexDir == "" {
 		return repoState{}, corpusSearchable, fmt.Errorf("scoped git corpus missing fallback paths")
@@ -534,7 +491,7 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 	indexDir := plan.scopedIndexDir
 	treeish := normalizeCommittedTreeish(state.HeadSHA)
 	scopedState := repoStateForDirtyScope(state, plan.dirtyScope)
-	currentState := scopedFallbackStateHash(paths, plan.dirtyScope, state)
+	currentState := scopedFallbackStateHash(paths, scopedState)
 
 	if readStateFile(cacheDir) == "" {
 		ensureUntrackedCache(ctx, paths)
@@ -623,8 +580,8 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 		}
 	}
 
-	// validate-before-publish: HEAD must still equal the treeish indexed.
-	if err := validateCommittedHead(ctx, cacheDir, paths, treeish); err != nil {
+	// HEAD must still equal the captured value before publication.
+	if err := validateCommittedHead(ctx, paths, treeish); err != nil {
 		return repoState{}, corpusSearchable, err // discard (defer)
 	}
 
@@ -632,7 +589,7 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 	// publish-lock hold (see publishGeneration: avoids serving new shards with a
 	// stale-matching state label after a crash + content revert).
 	if err := publishGeneration(ctx, cacheDir, indexDir, buildDir, familyAll, func() error {
-		return writeCommittedLayerState(cacheDir, treeish, currentState, !shardsExist(indexDir))
+		return writeScopedFallbackState(cacheDir, treeish, currentState, !shardsExist(indexDir))
 	}); err != nil {
 		if errors.Is(err, errCorpusEvicted) {
 			return state, corpusSearchable, nil
@@ -662,35 +619,30 @@ func scopedFallbackCached(cacheDir, indexDir, currentState string) (corpusIndexS
 	return corpusSearchable, false
 }
 
-// scopedFallbackStateHash keys the over-cap fallback by HEAD treeish, scope, and
-// the in-scope working-tree state, so a commit, a scope change, or an in-scope
-// edit rebuilds it. repoStateForDirtyScope already encodes head+scope+files.
-func scopedFallbackStateHash(paths gitPaths, scope *gitDirtyScope, state repoState) string {
-	scoped := repoStateForDirtyScope(state, scope)
-	return gitCorpusStateHash(paths, repoState{
-		HeadSHA: normalizeCommittedTreeish(state.HeadSHA),
-		RawOutput: stringsJoinNUL(
-			"git-overcap-fallback-v1",
-			scoped.RawOutput,
-		),
-	})
+// scopedFallbackStateHash keys the fallback by its committed tree, scope, and
+// in-scope working files. The file list lets gitCorpusStateHash include the
+// current metadata fingerprint for dirty files.
+func scopedFallbackStateHash(paths gitPaths, state repoState) string {
+	state.HeadSHA = normalizeCommittedTreeish(state.HeadSHA)
+	state.RawOutput = stringsJoinNUL("git-overcap-fallback-v1", state.RawOutput)
+	return gitCorpusStateHash(paths, state)
 }
 
-// writeCommittedLayerState persists the head + state (+ optional empty marker)
-// for the over-cap per-scope fallback's cache dir.
-func writeCommittedLayerState(cacheDir, treeish, stateHash string, empty bool) error {
+// writeScopedFallbackState persists the captured HEAD, state hash, and optional
+// empty marker for an over-cap scoped fallback.
+func writeScopedFallbackState(cacheDir, treeish, stateHash string, empty bool) error {
 	if treeish == "no-head" {
 		_ = os.Remove(filepath.Join(cacheDir, headFile))
 		_ = os.Remove(filepath.Join(cacheDir, headFile+".tmp"))
 	} else if err := writeHeadFile(cacheDir, treeish); err != nil {
-		return fmt.Errorf("write committed head file: %w", err)
+		return fmt.Errorf("write scoped fallback head file: %w", err)
 	}
 	if err := writeStateFile(cacheDir, stateHash); err != nil {
-		return fmt.Errorf("write committed state file: %w", err)
+		return fmt.Errorf("write scoped fallback state file: %w", err)
 	}
 	if empty {
 		if err := writeEmptyStateFile(cacheDir, stateHash); err != nil {
-			return fmt.Errorf("write committed empty marker: %w", err)
+			return fmt.Errorf("write scoped fallback empty marker: %w", err)
 		}
 		return nil
 	}
@@ -699,7 +651,7 @@ func writeCommittedLayerState(cacheDir, treeish, stateHash string, empty bool) e
 }
 
 // gitCapMarkerFile records, in the combined corpus cache dir, that the
-// whole-repo tree exceeded the index caps. Its payload (gitCapMarkerValue) is
+// committed whole-repo tree exceeded the index caps. Its payload is
 // the committed treeish plus the cap limits in effect. While the marker matches
 // the current HEAD *and* the current cap limits, scoped searches skip the
 // combined index (and its budget re-scan) and use the per-scope combined
@@ -732,24 +684,21 @@ func removeGitCapMarker(cacheDir string) {
 }
 
 func normalizeCommittedTreeish(headSHA string) string {
-	if headSHA == "" || headSHA == "no-head" || headSHA == "(initial)" {
+	if headSHA == "" || headSHA == "no-head" {
 		return "no-head"
 	}
 	return headSHA
 }
 
-// validateCommittedHead is the TOCTOU guard shared by the per-scope and
-// whole-repo committed builds: HEAD must still equal the treeish indexed,
-// else the just-written shards are stale and its state files are deleted.
-func validateCommittedHead(ctx context.Context, cacheDir string, paths gitPaths, expectedTreeish string) error {
-	currentTreeish, err := gitHeadTreeish(ctx, paths.RepoDir)
+// validateCommittedHead reports whether HEAD still equals the captured commit
+// OID or no-head sentinel. It does not change published cache state.
+func validateCommittedHead(ctx context.Context, paths gitPaths, expectedHead string) error {
+	currentHead, err := gitHeadTreeish(ctx, paths.RepoDir)
 	if err != nil {
-		deleteStateFiles(cacheDir)
 		return err
 	}
-	if normalizeCommittedTreeish(currentTreeish) != normalizeCommittedTreeish(expectedTreeish) {
-		deleteStateFiles(cacheDir)
-		return errScopedLayerStateChanged
+	if normalizeCommittedTreeish(currentHead) != normalizeCommittedTreeish(expectedHead) {
+		return errGitIndexStateChanged
 	}
 	return nil
 }
@@ -900,7 +849,7 @@ func validateScopedSearchLayerStates(plan corpusPlan) error {
 		return nil
 	}
 	if !scopedLayerStateMatches(plan.scopedCacheDir, plan.scopedIndexDir, plan.scopedStateHash) {
-		return errScopedLayerStateChanged
+		return errGitIndexStateChanged
 	}
 	return nil
 }

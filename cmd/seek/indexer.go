@@ -62,22 +62,6 @@ const (
 	// Default zoekt value is 100MB (3 shards for k8s, ~1.7 cores used).
 	// 10MB produces ~23 shards for k8s, utilizing ~5 cores → 2.7x faster.
 	// No measurable impact on warm search latency.
-	//
-	// TODO(perf): shard rotation is content-byte-driven only. A corpus
-	// of 100k tiny files (e.g. ~50 B each) totalling < shardMax never
-	// rotates → one shard → single goroutine → no parallelism on cold
-	// index. Real-world Go/k8s/linux repos have 5-20 KB avg file size
-	// and hit shardMax naturally, so this degenerate case is rare.
-	// If we ever see lots-of-tiny-files workloads in the wild, options:
-	//   (a) Secondary file-count threshold (e.g. flush every ~5000
-	//       files regardless of bytes).
-	//   (b) Lower shardMax further. Trade-off: more shards at search
-	//       time → more open fds, marginally more shard-open cost.
-	//   (c) Plan-time dynamic shardMax = min(shardMax, totalContent /
-	//       parallelism). Complexity but optimal per workload.
-	// Validation: cicd/bench-field.sh used to ship a 43 B-per-file
-	// synth fixture that landed in 1 shard and skewed numbers 80%
-	// vs realistic ~250 B files. Fixed in that script.
 	shardMax = 10 * 1024 * 1024 // 10 MB
 )
 
@@ -103,19 +87,16 @@ func formatHex16(v uint64) string {
 	return string(buf[:])
 }
 
-// repoStateFingerprint returns the raw git status output enriched with working
-// tree file stats (mtime, size, and inode) for dirty files. git status
-// --porcelain=v2 doesn't include working tree content hashes, so consecutive
-// edits to an already-modified file produce identical porcelain output.
-// Appending file stats ensures the state hash changes whenever a dirty file is
-// modified. The inode detects atomic-write editors (vim, emacs) that replace
-// files via write-to-tmp + rename, which changes the inode but may preserve
-// mtime.
+// repoStateFingerprint returns raw Git status output plus the path, mtime,
+// size, and inode of each dirty file. Git status porcelain does not include
+// working-tree content hashes, so these fields detect common changes to files
+// that are already dirty. This is a metadata fingerprint, not a content hash;
+// an edit that preserves every observed field can keep the same fingerprint.
 //
 // Called twice per indexing cycle: once before indexing (to compute the
 // pre-state hash) and once after (to detect drift). The second call
-// re-Lstats the same files, so any modification during indexing produces
-// a different hash.
+// reads the same metadata again so changes to an observed field cause the
+// build to be discarded.
 func repoStateFingerprint(repoDir string, state repoState) string {
 	if len(state.Files) == 0 {
 		return state.RawOutput
@@ -232,14 +213,33 @@ func indexBuildOptions(indexDir string, parallelism int) index.Options {
 	}
 }
 
-// ctagsOnce caches the result of checkCtags so the PATH lookup and
-// --version subprocess run at most once per process. The result is
-// deterministic within a single invocation (ctags won't be uninstalled
-// between search cycles).
+// ctagsOnce caches executable discovery for one process.
 var (
 	ctagsOnce sync.Once
 	ctagsErr  error
 )
+
+// ctagsUnavailableError identifies a failure to locate an executable Ctags
+// command. An explicit command records its CTAGS_COMMAND value. The wrapped
+// cause keeps lookup details for verbose logs.
+type ctagsUnavailableError struct {
+	command string
+	cause   error
+}
+
+func (e *ctagsUnavailableError) Error() string {
+	if e.command != "" {
+		return fmt.Sprintf("cannot use CTAGS_COMMAND=%q: %v", e.command, e.cause)
+	}
+	if e.cause != nil {
+		return fmt.Sprintf("universal-ctags executable not found: %v", e.cause)
+	}
+	return "universal-ctags executable not found"
+}
+
+func (e *ctagsUnavailableError) Unwrap() error {
+	return e.cause
+}
 
 // checkCtagsCached returns the cached result of checkCtags, running the
 // check at most once per process.
@@ -248,9 +248,10 @@ func checkCtagsCached() error {
 	return ctagsErr
 }
 
-// checkCtags verifies that universal-ctags is installed. Zoekt silently skips
-// symbol parsing when ctags is missing (even with CTagsMustSucceed), so we
-// must detect this explicitly.
+// checkCtags locates an executable command before Zoekt creates a builder. It
+// verifies the generic "ctags" fallback by version because that name can refer
+// to other implementations. Zoekt validates required Universal Ctags features
+// when CTagsMustSucceed is set.
 //
 // Detection order:
 //  1. CTAGS_COMMAND env var (explicit user override)
@@ -261,29 +262,35 @@ func checkCtags() error {
 	// 1. Explicit env var — trust the user.
 	if cmd := os.Getenv("CTAGS_COMMAND"); cmd != "" {
 		if _, err := exec.LookPath(cmd); err != nil {
-			return fmt.Errorf("CTAGS_COMMAND=%q not found on PATH: %w", cmd, err)
+			return &ctagsUnavailableError{command: cmd, cause: err}
 		}
 		return nil
 	}
 
 	// 2. Zoekt default: looks for "universal-ctags" on PATH.
-	var opts index.Options
-	opts.SetDefaults()
-	if opts.CTagsPath != "" {
+	if _, err := exec.LookPath("universal-ctags"); err == nil {
 		return nil
-	}
+	} else {
+		universalErr := err
 
-	// 3. Fallback: Homebrew installs universal-ctags as "ctags".
-	// Verify via --version to distinguish from Exuberant Ctags.
-	if ctags, err := exec.LookPath("ctags"); err == nil {
-		out, err := exec.Command(ctags, "--version").Output()
-		if err == nil && strings.Contains(string(out), "Universal Ctags") {
+		// 3. Fallback: Homebrew installs universal-ctags as "ctags".
+		// Verify via --version to distinguish it from Exuberant Ctags.
+		ctags, lookupErr := exec.LookPath("ctags")
+		if lookupErr != nil {
+			return &ctagsUnavailableError{cause: errors.Join(universalErr, lookupErr)}
+		}
+		out, versionErr := exec.Command(ctags, "--version").Output()
+		if versionErr == nil && strings.Contains(string(out), "Universal Ctags") {
 			_ = os.Setenv("CTAGS_COMMAND", ctags)
 			return nil
 		}
+		if versionErr != nil {
+			versionErr = fmt.Errorf("check %q --version: %w", ctags, versionErr)
+		} else {
+			versionErr = fmt.Errorf("%q is not Universal Ctags", ctags)
+		}
+		return &ctagsUnavailableError{cause: errors.Join(universalErr, versionErr)}
 	}
-
-	return fmt.Errorf("universal-ctags required but not found.\n  macOS:  brew install universal-ctags\n  Linux:  sudo apt-get install universal-ctags\n  Or set CTAGS_COMMAND=/path/to/ctags")
 }
 
 // runIndexingWithCache makes the combined committed+uncommitted git index
@@ -291,10 +298,9 @@ func checkCtags() error {
 //
 //   - .build.lock (acquireBuildLock) serializes builders and is held across the
 //     whole build; readers never take it, so a long build never blocks search.
-//   - The committed family (the multi-minute case) is built lock-free into a
-//     temp dir seeded with the current shards (hardlinks, for zoekt's delta
-//     baseline), HEAD is re-validated BEFORE publish (closes gap-e), then it is
-//     swapped into the live dir under the brief publish lock.
+//   - The committed family is built outside the publish lock in a temporary
+//     directory seeded with current shards. HEAD is checked before the brief
+//     publish-lock swap.
 //   - The uncommitted family is fast and carries a cacheDir manifest, so it is
 //     rebuilt in-place under that same brief publish lock (readers excluded for
 //     its sub-second build), avoiding a temp/manifest desync.
@@ -303,8 +309,7 @@ func checkCtags() error {
 // observe exactly the pre- or post-swap shard set — never torn.
 func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDir string, state repoState, preState string) error {
 	repoDir := paths.RepoDir
-	// Fail fast if ctags is missing. Uses sync.Once cache so the PATH
-	// lookup + --version subprocess runs at most once per process.
+	// Fail fast when no executable Ctags command can be found.
 	if err := checkCtagsCached(); err != nil {
 		deleteStateFiles(cacheDir)
 		return gitCorpusError(repoDir, indexDir, err)
@@ -348,9 +353,9 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	hasDirty := len(state.Files) > 0
 	// Skip committed indexing when HEAD hasn't moved since the last successful
 	// index (cheap incremental no-op path).
-	needCommitted := state.HeadSHA != readHeadFile(cacheDir)
+	needCommitted := state.HeadSHA != "no-head" && state.HeadSHA != readHeadFile(cacheDir)
 
-	// --- Committed family: lock-free build into a seeded temp dir. ---
+	// Build the committed family outside the publish lock in a seeded temp dir.
 	var buildDir string
 	if needCommitted {
 		if _, err := scanGitCommittedIndexBudget(ctx, repoDir, gitCandidateFileLimit, gitCorpusIndexedByteLimit); err != nil {
@@ -366,28 +371,23 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 			return err
 		}
 		if cErr := indexCommitted(repoDir, buildDir, parallelism); cErr != nil {
-			slog.Warn("Committed indexing failed", "error", cErr)
-			if errors.Is(cErr, errGitCapExceeded) {
-				deleteStateFiles(cacheDir)
-				return cErr
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
 			}
-			// Cold cache with no usable shards anywhere — surface the failure.
-			if !shardsExist(buildDir) && !shardsExist(indexDir) {
+			if !shardsExist(indexDir) {
 				deleteStateFiles(cacheDir)
-				return cErr
 			}
-			// Partial committed build: discard it, keep the live shards.
-			return nil
+			// The caller decides whether existing shards make a stale search safe.
+			return cErr
 		}
-		// validate-before-publish (gap-e): HEAD must still equal what we indexed,
-		// else the build is torn (indexed across two HEADs). Discard it; the live
-		// shards are untouched. This is the across-call bounded retry: the caller
-		// re-derives fresh state each search, so the next invocation rebuilds at
-		// the now-current HEAD — converging once HEAD stabilizes, with warm repos
-		// serving the prior consistent generation in the meantime.
-		if cur, hErr := gitHeadTreeish(ctx, repoDir); hErr != nil ||
-			normalizeCommittedTreeish(cur) != normalizeCommittedTreeish(state.HeadSHA) {
-			slog.Warn("HEAD moved during committed index; will re-index on next search")
+		// HEAD must still equal the captured value before publication. Otherwise,
+		// discard the temp build and keep the current published shards. The next
+		// search derives fresh state and can rebuild once HEAD is stable.
+		publish, err := validateCommittedBuildHead(ctx, paths, state.HeadSHA)
+		if err != nil {
+			return err
+		}
+		if !publish {
 			return nil // discard build; live shards untouched
 		}
 	}
@@ -417,32 +417,32 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 		}
 	}
 
-	var uncommittedErr error
 	if hasDirty {
-		uncommittedErr = indexUncommitted(ctx, repoDir, indexDir, cacheDir, state, cachedState, preState, parallelism)
+		uncommittedErr := gitCorpusError(
+			repoDir,
+			indexDir,
+			indexUncommitted(ctx, repoDir, indexDir, cacheDir, state, cachedState, preState, parallelism),
+		)
 		if uncommittedErr != nil {
-			slog.Warn("Uncommitted indexing failed", "error", uncommittedErr)
+			deleteStateFiles(cacheDir)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return uncommittedErr
 		}
 	} else {
 		cleanUncommittedShards(indexDir)
 		deleteUncommittedManifest(cacheDir)
 	}
 
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		deleteStateFiles(cacheDir)
+		return ctxErr
+	}
+
 	// Re-stat the dirty files to detect changes during the (sub-second)
 	// uncommitted build window.
 	postState := gitCorpusStateHash(paths, state)
-
-	if uncommittedErr != nil {
-		deleteStateFiles(cacheDir)
-		if errors.Is(uncommittedErr, errGitCapExceeded) {
-			return uncommittedErr
-		}
-		if !shardsExist(indexDir) {
-			return uncommittedErr
-		}
-		slog.Warn("Index incomplete, will re-index on next search")
-		return nil
-	}
 
 	if postState == preState {
 		if err := writeStateFile(cacheDir, preState); err != nil {
@@ -458,6 +458,26 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	}
 
 	return nil
+}
+
+// validateCommittedBuildHead distinguishes a real HEAD change from a failed
+// validation. A changed HEAD discards the new build and keeps the live index.
+// Cancellation and other Git failures propagate to the corpus worker.
+func validateCommittedBuildHead(
+	ctx context.Context,
+	paths gitPaths,
+	expectedTreeish string,
+) (bool, error) {
+	err := validateCommittedHead(ctx, paths, expectedTreeish)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, errGitIndexStateChanged):
+		slog.Warn("HEAD moved during committed index; will re-index on next search")
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
 // shardsExist checks if any *.zoekt shard files exist in the index directory.
@@ -479,9 +499,8 @@ const maxCommittedDeltaShards = 64
 // the prior commit is gone (force-push, GC), branch set changes, index option
 // hash differs, or the shard count exceeds DeltaShardNumberFallbackThreshold.
 //
-// The fallback repository name gives Zoekt a non-empty shard namespace for
-// local repos with no remote.origin.url and no [zoekt] name. Zoekt still
-// overwrites it when repo config or origin metadata provides a real name.
+// The fallback repository name gives Zoekt a stable shard namespace. Zoekt
+// keeps this name unless the repository has an explicit [zoekt] name.
 func indexCommitted(repoDir, indexDir string, parallelism int) error {
 	buildOpts := indexBuildOptions(indexDir, parallelism)
 	buildOpts.IsDelta = true

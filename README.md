@@ -83,16 +83,18 @@ Or download a pre-built binary from [GitHub Releases](https://github.com/dualeai
 
 ### Prerequisites
 
-[Universal Ctags](https://github.com/universal-ctags/ctags) is required for
-indexing and `sym:` definition search:
+[Universal Ctags](https://github.com/universal-ctags/ctags) is required to build
+or update an index and to support `sym:` definition search. Put it on `PATH` or
+set `CTAGS_COMMAND` to its executable:
 
 ```bash
 brew install universal-ctags       # macOS
 sudo apt-get install universal-ctags  # Linux
 ```
 
-**Git 2.31+** is required for [`git worktree`](https://git-scm.com/docs/git-worktree)
-setups. On older Git versions, normal repos still work.
+Git is required for Git-backed searches. **Git 2.31+** is required for
+[`git worktree`](https://git-scm.com/docs/git-worktree) setups. On older Git
+versions, normal repositories still work.
 
 ### Agent Integration
 
@@ -127,11 +129,11 @@ The package does not use an Agent Plugins 1.0 root manifest because that
 standard does not define portable hooks. See the
 [compatibility note](plugins/seek-router/README.md#why-there-is-no-agent-plugins-manifest).
 
-A working plugin installation requires `seek`, `jq`, a POSIX `awk`, and
-Universal Ctags on `PATH`. The router is implemented inside the plugin and
-calls only the public seek CLI. Seek does not contain hook parsing or command
-adapters. If a hook dependency is missing, the hook leaves the original command
-unchanged.
+The router requires `seek`, `jq`, and a POSIX `awk`. Building or updating a seek
+index also requires Universal Ctags on `PATH` or through `CTAGS_COMMAND`. The
+router is implemented inside the plugin and calls only the public seek CLI.
+Seek does not contain hook parsing or command adapters. If a hook dependency is
+missing, the hook leaves the original command unchanged.
 
 Try it without installing: `claude --plugin-dir ./plugins/seek-router`.
 
@@ -190,8 +192,8 @@ The query comes first. Paths after the query choose where to search.
 - Exact files: search only that file, not sibling files, even when the file is
   inside a Git repo.
 - Folders outside Git: search that folder with filesystem rules.
-- Nested Git repos inside selected folders are searched once with their own Git
-  rules.
+- Visible nested Git worktrees inside selected folders are searched once with
+  their own Git rules.
 - Files or folders ignored by Git stay ignored when you search that repo or a
   folder inside it. Passing an exact ignored file or folder still searches it.
 
@@ -204,7 +206,10 @@ seek -n 5 -m 3 "handleRequest" ./src
 Paths must exist. Symlinks passed on the command line are resolved to their
 targets. Broken symlinks and invalid paths exit with code 2. Symlinks found
 while walking folders are skipped.
-Filters such as `file:api` still live inside the query string.
+
+Path operands constrain what Seek indexes. Query filters such as `file:api` and
+`-file:test` filter search results after indexing. They do not reduce index
+limits.
 
 ## Query Syntax
 
@@ -213,14 +218,14 @@ Filters such as `file:api` still live inside the query string.
 | Query | What it does |
 |-------|-------------|
 | `seek "CoreRouter"` | Substring search across content and file names |
-| `seek "content:async def.*handler"` | Search only file content (not file names) |
+| `seek "content:async def.*handler"` | Search file content, not file names |
 | `seek "regex:foo.*bar"` | Explicit regex search |
 
 ### Symbols
 
 | Query | What it does |
 |-------|-------------|
-| `seek "sym:CoreRouter"` | Find definitions such as functions, classes, methods, and types |
+| `seek "sym:CoreRouter"` | Find function, class, method, and type definitions |
 
 ### Filters
 
@@ -229,7 +234,7 @@ Filters such as `file:api` still live inside the query string.
 | `seek "file:router/src"` | Filter results to paths matching `router/src` |
 | `seek "lang:python error"` | Filter by language |
 | `seek "case:yes FooBar"` | Case-sensitive search (`yes`, `no`, `auto`) |
-| `seek "type:file config"` | Return matching file names only (no content matches) |
+| `seek "type:file config"` | Return file names without content matches |
 
 ### Boolean Logic
 
@@ -238,9 +243,10 @@ Filters such as `file:api` still live inside the query string.
 | `seek "-file:test"` | Exclude paths matching `test` |
 | `seek "foo or bar"` | Match either term |
 | `seek "(foo or bar) lang:go"` | Group expressions with parentheses |
-| `seek "handleError file:api -file:test"` | Combined: substring + path filter + exclusion |
+| `seek "handleError file:api -file:test"` | Combine content and path filters |
 
-More [query syntax](https://github.com/sourcegraph/zoekt/blob/main/doc/query_syntax.md) is supported. Results are ranked by relevance.
+More [query syntax](https://github.com/sourcegraph/zoekt/blob/a0f5789d25cb/doc/query_syntax.md)
+is supported by the pinned Zoekt version. Results are ranked by relevance.
 
 ### Flags
 
@@ -251,7 +257,7 @@ More [query syntax](https://github.com/sourcegraph/zoekt/blob/main/doc/query_syn
 | `seek -A 5 "query"` | Show 5 lines after each match (`--after-context`) |
 | `seek -C 5 "query"` | Show 5 lines on both sides (`--context`) |
 | `seek -n 5 -m 3 "query"` | Top 5 files, max 3 matches each |
-| `seek -v "query"` | Enable debug logging (`--verbose`) |
+| `seek -v "query"` | Show debug logs and detailed errors (`--verbose`) |
 
 Flags compose with query filters and paths. For example,
 `seek -n 3 "sym:handleRequest file:api" ./src` returns the top 3 matching files
@@ -265,13 +271,13 @@ search. seek adds the parts agents usually need when they search repeatedly:
 
 | | ripgrep | seek |
 |---|---|---|
-| **Search model** | Scans files every query | Builds an index once, then reuses it |
+| **Search model** | Scans files per query | Builds and reuses an index |
 | **Relevance ranking** | Results in file-path order | Best matches first |
-| **Definitions** | Text matches only | Symbol tags such as `[func]` and `[class]` |
-| **Context lines** | None by default | 3 lines of surrounding code with every match |
-| **Local changes** | No separate local-change label | Includes and labels local changes |
-| **Language detection** | `--type` filter (extension-based) | Labels each file `(Go)`, `(Python)` via [go-enry](https://github.com/go-enry/go-enry) |
-| **Parallel agents** | Each command scans on its own | Several agents can use the same index safely |
+| **Definitions** | Text matches only | Tags such as `[func]` and `[class]` |
+| **Context lines** | None by default | 3 lines around each match |
+| **Local changes** | No local-change label | Includes and labels local changes |
+| **Language detection** | Extension-based `--type` | Labels files via [go-enry](https://github.com/go-enry/go-enry) |
+| **Parallel agents** | Each command scans | Agents share one index safely |
 
 Use ripgrep for quick raw regex searches. Use seek when you want ranked,
 filtered results with context.
@@ -298,6 +304,11 @@ Folder searches read regular files and skip `.git` folders. They do not skip
 dependency, build, cache, or vendor folders by name. Git ignore rules apply only
 inside Git repos. Files larger than 100 MiB are skipped, and folder scans stop
 at 1,000,000 candidate files or 10 GiB of indexed bytes.
+
+Git applies a limit of 10,000,000 candidate files and 10 GiB of indexed bytes
+separately to the committed and working-tree index families. If the full
+repository exceeds a limit, a scoped search can build a combined fallback for
+its selected paths. An unscoped search reports the limit error.
 
 ### Cache maintenance
 
@@ -357,10 +368,11 @@ When multiple `seek` commands search the same repo at the same time:
 | Scenario | Behavior |
 |----------|----------|
 | Index is fresh | All commands search at the same time |
-| Index is stale | First command updates it; others use the old index with a warning |
+| Update active | One command updates; others search the published index |
+| Update fails; old index exists | Seek searches the old index and warns |
 | No index yet | First command builds it; others wait up to 60s |
 
-### Exit Codes
+### Search Exit Codes
 
 | Code | Meaning |
 |------|---------|
@@ -373,13 +385,17 @@ in scripts.
 
 ## Security
 
-- [Security Policy](SECURITY.md) -- vulnerability reporting and response timeline
-- [SBOM](https://github.com/dualeai/seek/releases) -- CycloneDX Software Bill of Materials attached to each release
-- [GitHub Attestations](https://github.com/dualeai/seek/attestations) -- verify build provenance with `gh attestation verify`
+- [Security Policy](SECURITY.md) -- vulnerability reporting and response
+  timeline
+- [SBOM](https://github.com/dualeai/seek/releases) -- CycloneDX Software Bill
+  of Materials attached to each release
+- [GitHub Attestations](https://github.com/dualeai/seek/attestations) -- verify
+  build provenance with `gh attestation verify`
 
 ## Contributing
 
-Contributions are welcome. Please open an issue to discuss changes before submitting a pull request.
+Contributions are welcome. Please open an issue to discuss changes before
+submitting a pull request.
 
 ```bash
 git clone https://github.com/dualeai/seek.git

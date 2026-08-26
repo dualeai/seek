@@ -161,7 +161,7 @@ func TestFix_ConcurrentSearchDuringReindex_Stress(t *testing.T) {
 	paths, plan := planGitTestCorpus(t, dir)
 
 	// Initial index
-	state := gitRepoStateIn(ctx, dir)
+	state := mustGitRepoStateIn(t, ctx, dir)
 	currentState := gitCorpusStateHash(paths, state)
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, currentState); err != nil {
 		t.Fatalf("initial indexing: %v", err)
@@ -196,7 +196,11 @@ func TestFix_ConcurrentSearchDuringReindex_Stress(t *testing.T) {
 				recordIndexError(fmt.Errorf("write dirty fixture %q: %w", marker, err))
 				return
 			}
-			state := gitRepoStateIn(ctx, dir)
+			state, err := gitRepoStateIn(ctx, dir)
+			if err != nil {
+				recordIndexError(fmt.Errorf("read repository state for %q: %w", marker, err))
+				return
+			}
 			currentState := gitCorpusStateHash(paths, state)
 			if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, currentState); err != nil {
 				recordIndexError(fmt.Errorf("refresh dirty fixture %q: %w", marker, err))
@@ -260,7 +264,7 @@ func TestFix_ConcurrentSearchDuringCommittedSwap(t *testing.T) {
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
 
-	st := gitRepoStateIn(ctx, dir)
+	st := mustGitRepoStateIn(t, ctx, dir)
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, st, gitCorpusStateHash(paths, st)); err != nil {
 		t.Fatalf("initial committed index: %v", err)
 	}
@@ -275,7 +279,11 @@ func TestFix_ConcurrentSearchDuringCommittedSwap(t *testing.T) {
 		<-start
 		for i := 0; i < 20; i++ {
 			writeTrackedFile(t, dir, fmt.Sprintf("c_%d.go", i), fmt.Sprintf("package main\n// commit_%d\n", i))
-			s := gitRepoStateIn(ctx, dir)
+			s, err := gitRepoStateIn(ctx, dir)
+			if err != nil {
+				t.Errorf("read repository state: %v", err)
+				return
+			}
 			_ = runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, s, gitCorpusStateHash(paths, s))
 		}
 	}()
@@ -308,9 +316,8 @@ func TestFix_ConcurrentSearchDuringCommittedSwap(t *testing.T) {
 	}
 }
 
-// TestGC_SkipsCorpusWithBuildInProgress covers the Phase 2 gc guard: a lock-free
-// temp-swap build holds only .build.lock (not .lock), so evictCorpus must also
-// try .build.lock and skip eviction while a build is in progress.
+// TestGC_SkipsCorpusWithBuildInProgress verifies that GC honors .build.lock
+// while a temp-swap build runs outside the publish lock.
 func TestGC_SkipsCorpusWithBuildInProgress(t *testing.T) {
 	root := cacheRootForTest(t)
 	dir := seedCorpus(t, root, fakeCorpusHash(91), time.Now().Add(-30*24*time.Hour))

@@ -65,15 +65,6 @@ func TestEnsureFolderCorpusFresh_WarmCallExercisesPreLockGate(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------
-// (2) jobs channel sized to len(entries).
-//
-// Audit caught that the previous test routed through scanFolderCorpus
-// (the serial walker), not scanFolderRootEntriesParallel (the parallel
-// dispatcher that holds the iter-005 change). folderCorpusStateParallel
-// is the entry the parallel path takes for rootTypeDirectory plans.
-// ---------------------------------------------------------------------
-
 // TestFolderCorpusStateParallel_HighFanout_NoStallNoDrop drives the
 // parallel dispatcher directly with entry count far exceeding worker
 // count to exercise the buffered-jobs change. Asserts every subdir's
@@ -238,14 +229,6 @@ func TestFingerprintRootEntry_RegularFile_CallsInfo(t *testing.T) {
 		t.Fatalf("entry.Info() called %d times for regular; want 1", entry.infoCalls)
 	}
 }
-
-// ---------------------------------------------------------------------
-// (5) walkDirectory skips path-string build for .git metadata dirs.
-//
-// Audit flagged that the original test conflated two invariants:
-// "walker skips .git" AND "boundary marker stable". Split for cleaner
-// diagnostics.
-// ---------------------------------------------------------------------
 
 // TestWalkDirectory_GitContentNotInStateHash asserts the walker does
 // NOT read content inside `.git/`. Mutating a sentinel file in there

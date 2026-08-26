@@ -35,17 +35,12 @@ func waitUntilSemaphoreBelow(t *testing.T, sem *semaphore.Weighted, threshold in
 		deadline, availableWeight(sem), threshold)
 }
 
-// defaultReadSemBudget returns the live readSemaphore budget — the
-// value either set by swapReadSemaphoreForTest or production default.
-// Acquire-all-then-Release probe via TryAcquire is too disruptive; we
-// snapshot the available weight under the assumption that no other
-// test holds weight at call time (caller MUST hold testReadSemMu).
-func defaultReadSemBudget() int64 { return availableWeight(readSemaphore) }
-
-// availableWeight returns the currently-available weight on sem by
-// binary-search via TryAcquire/Release. Callers touching the shared
-// readSemaphore MUST hold testReadSemMu for the entire before→action→
-// after sequence; otherwise concurrent acquires bias the reading.
+// availableWeight probes available weight by binary-search with
+// TryAcquire/Release. While a waiter is queued, TryAcquire can fail even when
+// capacity remains, so active-pipeline callers must use this only as an
+// activity signal. After all workers stop, it gives an exact leak check.
+// Callers touching the shared readSemaphore MUST hold testReadSemMu for the
+// full before-action-after sequence.
 func availableWeight(sem *semaphore.Weighted) int64 {
 	lo, hi := int64(0), int64(maxInFlightBytes)
 	for lo < hi {

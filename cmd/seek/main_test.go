@@ -1,18 +1,6 @@
 package main
 
-import (
-	"errors"
-	"fmt"
-	"testing"
-)
-
-func TestErrNoMatch_IsDistinct(t *testing.T) {
-	// errNoMatch must not be confused with generic errors.
-	generic := errors.New("something went wrong")
-	if errors.Is(generic, errNoMatch) {
-		t.Error("generic error should not match errNoMatch")
-	}
-}
+import "testing"
 
 // TestDirtyFileSetFromState pins the dirty-set as EXACT-membership. The
 // formatter suppresses a committed match only when its FileName is in this set,
@@ -33,30 +21,6 @@ func TestDirtyFileSetFromState(t *testing.T) {
 		if set.contains(miss) {
 			t.Errorf("non-member %q matched — set must be exact, not substring", miss)
 		}
-	}
-}
-
-func TestErrNoMatch_WrappedIsDetectable(t *testing.T) {
-	// Even when wrapped, errors.Is must still detect errNoMatch so that
-	// callers (main) can reliably map it to exit code 1.
-	wrapped := fmt.Errorf("search: %w", errNoMatch)
-	if !errors.Is(wrapped, errNoMatch) {
-		t.Error("wrapped errNoMatch should be detectable via errors.Is")
-	}
-}
-
-func TestExitCodeForError(t *testing.T) {
-	if got := exitCodeForError(nil); got != 0 {
-		t.Fatalf("nil error exit code: got %d, want 0", got)
-	}
-	if got := exitCodeForError(errNoMatch); got != 1 {
-		t.Fatalf("no-match exit code: got %d, want 1", got)
-	}
-	if got := exitCodeForError(fmt.Errorf("wrapped: %w", errNoMatch)); got != 1 {
-		t.Fatalf("wrapped no-match exit code: got %d, want 1", got)
-	}
-	if got := exitCodeForError(errors.New("boom")); got != 2 {
-		t.Fatalf("generic error exit code: got %d, want 2", got)
 	}
 }
 

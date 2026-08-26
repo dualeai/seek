@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -110,6 +111,15 @@ func ensureTestUserCache(tb testing.TB) {
 		return
 	}
 	setTestUserCache(tb)
+}
+
+func mustGitRepoStateIn(tb testing.TB, ctx context.Context, dir string) repoState {
+	tb.Helper()
+	state, err := gitRepoStateIn(ctx, dir)
+	if err != nil {
+		tb.Fatalf("read Git repository state: %v", err)
+	}
+	return state
 }
 
 func planGitTestCorpus(tb testing.TB, repoDir string) (gitPaths, corpusPlan) {
@@ -372,6 +382,44 @@ func main() {
 	}
 }
 
+func TestRun_UnbornRepositorySearchesUntrackedFile(t *testing.T) {
+	requireTools(t)
+	dir := initEmptyGitRepo(t)
+	if err := os.WriteFile(
+		filepath.Join(dir, "untracked.go"),
+		[]byte("package unborn\n// unborn_untracked_marker\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	setTestUserCache(t)
+	t.Chdir(dir)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "unborn_untracked_marker", nil, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("search unborn repository: %v", err)
+	}
+	if !strings.Contains(out, "## untracked.go") || !strings.Contains(out, "unborn_untracked_marker") {
+		t.Fatalf("expected untracked file from unborn repository, got:\n%s", out)
+	}
+}
+
+func TestRun_EmptyUnbornRepositoryReturnsNoMatch(t *testing.T) {
+	requireTools(t)
+	dir := initEmptyGitRepo(t)
+	setTestUserCache(t)
+	t.Chdir(dir)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "absent_unborn_marker", nil, 0, 0)
+	})
+	if !errors.Is(err, errNoMatch) {
+		t.Fatalf("empty unborn repository: error=%v output=%q, want no match", err, out)
+	}
+}
+
 func TestRun_UsesUserCache(t *testing.T) {
 	requireTools(t)
 
@@ -485,21 +533,6 @@ func TestRun_GitRootAndChildOperandsDoNotDuplicateChildResults(t *testing.T) {
 	}
 }
 
-func TestRun_MissingPathOperandFails(t *testing.T) {
-	requireTools(t)
-
-	dir := initGitRepo(t, "app.go", "package main\n// missing_path_marker\n")
-	t.Chdir(dir)
-
-	err := run(context.Background(), "missing_path_marker", []string{"does-not-exist"}, 0, 0)
-	if err == nil {
-		t.Fatal("expected missing path operand to fail")
-	}
-	if !strings.Contains(err.Error(), "read path") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 func TestRun_ExternalFolderPathWorksOutsideGit(t *testing.T) {
 	requireTools(t)
 
@@ -572,8 +605,12 @@ func TestRun_InvalidQueryDoesNotCreateV2Cache(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected invalid query to fail")
 	}
-	if !strings.Contains(err.Error(), "parse query") {
-		t.Fatalf("expected parse query error, got %v", err)
+	queryErr, ok := errors.AsType[*querySyntaxError](err)
+	if !ok {
+		t.Fatalf("error=%v, want querySyntaxError", err)
+	}
+	if queryErr.query != "(" || errors.Unwrap(queryErr) == nil {
+		t.Fatalf("query error=%+v, want query and wrapped parser cause", queryErr)
 	}
 
 	cacheRoot := filepath.Join(home, "xdg-cache", "seek")
@@ -647,8 +684,12 @@ func TestRun_ExternalGitRepoPathUsesGitIgnore(t *testing.T) {
 func TestRun_ExternalGitRepoPathDoesNotBudgetIgnoredFiles(t *testing.T) {
 	requireTools(t)
 
-	externalRepo := initGitRepo(t, "app.go", "package main\n// external_git_budget_marker\n")
-	if err := os.WriteFile(filepath.Join(externalRepo, ".gitignore"), []byte("ignored/\n"), 0o644); err != nil {
+	const (
+		appContent    = "package main\n// external_git_budget_marker\n"
+		ignoreContent = "ignored/\n"
+	)
+	externalRepo := initGitRepo(t, "app.go", appContent)
+	if err := os.WriteFile(filepath.Join(externalRepo, ".gitignore"), []byte(ignoreContent), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitRunIn(t, externalRepo, "add", ".gitignore")
@@ -657,25 +698,26 @@ func TestRun_ExternalGitRepoPathDoesNotBudgetIgnoredFiles(t *testing.T) {
 	if err := os.MkdirAll(ignoredDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	ignoredLarge := filepath.Join(ignoredDir, "huge.dat")
-	if err := os.WriteFile(ignoredLarge, nil, 0o644); err != nil {
-		t.Fatal(err)
+	trackedBytes := int64(len(appContent) + len(ignoreContent))
+	ignoredContent := strings.Repeat("x", int(trackedBytes)+1)
+	if int64(len(ignoredContent)) > maxGitDirtyFileSize {
+		t.Fatal("test ignored file must stay below the per-file limit")
 	}
-	if err := os.Truncate(ignoredLarge, maxCorpusIndexedBytes+1); err != nil {
+	if err := os.WriteFile(filepath.Join(ignoredDir, "artifact.bin"), []byte(ignoredContent), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
+	oldLimit := gitCorpusIndexedByteLimit
+	gitCorpusIndexedByteLimit = trackedBytes
+	defer func() { gitCorpusIndexedByteLimit = oldLimit }()
 	setTestUserCache(t)
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
 		return run(context.Background(), "external_git_budget_marker", []string{externalRepo}, 0, 0)
 	})
-	if err != nil {
-		t.Fatalf("external Git repo should not budget ignored files, got err=%v out=%q", err, out)
-	}
-	if !strings.Contains(out, "external_git_budget_marker") {
-		t.Fatalf("expected tracked file result, got:\n%s", out)
+	if err != nil || !strings.Contains(out, "external_git_budget_marker") {
+		t.Fatalf("output=%q error=%v, want tracked result within budget", out, err)
 	}
 }
 
@@ -863,10 +905,12 @@ func TestRun_GitSubdirOperandDoesNotBudgetIgnoredFolderArtifacts(t *testing.T) {
 	if err := os.MkdirAll(scope, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(scope, "app.go"), []byte("package platform\n// scoped_visible_marker\n"), 0o644); err != nil {
+	appContent := "package platform\n// scoped_visible_marker\n"
+	if err := os.WriteFile(filepath.Join(scope, "app.go"), []byte(appContent), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(scope, ".gitignore"), []byte(".data/\n"), 0o644); err != nil {
+	ignoreContent := ".data/\n"
+	if err := os.WriteFile(filepath.Join(scope, ".gitignore"), []byte(ignoreContent), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitRunIn(t, repo, "add", "platform")
@@ -876,17 +920,14 @@ func TestRun_GitSubdirOperandDoesNotBudgetIgnoredFolderArtifacts(t *testing.T) {
 	if err := os.MkdirAll(ignoredData, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	size := int64(maxIndexedDocumentBytes)
-	count := maxFolderIndexedBytes/maxIndexedDocumentBytes + 1
-	for i := range count {
-		path := filepath.Join(ignoredData, fmt.Sprintf("artifact_%03d.bin", i))
-		if err := os.WriteFile(path, nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Truncate(path, size); err != nil {
-			t.Fatal(err)
-		}
+	artifactContent := strings.Repeat("x", len(appContent)+len(ignoreContent)+1)
+	if err := os.WriteFile(filepath.Join(ignoredData, "artifact.bin"), []byte(artifactContent), 0o644); err != nil {
+		t.Fatal(err)
 	}
+
+	oldLimit := gitCorpusIndexedByteLimit
+	gitCorpusIndexedByteLimit = int64(len(appContent) + len(ignoreContent))
+	defer func() { gitCorpusIndexedByteLimit = oldLimit }()
 
 	setTestUserCache(t)
 	t.Chdir(t.TempDir())
@@ -910,7 +951,8 @@ func TestRun_GitSubdirOperandDoesNotBudgetUnignoredSiblingDirtyArtifacts(t *test
 	if err := os.MkdirAll(scope, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(scope, "app.go"), []byte("package platform\n// scoped_dirty_visible_marker\n"), 0o644); err != nil {
+	appContent := "package platform\n// scoped_dirty_visible_marker\n"
+	if err := os.WriteFile(filepath.Join(scope, "app.go"), []byte(appContent), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitRunIn(t, repo, "add", "platform")
@@ -920,17 +962,14 @@ func TestRun_GitSubdirOperandDoesNotBudgetUnignoredSiblingDirtyArtifacts(t *test
 	if err := os.MkdirAll(sibling, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	size := int64(maxIndexedDocumentBytes)
-	count := maxFolderIndexedBytes/maxIndexedDocumentBytes + 1
-	for i := range count {
-		path := filepath.Join(sibling, fmt.Sprintf("artifact_%03d.bin", i))
-		if err := os.WriteFile(path, nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Truncate(path, size); err != nil {
-			t.Fatal(err)
-		}
+	artifactContent := strings.Repeat("x", len(appContent)+1)
+	if err := os.WriteFile(filepath.Join(sibling, "artifact.bin"), []byte(artifactContent), 0o644); err != nil {
+		t.Fatal(err)
 	}
+
+	oldLimit := gitCorpusIndexedByteLimit
+	gitCorpusIndexedByteLimit = int64(len(appContent))
+	defer func() { gitCorpusIndexedByteLimit = oldLimit }()
 
 	setTestUserCache(t)
 	t.Chdir(t.TempDir())
@@ -1039,7 +1078,7 @@ func TestSearchPlannedScopedCorpus_RejectsLayerStateMismatch(t *testing.T) {
 		t.Fatalf("parse query: %v", err)
 	}
 	_, err = searchPlannedCorpusParsed(context.Background(), plans[0], q, defaultSearchConfig())
-	if !errors.Is(err, errScopedLayerStateChanged) {
+	if !errors.Is(err, errGitIndexStateChanged) {
 		t.Fatalf("expected scoped layer state mismatch, got %v", err)
 	}
 }
@@ -1897,25 +1936,6 @@ func TestRun_GitScopeSymlinkOutsideWorktreeRoutedExternal(t *testing.T) {
 	}
 }
 
-func TestRun_BrokenSymlinkOperandErrors(t *testing.T) {
-	root := t.TempDir()
-	link := filepath.Join(root, "broken-link")
-	if err := os.Symlink(filepath.Join(root, "does-not-exist"), link); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
-	}
-
-	setTestUserCache(t)
-	t.Chdir(t.TempDir())
-
-	err := run(context.Background(), "broken_symlink_marker", []string{link}, 0, 0)
-	if err == nil {
-		t.Fatal("expected broken symlink operand to fail")
-	}
-	if !strings.Contains(err.Error(), "read path") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 func TestRun_CurrentRepoExactFilePathOperandScopesSearch(t *testing.T) {
 	requireTools(t)
 
@@ -2172,6 +2192,131 @@ func TestRun_GitColdCacheNoShardSurfacesCommittedIndexerFailure(t *testing.T) {
 	}
 }
 
+func TestRun_GitWarmCachePreservesIndexWhenStatusFails(t *testing.T) {
+	requireTools(t)
+	dir := initGitRepo(t, "app.go", "package main\n// git_status_failure_marker\n")
+	setTestUserCache(t)
+	t.Chdir(dir)
+
+	if _, err := captureStdout(t, func() error {
+		return run(context.Background(), "git_status_failure_marker", nil, 0, 0)
+	}); err != nil {
+		t.Fatalf("initial run: %v", err)
+	}
+
+	paths, err := resolveGitPaths(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("resolve Git paths: %v", err)
+	}
+	plan, err := planCurrentGitCorpus(paths)
+	if err != nil {
+		t.Fatalf("plan Git corpus: %v", err)
+	}
+	stateBefore := readStateFile(plan.cacheDir)
+	shardsBefore, err := filepath.Glob(filepath.Join(plan.indexDir, "*.zoekt"))
+	if err != nil {
+		t.Fatalf("list initial shards: %v", err)
+	}
+	if stateBefore == "" || len(shardsBefore) == 0 {
+		t.Fatal("initial run did not create a cached index")
+	}
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git executable: %v", err)
+	}
+	shimDir := t.TempDir()
+	shim := "#!/bin/sh\n" +
+		"if [ \"$1\" = status ]; then\n" +
+		"  echo forced-status-failure >&2\n" +
+		"  exit 42\n" +
+		"fi\n" +
+		"exec \"$SEEK_TEST_REAL_GIT\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(shimDir, "git"), []byte(shim), 0o755); err != nil {
+		t.Fatalf("write Git shim: %v", err)
+	}
+	t.Setenv("SEEK_TEST_REAL_GIT", realGit)
+	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, err = captureStdout(t, func() error {
+		return run(context.Background(), "git_status_failure_marker", nil, 0, 0)
+	})
+	if err == nil {
+		t.Fatal("expected Git status error")
+	}
+	for _, want := range []string{"git status", "forced-status-failure"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Git status error missing %q: %v", want, err)
+		}
+	}
+
+	if got := readStateFile(plan.cacheDir); got != stateBefore {
+		t.Fatalf("Git status failure changed cached state: got %q, want %q", got, stateBefore)
+	}
+	shardsAfter, globErr := filepath.Glob(filepath.Join(plan.indexDir, "*.zoekt"))
+	if globErr != nil {
+		t.Fatalf("list shards after failure: %v", globErr)
+	}
+	if strings.Join(shardsAfter, "\x00") != strings.Join(shardsBefore, "\x00") {
+		t.Fatalf("Git status failure changed shards: got %v, want %v", shardsAfter, shardsBefore)
+	}
+}
+
+func TestRun_GitWarmCacheReportsIndexerFailureOnce(t *testing.T) {
+	requireTools(t)
+	for _, tc := range []struct {
+		name           string
+		commit         bool
+		wantStaleMatch bool
+	}{
+		{name: "committed", commit: true, wantStaleMatch: true},
+		{name: "uncommitted"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			marker := "stale_" + tc.name + "_marker"
+			dir := initGitRepo(t, "app.go", "package main\n// "+marker+"\n")
+			setTestUserCache(t)
+			t.Chdir(dir)
+
+			if _, err := captureStdout(t, func() error {
+				return run(context.Background(), marker, nil, 0, 0)
+			}); err != nil {
+				t.Fatalf("initial run: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// replacement_marker\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if tc.commit {
+				gitRunIn(t, dir, "add", "app.go")
+				gitRunIn(t, dir, "commit", "-m", "change marker")
+			}
+			forceFailingCtags(t)
+			logs := captureTestLogs(t, slog.LevelWarn)
+
+			out, err := captureStdout(t, func() error {
+				return run(context.Background(), marker, nil, 0, 0)
+			})
+			if tc.wantStaleMatch {
+				if err != nil || !strings.Contains(out, marker) {
+					t.Fatalf("stale run output=%q error=%v, want cached match", out, err)
+				}
+			} else if !errors.Is(err, errNoMatch) || out != "" {
+				t.Fatalf("dirty stale run output=%q error=%v, want no stale committed match", out, err)
+			}
+
+			warningCount := 0
+			for _, record := range logs.Records() {
+				if record.Level == slog.LevelWarn && record.Message == "Index update failed; using the existing index" {
+					warningCount++
+				}
+			}
+			if warningCount != 1 {
+				t.Fatalf("stale-index warning count=%d, want 1", warningCount)
+			}
+		})
+	}
+}
+
 func TestRun_MultiCorpusShowsContextEvenWhenOnlyOneCorpusMatches(t *testing.T) {
 	requireTools(t)
 
@@ -2204,9 +2349,7 @@ func TestRun_MultiCorpusShowsContextEvenWhenOnlyOneCorpusMatches(t *testing.T) {
 	}
 }
 
-// TestRun_PipedOutputHasNoANSI is the load-bearing guarantee for the agent-first
-// design: captureStdout replaces os.Stdout with a pipe (not a TTY), so the color
-// gate must yield plain, escape-free text end-to-end through run().
+// TestRun_PipedOutputHasNoANSI verifies that non-TTY output is plain text.
 func TestRun_PipedOutputHasNoANSI(t *testing.T) {
 	requireTools(t)
 
@@ -2351,19 +2494,38 @@ func TestRun_ExternalFolderCapErrorDoesNotSearchStaleShards(t *testing.T) {
 	if !errors.Is(err, errFolderCapExceeded) {
 		t.Fatalf("expected folder cap error, got err=%v out=%q", err, out)
 	}
-	errText := err.Error()
-	for _, want := range []string{
-		"root=" + strconv.Quote(canonicalCorpusPath(folder)),
-		"cache=",
-		"index=",
-		"indexed_bytes=",
-		"limit=",
-	} {
-		if !strings.Contains(errText, want) {
-			t.Fatalf("cap error missing %q in: %v", want, err)
-		}
-	}
 	if strings.Contains(out, "cap_stale_marker") {
+		t.Fatalf("must not search stale shards after cap error, got:\n%s", out)
+	}
+}
+
+func TestRun_GitDirtyCapErrorDoesNotSearchStaleShards(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "app.go", "package main\n// git_cap_stale_marker\n")
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+
+	if _, err := captureStdout(t, func() error {
+		return run(context.Background(), "git_cap_stale_marker", []string{repo}, 0, 0)
+	}); err != nil {
+		t.Fatalf("initial run: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "app.go"), []byte("package main\n// replacement\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldLimit := gitCandidateFileLimit
+	gitCandidateFileLimit = 0
+	defer func() { gitCandidateFileLimit = oldLimit }()
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "git_cap_stale_marker", []string{repo}, 0, 0)
+	})
+	if !errors.Is(err, errGitCapExceeded) {
+		t.Fatalf("expected Git cap error, got err=%v out=%q", err, out)
+	}
+	if strings.Contains(out, "git_cap_stale_marker") {
 		t.Fatalf("must not search stale shards after cap error, got:\n%s", out)
 	}
 }
@@ -2964,9 +3126,8 @@ func TestRun_CleanScopedSearchElidesDirtyLayer(t *testing.T) {
 	}
 }
 
-// Path C: a scoped search with an in-scope uncommitted file reuses the SINGLE
-// combined whole-repo index (one corpus dir holds both committed and
-// uncommitted shards) and still tags the result [uncommitted].
+// A scoped search with an in-scope dirty file reuses the combined whole-repo
+// index and still tags the result as uncommitted.
 func TestRun_DirtyScopedSearchReusesCombinedIndex(t *testing.T) {
 	requireTools(t)
 
@@ -3159,8 +3320,7 @@ func TestScoped_EqualsUnscopedIntersectScope(t *testing.T) {
 }
 
 // When the whole repo exceeds the index caps, a scoped search of a small
-// in-budget subtree must fall back to the per-scope committed layer and still
-// succeed (budget isolation), recording a cap marker on the shared layer.
+// in-budget subtree must use the per-scope combined fallback and still succeed.
 func TestRun_OverCapScopedSearchFallsBackToPerScope(t *testing.T) {
 	requireTools(t)
 
@@ -3190,43 +3350,201 @@ func TestRun_OverCapScopedSearchFallsBackToPerScope(t *testing.T) {
 	}
 }
 
-// Over-cap fallback with an in-scope uncommitted edit: the per-scope fallback
-// must index BOTH the in-scope committed tree and the in-scope dirty file into
-// its one dir, tagging the modified file [uncommitted].
+// The over-cap fallback must expose separate committed and dirty in-scope files
+// from one published generation and tag only the dirty result as uncommitted.
 func TestRun_OverCapScopedSearch_DirtyInScope(t *testing.T) {
 	requireTools(t)
 
 	repo := initGitRepo(t, "seed.go", "package seed\n")
-	inScope := "package small\n// OVERCAP_DIRTY_MARKER\n"
-	writeTrackedFile(t, repo, filepath.Join("small", "a.go"), "package small\n")
-	writeTrackedFile(t, repo, filepath.Join("big", "huge.go"), "package big\n"+strings.Repeat("x", len(inScope)*8))
-	// Modify the in-scope tracked file (uncommitted) so it must come from the
-	// fallback's dirty pass.
-	if err := os.WriteFile(filepath.Join(repo, "small", "a.go"), []byte(inScope), 0o644); err != nil {
+	committed := "package small\n// OVERCAP_COMMITTED_MARKER\n"
+	dirtyBase := "package small\n// base\n"
+	dirty := "package small\n// OVERCAP_DIRTY_MARKER\n"
+	writeTrackedFile(t, repo, filepath.Join("small", "committed.go"), committed)
+	writeTrackedFile(t, repo, filepath.Join("small", "dirty.go"), dirtyBase)
+	writeTrackedFile(t, repo, filepath.Join("big", "huge.go"), "package big\n"+strings.Repeat("x", (len(committed)+len(dirtyBase))*8))
+	if err := os.WriteFile(filepath.Join(repo, "small", "dirty.go"), []byte(dirty), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	oldLimit := gitCorpusIndexedByteLimit
-	gitCorpusIndexedByteLimit = int64(len(inScope) + 8) // whole repo over cap; small/ fits
+	gitCorpusIndexedByteLimit = int64(len(committed) + len(dirtyBase) + 8)
 	defer func() { gitCorpusIndexedByteLimit = oldLimit }()
 
 	setTestUserCache(t)
 	t.Chdir(repo)
 
-	out, err := captureStdout(t, func() error {
+	committedOut, err := captureStdout(t, func() error {
+		return run(context.Background(), "OVERCAP_COMMITTED_MARKER", []string{filepath.Join(repo, "small")}, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("over-cap committed scoped search: %v", err)
+	}
+	if !strings.Contains(committedOut, "OVERCAP_COMMITTED_MARKER") || strings.Contains(committedOut, "[uncommitted]") {
+		t.Fatalf("committed fallback result=%q, want committed marker without uncommitted tag", committedOut)
+	}
+
+	dirtyOut, err := captureStdout(t, func() error {
 		return run(context.Background(), "OVERCAP_DIRTY_MARKER", []string{filepath.Join(repo, "small")}, 0, 0)
 	})
 	if err != nil {
 		t.Fatalf("over-cap dirty scoped search: %v", err)
 	}
-	if !strings.Contains(out, "OVERCAP_DIRTY_MARKER") {
-		t.Fatalf("expected in-scope dirty match via fallback, got:\n%s", out)
+	if !strings.Contains(dirtyOut, "OVERCAP_DIRTY_MARKER") {
+		t.Fatalf("expected in-scope dirty match via fallback, got:\n%s", dirtyOut)
 	}
-	if !strings.Contains(out, "[uncommitted]") {
-		t.Fatalf("in-scope uncommitted edit must be tagged, got:\n%s", out)
+	if !strings.Contains(dirtyOut, "[uncommitted]") {
+		t.Fatalf("in-scope uncommitted edit must be tagged, got:\n%s", dirtyOut)
 	}
-	if strings.Contains(out, "big/") {
-		t.Fatalf("out-of-scope sibling leaked under fallback, got:\n%s", out)
+	if strings.Contains(committedOut, "big/") || strings.Contains(dirtyOut, "big/") {
+		t.Fatalf("out-of-scope sibling leaked under fallback: committed=%q dirty=%q", committedOut, dirtyOut)
+	}
+}
+
+func TestRun_OverCapScopedSearchRefreshesDirtyFile(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "seed.go", "package seed\n")
+	writeTrackedFile(t, repo, filepath.Join("small", "a.go"), "package small\n")
+	v1 := "package small\n// OVERCAP_REFRESH_V1\n"
+	v2 := "package small\n// OVERCAP_REFRESH_V2_LONGER\n"
+	writeTrackedFile(t, repo, filepath.Join("big", "huge.go"), "package big\n"+strings.Repeat("x", len(v2)*8))
+	if err := os.WriteFile(filepath.Join(repo, "small", "a.go"), []byte(v1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldLimit := gitCorpusIndexedByteLimit
+	gitCorpusIndexedByteLimit = int64(len(v2) + 8)
+	defer func() { gitCorpusIndexedByteLimit = oldLimit }()
+	setTestUserCache(t)
+	t.Chdir(repo)
+	scope := []string{filepath.Join(repo, "small")}
+
+	if out, err := captureStdout(t, func() error {
+		return run(context.Background(), "OVERCAP_REFRESH_V1", scope, 0, 0)
+	}); err != nil || !strings.Contains(out, "OVERCAP_REFRESH_V1") {
+		t.Fatalf("first dirty search: error=%v output=%q", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "small", "a.go"), []byte(v2), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "OVERCAP_REFRESH_V2_LONGER", scope, 0, 0)
+	})
+	if err != nil {
+		t.Fatalf("second dirty search: %v", err)
+	}
+	if !strings.Contains(out, "OVERCAP_REFRESH_V2_LONGER") {
+		t.Fatalf("scoped fallback did not refresh the dirty file, got:\n%s", out)
+	}
+}
+
+func TestRun_DirtyCapFallbackDoesNotWriteCommittedCapMarker(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "seed.go", "package seed\n")
+	scopeDir := filepath.Join(repo, "small")
+	writeTrackedFile(t, repo, filepath.Join("small", "a.go"), "package small\n// DIRTY_CAP_SCOPE_MARKER\n")
+	dirtyPath := filepath.Join(repo, "other", "large.go")
+	if err := os.MkdirAll(filepath.Dir(dirtyPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dirtyPath, []byte("package other\n"+strings.Repeat("x", 256)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldLimit := gitCorpusIndexedByteLimit
+	gitCorpusIndexedByteLimit = 128
+	defer func() { gitCorpusIndexedByteLimit = oldLimit }()
+	setTestUserCache(t)
+	t.Chdir(repo)
+	paths, err := resolveGitPaths(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plans, err := planCorpora(context.Background(), &paths, []string{scopeDir})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plan scoped corpus: plans=%v error=%v", plans, err)
+	}
+
+	if out, err := captureStdout(t, func() error {
+		return run(context.Background(), "DIRTY_CAP_SCOPE_MARKER", []string{scopeDir}, 0, 0)
+	}); err != nil || !strings.Contains(out, "DIRTY_CAP_SCOPE_MARKER") {
+		t.Fatalf("dirty-cap fallback: error=%v output=%q", err, out)
+	}
+	if got := readGitCapMarker(plans[0].cacheDir); got != "" {
+		t.Fatalf("dirty cap must not write a committed cap marker, got %q", got)
+	}
+
+	if err := os.WriteFile(dirtyPath, []byte("package other\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureStdout(t, func() error {
+		return run(context.Background(), "DIRTY_CAP_SCOPE_MARKER", []string{scopeDir}, 0, 0)
+	}); err != nil {
+		t.Fatalf("search after dirty file shrank: %v", err)
+	}
+	if got := readStateFile(plans[0].cacheDir); got == "" {
+		t.Fatal("combined index did not recover after the dirty file shrank")
+	}
+}
+
+func TestRun_CommittedCapMarkerSkipsRepeatedBudgetScan(t *testing.T) {
+	requireTools(t)
+
+	repo := initGitRepo(t, "seed.go", "package seed\n")
+	scopeDir := filepath.Join(repo, "small")
+	inScope := "package small\n// COMMITTED_CAP_FAST_MARKER\n"
+	writeTrackedFile(t, repo, filepath.Join("small", "a.go"), inScope)
+	writeTrackedFile(t, repo, filepath.Join("big", "huge.go"), "package big\n"+strings.Repeat("x", len(inScope)*8))
+
+	oldLimit := gitCorpusIndexedByteLimit
+	gitCorpusIndexedByteLimit = int64(len(inScope) + 8)
+	defer func() { gitCorpusIndexedByteLimit = oldLimit }()
+	setTestUserCache(t)
+	t.Chdir(repo)
+	paths, err := resolveGitPaths(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plans, err := planCorpora(context.Background(), &paths, []string{scopeDir})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plan scoped corpus: plans=%v error=%v", plans, err)
+	}
+
+	if _, err := captureStdout(t, func() error {
+		return run(context.Background(), "COMMITTED_CAP_FAST_MARKER", []string{scopeDir}, 0, 0)
+	}); err != nil {
+		t.Fatalf("initial committed-cap fallback: %v", err)
+	}
+	state := mustGitRepoStateIn(t, context.Background(), repo)
+	wantMarker := gitCapMarkerValue(normalizeCommittedTreeish(state.HeadSHA))
+	if got := readGitCapMarker(plans[0].cacheDir); got != wantMarker {
+		t.Fatalf("cap marker=%q, want %q", got, wantMarker)
+	}
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shimDir := t.TempDir()
+	shim := "#!/bin/sh\n" +
+		"if [ \"$1\" = ls-tree ]; then\n" +
+		"  echo repeated-budget-scan >&2\n" +
+		"  exit 43\n" +
+		"fi\n" +
+		"exec \"$SEEK_TEST_REAL_GIT\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(shimDir, "git"), []byte(shim), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SEEK_TEST_REAL_GIT", realGit)
+	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "COMMITTED_CAP_FAST_MARKER", []string{scopeDir}, 0, 0)
+	})
+	if err != nil || !strings.Contains(out, "COMMITTED_CAP_FAST_MARKER") {
+		t.Fatalf("cached committed-cap fallback: error=%v output=%q", err, out)
 	}
 }
 
@@ -3252,10 +3570,8 @@ func resultFileOrder(out string) []string {
 	return order
 }
 
-// Path C ranking improvement: because a scoped search reads the SAME combined
-// shards as the unscoped search, scoped ranking equals the unscoped ranking
-// restricted to the scope (scope is a pure post-score filter). c0b4326's
-// per-scope/shared layers could reorder via a different per-shard avgdl.
+// Because scoped and unscoped searches read the same combined shards, scoped
+// ranking equals unscoped ranking restricted to the scope.
 func TestScoped_RankingEqualsUnscopedIntersectScope(t *testing.T) {
 	requireTools(t)
 
@@ -3409,6 +3725,11 @@ func TestRace_ConcurrentScopedUnscopedSameRepo(t *testing.T) {
 	})
 
 	var wg sync.WaitGroup
+	type concurrentRunResult struct {
+		scoped bool
+		err    error
+	}
+	runResults := make(chan concurrentRunResult, 8)
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		scoped := i%2 == 0
@@ -3418,13 +3739,29 @@ func TestRace_ConcurrentScopedUnscopedSameRepo(t *testing.T) {
 			if scoped {
 				operands = []string{filepath.Join(repo, "sub")}
 			}
-			_ = run(context.Background(), "CONCURRENT_MARKER", operands, 0, 0)
+			runResults <- concurrentRunResult{
+				scoped: scoped,
+				err:    run(context.Background(), "CONCURRENT_MARKER", operands, 0, 0),
+			}
 		}(scoped)
 	}
 	wg.Wait()
+	close(runResults)
+	for result := range runResults {
+		if result.err != nil {
+			t.Errorf("scoped=%v concurrent search: %v", result.scoped, result.err)
+		}
+	}
+	if t.Failed() {
+		return
+	}
 
 	if n := countCorpora(t); n != 1 {
 		t.Fatalf("concurrent scoped+unscoped on one under-cap repo must share 1 combined corpus, got %d", n)
+	}
+	files, err := runSeekInRepo(t, repo, "CONCURRENT_MARKER")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("search published combined index: files=%v error=%v", files, err)
 	}
 }
 

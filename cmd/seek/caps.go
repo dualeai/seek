@@ -15,19 +15,10 @@ const (
 	// Files above this cap are skipped at read time with a slog.Warn.
 	maxIndexedDocumentBytes = 100 * 1024 * 1024 // 100 MiB
 
-	// maxCorpusIndexedBytes is the shared selected-content budget per
-	// planned corpus index. Bounds foreground indexing work for both Git
-	// and standard folder corpora.
-	//
-	// Bumped from 5 GiB to 10 GiB to give dev-parent folder corpora more
-	// headroom after nested-git discovery carves out per-repo subtrees.
-	// Discovery is the primary fix for the cap-exhausted UX; the 10 GiB
-	// ceiling is a belt-and-suspenders cushion for pathological folders
-	// whose remaining non-git content still exceeds 5 GiB.
-	//
-	// Peak RSS during indexing is independently bounded by
-	// maxInFlightBytes (600 MiB × corpusWorkerCap) — raising this cap
-	// does NOT change peak memory, only total content admitted.
+	// maxCorpusIndexedBytes limits selected content admitted to one folder
+	// corpus or one Git index family. Git applies the limit separately to its
+	// committed and working-tree families. This is a work limit, not a bound
+	// on process memory.
 	maxCorpusIndexedBytes = 10 * 1024 * 1024 * 1024 // 10 GiB
 
 	// Git has a higher file-count budget than raw folders because Git
@@ -42,22 +33,16 @@ const (
 	maxGitDirtyFileSize   = maxIndexedDocumentBytes
 	maxFolderIndexedBytes = maxCorpusIndexedBytes
 
-	// corpusWorkerCap bounds the number of corpus indexers that may run
-	// concurrently. 4 balances wall-clock vs peak memory: empirical
-	// benchmarks showed ~50% reduction on multi-corpus workloads while
-	// keeping the peak in-flight budget at 2.4 GiB (4 × 6 × 100 MiB).
-	// Increasing further yields diminishing returns because per-corpus
-	// indexing already saturates min(NumCPU, 16) builders internally
-	// (indexer.go:indexParallelism).
+	// corpusWorkerCap limits active corpus indexers. Each corpus indexer can
+	// also use the internal parallelism returned by indexParallelism.
 	corpusWorkerCap = 4
 
-	// maxInFlightBytes bounds total bytes resident in reader buffers
-	// across all reader workers. Per-worker budget is 600 MiB (six
-	// max-sized 100 MiB files) — empirical headroom that keeps the
-	// windowed-fit invariant satisfied at any corpusWorkerCap ≥ 1.
-	// Acquired in readers, Released by the consumer after the
-	// Builder.Finish() that buffered the doc — see fileContent for the
-	// per-doc Release contract.
+	// maxInFlightBytes is the global semaphore capacity for accounted document
+	// content across all corpus readers and builders. Capacity grows by six
+	// maximum-sized documents per corpus slot; workers do not own separate
+	// quotas. Readers acquire weight, and consumers release it after the
+	// Builder.Finish that stops retaining the document. Other allocations are
+	// not covered, so this value does not bound process RSS.
 	maxInFlightBytes = 6 * maxIndexedDocumentBytes * corpusWorkerCap
 
 	// defaultIndexWindowBytes caps doc weight per windowed rotation in
@@ -65,9 +50,8 @@ const (
 	// accumulate up to this much pending weight before rotating; the
 	// global semaphore must accommodate every consumer's window plus
 	// one in-rotation max-sized reader Acquire concurrently. The
-	// formula keeps N*window + 2*doc ≤ budget for any N ≥ 1; the
-	// compile-time guard below pins this invariant and
-	// caps_invariant_test.go asserts it at runtime.
+	// formula keeps N*window + 2*doc ≤ budget; the compile-time guard below
+	// pins this invariant and caps_invariant_test.go reports readable failures.
 	defaultIndexWindowBytes = (maxInFlightBytes - 2*maxIndexedDocumentBytes) / (2 * corpusWorkerCap)
 )
 
@@ -92,13 +76,17 @@ const _ = uint(maxInFlightBytes - maxIndexedDocumentBytes)
 // accumulating up to defaultIndexWindowBytes plus one in-rotation
 // max-sized reader Acquire (= 2 × maxIndexedDocumentBytes for the
 // in-flight tip + the new reader) must fit within maxInFlightBytes.
-// Otherwise readers wedge while consumers are in Finish — the original
-// 3-way deadlock at N=1 scales to an N+1-way deadlock at N>1.
+// Otherwise readers can wait while every consumer is inside Finish.
 const _ = uint(maxInFlightBytes - (corpusWorkerCap*defaultIndexWindowBytes + 2*maxIndexedDocumentBytes))
 
 var (
-	errGitCapExceeded    = errors.New("git cap exceeded")
-	errFolderCapExceeded = errors.New("folder cap exceeded")
+	errGitCapExceeded = errors.New("git cap exceeded")
+
+	// errGitCommittedCapExceeded marks a stable cap result from the immutable
+	// committed-tree scan. Only this subtype can be cached by committed HEAD.
+	// Working-tree checks return the broader errGitCapExceeded sentinel.
+	errGitCommittedCapExceeded = fmt.Errorf("git committed cap exceeded: %w", errGitCapExceeded)
+	errFolderCapExceeded       = errors.New("folder cap exceeded")
 
 	// errDeltaPayloadExceedsWindow fires when a delta (working-tree
 	// dirty set OR folder-manifest changed set) would exceed
@@ -111,10 +99,17 @@ var (
 type indexCapExceededError struct {
 	cause   error
 	message string
-	metric  string
+	metric  indexCapMetric
 	current int64
 	limit   int64
 }
+
+type indexCapMetric string
+
+const (
+	indexCapCandidateFiles indexCapMetric = "candidate_files"
+	indexCapIndexedBytes   indexCapMetric = "indexed_bytes"
+)
 
 func (e indexCapExceededError) Error() string {
 	return fmt.Sprintf("%s: %s=%d limit=%d", e.message, e.metric, e.current, e.limit)
@@ -124,7 +119,7 @@ func (e indexCapExceededError) Unwrap() error {
 	return e.cause
 }
 
-func indexCapError(cause error, message, metric string, current, limit int64) error {
+func indexCapError(cause error, message string, metric indexCapMetric, current, limit int64) error {
 	return indexCapExceededError{
 		cause:   cause,
 		message: message,
@@ -134,10 +129,14 @@ func indexCapError(cause error, message, metric string, current, limit int64) er
 	}
 }
 
-func gitCapError(message, metric string, current, limit int64) error {
+func gitCapError(message string, metric indexCapMetric, current, limit int64) error {
 	return indexCapError(errGitCapExceeded, message, metric, current, limit)
 }
 
-func folderCapError(message, metric string, current, limit int64) error {
+func gitCommittedCapError(message string, metric indexCapMetric, current, limit int64) error {
+	return indexCapError(errGitCommittedCapExceeded, message, metric, current, limit)
+}
+
+func folderCapError(message string, metric indexCapMetric, current, limit int64) error {
 	return indexCapError(errFolderCapExceeded, message, metric, current, limit)
 }

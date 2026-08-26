@@ -5,12 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -109,8 +110,8 @@ func TestParseGitStatusV2_BranchOid(t *testing.T) {
 func TestParseGitStatusV2_NoHead(t *testing.T) {
 	raw := "# branch.oid (initial)\x00# branch.head main\x00"
 	state := parseGitStatusV2(raw)
-	if state.HeadSHA != "(initial)" {
-		t.Errorf("expected HeadSHA %q, got %q", "(initial)", state.HeadSHA)
+	if state.HeadSHA != "no-head" {
+		t.Errorf("expected HeadSHA %q, got %q", "no-head", state.HeadSHA)
 	}
 }
 
@@ -535,44 +536,215 @@ func TestShardsExist_NonexistentDir(t *testing.T) {
 
 // --- checkCtags detection tests ---
 
-func TestCheckCtags_CTAGS_COMMAND_Valid(t *testing.T) {
-	// Point CTAGS_COMMAND to a known-good binary (the real ctags).
-	requireTools(t)
-	ctags, err := exec.LookPath("ctags")
-	if err != nil {
-		ctags, err = exec.LookPath("universal-ctags")
-		if err != nil {
-			t.Fatal("neither ctags nor universal-ctags on PATH")
-		}
+func TestCheckCtags_CTAGS_COMMAND_Executable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("temporary executable fixture requires a Unix executable file")
 	}
+	ctags := writeCtagsTestExecutable(t, t.TempDir(), "configured-ctags", "#!/bin/sh\nexit 0\n")
 	t.Setenv("CTAGS_COMMAND", ctags)
+	t.Setenv("PATH", t.TempDir())
 	if err := checkCtags(); err != nil {
-		t.Fatalf("checkCtags failed with valid CTAGS_COMMAND=%q: %v", ctags, err)
-	}
-}
-
-func TestCheckCtags_CTAGS_COMMAND_Invalid(t *testing.T) {
-	t.Setenv("CTAGS_COMMAND", "/nonexistent/binary")
-	if err := checkCtags(); err == nil {
-		t.Fatal("expected error for nonexistent CTAGS_COMMAND")
+		t.Fatalf("checkCtags failed with executable CTAGS_COMMAND=%q: %v", ctags, err)
 	}
 }
 
 func TestCheckCtags_CTAGS_COMMAND_TakesPrecedence(t *testing.T) {
-	// Even when universal-ctags is on PATH, CTAGS_COMMAND should be checked first.
-	// Pointing to a bad path should fail, proving we don't fall through.
-	t.Setenv("CTAGS_COMMAND", "/nonexistent/ctags")
-	if err := checkCtags(); err == nil {
-		t.Fatal("expected error: CTAGS_COMMAND should take precedence over PATH lookup")
+	if runtime.GOOS == "windows" {
+		t.Skip("temporary executable fixture requires a Unix executable file")
+	}
+	binDir := t.TempDir()
+	fallback := filepath.Join(binDir, "universal-ctags")
+	if err := os.WriteFile(fallback, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(t.TempDir(), "configured-missing-ctags")
+	t.Setenv("PATH", binDir)
+	t.Setenv("CTAGS_COMMAND", missing)
+	err := checkCtags()
+	ctagsErr, ok := errors.AsType[*ctagsUnavailableError](err)
+	if !ok || ctagsErr.command != missing || !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("error=%v, want explicit missing command despite usable PATH fallback", err)
 	}
 }
 
-func TestCheckCtags_DetectsFromPATH(t *testing.T) {
-	requireTools(t)
-	// Unset CTAGS_COMMAND so detection relies on PATH.
+func TestCheckCtags_CTAGS_COMMAND_NonExecutable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix executable permissions are not available")
+	}
+	command := filepath.Join(t.TempDir(), "ctags")
+	if err := os.WriteFile(command, []byte("not executable\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CTAGS_COMMAND", command)
+	err := checkCtags()
+	ctagsErr, ok := errors.AsType[*ctagsUnavailableError](err)
+	if !ok || ctagsErr.command != command || !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("error=%v, want configured permission failure", err)
+	}
+}
+
+func TestCheckCtags_MissingReturnsTypedError(t *testing.T) {
 	t.Setenv("CTAGS_COMMAND", "")
+	t.Setenv("PATH", t.TempDir())
+	err := checkCtags()
+	ctagsErr, ok := errors.AsType[*ctagsUnavailableError](err)
+	if !ok || ctagsErr.command != "" || !errors.Is(err, exec.ErrNotFound) {
+		t.Fatalf("error=%v, want unconfigured ctagsUnavailableError", err)
+	}
+}
+
+func TestCheckCtags_FindsUniversalCtagsNameOnPATH(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("temporary executable fixture requires a Unix executable file")
+	}
+	binDir := t.TempDir()
+	writeCtagsTestExecutable(t, binDir, "universal-ctags", "#!/bin/sh\nexit 0\n")
+	t.Setenv("CTAGS_COMMAND", "")
+	t.Setenv("PATH", binDir)
 	if err := checkCtags(); err != nil {
-		t.Fatalf("checkCtags should detect ctags from PATH: %v", err)
+		t.Fatalf("checkCtags should find universal-ctags on PATH: %v", err)
+	}
+	if got := os.Getenv("CTAGS_COMMAND"); got != "" {
+		t.Fatalf("CTAGS_COMMAND=%q, want unchanged for default executable", got)
+	}
+}
+
+func TestCheckCtags_AcceptsVerifiedCtagsFallbackFromPATH(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("temporary executable fixture requires a Unix executable file")
+	}
+	binDir := t.TempDir()
+	ctags := writeCtagsTestExecutable(t, binDir, "ctags", "#!/bin/sh\nprintf '%s\\n' 'Universal Ctags 6.0'\n")
+	t.Setenv("CTAGS_COMMAND", "")
+	t.Setenv("PATH", binDir)
+
+	if err := checkCtags(); err != nil {
+		t.Fatalf("checkCtags should accept Universal Ctags fallback: %v", err)
+	}
+	if got := os.Getenv("CTAGS_COMMAND"); got != ctags {
+		t.Fatalf("CTAGS_COMMAND=%q, want %q", got, ctags)
+	}
+}
+
+func TestCheckCtags_FallbackVersionFailureReturnsTypedError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("temporary executable fixture requires a Unix executable file")
+	}
+	binDir := t.TempDir()
+	writeCtagsTestExecutable(t, binDir, "ctags", "#!/bin/sh\nexit 7\n")
+	t.Setenv("CTAGS_COMMAND", "")
+	t.Setenv("PATH", binDir)
+
+	err := checkCtags()
+	ctagsErr, ok := errors.AsType[*ctagsUnavailableError](err)
+	if !ok || ctagsErr.command != "" {
+		t.Fatalf("error=%v, want auto-detected ctagsUnavailableError", err)
+	}
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	if !ok || exitErr.ExitCode() != 7 {
+		t.Fatalf("error=%v, want wrapped exit status 7", err)
+	}
+}
+
+func writeCtagsTestExecutable(t *testing.T, dir, name, script string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestGitHeadTreeish_UnbornRepository(t *testing.T) {
+	requireGit(t)
+	repo := initEmptyGitRepo(t)
+
+	treeish, err := gitHeadTreeish(t.Context(), repo)
+	if err != nil || treeish != "no-head" {
+		t.Fatalf("treeish=%q error=%v, want no-head", treeish, err)
+	}
+}
+
+func TestValidateCommittedBuildHead_CancellationDoesNotWarnThatHeadMoved(t *testing.T) {
+	requireGit(t)
+	repo := initGitRepo(t, "app.go", "package main\n")
+	paths, err := resolveGitPaths(t.Context(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedHead, err := gitHeadTreeish(t.Context(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	logs := captureTestLogs(t, slog.LevelWarn)
+
+	publish, err := validateCommittedBuildHead(ctx, paths, expectedHead)
+	if publish || !errors.Is(err, context.Canceled) {
+		t.Fatalf("publish=%v error=%v, want canceled validation", publish, err)
+	}
+	if records := logs.Records(); len(records) != 0 {
+		t.Fatalf("cancellation records=%+v, want no HEAD warning", records)
+	}
+}
+
+func TestValidateCommittedBuildHead_ConfirmedChangeWarnsAndDiscards(t *testing.T) {
+	requireGit(t)
+	repo := initGitRepo(t, "app.go", "package main\n")
+	paths, err := resolveGitPaths(t.Context(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedHead, err := gitHeadTreeish(t.Context(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "app.go"), []byte("package main\n// changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repo, "add", "app.go")
+	gitRunIn(t, repo, "commit", "-m", "move head")
+
+	logs := captureTestLogs(t, slog.LevelWarn)
+	publish, err := validateCommittedBuildHead(t.Context(), paths, expectedHead)
+	if publish || err != nil {
+		t.Fatalf("publish=%v error=%v, want clean discard", publish, err)
+	}
+	records := logs.Records()
+	if len(records) != 1 || records[0].Level != slog.LevelWarn ||
+		records[0].Message != "HEAD moved during committed index; will re-index on next search" {
+		t.Fatalf("records=%+v, want one confirmed HEAD-change warning", records)
+	}
+}
+
+func TestValidateCommittedBuildHead_CommandStartFailurePropagates(t *testing.T) {
+	requireGit(t)
+	repo := initGitRepo(t, "app.go", "package main\n")
+	paths, err := resolveGitPaths(t.Context(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(repo); err != nil {
+		t.Fatal(err)
+	}
+
+	logs := captureTestLogs(t, slog.LevelWarn)
+
+	publish, err := validateCommittedBuildHead(t.Context(), paths, "captured-head")
+	if publish || err == nil {
+		t.Fatalf("publish=%v error=%v, want failed validation", publish, err)
+	}
+	if _, ok := errors.AsType[*os.PathError](err); !ok || !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("error=%v, want missing working-directory path error", err)
+	}
+	if !strings.Contains(err.Error(), "git rev-parse HEAD") {
+		t.Fatalf("error=%v, want operation context", err)
+	}
+	if records := logs.Records(); len(records) != 0 {
+		t.Fatalf("failure records=%+v, want no HEAD warning", records)
 	}
 }
 
@@ -698,23 +870,31 @@ func TestGitCommittedIndexBudget_FileCap(t *testing.T) {
 	if !errors.Is(err, errGitCapExceeded) {
 		t.Fatalf("expected git cap error, got budget=%+v err=%v", budget, err)
 	}
-	for _, want := range []string{"candidate_files=1", "limit=0"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("git file cap error missing %q in: %v", want, err)
-		}
+	capErr, ok := errors.AsType[indexCapExceededError](err)
+	if !ok {
+		t.Fatalf("error=%v, want indexCapExceededError", err)
+	}
+	if capErr.metric != indexCapCandidateFiles || capErr.current != 1 || capErr.limit != 0 {
+		t.Fatalf("cap error=%+v, want metric=%q current=1 limit=0", capErr, indexCapCandidateFiles)
 	}
 }
 
 func TestGitCommittedIndexBudget_IndexedByteCap(t *testing.T) {
 	requireGit(t)
 
-	dir := initGitRepo(t, "app.go", "package main\n// committed_byte_budget_marker\n")
+	const content = "package main\n// committed_byte_budget_marker\n"
+	dir := initGitRepo(t, "app.go", content)
 	budget, err := scanGitCommittedIndexBudget(context.Background(), dir, maxGitCandidateFiles, 0)
 	if !errors.Is(err, errGitCapExceeded) {
 		t.Fatalf("expected git cap error, got budget=%+v err=%v", budget, err)
 	}
-	if !strings.Contains(err.Error(), "indexed_bytes=") || !strings.Contains(err.Error(), "limit=0") {
-		t.Fatalf("git byte cap error should include measured value and limit, got: %v", err)
+	capErr, ok := errors.AsType[indexCapExceededError](err)
+	if !ok {
+		t.Fatalf("error=%v, want indexCapExceededError", err)
+	}
+	wantBytes := int64(len(content))
+	if budget.indexedBytes != wantBytes || capErr.metric != indexCapIndexedBytes || capErr.current != wantBytes || capErr.limit != 0 {
+		t.Fatalf("cap error=%+v budget=%+v, want indexed bytes=%d limit=0", capErr, budget, wantBytes)
 	}
 }
 
@@ -862,26 +1042,39 @@ func TestIndexScopedCommittedUsesCapturedTreeish(t *testing.T) {
 	}
 }
 
-func TestGitDirtyFileBudget_IncludesCorpusContextAndCaps(t *testing.T) {
+func TestGitDirtyFileBudget_CapsIncludeCorpusContext(t *testing.T) {
 	dir := t.TempDir()
-	indexDir := filepath.Join(t.TempDir(), "index")
-	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package a\n"), 0o644); err != nil {
+	const content = "package a\n"
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	err := checkGitDirtyFileBudgetWithLimits(dir, indexDir, []string{"a.go"}, maxGitCandidateFiles, 0)
-	if !errors.Is(err, errGitCapExceeded) {
-		t.Fatalf("expected git cap error, got: %v", err)
+	tests := []struct {
+		name     string
+		maxFiles int64
+		maxBytes int64
+		metric   indexCapMetric
+		current  int64
+	}{
+		{name: "candidate files", maxFiles: 0, maxBytes: maxCorpusIndexedBytes, metric: indexCapCandidateFiles, current: 1},
+		{name: "indexed bytes", maxFiles: maxGitCandidateFiles, maxBytes: 0, metric: indexCapIndexedBytes, current: int64(len(content))},
 	}
-	for _, want := range []string{
-		"git corpus root=" + strconv.Quote(dir),
-		"index=" + strconv.Quote(indexDir),
-		"indexed_bytes=",
-		"limit=0",
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("git dirty cap error missing %q in: %v", want, err)
-		}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			indexDir := filepath.Join(t.TempDir(), "index")
+			err := checkGitDirtyFileBudgetWithLimits(dir, indexDir, []string{"a.go"}, tc.maxFiles, tc.maxBytes)
+			if !errors.Is(err, errGitCapExceeded) {
+				t.Fatalf("error=%v, want Git cap error", err)
+			}
+			contextErr, ok := errors.AsType[*gitCorpusContextError](err)
+			if !ok || contextErr.root != dir || contextErr.indexDir != indexDir {
+				t.Fatalf("context error=%+v, want root=%q index=%q", contextErr, dir, indexDir)
+			}
+			capErr, ok := errors.AsType[indexCapExceededError](err)
+			if !ok || capErr.metric != tc.metric || capErr.current != tc.current || capErr.limit != 0 {
+				t.Fatalf("cap error=%+v, want metric=%q current=%d limit=0", capErr, tc.metric, tc.current)
+			}
+		})
 	}
 }
 
@@ -1138,9 +1331,8 @@ func TestStreamFiles_DuplicateNames(t *testing.T) {
 // whether the state file is cached after indexing. These tests verify all branches.
 // ---------------------------------------------------------------------------
 
-// TestStateCaching_BothSucceed_StateStable verifies that when both committed
-// and uncommitted indexing succeed and the repo doesn't change during
-// indexing, the state file IS written (index is cached).
+// TestStateCaching_BothSucceed_StateStable verifies that successful committed
+// and working-tree indexing records and preserves a stable state value.
 func TestStateCaching_BothSucceed_StateStable(t *testing.T) {
 	requireTools(t)
 
@@ -1154,7 +1346,7 @@ func TestStateCaching_BothSucceed_StateStable(t *testing.T) {
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
 
-	state := gitRepoStateIn(ctx, dir)
+	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
@@ -1167,14 +1359,12 @@ func TestStateCaching_BothSucceed_StateStable(t *testing.T) {
 		t.Fatal("expected state file to be written after successful indexing")
 	}
 
-	// Second run should be a no-op (state matches)
-	state2 := gitRepoStateIn(ctx, dir)
+	// A second call with the same state must preserve the cached value.
+	state2 := mustGitRepoStateIn(t, ctx, dir)
 	stateHash2 := gitCorpusStateHash(paths, state2)
 	if stateHash2 != cached {
 		t.Fatalf("state changed between stable runs: cached=%q current=%q", cached, stateHash2)
 	}
-	// runIndexingWithCache should short-circuit at the state check.
-	// We verify by checking the state file is unchanged
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state2, stateHash2); err != nil {
 		t.Fatalf("second indexing failed: %v", err)
 	}
@@ -1184,10 +1374,9 @@ func TestStateCaching_BothSucceed_StateStable(t *testing.T) {
 	}
 }
 
-// TestStateCaching_BothSucceed_DirtyFileDrifted verifies that when a file
-// in state.Files is modified during indexing, post-verification detects
-// the drift via re-stat and does NOT write the state file.
-func TestStateCaching_BothSucceed_DirtyFileDrifted(t *testing.T) {
+// TestStateCaching_BothSucceed_DirtyFileChangedAfterStateCapture verifies that
+// post-verification detects changed metadata for a previously dirty file.
+func TestStateCaching_BothSucceed_DirtyFileChangedAfterStateCapture(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// original\n")
@@ -1201,13 +1390,13 @@ func TestStateCaching_BothSucceed_DirtyFileDrifted(t *testing.T) {
 	paths, plan := planGitTestCorpus(t, dir)
 
 	// Capture pre-state (app.go is dirty → in state.Files)
-	state := gitRepoStateIn(ctx, dir)
+	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 	if len(state.Files) == 0 {
 		t.Fatal("precondition: app.go should be in state.Files")
 	}
 
-	// Mutate the dirty file AGAIN (simulates user editing during indexing)
+	// Mutate the dirty file after capturing the state passed to the indexer.
 	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// second_edit_during_indexing\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1240,11 +1429,10 @@ func TestStateCaching_BothSucceed_DirtyFileDrifted(t *testing.T) {
 	}
 }
 
-// TestStateCaching_BothSucceed_CleanFileBecomesDirty verifies that when
-// a previously clean file becomes dirty during indexing (new mutation not
-// in state.Files), the state file can be written for the stale state, and the
-// next search still refreshes through the normal freshness path.
-func TestStateCaching_BothSucceed_CleanFileBecomesDirty(t *testing.T) {
+// TestStateCaching_BothSucceed_CleanFileChangesAfterStateCapture verifies that
+// a new dirty path absent from the captured file list is found on the next
+// search through normal freshness detection.
+func TestStateCaching_BothSucceed_CleanFileChangesAfterStateCapture(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// original\n")
@@ -1253,10 +1441,10 @@ func TestStateCaching_BothSucceed_CleanFileBecomesDirty(t *testing.T) {
 	paths, plan := planGitTestCorpus(t, dir)
 
 	// Capture pre-state (clean repo, state.Files is empty)
-	state := gitRepoStateIn(ctx, dir)
+	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 
-	// Mutate a file not in state.Files (simulates user editing during indexing)
+	// Mutate a file that was not in the captured state.Files list.
 	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// mutated\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1283,9 +1471,9 @@ func TestStateCaching_BothSucceed_CleanFileBecomesDirty(t *testing.T) {
 	}
 }
 
-// TestStateCaching_DirtyFileDeleted verifies that deleting a dirty file
-// during indexing is detected by the restat post-verification.
-func TestStateCaching_DirtyFileDeleted(t *testing.T) {
+// TestStateCaching_DirtyFileDeletedAfterStateCapture verifies that
+// post-verification detects deletion of a captured dirty file.
+func TestStateCaching_DirtyFileDeletedAfterStateCapture(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// original\n")
@@ -1298,13 +1486,13 @@ func TestStateCaching_DirtyFileDeleted(t *testing.T) {
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
 
-	state := gitRepoStateIn(ctx, dir)
+	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 	if len(state.Files) == 0 {
 		t.Fatal("precondition: app.go should be dirty")
 	}
 
-	// Delete the file (simulates deletion during indexing)
+	// Delete the file after capturing the state passed to the indexer.
 	if err := os.Remove(filepath.Join(dir, "app.go")); err != nil {
 		t.Fatal(err)
 	}
@@ -1316,7 +1504,7 @@ func TestStateCaching_DirtyFileDeleted(t *testing.T) {
 	// Drift should be detected when the previously dirty file disappears.
 	cached := readStateFile(plan.cacheDir)
 	if cached != "" {
-		t.Errorf("expected no state file after file deletion during indexing, got %q", cached)
+		t.Errorf("expected no state file after captured file deletion, got %q", cached)
 	}
 
 	files, err := runSeekInPlannedGitCorpus(ctx, "dirty_deleted_marker", paths, plan)
@@ -1328,9 +1516,9 @@ func TestStateCaching_DirtyFileDeleted(t *testing.T) {
 	}
 }
 
-// TestStateCaching_DirtyFileAtomicReplace verifies that an atomic-write
-// editor (write-to-tmp + rename) during indexing is detected via inode change.
-func TestStateCaching_DirtyFileAtomicReplace(t *testing.T) {
+// TestStateCaching_DirtyFileAtomicReplaceAfterStateCapture verifies that an
+// atomic replacement of a captured dirty file changes its inode fingerprint.
+func TestStateCaching_DirtyFileAtomicReplaceAfterStateCapture(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// original\n")
@@ -1343,7 +1531,7 @@ func TestStateCaching_DirtyFileAtomicReplace(t *testing.T) {
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
 
-	state := gitRepoStateIn(ctx, dir)
+	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 
 	// Simulate atomic-write editor: write to tmp, rename over original.
@@ -1375,8 +1563,8 @@ func TestStateCaching_DirtyFileAtomicReplace(t *testing.T) {
 	}
 }
 
-// TestStateCaching_UntouchedDirtyFile verifies that when a dirty file is
-// NOT modified during indexing, the state file IS written (no false drift).
+// TestStateCaching_UntouchedDirtyFile verifies that stable dirty-file metadata
+// permits the state value to be written.
 func TestStateCaching_UntouchedDirtyFile(t *testing.T) {
 	requireTools(t)
 
@@ -1389,7 +1577,7 @@ func TestStateCaching_UntouchedDirtyFile(t *testing.T) {
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
 
-	state := gitRepoStateIn(ctx, dir)
+	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 
 	// Do NOT modify the file — indexing should detect no drift
@@ -1399,19 +1587,16 @@ func TestStateCaching_UntouchedDirtyFile(t *testing.T) {
 
 	cached := readStateFile(plan.cacheDir)
 	if cached == "" {
-		t.Fatal("expected state file to be written when dirty file is untouched during indexing")
+		t.Fatal("expected state file to be written when dirty file metadata stays stable")
 	}
 	if cached != stateHash {
 		t.Errorf("state file mismatch: got %q, want %q", cached, stateHash)
 	}
 }
 
-// TestStateCaching_HeadChangeDuringIndexingDiscardsStaleBuild verifies the
-// Phase 2 validate-before-publish guarantee (gap-e closure): a HEAD change
-// during the (lock-free temp) committed build is detected before publish, so
-// the stale-HEAD build is DISCARDED — no state is written and no torn shards
-// are published. The next search rebuilds at the new HEAD and finds the content.
-func TestStateCaching_HeadChangeDuringIndexingDiscardsStaleBuild(t *testing.T) {
+// TestStateCaching_StaleCapturedHeadDiscardsBuild verifies that the indexer
+// does not publish a build made from state captured at an older HEAD.
+func TestStateCaching_StaleCapturedHeadDiscardsBuild(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// v1\n")
@@ -1425,21 +1610,19 @@ func TestStateCaching_HeadChangeDuringIndexingDiscardsStaleBuild(t *testing.T) {
 	paths, plan := planGitTestCorpus(t, dir)
 
 	// Capture pre-state (HEAD = commit1, app.go dirty)
-	state := gitRepoStateIn(ctx, dir)
+	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 
-	// Simulate HEAD change: commit the dirty file (HEAD now != captured state).
+	// Move HEAD after state capture and before calling the indexer.
 	gitRunIn(t, dir, "add", "app.go")
-	gitRunIn(t, dir, "commit", "-m", "commit during indexing")
+	gitRunIn(t, dir, "commit", "-m", "move head after state capture")
 
-	// Run indexing with the captured STALE state. validate-before-publish must
-	// notice HEAD moved and discard the build.
+	// Run with the stale captured state. HEAD validation must discard the build.
 	deleteStateFiles(plan.cacheDir)
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
-	// gap-e closed: the stale-HEAD build is discarded → no state written.
 	if cached := readStateFile(plan.cacheDir); cached != "" {
 		t.Fatalf("stale-HEAD build must be discarded, not published; got state %q", cached)
 	}
@@ -1457,10 +1640,44 @@ func TestStateCaching_HeadChangeDuringIndexingDiscardsStaleBuild(t *testing.T) {
 	}
 }
 
-// TestStateCaching_NewUntrackedFileDuringIndexing verifies that a new
-// untracked file appearing during indexing is not detected by restat
-// but IS caught by the next search.
-func TestStateCaching_NewUntrackedFileDuringIndexing(t *testing.T) {
+func TestStateCaching_StaleAValidationKeepsPublishedBState(t *testing.T) {
+	requireTools(t)
+
+	dir := initGitRepo(t, "app.go", "package main\n// lifecycle_a\n")
+	ctx := context.Background()
+	paths, plan := planGitTestCorpus(t, dir)
+	stateA := mustGitRepoStateIn(t, ctx, dir)
+	hashA := gitCorpusStateHash(paths, stateA)
+
+	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// lifecycle_b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, dir, "add", "app.go")
+	gitRunIn(t, dir, "commit", "-m", "B")
+	stateB := mustGitRepoStateIn(t, ctx, dir)
+	hashB := gitCorpusStateHash(paths, stateB)
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, stateB, hashB); err != nil {
+		t.Fatalf("publish B: %v", err)
+	}
+	if got := readStateFile(plan.cacheDir); got != hashB {
+		t.Fatalf("published state=%q, want B state %q", got, hashB)
+	}
+
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, stateA, hashA); err != nil {
+		t.Fatalf("stale A attempt: %v", err)
+	}
+	if got := readStateFile(plan.cacheDir); got != hashB {
+		t.Fatalf("stale A validation changed published B state: got %q, want %q", got, hashB)
+	}
+	files, err := runSeekInPlannedGitCorpus(ctx, "lifecycle_b", paths, plan)
+	if err != nil || len(files) == 0 {
+		t.Fatalf("search published B after stale A: files=%v error=%v", files, err)
+	}
+}
+
+// TestStateCaching_NewUntrackedFileAfterStateCapture verifies that a new path
+// absent from the captured file list is found by the next search.
+func TestStateCaching_NewUntrackedFileAfterStateCapture(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// original\n")
@@ -1469,10 +1686,10 @@ func TestStateCaching_NewUntrackedFileDuringIndexing(t *testing.T) {
 	paths, plan := planGitTestCorpus(t, dir)
 
 	// Capture pre-state (clean repo)
-	state := gitRepoStateIn(ctx, dir)
+	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 
-	// Simulate: new file appears during indexing
+	// Add a file after capturing the state passed to the indexer.
 	if err := os.WriteFile(filepath.Join(dir, "new_file.go"), []byte("package main\n// brand_new\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1497,9 +1714,9 @@ func TestStateCaching_NewUntrackedFileDuringIndexing(t *testing.T) {
 	}
 }
 
-// TestStateCaching_CommittedFails verifies that when committed indexing
-// fails, the state file is deleted regardless of uncommitted success.
-func TestStateCaching_CommittedFails(t *testing.T) {
+// TestStateCaching_CommittedFailureClearsState verifies that a failed
+// committed stage removes the stale state value.
+func TestStateCaching_CommittedFailureClearsState(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// content\n")
@@ -1512,7 +1729,7 @@ func TestStateCaching_CommittedFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	state := gitRepoStateIn(ctx, dir)
+	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 
 	// Remove the .git directory to make committed indexing fail
@@ -1521,14 +1738,13 @@ func TestStateCaching_CommittedFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// runIndexingWithCache will fail at ctags check or committed indexing.
-	// The error itself is expected — we only verify state file behavior.
 	err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash)
+	if err == nil {
+		t.Fatal("runIndexingWithCache error=nil, want committed-stage failure")
+	}
 
-	// State file must not retain the stale value after a failed indexing run.
-	cached := readStateFile(plan.cacheDir)
-	if cached == "fake_stale_state" {
-		t.Errorf("state file was NOT deleted after committed indexing failure (runIndexingWithCache err=%v)", err)
+	if cached := readStateFile(plan.cacheDir); cached != "" {
+		t.Errorf("state after committed indexing failure=%q, want empty", cached)
 	}
 }
 
@@ -1548,7 +1764,7 @@ func TestStateCaching_WithUncommittedFiles_BothSucceed(t *testing.T) {
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
 
-	state := gitRepoStateIn(ctx, dir)
+	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 
 	if len(state.Files) == 0 {
@@ -1585,7 +1801,7 @@ func TestStateCaching_NoUncommittedFiles(t *testing.T) {
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
 
-	state := gitRepoStateIn(ctx, dir)
+	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 
 	if len(state.Files) != 0 {
@@ -1625,7 +1841,7 @@ func TestStateCaching_DoubleCheck_SkipsRedundantIndex(t *testing.T) {
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
 
-	state := gitRepoStateIn(ctx, dir)
+	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 
 	// First index
@@ -1663,7 +1879,7 @@ func TestStateCaching_StaleFallback_DoesNotWriteState(t *testing.T) {
 	paths, plan := planGitTestCorpus(t, dir)
 
 	// First index to create shards
-	state := gitRepoStateIn(ctx, dir)
+	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("initial indexing failed: %v", err)
@@ -1722,9 +1938,7 @@ func TestStateCaching_StaleFallback_DoesNotWriteState(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestRepoStateFingerprint_InodeChange_AtomicWrite verifies that when a file
-// is replaced via atomic write (write-to-tmp + rename — vim/emacs pattern),
-// the fingerprint changes even if mtime and size happen to match. This is the
-// primary scenario the inode field was added to detect.
+// is replaced by rename, the inode field changes even if mtime and size match.
 func TestRepoStateFingerprint_InodeChange_AtomicWrite(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "file.go")
@@ -1884,12 +2098,16 @@ func TestRepoStateFingerprint_MixedDeletedAndExistingIsSensitive(t *testing.T) {
 	}
 }
 
-// TestRepoStateFingerprint_ContentChangeDetected verifies that editing a file's
-// content (changing mtime and potentially size) is detected by the fingerprint.
-func TestRepoStateFingerprint_ContentChangeDetected(t *testing.T) {
+// TestRepoStateFingerprint_ContentEditWithNewMetadata verifies that a content
+// edit with a new size and mtime changes the metadata fingerprint.
+func TestRepoStateFingerprint_ContentEditWithNewMetadata(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "f.go")
 	_ = os.WriteFile(path, []byte("version1\n"), 0o644)
+	initialTime := time.Unix(1_700_000_000, 0)
+	if err := os.Chtimes(path, initialTime, initialTime); err != nil {
+		t.Fatal(err)
+	}
 
 	state := repoState{
 		RawOutput: "# branch.oid abc\x00",
@@ -1897,22 +2115,27 @@ func TestRepoStateFingerprint_ContentChangeDetected(t *testing.T) {
 	}
 	fp1 := repoStateFingerprint(dir, state)
 
-	// Ensure mtime advances (some filesystems have coarse granularity)
-	time.Sleep(10 * time.Millisecond)
 	_ = os.WriteFile(path, []byte("version2\n"), 0o644)
+	if err := os.Chtimes(path, initialTime.Add(time.Second), initialTime.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
 
 	fp2 := repoStateFingerprint(dir, state)
 	if fp1 == fp2 {
-		t.Error("fingerprint should change when file content changes")
+		t.Error("fingerprint should change when observed metadata changes")
 	}
 }
 
-// TestRepoStateFingerprint_SameSizeDifferentContent verifies detection when
-// file content changes but size stays the same (e.g. "aaa" → "bbb").
-func TestRepoStateFingerprint_SameSizeDifferentContent(t *testing.T) {
+// TestRepoStateFingerprint_SameSizeEditWithNewMtime verifies that mtime changes
+// the fingerprint when file size stays equal.
+func TestRepoStateFingerprint_SameSizeEditWithNewMtime(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "f.go")
 	_ = os.WriteFile(path, []byte("aaa"), 0o644)
+	initialTime := time.Unix(1_700_000_000, 0)
+	if err := os.Chtimes(path, initialTime, initialTime); err != nil {
+		t.Fatal(err)
+	}
 
 	state := repoState{
 		RawOutput: "# branch.oid abc\x00",
@@ -1920,19 +2143,19 @@ func TestRepoStateFingerprint_SameSizeDifferentContent(t *testing.T) {
 	}
 	fp1 := repoStateFingerprint(dir, state)
 
-	// Same size, different content — mtime should change
-	time.Sleep(10 * time.Millisecond)
 	_ = os.WriteFile(path, []byte("bbb"), 0o644)
+	if err := os.Chtimes(path, initialTime.Add(time.Second), initialTime.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
 
 	fp2 := repoStateFingerprint(dir, state)
 	if fp1 == fp2 {
-		t.Error("fingerprint should change when content changes (same size, different mtime)")
+		t.Error("fingerprint should change when mtime changes")
 	}
 }
 
-// TestRepoStateFingerprint_SymlinkSkippedByLstat verifies that Lstat is used
-// (not Stat), so symlinks are reported as symlinks, not as their targets.
-// This matters because collectStreamFilesForTest skips symlinks.
+// TestRepoStateFingerprint_SymlinkInFingerprint verifies that Lstat records
+// symlink metadata instead of target metadata.
 func TestRepoStateFingerprint_SymlinkInFingerprint(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target.go")

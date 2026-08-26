@@ -576,8 +576,8 @@ func evictCorpus(e corpusDirEntry, trashDir string, cutoff time.Time) gcRowResul
 		return gcRowResult{action: actionLocked}
 	}
 
-	// A temp-swap build runs lock-free, holding only the build lock (not the
-	// publish/read lock above). Skip eviction while a build is in progress so it
+	// A temp-swap build holds the build lock, not the publish/read lock above.
+	// Skip eviction while a build is in progress so it
 	// is not pulled out from under the builder mid-build.
 	bf, ok, bErr := tryBuildLock(e.path)
 	if bErr != nil {

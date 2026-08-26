@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -26,28 +27,29 @@ type gitPaths struct {
 	ConfigPath string
 }
 
+type gitUnavailableError struct {
+	cause error
+}
+
+func (e *gitUnavailableError) Error() string {
+	return fmt.Sprintf("Git executable is unavailable: %v", e.cause)
+}
+
+func (e *gitUnavailableError) Unwrap() error {
+	return e.cause
+}
+
 // gitCmd creates an exec.Cmd for git with graceful shutdown.
 // Uses a graceful signal on context cancellation so git can release locks.
 // Note: we intentionally do NOT set GIT_OPTIONAL_LOCKS=0. While it
 // prevents lock contention on .git/index, it also prevents git from
 // refreshing its stat cache, which can cause same-second edits to be
 // invisible (same mtime + same size = git thinks file is unchanged).
-//
-// TODO(perf/scale): there is no process-wide cap on concurrent `git`
-// subprocesses today. At corpusWorkerCap=4 with each corpus running
-// up to indexParallelism()=min(NumCPU,16) builders, plus ctags per
-// builder, plus this gitCmd path for every L3 resolve / status
-// invocation, peak subprocess concurrency can reach ~64+ on a large
-// machine. macOS default RLIMIT_NOFILE is 256 and Linux is 1024 —
-// comfortable today, but a future feature that
-// fans out many subprocesses concurrently could push past it. Revisit
-// IF a user reports EMFILE / ENOMEM under load, OR IF corpusWorkerCap
-// grows: add a `golang.org/x/sync/semaphore` weighted to NumCPU()
-// around exec.Command, acquired before Start and released on Wait
-// completion. Defer for now because the gain is bounded by a hard
-// OS-level fd budget we have not actually been observed hitting.
 func gitCmd(ctx context.Context, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "git", args...)
+	if errors.Is(cmd.Err, exec.ErrNotFound) {
+		cmd.Err = &gitUnavailableError{cause: cmd.Err}
+	}
 	cmd.Env = sanitizedGitEnv(os.Environ())
 	cmd.Cancel = func() error {
 		return cmd.Process.Signal(gitCancelSignal())
@@ -142,18 +144,27 @@ func resolveGitPaths(ctx context.Context, dir string) (gitPaths, error) {
 
 // gitRepoStateIn returns the repository state for a specific directory.
 // Used when the CWD may not be inside the target repository.
-func gitRepoStateIn(ctx context.Context, dir string) repoState {
+func gitRepoStateIn(ctx context.Context, dir string) (repoState, error) {
 	cmd := gitCmd(ctx, "status", "--porcelain=v2", "--branch", "--no-renames", "--no-ahead-behind", "--untracked-files=all", "-z")
 	cmd.Dir = dir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return repoState{HeadSHA: "no-head"}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return repoState{}, ctxErr
+		}
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			return repoState{}, fmt.Errorf("git status: %w", err)
+		}
+		return repoState{}, fmt.Errorf("git status: %w: %s", err, msg)
 	}
-	return parseGitStatusV2(string(out))
+	return parseGitStatusV2(string(out)), nil
 }
 
 func gitHeadTreeish(ctx context.Context, dir string) (string, error) {
-	cmd := gitCmd(ctx, "rev-parse", "--verify", "HEAD^{commit}")
+	cmd := gitCmd(ctx, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
 	cmd.Dir = dir
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -162,9 +173,12 @@ func gitHeadTreeish(ctx context.Context, dir string) (string, error) {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", ctxErr
 		}
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" || strings.Contains(msg, "Needed a single revision") {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 			return "no-head", nil
+		}
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			return "", fmt.Errorf("git rev-parse HEAD: %w", err)
 		}
 		return "", fmt.Errorf("git rev-parse HEAD: %w: %s", err, msg)
 	}
@@ -200,6 +214,9 @@ func parseGitStatusV2(raw string) repoState {
 		if entry[0] == '#' {
 			if strings.HasPrefix(entry, "# branch.oid ") {
 				state.HeadSHA = entry[len("# branch.oid "):]
+				if state.HeadSHA == "(initial)" {
+					state.HeadSHA = "no-head"
+				}
 			}
 			continue
 		}

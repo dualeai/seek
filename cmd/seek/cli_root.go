@@ -1,10 +1,9 @@
 package main
 
 import (
-	"context"
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"os"
 	"strings"
@@ -24,26 +23,8 @@ type cliFlags struct {
 	search       searchConfig
 }
 
-// knownFlagTokens enumerates the root command's flag names so
-// splicePassthroughSeparator can distinguish "actual flag" from
-// "unknown single-dash token that's really a Zoekt query". Drift
-// against the cobra flag definitions below breaks the single-dash
-// query passthrough contract.
-//
-// gc subcommand flags are NOT listed: the splicer early-returns on
-// args[0]=="gc" so it never inspects subsequent tokens.
-var knownFlagTokens = []string{
-	"-h", "--help",
-	"-v", "--verbose",
-	"--version",
-	"-n", "--limit",
-	"-m", "--max-matches",
-	"-A", "--after-context",
-	"-C", "--context",
-}
-
 // splicePassthroughSeparator preserves Zoekt-style single-dash queries
-// (`-file:test`, `-lang:go`) under pflag's POSIX-strict parser. Scan
+// (`-file:test`, `-lang:go`) under pflag parsing. Scan
 // args left-to-right; the first arg starting with a SINGLE dash that
 // isn't a known flag (or `-` / `--`) triggers an injection of `--`
 // before it so pflag treats it plus everything after as positional.
@@ -55,7 +36,7 @@ var knownFlagTokens = []string{
 //
 // `seek gc` is special: arguments after the subcommand are all flags
 // or none. If args[0] == "gc", splice nothing.
-func splicePassthroughSeparator(args []string) []string {
+func splicePassthroughSeparator(args []string, flags *pflag.FlagSet) []string {
 	if len(args) == 0 || args[0] == "gc" {
 		return args
 	}
@@ -69,12 +50,12 @@ func splicePassthroughSeparator(args []string) []string {
 		}
 		// Strip optional `=value` to match the registered name.
 		name, _, hasEq := strings.Cut(arg, "=")
-		if isKnownFlagToken(name) {
+		if flag := lookupExactFlag(flags, name); flag != nil {
 			// Skip the value arg when the flag takes one and used
 			// the space-separated form (`-n 5` not `-n=5`),
 			// otherwise the next iteration would see `5` (or
 			// `-5`) as a candidate splice point.
-			if flagTakesValue(name) && !hasEq && i+1 < len(args) {
+			if flag.NoOptDefVal == "" && !hasEq && i+1 < len(args) {
 				i++
 			}
 			continue
@@ -95,21 +76,14 @@ func splicePassthroughSeparator(args []string) []string {
 	return args
 }
 
-func isKnownFlagToken(name string) bool {
-	for _, k := range knownFlagTokens {
-		if k == name {
-			return true
-		}
+func lookupExactFlag(flags *pflag.FlagSet, token string) *pflag.Flag {
+	if name, ok := strings.CutPrefix(token, "--"); ok && name != "" {
+		return flags.Lookup(name)
 	}
-	return false
-}
-
-func flagTakesValue(name string) bool {
-	switch name {
-	case "-n", "--limit", "-m", "--max-matches", "-A", "--after-context", "-C", "--context":
-		return true
+	if len(token) == 2 && token[0] == '-' {
+		return flags.ShorthandLookup(token[1:])
 	}
-	return false
+	return nil
 }
 
 // newRootCmd builds the seek root command with shared flags, examples,
@@ -131,18 +105,7 @@ once.`,
   seek 'TODO' ./src           search a specific subtree`,
 		Args: rootArgsValidator,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
-			logLevel := slog.LevelWarn
-			if flags.verbose {
-				logLevel = slog.LevelDebug
-			}
-			logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel}))
-			slog.SetDefault(logger)
-			if flags.verbose {
-				log.SetOutput(newSlogWriter(logger))
-				log.SetFlags(0)
-			} else {
-				log.SetOutput(io.Discard)
-			}
+			configureCLILogging(os.Stderr, flags.verbose)
 			return nil
 		},
 		PreRunE: func(cmd *cobra.Command, args []string) error {
@@ -174,7 +137,7 @@ once.`,
 		SilenceUsage:  true,
 	}
 
-	cmd.PersistentFlags().BoolVarP(&flags.verbose, "verbose", "v", false, "enable debug logging")
+	cmd.PersistentFlags().BoolVarP(&flags.verbose, "verbose", "v", false, "show debug logs and detailed errors")
 	cmd.Flags().IntVarP(&flags.limit, "limit", "n", 0, "maximum number of files to display (≥ 0, 0 = unlimited)")
 	cmd.Flags().IntVarP(&flags.maxMatches, "max-matches", "m", 0, "maximum matches per file (≥ 0, 0 = unlimited)")
 	cmd.Flags().IntVarP(&flags.afterContext, "after-context", "A", 0, "lines to display after each match (0–512)")
@@ -203,6 +166,10 @@ once.`,
 	return cmd
 }
 
+func configureCLILogging(w io.Writer, verbose bool) {
+	slog.SetDefault(newCLILogger(w, verbose))
+}
+
 func selectSearchConfig(cmd *cobra.Command, flags *cliFlags) error {
 	afterChanged := cmd.Flags().Changed("after-context")
 	contextChanged := cmd.Flags().Changed("context")
@@ -227,56 +194,29 @@ func selectSearchConfig(cmd *cobra.Command, flags *cliFlags) error {
 	return nil
 }
 
-// rootArgsValidator replaces cobra.MinimumNArgs(1) so the no-args path
-// emits a friendly hint AND so subcommand typos (e.g. `seek gcc` for
-// `seek gc`, `seek garbage-colect` for `seek garbage-collect`) are
-// caught instead of silently being treated as a search query.
-func rootArgsValidator(cmd *cobra.Command, args []string) error {
+// rootArgsValidator replaces cobra.MinimumNArgs(1) so the no-args path emits a
+// useful hint. A non-empty first positional argument remains a possible search
+// query. Cobra dispatches exact subcommand names before this validator runs.
+func rootArgsValidator(_ *cobra.Command, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("missing query (try 'seek --help' for usage)")
 	}
-	if suggestion := closestSubcommand(cmd, args[0]); suggestion != "" {
-		return fmt.Errorf("unknown subcommand %q (did you mean %q?)", args[0], suggestion)
-	}
 	return nil
-}
-
-// closestSubcommand returns the subcommand name (or alias) within
-// Levenshtein distance 2 of `want`, or "" when no candidate is close
-// enough. Only consults registered child commands, so it cannot flag
-// a legitimate query as a typo unless the user actually mistyped a
-// subcommand-looking token.
-func closestSubcommand(cmd *cobra.Command, want string) string {
-	best := ""
-	bestDist := 3
-	for _, c := range cmd.Commands() {
-		if c.Hidden {
-			continue
-		}
-		for _, name := range append([]string{c.Name()}, c.Aliases...) {
-			if name == want {
-				return ""
-			}
-			d := levenshtein(want, name)
-			if d > 0 && d < bestDist {
-				best = name
-				bestDist = d
-			}
-		}
-	}
-	return best
 }
 
 // suggestFlagError appends a Levenshtein-based did-you-mean hint when a
 // user mistypes a flag. SilenceErrors=true is in effect on the parent
 // command, so Cobra's built-in suggestion line is suppressed; this hook
-// folds the suggestion into the error message that main()'s plain
-// `seek: <err>` printer surfaces.
+// folds the suggestion into the error message that the CLI presenter surfaces.
 func suggestFlagError(cmd *cobra.Command, err error) error {
 	if err == nil {
 		return nil
 	}
-	bad := extractUnknownFlagName(err.Error())
+	notExistErr, ok := errors.AsType[*pflag.NotExistError](err)
+	if !ok {
+		return err
+	}
+	bad := notExistErr.GetSpecifiedName()
 	if bad == "" {
 		return err
 	}
@@ -286,19 +226,6 @@ func suggestFlagError(cmd *cobra.Command, err error) error {
 		return err
 	}
 	return fmt.Errorf("%w (did you mean --%s?)", err, suggestion)
-}
-
-// extractUnknownFlagName parses pflag's "unknown flag: --foo" error
-// text. pflag does not export a sentinel error or a typed accessor for
-// the offending flag, so string extraction is the only option.
-func extractUnknownFlagName(msg string) string {
-	const prefix = "unknown flag: --"
-	idx := strings.Index(msg, prefix)
-	if idx < 0 {
-		// Short-flag form: "unknown shorthand flag: 'x' in -x"
-		return ""
-	}
-	return strings.TrimSpace(msg[idx+len(prefix):])
 }
 
 // collectFlagNames returns every long-form flag name registered on the
@@ -355,12 +282,4 @@ func levenshtein(a, b string) int {
 		prev, curr = curr, prev
 	}
 	return prev[len(b)]
-}
-
-// executeCLI is the entry point main() calls. Returns the error from
-// Cobra so main() can map it to an exit code via exitCodeForError.
-func executeCLI(ctx context.Context) error {
-	root := newRootCmd()
-	root.SetArgs(splicePassthroughSeparator(os.Args[1:]))
-	return root.ExecuteContext(ctx)
 }

@@ -12,10 +12,10 @@ import (
 	"time"
 )
 
-// errCorpusEvicted is returned by acquirePublishLock when the corpus dir no
-// longer exists (gc evicted it during a lock-free build). The caller must
-// discard its temp build and let the next search cold-rebuild — never recreate
-// the lock file (which would resurrect a phantom, shard-less corpus).
+// errCorpusEvicted is returned by acquirePublishLock when the corpus directory
+// no longer exists. GC can remove it during a build outside the publish lock.
+// The caller must discard its temporary build and let the next search rebuild
+// it. The caller must not recreate the lock file and its missing corpus.
 var errCorpusEvicted = errors.New("corpus evicted during build")
 
 // Two-lock protocol (single-flight build + brief publish, non-blocking reads):
@@ -70,7 +70,7 @@ func acquireBuildLock(ctx context.Context, cacheDir, indexDir string) (*os.File,
 
 // tryBuildLock attempts a NON-blocking LOCK_EX on cacheDir/.build.lock. Returns
 // (fd, true, nil) when acquired, (nil, false, nil) when a builder holds it. Used
-// by gc to skip a corpus whose lock-free build is in progress.
+// by gc to skip a corpus whose build is in progress.
 func tryBuildLock(cacheDir string) (*os.File, bool, error) {
 	lockPath := filepath.Join(cacheDir, buildLockFile)
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
@@ -109,7 +109,7 @@ func acquirePublishLock(ctx context.Context, cacheDir string) (*os.File, error) 
 // acquireReadLock takes the shared read lock (LOCK_SH on the already-open f =
 // cacheDir/.lock) and holds it across the caller's full glob+open+search. It
 // polls a bounded time; if a swap is wedged past the bound AND shards exist, it
-// degrades to a lock-free stale read (liveness valve) rather than failing.
+// degrades to an unlocked stale read rather than failing.
 func acquireReadLock(ctx context.Context, indexDir string, f *os.File) error {
 	if err := lockFileSharedNB(f); err == nil {
 		return nil

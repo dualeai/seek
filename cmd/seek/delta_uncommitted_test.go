@@ -447,7 +447,11 @@ func TestDeltaUncommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 				t.Errorf("write: %v", err)
 				return
 			}
-			state := gitRepoStateIn(ctx, dir)
+			state, err := gitRepoStateIn(ctx, dir)
+			if err != nil {
+				t.Errorf("read repository state: %v", err)
+				return
+			}
 			hash := gitCorpusStateHash(paths, state)
 			if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, hash); err != nil {
 				t.Errorf("reindex: %v", err)
