@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - uses: ./.github/actions/setup-go
@@ -35,7 +35,7 @@ jobs:
         run: jq empty sbom.cyclonedx.json
 
       # Install goreleaser
-      - uses: goreleaser/goreleaser-action@ec59f474b9834571250b370d4735c50f8e2d1e29 # v7.0.0
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           install-only: true
 
@@ -46,7 +46,7 @@ jobs:
 
       # Supply chain attestations (SLSA L2)
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/*.tar.gz
