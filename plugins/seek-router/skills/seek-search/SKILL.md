@@ -59,6 +59,9 @@ directories or exact files, inside or outside the worktree, and can be mixed in
 one call. Across roots, headers show the absolute path and a `[git]`/`[folder]`
 tag so every match is directly openable.
 
+Path operands constrain what Seek indexes. `file:` and `-file:` query filters
+apply to results after indexing and do not reduce index limits.
+
 ## Pitfalls
 
 - **One quoted argument for filters.** `seek 'sym:Foo file:bar'`, not

@@ -9,10 +9,10 @@ See [Agent Integration](../../README.md#agent-integration) for installation.
 
 ## Requirements
 
-A working plugin installation requires `seek`, `jq`, a POSIX `awk`, and
-Universal Ctags on `PATH`. Context rewrites also require the public seek `-A`
-and `-C` flags. If those flags are not available, only context commands stay
-unchanged.
+The router requires `seek`, `jq`, and a POSIX `awk`. Building or updating a seek
+index also requires Universal Ctags on `PATH` or through `CTAGS_COMMAND`.
+Context rewrites require the public seek `-A` and `-C` flags. If those flags are
+not available, only context commands stay unchanged.
 
 The router implementation is wholly inside this plugin. `bin/router.sh` owns
 the hook JSON and `lib/router.awk` owns shell parsing and command adapters. Seek
