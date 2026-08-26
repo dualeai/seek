@@ -420,6 +420,136 @@ func TestRun_EmptyUnbornRepositoryReturnsNoMatch(t *testing.T) {
 	}
 }
 
+func TestRun_UnbornRepositoryClearsWarmCommittedIndex(t *testing.T) {
+	requireTools(t)
+	dir := initGitRepo(t, "old.go", "package old\n// unborn_old_marker\n")
+	setTestUserCache(t)
+	t.Chdir(dir)
+
+	if _, err := captureStdout(t, func() error {
+		return run(context.Background(), "unborn_old_marker", nil, 0, 0)
+	}); err != nil {
+		t.Fatalf("warm committed index: %v", err)
+	}
+	paths, err := resolveGitPaths(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("resolve Git paths: %v", err)
+	}
+	plan, err := planCurrentGitCorpus(paths)
+	if err != nil {
+		t.Fatalf("plan Git corpus: %v", err)
+	}
+
+	gitRun(t, dir, "switch", "--orphan", "unborn")
+	if err := os.WriteFile(
+		filepath.Join(dir, "new.go"),
+		[]byte("package unborn\n// unborn_new_marker\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ {
+		out, err := captureStdout(t, func() error {
+			return run(context.Background(), "unborn_new_marker", nil, 0, 0)
+		})
+		if err != nil || !strings.Contains(out, "unborn_new_marker") {
+			t.Fatalf("search new marker, run %d: error=%v output=%q", i+1, err, out)
+		}
+
+		out, err = captureStdout(t, func() error {
+			return run(context.Background(), "unborn_old_marker", nil, 0, 0)
+		})
+		if !errors.Is(err, errNoMatch) || out != "" {
+			t.Fatalf("search old marker, run %d: error=%v output=%q", i+1, err, out)
+		}
+	}
+
+	if artifacts := familyShardFiles(plan.indexDir, familyCommitted); len(artifacts) != 0 {
+		t.Fatalf("unborn repository retained committed artifacts: %v", artifacts)
+	}
+}
+
+func TestRun_UnbornRepositoryRepairsMatchingStateCommittedArtifacts(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		metaOnly bool
+	}{
+		{name: "base"},
+		{name: "meta_only", metaOnly: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requireTools(t)
+			dir := initGitRepo(t, "old.go", "package old\n// repair_old_marker\n")
+			setTestUserCache(t)
+			t.Chdir(dir)
+
+			if _, err := captureStdout(t, func() error {
+				return run(context.Background(), "repair_old_marker", nil, 0, 0)
+			}); err != nil {
+				t.Fatalf("warm committed index: %v", err)
+			}
+			paths, err := resolveGitPaths(context.Background(), dir)
+			if err != nil {
+				t.Fatalf("resolve Git paths: %v", err)
+			}
+			plan, err := planCurrentGitCorpus(paths)
+			if err != nil {
+				t.Fatalf("plan Git corpus: %v", err)
+			}
+
+			gitRun(t, dir, "switch", "--orphan", "unborn")
+			if err := os.WriteFile(
+				filepath.Join(dir, "new.go"),
+				[]byte("package unborn\n// repair_new_marker\n"),
+				0o644,
+			); err != nil {
+				t.Fatal(err)
+			}
+			state := mustGitRepoStateIn(t, context.Background(), dir)
+			if state.HeadSHA != "no-head" {
+				t.Fatalf("HEAD=%q, want no-head", state.HeadSHA)
+			}
+			if err := writeStateFile(plan.cacheDir, gitCorpusStateHash(paths, state)); err != nil {
+				t.Fatalf("seed matching state: %v", err)
+			}
+			if err := writeHeadFile(plan.cacheDir, state.HeadSHA); err != nil {
+				t.Fatalf("seed no-head file: %v", err)
+			}
+
+			artifacts := familyShardFiles(plan.indexDir, familyCommitted)
+			if len(artifacts) == 0 {
+				t.Fatal("warm cache has no committed artifact")
+			}
+			if tc.metaOnly {
+				for _, artifact := range artifacts {
+					if strings.HasSuffix(artifact, ".zoekt") {
+						if err := os.Rename(artifact, artifact+".meta"); err != nil {
+							t.Fatalf("seed meta-only artifact: %v", err)
+						}
+					}
+				}
+			}
+
+			out, err := captureStdout(t, func() error {
+				return run(context.Background(), "repair_new_marker", nil, 0, 0)
+			})
+			if err != nil || !strings.Contains(out, "repair_new_marker") {
+				t.Fatalf("search repaired new marker: error=%v output=%q", err, out)
+			}
+			out, err = captureStdout(t, func() error {
+				return run(context.Background(), "repair_old_marker", nil, 0, 0)
+			})
+			if !errors.Is(err, errNoMatch) || out != "" {
+				t.Fatalf("search repaired old marker: error=%v output=%q", err, out)
+			}
+			if artifacts := familyShardFiles(plan.indexDir, familyCommitted); len(artifacts) != 0 {
+				t.Fatalf("repair retained committed artifacts: %v", artifacts)
+			}
+		})
+	}
+}
+
 func TestRun_UsesUserCache(t *testing.T) {
 	requireTools(t)
 

@@ -443,13 +443,14 @@ func ensureCombinedGitCorpus(ctx context.Context, plan corpusPlan, paths gitPath
 
 	currentState := gitCorpusStateHash(paths, state)
 	hasShards := shardsExist(plan.indexDir)
+	clearCommitted := noHeadHasCommittedArtifacts(plan.indexDir, state.HeadSHA)
 	// A leftover .swapping marker means a prior publish was interrupted and the
 	// shards may be torn; force the build path so recoverIncompleteSwap runs even
 	// when state otherwise looks current.
 	swapPending := readCacheFile(plan.cacheDir, swappingMarkerFile) != ""
-	needBuild := currentState != cachedState || !hasShards || swapPending
-	if (currentState != cachedState || !hasShards) && gitCorpusKnownEmpty(ctx, paths, state) {
-		if cachedState == currentState && !hasShards {
+	needBuild := currentState != cachedState || !hasShards || swapPending || clearCommitted
+	if (currentState != cachedState || !hasShards || clearCommitted) && gitCorpusKnownEmpty(ctx, paths, state) {
+		if cachedState == currentState && !hasShards && !clearCommitted {
 			return corpusKnownEmpty, nil
 		}
 		marked, err := markGitCorpusKnownEmpty(ctx, plan, state, currentState)
