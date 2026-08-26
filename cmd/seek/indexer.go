@@ -339,7 +339,7 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	// Double-check state after acquiring the build lock (a peer may have just
 	// published this generation).
 	cachedState := readStateFile(cacheDir)
-	if cachedState == preState {
+	if cachedState == preState && !noHeadHasCommittedArtifacts(indexDir, state.HeadSHA) {
 		return nil
 	}
 
@@ -354,19 +354,24 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	// Skip committed indexing when HEAD hasn't moved since the last successful
 	// index (cheap incremental no-op path).
 	needCommitted := state.HeadSHA != "no-head" && state.HeadSHA != readHeadFile(cacheDir)
+	clearCommitted := noHeadHasCommittedArtifacts(indexDir, state.HeadSHA)
 
-	// Build the committed family outside the publish lock in a seeded temp dir.
+	// Build the next committed family outside the publish lock. An unborn
+	// repository publishes an empty family so shards from its former HEAD cannot
+	// remain searchable.
 	var buildDir string
-	if needCommitted {
-		if _, err := scanGitCommittedIndexBudget(ctx, repoDir, gitCandidateFileLimit, gitCorpusIndexedByteLimit); err != nil {
-			deleteStateFiles(cacheDir)
-			return gitCorpusError(repoDir, indexDir, err)
-		}
+	if needCommitted || clearCommitted {
 		buildDir, err = newBuildDir(indexDir)
 		if err != nil {
 			return err
 		}
 		defer discardBuildDir(buildDir)
+	}
+	if needCommitted {
+		if _, err := scanGitCommittedIndexBudget(ctx, repoDir, gitCandidateFileLimit, gitCorpusIndexedByteLimit); err != nil {
+			deleteStateFiles(cacheDir)
+			return gitCorpusError(repoDir, indexDir, err)
+		}
 		if err := seedFamily(indexDir, buildDir, familyCommitted); err != nil {
 			return err
 		}
@@ -380,6 +385,8 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 			// The caller decides whether existing shards make a stale search safe.
 			return cErr
 		}
+	}
+	if needCommitted || clearCommitted {
 		// HEAD must still equal the captured value before publication. Otherwise,
 		// discard the temp build and keep the current published shards. The next
 		// search derives fresh state and can rebuild once HEAD is stable.
@@ -411,7 +418,7 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 		return nil // evicted; discard
 	}
 
-	if needCommitted {
+	if needCommitted || clearCommitted {
 		if err := publishShardFamilyLocked(cacheDir, indexDir, buildDir, familyCommitted); err != nil {
 			return fmt.Errorf("publish committed shards: %w", err)
 		}
@@ -484,6 +491,10 @@ func validateCommittedBuildHead(
 func shardsExist(indexDir string) bool {
 	entries, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
 	return err == nil && len(entries) > 0
+}
+
+func noHeadHasCommittedArtifacts(indexDir, headSHA string) bool {
+	return headSHA == "no-head" && len(familyShardFiles(indexDir, familyCommitted)) > 0
 }
 
 // maxCommittedDeltaShards bounds delta-stacked committed shards before Zoekt
@@ -1242,6 +1253,10 @@ func cleanRepositoryShards(indexDir, repoName string) {
 	for _, m := range repositoryShardFiles(indexDir, repoName) {
 		_ = os.Remove(m)
 	}
+	metas, _ := filepath.Glob(filepath.Join(indexDir, repoName+"_v*.zoekt.meta"))
+	for _, m := range metas {
+		_ = os.Remove(m)
+	}
 }
 
 func repositoryShardCount(indexDir, repoName string) int {
@@ -1257,11 +1272,7 @@ func repositoryShardFiles(indexDir, repoName string) []string {
 }
 
 func cleanAllShards(indexDir string) {
-	matches, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
-	if err != nil {
-		return
-	}
-	for _, m := range matches {
+	for _, m := range familyShardFiles(indexDir, familyAll) {
 		_ = os.Remove(m)
 	}
 }
