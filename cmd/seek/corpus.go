@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/sourcegraph/zoekt"
+	"github.com/sourcegraph/zoekt/index"
 	"github.com/sourcegraph/zoekt/query"
 )
 
@@ -34,7 +35,13 @@ const (
 	// byte budget.
 	seekCacheLayoutVersion    = "v3"
 	seekDocumentNamingVersion = "slash-relative-v1"
-	zoektCompatibilityVersion = "zoekt-a0f5789d25cb"
+)
+
+// zoektCompatibilityVersion follows Zoekt's documented reindex markers.
+var zoektCompatibilityVersion = fmt.Sprintf(
+	"zoekt-index-v%d-feature-v%d",
+	index.IndexFormatVersion,
+	index.FeatureVersion,
 )
 
 type corpusPlan struct {

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -24,11 +23,6 @@ func reindexGit(t *testing.T, ctx context.Context, paths gitPaths, plan corpusPl
 	}
 }
 
-// testCommittedShardPrefix is the URL-escaped repository name Zoekt uses for
-// committed shards in this fixture (derived from origin URL
-// "https://github.com/test/repo.git" via url.QueryEscape).
-var testCommittedShardPrefix = url.QueryEscape("github.com/test/repo")
-
 func TestDeltaCommitted_ModifyFileTombstonesOldContent(t *testing.T) {
 	requireTools(t)
 
@@ -42,7 +36,7 @@ func TestDeltaCommitted_ModifyFileTombstonesOldContent(t *testing.T) {
 	if err != nil || len(results) == 0 {
 		t.Fatalf("baseline v1 must be findable: results=%d err=%v", len(results), err)
 	}
-	shardsBefore := repositoryShardCount(plan.indexDir, testCommittedShardPrefix)
+	shardsBefore := committedShardCount(t, plan.indexDir)
 
 	if err := os.WriteFile(filepath.Join(dir, "foo.go"), []byte("package main\n// delta_modify_v2\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -68,7 +62,7 @@ func TestDeltaCommitted_ModifyFileTombstonesOldContent(t *testing.T) {
 	// top of the existing set (Zoekt index/builder.go:585). A silent
 	// fallback to a non-delta rebuild would leave shardsAfter == shardsBefore
 	// because the old shard would be replaced rather than supplemented.
-	shardsAfter := repositoryShardCount(plan.indexDir, testCommittedShardPrefix)
+	shardsAfter := committedShardCount(t, plan.indexDir)
 	if shardsAfter != shardsBefore+1 {
 		t.Fatalf("expected delta path to stack +1 shard (before=%d, after=%d) — non-delta rebuild would replace rather than append", shardsBefore, shardsAfter)
 	}
@@ -159,7 +153,7 @@ func TestDeltaCommitted_HeadRewindFallsBackCleanly(t *testing.T) {
 	// Delta-path proof: five HEAD-advancing reindex cycles must have stacked
 	// shards (one per delta). A non-delta build would replace shards each
 	// time, leaving the count at 1.
-	shardsBefore := repositoryShardCount(plan.indexDir, testCommittedShardPrefix)
+	shardsBefore := committedShardCount(t, plan.indexDir)
 	if shardsBefore < 2 {
 		t.Fatalf("expected delta accumulation across 5 commits, got %d shard(s) — delta path may have silently fallen back", shardsBefore)
 	}
@@ -215,7 +209,7 @@ func TestDeltaCommitted_RebaseLeavesNoDuplicateHits(t *testing.T) {
 		reindexGit(t, ctx, paths, plan)
 	}
 
-	shardsBefore := repositoryShardCount(plan.indexDir, testCommittedShardPrefix)
+	shardsBefore := committedShardCount(t, plan.indexDir)
 	if shardsBefore < 2 {
 		t.Fatalf("setup must accumulate multiple delta shards (got %d) — delta path may not be engaged", shardsBefore)
 	}
@@ -271,7 +265,7 @@ func TestDeltaCommitted_ShardThresholdTriggersFullRebuild(t *testing.T) {
 		gitRun(t, dir, "add", ".")
 		gitRun(t, dir, "commit", "-m", fmt.Sprintf("cycle %d", i))
 		reindexGit(t, ctx, paths, plan)
-		shardSeries = append(shardSeries, repositoryShardCount(plan.indexDir, testCommittedShardPrefix))
+		shardSeries = append(shardSeries, committedShardCount(t, plan.indexDir))
 	}
 
 	peak := 0

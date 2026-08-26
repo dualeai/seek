@@ -499,9 +499,8 @@ const maxCommittedDeltaShards = 64
 // the prior commit is gone (force-push, GC), branch set changes, index option
 // hash differs, or the shard count exceeds DeltaShardNumberFallbackThreshold.
 //
-// The fallback repository name gives Zoekt a non-empty shard namespace for
-// local repos with no remote.origin.url and no [zoekt] name. Zoekt still
-// overwrites it when repo config or origin metadata provides a real name.
+// The fallback repository name gives Zoekt a stable shard namespace. Zoekt
+// keeps this name unless the repository has an explicit [zoekt] name.
 func indexCommitted(repoDir, indexDir string, parallelism int) error {
 	buildOpts := indexBuildOptions(indexDir, parallelism)
 	buildOpts.IsDelta = true

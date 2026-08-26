@@ -208,6 +208,62 @@ func TestPlanCurrentGitCorpus_IsStable(t *testing.T) {
 	}
 }
 
+func TestZoektCompatibilityVersion_RotatesCacheKeys(t *testing.T) {
+	root := t.TempDir()
+	setTestUserCache(t)
+
+	paths := fakeGitPathsForPlanTest(root)
+	state := repoState{HeadSHA: "abc", RawOutput: "# branch.oid abc\x00"}
+	info, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gitBefore, err := planCurrentGitCorpus(paths)
+	if err != nil {
+		t.Fatalf("plan Git corpus before upgrade: %v", err)
+	}
+	folderBefore, err := planFolderCorpus(root, info)
+	if err != nil {
+		t.Fatalf("plan folder corpus before upgrade: %v", err)
+	}
+	optionsBefore := indexOptionsHash()
+	gitStateBefore := gitCorpusStateHash(paths, state)
+	folderStateBefore := finishFolderStateHash(newFolderStateHasher(folderBefore))
+
+	original := zoektCompatibilityVersion
+	zoektCompatibilityVersion = original + "-upgrade-test"
+	t.Cleanup(func() { zoektCompatibilityVersion = original })
+
+	gitAfter, err := planCurrentGitCorpus(paths)
+	if err != nil {
+		t.Fatalf("plan Git corpus after upgrade: %v", err)
+	}
+	folderAfter, err := planFolderCorpus(root, info)
+	if err != nil {
+		t.Fatalf("plan folder corpus after upgrade: %v", err)
+	}
+
+	checks := []struct {
+		name   string
+		before string
+		after  string
+	}{
+		{"index options hash", optionsBefore, indexOptionsHash()},
+		{"Git corpus ID", string(gitBefore.id), string(gitAfter.id)},
+		{"Git cache directory", gitBefore.cacheDir, gitAfter.cacheDir},
+		{"Git state hash", gitStateBefore, gitCorpusStateHash(paths, state)},
+		{"folder corpus ID", string(folderBefore.id), string(folderAfter.id)},
+		{"folder cache directory", folderBefore.cacheDir, folderAfter.cacheDir},
+		{"folder state hash", folderStateBefore, finishFolderStateHash(newFolderStateHasher(folderAfter))},
+	}
+	for _, check := range checks {
+		if check.before == check.after {
+			t.Errorf("%s did not change after a Zoekt compatibility upgrade", check.name)
+		}
+	}
+}
+
 func TestGitCorpusFingerprint_ChangesWithGitIdentity(t *testing.T) {
 	root := t.TempDir()
 	state := repoState{HeadSHA: "abc", RawOutput: "# branch.oid abc\x00"}
