@@ -137,10 +137,8 @@ func TestIndexDocuments_ReleasesWeightOnFinishError(t *testing.T) {
 	// proves the err-path Release fired despite the error.
 }
 
-// TestIndexDocuments_ReleasesWeightWhenMixedDocsSucceed — three docs,
-// all valid. Tests the bog-standard happy path and asserts no weight
-// leak. Mirrors the original ReleasesAllWeightOnEarlyAddError intent
-// (release-regardless) but without claiming a non-existent addErr.
+// TestIndexDocuments_ReleasesWeightWhenMixedDocsSucceed verifies that a
+// successful mixed document set returns all acquired weight.
 func TestIndexDocuments_ReleasesWeightWhenMixedDocsSucceed(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)

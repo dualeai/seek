@@ -82,7 +82,7 @@ func BenchmarkLargeRepo_UncommittedRealistic(b *testing.B) {
 		if err := os.WriteFile(target, body, 0o644); err != nil {
 			b.Fatal(err)
 		}
-		state := gitRepoStateIn(ctx, repoDir)
+		state := mustGitRepoStateIn(b, ctx, repoDir)
 		preState := gitCorpusStateHash(paths, state)
 		if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, preState); err != nil {
 			b.Fatalf("reindex iter %d: %v", i, err)

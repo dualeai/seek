@@ -125,11 +125,9 @@ func TestFolderFingerprintStableUnderNestedCommit(t *testing.T) {
 	}
 }
 
-// TestFolderWalkerDedupesPhysicalRepo — same repo reached via the
-// canonical path and via a symlink must produce ONE pool plan
-// (corpusID-based dedup). The discovery callback may see duplicate
-// boundaries, but only genuinely-new repos get new pool plans.
-func TestFolderWalkerDedupesPhysicalRepo(t *testing.T) {
+// TestFolderWalkerSkipsSymlinkedWorktree verifies that discovery visits the
+// canonical worktree and does not follow a symlink to it.
+func TestFolderWalkerSkipsSymlinkedWorktree(t *testing.T) {
 	root := canonTempDir(t)
 	canonical := filepath.Join(root, "real")
 	writeMinimalGitRepo(t, canonical)

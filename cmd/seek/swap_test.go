@@ -175,7 +175,7 @@ func TestTempSwap_ReaderExcludedFromTornWindow(t *testing.T) {
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
 
-	st := gitRepoStateIn(ctx, dir)
+	st := mustGitRepoStateIn(t, ctx, dir)
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, st, gitCorpusStateHash(paths, st)); err != nil {
 		t.Fatalf("initial build: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestTempSwap_ReaderExcludedFromTornWindow(t *testing.T) {
 
 	// New commit → HEAD moves → committed swap → hook fires mid-swap.
 	writeTrackedFile(t, dir, "b.go", "package main\n// B\n")
-	s := gitRepoStateIn(ctx, dir)
+	s := mustGitRepoStateIn(t, ctx, dir)
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, s, gitCorpusStateHash(paths, s)); err != nil {
 		t.Fatalf("delta build: %v", err)
 	}

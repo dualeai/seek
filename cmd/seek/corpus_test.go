@@ -2,11 +2,113 @@ package main
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestResolveDefaultSearchRoot_OutsideGitReturnsTypedError(t *testing.T) {
+	requireGit(t)
+	t.Chdir(t.TempDir())
+	paths, err := resolveDefaultSearchRoot(t.Context(), nil)
+	if paths != nil {
+		t.Fatalf("paths=%+v, want nil", paths)
+	}
+	if _, ok := errors.AsType[*searchRootError](err); !ok {
+		t.Fatalf("error=%v, want searchRootError", err)
+	}
+	if _, ok := errors.AsType[*exec.ExitError](err); !ok {
+		t.Fatalf("error=%v, want wrapped Git exit error", err)
+	}
+}
+
+func TestResolveDefaultSearchRoot_ExplicitOperandNeedsNoGitRoot(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Chdir(t.TempDir())
+	paths, err := resolveDefaultSearchRoot(t.Context(), []string{"."})
+	if err != nil || paths != nil {
+		t.Fatalf("paths=%+v error=%v, want nil paths and error", paths, err)
+	}
+}
+
+func TestResolveDefaultSearchRoot_MissingGitReturnsTypedError(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Chdir(t.TempDir())
+	paths, err := resolveDefaultSearchRoot(t.Context(), nil)
+	if paths != nil {
+		t.Fatalf("paths=%+v, want nil", paths)
+	}
+	if _, ok := errors.AsType[*gitUnavailableError](err); !ok {
+		t.Fatalf("error=%v, want gitUnavailableError", err)
+	}
+	if !errors.Is(err, exec.ErrNotFound) {
+		t.Fatalf("error=%v, want wrapped exec.ErrNotFound", err)
+	}
+}
+
+func TestResolveDefaultSearchRoot_CancellationIsNotAPathError(t *testing.T) {
+	requireGit(t)
+	t.Chdir(t.TempDir())
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	paths, err := resolveDefaultSearchRoot(ctx, nil)
+	if paths != nil {
+		t.Fatalf("paths=%+v, want nil", paths)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v, want context.Canceled", err)
+	}
+	if _, ok := errors.AsType[*searchRootError](err); ok {
+		t.Fatalf("error=%v, must not be searchRootError", err)
+	}
+}
+
+func TestCollectExternalOperands_PathReadErrorsPreserveOperand(t *testing.T) {
+	tests := []struct {
+		name    string
+		operand func(t *testing.T) string
+	}{
+		{
+			name: "missing path",
+			operand: func(t *testing.T) string {
+				t.Chdir(t.TempDir())
+				return filepath.Join("nested", "missing")
+			},
+		},
+		{
+			name: "broken symlink",
+			operand: func(t *testing.T) string {
+				root := t.TempDir()
+				link := filepath.Join(root, "broken-link")
+				if err := os.Symlink(filepath.Join(root, "missing-target"), link); err != nil {
+					t.Skipf("symlink unavailable: %v", err)
+				}
+				return link
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			operand := tc.operand(t)
+			_, err := collectExternalOperands(t.Context(), []string{operand})
+			pathErr, ok := errors.AsType[*pathOperandError](err)
+			if !ok {
+				t.Fatalf("error=%v, want pathOperandError", err)
+			}
+			if pathErr.operation != pathOperandRead || pathErr.operand != operand {
+				t.Fatalf("error=%+v, want read operation for raw operand %q", pathErr, operand)
+			}
+			if !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("error=%v, want fs.ErrNotExist", err)
+			}
+		})
+	}
+}
 
 // TestPlanDiscoveredGitCorpus_MatchesExplicitID — a discovered plan
 // for the same physical repo as an explicit operand must produce the
@@ -324,10 +426,8 @@ func TestPlanCorpora_ExactFilesAndDirectoriesUseScopedGitCorpus(t *testing.T) {
 	}
 }
 
-// Path C: a scoped Git directory plan reuses the SAME combined corpus ID (and
-// index dir) as the unscoped repo — that sharing is the disk win. It differs
-// only by carrying a scope filter, a dirtyScope (pathspec carrier), and a
-// distinct over-cap fallback dir.
+// A scoped Git directory plan reuses the unscoped combined corpus ID and index
+// directory. It adds a search scope, a Git path scope, and an over-cap fallback.
 func TestPlanCorpora_ScopedGitDirectoryReusesCombinedCorpusID(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
@@ -370,9 +470,8 @@ func TestPlanCorpora_ScopedGitDirectoryReusesCombinedCorpusID(t *testing.T) {
 	}
 }
 
-// Path C: distinct scopes of one repo SHARE the single combined whole-repo
-// index (same cacheDir/indexDir) and differ only in plan.scope and in their
-// per-scope over-cap fallback dir (which a huge sibling would force).
+// Distinct scopes of one repository share the combined whole-repo index and
+// use different search scopes and over-cap fallback directories.
 func TestPlanCorpora_ScopedGitDirectoriesShareCombinedIndex(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)

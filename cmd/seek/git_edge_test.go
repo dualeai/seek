@@ -627,18 +627,15 @@ func TestIntegration_SubmoduleDirtySkipped(t *testing.T) {
 	}
 }
 
-// TestGitRepoState_CancelledContext verifies that a cancelled context
-// returns a safe default state rather than panicking.
+// TestGitRepoState_CancelledContext verifies that cancellation is not hidden as
+// an empty repository state.
 func TestGitRepoState_CancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel immediately
+	cancel()
 
-	state := gitRepoStateIn(ctx, "")
-	if state.HeadSHA != "no-head" {
-		t.Errorf("expected no-head for cancelled context, got %q", state.HeadSHA)
-	}
-	if len(state.Files) != 0 {
-		t.Errorf("expected no files for cancelled context, got %v", state.Files)
+	_, err := gitRepoStateIn(ctx, "")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation, got %v", err)
 	}
 }
 

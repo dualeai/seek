@@ -50,6 +50,22 @@ type searchConfig struct {
 	contextDirtyFiles dirtyFileSet
 }
 
+// querySyntaxError identifies a query that Zoekt could not parse. The original
+// query and wrapped cause let the CLI explain the input and retain Zoekt's
+// diagnostic in verbose output.
+type querySyntaxError struct {
+	query string
+	cause error
+}
+
+func (e *querySyntaxError) Error() string {
+	return fmt.Sprintf("parse query %q: %v", e.query, e.cause)
+}
+
+func (e *querySyntaxError) Unwrap() error {
+	return e.cause
+}
+
 func defaultSearchConfig() searchConfig {
 	return searchConfig{opts: &searchOpts}
 }
@@ -166,7 +182,7 @@ func loadShardPaths(indexDir string, paths []string) ([]zoekt.Searcher, error) {
 func parseSearchQuery(pattern string) (query.Q, error) {
 	q, err := query.Parse(pattern)
 	if err != nil {
-		return nil, fmt.Errorf("parse query %q: %w", pattern, err)
+		return nil, &querySyntaxError{query: pattern, cause: err}
 	}
 	q = query.Map(q, query.ExpandFileContent)
 	return query.Simplify(q), nil

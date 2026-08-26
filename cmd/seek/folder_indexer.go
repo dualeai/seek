@@ -227,39 +227,39 @@ func checkNotBareRepo(plan corpusPlan) error {
 	return nil
 }
 
+type folderCorpusContextError struct {
+	root     string
+	cacheDir string
+	indexDir string
+	cause    error
+}
+
+func (e *folderCorpusContextError) Error() string {
+	return fmt.Sprintf(
+		"folder corpus root=%q cache=%q index=%q: %v",
+		e.root,
+		e.cacheDir,
+		e.indexDir,
+		e.cause,
+	)
+}
+
+func (e *folderCorpusContextError) Unwrap() error {
+	return e.cause
+}
+
 func folderCorpusError(plan corpusPlan, err error) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf(
-		"folder corpus root=%q cache=%q index=%q: %w",
-		plan.root,
-		plan.cacheDir,
-		plan.indexDir,
-		err,
-	)
+	return &folderCorpusContextError{
+		root:     plan.root,
+		cacheDir: plan.cacheDir,
+		indexDir: plan.indexDir,
+		cause:    err,
+	}
 }
 
-// TODO(perf): manifest-fast-path.
-//
-// On a warm cache hit ensureFolderCorpusFresh STILL calls
-// folderCorpusFingerprint which walks the full subtree with Fstatat
-// per entry; ~50-80 ms on warm dentry for a 100k-file parent.
-// Manifest-fast-path: when `.folder-manifest-v1` exists, read it once
-// and Lstat only the manifest's entries (skip directory enumeration
-// AND the tryDiscoverBoundary per-subdir probe). On unchanged trees
-// this is N entries instead of N entries + D directory reads, saves
-// ~30-50% of warm-search latency on huge parents.
-//
-// Why deferred: real risk to the delta path. changedFolderDocumentsFromManifest
-// already streams (selected vs manifest) in sort order; a fast-path
-// that skips the walk must preserve byte-equal stateHash output
-// (otherwise the cache mismatches and a full re-index fires). The
-// reviewer at ANGLE 3 flagged it as the biggest single warm-path win;
-// it's also the single change most likely to regress correctness if
-// the manifest's invariants drift from the walker's invariants. Ship
-// AFTER a TestManifestFastPathParity test pins byte-equal stateHash
-// between fast-path and walk on a corpus of varying shapes.
 func folderCorpusFingerprint(ctx context.Context, plan corpusPlan) (string, int, error) {
 	if plan.rootType == rootTypeDirectory {
 		return folderCorpusFingerprintParallel(ctx, plan)
@@ -331,15 +331,6 @@ type folderCorpusScanner struct {
 	// recurses without classifying. enqueueDiscovered receives confirmed
 	// boundaries; true means a corpus owns the subtree, false means the
 	// walker should descend as plain folder.
-	//
-	// TODO(perf): a `sync.Map[parent_dev_ino]struct{}` memoizer would
-	// short-circuit "no nested .git here" probes when the same physical
-	// directory is reached via multiple operands or symlinks. Within a
-	// single corpus walk each subdir is visited exactly once so the
-	// memoizer would carry no benefit and add an extra dev:ino lookup
-	// to every probe. Revisit IF seek grows multi-operand-with-overlap
-	// workloads where the same subtree is reached from two roots in
-	// one invocation.
 	scanRoot          string
 	excludeRoots      []string
 	discoveryEnabled  bool
@@ -357,17 +348,6 @@ func (s *folderCorpusScanner) walkDirectory(dir, relBase string) error {
 	defer func() { _ = dirFile.Close() }()
 	dirFD := int(dirFile.Fd())
 	separator := string(filepath.Separator)
-	// TODO(perf): each iteration below builds `path := dir + separator
-	// + name` and `rel := relBase + "/" + name` — two string
-	// concatenations allocate per entry. For a walker visiting 100k
-	// entries that's ~200k tiny heap allocs. Go strings are immutable
-	// so the only way to remove the allocs is a per-scanner []byte
-	// buffer reused across entries (truncate-and-append pattern). The
-	// allocation overhead is currently dwarfed by the Fstatat/Lstat
-	// syscalls themselves and by xxhash writes; revisit IF
-	// BenchmarkWalker_PlainFolder_LstatOverhead (plan §J') shows
-	// allocation cost in the same order of magnitude as syscall cost
-	// on the target hardware.
 	for _, entry := range entries {
 		if s.ctx.Err() != nil {
 			return s.ctx.Err()
@@ -453,7 +433,7 @@ func (s *folderCorpusScanner) addFingerprintFile(dirFD int, name, rel string) er
 	}
 	s.candidateCount++
 	if s.candidateCount > maxFolderCandidateFiles {
-		return folderCapError("folder file cap exceeded", "candidate_files", int64(s.candidateCount), maxFolderCandidateFiles)
+		return folderCapError("folder file cap exceeded", indexCapCandidateFiles, int64(s.candidateCount), maxFolderCandidateFiles)
 	}
 	appendFolderFileHash(s.stateHasher, rel, stat.mode, stat.size, stat.mtime, stat.dev, stat.ino)
 	if stat.size > maxIndexedDocumentBytes {
@@ -461,16 +441,7 @@ func (s *folderCorpusScanner) addFingerprintFile(dirFD int, name, rel string) er
 	}
 	s.indexedBytes += stat.size
 	if s.indexedBytes > maxFolderIndexedBytes {
-		// NOTE(unresolved-dev-ex): cap-exceeded currently returns a hard
-		// folderCapError. Open question: should this degrade to a
-		// truncated index + slog.Warn instead? Trade-offs: (1) hard
-		// error surfaces the problem and pushes users to refine search
-		// root, but breaks indexing for sprawling dev parents; (2)
-		// graceful degrade keeps search working with partial coverage
-		// but silently hides data. Tied to maxCorpusIndexedBytes in
-		// caps.go. Revisit once nested-git discovery measures post-
-		// exclusion budget pressure on real user workloads.
-		return folderCapError("folder indexed byte cap exceeded", "indexed_bytes", s.indexedBytes, maxFolderIndexedBytes)
+		return folderCapError("folder indexed byte cap exceeded", indexCapIndexedBytes, s.indexedBytes, maxFolderIndexedBytes)
 	}
 	s.selectedCount++
 	return nil
@@ -483,7 +454,7 @@ func (s *folderCorpusScanner) addSelectedFile(dirFD int, name, path, rel string)
 	}
 	s.candidateCount++
 	if s.candidateCount > maxFolderCandidateFiles {
-		return folderCapError("folder file cap exceeded", "candidate_files", int64(s.candidateCount), maxFolderCandidateFiles)
+		return folderCapError("folder file cap exceeded", indexCapCandidateFiles, int64(s.candidateCount), maxFolderCandidateFiles)
 	}
 	candidate := folderCandidate{
 		name:  rel,
@@ -560,10 +531,10 @@ func isFolderMetadataDir(name string) bool {
 // into the subtree (a corpus took ownership of the content); returns
 // false when the caller should descend as plain folder.
 //
-// Important: only emits the "git-boundary" fingerprint marker when the
-// enqueue succeeded. If the callback rejects the boundary (for example,
-// plan build failure), the walker falls through to plain-folder descent so
-// the subtree's content is NOT silently lost from the indexed set.
+// The callback accepts the boundary when a new or existing pool corpus owns
+// it. Only then does the scanner emit the "git-boundary" fingerprint marker.
+// If no corpus accepts ownership, the walker descends as a plain folder so it
+// does not omit the subtree.
 func (s *folderCorpusScanner) tryDiscoverBoundary(path, rel string) bool {
 	if !s.discoveryEnabled {
 		return false
@@ -593,7 +564,7 @@ func (s *folderCorpusScanner) tryDiscoverBoundary(path, rel string) bool {
 			return false
 		}
 	}
-	slog.Debug("discovery: boundary confirmed, enqueued as git corpus",
+	slog.Debug("discovery: boundary covered by git corpus",
 		"repo", b.RepoDir, "mode", b.Mode)
 	s.emitBoundaryMarker(rel, b)
 	return true
@@ -630,12 +601,8 @@ func (s *folderCorpusScanner) emitBoundaryMarker(rel string, b gitBoundary) {
 	}
 }
 
-// appendBoundaryUintField / appendBoundaryIntField write one labelled
-// numeric field into the boundary marker's hash contribution. Two
-// helpers (signed + unsigned) preserve the pre-helper byte encoding
-// of mtime exactly so cache state hashes are byte-identical to the
-// inline version that previously did strconv.AppendInt/AppendUint
-// directly.
+// appendBoundaryUintField and appendBoundaryIntField write one labeled numeric
+// field using the boundary hash's signed or unsigned decimal encoding.
 func appendBoundaryUintField(h *xxhash.Digest, buf []byte, label string, value uint64) {
 	appendFolderFingerprintPart(h, label)
 	appendFolderFingerprintBytes(h, strconv.AppendUint(buf[:0], value, 10))
@@ -657,11 +624,7 @@ func selectFolderCandidate(
 	}
 	*indexedBytes += candidate.size
 	if *indexedBytes > maxFolderIndexedBytes {
-		// NOTE(unresolved-dev-ex): see the matching note in
-		// folder_indexer.go's addFingerprintFile. Hard error vs
-		// graceful degrade is still an open question; both fail-closed
-		// sites must move together when revisited.
-		return selected, false, folderCapError("folder indexed byte cap exceeded", "indexed_bytes", *indexedBytes, maxFolderIndexedBytes)
+		return selected, false, folderCapError("folder indexed byte cap exceeded", indexCapIndexedBytes, *indexedBytes, maxFolderIndexedBytes)
 	}
 	if !collectSelected {
 		return selected, true, nil
@@ -785,15 +748,11 @@ func scanFolderRootEntriesParallel(
 		appendFolderFingerprintBytes(stateHasher, strconv.AppendUint(numBuf[:0], piece.hash, 10))
 		candidateCount += piece.candidates
 		if candidateCount > maxFolderCandidateFiles {
-			return "", 0, nil, folderCapError("folder file cap exceeded", "candidate_files", int64(candidateCount), maxFolderCandidateFiles)
+			return "", 0, nil, folderCapError("folder file cap exceeded", indexCapCandidateFiles, int64(candidateCount), maxFolderCandidateFiles)
 		}
 		indexedBytes += piece.indexedBytes
 		if indexedBytes > maxFolderIndexedBytes {
-			// NOTE(unresolved-dev-ex): see the matching note in
-			// folder_indexer.go's addFingerprintFile. Hard error vs
-			// graceful degrade is still an open question; both fail-
-			// closed sites must move together when revisited.
-			return "", 0, nil, folderCapError("folder indexed byte cap exceeded", "indexed_bytes", indexedBytes, maxFolderIndexedBytes)
+			return "", 0, nil, folderCapError("folder indexed byte cap exceeded", indexCapIndexedBytes, indexedBytes, maxFolderIndexedBytes)
 		}
 		selectedCount += piece.selected
 		if collectSelected {

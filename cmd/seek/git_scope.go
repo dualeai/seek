@@ -122,11 +122,11 @@ func buildGitScopeSpec(root string, operands []string) (gitScopeSpec, error) {
 	for _, operand := range operands {
 		abs, err := filepath.Abs(operand)
 		if err != nil {
-			return gitScopeSpec{}, fmt.Errorf("resolve path %q: %w", operand, err)
+			return gitScopeSpec{}, newPathOperandError(pathOperandResolve, operand, err)
 		}
 		info, err := os.Stat(abs)
 		if err != nil {
-			return gitScopeSpec{}, fmt.Errorf("read path %q: %w", operand, err)
+			return gitScopeSpec{}, newPathOperandError(pathOperandRead, operand, err)
 		}
 		canonical := canonicalCorpusPath(abs)
 		rel, ok := relWithin(root, canonical)

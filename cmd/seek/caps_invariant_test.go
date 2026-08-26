@@ -2,12 +2,8 @@ package main
 
 import "testing"
 
-// TestCapsInvariants asserts the byte-budget invariants at runtime as a
-// belt-and-suspenders companion to the compile-time guards in caps.go
-// (the `const _ = uint(...)` lines that underflow on violation). The
-// runtime form makes a violation inspectable in test failure logs and
-// catches drift introduced by hand-editing one constant without checking
-// its dependents.
+// TestCapsInvariants mirrors the compile-time byte-budget guards in caps.go
+// and reports the values when a dependent constant changes.
 func TestCapsInvariants(t *testing.T) {
 	t.Run("worker_cap_positive", func(t *testing.T) {
 		if corpusWorkerCap < 1 {
@@ -20,11 +16,8 @@ func TestCapsInvariants(t *testing.T) {
 		}
 	})
 	t.Run("nway_windowed_fit", func(t *testing.T) {
-		// N concurrent consumers each fully-pending plus one in-rotation
-		// reader Acquire. The pre-PR2 formula (window=budget/2) failed
-		// this at corpusWorkerCap≥3 because peak in-flight grew as N²
-		// while budget grew as N. The current formula keeps the peak at
-		// budget/2 + doc, independent of N.
+		// Account for one pending window per consumer and two maximum-sized
+		// documents at the in-flight rotation point.
 		required := corpusWorkerCap*defaultIndexWindowBytes + 2*maxIndexedDocumentBytes
 		if maxInFlightBytes < required {
 			t.Fatalf("N-way windowed-fit: maxInFlightBytes=%d < required=%d (N*window=%d + 2*doc=%d)",

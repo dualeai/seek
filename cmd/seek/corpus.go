@@ -79,7 +79,7 @@ type corpusPlan struct {
 	// userExplicit distinguishes plans the user asked for on the CLI
 	// (failure is fatal) from plans the folder walker discovered via
 	// nested-git detection (failure is logged + skipped). The pool
-	// worker wrapper honours the policy at corpus_pool.go:Enqueue.
+	// owns this policy in corpusPool.handlePlanError.
 	userExplicit bool
 	// discover is the dynamic-enqueue callback the corpusPool installs
 	// on folder plans before invoking the worker. The walker calls
@@ -107,6 +107,35 @@ const (
 	corpusSearchable corpusIndexState = iota
 	corpusKnownEmpty
 )
+
+// searchRootError means that Seek could not infer a Git worktree and the user
+// did not give a path operand. The wrapped Git error remains available to
+// verbose logs.
+type searchRootError struct {
+	cause error
+}
+
+func (e *searchRootError) Error() string {
+	return fmt.Sprintf("resolve default Git search root: %v", e.cause)
+}
+
+func (e *searchRootError) Unwrap() error {
+	return e.cause
+}
+
+func resolveDefaultSearchRoot(ctx context.Context, operands []string) (*gitPaths, error) {
+	if len(operands) > 0 {
+		return nil, nil
+	}
+	paths, err := resolveGitPathsFromCWD(ctx)
+	if err == nil {
+		return &paths, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	return nil, &searchRootError{cause: err}
+}
 
 func planCorpora(ctx context.Context, paths *gitPaths, operands []string) ([]corpusPlan, error) {
 	if len(operands) == 0 {
@@ -192,24 +221,49 @@ type resolvedOperand struct {
 	repo      *gitPaths // owning worktree, or nil when outside any repo
 }
 
+type pathOperandOperation string
+
+const (
+	pathOperandResolve pathOperandOperation = "resolve"
+	pathOperandRead    pathOperandOperation = "read"
+)
+
+// pathOperandError preserves the exact operand and operation while wrapping
+// the file-system cause for errors.Is and verbose logs.
+type pathOperandError struct {
+	operation pathOperandOperation
+	operand   string
+	cause     error
+}
+
+func (e *pathOperandError) Error() string {
+	return fmt.Sprintf("%s path %q: %v", e.operation, e.operand, e.cause)
+}
+
+func (e *pathOperandError) Unwrap() error {
+	return e.cause
+}
+
+func newPathOperandError(operation pathOperandOperation, operand string, cause error) error {
+	return &pathOperandError{operation: operation, operand: operand, cause: cause}
+}
+
 func collectExternalOperands(ctx context.Context, operands []string) (plannedExternalOperands, error) {
 	var result plannedExternalOperands
 
-	// Phase 1 — resolve each operand to its canonical path and owning Git
-	// worktree. A file operand is resolved through its parent directory so a
-	// tracked file routes to its repo exactly like the directory containing
-	// it. Operands inside a repo are grouped by repo root for a single
-	// ignore check below.
+	// Resolve each operand to its canonical path and owning Git worktree. A file
+	// operand is resolved through its parent directory. Group in-repo operands
+	// by repository so visibility needs one Git check per root.
 	resolved := make([]resolvedOperand, 0, len(operands))
 	pathsByRepo := make(map[string][]string)
 	for _, operand := range operands {
 		abs, err := filepath.Abs(operand)
 		if err != nil {
-			return result, fmt.Errorf("resolve path %q: %w", operand, err)
+			return result, newPathOperandError(pathOperandResolve, operand, err)
 		}
 		info, err := os.Stat(abs)
 		if err != nil {
-			return result, fmt.Errorf("read path %q: %w", operand, err)
+			return result, newPathOperandError(pathOperandRead, operand, err)
 		}
 		if !info.IsDir() && !info.Mode().IsRegular() {
 			return result, fmt.Errorf("unsupported path operand: %s", operand)
@@ -236,10 +290,8 @@ func collectExternalOperands(ctx context.Context, operands []string) (plannedExt
 		resolved = append(resolved, ro)
 	}
 
-	// Phase 2 — one ignore check per repo root decides, for every in-repo
-	// operand, whether the Git index covers it (route to the scoped Git
-	// corpus) or a .gitignore rule excludes it (fall back to a folder/file
-	// corpus so its content is still searched).
+	// Classify each in-repo operand. Visible paths use the scoped Git corpus;
+	// ignored paths use a folder or file corpus so their content stays visible.
 	vis := make(map[string]visibility)
 	for repoRoot, paths := range pathsByRepo {
 		decided, err := classifyVisibility(ctx, repoRoot, paths)
@@ -251,9 +303,8 @@ func collectExternalOperands(ctx context.Context, operands []string) (plannedExt
 		}
 	}
 
-	// Phase 3 — route. A file and a directory inside a worktree take the
-	// same decision; only the nested-Git discovery walk is directory-only
-	// (a file has no children).
+	// Create corpus plans. Files and directories use the same visibility rule;
+	// only directories can discover nested Git worktrees.
 	external := make(map[string]externalRoot)
 	externalGit := make(map[string]*externalGitRoot)
 	for _, ro := range resolved {
@@ -740,11 +791,9 @@ func planCurrentGitCorpusWithExclusions(paths gitPaths, operands, excludes []str
 		return corpusPlan{}, err
 	}
 	if dirtyScope != nil {
-		// Path C: a scoped search reuses the SAME combined whole-repo index as
-		// an unscoped search (plan.id stays the base repo id) and filters via
-		// plan.scope at search time. dirtyScope is retained only to build/key
-		// the over-cap fallback — a sibling corpus, never the main id, used only
-		// when the whole repo exceeds the index caps.
+		// A scoped search reuses the combined whole-repo index and applies
+		// plan.scope at search time. dirtyScope only keys and builds the separate
+		// fallback used when the whole repository exceeds an index cap.
 		plan.dirtyScope = dirtyScope
 		fallback, err := buildGitCorpusPlan(paths.RepoDir, paths.CommonDir, "git_scope_fallback", dirtyScope.key)
 		if err != nil {

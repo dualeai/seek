@@ -133,9 +133,8 @@ func discardBuildDir(buildDir string) {
 // section, so they observe the new shards and the new state together — never new
 // shards with stale state (which an unlocked state write after the swap could
 // expose: an aborted generation's shards under a stale-matching state label).
-// writeState runs only after a successful swap and is skipped on errCorpusEvicted
-// (the corpus was gc-evicted during the lock-free build, so the build is
-// discarded).
+// writeState runs only after a successful swap. It is skipped when GC removes
+// the corpus during a build outside the publish lock. The build is discarded.
 func publishGeneration(ctx context.Context, cacheDir, indexDir, buildDir string, fam shardFamily, writeState func() error) error {
 	pub, err := acquirePublishLock(ctx, cacheDir)
 	if err != nil {
@@ -143,8 +142,8 @@ func publishGeneration(ctx context.Context, cacheDir, indexDir, buildDir string,
 	}
 	defer releaseLock(pub)
 
-	// Corpus may have been evicted (renamed to trash) during the lock-free
-	// build even though our build-lock fd survived the rename.
+	// Corpus may have been evicted (renamed to trash) while the build ran
+	// outside the publish lock, even though its build-lock fd survived.
 	if _, err := os.Stat(indexDir); err != nil {
 		if os.IsNotExist(err) {
 			return errCorpusEvicted

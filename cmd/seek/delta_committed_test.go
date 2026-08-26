@@ -17,7 +17,7 @@ import (
 // repoUncommitted to let callers assert on shard accumulation.
 func reindexGit(t *testing.T, ctx context.Context, paths gitPaths, plan corpusPlan) {
 	t.Helper()
-	state := gitRepoStateIn(ctx, paths.RepoDir)
+	state := mustGitRepoStateIn(t, ctx, paths.RepoDir)
 	hash := gitCorpusStateHash(paths, state)
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, hash); err != nil {
 		t.Fatalf("runIndexingWithCache: %v", err)
@@ -377,7 +377,11 @@ func TestDeltaCommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 			}
 			gitRun(t, dir, "add", ".")
 			gitRun(t, dir, "commit", "-m", fmt.Sprintf("step %d", i))
-			state := gitRepoStateIn(ctx, dir)
+			state, err := gitRepoStateIn(ctx, dir)
+			if err != nil {
+				t.Errorf("read repository state: %v", err)
+				return
+			}
 			hash := gitCorpusStateHash(paths, state)
 			if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, hash); err != nil {
 				t.Errorf("reindex: %v", err)
