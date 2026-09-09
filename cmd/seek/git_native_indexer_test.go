@@ -154,7 +154,7 @@ func TestNativeGitSHA256FullAndDelta(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	delta, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.indexDir, target, scan)
+	delta, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.cacheDir, plan.indexDir, target, scan)
 	if err != nil || !eligible {
 		t.Fatalf("prepare SHA-256 delta: eligible=%t error=%v", eligible, err)
 	}

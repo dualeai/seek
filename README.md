@@ -98,9 +98,9 @@ brew install universal-ctags       # macOS
 sudo apt-get install universal-ctags  # Linux
 ```
 
-Git is required for Git-backed searches. **Git 2.31+** is required for
-[`git worktree`](https://git-scm.com/docs/git-worktree) setups. On older Git
-versions, normal repositories still work.
+Git 2.36 or later is required for Git-backed searches. Seek uses the buffered
+[`git cat-file --batch-command`](https://git-scm.com/docs/git-cat-file)
+protocol added in Git 2.36 for normal repositories and `git worktree` setups.
 
 The re-ranker does not need a model download, an ONNX Runtime install, or an ML
 service. The executable contains those resources. Release archives support
@@ -351,11 +351,27 @@ filtered results with context.
 
 Seek has one reader for committed Git data. Normal full indexing, committed
 delta indexing, and scoped full indexing all use Git plumbing with captured
-full object IDs. `git ls-tree` lists files, `git cat-file --batch-check` reads
-sizes, `git cat-file --batch` reads approved blob bodies, and `git diff-tree`
-lists changed paths for eligible deltas. These commands provide documents to
+full object IDs. `git ls-tree` lists files. During a full or scoped full scan,
+one buffered `git cat-file --batch-command` session reads sizes and approved
+blob bodies. `git diff-tree` lists changed paths for eligible deltas. A delta
+uses the same checked protocol in separate bounded phases for its ignore file,
+blob sizes, and blob bodies. These commands provide documents to
 `zoekt/index.Builder`, which writes shards in the staging directory. There is
 no go-git, `zoekt/gitindex`, or other committed-data fallback.
+
+A normal whole-repository full build saves its candidate count, indexed byte
+count, commit, and base shard count. Before a delta, Seek checks the target root
+`.sourcegraph/ignore` file. Delta budget admission then checks only the old and
+new blobs from `git diff-tree` and updates the saved totals. The 64-shard value
+is a pre-admission threshold for shards added after the full base, not a hard
+maximum for the resulting family. A large full index can therefore use deltas.
+After the added-shard count goes above 64, the next update selects compaction.
+
+Seek does not reduce index quality to save memory. It sends every supported
+file up to 100 MiB through the same content and symbol-analysis path. A file
+larger than one normal shard still gets full content and ctags analysis. Seek
+only limits large shard and ctags jobs to three at a time across active
+corpora.
 
 Git is the data format and object source. Its hosting service does not select
 index behavior or metadata policy. An origin URL does not change repository
@@ -372,7 +388,8 @@ Indexes are stored centrally in the user cache, never inside searched folders:
 
 - macOS: `~/Library/Caches/seek/corpora/<id>/`
 - Linux: `${XDG_CACHE_HOME:-$HOME/.cache}/seek/corpora/<id>/`
-- Index files live in `index/`; `.state`, `.head`, and `.lock` live next to it.
+- Index files live in `index/`; `.state`, `.head`, `.git-committed-v1`, and
+  `.lock` live next to it.
 
 The re-ranker stores only its extracted runtime under
 `<seek-cache>/reranker/1.29.0/<sha256>/`. The model and tokenizer stay in the
@@ -384,11 +401,13 @@ inside Git repos. Files larger than 100 MiB are skipped, and folder scans stop
 at 1,000,000 candidate files or 10 GiB of indexed bytes.
 
 Git applies the 10,000,000-file and 10 GiB work limits separately to its
-committed and working-tree index families. The committed family counts
-candidate blob sizes before `.sourcegraph/ignore` filtering. The working-tree
-family counts selected regular-file content. If the full repository exceeds a
-limit, a scoped search can build a combined fallback for its selected paths.
-An unscoped search reports the limit error.
+committed and working-tree index families. The committed family counts all
+candidate blobs. Its byte total includes candidate blobs at or below the
+100 MiB document limit. It calculates both totals before
+`.sourcegraph/ignore` filtering. The working-tree family counts selected
+regular-file content. If the full repository exceeds a limit, a scoped search
+can build a combined fallback for its selected paths. An unscoped search
+reports the limit error.
 
 ### Cache maintenance
 
@@ -416,8 +435,9 @@ seek gc --all                   # evict every corpus not actively in use
 
 ### Benchmarks
 
-Latest field benchmarks, generated on Apple M1 Max / macOS with
-`./cicd/bench-field.sh --keep` on 2026-06-21:
+Pre-cutover field benchmarks, generated on Apple M1 Max / macOS with
+`./cicd/bench-field.sh --keep` on 2026-06-21. The Git rows use the former
+go-git committed reader; the folder rows are not part of that reader change:
 
 | Kind | Workload | Files | Cold index | Warm search | Dirty 1% | Dirty 10% |
 |------|----------|-------|------------|-------------|----------|-----------|

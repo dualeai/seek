@@ -14,10 +14,40 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sourcegraph/zoekt/ignore"
 	"github.com/sourcegraph/zoekt/index"
 )
 
 const nativeTestOID = "0123456789abcdef0123456789abcdef01234567"
+
+var (
+	parsedTreeEntrySink gitTreeEntry
+	parsedBatchSizeSink int64
+)
+
+func TestNativeGitRecordParserAllocations(t *testing.T) {
+	treeRecord := []byte("100644 blob " + nativeTestOID + "\tpath/to/file.go\x00")
+	if allocs := testing.AllocsPerRun(1000, func() {
+		entry, err := parseNativeGitTreeRecord(treeRecord)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsedTreeEntrySink = entry
+	}); allocs > 2 {
+		t.Fatalf("tree parser allocations=%g, want at most 2", allocs)
+	}
+
+	batchHeader := []byte(nativeTestOID + " blob 12345")
+	if allocs := testing.AllocsPerRun(1000, func() {
+		size, err := parseNativeGitBatchHeader(batchHeader, gitObjectID(nativeTestOID), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsedBatchSizeSink = size
+	}); allocs != 0 {
+		t.Fatalf("batch parser allocations=%g, want 0", allocs)
+	}
+}
 
 func installFakeGit(t *testing.T) {
 	t.Helper()
@@ -26,7 +56,37 @@ func installFakeGit(t *testing.T) {
 	}
 	binDir := t.TempDir()
 	script := `#!/bin/sh
+read_object_command() {
+  IFS=' ' read -r verb object
+}
 case "$FAKE_GIT_MODE" in
+	version_old)
+		printf 'git version 2.35.9\n'
+		exit 0
+		;;
+	version_minimum)
+		printf 'git version 2.36.0\n'
+		exit 0
+		;;
+	version_newer)
+		printf 'git version 3.0.1\n'
+		exit 0
+		;;
+	batch_session_valid)
+		read_object_command
+		test "$verb" = info || exit 65
+		id=$object
+		IFS= read -r flush
+		test "$flush" = flush || exit 66
+		printf '%s blob 3\n' "$id"
+		read_object_command
+		test "$verb" = contents || exit 67
+		test "$object" = "$id" || exit 68
+		IFS= read -r flush
+		test "$flush" = flush || exit 69
+		printf '%s blob 3\nabc\n' "$id"
+		exit 0
+		;;
   valid_then_fail)
     printf '100644 blob 0123456789abcdef0123456789abcdef01234567\tfile.go\0'
     printf 'FIRST_GIT_ERROR\n' >&2
@@ -51,44 +111,53 @@ case "$FAKE_GIT_MODE" in
     while :; do :; done
     ;;
   batch_check_wrong_id)
-    IFS= read -r id
+    read_object_command
     printf '1123456789abcdef0123456789abcdef01234567 blob 3\n'
     ;;
   batch_check_wrong_type)
-    IFS= read -r id
-    printf '%s tree 3\n' "$id"
+    read_object_command
+    printf '%s tree 3\n' "$object"
     ;;
   batch_check_invalid_size)
-    IFS= read -r id
-    printf '%s blob -1\n' "$id"
+    read_object_command
+    printf '%s blob -1\n' "$object"
     ;;
   batch_check_overflow)
-    IFS= read -r id
-    printf '%s blob 999999999999999999999999999999999999\n' "$id"
+    read_object_command
+    printf '%s blob 999999999999999999999999999999999999\n' "$object"
     ;;
   batch_check_limits)
-    IFS= read -r first
-    IFS= read -r second
+    read_object_command
+    first=$object
+    read_object_command
+    second=$object
     printf '%s blob 104857600\n' "$first"
     printf '%s blob 104857601\n' "$second"
     exit 0
     ;;
+	batch_check_oversize)
+		read_object_command
+		IFS= read -r flush
+		test "$flush" = flush || exit 70
+		printf '%s blob 104857601\n' "$object"
+		exit 0
+		;;
   batch_check_missing)
-    IFS= read -r id
-    printf '%s missing\n' "$id"
+    read_object_command
+    printf '%s missing\n' "$object"
     ;;
   batch_check_extra)
-    IFS= read -r id
-    printf '%s blob 3\nEXTRA\n' "$id"
+    read_object_command
+    printf '%s blob 3\nEXTRA\n' "$object"
     ;;
   batch_check_nonzero)
-    IFS= read -r id
-    printf '%s blob 3\n' "$id"
+    read_object_command
+    printf '%s blob 3\n' "$object"
     printf 'late batch failure\n' >&2
     exit 9
     ;;
   batch_check_long_header)
-    IFS= read -r id
+    read_object_command
     i=0
     while [ "$i" -lt 600 ]; do printf x; i=$((i + 1)); done
     printf '\n'
@@ -99,30 +168,30 @@ case "$FAKE_GIT_MODE" in
       printf '0123456789abcdef0123456789abcdef01234567 blob 3\n'
       i=$((i + 1))
     done
-    while IFS= read -r id; do :; done
+    while IFS= read -r line; do :; done
     exit 0
     ;;
   batch_content_truncated)
-    IFS= read -r id
-    printf '%s blob 3\nab' "$id"
+    read_object_command
+    printf '%s blob 3\nab' "$object"
     ;;
   batch_content_bad_delimiter)
-    IFS= read -r id
-    printf '%s blob 3\nabcX' "$id"
+    read_object_command
+    printf '%s blob 3\nabcX' "$object"
     ;;
   batch_content_extra)
-    IFS= read -r id
-    printf '%s blob 3\nabc\nEXTRA' "$id"
+    read_object_command
+    printf '%s blob 3\nabc\nEXTRA' "$object"
     ;;
   batch_content_nonzero)
-    IFS= read -r id
-    printf '%s blob 3\nabc\n' "$id"
+    read_object_command
+    printf '%s blob 3\nabc\n' "$object"
     printf 'late content failure\n' >&2
     exit 11
     ;;
   batch_content_wrong_size)
-    IFS= read -r id
-    printf '%s blob 4\nabcd\n' "$id"
+    read_object_command
+    printf '%s blob 4\nabcd\n' "$object"
     ;;
   batch_content_blocked_pipes)
     i=0
@@ -130,7 +199,7 @@ case "$FAKE_GIT_MODE" in
       printf '0123456789abcdef0123456789abcdef01234567 blob 3\nabc\n'
       i=$((i + 1))
     done
-    while IFS= read -r id; do :; done
+    while IFS= read -r line; do :; done
     exit 0
     ;;
   diff_valid_then_fail)
@@ -155,6 +224,34 @@ exit 64
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir)
+}
+
+func TestNativeGitBatchSessionFramesInfoContentsAndFlush(t *testing.T) {
+	installFakeGit(t)
+	t.Setenv("FAKE_GIT_MODE", "batch_session_valid")
+	batch, err := startNativeGitBatch(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := fakeTreeEntry(nativeTestOID)
+	infos, err := batch.check([]gitTreeEntry{entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var content []byte
+	if err := batch.read(infos, func(document fileContent) error {
+		content = append([]byte(nil), document.content...)
+		readSemaphore.Release(document.weight)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.close(); err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "abc" {
+		t.Fatalf("content=%q, want abc", content)
+	}
 }
 
 func requireProcessGone(t *testing.T, pidFile string) {
@@ -203,6 +300,36 @@ func TestParseGitObjectID(t *testing.T) {
 			t.Fatalf("parse %q succeeded", invalid)
 		}
 	}
+}
+
+func TestRequireNativeGitVersion(t *testing.T) {
+	for _, tc := range []struct {
+		mode    string
+		wantErr bool
+	}{
+		{mode: "version_old", wantErr: true},
+		{mode: "version_minimum"},
+		{mode: "version_newer"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			installFakeGit(t)
+			t.Setenv("FAKE_GIT_MODE", tc.mode)
+			err := requireNativeGitVersion(t.Context(), t.TempDir())
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error=%v, want error=%t", err, tc.wantErr)
+			}
+			if tc.wantErr && !strings.Contains(err.Error(), "Git 2.36 or later") {
+				t.Fatalf("error=%q does not state the Git floor", err)
+			}
+		})
+	}
+	t.Run("unavailable", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		err := requireNativeGitVersion(t.Context(), t.TempDir())
+		if !errors.Is(err, exec.ErrNotFound) {
+			t.Fatalf("error=%v, want Git executable failure", err)
+		}
+	})
 }
 
 func TestParseNativeGitTreeRecordModesAndBytePaths(t *testing.T) {
@@ -370,7 +497,7 @@ func fakeTreeEntry(oid string) gitTreeEntry {
 	return gitTreeEntry{mode: "100644", oid: gitObjectID(oid), path: "file.go"}
 }
 
-func TestCheckNativeGitBlobsUsesBoundedChildrenAndAcceptsDuplicates(t *testing.T) {
+func TestCheckNativeGitBlobsUsesBoundedChunksAndAcceptsDuplicates(t *testing.T) {
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
 	path := filepath.Join(repoDir, "blob")
@@ -416,7 +543,7 @@ func TestCheckNativeGitBlobReplyFailures(t *testing.T) {
 			t.Setenv("FAKE_GIT_MODE", mode)
 			_, err := checkNativeGitBlobChunk(t.Context(), t.TempDir(), []gitTreeEntry{fakeTreeEntry(nativeTestOID)})
 			if err == nil {
-				t.Fatal("malformed batch-check reply succeeded")
+				t.Fatal("malformed cat-file info reply succeeded")
 			}
 		})
 	}
@@ -436,6 +563,25 @@ func TestCheckNativeGitBlobExactLimitAndOversize(t *testing.T) {
 	if len(infos) != 2 || infos[0].size != maxIndexedDocumentBytes || infos[0].oversize ||
 		infos[1].size != maxIndexedDocumentBytes+1 || !infos[1].oversize {
 		t.Fatalf("blob limits=%+v", infos)
+	}
+}
+
+func TestScanNativeGitDeltaChangesCountsOversizeWithoutBytes(t *testing.T) {
+	installFakeGit(t)
+	t.Setenv("FAKE_GIT_MODE", "batch_check_oversize")
+	base := gitIndexBudget{candidates: 7, indexedBytes: 99}
+	diff := []gitDiffEntry{{
+		newMode: "100644",
+		newOID:  gitObjectID(nativeTestOID),
+		newPath: "oversize.bin",
+	}}
+	infos, got, consistent, err := scanNativeGitDeltaChanges(t.Context(), t.TempDir(), &ignore.Matcher{}, diff, base)
+	if err != nil || !consistent {
+		t.Fatalf("scan oversize delta: consistent=%t error=%v", consistent, err)
+	}
+	want := gitIndexBudget{candidates: 8, indexedBytes: 99}
+	if got != want || len(infos) != 1 || !infos[0].oversize || infos[0].entry.path != "oversize.bin" {
+		t.Fatalf("budget=%+v infos=%+v, want budget=%+v and one oversize file", got, infos, want)
 	}
 }
 
@@ -589,7 +735,7 @@ func TestParseNativeGitDiffHeader(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if entry.oldMode != test.oldMode || entry.newMode != test.newMode || entry.newOID.String() != test.newOID || entry.oldPath != "a\tpath\n.go" {
+		if entry.oldMode != test.oldMode || entry.newMode != test.newMode || entry.oldOID.String() != test.oldOID || entry.newOID.String() != test.newOID || entry.oldPath != "a\tpath\n.go" {
 			t.Fatalf("entry=%+v", entry)
 		}
 	}

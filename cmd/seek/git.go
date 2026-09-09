@@ -318,6 +318,10 @@ func gitVersionAtLeast(ctx context.Context, dir string, major, minor int) bool {
 	if err != nil {
 		return false
 	}
+	return gitVersionOutputAtLeast(out, major, minor)
+}
+
+func gitVersionOutputAtLeast(out []byte, major, minor int) bool {
 	// Parse "git version 2.43.0" or "git version 2.43.0.windows.1"
 	s := strings.TrimSpace(string(out))
 	s = strings.TrimPrefix(s, "git version ")

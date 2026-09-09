@@ -24,6 +24,9 @@ func TestTempSwap_RecoversFromIncompleteSwap(t *testing.T) {
 	if files, err := runSeekInPlannedGitCorpus(ctx, "RECOVER_MARKER", paths, plan); err != nil || len(files) == 0 {
 		t.Fatalf("initial build: files=%v err=%v", files, err)
 	}
+	if _, ok := readCommittedGitState(plan.cacheDir); !ok {
+		t.Fatal("initial build did not publish committed Git state")
+	}
 
 	// Simulate an interrupted swap: drop a .swapping marker for the committed
 	// family. recoverIncompleteSwap should clean committed shards + clear state
@@ -41,6 +44,10 @@ func TestTempSwap_RecoversFromIncompleteSwap(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(plan.cacheDir, swappingMarkerFile)); !os.IsNotExist(err) {
 		t.Fatalf("swapping marker should be cleared after recovery, stat err=%v", err)
+	}
+	recovered, ok := readCommittedGitState(plan.cacheDir)
+	if !ok || recovered.head.String() != gitOutputIn(t, dir, "rev-parse", "HEAD") {
+		t.Fatalf("recovered committed Git state=%+v ok=%t", recovered, ok)
 	}
 }
 

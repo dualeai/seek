@@ -55,6 +55,10 @@ const (
 	// shardMax is the maximum corpus size (in bytes) per zoekt shard.
 	// Smaller shards let Zoekt build more shards concurrently.
 	shardMax = 10 * 1024 * 1024 // 10 MB
+	// largeDocumentParallelism bounds concurrent shard and ctags jobs when one
+	// document is larger than a normal shard. Seek does not reduce index quality
+	// for these files: it still indexes full content and runs symbol analysis.
+	largeDocumentParallelism = 3
 )
 
 // computeStateHash computes the xxHash64 of the given state string.
@@ -129,7 +133,7 @@ func repoStateFingerprint(repoDir string, state repoState) string {
 	return b.String()
 }
 
-// readCacheFile reads a single-line cached value from cacheDir/name.
+// readCacheFile reads small cached text and removes outer white space.
 func readCacheFile(cacheDir, name string) string {
 	data, err := os.ReadFile(filepath.Join(cacheDir, name))
 	if err != nil {
@@ -170,7 +174,7 @@ func deleteEmptyStateFiles(cacheDir string) {
 	_ = os.Remove(filepath.Join(cacheDir, emptyFile+".tmp"))
 }
 
-// deleteStateFiles removes .state, .head, .empty, and their tmp files.
+// deleteStateFiles removes all cached publication state and its tmp files.
 // Clearing .head alongside .state ensures that a failed or drifted
 // indexing cycle forces a full re-index (including committed) on the
 // next invocation, rather than relying on a potentially stale .head
@@ -181,6 +185,7 @@ func deleteStateFiles(cacheDir string) {
 	_ = os.Remove(filepath.Join(cacheDir, headFile))
 	_ = os.Remove(filepath.Join(cacheDir, headFile+".tmp"))
 	deleteEmptyStateFiles(cacheDir)
+	deleteCommittedGitState(cacheDir)
 }
 
 // indexParallelism returns the number of parallel indexing workers.
@@ -196,6 +201,8 @@ func indexParallelism() int {
 }
 
 func indexBuildOptions(indexDir string, parallelism int) index.Options {
+	// Keep the same content and ctags contract for every accepted document.
+	// Large-file controls can change only Builder scheduling and parallelism.
 	return index.Options{
 		IndexDir:         indexDir,
 		SizeMax:          maxIndexedDocumentBytes,
@@ -305,6 +312,7 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	defer func() {
 		_ = os.Remove(filepath.Join(cacheDir, stateTmpFile))
 		_ = os.Remove(filepath.Join(cacheDir, headFile+".tmp"))
+		_ = os.Remove(filepath.Join(cacheDir, committedGitStateFile+".tmp"))
 	}()
 
 	buildFd, acquired, err := acquireBuildLock(ctx, cacheDir, indexDir)
@@ -359,6 +367,7 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	// repository publishes an empty family so shards from its former HEAD cannot
 	// remain searchable.
 	var buildDir string
+	var nextCommittedState *committedGitState
 	if needCommitted || clearCommitted {
 		buildDir, err = newBuildDir(indexDir)
 		if err != nil {
@@ -375,12 +384,30 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 			deleteStateFiles(cacheDir)
 			return gitCorpusError(repoDir, indexDir, cErr)
 		}
-		delta, eligible, cErr := prepareNativeGitDelta(ctx, repoDir, indexDir, snapshot, sc)
+		delta, eligible, cErr := prepareNativeGitDelta(ctx, repoDir, cacheDir, indexDir, snapshot, sc)
 		if cErr == nil {
 			if eligible {
 				cErr = indexNativeGitDelta(ctx, repoDir, buildDir, sc.paths(familyCommitted), delta)
+				if cErr == nil {
+					state := delta.nextState
+					nextCommittedState = &state
+				}
 			} else {
-				cErr = indexNativeGitFull(ctx, repoDir, buildDir, snapshot, nil, parallelism)
+				var budget gitIndexBudget
+				budget, cErr = indexNativeGitFullWithBudget(ctx, repoDir, buildDir, snapshot, nil, parallelism)
+				if cErr == nil {
+					buildScan, scanErr := scanFamily(buildDir)
+					if scanErr != nil {
+						cErr = scanErr
+					} else {
+						nextCommittedState = &committedGitState{
+							head:       snapshot.commitOID,
+							baseHead:   snapshot.commitOID,
+							budget:     budget,
+							baseShards: nativeCommittedShardCount(buildScan),
+						}
+					}
+				}
 			}
 		}
 		if cErr != nil {
@@ -465,6 +492,7 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 		// This process changed the directory, so scan it again.
 		post, postErr := scanFamily(indexDir)
 		if postErr != nil {
+			deleteStateFiles(cacheDir)
 			return postErr
 		}
 		finalHasShard := post.hasShard()
@@ -474,18 +502,34 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 			}
 		}
 		if err := writeFamilyManifest(indexDir, names); err != nil {
+			deleteStateFiles(cacheDir)
 			return fmt.Errorf("write family manifest: %w", err)
 		}
+		if needCommitted {
+			if nextCommittedState == nil {
+				deleteStateFiles(cacheDir)
+				return fmt.Errorf("committed Git build did not return publication state")
+			}
+			if err := writeCommittedGitState(cacheDir, *nextCommittedState); err != nil {
+				deleteStateFiles(cacheDir)
+				return fmt.Errorf("write committed Git state: %w", err)
+			}
+		} else if clearCommitted {
+			deleteCommittedGitState(cacheDir)
+		}
 		if err := writeStateFile(cacheDir, preState); err != nil {
+			deleteStateFiles(cacheDir)
 			return fmt.Errorf("write state file: %w", err)
 		}
 		if finalHasShard {
 			deleteEmptyStateFiles(cacheDir)
 		} else if err := writeEmptyStateFile(cacheDir, preState); err != nil {
+			deleteStateFiles(cacheDir)
 			return fmt.Errorf("write empty state file: %w", err)
 		}
 		// Persist HEAD so working-tree-only changes skip the committed indexer.
 		if err := writeHeadFile(cacheDir, state.HeadSHA); err != nil {
+			deleteStateFiles(cacheDir)
 			slog.Warn("Failed to write head file", "error", err)
 		}
 	} else {
@@ -538,8 +582,11 @@ func shardsExist(indexDir string) bool {
 	return err == nil && present
 }
 
-// maxCommittedDeltaShards bounds delta-stacked committed shards before Seek
-// selects a native full build. It matches maxFolderDeltaShards.
+// maxCommittedDeltaShards is the pre-admission threshold for shards added after
+// the last committed full build. This shard check permits a delta when the
+// existing added count equals this value, so that delta can take the family
+// above the threshold. The next update selects a native full build. This value
+// does not limit the full base shard count. It matches maxFolderDeltaShards.
 const maxCommittedDeltaShards = 64
 
 // fallbackGitRepositoryName returns the default opaque name for committed Git
@@ -912,8 +959,11 @@ func indexDocuments(
 }
 
 // indexDocumentsWithRepository consumes fileContent through rotating Builder
-// windows. It calls Finish when a window's document weight reaches or passes
-// indexWindowBytes, then releases that weight to readSemaphore. See fileContent
+// windows. It calls Finish when a normal window reaches indexWindowBytes.
+// Documents larger than shardMax use separate windows and a global concurrency
+// limit. This scheduling rule does not change content or symbol indexing. It
+// releases Builder-owned document weight after Finish and releases documents
+// that no Builder accepted as soon as their error path ends. See fileContent
 // for ownership.
 //
 // Window 0 uses IsDelta=false, so Finish prunes stale shards. Later windows use
@@ -927,17 +977,25 @@ func indexDocumentsWithRepository(
 	parallelism int,
 	cancelProducer context.CancelFunc,
 ) (bool, error) {
+	largeParallelism := min(max(parallelism, 1), largeDocumentParallelism)
 	var current *index.Builder
 	var pendingWeight int64
 	var addErr error
 	indexedAny := false
 	openedWindows := 0
+	currentLarge := false
+	largeDocuments := 0
+	var largeReservations int64
 
-	openWindow := func(isDelta bool) error {
+	openWindow := func(isDelta, large bool) error {
 		if err := checkCtagsCached(); err != nil {
 			return err
 		}
-		opts := indexBuildOptions(indexDir, parallelism)
+		builderParallelism := parallelism
+		if large {
+			builderParallelism = largeParallelism
+		}
+		opts := indexBuildOptions(indexDir, builderParallelism)
 		opts.RepositoryDescription = repository
 		opts.IsDelta = isDelta
 		b, err := index.NewBuilder(opts)
@@ -945,6 +1003,8 @@ func indexDocumentsWithRepository(
 			return fmt.Errorf("create builder: %w", err)
 		}
 		current = b
+		currentLarge = large
+		largeDocuments = 0
 		openedWindows++
 		indexedAny = true
 		return nil
@@ -964,7 +1024,13 @@ func indexDocumentsWithRepository(
 			readSemaphore.Release(pendingWeight)
 			pendingWeight = 0
 		}
+		if largeReservations > 0 {
+			largeDocumentSemaphore.Release(largeReservations)
+			largeReservations = 0
+		}
 		current = nil
+		currentLarge = false
+		largeDocuments = 0
 		return err
 	}
 
@@ -995,8 +1061,52 @@ func indexDocumentsWithRepository(
 			continue
 		}
 
+		large := len(doc.content) > shardMax
+		if current != nil && large != currentLarge {
+			if err := finishWindow(); err != nil {
+				if cancelProducer != nil {
+					cancelProducer()
+				}
+				if doc.weight > 0 {
+					readSemaphore.Release(doc.weight)
+				}
+				drainRemaining()
+				return indexedAny, err
+			}
+		}
+		if large {
+			if current != nil && !largeDocumentSemaphore.TryAcquire(1) {
+				if err := finishWindow(); err != nil {
+					if cancelProducer != nil {
+						cancelProducer()
+					}
+					if doc.weight > 0 {
+						readSemaphore.Release(doc.weight)
+					}
+					drainRemaining()
+					return indexedAny, err
+				}
+			}
+			if current == nil {
+				if err := largeDocumentSemaphore.Acquire(ctx, 1); err != nil {
+					if cancelProducer != nil {
+						cancelProducer()
+					}
+					if doc.weight > 0 {
+						readSemaphore.Release(doc.weight)
+					}
+					drainRemaining()
+					return indexedAny, err
+				}
+			}
+			largeReservations++
+		}
 		if current == nil {
-			if err := openWindow(openedWindows > 0); err != nil {
+			if err := openWindow(openedWindows > 0, large); err != nil {
+				if largeReservations > 0 {
+					largeDocumentSemaphore.Release(largeReservations)
+					largeReservations = 0
+				}
 				if cancelProducer != nil {
 					cancelProducer()
 				}
@@ -1008,9 +1118,12 @@ func indexDocumentsWithRepository(
 			}
 		}
 
-		// Zoekt's Builder.Add buffers doc into b.todo before any error
-		// return, so doc.weight stays the window's responsibility either
-		// way and is Released by finishWindow.
+		// Quality invariant: file size changes scheduling only. Do not set
+		// Document.Symbols to a non-nil empty slice or disable ctags for a large
+		// document. Either action would make sym: results depend on file size.
+		// Zoekt's Builder.Add buffers doc into b.todo before any error return, so
+		// doc.weight stays the window's responsibility either way and is Released
+		// by finishWindow.
 		pendingWeight += doc.weight
 		if err := current.Add(index.Document{
 			Name:       doc.name,
@@ -1024,8 +1137,11 @@ func indexDocumentsWithRepository(
 			}
 			continue
 		}
+		if large {
+			largeDocuments++
+		}
 
-		if pendingWeight >= indexWindowBytes {
+		if pendingWeight >= indexWindowBytes || (currentLarge && largeDocuments >= largeParallelism) {
 			if err := finishWindow(); err != nil {
 				if cancelProducer != nil {
 					cancelProducer()

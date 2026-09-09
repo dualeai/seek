@@ -22,6 +22,11 @@ type gitSnapshot struct {
 	commitTime time.Time
 }
 
+type nativeGitStreamResult struct {
+	budget gitIndexBudget
+	err    error
+}
+
 // captureGitSnapshot verifies a full SHA-1 or SHA-256 commit ID and reads its
 // committer time. The "no-head" value returns ok=false without an error.
 func captureGitSnapshot(ctx context.Context, repoDir, captured string) (gitSnapshot, bool, error) {
@@ -201,18 +206,35 @@ func readNativeGitIgnore(ctx context.Context, repoDir string, snapshot gitSnapsh
 	if entry == nil {
 		return &ignore.Matcher{}, nil
 	}
-	var info gitBlobInfo
-	if err := checkNativeGitBlobs(ctx, repoDir, []gitTreeEntry{*entry}, func(infos []gitBlobInfo) error {
-		info = infos[0]
-		return nil
-	}); err != nil {
+	batch, err := startNativeGitBatch(ctx, repoDir)
+	if err != nil {
+		return nil, fmt.Errorf("start .sourcegraph/ignore object reader: %w", err)
+	}
+	matcher, readErr := readNativeGitIgnoreEntry(batch, entry)
+	closeErr := batch.close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("finish .sourcegraph/ignore object reader: %w", closeErr)
+	}
+	return matcher, nil
+}
+
+func readNativeGitIgnoreEntry(batch *nativeGitBatch, entry *gitTreeEntry) (*ignore.Matcher, error) {
+	if entry == nil {
+		return &ignore.Matcher{}, nil
+	}
+	infos, err := batch.check([]gitTreeEntry{*entry})
+	if err != nil {
 		return nil, fmt.Errorf("check .sourcegraph/ignore: %w", err)
 	}
+	info := infos[0]
 	if info.oversize {
 		return nil, fmt.Errorf(".sourcegraph/ignore exceeds the %d-byte document limit", maxIndexedDocumentBytes)
 	}
 	var matcher *ignore.Matcher
-	if err := readNativeGitBlobs(ctx, repoDir, []gitBlobInfo{info}, func(document fileContent) error {
+	if err := batch.read([]gitBlobInfo{info}, func(document fileContent) error {
 		parsed, parseErr := ignore.ParseIgnoreFile(bytes.NewReader(document.content))
 		if parseErr != nil {
 			return parseErr
@@ -233,14 +255,25 @@ func streamNativeGitDocuments(
 	repoDir string,
 	snapshot gitSnapshot,
 	scope *gitDirtyScope,
-) (<-chan fileContent, <-chan error) {
+) (<-chan fileContent, <-chan nativeGitStreamResult) {
 	documents := make(chan fileContent)
-	result := make(chan error, 1)
+	result := make(chan nativeGitStreamResult, 1)
 	go func() {
 		defer close(documents)
-		matcher, err := readNativeGitIgnore(ctx, repoDir, snapshot)
+		ignoreEntry, err := readNativeGitRootIgnoreEntry(ctx, repoDir, snapshot)
 		if err != nil {
-			result <- err
+			result <- nativeGitStreamResult{err: err}
+			return
+		}
+		batch, err := startNativeGitBatch(ctx, repoDir)
+		if err != nil {
+			result <- nativeGitStreamResult{err: err}
+			return
+		}
+		matcher, err := readNativeGitIgnoreEntry(batch, ignoreEntry)
+		if err != nil {
+			_ = batch.close()
+			result <- nativeGitStreamResult{err: err}
 			return
 		}
 
@@ -263,37 +296,42 @@ func streamNativeGitDocuments(
 				}
 				blobs = append(blobs, entry)
 			}
-			return checkNativeGitBlobs(ctx, repoDir, blobs, func(infos []gitBlobInfo) error {
-				selectedInfos := make([]gitBlobInfo, 0, len(infos))
-				for _, info := range infos {
-					if !info.oversize {
-						budget.indexedBytes += info.size
-						if budget.indexedBytes > gitCorpusIndexedByteLimit {
-							return gitCommittedCapError(
-								"git committed candidate blob byte cap exceeded",
-								indexCapIndexedBytes,
-								budget.indexedBytes,
-								gitCorpusIndexedByteLimit,
-							)
-						}
+			infos, err := batch.check(blobs)
+			if err != nil {
+				return err
+			}
+			selectedInfos := make([]gitBlobInfo, 0, len(infos))
+			for _, info := range infos {
+				if !info.oversize {
+					budget.indexedBytes += info.size
+					if budget.indexedBytes > gitCorpusIndexedByteLimit {
+						return gitCommittedCapError(
+							"git committed candidate blob byte cap exceeded",
+							indexCapIndexedBytes,
+							budget.indexedBytes,
+							gitCorpusIndexedByteLimit,
+						)
 					}
-					if matcher.Match(info.entry.path) {
-						continue
-					}
-					selectedInfos = append(selectedInfos, info)
 				}
-				return readNativeGitBlobs(ctx, repoDir, selectedInfos, func(document fileContent) error {
-					document.branches = headBranch
-					select {
-					case documents <- document:
-						return nil
-					case <-ctx.Done():
-						return ctx.Err()
-					}
-				})
+				if matcher.Match(info.entry.path) {
+					continue
+				}
+				selectedInfos = append(selectedInfos, info)
+			}
+			return batch.read(selectedInfos, func(document fileContent) error {
+				document.branches = headBranch
+				select {
+				case documents <- document:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			})
 		})
-		result <- err
+		if closeErr := batch.close(); err == nil {
+			err = closeErr
+		}
+		result <- nativeGitStreamResult{budget: budget, err: err}
 	}()
 	return documents, result
 }
@@ -311,9 +349,27 @@ func indexNativeGitFull(
 	scope *gitDirtyScope,
 	parallelism int,
 ) error {
+	_, err := indexNativeGitFullWithBudget(ctx, repoDir, indexDir, snapshot, scope, parallelism)
+	return err
+}
+
+// indexNativeGitFullWithBudget returns the exact committed-tree work totals
+// proved by the full scan. The combined-corpus publisher persists these totals
+// for O(changed objects) delta admission. Scoped builds discard them.
+func indexNativeGitFullWithBudget(
+	ctx context.Context,
+	repoDir string,
+	indexDir string,
+	snapshot gitSnapshot,
+	scope *gitDirtyScope,
+	parallelism int,
+) (gitIndexBudget, error) {
+	if err := requireNativeGitVersion(ctx, repoDir); err != nil {
+		return gitIndexBudget{}, err
+	}
 	repository, err := nativeGitRepository(ctx, repoDir, snapshot)
 	if err != nil {
-		return err
+		return gitIndexBudget{}, err
 	}
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -326,15 +382,15 @@ func indexNativeGitFull(
 		parallelism,
 		cancel,
 	)
-	streamErr := <-result
+	streamResult := <-result
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return ctxErr
+		return gitIndexBudget{}, ctxErr
 	}
 	if buildErr != nil {
-		return buildErr
+		return gitIndexBudget{}, buildErr
 	}
-	if streamErr != nil {
-		return streamErr
+	if streamResult.err != nil {
+		return gitIndexBudget{}, streamResult.err
 	}
-	return nil
+	return streamResult.budget, nil
 }

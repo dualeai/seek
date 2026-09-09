@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
-	"strconv"
 	"strings"
 
 	"github.com/sourcegraph/zoekt/index"
@@ -19,14 +18,18 @@ import (
 // full object IDs. There is no go-git or zoekt/gitindex fallback. Git reads
 // the objects; index.Builder writes the resulting documents to staging.
 //
-// Full scans use ls-tree, then batch-check to get blob sizes before batch asks
-// for approved bodies. This keeps oversize bodies out of the content stream.
-// Each cat-file child handles at most gitObjectBatchSize requests. A malformed
-// or short reply, a write error, or a failed child rejects the staged build.
+// Full scans use ls-tree, then one buffered batch-command session. `info`
+// gets blob sizes before `contents` asks for approved bodies. This keeps
+// oversize bodies out of the content stream. Each protocol window handles at
+// most gitObjectBatchSize objects. Delta work can use separate sessions for
+// ignore, size, and content phases. A malformed or short reply, a write error,
+// or a failed child rejects the staged build.
 const (
 	gitObjectBatchSize = 8192
 	gitBatchHeaderMax  = 512
 	gitStderrMax       = 32 * 1024
+	minNativeGitMajor  = 2
+	minNativeGitMinor  = 36
 )
 
 var errNativeGitDeltaTooLarge = errors.New("native Git delta has too many changed paths")
@@ -48,21 +51,75 @@ type gitBlobInfo struct {
 type gitDiffEntry struct {
 	oldMode string
 	newMode string
+	oldOID  gitObjectID
 	newOID  gitObjectID
 	oldPath string
 	newPath string
 }
 
 func parseGitObjectID(raw []byte) (gitObjectID, error) {
+	if !validGitObjectID(raw) {
+		if len(raw) != 40 && len(raw) != 64 {
+			return "", fmt.Errorf("git object ID has %d bytes, want 40 or 64", len(raw))
+		}
+		return "", fmt.Errorf("git object ID is not full lowercase hexadecimal: %q", raw)
+	}
+	return gitObjectID(raw), nil
+}
+
+func validGitObjectID(raw []byte) bool {
 	if len(raw) != 40 && len(raw) != 64 {
-		return "", fmt.Errorf("git object ID has %d bytes, want 40 or 64", len(raw))
+		return false
 	}
 	for _, c := range raw {
 		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return "", fmt.Errorf("git object ID is not full lowercase hexadecimal: %q", raw)
+			return false
 		}
 	}
-	return gitObjectID(raw), nil
+	return true
+}
+
+func gitObjectIDEqualBytes(id gitObjectID, raw []byte) bool {
+	if len(id) != len(raw) {
+		return false
+	}
+	for i := range raw {
+		if id[i] != raw[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func gitBytesEqualString(raw []byte, value string) bool {
+	if len(raw) != len(value) {
+		return false
+	}
+	for i := range raw {
+		if raw[i] != value[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func parseGitDecimal(raw []byte) (int64, bool) {
+	if len(raw) == 0 {
+		return 0, false
+	}
+	const maxInt64 = int64(^uint64(0) >> 1)
+	var n int64
+	for _, c := range raw {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		digit := int64(c - '0')
+		if n > (maxInt64-digit)/10 {
+			return 0, false
+		}
+		n = n*10 + digit
+	}
+	return n, true
 }
 
 func (id gitObjectID) String() string { return string(id) }
@@ -72,6 +129,26 @@ func nativeGitCmd(ctx context.Context, repoDir string, args ...string) *exec.Cmd
 	cmd := gitCmd(ctx, append(base, args...)...)
 	cmd.Dir = repoDir
 	return cmd
+}
+
+func requireNativeGitVersion(ctx context.Context, repoDir string) error {
+	cmd := gitCmd(ctx, "version")
+	cmd.Dir = repoDir
+	out, err := cmd.Output()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf("check Git version: %w", err)
+	}
+	if gitVersionOutputAtLeast(out, minNativeGitMajor, minNativeGitMinor) {
+		return nil
+	}
+	return fmt.Errorf(
+		"direct Git indexing requires Git %d.%d or later for cat-file --batch-command",
+		minNativeGitMajor,
+		minNativeGitMinor,
+	)
 }
 
 // boundedGitStderr keeps both ends of Git stderr. Git often puts the cause at
@@ -172,27 +249,46 @@ func parseNativeGitTreeRecord(record []byte) (gitTreeEntry, error) {
 		return gitTreeEntry{}, fmt.Errorf("git tree record has no final NUL")
 	}
 	record = record[:len(record)-1]
-	header, path, ok := bytes.Cut(record, []byte{'\t'})
-	if !ok || len(path) == 0 {
+	tab := bytes.IndexByte(record, '\t')
+	if tab < 0 || tab == len(record)-1 {
 		return gitTreeEntry{}, fmt.Errorf("malformed Git tree record")
 	}
-	fields := bytes.Split(header, []byte{' '})
-	if len(fields) != 3 || len(fields[0]) == 0 || len(fields[1]) == 0 || len(fields[2]) == 0 {
+	header := record[:tab]
+	path := record[tab+1:]
+	firstSpace := bytes.IndexByte(header, ' ')
+	if firstSpace <= 0 {
 		return gitTreeEntry{}, fmt.Errorf("malformed Git tree header %q", header)
 	}
-	mode := string(fields[0])
+	secondRelative := bytes.IndexByte(header[firstSpace+1:], ' ')
+	if secondRelative <= 0 {
+		return gitTreeEntry{}, fmt.Errorf("malformed Git tree header %q", header)
+	}
+	secondSpace := firstSpace + 1 + secondRelative
+	if secondSpace == len(header)-1 || bytes.IndexByte(header[secondSpace+1:], ' ') >= 0 {
+		return gitTreeEntry{}, fmt.Errorf("malformed Git tree header %q", header)
+	}
+	modeRaw := header[:firstSpace]
+	typeRaw := header[firstSpace+1 : secondSpace]
+	oidRaw := header[secondSpace+1:]
+	var mode string
 	wantType := "blob"
-	switch mode {
-	case "100644", "100755", "120000":
-	case "160000":
+	switch {
+	case gitBytesEqualString(modeRaw, "100644"):
+		mode = "100644"
+	case gitBytesEqualString(modeRaw, "100755"):
+		mode = "100755"
+	case gitBytesEqualString(modeRaw, "120000"):
+		mode = "120000"
+	case gitBytesEqualString(modeRaw, "160000"):
+		mode = "160000"
 		wantType = "commit"
 	default:
-		return gitTreeEntry{}, fmt.Errorf("unsupported Git tree mode %q", mode)
+		return gitTreeEntry{}, fmt.Errorf("unsupported Git tree mode %q", modeRaw)
 	}
-	if string(fields[1]) != wantType {
-		return gitTreeEntry{}, fmt.Errorf("git tree mode %s has type %q, want %q", mode, fields[1], wantType)
+	if !gitBytesEqualString(typeRaw, wantType) {
+		return gitTreeEntry{}, fmt.Errorf("git tree mode %s has type %q, want %q", modeRaw, typeRaw, wantType)
 	}
-	oid, err := parseGitObjectID(fields[2])
+	oid, err := parseGitObjectID(oidRaw)
 	if err != nil {
 		return gitTreeEntry{}, fmt.Errorf("git tree object: %w", err)
 	}
@@ -308,34 +404,6 @@ func readNativeGitRootIgnoreEntry(ctx context.Context, repoDir string, snapshot 
 	return &entries[0], nil
 }
 
-// writeNativeGitRequests writes object IDs while the caller reads Git replies,
-// which prevents the input and output pipes from blocking each other. The
-// channel receives the final write, flush, or close error.
-func writeNativeGitRequests(stdin io.WriteCloser, ids []gitObjectID) <-chan error {
-	done := make(chan error, 1)
-	go func() {
-		writer := bufio.NewWriterSize(stdin, 64*1024)
-		var err error
-		for _, id := range ids {
-			if _, err = writer.WriteString(id.String()); err != nil {
-				break
-			}
-			if err = writer.WriteByte('\n'); err != nil {
-				break
-			}
-		}
-		if err == nil {
-			err = writer.Flush()
-		}
-		closeErr := stdin.Close()
-		if err == nil {
-			err = closeErr
-		}
-		done <- err
-	}()
-	return done
-}
-
 func readNativeGitBatchHeader(reader *bufio.Reader) ([]byte, error) {
 	header, err := reader.ReadSlice('\n')
 	if errors.Is(err, bufio.ErrBufferFull) || len(header) > gitBatchHeaderMax+1 {
@@ -354,23 +422,33 @@ func readNativeGitBatchHeader(reader *bufio.Reader) ([]byte, error) {
 }
 
 func parseNativeGitBatchHeader(header []byte, want gitObjectID, wantSize *int64) (int64, error) {
-	fields := bytes.Split(header, []byte{' '})
-	if len(fields) != 3 {
+	firstSpace := bytes.IndexByte(header, ' ')
+	if firstSpace <= 0 {
 		return 0, fmt.Errorf("malformed Git cat-file reply %q", header)
 	}
-	oid, err := parseGitObjectID(fields[0])
-	if err != nil {
-		return 0, fmt.Errorf("git cat-file reply object: %w", err)
+	secondRelative := bytes.IndexByte(header[firstSpace+1:], ' ')
+	if secondRelative <= 0 {
+		return 0, fmt.Errorf("malformed Git cat-file reply %q", header)
 	}
-	if oid != want {
-		return 0, fmt.Errorf("git cat-file returned object %s, want %s", oid, want)
+	secondSpace := firstSpace + 1 + secondRelative
+	if secondSpace == len(header)-1 || bytes.IndexByte(header[secondSpace+1:], ' ') >= 0 {
+		return 0, fmt.Errorf("malformed Git cat-file reply %q", header)
 	}
-	if string(fields[1]) != "blob" {
-		return 0, fmt.Errorf("git cat-file returned type %q for %s, want blob", fields[1], want)
+	oidRaw := header[:firstSpace]
+	typeRaw := header[firstSpace+1 : secondSpace]
+	sizeRaw := header[secondSpace+1:]
+	if !validGitObjectID(oidRaw) {
+		return 0, fmt.Errorf("git cat-file reply object is not a full lowercase object ID: %q", oidRaw)
 	}
-	size, err := strconv.ParseInt(string(fields[2]), 10, 64)
-	if err != nil || size < 0 {
-		return 0, fmt.Errorf("invalid Git blob size %q for %s", fields[2], want)
+	if !gitObjectIDEqualBytes(want, oidRaw) {
+		return 0, fmt.Errorf("git cat-file returned object %s, want %s", oidRaw, want)
+	}
+	if !gitBytesEqualString(typeRaw, "blob") {
+		return 0, fmt.Errorf("git cat-file returned type %q for %s, want blob", typeRaw, want)
+	}
+	size, ok := parseGitDecimal(sizeRaw)
+	if !ok {
+		return 0, fmt.Errorf("invalid Git blob size %q for %s", sizeRaw, want)
 	}
 	if wantSize != nil && size != *wantSize {
 		return 0, fmt.Errorf("git blob %s size changed from %d to %d", want, *wantSize, size)
@@ -379,59 +457,18 @@ func parseNativeGitBatchHeader(header []byte, want gitObjectID, wantSize *int64)
 }
 
 func checkNativeGitBlobChunk(ctx context.Context, repoDir string, entries []gitTreeEntry) ([]gitBlobInfo, error) {
-	ids := make([]gitObjectID, len(entries))
-	for i := range entries {
-		ids[i] = entries[i].oid
+	if len(entries) == 0 {
+		return nil, nil
 	}
-	cmd := nativeGitCmd(ctx, repoDir, "cat-file", "--batch-check")
-	stdin, err := cmd.StdinPipe()
+	batch, err := startNativeGitBatch(ctx, repoDir)
 	if err != nil {
-		return nil, fmt.Errorf("open git cat-file --batch-check stdin: %w", err)
+		return nil, err
 	}
-	stdout, err := cmd.StdoutPipe()
+	infos, err := batch.check(entries)
 	if err != nil {
-		_ = stdin.Close()
-		return nil, fmt.Errorf("open git cat-file --batch-check stdout: %w", err)
+		return nil, err
 	}
-	var stderr boundedGitStderr
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		_ = stdin.Close()
-		return nil, nativeGitCommandError(ctx, "start git cat-file --batch-check", err, &stderr)
-	}
-	writeDone := writeNativeGitRequests(stdin, ids)
-	reader := bufio.NewReaderSize(stdout, gitBatchHeaderMax+1)
-	infos := make([]gitBlobInfo, len(entries))
-	for i, entry := range entries {
-		header, err := readNativeGitBatchHeader(reader)
-		if err != nil {
-			abortNativeGitChild(cmd, stdin)
-			<-writeDone
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, ctxErr
-			}
-			return nil, fmt.Errorf("read git cat-file --batch-check reply %d: %w", i, err)
-		}
-		size, err := parseNativeGitBatchHeader(header, entry.oid, nil)
-		if err != nil {
-			abortNativeGitChild(cmd, stdin)
-			<-writeDone
-			return nil, err
-		}
-		infos[i] = gitBlobInfo{entry: entry, size: size, oversize: size > maxIndexedDocumentBytes}
-	}
-	if err := <-writeDone; err != nil {
-		abortNativeGitChild(cmd, stdin)
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
-		}
-		return nil, fmt.Errorf("write git cat-file --batch-check requests: %w", err)
-	}
-	if err := readExactEOF(reader); err != nil {
-		abortNativeGitChild(cmd, nil)
-		return nil, nativeGitReadError(ctx, "finish git cat-file --batch-check output", err)
-	}
-	if err := waitNativeGitChild(ctx, cmd, "git cat-file --batch-check", &stderr); err != nil {
+	if err := batch.close(); err != nil {
 		return nil, err
 	}
 	return infos, nil
@@ -443,9 +480,21 @@ func checkNativeGitBlobs(
 	entries []gitTreeEntry,
 	consume func([]gitBlobInfo) error,
 ) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	batch, err := startNativeGitBatch(ctx, repoDir)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if !batch.finished {
+			batch.abort(nil)
+		}
+	}()
 	for start := 0; start < len(entries); start += gitObjectBatchSize {
 		end := min(start+gitObjectBatchSize, len(entries))
-		infos, err := checkNativeGitBlobChunk(ctx, repoDir, entries[start:end])
+		infos, err := batch.check(entries[start:end])
 		if err != nil {
 			return err
 		}
@@ -453,7 +502,7 @@ func checkNativeGitBlobs(
 			return err
 		}
 	}
-	return nil
+	return batch.close()
 }
 
 func readNativeGitBlobChunk(
@@ -462,13 +511,17 @@ func readNativeGitBlobChunk(
 	infos []gitBlobInfo,
 	consume func(fileContent) error,
 ) error {
-	ids := make([]gitObjectID, 0, len(infos))
-	for i := range infos {
-		if !infos[i].oversize {
-			ids = append(ids, infos[i].entry.oid)
+	if len(infos) == 0 {
+		return nil
+	}
+	allOversize := true
+	for _, info := range infos {
+		if !info.oversize {
+			allOversize = false
+			break
 		}
 	}
-	if len(ids) == 0 {
+	if allOversize {
 		for _, info := range infos {
 			if err := consume(fileContent{name: info.entry.path, skipReason: index.SkipReasonTooLarge}); err != nil {
 				return err
@@ -476,91 +529,14 @@ func readNativeGitBlobChunk(
 		}
 		return nil
 	}
-	cmd := nativeGitCmd(ctx, repoDir, "cat-file", "--batch")
-	stdin, err := cmd.StdinPipe()
+	batch, err := startNativeGitBatch(ctx, repoDir)
 	if err != nil {
-		return fmt.Errorf("open git cat-file --batch stdin: %w", err)
+		return err
 	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		_ = stdin.Close()
-		return fmt.Errorf("open git cat-file --batch stdout: %w", err)
+	if err := batch.read(infos, consume); err != nil {
+		return err
 	}
-	var stderr boundedGitStderr
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		_ = stdin.Close()
-		return nativeGitCommandError(ctx, "start git cat-file --batch", err, &stderr)
-	}
-	writeDone := writeNativeGitRequests(stdin, ids)
-	reader := bufio.NewReaderSize(stdout, 64*1024)
-	replyIndex := 0
-	for _, info := range infos {
-		if info.oversize {
-			if err := consume(fileContent{name: info.entry.path, skipReason: index.SkipReasonTooLarge}); err != nil {
-				abortNativeGitChild(cmd, stdin)
-				<-writeDone
-				return err
-			}
-			continue
-		}
-		header, err := readNativeGitBatchHeader(reader)
-		if err != nil {
-			abortNativeGitChild(cmd, stdin)
-			<-writeDone
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			return fmt.Errorf("read git cat-file --batch reply %d: %w", replyIndex, err)
-		}
-		replyIndex++
-		if _, err := parseNativeGitBatchHeader(header, info.entry.oid, &info.size); err != nil {
-			abortNativeGitChild(cmd, stdin)
-			<-writeDone
-			return err
-		}
-		if err := readSemaphore.Acquire(ctx, info.size); err != nil {
-			abortNativeGitChild(cmd, stdin)
-			<-writeDone
-			return err
-		}
-		content := make([]byte, int(info.size))
-		if _, err := io.ReadFull(reader, content); err != nil {
-			readSemaphore.Release(info.size)
-			abortNativeGitChild(cmd, stdin)
-			<-writeDone
-			return nativeGitReadError(ctx, fmt.Sprintf("read Git blob %s body", info.entry.oid), err)
-		}
-		delimiter, err := reader.ReadByte()
-		if err != nil || delimiter != '\n' {
-			readSemaphore.Release(info.size)
-			abortNativeGitChild(cmd, stdin)
-			<-writeDone
-			if err == nil {
-				err = fmt.Errorf("got byte 0x%02x", delimiter)
-			}
-			return nativeGitReadError(ctx, fmt.Sprintf("read Git blob %s delimiter", info.entry.oid), err)
-		}
-		document := fileContent{name: info.entry.path, content: content, weight: info.size}
-		if err := consume(document); err != nil {
-			readSemaphore.Release(info.size)
-			abortNativeGitChild(cmd, stdin)
-			<-writeDone
-			return err
-		}
-	}
-	if err := <-writeDone; err != nil {
-		abortNativeGitChild(cmd, stdin)
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		return fmt.Errorf("write git cat-file --batch requests: %w", err)
-	}
-	if err := readExactEOF(reader); err != nil {
-		abortNativeGitChild(cmd, nil)
-		return nativeGitReadError(ctx, "finish git cat-file --batch output", err)
-	}
-	return waitNativeGitChild(ctx, cmd, "git cat-file --batch", &stderr)
+	return batch.close()
 }
 
 // readNativeGitBlobs emits entries in input order and does not request oversize
@@ -574,13 +550,35 @@ func readNativeGitBlobs(
 	infos []gitBlobInfo,
 	consume func(fileContent) error,
 ) error {
+	if len(infos) == 0 {
+		return nil
+	}
+	allOversize := true
+	for _, info := range infos {
+		if !info.oversize {
+			allOversize = false
+			break
+		}
+	}
+	if allOversize {
+		for _, info := range infos {
+			if err := consume(fileContent{name: info.entry.path, skipReason: index.SkipReasonTooLarge}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	batch, err := startNativeGitBatch(ctx, repoDir)
+	if err != nil {
+		return err
+	}
 	for start := 0; start < len(infos); start += gitObjectBatchSize {
 		end := min(start+gitObjectBatchSize, len(infos))
-		if err := readNativeGitBlobChunk(ctx, repoDir, infos[start:end], consume); err != nil {
+		if err := batch.read(infos[start:end], consume); err != nil {
 			return err
 		}
 	}
-	return nil
+	return batch.close()
 }
 
 func parseNativeGitDiffHeader(header, path []byte, oidLength int) (gitDiffEntry, error) {
@@ -604,7 +602,7 @@ func parseNativeGitDiffHeader(header, path []byte, oidLength int) (gitDiffEntry,
 	if !validMode(oldMode) || !validMode(newMode) {
 		return gitDiffEntry{}, fmt.Errorf("unsupported Git raw diff modes %q and %q", oldMode, newMode)
 	}
-	_, err := parseGitObjectID(fields[2])
+	oldOID, err := parseGitObjectID(fields[2])
 	if err != nil || len(fields[2]) != oidLength {
 		return gitDiffEntry{}, fmt.Errorf("invalid old Git raw diff object %q", fields[2])
 	}
@@ -633,6 +631,7 @@ func parseNativeGitDiffHeader(header, path []byte, oidLength int) (gitDiffEntry,
 	return gitDiffEntry{
 		oldMode: oldMode,
 		newMode: newMode,
+		oldOID:  oldOID,
 		newOID:  newOID,
 		oldPath: name,
 		newPath: name,

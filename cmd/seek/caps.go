@@ -7,17 +7,20 @@ import (
 
 const (
 	// maxIndexedDocumentBytes is the shared per-document limit passed to
-	// Zoekt as index.Options.SizeMax. Every seek-side reader rejects files
-	// larger than this so we never read content Zoekt will discard.
+	// Zoekt as index.Options.SizeMax. Seek-side readers do not read bodies above
+	// this limit, so they do not load content that Zoekt will discard.
 	//
 	// 100 MiB accommodates vendored libraries, generated JSON/CSV dumps,
 	// and large data files that occasionally appear in source trees.
-	// Files above this cap are skipped at read time with a slog.Warn.
+	// For a selected oversize blob, committed Git emits a name-only TooLarge
+	// document. Folder and dirty readers skip the file; the dirty reader also
+	// logs a warning.
 	maxIndexedDocumentBytes = 100 * 1024 * 1024 // 100 MiB
 
 	// maxCorpusIndexedBytes limits content work for one folder corpus or one
-	// Git index family. The committed reader counts candidate blob sizes before
-	// ignore filtering; the folder and dirty readers count selected content.
+	// Git index family. Before ignore filtering, the committed reader counts the
+	// sizes of candidate blobs at or below maxIndexedDocumentBytes. The folder
+	// and dirty readers count selected content.
 	// Git applies the limit separately to its committed and working-tree
 	// families. This is a work limit, not a process-memory bound.
 	maxCorpusIndexedBytes = 10 * 1024 * 1024 * 1024 // 10 GiB

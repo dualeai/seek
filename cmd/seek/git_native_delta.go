@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os/exec"
 	"reflect"
 
@@ -18,6 +17,7 @@ type nativeGitDelta struct {
 	repository   zoekt.Repository
 	changedPaths []string
 	targetInfos  []gitBlobInfo
+	nextState    committedGitState
 }
 
 func nativeGitBlobMode(mode string) bool {
@@ -59,6 +59,10 @@ func nativeCommittedShardCount(scan familyScan) int {
 	return count
 }
 
+func nativeGitDeltaShardLimitExceeded(current, base int) bool {
+	return base < 1 || current < base || current-base > maxCommittedDeltaShards
+}
+
 func nativeGitDeltaStaticMetadataEqual(existing, target *zoekt.Repository) bool {
 	return existing.TenantID == target.TenantID &&
 		existing.ID == target.ID &&
@@ -81,6 +85,7 @@ func nativeGitDeltaStaticMetadataEqual(existing, target *zoekt.Repository) bool 
 func prepareNativeGitDelta(
 	ctx context.Context,
 	repoDir string,
+	cacheDir string,
 	indexDir string,
 	target gitSnapshot,
 	scan familyScan,
@@ -88,8 +93,8 @@ func prepareNativeGitDelta(
 	if !scan.hasCommittedShard() || !scan.contiguous(familyCommitted) || !scan.matchesManifestFamily(indexDir, familyCommitted) {
 		return nil, false, nil
 	}
-	if nativeCommittedShardCount(scan) > maxCommittedDeltaShards {
-		return nil, false, nil
+	if err := requireNativeGitVersion(ctx, repoDir); err != nil {
+		return nil, false, err
 	}
 	// This also resolves the verified `ctags` fallback before index options are
 	// compared with the base. If Ctags is unavailable, let native full decide
@@ -114,6 +119,11 @@ func prepareNativeGitDelta(
 	}
 	baseOID, err := parseGitObjectID([]byte(existing.Branches[0].Version))
 	if err != nil || len(baseOID) != len(target.commitOID) || baseOID == target.commitOID {
+		return nil, false, nil
+	}
+	committedState, ok := readCommittedGitState(cacheDir)
+	currentShards := nativeCommittedShardCount(scan)
+	if !ok || committedState.head != baseOID || nativeGitDeltaShardLimitExceeded(currentShards, committedState.baseShards) {
 		return nil, false, nil
 	}
 	if !nativeGitDeltaStaticMetadataEqual(existing, &repository) {
@@ -160,9 +170,12 @@ func prepareNativeGitDelta(
 		}
 	}
 
-	targetInfos, err := scanNativeGitDeltaTarget(ctx, repoDir, target, matcher, diff)
+	targetInfos, nextBudget, consistent, err := scanNativeGitDeltaChanges(ctx, repoDir, matcher, diff, committedState.budget)
 	if err != nil {
 		return nil, false, err
+	}
+	if !consistent {
+		return nil, false, nil
 	}
 	var payloadBytes int64
 	for _, info := range targetInfos {
@@ -184,77 +197,105 @@ func prepareNativeGitDelta(
 		repository:   repository,
 		changedPaths: changedPaths,
 		targetInfos:  targetInfos,
+		nextState: committedGitState{
+			head:       target.commitOID,
+			baseHead:   committedState.baseHead,
+			budget:     nextBudget,
+			baseShards: committedState.baseShards,
+		},
 	}, true, nil
 }
 
-func scanNativeGitDeltaTarget(
+// scanNativeGitDeltaChanges updates totals from the old and new objects named
+// by diff-tree. The saved full-scan totals account for every unchanged blob,
+// so delta admission never enumerates the unchanged target tree.
+func scanNativeGitDeltaChanges(
 	ctx context.Context,
 	repoDir string,
-	target gitSnapshot,
 	matcher *ignore.Matcher,
 	diff []gitDiffEntry,
-) ([]gitBlobInfo, error) {
-	expected := make(map[string]gitDiffEntry, len(diff))
-	for _, entry := range diff {
+	base gitIndexBudget,
+) ([]gitBlobInfo, gitIndexBudget, bool, error) {
+	type requestRole struct {
+		diffIndex int
+		old       bool
+	}
+	entries := make([]gitTreeEntry, 0, 2*len(diff))
+	roles := make([]requestRole, 0, 2*len(diff))
+	for i, entry := range diff {
+		if nativeGitBlobMode(entry.oldMode) {
+			entries = append(entries, gitTreeEntry{mode: entry.oldMode, oid: entry.oldOID, path: entry.oldPath})
+			roles = append(roles, requestRole{diffIndex: i, old: true})
+		}
 		if nativeGitBlobMode(entry.newMode) {
-			expected[entry.newPath] = entry
+			entries = append(entries, gitTreeEntry{mode: entry.newMode, oid: entry.newOID, path: entry.newPath})
+			roles = append(roles, requestRole{diffIndex: i})
 		}
 	}
-	found := make(map[string]struct{}, len(expected))
-	targetInfos := make([]gitBlobInfo, 0, len(expected))
-	var budget gitIndexBudget
-	err := readNativeGitTree(ctx, repoDir, target, nil, func(entries []gitTreeEntry) error {
-		blobs := make([]gitTreeEntry, 0, len(entries))
-		for _, entry := range entries {
-			if entry.mode == "160000" {
-				continue
+	oldInfos := make([]gitBlobInfo, len(diff))
+	newInfos := make([]gitBlobInfo, len(diff))
+	oldPresent := make([]bool, len(diff))
+	newPresent := make([]bool, len(diff))
+	roleIndex := 0
+	if err := checkNativeGitBlobs(ctx, repoDir, entries, func(infos []gitBlobInfo) error {
+		for _, info := range infos {
+			role := roles[roleIndex]
+			roleIndex++
+			if role.old {
+				oldInfos[role.diffIndex] = info
+				oldPresent[role.diffIndex] = true
+			} else {
+				newInfos[role.diffIndex] = info
+				newPresent[role.diffIndex] = true
 			}
-			budget.candidates++
-			if budget.candidates > gitCandidateFileLimit {
-				return gitCommittedCapError(
-					"git committed file cap exceeded",
-					indexCapCandidateFiles,
-					budget.candidates,
-					gitCandidateFileLimit,
+		}
+		return nil
+	}); err != nil {
+		return nil, gitIndexBudget{}, false, err
+	}
+
+	budget := base
+	targetInfos := make([]gitBlobInfo, 0, len(diff))
+	for i, entry := range diff {
+		if oldPresent[i] {
+			oldInfo := oldInfos[i]
+			if budget.candidates == 0 || (!oldInfo.oversize && budget.indexedBytes < oldInfo.size) {
+				return nil, gitIndexBudget{}, false, nil
+			}
+			budget.candidates--
+			if !oldInfo.oversize {
+				budget.indexedBytes -= oldInfo.size
+			}
+		}
+		if !newPresent[i] {
+			continue
+		}
+		newInfo := newInfos[i]
+		budget.candidates++
+		if budget.candidates > gitCandidateFileLimit {
+			return nil, gitIndexBudget{}, false, gitCommittedCapError(
+				"git committed file cap exceeded",
+				indexCapCandidateFiles,
+				budget.candidates,
+				gitCandidateFileLimit,
+			)
+		}
+		if !newInfo.oversize {
+			budget.indexedBytes += newInfo.size
+			if budget.indexedBytes > gitCorpusIndexedByteLimit {
+				return nil, gitIndexBudget{}, false, gitCommittedCapError(
+					"git committed candidate blob byte cap exceeded",
+					indexCapIndexedBytes,
+					budget.indexedBytes,
+					gitCorpusIndexedByteLimit,
 				)
 			}
-			blobs = append(blobs, entry)
 		}
-		return checkNativeGitBlobs(ctx, repoDir, blobs, func(infos []gitBlobInfo) error {
-			for _, info := range infos {
-				if !info.oversize {
-					budget.indexedBytes += info.size
-					if budget.indexedBytes > gitCorpusIndexedByteLimit {
-						return gitCommittedCapError(
-							"git committed candidate blob byte cap exceeded",
-							indexCapIndexedBytes,
-							budget.indexedBytes,
-							gitCorpusIndexedByteLimit,
-						)
-					}
-				}
-				entry, changed := expected[info.entry.path]
-				if !changed {
-					continue
-				}
-				if entry.newMode != info.entry.mode || entry.newOID != info.entry.oid {
-					return fmt.Errorf("git delta target entry %q changed during scan", info.entry.path)
-				}
-				found[info.entry.path] = struct{}{}
-				if !matcher.Match(info.entry.path) {
-					targetInfos = append(targetInfos, info)
-				}
-			}
-			return nil
-		})
-	})
-	if err != nil {
-		return nil, err
+		if !matcher.Match(entry.newPath) {
+			targetInfos = append(targetInfos, newInfo)
+		}
 	}
-	if len(found) != len(expected) {
-		return nil, fmt.Errorf("git delta target tree lacks %d changed blobs", len(expected)-len(found))
-	}
-	return targetInfos, nil
+	return targetInfos, budget, true, nil
 }
 
 // indexNativeGitDelta hard-links the verified committed seed into buildDir and

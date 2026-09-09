@@ -1712,6 +1712,10 @@ func cloneBenchRepoAt(b *testing.B, sourceRepo, ref string) string {
 	want := gitOutputIn(b, sourceAbs, "rev-parse", ref)
 	repoDir := filepath.Join(b.TempDir(), "repo")
 	gitRunIn(b, filepath.Dir(repoDir), "clone", "--no-checkout", sourceAbs, repoDir)
+	// A local clone can copy core.fsmonitor=true while its daemon socket still
+	// points at the source worktree. Disable it so the benchmark measures Seek
+	// instead of a failed fsmonitor IPC request.
+	gitRunIn(b, repoDir, "config", "core.fsmonitor", "false")
 	gitRunIn(b, repoDir, "checkout", "-B", "seek-bench", want)
 	if got := gitOutputIn(b, repoDir, "rev-parse", "HEAD"); got != want {
 		b.Fatalf("bench clone HEAD mismatch: source=%s clone=%s", want, got)
@@ -1738,7 +1742,7 @@ func BenchmarkLargeRepo_ColdIndex(b *testing.B) {
 		}
 		b.StartTimer()
 
-		if results, err := runSeekInPlannedGitCorpus(ctx, "func main", paths, plan); err != nil {
+		if results, err := runSeekInPlannedGitCorpus(ctx, "type:file", paths, plan); err != nil {
 			b.Fatalf("cold large-repo search: %v", err)
 		} else if len(results) == 0 {
 			b.Fatal("expected cold large-repo result")
@@ -1751,7 +1755,7 @@ func BenchmarkLargeRepo_WarmSearch(b *testing.B) {
 	ctx := context.Background()
 	b.ResetTimer()
 	for b.Loop() {
-		if results, err := runSeekInPlannedGitCorpus(ctx, "func main", paths, plan); err != nil {
+		if results, err := runSeekInPlannedGitCorpus(ctx, "type:file", paths, plan); err != nil {
 			b.Fatalf("warm large-repo search: %v", err)
 		} else if len(results) == 0 {
 			b.Fatal("expected warm large-repo result")
