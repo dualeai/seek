@@ -550,7 +550,7 @@ func ensureCombinedGitCorpus(ctx context.Context, plan corpusPlan, paths gitPath
 	// Use one directory scan so all integrity checks describe the same state.
 	sc, scErr := scanFamilyOptional(plan.indexDir)
 	hasShards := scErr == nil && sc.hasShard() &&
-		(state.HeadSHA == "no-head" || sc.hasCommittedShard()) &&
+		committedSnapshotReady(plan.cacheDir, plan.indexDir, state, sc) &&
 		sc.matchesManifest(plan.indexDir)
 	clearCommitted := state.HeadSHA == "no-head" && sc.hasMember(familyCommitted)
 	// A leftover .swapping marker means a prior publish was interrupted and the
@@ -558,17 +558,9 @@ func ensureCombinedGitCorpus(ctx context.Context, plan corpusPlan, paths gitPath
 	// when state otherwise looks current.
 	swapPending := readCacheFile(plan.cacheDir, swappingMarkerFile) != ""
 	needBuild := currentState != cachedState || !hasShards || swapPending || clearCommitted
-	if (currentState != cachedState || !hasShards || clearCommitted) && gitCorpusKnownEmpty(ctx, paths, state) {
-		if cachedState == currentState && !hasShards && !clearCommitted {
-			return corpusKnownEmpty, nil
-		}
-		marked, err := markGitCorpusKnownEmpty(ctx, plan, state, currentState)
-		if err != nil {
-			return corpusSearchable, err
-		}
-		if marked {
-			return corpusKnownEmpty, nil
-		}
+	if !swapPending && !clearCommitted && cachedState == currentState && !hasShards &&
+		readEmptyStateFile(plan.cacheDir) == currentState {
+		return corpusKnownEmpty, nil
 	}
 
 	if needBuild {
@@ -589,6 +581,9 @@ func ensureCombinedGitCorpus(ctx context.Context, plan corpusPlan, paths gitPath
 				return corpusSearchable, err
 			}
 			reportStaleIndexWarning(err)
+		}
+		if readEmptyStateFile(plan.cacheDir) == currentState && !shardsExist(plan.indexDir) {
+			return corpusKnownEmpty, nil
 		}
 	}
 	return corpusSearchable, nil
@@ -664,20 +659,17 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 	defer discardBuildDir(buildDir)
 
 	if treeish != "no-head" {
-		_, selected, err := scanGitCommittedScopeBudgetAt(ctx, paths.RepoDir, treeish, plan.dirtyScope, gitCandidateFileLimit, gitCorpusIndexedByteLimit)
-		if err != nil {
+		snapshot, ok, err := captureGitSnapshot(ctx, paths.RepoDir, treeish)
+		if err != nil || !ok {
+			if err == nil {
+				err = fmt.Errorf("captured scoped Git state has no commit")
+			}
 			deleteStateFiles(cacheDir)
 			return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, indexDir, err)
 		}
-		if selected > 0 {
-			if err := checkCtagsCached(); err != nil {
-				deleteStateFiles(cacheDir)
-				return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, indexDir, err)
-			}
-			if _, err := indexScopedCommitted(ctx, paths.RepoDir, buildDir, treeish, plan.dirtyScope, indexParallelism()); err != nil {
-				deleteStateFiles(cacheDir)
-				return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, indexDir, err)
-			}
+		if _, err := indexNativeGitFull(ctx, paths.RepoDir, buildDir, snapshot, plan.dirtyScope, indexParallelism()); err != nil {
+			deleteStateFiles(cacheDir)
+			return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, indexDir, err)
 		}
 	}
 
@@ -857,69 +849,6 @@ func repoStateForDirtyScope(state repoState, scope *gitDirtyScope) repoState {
 		RawOutput: b.String(),
 		Files:     files,
 	}
-}
-
-func gitCorpusKnownEmpty(ctx context.Context, paths gitPaths, state repoState) bool {
-	if len(state.Files) > 0 {
-		return false
-	}
-	if state.HeadSHA == "no-head" {
-		return true
-	}
-
-	cmd := gitCmd(ctx, "rev-parse", "HEAD^{tree}")
-	cmd.Dir = paths.RepoDir
-	out, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(out)) == emptyGitTreeSHA
-}
-
-func markGitCorpusKnownEmpty(ctx context.Context, plan corpusPlan, state repoState, stateHash string) (bool, error) {
-	if err := os.MkdirAll(plan.indexDir, 0o755); err != nil {
-		return false, fmt.Errorf("create index directory: %w", err)
-	}
-
-	buildFd, acquired, err := acquireBuildLock(ctx, plan.cacheDir, plan.indexDir)
-	if err != nil {
-		return false, err
-	}
-	if !acquired {
-		slog.Debug("Another process is indexing; serving current index")
-		return false, nil
-	}
-	defer releaseLock(buildFd)
-
-	// Clear shards under the publish lock so readers (SH) never see the empty
-	// dir mid-clean.
-	pub, err := acquirePublishLock(ctx, plan.cacheDir)
-	if err != nil {
-		if errors.Is(err, errCorpusEvicted) {
-			return false, nil
-		}
-		return false, err
-	}
-	defer releaseLock(pub)
-
-	cleanAllShards(plan.indexDir)
-	// Remove the manifest with the shard family that it describes.
-	removeFamilyManifest(plan.indexDir)
-	deleteUncommittedManifest(plan.cacheDir)
-	// cleanAllShards already removed any torn shards a prior interrupted swap
-	// left, so a lingering .swapping marker would only force needless rebuilds
-	// of this now-known-empty corpus — clear it.
-	removeCacheFile(plan.cacheDir, swappingMarkerFile)
-	if state.HeadSHA == "no-head" {
-		_ = os.Remove(filepath.Join(plan.cacheDir, headFile))
-		_ = os.Remove(filepath.Join(plan.cacheDir, headFile+".tmp"))
-	} else if err := writeHeadFile(plan.cacheDir, state.HeadSHA); err != nil {
-		slog.Warn("Failed to write head file", "error", err)
-	}
-	if err := writeStateFile(plan.cacheDir, stateHash); err != nil {
-		return false, fmt.Errorf("write state file: %w", err)
-	}
-	return true, nil
 }
 
 func searchPlannedCorpusParsed(

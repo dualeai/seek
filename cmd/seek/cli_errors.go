@@ -7,7 +7,6 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 )
@@ -88,8 +87,8 @@ func (h zoektWarningHandler) Handle(ctx context.Context, r slog.Record) error {
 	return h.Handler.Handle(ctx, r)
 }
 
-// isZoektDamageNotice identifies the Zoekt warnings that can mean an incomplete
-// index. This includes its warning prefixes and its cat-file fallback notice.
+// isZoektDamageNotice identifies Zoekt warnings that can mean an incomplete
+// index.
 func isZoektDamageNotice(msg string) bool {
 	for _, prefix := range zoektDamagePrefixes {
 		if strings.HasPrefix(msg, prefix) {
@@ -99,14 +98,12 @@ func isZoektDamageNotice(msg string) bool {
 	return false
 }
 
-// zoektDamagePrefixes identify messages that can mean an incomplete index. The
-// cat-file fallback matters because it removes the missing-object signal.
+// zoektDamagePrefixes identify messages that can mean an incomplete index.
 var zoektDamagePrefixes = []string{
 	"warning: blob ",
 	"warn: ",
 	"WARN: ",
 	"WARN ",
-	"git cat-file does not support",
 }
 
 func (h zoektWarningHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
@@ -118,24 +115,6 @@ func (h zoektWarningHandler) WithGroup(name string) slog.Handler {
 }
 
 func formatCLIError(err error) string {
-	if objErr, ok := errors.AsType[*unreadableObjectsError](err); ok {
-		if objErr.alternate != "" {
-			return fmt.Sprintf(
-				"seek: cannot index Git repository %q: its objects live in the alternate "+
-					"%q, which seek's Git library cannot reach\n"+
-					"hint: copy them into this repository, then drop the alternate:\n"+
-					"        git -C %s repack -a -d\n"+
-					"        rm %s",
-				objErr.repoDir, objErr.alternate, objErr.repoDir,
-				filepath.Join(objErr.repoDir, ".git", "objects", "info", "alternates"))
-		}
-		return fmt.Sprintf(
-			"seek: cannot index Git repository %q: its objects live in %q, a pack "+
-				"seek's Git library cannot discover\n"+
-				"hint: repack them under a discoverable name:\n"+
-				"        git -C %s repack -a -d",
-			objErr.repoDir, objErr.pack, objErr.repoDir)
-	}
 	if queryErr, ok := errors.AsType[*querySyntaxError](err); ok {
 		return fmt.Sprintf("seek: invalid query %q: %v", queryErr.query, queryErr.cause)
 	}

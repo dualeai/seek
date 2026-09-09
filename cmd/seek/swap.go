@@ -218,9 +218,9 @@ func inFamily(fam shardFamily, m familyMember) bool {
 	return fam != familyCommitted || !m.uncommitted
 }
 
-// paths returns the family's shards and sidecars. The committed repository name
-// can come from the origin, so the committed family is all entries outside the
-// fixed uncommitted family.
+// paths returns the family's shards and sidecars. Committed repository names
+// can vary through local [zoekt] config, so the committed family is all entries
+// outside the fixed uncommitted family.
 func (s familyScan) paths(fam shardFamily) []string {
 	out := make([]string, 0, len(s.members))
 	for _, m := range s.members {

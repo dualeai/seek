@@ -19,6 +19,21 @@ import (
 var benchmarkStringSink string
 var benchmarkPlansSink []corpusPlan
 
+func benchmarkRefreshGit(ctx context.Context, paths gitPaths, plan corpusPlan) error {
+	state, err := gitRepoStateIn(ctx, paths.RepoDir)
+	if err != nil {
+		return err
+	}
+	return runIndexingWithCache(
+		ctx,
+		paths,
+		plan.cacheDir,
+		plan.indexDir,
+		state,
+		gitCorpusStateHash(paths, state),
+	)
+}
+
 // --- Hot-path microbenchmarks ---
 // These cover every function called on each search invocation.
 
@@ -905,10 +920,10 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 		}
 	})
 
-	b.Run("indexCommitted_incremental", func(b *testing.B) {
+	b.Run("refreshCommitted_cached", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			if err := indexCommitted(dir, plan.indexDir, indexParallelism()); err != nil {
+			if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
 				b.Fatalf("index committed: %v", err)
 			}
 		}
@@ -1838,10 +1853,10 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		}
 	})
 
-	b.Run("indexCommitted_incremental", func(b *testing.B) {
+	b.Run("refreshCommitted_cached", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			if err := indexCommitted(paths.RepoDir, plan.indexDir, indexParallelism()); err != nil {
+			if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
 				b.Fatalf("index committed: %v", err)
 			}
 		}
@@ -2078,9 +2093,8 @@ func assertBenchmarkResultsContainPaths(b *testing.B, repoDir string, targets []
 
 // BenchmarkGitCommitted_1CommitAhead measures the steady-state cost of
 // indexing a single committed change. Each iteration prepares a new commit
-// outside the timed section, then runs indexCommitted with IsDelta=true. The
-// expected gain vs a hypothetical IsDelta=false build comes from Zoekt's
-// tree-to-tree diff (only the new blob is hashed + ctags-parsed).
+// outside the timed section, then runs the production native refresh. The
+// refresh uses a native delta when the new commit passes admission.
 func BenchmarkGitCommitted_1CommitAhead(b *testing.B) {
 	if testing.Short() {
 		b.Skip("skipping end-to-end benchmark in short mode")
@@ -2088,8 +2102,9 @@ func BenchmarkGitCommitted_1CommitAhead(b *testing.B) {
 	requireTools(b)
 
 	dir := initGitRepo(b, "seed.go", "package main\n// commit_ahead_seed\n")
+	ctx := context.Background()
 	paths, plan := planGitTestCorpus(b, dir)
-	if err := indexCommitted(paths.RepoDir, plan.indexDir, indexParallelism()); err != nil {
+	if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
 		b.Fatalf("initial commit index: %v", err)
 	}
 
@@ -2105,7 +2120,7 @@ func BenchmarkGitCommitted_1CommitAhead(b *testing.B) {
 		gitRunIn(b, dir, "add", ".")
 		gitRunIn(b, dir, "commit", "-m", "delta step")
 		b.StartTimer()
-		if err := indexCommitted(paths.RepoDir, plan.indexDir, indexParallelism()); err != nil {
+		if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
 			b.Fatalf("delta commit index: %v", err)
 		}
 	}
@@ -2183,7 +2198,8 @@ func BenchmarkGitBranch_Switch_Unrelated(b *testing.B) {
 	gitRunIn(b, dir, "commit", "-am", "feature churn")
 
 	paths, plan := planGitTestCorpus(b, dir)
-	if err := indexCommitted(paths.RepoDir, plan.indexDir, indexParallelism()); err != nil {
+	ctx := context.Background()
+	if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
 		b.Fatalf("initial index: %v", err)
 	}
 
@@ -2195,7 +2211,7 @@ func BenchmarkGitBranch_Switch_Unrelated(b *testing.B) {
 			target = "feature"
 		}
 		gitRunIn(b, dir, "checkout", target)
-		if err := indexCommitted(paths.RepoDir, plan.indexDir, indexParallelism()); err != nil {
+		if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
 			b.Fatalf("post-switch index: %v", err)
 		}
 	}

@@ -159,20 +159,6 @@ func (s *gitDirtyScope) contains(name string) bool {
 	return coveredByAnyDir(name, s.includeDirs) || containsString(s.includeFiles, name)
 }
 
-func (s *gitDirtyScope) gitIncludePathspecs() []string {
-	if s == nil {
-		return nil
-	}
-	pathspecs := make([]string, 0, len(s.includeDirs)+len(s.includeFiles))
-	for _, dir := range s.includeDirs {
-		pathspecs = append(pathspecs, gitLiteralPathspec(dir))
-	}
-	for _, file := range s.includeFiles {
-		pathspecs = append(pathspecs, gitLiteralPathspec(file))
-	}
-	return pathspecs
-}
-
 func gitLiteralPathspec(name string) string {
 	if name == "." {
 		return "."

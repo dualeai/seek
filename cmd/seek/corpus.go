@@ -691,7 +691,7 @@ func crossesGitBoundary(parent string, child externalRoot) bool {
 func buildGitCorpusPlan(repoDir, commonDir string, extraIDParts ...string) (corpusPlan, error) {
 	root := canonicalCorpusPath(repoDir)
 	cdir := canonicalCorpusPath(commonDir)
-	idParts := []string{"git_worktree", root, "git_common_dir", cdir}
+	idParts := []string{"git_worktree", root, "git_common_dir", cdir, "git_committed_backend", "native-v1"}
 	idParts = append(idParts, extraIDParts...)
 	return newCorpusPlan(corpusKindGit, rootTypeWorktree, root, "git", idParts...)
 }

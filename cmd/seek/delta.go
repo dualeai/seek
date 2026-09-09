@@ -31,9 +31,23 @@ func indexDeltaDocuments(
 	shardMaxBytes int,
 	changedPaths []string,
 ) (bool, error) {
+	repository := zoekt.Repository{Name: repoName, Source: source}
+	return indexDeltaDocumentsWithRepository(indexDir, repository, files, shardMaxBytes, changedPaths)
+}
+
+func indexDeltaDocumentsWithRepository(
+	indexDir string,
+	repository zoekt.Repository,
+	files []fileContent,
+	shardMaxBytes int,
+	changedPaths []string,
+) (bool, error) {
+	if err := checkCtagsCached(); err != nil {
+		releaseFileContentWeights(files)
+		return false, err
+	}
 	opts := indexBuildOptions(indexDir, 1)
-	opts.RepositoryDescription.Name = repoName
-	opts.RepositoryDescription.Source = source
+	opts.RepositoryDescription = repository
 	if shardMaxBytes > 0 {
 		opts.ShardMax = shardMaxBytes
 	}
@@ -54,8 +68,10 @@ func indexDeltaDocuments(
 	for _, doc := range files {
 		if addErr == nil {
 			if err := builder.Add(index.Document{
-				Name:    doc.name,
-				Content: doc.content,
+				Name:       doc.name,
+				Content:    doc.content,
+				Branches:   doc.branches,
+				SkipReason: doc.skipReason,
 			}); err != nil {
 				addErr = fmt.Errorf("add delta document %s: %w", doc.name, err)
 			}

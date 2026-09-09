@@ -14,7 +14,8 @@ import (
 // Setup: capture a forward chain of recent commit SHAs ending at the current
 // HEAD, create a scratch clone under b.TempDir(), check out a local benchmark
 // branch at the oldest commit, build a base index, then reset the clone to each
-// next SHA and time indexCommitted. Iterations are capped to len(chain)-1; if
+// next SHA and time the production native refresh. Iterations are capped to
+// len(chain)-1; if
 // Go's benchmark framework wants more, it gets a loop reset (which behaves
 // like a fresh advance from the oldest). Each iteration is a real one-commit
 // advance, not a reflog oscillation between two distant positions.
@@ -31,9 +32,10 @@ func BenchmarkLargeRepo_CommittedAdvance(b *testing.B) {
 	chain := commits[1:]
 
 	repoDir := cloneBenchRepoAt(b, sourceRepo, base)
+	ctx := context.Background()
 	paths, plan := planGitTestCorpus(b, repoDir)
 
-	if err := indexCommitted(paths.RepoDir, plan.indexDir, indexParallelism()); err != nil {
+	if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
 		b.Fatalf("cold base index: %v", err)
 	}
 
@@ -46,14 +48,14 @@ func BenchmarkLargeRepo_CommittedAdvance(b *testing.B) {
 		idx := i % len(chain)
 		if idx == 0 && i > 0 {
 			gitRunIn(b, repoDir, "reset", "--hard", base)
-			if err := indexCommitted(paths.RepoDir, plan.indexDir, indexParallelism()); err != nil {
+			if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
 				b.Fatalf("chain replay base index: %v", err)
 			}
 		}
 		gitRunIn(b, repoDir, "reset", "--hard", chain[idx])
 		b.StartTimer()
 
-		if err := indexCommitted(paths.RepoDir, plan.indexDir, indexParallelism()); err != nil {
+		if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
 			b.Fatalf("delta advance index (iter %d): %v", i, err)
 		}
 	}

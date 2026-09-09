@@ -57,8 +57,7 @@ func gitCmd(ctx context.Context, args ...string) *exec.Cmd {
 
 // gitLocationEnv names the variables that redirect git at a different
 // repository than the one Seek resolved from the filesystem. Seek removes them
-// from its Git commands and from the environment inherited by Zoekt cat-file
-// commands.
+// from all Git commands.
 var gitLocationEnv = [5]string{
 	"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
 }
@@ -68,7 +67,8 @@ func sanitizedGitEnv(env []string) []string {
 	for _, kv := range env {
 		name, _, _ := strings.Cut(kv, "=")
 		switch name {
-		case "GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS":
+		case "GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS",
+			"GIT_TERMINAL_PROMPT", "LC_ALL", "LANG":
 			continue
 		// Corpus identity comes from the filesystem. A location variable could
 		// make Git describe a different repository from the indexed corpus.
@@ -78,6 +78,11 @@ func sanitizedGitEnv(env []string) []string {
 			filtered = append(filtered, kv)
 		}
 	}
+	filtered = append(filtered,
+		"GIT_TERMINAL_PROMPT=0",
+		"LC_ALL=C",
+		"LANG=C",
+	)
 	return filtered
 }
 

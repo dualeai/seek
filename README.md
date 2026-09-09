@@ -347,6 +347,18 @@ filtered results with context.
 4. **Search** -- reads the index for every selected repo or folder, runs one
    query, merges duplicate results, sorts by relevance, then applies limits.
 
+### Git indexing
+
+Seek uses Git plumbing to index committed data. `git ls-tree` lists files,
+`git cat-file` reads objects, and `git diff-tree` supplies small updates. The
+Git host does not select index behavior or metadata policy. An origin URL does
+not change repository identity, rank, or links. A local `[zoekt]` section can
+set a repository name and one opaque `web-url` explicitly.
+
+This release changes the committed Git cache identity to `native-v1`. The first
+Git search after the upgrade rebuilds that cache. Dirty-file indexing and folder
+indexing do not change.
+
 Indexes are stored centrally in the user cache, never inside searched folders:
 
 - macOS: `~/Library/Caches/seek/corpora/<id>/`

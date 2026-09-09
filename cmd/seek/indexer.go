@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -17,9 +16,8 @@ import (
 	"syscall"
 
 	"github.com/cespare/xxhash/v2"
-	"github.com/sourcegraph/zoekt/gitindex"
+	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/index"
-	"github.com/sourcegraph/zoekt/query"
 )
 
 const (
@@ -51,8 +49,6 @@ const (
 	buildDirPrefix = ".build-"
 	// repoUncommitted is the zoekt repository name for uncommitted file shards.
 	repoUncommitted = "uncommitted"
-	// emptyGitTreeSHA is Git's canonical SHA-1 for the empty tree.
-	emptyGitTreeSHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 	// stateVersion is the prefix used in state hashing to invalidate previous
 	// state formats when the hash algorithm or input format changes.
 	stateVersion = "v6\x00"
@@ -302,12 +298,6 @@ func checkCtags() error {
 // They therefore see either the old family or the new family.
 func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDir string, state repoState, preState string) error {
 	repoDir := paths.RepoDir
-	// Fail fast when no executable Ctags command can be found.
-	if err := checkCtagsCached(); err != nil {
-		deleteStateFiles(cacheDir)
-		return gitCorpusError(repoDir, indexDir, err)
-	}
-
 	// Ensure partial temp files are cleaned up on all exit paths.
 	defer func() {
 		_ = os.Remove(filepath.Join(cacheDir, stateTmpFile))
@@ -343,7 +333,7 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	// uncommitted family.
 	committedIntact := sc.matchesManifestFamily(indexDir, familyCommitted)
 	noHeadArtifacts := state.HeadSHA == "no-head" && sc.hasMember(familyCommitted)
-	committedPresent := state.HeadSHA == "no-head" || sc.hasCommittedShard()
+	committedPresent := committedSnapshotReady(cacheDir, indexDir, state, sc)
 	if cachedState == preState && !noHeadArtifacts && committedPresent && familyIntact {
 		return nil
 	}
@@ -366,7 +356,6 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	// repository publishes an empty family so shards from its former HEAD cannot
 	// remain searchable.
 	var buildDir string
-	seeded := false
 	if needCommitted || clearCommitted {
 		buildDir, err = newBuildDir(indexDir)
 		if err != nil {
@@ -375,35 +364,23 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 		defer discardBuildDir(buildDir)
 	}
 	if needCommitted {
-		_, selected, err := scanGitCommittedBudget(ctx, repoDir, "HEAD", nil, gitCandidateFileLimit, gitCorpusIndexedByteLimit)
-		if err != nil {
-			deleteStateFiles(cacheDir)
-			return gitCorpusError(repoDir, indexDir, err)
-		}
-		// Seed only a complete, contiguous family. Zoekt derives the next shard
-		// number from the contiguous run. A gap can make a delta replace a later
-		// shard. A changed file or missing sidecar is also an invalid base.
-		existing := sc.paths(familyCommitted)
-		contiguous := sc.contiguous(familyCommitted)
-		switch {
-		case len(existing) == 0:
-			// Cold corpus: nothing to seed and nothing wrong. Stay silent.
-		case !contiguous:
-			slog.Warn("Committed shard family has a numbering gap; rebuilding it in full",
-				"index_dir", indexDir)
-		case !committedIntact:
-			slog.Warn("Committed shard family does not match its manifest; rebuilding it in full",
-				"index_dir", indexDir)
-		default:
-			if err := seedFamilyFiles(buildDir, existing); err != nil {
-				return err
+		snapshot, ok, cErr := captureGitSnapshot(ctx, repoDir, state.HeadSHA)
+		if cErr != nil || !ok {
+			if cErr == nil {
+				cErr = fmt.Errorf("captured committed Git state has no commit")
 			}
-			seeded = true
+			deleteStateFiles(cacheDir)
+			return gitCorpusError(repoDir, indexDir, cErr)
 		}
-		if cErr := indexCommitted(repoDir, buildDir, parallelism); cErr != nil {
-			// Inspect the object-store form only after a failed build. Its presence
-			// alone does not prove that a required object is hidden.
-			cErr = annotateUnreadableObjectStore(paths.CommonDir, repoDir, cErr)
+		delta, eligible, cErr := prepareNativeGitDelta(ctx, repoDir, indexDir, snapshot, sc)
+		if cErr == nil {
+			if eligible {
+				_, cErr = indexNativeGitDelta(ctx, repoDir, buildDir, sc.paths(familyCommitted), delta)
+			} else {
+				_, cErr = indexNativeGitFull(ctx, repoDir, buildDir, snapshot, nil, parallelism)
+			}
+		}
+		if cErr != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
@@ -411,25 +388,17 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 				deleteStateFiles(cacheDir)
 			}
 			// The caller decides whether existing shards make a stale search safe.
-			return cErr
-		}
-		// go-git can end a tree walk at an unreadable subtree and report success.
-		// Check coverage only for a full build on a known object-store form.
-		if !seeded && storeMayHideObjects(paths.CommonDir) {
-			warnOnShortCommittedCoverage(ctx, buildDir, repoDir, selected)
+			return gitCorpusError(repoDir, indexDir, cErr)
 		}
 	}
-	if needCommitted || clearCommitted {
-		// HEAD must still equal the captured value before publication. Otherwise,
-		// discard the temp build and keep the current published shards. The next
-		// search derives fresh state and can rebuild once HEAD is stable.
-		publish, err := validateCommittedBuildHead(ctx, paths, state.HeadSHA)
-		if err != nil {
-			return err
-		}
-		if !publish {
-			return nil // discard build; live shards untouched
-		}
+	// HEAD must still equal the captured value before publication. This check
+	// also covers an unborn snapshot that had no committed Builder work.
+	publish, err := validateCommittedBuildHead(ctx, paths, state.HeadSHA)
+	if err != nil {
+		return err
+	}
+	if !publish {
+		return nil // discard build; live shards untouched
 	}
 
 	// Keep the committed publish, uncommitted build, and state files under one
@@ -486,6 +455,7 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	postState := gitCorpusStateHash(paths, state)
 
 	if postState == preState {
+		finalHasShard := false
 		// Write the manifest under the same publish lock as the state. Use the
 		// committed names returned by the swap and scan the uncommitted files
 		// that this process just wrote. Record dirty-to-clean transitions too.
@@ -496,6 +466,7 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 			if postErr != nil {
 				return postErr
 			}
+			finalHasShard = post.hasShard()
 			for _, m := range post.members {
 				if m.uncommitted || !publishedCommitted {
 					names = append(names, m.name)
@@ -508,6 +479,11 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 		if err := writeStateFile(cacheDir, preState); err != nil {
 			return fmt.Errorf("write state file: %w", err)
 		}
+		if finalHasShard {
+			deleteEmptyStateFiles(cacheDir)
+		} else if err := writeEmptyStateFile(cacheDir, preState); err != nil {
+			return fmt.Errorf("write empty state file: %w", err)
+		}
 		// Persist HEAD so working-tree-only changes skip the committed indexer.
 		if err := writeHeadFile(cacheDir, state.HeadSHA); err != nil {
 			slog.Warn("Failed to write head file", "error", err)
@@ -518,6 +494,19 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	}
 
 	return nil
+}
+
+// committedSnapshotReady reports whether this family already represents the
+// captured commit. A valid manifest can describe an empty committed family
+// beside live dirty shards, so a committed shard is not always required.
+func committedSnapshotReady(cacheDir, indexDir string, state repoState, scan familyScan) bool {
+	if state.HeadSHA == "no-head" {
+		return !scan.hasMember(familyCommitted)
+	}
+	if scan.hasCommittedShard() {
+		return true
+	}
+	return readHeadFile(cacheDir) == state.HeadSHA && scan.matchesManifestFamily(indexDir, familyCommitted)
 }
 
 // validateCommittedBuildHead distinguishes a real HEAD change from a failed
@@ -548,425 +537,9 @@ func shardsExist(indexDir string) bool {
 	return err == nil && present
 }
 
-// maxCommittedDeltaShards bounds delta-stacked committed shards before Zoekt
-// forces a full rebuild. It matches maxFolderDeltaShards.
+// maxCommittedDeltaShards bounds delta-stacked committed shards before Seek
+// selects a native full build. It matches maxFolderDeltaShards.
 const maxCommittedDeltaShards = 64
-
-// indexCommitted indexes committed files using gitindex.IndexGitRepo.
-//
-// IsDelta=true makes Zoekt diff the tree between the last indexed commit and
-// the current HEAD, indexing only changed blobs and tombstoning the rest via
-// per-shard .meta sidecars. Zoekt falls back to a full rebuild on its own when
-// the prior commit is gone (force-push, GC), branch set changes, index option
-// hash differs, or the shard count exceeds DeltaShardNumberFallbackThreshold.
-//
-// The fallback repository name gives Zoekt a stable shard namespace. Zoekt
-// keeps this name unless the repository has an explicit [zoekt] name.
-// enableCatfileBatch makes `git cat-file --batch` the default Zoekt blob
-// reader. This path supports alternates and promisor packs and reports missing
-// objects correctly.
-//
-// Set once at process start rather than per build, so concurrent corpus workers
-// never race on the environment. An explicit user setting always wins.
-var catfileOnce sync.Once
-
-func enableCatfileBatch() {
-	catfileOnce.Do(func() {
-		if _, set := os.LookupEnv("ZOEKT_DISABLE_CATFILE_BATCH"); !set {
-			_ = os.Setenv("ZOEKT_DISABLE_CATFILE_BATCH", "false")
-		}
-		// Zoekt cat-file commands inherit the process environment. Remove Git
-		// location variables so cmd.Dir selects the intended repository.
-		for _, name := range gitLocationEnv {
-			_ = os.Unsetenv(name)
-		}
-	})
-}
-
-// storeMayHideObjects reports whether this object store uses a form that go-git
-// does not fully read.
-//
-// Two known forms can hide objects:
-//
-//   - a pack not named pack-*. `git maintenance` writes the loose-objects
-//     task's output as loose-<hash>.pack, and go-git skips names without the
-//     pack- prefix.
-//   - an objects/info/alternates file. zoekt never sets AlternatesFS, so the
-//     borrowed store is invisible.
-//
-// go-git's TreeWalker.Next can turn a missing subtree into io.EOF. The build
-// can then report success with an incomplete file list. This function enables
-// the coverage check for those stores.
-func storeMayHideObjects(commonDir string) bool {
-	if commonDir == "" {
-		return false
-	}
-	objects := filepath.Join(commonDir, "objects")
-	if _, err := os.Stat(filepath.Join(objects, "info", "alternates")); err == nil {
-		return true
-	}
-	entries, err := os.ReadDir(filepath.Join(objects, "pack"))
-	if err != nil {
-		return false
-	}
-	for _, ent := range entries {
-		name := ent.Name()
-		if !strings.HasSuffix(name, ".pack") || strings.HasPrefix(name, "pack-") {
-			continue
-		}
-		// git writes its own in-flight repack output as .tmp-<pid>-pack-*.pack;
-		// a search racing a repack is not looking at a hidden region.
-		if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "tmp") {
-			continue
-		}
-		return true
-	}
-	return false
-}
-
-// warnOnShortCommittedCoverage compares the document count from a full build
-// with the indexable blob count from Git. It warns when fewer than half of the
-// expected documents were indexed.
-//
-// The caller runs this only for an object store that storeMayHideObjects
-// identified and for a build that seeded no old shards.
-//
-// Compare documents, not bytes. Zoekt excludes the content of skipped binary,
-// large, small, or high-trigram documents from ContentBytes, but it still
-// counts those documents. Delta stacking can make the indexed count larger
-// than the current tree, so only a shortfall is damage.
-func warnOnShortCommittedCoverage(ctx context.Context, buildDir, repoDir string, selected int) {
-	if selected <= 0 {
-		return
-	}
-	searchers, err := loadShardsOptional(buildDir)
-	if err != nil || len(searchers) == 0 {
-		return
-	}
-	defer func() {
-		for _, s := range searchers {
-			s.Close()
-		}
-	}()
-	documents := 0
-	for _, s := range searchers {
-		list, lerr := s.List(ctx, &query.Const{Value: true}, nil)
-		if lerr != nil {
-			return
-		}
-		documents += list.Stats.Documents
-	}
-	if documents*2 >= selected {
-		return
-	}
-	slog.Warn("Indexed far fewer files than the repository holds; the object store has a region the indexer cannot read",
-		"repo", repoDir,
-		"indexed_files", documents,
-		"expected_files", selected,
-		"hint", "git -C "+repoDir+" repack -a -d")
-}
-
-// unreadableObjectsError reports an object-store region that the indexing
-// library cannot read. One of pack or alternate is set.
-type unreadableObjectsError struct {
-	repoDir   string
-	pack      string // a pack whose name the library will not discover
-	alternate string // a borrowed object store the library cannot reach
-	cause     error
-}
-
-func (e *unreadableObjectsError) Unwrap() error { return e.cause }
-
-func (e *unreadableObjectsError) Error() string {
-	if e.alternate != "" {
-		return fmt.Sprintf("git objects live in an alternate seek cannot read: %s", e.alternate)
-	}
-	return fmt.Sprintf("git objects live in a pack seek cannot read: %s", e.pack)
-}
-
-// annotateUnreadableObjectStore adds an actionable error when a failed build
-// uses an object-store form detected by storeMayHideObjects.
-func annotateUnreadableObjectStore(commonDir, repoDir string, cause error) error {
-	objects := filepath.Join(commonDir, "objects")
-	entries, err := os.ReadDir(filepath.Join(objects, "pack"))
-	if err == nil {
-		for _, ent := range entries {
-			name := ent.Name()
-			if !strings.HasSuffix(name, ".pack") || strings.HasPrefix(name, "pack-") {
-				continue
-			}
-			// git writes its own in-flight repack output as
-			// .tmp-<pid>-pack-*.pack; a search racing a repack must not be told
-			// to run a repack.
-			if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "tmp") {
-				continue
-			}
-			return &unreadableObjectsError{repoDir: repoDir, pack: name, cause: cause}
-		}
-	}
-	if raw := strings.TrimSpace(readCacheFile(filepath.Join(objects, "info"), "alternates")); raw != "" {
-		first, _, _ := strings.Cut(raw, "\n")
-		if first = strings.TrimSpace(first); first != "" {
-			return &unreadableObjectsError{repoDir: repoDir, alternate: first, cause: cause}
-		}
-	}
-	return cause
-}
-
-func indexCommitted(repoDir, indexDir string, parallelism int) error {
-	enableCatfileBatch()
-	buildOpts := indexBuildOptions(indexDir, parallelism)
-	buildOpts.IsDelta = true
-	buildOpts.RepositoryDescription.Name = fallbackGitRepositoryName(repoDir)
-	opts := gitindex.Options{
-		RepoDir:                           repoDir,
-		Incremental:                       true,
-		Branches:                          []string{"HEAD"},
-		BuildOptions:                      buildOpts,
-		DeltaShardNumberFallbackThreshold: maxCommittedDeltaShards,
-	}
-	_, err := gitindex.IndexGitRepo(opts)
-	if err != nil {
-		return gitCorpusError(repoDir, indexDir, err)
-	}
-	return nil
-}
-
-func indexScopedCommitted(ctx context.Context, repoDir, indexDir, treeish string, scope *gitDirtyScope, parallelism int) (bool, error) {
-	repoName := fallbackGitRepositoryName(repoDir)
-	errCh := make(chan error, 1)
-	fileCh := streamGitTreeBlobs(ctx, repoDir, treeish, scope, errCh)
-	indexedAny, err := indexDocuments(ctx, indexDir, repoName, repoDir, fileCh, parallelism)
-	if err != nil {
-		return indexedAny, err
-	}
-	select {
-	case err := <-errCh:
-		if err != nil {
-			return indexedAny, err
-		}
-	default:
-	}
-	return indexedAny, nil
-}
-
-func streamGitTreeBlobs(ctx context.Context, repoDir, treeish string, scope *gitDirtyScope, errCh chan<- error) <-chan fileContent {
-	out := make(chan fileContent)
-	go func() {
-		defer close(out)
-
-		args := []string{"ls-tree", "-r", "-l", "-z", treeish, "--"}
-		args = append(args, scope.gitIncludePathspecs()...)
-		lsCmd := gitCmd(ctx, args...)
-		lsCmd.Dir = repoDir
-		lsStdout, err := lsCmd.StdoutPipe()
-		if err != nil {
-			sendGitBlobStreamErr(errCh, fmt.Errorf("open git ls-tree stdout: %w", err))
-			return
-		}
-		var lsStderr strings.Builder
-		lsCmd.Stderr = &lsStderr
-		if err := lsCmd.Start(); err != nil {
-			sendGitBlobStreamErr(errCh, fmt.Errorf("start git ls-tree: %w", err))
-			return
-		}
-		abortLs := func() {
-			if lsCmd.Process != nil {
-				_ = lsCmd.Process.Kill()
-			}
-			_ = lsCmd.Wait()
-		}
-
-		var catCmd *exec.Cmd
-		var catStdin io.WriteCloser
-		var catReader *bufio.Reader
-		var catStderr strings.Builder
-		closeCat := func() {
-			if catCmd == nil {
-				return
-			}
-			_ = catStdin.Close()
-			if err := catCmd.Wait(); err != nil {
-				if msg := strings.TrimSpace(catStderr.String()); msg != "" {
-					sendGitBlobStreamErr(errCh, fmt.Errorf("git cat-file: %w: %s", err, msg))
-					return
-				}
-				sendGitBlobStreamErr(errCh, fmt.Errorf("git cat-file: %w", err))
-			}
-		}
-		abortCat := func() {
-			if catCmd == nil {
-				return
-			}
-			if catCmd.Process != nil {
-				_ = catCmd.Process.Kill()
-			}
-			_ = catCmd.Wait()
-			catCmd = nil
-		}
-		defer closeCat()
-		startCat := func() error {
-			if catCmd != nil {
-				return nil
-			}
-			cmd := gitCmd(ctx, "cat-file", "--batch")
-			cmd.Dir = repoDir
-			stdin, err := cmd.StdinPipe()
-			if err != nil {
-				return fmt.Errorf("open git cat-file stdin: %w", err)
-			}
-			catStdout, err := cmd.StdoutPipe()
-			if err != nil {
-				return fmt.Errorf("open git cat-file stdout: %w", err)
-			}
-			cmd.Stderr = &catStderr
-			if err := cmd.Start(); err != nil {
-				return fmt.Errorf("start git cat-file: %w", err)
-			}
-			catCmd = cmd
-			catStdin = stdin
-			catReader = bufio.NewReaderSize(catStdout, 64*1024)
-			return nil
-		}
-
-		lsReader := bufio.NewReaderSize(lsStdout, 64*1024)
-		var longRecord []byte
-		var readErr error
-		for {
-			record, err := lsReader.ReadSlice(0)
-			if errors.Is(err, bufio.ErrBufferFull) {
-				longRecord = append(longRecord, record...)
-				continue
-			}
-			if len(longRecord) > 0 {
-				longRecord = append(longRecord, record...)
-				record = longRecord
-				longRecord = nil
-			}
-			if len(record) > 0 {
-				blob, ok := parseGitTreeBlobRecord(record)
-				if ok && scope.contains(blob.name) && blob.size <= maxIndexedDocumentBytes {
-					if err := ctx.Err(); err != nil {
-						abortLs()
-						abortCat()
-						sendGitBlobStreamErr(errCh, err)
-						return
-					}
-					if err := startCat(); err != nil {
-						abortLs()
-						sendGitBlobStreamErr(errCh, err)
-						return
-					}
-					if _, err := fmt.Fprintln(catStdin, blob.oid); err != nil {
-						abortLs()
-						abortCat()
-						sendGitBlobStreamErr(errCh, fmt.Errorf("write git cat-file request: %w", err))
-						return
-					}
-					content, weight, err := readGitBlobFromCatFile(ctx, catReader, blob)
-					if err != nil {
-						abortLs()
-						abortCat()
-						sendGitBlobStreamErr(errCh, err)
-						return
-					}
-					if content == nil {
-						continue
-					}
-					select {
-					case out <- fileContent{name: blob.name, content: content, weight: weight}:
-					case <-ctx.Done():
-						if weight > 0 {
-							readSemaphore.Release(weight)
-						}
-						abortLs()
-						abortCat()
-						sendGitBlobStreamErr(errCh, ctx.Err())
-						return
-					}
-				}
-			}
-			if err == nil {
-				continue
-			}
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			readErr = err
-			break
-		}
-		if readErr != nil {
-			_ = lsCmd.Process.Kill()
-			_ = lsCmd.Wait()
-			sendGitBlobStreamErr(errCh, fmt.Errorf("read git ls-tree: %w", readErr))
-			return
-		}
-		if err := lsCmd.Wait(); err != nil {
-			if msg := strings.TrimSpace(lsStderr.String()); msg != "" {
-				sendGitBlobStreamErr(errCh, fmt.Errorf("git ls-tree: %w: %s", err, msg))
-				return
-			}
-			sendGitBlobStreamErr(errCh, fmt.Errorf("git ls-tree: %w", err))
-		}
-	}()
-	return out
-}
-
-func readGitBlobFromCatFile(ctx context.Context, reader *bufio.Reader, blob gitTreeBlob) ([]byte, int64, error) {
-	header, err := reader.ReadString('\n')
-	if err != nil {
-		return nil, 0, fmt.Errorf("read git cat-file header for %s: %w", blob.name, err)
-	}
-	fields := strings.Fields(header)
-	if len(fields) < 3 || fields[1] != "blob" {
-		return nil, 0, fmt.Errorf("unexpected git cat-file header for %s: %q", blob.name, strings.TrimSpace(header))
-	}
-	size, err := strconv.ParseInt(fields[2], 10, 64)
-	if err != nil || size < 0 {
-		return nil, 0, fmt.Errorf("parse git cat-file size for %s: %q", blob.name, fields[2])
-	}
-	if size > maxIndexedDocumentBytes {
-		if _, err := io.CopyN(io.Discard, reader, size+1); err != nil {
-			return nil, 0, fmt.Errorf("skip large git blob %s: %w", blob.name, err)
-		}
-		return nil, 0, nil
-	}
-	weight := size
-	if err := readSemaphore.Acquire(ctx, weight); err != nil {
-		return nil, 0, err
-	}
-	content := make([]byte, int(size))
-	if _, err := io.ReadFull(reader, content); err != nil {
-		if weight > 0 {
-			readSemaphore.Release(weight)
-		}
-		return nil, 0, fmt.Errorf("read git blob %s: %w", blob.name, err)
-	}
-	delim, err := reader.ReadByte()
-	if err != nil {
-		if weight > 0 {
-			readSemaphore.Release(weight)
-		}
-		return nil, 0, fmt.Errorf("read git blob delimiter %s: %w", blob.name, err)
-	}
-	if delim != '\n' {
-		if weight > 0 {
-			readSemaphore.Release(weight)
-		}
-		return nil, 0, fmt.Errorf("unexpected git blob delimiter %s: %q", blob.name, delim)
-	}
-	return content, weight, nil
-}
-
-func sendGitBlobStreamErr(errCh chan<- error, err error) {
-	if err == nil {
-		return
-	}
-	select {
-	case errCh <- err:
-	default:
-	}
-}
 
 // fallbackGitRepositoryName returns a stable opaque name for Git committed
 // shards when Zoekt cannot derive one from repo metadata. It is intentionally
@@ -987,9 +560,11 @@ func fallbackGitRepositoryName(repoDir string) string {
 // Zero weight means that a synchronous folder-delta read did not use the
 // semaphore. Releasing zero has no effect.
 type fileContent struct {
-	name    string
-	content []byte
-	weight  int64
+	name       string
+	content    []byte
+	weight     int64
+	branches   []string
+	skipReason index.SkipReason
 }
 
 // readFilesToChannel reads files from the working tree using a bounded
@@ -1340,6 +915,18 @@ func indexDocuments(
 	fileCh <-chan fileContent,
 	parallelism int,
 ) (bool, error) {
+	repository := zoekt.Repository{Name: repoName, Source: source}
+	return indexDocumentsWithRepository(ctx, indexDir, repository, fileCh, parallelism, nil)
+}
+
+func indexDocumentsWithRepository(
+	ctx context.Context,
+	indexDir string,
+	repository zoekt.Repository,
+	fileCh <-chan fileContent,
+	parallelism int,
+	cancelProducer context.CancelFunc,
+) (bool, error) {
 	var current *index.Builder
 	var pendingWeight int64
 	var addErr error
@@ -1347,9 +934,11 @@ func indexDocuments(
 	openedWindows := 0
 
 	openWindow := func(isDelta bool) error {
+		if err := checkCtagsCached(); err != nil {
+			return err
+		}
 		opts := indexBuildOptions(indexDir, parallelism)
-		opts.RepositoryDescription.Name = repoName
-		opts.RepositoryDescription.Source = source
+		opts.RepositoryDescription = repository
 		opts.IsDelta = isDelta
 		b, err := index.NewBuilder(opts)
 		if err != nil {
@@ -1389,6 +978,9 @@ func indexDocuments(
 
 	for doc := range fileCh {
 		if err := ctx.Err(); err != nil {
+			if cancelProducer != nil {
+				cancelProducer()
+			}
 			if doc.weight > 0 {
 				readSemaphore.Release(doc.weight)
 			}
@@ -1405,6 +997,9 @@ func indexDocuments(
 
 		if current == nil {
 			if err := openWindow(openedWindows > 0); err != nil {
+				if cancelProducer != nil {
+					cancelProducer()
+				}
 				if doc.weight > 0 {
 					readSemaphore.Release(doc.weight)
 				}
@@ -1417,13 +1012,24 @@ func indexDocuments(
 		// return, so doc.weight stays the window's responsibility either
 		// way and is Released by finishWindow.
 		pendingWeight += doc.weight
-		if err := current.Add(index.Document{Name: doc.name, Content: doc.content}); err != nil {
+		if err := current.Add(index.Document{
+			Name:       doc.name,
+			Content:    doc.content,
+			Branches:   doc.branches,
+			SkipReason: doc.skipReason,
+		}); err != nil {
 			addErr = fmt.Errorf("add document %s: %w", doc.name, err)
+			if cancelProducer != nil {
+				cancelProducer()
+			}
 			continue
 		}
 
 		if pendingWeight >= indexWindowBytes {
 			if err := finishWindow(); err != nil {
+				if cancelProducer != nil {
+					cancelProducer()
+				}
 				drainRemaining()
 				return indexedAny, err
 			}
@@ -1432,13 +1038,16 @@ func indexDocuments(
 
 	if current != nil {
 		if err := finishWindow(); err != nil {
+			if cancelProducer != nil {
+				cancelProducer()
+			}
 			if addErr != nil {
 				return true, addErr
 			}
 			return true, err
 		}
 	} else if !indexedAny {
-		cleanRepositoryShards(indexDir, repoName)
+		cleanRepositoryShards(indexDir, repository.Name)
 		return false, nil
 	}
 
@@ -1473,15 +1082,4 @@ func repositoryShardFiles(indexDir, repoName string) []string {
 		return nil
 	}
 	return matches
-}
-
-func cleanAllShards(indexDir string) {
-	all, err := familyShardFiles(indexDir, familyAll)
-	if err != nil {
-		slog.Warn("Cannot enumerate shard family to clean", "index_dir", indexDir, "error", err)
-		return
-	}
-	for _, m := range all {
-		_ = os.Remove(m)
-	}
 }

@@ -240,8 +240,8 @@ func folderCorpusState(ctx context.Context, plan corpusPlan) (string, []folderCa
 }
 
 // errBareRepoNotSupported lets callers branch on the rejection via
-// errors.Is — Zoekt's gitindex needs a working tree, so bare repos
-// can't be indexed under the folder-corpus pipeline.
+// errors.Is. The folder pipeline needs a working tree and does not index a bare
+// repository's internal object files as normal files.
 var errBareRepoNotSupported = errors.New("bare git repositories are not supported as folder corpora")
 
 // checkNotBareRepo gates the two folder-corpus entry points

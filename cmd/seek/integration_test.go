@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,8 +36,8 @@ func requireTools(tb testing.TB) {
 func initEmptyGitRepo(tb testing.TB) string {
 	tb.Helper()
 	dir := initEmptyGitRepoNoRemote(tb)
-	// zoekt's gitindex.IndexGitRepo derives the repo name from the remote URL.
-	// Most tests keep this remote so committed shard prefixes stay stable.
+	// Keep a common remote fixture for tests that inspect Git status or config.
+	// The committed indexer does not use it for identity or link policy.
 	gitRunIn(tb, dir, "remote", "add", "origin", "https://github.com/test/repo.git")
 	return dir
 }
@@ -420,20 +422,15 @@ func TestRun_EmptyUnbornRepositoryReturnsNoMatch(t *testing.T) {
 	}
 }
 
-func TestMarkGitCorpusKnownEmptyRemovesArtifactsAndManifest(t *testing.T) {
-	dir := initEmptyGitRepo(t)
+func TestEnsureCombinedGitCorpusPublishesEmptyNativeSnapshot(t *testing.T) {
+	requireTools(t)
+	dir := initGitRepo(t, "old.go", "package old\n// old_empty_transition_marker\n")
 	paths, plan := planGitTestCorpus(t, dir)
-	for _, name := range []string{
-		"repo_v16.00000.zoekt",
-		"repo_v16.00000.zoekt.meta",
-		"orphan_v16.00001.zoekt.meta",
-		"uncommitted_v16.00000.zoekt",
-		"uncommitted_v16.00000.zoekt.meta",
-	} {
-		if err := os.WriteFile(filepath.Join(plan.indexDir, name), nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
+	state := mustGitRepoStateIn(t, context.Background(), dir)
+	if got, err := ensureCombinedGitCorpus(context.Background(), plan, paths, state); err != nil || got != corpusSearchable {
+		t.Fatalf("warm native corpus: state=%v error=%v", got, err)
 	}
+
 	if err := os.WriteFile(
 		filepath.Join(plan.cacheDir, uncommittedManifestFileName),
 		[]byte("stale"),
@@ -441,22 +438,157 @@ func TestMarkGitCorpusKnownEmptyRemovesArtifactsAndManifest(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+	// A missing manifest rejects the prior family as a delta base. The common
+	// native full path must replace that family with an empty snapshot.
+	removeFamilyManifest(plan.indexDir)
 
-	state := mustGitRepoStateIn(t, context.Background(), dir)
-	marked, err := markGitCorpusKnownEmpty(
-		context.Background(),
-		plan,
-		state,
-		gitCorpusStateHash(paths, state),
-	)
-	if err != nil || !marked {
-		t.Fatalf("mark known empty: marked=%v error=%v", marked, err)
+	gitRun(t, dir, "switch", "--orphan", "empty")
+	gitRun(t, dir, "rm", "-rf", "--ignore-unmatch", ".")
+	gitRun(t, dir, "commit", "--allow-empty", "-m", "empty")
+	state = mustGitRepoStateIn(t, context.Background(), dir)
+	stateHash := gitCorpusStateHash(paths, state)
+	if got, err := ensureCombinedGitCorpus(context.Background(), plan, paths, state); err != nil || got != corpusKnownEmpty {
+		t.Fatalf("publish empty native corpus: state=%v error=%v marker=%q shards=%v", got, err,
+			readEmptyStateFile(plan.cacheDir), familyShardFilesForTest(t, plan.indexDir, familyAll))
 	}
 	if artifacts := familyShardFilesForTest(t, plan.indexDir, familyAll); len(artifacts) != 0 {
-		t.Fatalf("known-empty corpus retained artifacts: %v", artifacts)
+		t.Fatalf("empty native corpus retained artifacts: %v", artifacts)
 	}
 	if _, err := os.Stat(filepath.Join(plan.cacheDir, uncommittedManifestFileName)); !os.IsNotExist(err) {
-		t.Fatalf("known-empty corpus retained manifest: %v", err)
+		t.Fatalf("empty native corpus retained manifest: %v", err)
+	}
+	if got := readEmptyStateFile(plan.cacheDir); got != stateHash {
+		t.Fatalf("empty state=%q, want %q", got, stateHash)
+	}
+	if got := readHeadFile(plan.cacheDir); got != state.HeadSHA {
+		t.Fatalf("empty HEAD=%q, want %q", got, state.HeadSHA)
+	}
+	if got, err := ensureCombinedGitCorpus(context.Background(), plan, paths, state); err != nil || got != corpusKnownEmpty {
+		t.Fatalf("reuse empty native corpus: state=%v error=%v", got, err)
+	}
+}
+
+func publishedGitGenerationBytes(t *testing.T, plan corpusPlan) map[string]string {
+	t.Helper()
+	paths := familyShardFilesForTest(t, plan.indexDir, familyAll)
+	paths = append(paths, filepath.Join(plan.indexDir, familyManifestFile))
+	result := make(map[string]string, len(paths))
+	for _, path := range paths {
+		raw, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("read published artifact %s: %v", path, err)
+		}
+		result[path] = string(raw)
+	}
+	return result
+}
+
+func hideLooseGitObject(t *testing.T, commonDir, oid string) func() {
+	t.Helper()
+	objectPath := filepath.Join(commonDir, "objects", oid[:2], oid[2:])
+	backupPath := filepath.Join(t.TempDir(), "object")
+	if err := os.Rename(objectPath, backupPath); err != nil {
+		t.Fatalf("hide Git object %s: %v", oid, err)
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		if err := os.Rename(backupPath, objectPath); err != nil {
+			t.Fatalf("restore Git object %s: %v", oid, err)
+		}
+		restored = true
+	}
+	t.Cleanup(restore)
+	return restore
+}
+
+func TestNativeGitMissingObjectKeepsPublishedFamily(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		objectSpec string
+	}{
+		{name: "tree", objectSpec: "HEAD:z-missing"},
+		{name: "blob", objectSpec: "HEAD:z-missing/object.go"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requireTools(t)
+			repoDir := initGitRepo(t, "old.go", "package old\n// PUBLISHED_OBJECT_BASE\n")
+			paths, plan := planGitTestCorpus(t, repoDir)
+			reindexGit(t, t.Context(), paths, plan)
+			before := publishedGitGenerationBytes(t, plan)
+
+			if err := os.WriteFile(filepath.Join(repoDir, "old.go"), []byte("package current\n// PUBLISHED_OBJECT_TARGET\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(repoDir, "z-missing"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repoDir, "z-missing", "object.go"), []byte("package missing\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gitRunIn(t, repoDir, "add", ".")
+			gitRunIn(t, repoDir, "commit", "-m", "target with required object")
+			// A metadata change makes admission select native full before it
+			// reads the target tree. The tree case also fails after Git emits and
+			// Seek stages the valid root file.
+			gitRunIn(t, repoDir, "config", "zoekt.web-url", "https://example.test/native-object-test")
+			state := mustGitRepoStateIn(t, t.Context(), repoDir)
+			target := captureHeadForTest(t, paths.RepoDir)
+			oid := gitOutputIn(t, repoDir, "rev-parse", tc.objectSpec)
+			restore := hideLooseGitObject(t, paths.CommonDir, oid)
+			if tc.name == "tree" {
+				stagedDir := t.TempDir()
+				indexed, stagedErr := indexNativeGitFull(t.Context(), paths.RepoDir, stagedDir, target, nil, 1)
+				if !indexed || stagedErr == nil || !shardsExist(stagedDir) {
+					t.Fatalf("late tree failure: indexed=%t error=%v shards=%t", indexed, stagedErr, shardsExist(stagedDir))
+				}
+			}
+
+			err := runIndexingWithCache(t.Context(), paths, plan.cacheDir, plan.indexDir, state, gitCorpusStateHash(paths, state))
+			if err == nil {
+				t.Fatal("indexing succeeded with a required Git object missing")
+			}
+			if after := publishedGitGenerationBytes(t, plan); !maps.Equal(after, before) {
+				var changed []string
+				for path, want := range before {
+					if got, ok := after[path]; !ok {
+						changed = append(changed, "removed:"+filepath.Base(path))
+					} else if got != want {
+						changed = append(changed, "changed:"+filepath.Base(path))
+					}
+				}
+				for path := range after {
+					if _, ok := before[path]; !ok {
+						changed = append(changed, "added:"+filepath.Base(path))
+					}
+				}
+				sort.Strings(changed)
+				t.Fatalf("failed native build changed published artifacts: %v; error=%v; shards=%t", changed, err, shardsExist(plan.indexDir))
+			}
+			entries, err := os.ReadDir(plan.indexDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), buildDirPrefix) {
+					t.Fatalf("failed native build left staging directory %q", entry.Name())
+				}
+			}
+			if matches, err := searchPlannedCorpusForTest(t.Context(), plan, "PUBLISHED_OBJECT_BASE"); err != nil || len(matches) != 1 {
+				t.Fatalf("search prior generation: matches=%v error=%v", matches, err)
+			}
+
+			restore()
+			reindexGit(t, t.Context(), paths, plan)
+			if matches, err := searchPlannedCorpusForTest(t.Context(), plan, "PUBLISHED_OBJECT_TARGET"); err != nil || len(matches) != 1 {
+				t.Fatalf("search restored target: matches=%v error=%v", matches, err)
+			}
+		})
 	}
 }
 
@@ -2291,6 +2423,166 @@ func TestRun_WarmGitSearchDoesNotRequireCtags(t *testing.T) {
 	}
 }
 
+func TestRun_EmptyNativeGitSnapshotsDoNotRequireCtags(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Fatal("requires git on PATH")
+	}
+
+	tests := []struct {
+		name  string
+		setup func(*testing.T) string
+	}{
+		{
+			name: "empty_commit",
+			setup: func(t *testing.T) string {
+				dir := initEmptyGitRepo(t)
+				gitRun(t, dir, "commit", "--allow-empty", "-m", "empty")
+				return dir
+			},
+		},
+		{
+			name: "ignored_only",
+			setup: func(t *testing.T) string {
+				dir := initEmptyGitRepo(t)
+				if err := os.MkdirAll(filepath.Join(dir, ".sourcegraph"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, ".sourcegraph", "ignore"), []byte(".sourcegraph/ignore\nignored.go\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "ignored.go"), []byte("package ignored\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				gitRun(t, dir, "add", ".")
+				gitRun(t, dir, "commit", "-m", "ignored only")
+				return dir
+			},
+		},
+		{
+			name: "gitlink_only",
+			setup: func(t *testing.T) string {
+				dir := initEmptyGitRepo(t)
+				gitRun(t, dir, "commit", "--allow-empty", "-m", "gitlink target")
+				gitlinkOID := gitOutputIn(t, dir, "rev-parse", "HEAD")
+				gitRun(t, dir, "update-index", "--add", "--cacheinfo", "160000,"+gitlinkOID+",submodule")
+				gitRun(t, dir, "commit", "-m", "gitlink only")
+				return dir
+			},
+		},
+		{
+			name: "sha256_empty_commit",
+			setup: func(t *testing.T) string {
+				dir := t.TempDir()
+				cmd := exec.Command("git", "init", "--object-format=sha256", dir)
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Skipf("installed Git does not support SHA-256 repositories: %v: %s", err, out)
+				}
+				gitRun(t, dir, "config", "user.email", "test@test.com")
+				gitRun(t, dir, "config", "user.name", "Test")
+				gitRun(t, dir, "commit", "--allow-empty", "-m", "sha256 empty")
+				return dir
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := tc.setup(t)
+			setTestUserCache(t)
+			t.Chdir(dir)
+			forceMissingCtags(t)
+
+			out, err := captureStdout(t, func() error {
+				return run(context.Background(), "absent_empty_native_marker", nil, 0, 0)
+			})
+			if !errors.Is(err, errNoMatch) || out != "" {
+				t.Fatalf("empty native search: error=%v output=%q", err, out)
+			}
+			paths, err := resolveGitPaths(context.Background(), dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, err := planCurrentGitCorpus(paths)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if shardsExist(plan.indexDir) || readEmptyStateFile(plan.cacheDir) == "" {
+				t.Fatalf("empty native cache has shards=%t marker=%q", shardsExist(plan.indexDir), readEmptyStateFile(plan.cacheDir))
+			}
+		})
+	}
+}
+
+func TestRun_EmptyCommittedFamilyWithDirtyShardUsesWarmPath(t *testing.T) {
+	requireTools(t)
+	for _, tc := range []struct {
+		name  string
+		setup func(*testing.T) string
+	}{
+		{
+			name: "ignored_only",
+			setup: func(t *testing.T) string {
+				dir := initEmptyGitRepo(t)
+				if err := os.MkdirAll(filepath.Join(dir, ".sourcegraph"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, ".sourcegraph", "ignore"), []byte(".sourcegraph/ignore\nignored.go\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "ignored.go"), []byte("package ignored\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				gitRun(t, dir, "add", ".")
+				gitRun(t, dir, "commit", "-m", "ignored only")
+				return dir
+			},
+		},
+		{
+			name: "gitlink_only",
+			setup: func(t *testing.T) string {
+				dir := initEmptyGitRepo(t)
+				gitRun(t, dir, "commit", "--allow-empty", "-m", "gitlink target")
+				gitlinkOID := gitOutputIn(t, dir, "rev-parse", "HEAD")
+				gitRun(t, dir, "update-index", "--add", "--cacheinfo", "160000,"+gitlinkOID+",submodule")
+				gitRun(t, dir, "commit", "-m", "gitlink only")
+				return dir
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := tc.setup(t)
+			if err := os.WriteFile(filepath.Join(dir, "dirty.go"), []byte("package dirty\n// empty_committed_dirty_marker\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			setTestUserCache(t)
+			t.Chdir(dir)
+			if out, err := captureStdout(t, func() error {
+				return run(context.Background(), "empty_committed_dirty_marker", nil, 0, 0)
+			}); err != nil || !strings.Contains(out, "empty_committed_dirty_marker") {
+				t.Fatalf("cold dirty search: error=%v output=%q", err, out)
+			}
+
+			paths, err := resolveGitPaths(context.Background(), dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, err := planCurrentGitCorpus(paths)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(plan.cacheDir, uncommittedManifestFileName), []byte("corrupt"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			forceMissingCtags(t)
+			if out, err := captureStdout(t, func() error {
+				return run(context.Background(), "empty_committed_dirty_marker", nil, 0, 0)
+			}); err != nil || !strings.Contains(out, "empty_committed_dirty_marker") {
+				t.Fatalf("warm dirty search: error=%v output=%q", err, out)
+			}
+		})
+	}
+}
+
 func TestRun_GitRepoWithoutRemoteIndexesCommittedContent(t *testing.T) {
 	requireTools(t)
 
@@ -2373,6 +2665,75 @@ func TestRun_GitRepoNamedUncommittedWithoutRemoteLabelsOnlyDirtyResultUncommitte
 	}
 	if !strings.Contains(out, "## dirty.go (Go) [uncommitted]") {
 		t.Fatalf("dirty file should be tagged uncommitted, got:\n%s", out)
+	}
+}
+
+func TestRun_ReservedZoektNameKeepsCommittedFamily(t *testing.T) {
+	requireTools(t)
+	dir := initGitRepo(t, "committed.go", "package committed\n// reserved_name_committed_marker\n")
+	gitRun(t, dir, "config", "zoekt.name", repoUncommitted)
+	setTestUserCache(t)
+	t.Chdir(dir)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "reserved_name_committed_marker", nil, 0, 0)
+	})
+	if err != nil || !strings.Contains(out, "reserved_name_committed_marker") {
+		t.Fatalf("search committed file with reserved name: error=%v output=%q", err, out)
+	}
+
+	paths, err := resolveGitPaths(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := planCurrentGitCorpus(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := zoektRepositoryMetadata(t, plan.indexDir)
+	if repository.Name != fallbackGitRepositoryName(dir) {
+		t.Fatalf("repository name=%q, want safe fallback", repository.Name)
+	}
+}
+
+func TestRun_FirstNativeFailureDoesNotOpenLegacyGeneration(t *testing.T) {
+	requireTools(t)
+	repoDir := initGitRepo(t, "legacy.go", "package legacy\n// LEGACY_GENERATION_DECOY\n")
+	paths, currentPlan := planGitTestCorpus(t, repoDir)
+	root := canonicalCorpusPath(paths.RepoDir)
+	commonDir := canonicalCorpusPath(paths.CommonDir)
+	legacyPlan, err := newCorpusPlan(
+		corpusKindGit,
+		rootTypeWorktree,
+		root,
+		"git",
+		"git_worktree", root,
+		"git_common_dir", commonDir,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyPlan.cacheDir == currentPlan.cacheDir {
+		t.Fatal("native Git identity did not rotate the cache")
+	}
+	snapshot := captureHeadForTest(t, paths.RepoDir)
+	if _, err := indexNativeGitFull(t.Context(), paths.RepoDir, legacyPlan.indexDir, snapshot, nil, 1); err != nil {
+		t.Fatalf("build legacy-generation decoy: %v", err)
+	}
+	if matches, err := executeUnscopedShardSearchForTest(t.Context(), legacyPlan.indexDir, "LEGACY_GENERATION_DECOY"); err != nil || len(matches) != 1 {
+		t.Fatalf("legacy-generation decoy is not searchable: matches=%v error=%v", matches, err)
+	}
+
+	forceMissingCtags(t)
+	t.Chdir(repoDir)
+	out, err := captureStdout(t, func() error {
+		return run(t.Context(), "LEGACY_GENERATION_DECOY", nil, 0, 0)
+	})
+	if err == nil || errors.Is(err, errNoMatch) {
+		t.Fatalf("first native failure returned error=%v output=%q", err, out)
+	}
+	if out != "" || shardsExist(currentPlan.indexDir) {
+		t.Fatalf("first native failure used another generation: output=%q current_shards=%t", out, shardsExist(currentPlan.indexDir))
 	}
 }
 
@@ -3476,6 +3837,22 @@ func TestScoped_EqualsUnscopedIntersectScope(t *testing.T) {
 			scopedAbsent:   []string{"gone.go", "old.go", "sib.go", "root.go"},
 			unscopedHave:   []string{"keep.go", "also.go", "renamed.go", "new.go", "sib.go"},
 			unscopedAbsent: []string{"gone.go", "old.go"},
+		},
+		{
+			name:           "file",
+			query:          `QTERM file:keep\.go`,
+			scopedHave:     []string{"keep.go"},
+			scopedAbsent:   []string{"also.go", "gone.go", "old.go", "renamed.go", "new.go", "sib.go", "root.go"},
+			unscopedHave:   []string{"keep.go"},
+			unscopedAbsent: []string{"also.go", "gone.go", "old.go", "renamed.go", "new.go", "sib.go", "root.go"},
+		},
+		{
+			name:           "type-file",
+			query:          "type:file keep",
+			scopedHave:     []string{"keep.go"},
+			scopedAbsent:   []string{"also.go", "gone.go", "old.go", "renamed.go", "new.go", "sib.go", "root.go"},
+			unscopedHave:   []string{"keep.go"},
+			unscopedAbsent: []string{"also.go", "gone.go", "old.go", "renamed.go", "new.go", "sib.go", "root.go"},
 		},
 		{
 			name:           "symbol",
