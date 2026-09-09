@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"sync"
@@ -95,26 +95,26 @@ func openShard(path string) (zoekt.Searcher, error) {
 	return s, nil
 }
 
-// loadShards opens all .zoekt shard files in indexDir and returns individual
-// zoekt.Searcher instances. This is faster than search.NewDirectorySearcher
-// because it skips directory-watcher goroutines, fsnotify setup, and
-// ready-channel synchronization — overhead that is unnecessary for a
-// one-shot CLI search. Multiple shards are loaded in parallel.
+// loadShards opens all .zoekt entries in indexDir and returns individual
+// zoekt.Searcher instances. A one-shot CLI search does not need directory
+// watchers or ready-channel synchronization. Multiple shards load in parallel.
 func loadShards(indexDir string) ([]zoekt.Searcher, error) {
-	paths, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
+	paths, err := searchableShardPaths(indexDir)
 	if err != nil {
-		return nil, fmt.Errorf("glob shards: %w", err)
+		return nil, err
 	}
 	if len(paths) == 0 {
-		return nil, fmt.Errorf("no index shards in %s", indexDir)
+		// An index dir that holds no shard at all is damage the caller can
+		// repair, not a query failure to report.
+		return nil, fmt.Errorf("%w: no index shards in %s", errShardUnloadable, indexDir)
 	}
 	return loadShardPaths(indexDir, paths)
 }
 
 func loadShardsOptional(indexDir string) ([]zoekt.Searcher, error) {
-	paths, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
+	paths, err := searchableShardPaths(indexDir)
 	if err != nil {
-		return nil, fmt.Errorf("glob shards: %w", err)
+		return nil, err
 	}
 	if len(paths) == 0 {
 		return nil, nil
@@ -122,12 +122,22 @@ func loadShardsOptional(indexDir string) ([]zoekt.Searcher, error) {
 	return loadShardPaths(indexDir, paths)
 }
 
+// searchableShardPaths lists the non-directory .zoekt entries that a search
+// will try to open.
+//
+// The caller holds the shared publish lock, so this scan selects one stable
+// shard family. It needs names only and does not load size metadata.
+func searchableShardPaths(indexDir string) ([]string, error) {
+	return familyShardNames(indexDir)
+}
+
 func loadShardPaths(indexDir string, paths []string) ([]zoekt.Searcher, error) {
 	// Single shard — skip goroutine overhead.
 	if len(paths) == 1 {
 		s, err := openShard(paths[0])
 		if err != nil {
-			return nil, fmt.Errorf("load shard %s: %w", paths[0], err)
+			// Mark a single-shard load failure as index damage too.
+			return nil, fmt.Errorf("%w: load shard %s: %w", errShardUnloadable, paths[0], err)
 		}
 		return []zoekt.Searcher{s}, nil
 	}
@@ -171,13 +181,25 @@ func loadShardPaths(indexDir string, paths []string) ([]zoekt.Searcher, error) {
 		for _, s := range searchers {
 			s.Close()
 		}
-		return nil, loadErr
+		return nil, fmt.Errorf("%w: %w", errShardUnloadable, loadErr)
 	}
 	if len(searchers) == 0 {
-		return nil, fmt.Errorf("no loadable shards in %s", indexDir)
+		return nil, fmt.Errorf("%w: no loadable shards in %s", errShardUnloadable, indexDir)
 	}
 	return searchers, nil
 }
+
+// errShardUnloadable marks a shard that exists but cannot be opened: truncated,
+// unreadable, a directory, or a dangling symlink. The caller treats this as
+// index damage, invalidates the family manifest, and retries the search.
+//
+// This repair covers the committed family: dropping the manifest makes
+// needCommitted fire and that family be rebuilt. It does not cover the
+// uncommitted family, whose rebuild is driven by the working tree's own state
+// hash and shard contiguity, none of which notices a present, contiguous,
+// corrupt shard. Such an uncommitted shard can fail until the working tree
+// changes.
+var errShardUnloadable = errors.New("index damage")
 
 func parseSearchQuery(pattern string) (query.Q, error) {
 	q, err := query.Parse(pattern)
@@ -223,7 +245,7 @@ func executeParsedSearchScopedDirs(
 		searchers = append(searchers, loaded...)
 	}
 	if len(searchers) == 0 {
-		return nil, fmt.Errorf("no loadable shards")
+		return nil, fmt.Errorf("%w: no loadable shards", errShardUnloadable)
 	}
 	defer func() {
 		for _, s := range searchers {

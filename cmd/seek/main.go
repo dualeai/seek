@@ -242,9 +242,21 @@ func prepareAndSearchCorpus(
 	config searchConfig,
 ) ([]corpusSearchResult, dirtyFileSet, error) {
 	for attempt := 0; ; attempt++ {
-		results, dirty, err := prepareAndSearchCorpusOnce(ctx, plan, paths, userQ, config)
+		// Keep changes to the selected scoped fallback for the repair step below.
+		results, dirty, err := prepareAndSearchCorpusOnce(ctx, &plan, paths, userQ, config)
 		if errors.Is(err, errGitIndexStateChanged) && plan.dirtyScope != nil && attempt < maxScopedLayerRefreshRetries {
 			slog.Debug("scoped git index changed during search; retrying", "root", plan.root, "attempt", attempt+1)
+			continue
+		}
+		// Invalidate the manifest so the retry rebuilds the committed family or a
+		// complete folder or scoped family. Keep current shards until publication.
+		if errors.Is(err, errShardUnloadable) && attempt == 0 {
+			// Repair the dir the search actually read. A scoped over-cap search
+			// is served from scopedIndexDir, so clearing the combined corpus's
+			// manifest would leave the damaged fallback unrepaired and force a
+			// full rebuild of the healthy combined corpus.
+			removeFamilyManifest(plan.searchIndexDir())
+			slog.Warn("Index damage detected; rebuilding the corpus", "root", plan.root, "error", err)
 			continue
 		}
 		return results, dirty, err
@@ -253,11 +265,19 @@ func prepareAndSearchCorpus(
 
 func prepareAndSearchCorpusOnce(
 	ctx context.Context,
-	plan corpusPlan,
+	planp *corpusPlan,
 	paths *gitPaths,
 	userQ query.Q,
 	config searchConfig,
 ) ([]corpusSearchResult, dirtyFileSet, error) {
+	plan := *planp
+	// Each attempt selects its scoped fallback again. Do not reuse the selection
+	// from a prior attempt.
+	plan.scopedStateHash = ""
+	// Publish scoped-fallback selection back to the caller so its damage repair
+	// targets the directory this search actually read.
+	defer func() { *planp = plan }()
+
 	var dirtyFiles dirtyFileSet
 	var indexState corpusIndexState
 
@@ -442,8 +462,12 @@ func ensureCombinedGitCorpus(ctx context.Context, plan corpusPlan, paths gitPath
 	}
 
 	currentState := gitCorpusStateHash(paths, state)
-	hasShards := shardsExist(plan.indexDir)
-	clearCommitted := noHeadHasCommittedArtifacts(plan.indexDir, state.HeadSHA)
+	// Use one directory scan so all integrity checks describe the same state.
+	sc, scErr := scanFamilyOptional(plan.indexDir)
+	hasShards := scErr == nil && sc.hasShard() &&
+		(state.HeadSHA == "no-head" || sc.hasCommittedShard()) &&
+		sc.matchesManifest(plan.indexDir)
+	clearCommitted := state.HeadSHA == "no-head" && sc.hasMember(familyCommitted)
 	// A leftover .swapping marker means a prior publish was interrupted and the
 	// shards may be torn; force the build path so recoverIncompleteSwap runs even
 	// when state otherwise looks current.
@@ -463,6 +487,12 @@ func ensureCombinedGitCorpus(ctx context.Context, plan corpusPlan, paths gitPath
 	}
 
 	if needBuild {
+		// Remove a non-directory entry at the index path before MkdirAll.
+		if st, statErr := os.Lstat(plan.indexDir); statErr == nil && !st.IsDir() {
+			if rmErr := os.Remove(plan.indexDir); rmErr != nil {
+				return corpusSearchable, fmt.Errorf("remove non-directory at index path: %w", rmErr)
+			}
+		}
 		if err := os.MkdirAll(plan.indexDir, 0o755); err != nil {
 			return corpusSearchable, fmt.Errorf("create index directory: %w", err)
 		}
@@ -611,7 +641,10 @@ func scopedFallbackCached(cacheDir, indexDir, currentState string) (corpusIndexS
 	if readStateFile(cacheDir) != currentState {
 		return corpusSearchable, false
 	}
-	if shardsExist(indexDir) {
+	// A presence check cannot detect a missing shard, a changed size, or a
+	// missing sidecar. Validate the fallback against its family manifest.
+	sc, err := scanFamilyOptional(indexDir)
+	if err == nil && sc.hasShard() && sc.matchesManifest(indexDir) {
 		return corpusSearchable, true
 	}
 	if readEmptyStateFile(cacheDir) == currentState {
@@ -785,6 +818,8 @@ func markGitCorpusKnownEmpty(ctx context.Context, plan corpusPlan, state repoSta
 	defer releaseLock(pub)
 
 	cleanAllShards(plan.indexDir)
+	// Remove the manifest with the shard family that it describes.
+	removeFamilyManifest(plan.indexDir)
 	deleteUncommittedManifest(plan.cacheDir)
 	// cleanAllShards already removed any torn shards a prior interrupted swap
 	// left, so a lingering .swapping marker would only force needless rebuilds
@@ -808,11 +843,8 @@ func searchPlannedCorpusParsed(
 	userQ query.Q,
 	config searchConfig,
 ) ([]zoekt.FileMatch, error) {
-	// Hold LOCK_SH (the publish/read lock) across the entire glob+open+search so
-	// a concurrent temp-swap publish (brief LOCK_EX) can never interleave and
-	// tear the shard set — readers observe exactly the pre- or post-swap
-	// generation. A long build holds only the separate .build.lock, so it never
-	// blocks a reader; only the ms-scale publish does.
+	// Hold the shared publish lock while listing, opening, and searching shards.
+	// A publisher cannot replace the shard family during that work.
 	targets := searchLockTargets(plan)
 	locks := make([]*os.File, 0, len(targets))
 	for _, target := range targets {

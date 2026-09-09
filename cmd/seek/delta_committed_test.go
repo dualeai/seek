@@ -59,7 +59,7 @@ func TestDeltaCommitted_ModifyFileTombstonesOldContent(t *testing.T) {
 	}
 
 	// Delta-path proof: each delta cycle stacks exactly one new shard on
-	// top of the existing set (Zoekt index/builder.go:585). A silent
+	// top of the existing set when the Zoekt builder finishes. A silent
 	// fallback to a non-delta rebuild would leave shardsAfter == shardsBefore
 	// because the old shard would be replaced rather than supplemented.
 	shardsAfter := committedShardCount(t, plan.indexDir)
@@ -307,13 +307,8 @@ func TestDeltaCommitted_ShardThresholdTriggersFullRebuild(t *testing.T) {
 func TestDeltaCommitted_SubmoduleHostStaysSearchable(t *testing.T) {
 	requireTools(t)
 
-	// Reuse the submodule fixture pattern from git_edge_test.go:568. Zoekt
-	// only refuses delta builds for submodules when the caller passes
-	// Options.Submodules=true (zoekt/gitindex/index.go:818). Seek does NOT
-	// enable submodule walking, so the host repo's delta path runs normally
-	// — the submodule directory looks like an opaque blob to gitindex. The
-	// invariant we care about is that adding the submodule plus a follow-up
-	// commit does not break search.
+	// Seek does not enable Zoekt submodule walking. The host repository's delta
+	// path must remain searchable after a submodule and a later commit are added.
 	dir := initGitRepo(t, "app.go", "package main\n// submodule_delta_marker\n")
 	subSrc := initEmptyGitRepo(t)
 	if err := os.WriteFile(filepath.Join(subSrc, "sub.go"), []byte("package sub\n"), 0o644); err != nil {

@@ -489,7 +489,7 @@ func TestCleanUncommittedShards_RemovesMatching(t *testing.T) {
 
 	cleanUncommittedShards(dir)
 
-	entries := familyShardFiles(dir, familyAll)
+	entries := familyShardFilesForTest(t, dir, familyAll)
 	if len(entries) != 2 {
 		t.Fatalf("remaining artifacts=%v, want committed pair", entries)
 	}
@@ -875,7 +875,7 @@ func TestGitCommittedIndexBudget_FileCap(t *testing.T) {
 	requireGit(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// committed_budget_marker\n")
-	budget, err := scanGitCommittedIndexBudget(context.Background(), dir, 0, maxCorpusIndexedBytes)
+	budget, _, err := scanGitCommittedBudget(context.Background(), dir, "HEAD", nil, 0, maxCorpusIndexedBytes)
 	if !errors.Is(err, errGitCapExceeded) {
 		t.Fatalf("expected git cap error, got budget=%+v err=%v", budget, err)
 	}
@@ -893,7 +893,7 @@ func TestGitCommittedIndexBudget_IndexedByteCap(t *testing.T) {
 
 	const content = "package main\n// committed_byte_budget_marker\n"
 	dir := initGitRepo(t, "app.go", content)
-	budget, err := scanGitCommittedIndexBudget(context.Background(), dir, maxGitCandidateFiles, 0)
+	budget, _, err := scanGitCommittedBudget(context.Background(), dir, "HEAD", nil, maxGitCandidateFiles, 0)
 	if !errors.Is(err, errGitCapExceeded) {
 		t.Fatalf("expected git cap error, got budget=%+v err=%v", budget, err)
 	}
@@ -921,7 +921,7 @@ func TestGitCommittedIndexBudget_SkipsOversizeBlobsForByteCap(t *testing.T) {
 	gitRun(t, dir, "add", "large.bin")
 	gitRun(t, dir, "commit", "-m", "add large")
 
-	budget, err := scanGitCommittedIndexBudget(context.Background(), dir, maxGitCandidateFiles, 0)
+	budget, _, err := scanGitCommittedBudget(context.Background(), dir, "HEAD", nil, maxGitCandidateFiles, 0)
 	if err != nil {
 		t.Fatalf("oversize blob should not consume indexed byte budget, got budget=%+v err=%v", budget, err)
 	}
@@ -1463,7 +1463,7 @@ func TestStateCaching_BothSucceed_CleanFileChangesAfterStateCapture(t *testing.T
 		t.Fatalf("indexing failed: %v", err)
 	}
 
-	// State file IS written (mutation not visible to re-stat of empty file list).
+	// The state file is written because the metadata check has no files to read.
 	// This is intentional: the next search's git status call will detect the
 	// dirty file, produce a different hash, and trigger re-indexing.
 	cached := readStateFile(plan.cacheDir)
@@ -1708,7 +1708,8 @@ func TestStateCaching_NewUntrackedFileAfterStateCapture(t *testing.T) {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
-	// Restat doesn't detect new file (not in state.Files) — state IS written
+	// The metadata check does not detect the new file because it is not in
+	// state.Files. The state file is written.
 	cached := readStateFile(plan.cacheDir)
 
 	if cached == "" {
@@ -1877,8 +1878,8 @@ func TestStateCaching_DoubleCheck_SkipsRedundantIndex(t *testing.T) {
 }
 
 // TestStateCaching_StaleFallback_DoesNotWriteState verifies that when another
-// builder holds the build lock AND a usable index exists, runIndexingWithCache
-// SKIPS the build (serving current shards) and does NOT write state.
+// builder holds the build lock and a usable index exists, runIndexingWithCache
+// skips the build, serves current shards, and does not write state.
 func TestStateCaching_StaleFallback_DoesNotWriteState(t *testing.T) {
 	requireTools(t)
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"testing"
 
 	"github.com/sourcegraph/zoekt"
 )
@@ -34,4 +35,16 @@ func searchPlannedCorpusForTest(ctx context.Context, plan corpusPlan, pattern st
 		return nil, err
 	}
 	return searchPlannedCorpusParsed(ctx, plan, q, defaultSearchConfig())
+}
+
+// familyShardFilesForTest is the assertion form of familyShardFiles. Production
+// code must handle a directory-read failure explicitly, so the two-value form
+// stays; tests treat a read failure as a fatal error instead.
+func familyShardFilesForTest(tb testing.TB, dir string, fam shardFamily) []string {
+	tb.Helper()
+	files, err := familyShardFiles(dir, fam)
+	if err != nil {
+		tb.Fatalf("familyShardFiles(%s): %v", dir, err)
+	}
+	return files
 }

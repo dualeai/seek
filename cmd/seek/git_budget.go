@@ -78,11 +78,6 @@ func checkGitDirtyFileBudgetWithLimits(repoDir, indexDir string, files []string,
 	return nil
 }
 
-func scanGitCommittedIndexBudget(ctx context.Context, repoDir string, maxFiles, maxBytes int64) (gitIndexBudget, error) {
-	budget, _, err := scanGitCommittedBudget(ctx, repoDir, "HEAD", nil, maxFiles, maxBytes)
-	return budget, err
-}
-
 func scanGitCommittedScopeBudgetAt(ctx context.Context, repoDir, treeish string, scope *gitDirtyScope, maxFiles, maxBytes int64) (gitIndexBudget, int, error) {
 	return scanGitCommittedBudget(ctx, repoDir, treeish, scope, maxFiles, maxBytes)
 }

@@ -488,3 +488,46 @@ func TestFolderCorpusRefreshHandlesAddedChangedDeletedFiles(t *testing.T) {
 		}
 	}
 }
+
+// TestFolderFamilyUsable checks the post-lock family scan. A peer can publish
+// after the pre-lock scan, but one surviving shard does not make a partial
+// family usable.
+func TestFolderFamilyUsable(t *testing.T) {
+	dir := t.TempDir()
+
+	if folderFamilyUsable(dir) {
+		t.Error("empty directory reported usable")
+	}
+
+	shardA := "folder_abc_v16.00000.zoekt"
+	shardB := "folder_abc_v16.00001.zoekt"
+	for _, name := range []string{shardA, shardB} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Shards present but never published: no manifest, so not usable.
+	if folderFamilyUsable(dir) {
+		t.Error("unpublished family reported usable")
+	}
+
+	if err := writeFamilyManifest(dir, []string{shardA, shardB}); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	if !folderFamilyUsable(dir) {
+		t.Error("published family reported unusable")
+	}
+
+	// One survivor of a torn family: presence still says yes, the manifest says
+	// no. This is the case the restored check exists for.
+	if err := os.Remove(filepath.Join(dir, shardB)); err != nil {
+		t.Fatal(err)
+	}
+	if shardsExist(dir) != true {
+		t.Fatal("precondition: a shard should still be present")
+	}
+	if folderFamilyUsable(dir) {
+		t.Error("torn family reported usable")
+	}
+}

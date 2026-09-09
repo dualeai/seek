@@ -9,33 +9,9 @@ import (
 	"testing"
 )
 
-// Tests cover the five folder-corpus cold-path optimizations:
-//   (1) ensureFolderCorpusFresh caches the pre-lock shardsExist result
-//       and ORs it with a post-lock recheck.
-//   (2) scanFolderRootEntriesParallel sizes its jobs channel to
-//       len(entries) so the feeder loop drains in one pass.
-//   (3) The merged selected slice in scanFolderRootEntriesParallel is
-//       pre-allocated from the pieces' selectedCandidates totals.
-//   (4) fingerprintRootEntry short-circuits non-regular files via
-//       DirEntry.Type() before any Lstat / entry.Info() syscall.
-//   (5) walkDirectory's inner loop skips the .git metadata-dir check
-//       BEFORE building the per-entry path string.
-
-// ---------------------------------------------------------------------
-// (1) shardsExist caching.
-//
-// The audit flagged that asserting state==corpusSearchable alone does
-// not pin the cache fix — the post-lock recheck can produce the same
-// outcome. Strengthen the assertion by also checking the on-disk state
-// file is non-empty BEFORE the warm call, which proves the cached
-// `hasShards` and cachedState ran the gate at folder_indexer.go:51-72
-// (the pre-lock path) rather than falling through to the rewalk.
-// ---------------------------------------------------------------------
-
-// TestEnsureFolderCorpusFresh_WarmCallExercisesPreLockGate confirms
-// the second call returns Searchable AND that the cached state file
-// was present at warm-call time (proving the pre-lock gate fired).
-func TestEnsureFolderCorpusFresh_WarmCallExercisesPreLockGate(t *testing.T) {
+// TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable checks that a built
+// corpus with a stored state remains searchable on a warm call.
+func TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable(t *testing.T) {
 	if testing.Short() {
 		t.Skip("invokes Zoekt indexer + ctags subprocess")
 	}
@@ -65,10 +41,9 @@ func TestEnsureFolderCorpusFresh_WarmCallExercisesPreLockGate(t *testing.T) {
 	}
 }
 
-// TestFolderCorpusStateParallel_HighFanout_NoStallNoDrop drives the
-// parallel dispatcher directly with entry count far exceeding worker
-// count to exercise the buffered-jobs change. Asserts every subdir's
-// file landed in the final candidate set.
+// TestFolderCorpusStateParallel_HighFanout_NoStallNoDrop checks that the
+// parallel dispatcher returns every file when there are more entries than
+// workers.
 func TestFolderCorpusStateParallel_HighFanout_NoStallNoDrop(t *testing.T) {
 	root := t.TempDir()
 	const N = 200
@@ -94,14 +69,8 @@ func TestFolderCorpusStateParallel_HighFanout_NoStallNoDrop(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------
-// (3) Pre-allocated selected slice in the merge loop.
-//
-// Idempotency proves the merge is deterministic regardless of the
-// allocation pattern; running the parallel scan twice on the same tree
-// MUST yield the same stateHash + selected count.
-// ---------------------------------------------------------------------
-
+// TestFolderCorpusStateParallel_IdempotentSelectedAndStateHash checks that two
+// scans of an unchanged tree return the same state and selected file count.
 func TestFolderCorpusStateParallel_IdempotentSelectedAndStateHash(t *testing.T) {
 	root := t.TempDir()
 	for i := 0; i < 50; i++ {
@@ -127,14 +96,6 @@ func TestFolderCorpusStateParallel_IdempotentSelectedAndStateHash(t *testing.T) 
 	}
 }
 
-// ---------------------------------------------------------------------
-// (4) DirEntry.Type() short-circuit in fingerprintRootEntry.
-//
-// Spy-pattern fake DirEntry: production code must call Type() (the
-// d_type accessor) and return early WITHOUT reaching Info() for any
-// non-zero Type() bit.
-// ---------------------------------------------------------------------
-
 type fakeDirEntry struct {
 	name        string
 	isDir       bool
@@ -155,13 +116,9 @@ func (f *fakeDirEntry) Info() (os.FileInfo, error) {
 	return os.Lstat(f.regInfoFile)
 }
 
-// Coverage matrix: every non-zero bit returned by DirEntry.Type() per
-// io/fs.FileMode docs. Includes the modifier bits (setuid, setgid,
-// sticky, temporary, append, exclusive) — production check is
-// `Type() != 0`, so ALL non-zero combinations must short-circuit.
-// ModeDir is omitted: fingerprintRootEntry checks IsDir() first
-// (folder_indexer.go:792), so the Type() guard is unreachable for
-// directories.
+// Check each non-zero type bit from io/fs.FileMode. Modifier bits must also
+// return before Info because production checks Type() != 0.
+// ModeDir is omitted because fingerprintRootEntry checks IsDir first.
 func TestFingerprintRootEntry_NonRegular_SkipsEntryInfo(t *testing.T) {
 	plan := planFolderTestCorpus(t, t.TempDir())
 
@@ -203,10 +160,8 @@ func TestFingerprintRootEntry_NonRegular_SkipsEntryInfo(t *testing.T) {
 	}
 }
 
-// TestFingerprintRootEntry_RegularFile_CallsInfo pins the positive
-// case: production MUST call entry.Info() for regular files
-// (Type()==0). Regression caught: a too-aggressive short-circuit that
-// returns before Info() would fail this test.
+// TestFingerprintRootEntry_RegularFile_CallsInfo checks that a regular entry
+// loads its file information.
 func TestFingerprintRootEntry_RegularFile_CallsInfo(t *testing.T) {
 	plan := planFolderTestCorpus(t, t.TempDir())
 	regFile := filepath.Join(t.TempDir(), "real.txt")
@@ -230,9 +185,8 @@ func TestFingerprintRootEntry_RegularFile_CallsInfo(t *testing.T) {
 	}
 }
 
-// TestWalkDirectory_GitContentNotInStateHash asserts the walker does
-// NOT read content inside `.git/`. Mutating a sentinel file in there
-// MUST NOT change the parent stateHash.
+// TestWalkDirectory_GitContentNotInStateHash checks that content in .git does
+// not change the parent folder state.
 func TestWalkDirectory_GitContentNotInStateHash(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("payload"), 0o644); err != nil {
@@ -263,9 +217,8 @@ func TestWalkDirectory_GitContentNotInStateHash(t *testing.T) {
 	}
 }
 
-// TestWalkDirectory_GitPresenceAffectsBoundaryMarker confirms the
-// boundary-marker contribution still fires when `.git` appears — proves
-// the metadata-skip didn't kill the boundary signal entirely.
+// TestWalkDirectory_GitPresenceAffectsBoundaryMarker checks that adding .git
+// changes the boundary marker even though its content is excluded.
 func TestWalkDirectory_GitPresenceAffectsBoundaryMarker(t *testing.T) {
 	noGit := t.TempDir()
 	if err := os.WriteFile(filepath.Join(noGit, "a.txt"), []byte("payload"), 0o644); err != nil {

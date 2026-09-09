@@ -9,18 +9,12 @@ import (
 	"time"
 )
 
-// TestEnsureFolderCorpusFresh_MultiWindowEarlyBeaconSurvives — the
-// windowed indexer chains IsDelta=false (window 0) + IsDelta=true
-// (windows 1..N). Each delta-window's Finish rewrites the .meta of
-// every prior shard (zoekt/index/builder.go:684-742). A regression
-// in the chain that corrupted earlier shards' content would silently
-// pass every existing beacon test, because every other beacon is
-// sorted LAST and lands in the final window.
+// TestEnsureFolderCorpusFresh_MultiWindowEarlyBeaconSurvives checks a windowed
+// index build. The first window is a full build and later windows are delta
+// builds. Each Zoekt Builder.Finish call can update prior sidecars.
 //
-// This test writes an EARLY beacon (file name sorting first) so it
-// lands in window 0, then writes enough payload to force ≥3 windows,
-// then writes a LATE beacon last. Searching both proves the entire
-// shard chain remains queryable post-rotation.
+// The first marker sorts into the first window. The last marker sorts into the
+// final window. Both must remain searchable after at least three windows.
 func TestEnsureFolderCorpusFresh_MultiWindowEarlyBeaconSurvives(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
@@ -76,7 +70,7 @@ func TestEnsureFolderCorpusFresh_MultiWindowEarlyBeaconSurvives(t *testing.T) {
 		t.Fatalf("expected >= 2 shards (rotation didn't fire), got %d", n)
 	}
 
-	// Both beacons MUST be findable. The early beacon proves window 0's
+	// Both beacons must be findable. The early beacon proves window 0's
 	// content was not corrupted by subsequent IsDelta=true Finish .meta
 	// rewrites; the late beacon proves the final window flushed.
 	for _, b := range []struct{ name, marker string }{{"early", earlyBeacon}, {"late", lateBeacon}} {
@@ -85,7 +79,7 @@ func TestEnsureFolderCorpusFresh_MultiWindowEarlyBeaconSurvives(t *testing.T) {
 			t.Fatalf("search %s beacon: %v", b.name, err)
 		}
 		if len(results) == 0 {
-			t.Fatalf("%s beacon NOT found — cross-window shard chain corrupted", b.name)
+			t.Fatalf("%s beacon not found; cross-window shard chain is corrupt", b.name)
 		}
 	}
 }

@@ -452,7 +452,7 @@ func TestMarkGitCorpusKnownEmptyRemovesArtifactsAndManifest(t *testing.T) {
 	if err != nil || !marked {
 		t.Fatalf("mark known empty: marked=%v error=%v", marked, err)
 	}
-	if artifacts := familyShardFiles(plan.indexDir, familyAll); len(artifacts) != 0 {
+	if artifacts := familyShardFilesForTest(t, plan.indexDir, familyAll); len(artifacts) != 0 {
 		t.Fatalf("known-empty corpus retained artifacts: %v", artifacts)
 	}
 	if _, err := os.Stat(filepath.Join(plan.cacheDir, uncommittedManifestFileName)); !os.IsNotExist(err) {
@@ -495,7 +495,7 @@ func TestRun_KnownEmptyRemovesCommittedSidecarBeforeShardNameReuse(t *testing.T)
 		t.Fatalf("index second commit: %v", err)
 	}
 	foundMeta := false
-	for _, artifact := range familyShardFiles(plan.indexDir, familyCommitted) {
+	for _, artifact := range familyShardFilesForTest(t, plan.indexDir, familyCommitted) {
 		foundMeta = foundMeta || strings.HasSuffix(artifact, ".zoekt.meta")
 	}
 	if !foundMeta {
@@ -508,7 +508,7 @@ func TestRun_KnownEmptyRemovesCommittedSidecarBeforeShardNameReuse(t *testing.T)
 	}); !errors.Is(err, errNoMatch) {
 		t.Fatalf("clear empty unborn repository: %v", err)
 	}
-	if artifacts := familyShardFiles(plan.indexDir, familyAll); len(artifacts) != 0 {
+	if artifacts := familyShardFilesForTest(t, plan.indexDir, familyAll); len(artifacts) != 0 {
 		t.Fatalf("empty unborn repository retained artifacts: %v", artifacts)
 	}
 
@@ -574,7 +574,7 @@ func TestRun_UnbornRepositoryClearsWarmCommittedIndex(t *testing.T) {
 		}
 	}
 
-	if artifacts := familyShardFiles(plan.indexDir, familyCommitted); len(artifacts) != 0 {
+	if artifacts := familyShardFilesForTest(t, plan.indexDir, familyCommitted); len(artifacts) != 0 {
 		t.Fatalf("unborn repository retained committed artifacts: %v", artifacts)
 	}
 }
@@ -626,7 +626,7 @@ func TestRun_UnbornRepositoryRepairsMatchingStateCommittedArtifacts(t *testing.T
 				t.Fatalf("seed no-head file: %v", err)
 			}
 
-			artifacts := familyShardFiles(plan.indexDir, familyCommitted)
+			artifacts := familyShardFilesForTest(t, plan.indexDir, familyCommitted)
 			if len(artifacts) == 0 {
 				t.Fatal("warm cache has no committed artifact")
 			}
@@ -652,7 +652,7 @@ func TestRun_UnbornRepositoryRepairsMatchingStateCommittedArtifacts(t *testing.T
 			if !errors.Is(err, errNoMatch) || out != "" {
 				t.Fatalf("search repaired old marker: error=%v output=%q", err, out)
 			}
-			if artifacts := familyShardFiles(plan.indexDir, familyCommitted); len(artifacts) != 0 {
+			if artifacts := familyShardFilesForTest(t, plan.indexDir, familyCommitted); len(artifacts) != 0 {
 				t.Fatalf("repair retained committed artifacts: %v", artifacts)
 			}
 		})
@@ -3107,23 +3107,10 @@ func TestIntegration_Worktree_NestedUntrackedFileWithStatusConfig(t *testing.T) 
 	}
 }
 
-// TestRun_NestedRepoVenvNotLeakedToParent — end-to-end regression
-// guard for the .venv leak bug (95156aa). User searches a PARENT
-// folder containing a nested git repo whose .gitignore excludes
-// `.venv/`. The walker must discover the nested repo as a boundary
-// and carve out its subtree from the parent folder corpus; the
-// nested git corpus must respect .gitignore (gitindex.IndexGitRepo
-// only indexes tracked files). Net: search must NOT match anything
-// inside .venv.
-//
-// Pre-fix bug: walker descended into the nested repo on the second
-// pass (state pass, after fingerprint pass had already enqueued the
-// boundary), and the parent folder corpus ate the whole working tree
-// including .venv content. Today's TestDedupHitMustSuppressDescent
-// catches it at the mid-layer (newTestPool + scanFolderCorpus); this
-// test exercises the same contract through the production run() path
-// so a regression in main.go's pool wiring or in the walker's
-// fingerprint-vs-state-pass interplay surfaces here.
+// TestRun_NestedRepoVenvNotLeakedToParent checks a repeated parent-folder
+// search that contains a nested Git repository. The parent folder must keep the
+// repository boundary on both scans. Git ignore rules must keep .venv content
+// out of the nested corpus.
 func TestRun_NestedRepoVenvNotLeakedToParent(t *testing.T) {
 	parent := t.TempDir()
 	nested := filepath.Join(parent, "nested-repo")
@@ -3143,9 +3130,8 @@ func TestRun_NestedRepoVenvNotLeakedToParent(t *testing.T) {
 	gitRunIn(t, nested, "add", ".")
 	gitRunIn(t, nested, "commit", "-q", "-m", "initial")
 
-	// Plant gitignored content with a unique marker that we will
-	// search for. If the walker descends into nested-repo under the
-	// PARENT corpus, this file gets indexed and the search will hit.
+	// Add ignored content that would match if the parent walker entered the
+	// nested repository.
 	venvDir := filepath.Join(nested, ".venv")
 	if err := os.MkdirAll(venvDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -3155,10 +3141,8 @@ func TestRun_NestedRepoVenvNotLeakedToParent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Parent-level file so the parent folder corpus has at least one
-	// selected entry after the carve-out — otherwise it's classified
-	// corpusKnownEmpty and the cached state file would short-circuit
-	// the second run's walker before the bug can fire.
+	// Keep one selected file in the parent corpus so the second search scans it
+	// again instead of using an empty-corpus marker.
 	if err := os.WriteFile(filepath.Join(parent, "parent-marker.txt"), []byte("seed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -3174,20 +3158,14 @@ func TestRun_NestedRepoVenvNotLeakedToParent(t *testing.T) {
 		t.Fatalf("first run: %v", err)
 	}
 
-	// Mutate parent-level content so the second run's fingerprint
-	// pass MUST diverge from the cached value, forcing
-	// ensureFolderCorpusFresh past its line-62 cache-hit short-circuit
-	// into the state pass where the dedup-rejection-descent bug
-	// manifests.
+	// Change parent content so the second fingerprint differs from the cached
+	// value and the search performs a new state scan.
 	if err := os.WriteFile(filepath.Join(parent, "parent-marker.txt"), []byte("seed\nedit\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	// Second run: warm cache + mismatch. ensureFolderCorpusFresh runs
-	// walker twice (fingerprint pass + state pass). PRE-fix the second
-	// pass hit pool dedup → returned false → walker descended → .venv
-	// indexed → search returned matches. POST-fix dedup returns true
-	// → descent suppressed → no match.
+	// The second scan must keep the nested repository boundary when the pool has
+	// already seen that corpus. It must not index .venv as parent-folder content.
 	out, err := captureStdout(t, func() error {
 		return run(context.Background(), marker, []string{parent}, 0, 0)
 	})
@@ -3236,16 +3214,13 @@ func TestRun_TrackedAndIgnoredFileOperandsBothSearchedOnce(t *testing.T) {
 	}
 }
 
-// On a case-insensitive filesystem, a file operand typed with different case
-// than git stored must still be found (routed to the git index with the scope
-// corrected to the real on-disk byte name), not silently missed.
+// On a case-insensitive filesystem, a file operand with different letter case
+// must resolve to the on-disk name used by the Git index.
 func TestRun_CaseMismatchedFileOperandStillFound(t *testing.T) {
 	requireTools(t)
 
 	repo := initGitRepo(t, "readme.md", "MARKER_CASE_FIX\n")
-	// The bug only exists on case/normalization-insensitive filesystems, so
-	// this regression coverage rides on the CI macOS (APFS) legs; on a
-	// case-sensitive FS the mistyped name is a genuinely different file.
+	// On a case-sensitive filesystem, the other letter case is a different path.
 	if _, err := os.Stat(filepath.Join(repo, "README.md")); err != nil {
 		t.Skip("case-sensitive filesystem; mistyped operand cannot resolve")
 	}
@@ -3288,10 +3263,8 @@ func TestRun_CurrentGitUntrackedFileOperandSearchesContent(t *testing.T) {
 	}
 }
 
-// Run-level symptom for the leading-colon bug: an ignored file whose name
-// starts with ':' must fall back to a folder corpus and have its content
-// searched. Pre-fix it was misparsed as a pathspec, classified visGit, and
-// silently missed (routed to the git index that excludes it).
+// An ignored file whose name starts with ':' must use a folder corpus so Seek
+// can search its content.
 func TestRun_LeadingColonIgnoredFileOperandSearchesContent(t *testing.T) {
 	requireTools(t)
 
@@ -3443,14 +3416,10 @@ func resultFileBasenames(out string) map[string]bool {
 	return set
 }
 
-// TestScoped_EqualsUnscopedIntersectScope is the durable, version-agnostic
-// regression guard for the Path-C collapse: a scoped search's RESULT SET must
-// equal the unscoped search's result set intersected with the scope. It holds
-// on the pre-Path-C scoped layers (result-set equivalence; only ranking drifts)
-// and is a tautology once scoped == unscoped + And(scope) over one combined
-// index. Exercises every git visibility class (committed, modified, deleted,
-// untracked, renamed) plus an out-of-scope sibling that ALSO matches the term
-// as the discriminator that would expose a scope leak.
+// TestScoped_EqualsUnscopedIntersectScope checks that a scoped result set equals
+// the unscoped result set limited to that scope. It covers committed, modified,
+// deleted, untracked, and renamed files, plus a matching sibling outside the
+// scope.
 func TestScoped_EqualsUnscopedIntersectScope(t *testing.T) {
 	requireTools(t)
 
@@ -3854,9 +3823,8 @@ func TestScoped_RankingEqualsUnscopedIntersectScope(t *testing.T) {
 	}
 }
 
-// A single file operand must match exactly that file (anchored regexp path) and
-// must yield the identical result set as the FileNameSet path — guarding the
-// trigram-assisted scope optimization against a correctness regression.
+// A single file operand must give the same result set through the anchored path
+// expression and the FileNameSet path.
 func TestScoped_FileOperandRegexpEqualsFileNameSet(t *testing.T) {
 	requireTools(t)
 

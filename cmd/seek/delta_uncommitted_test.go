@@ -117,10 +117,8 @@ func TestDeltaUncommitted_DirtyToCommittedTombstonesUncommittedShard(t *testing.
 func TestDeltaUncommitted_CommittedToDirtyHidesCommittedContent(t *testing.T) {
 	requireTools(t)
 
-	// Dirty content shadows committed content at the presentation layer
-	// (formatter.go drops committed hits for paths that appear in the
-	// dirty set, see formatter.go:110). Use runSeekInRepo so the test
-	// exercises the same code path users see.
+	// deduplicateCorpusResults makes dirty content replace committed content for
+	// the same path. Use runSeekInRepo to exercise the public search path.
 	dir := initGitRepo(t, "app.go", "package main\n// committed_only_marker\n")
 
 	files, err := runSeekInRepo(t, dir, "committed_only_marker")
@@ -308,10 +306,8 @@ func TestDeltaUncommitted_ManifestRecordsEveryDirtyFile(t *testing.T) {
 	}
 	reindexGit(t, ctx, paths, plan)
 
-	// Read the manifest directly and assert every dirty file appears with a
-	// real stat fingerprint matching the on-disk file. Anything weaker (e.g.
-	// just checking the file exists) lets a future bug silently truncate or
-	// scramble the manifest without failing this test.
+	// Check that the manifest contains each dirty file with its on-disk stat
+	// fingerprint.
 	data, err := os.ReadFile(filepath.Join(plan.cacheDir, uncommittedManifestFileName))
 	if err != nil {
 		t.Fatalf("read manifest: %v", err)

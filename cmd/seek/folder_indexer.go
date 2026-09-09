@@ -30,7 +30,7 @@ const (
 	maxFolderDeltaShards   = 64
 	folderManifestVersion  = 1
 	folderManifestFileName = ".folder-manifest-v1"
-	// Higher fanout was slower and more variable on APFS in the 1k-file bench.
+	// Bound the number of concurrent root-entry scans.
 	maxFolderFingerprintWorkers = 6
 )
 
@@ -46,9 +46,24 @@ type folderCandidate struct {
 	ino   uint64
 }
 
+// folderFamilyUsable checks the current shard family after the build lock is
+// acquired. A peer can publish after the pre-lock scan. One surviving shard is
+// not sufficient because the manifest can record more family members.
+func folderFamilyUsable(indexDir string) bool {
+	sc, err := scanFamilyOptional(indexDir)
+	return err == nil && sc.hasShard() && sc.matchesManifest(indexDir)
+}
+
 func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexState, error) {
 	cachedState := readStateFile(plan.cacheDir)
-	hasShards := shardsExist(plan.indexDir)
+	// One scan checks both shard presence and manifest agreement. Presence alone
+	// accepts any one surviving shard; the manifest detects missing or changed
+	// family members.
+	warmScan, warmScanErr := scanFamilyOptional(plan.indexDir)
+	if warmScanErr != nil {
+		return corpusSearchable, folderCorpusError(plan, warmScanErr)
+	}
+	hasShards := warmScan.hasShard() && warmScan.matchesManifest(plan.indexDir)
 
 	var stateHash string
 	var selected []folderCandidate
@@ -112,10 +127,11 @@ func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexS
 		if selectedCount == 0 {
 			return corpusKnownEmpty, nil
 		}
-		// Re-read shardsExist post-lock acquisition so a concurrent
-		// indexer's shards are picked up; the pre-lock hasShards captured
-		// at line 52 may be stale by now.
-		if hasShards || shardsExist(plan.indexDir) {
+		// Re-scan post-lock so a concurrent indexer's freshly published
+		// family is picked up; the pre-lock scan may be stale by now. Same
+		// gate as the warm path — presence alone would accept one survivor of
+		// a torn family.
+		if hasShards || folderFamilyUsable(plan.indexDir) {
 			return corpusSearchable, nil
 		}
 	} else if latestState != cachedState {
@@ -141,13 +157,25 @@ func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexS
 		if selectedCount == 0 {
 			return corpusKnownEmpty, nil
 		}
-		if hasShards || shardsExist(plan.indexDir) {
+		if hasShards {
 			return corpusSearchable, nil
 		}
 	}
 
 	repoName := folderRepoName(plan)
-	isDelta := cachedState != "" && hasShards
+	// Start a delta build only from the complete family recorded by the last
+	// publish. A gap, changed size, or missing sidecar requires a full build. A
+	// full build starts in an empty temporary directory.
+	sc, scErr := scanFamily(plan.indexDir)
+	if scErr != nil {
+		return corpusSearchable, folderCorpusError(plan, scErr)
+	}
+	intact := sc.matchesManifest(plan.indexDir)
+	if sc.hasShard() && !intact {
+		slog.Warn("Folder shard family does not match its manifest; rebuilding it in full",
+			"index_dir", plan.indexDir)
+	}
+	isDelta := cachedState != "" && sc.hasShard() && intact
 
 	// Build into a temp dir, then publish atomically. A delta build needs the
 	// prior shards present, so seed them (hardlinks); a full build ignores them.
@@ -157,12 +185,12 @@ func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexS
 	}
 	defer discardBuildDir(buildDir)
 	if isDelta {
-		if err := seedFamily(plan.indexDir, buildDir, familyAll); err != nil {
+		if err := seedFamilyFiles(buildDir, sc.paths(familyAll)); err != nil {
 			return corpusSearchable, folderCorpusError(plan, err)
 		}
 	}
 	bp := plan
-	bp.indexDir = buildDir // shards → buildDir; manifest stays in plan.cacheDir
+	bp.indexDir = buildDir // Shards go here; folder state stays in plan.cacheDir.
 
 	indexedAny := false
 	if selectedCount > 0 {
@@ -177,9 +205,8 @@ func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexS
 		}
 	}
 
-	// Publish atomically — shards + state under one publish-lock hold.
-	// selectedCount==0 → empty buildDir → the swap removes the live shards
-	// (known-empty).
+	// Publish the shard family and state while readers are excluded by the
+	// publish lock.
 	if err := publishGeneration(ctx, plan.cacheDir, plan.indexDir, buildDir, familyAll, func() error {
 		return writeStateFile(plan.cacheDir, stateHash)
 	}); err != nil {
@@ -188,8 +215,8 @@ func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexS
 		}
 		return corpusSearchable, folderCorpusError(plan, err)
 	}
-	// The manifest is read only by the next build (under the build lock), not by
-	// searchers, so it is fine to write outside the publish lock.
+	// Only a later build reads the folder state manifest. Searchers do not read
+	// it, so it can be written after the publish lock is released.
 	if selectedCount > 0 {
 		if err := writeFolderManifest(plan.cacheDir, stateHash, selected); err != nil {
 			slog.Debug("Failed to write folder manifest", "error", err)
@@ -527,7 +554,7 @@ func isFolderMetadataDir(name string) bool {
 
 // tryDiscoverBoundary checks whether `path` is a nested git boundary
 // and, if so, enqueues a discovered corpus plan via the scanner's
-// callback. Returns true when the caller MUST suppress further descent
+// callback. Returns true when the caller must stop further descent
 // into the subtree (a corpus took ownership of the content); returns
 // false when the caller should descend as plain folder.
 //
@@ -572,7 +599,7 @@ func (s *folderCorpusScanner) tryDiscoverBoundary(path, rel string) bool {
 
 // emitBoundaryMarker mixes a "git-boundary" namespaced contribution
 // into the parent's state hash. The marker payload includes the boundary's
-// relative path AND the .git entry's dev:ino:mtime so that:
+// relative path and the .git entry's device, inode, and modification time so:
 //
 //   - boundary appears   → marker absent before, present after → hash flips
 //   - boundary disappears → marker present before, absent after → hash flips
@@ -673,10 +700,8 @@ func scanFolderRootEntriesParallel(
 	discoveryEnabled := discoveryEnabledForPlan(plan)
 
 	workers := fileReadWorkerCount(maxFolderFingerprintWorkers, len(entries))
-	// Size jobs to len(entries) so the feeder loop (lines 690-698)
-	// drains the index sequence in one non-blocking pass. With a
-	// workers-sized buffer the feeder would block after `workers` sends
-	// and wait for consumers, serializing the dispatch path.
+	// Size jobs to len(entries) so the feeder can send every entry without
+	// waiting for a worker.
 	jobs := make(chan int, len(entries))
 	pieces := make([]folderFingerprintPiece, len(entries))
 	errCh := make(chan error, 1)
@@ -727,10 +752,7 @@ func scanFolderRootEntriesParallel(
 	var indexedBytes int64
 	var selected []folderCandidate
 	if collectSelected {
-		// Single-pass capacity computation avoids the 15-20 reallocations
-		// the append-driven growth path takes on large trees (each doubling
-		// triggers a memcpy of the running slice). Trivial overhead vs the
-		// alloc + memcpy churn it eliminates.
+		// Compute the exact capacity before appending the selected candidates.
 		capEst := 0
 		for _, p := range pieces {
 			if p.present {
@@ -808,9 +830,8 @@ func fingerprintRootEntry(
 				present: true,
 			}, nil
 		}
-		// Root-level boundary case: the entry IS a nested git repo at
-		// the immediate child level. Same semantics as deeper
-		// discovery: emit boundary marker, enqueue, suppress descent.
+		// This root entry is a nested Git repository. Record the boundary,
+		// enqueue it, and do not descend into it.
 		if scanner.tryDiscoverBoundary(path, name) {
 			return folderFingerprintPiece{
 				hash:    h.Sum64(),
@@ -829,10 +850,7 @@ func fingerprintRootEntry(
 			present:            scanner.candidateCount > 0,
 		}, nil
 	}
-	// Short-circuit non-regular files before entry.Info(). DirEntry.Type()
-	// on Linux/Darwin returns the readdir d_type field with no syscall;
-	// only regular files have Type()==0. Skipping symlinks, devices,
-	// sockets, etc. here avoids one Lstat per non-regular root entry.
+	// Skip known non-regular entries before loading their metadata.
 	if entry.Type() != 0 {
 		return folderFingerprintPiece{}, nil
 	}
@@ -1063,10 +1081,7 @@ func writeFolderManifest(cacheDir, state string, selected []folderCandidate) err
 	}
 	path := filepath.Join(cacheDir, folderManifestFileName)
 	tmp := path + ".tmp"
-	// Stream via json.Encoder into bufio.Writer instead of json.Marshal
-	// + WriteFile. For a 1M-entry manifest json.Marshal allocates ~2×
-	// payload (~150 MB) as a single bytes.Buffer; the streaming form
-	// holds at most one bufio (32 KiB) plus per-entry marshal scratch.
+	// Stream entries so the full encoded manifest is not held in memory.
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
@@ -1087,10 +1102,10 @@ func writeFolderManifest(cacheDir, state string, selected []folderCandidate) err
 	return os.Rename(tmp, path)
 }
 
-// changedFolderDocumentsFromManifest diffs selected against manifest
-// and reads only the changed files. Returns errDeltaPayloadExceedsWindow
-// when cumulative lstat size of read candidates reaches indexWindowBytes
-// — caller falls back to the windowed full rebuild.
+// changedFolderDocumentsFromManifest compares selected files with the manifest
+// and reads only changed files. It returns errDeltaPayloadExceedsWindow when
+// their cumulative stat size reaches indexWindowBytes. The caller then uses a
+// windowed full rebuild.
 func changedFolderDocumentsFromManifest(selected []folderCandidate, manifest folderManifest) ([]fileContent, []string, error) {
 	// Both slices are in scanner order: root entries are sorted, subdirectories
 	// are sorted, and manifests preserve the selected list order.
@@ -1245,16 +1260,12 @@ func appendFolderFingerprintBytes(h *xxhash.Digest, part []byte) {
 //   - the worker count (each worker holds at most one fileContent),
 //   - readSemaphore's maxInFlightBytes byte budget (see caps.go).
 //
-// Each yielded fileContent carries a weight (= candidate.size pre-read)
-// on the readSemaphore. The consumer MUST Release that weight after
-// the builder.Finish() that buffered the doc returns — see fileContent's
-// doc in indexer.go for the per-window vs per-call Release contract.
-// Abandoning the channel without draining
-// would hang workers blocked on send until ctx cancellation.
+// Each yielded fileContent carries the candidate's pre-read size as its
+// readSemaphore weight. The consumer releases that weight after Builder.Finish
+// stops using the content. A caller must drain the channel or cancel ctx.
 //
-// Synchronous folder-delta reads via readFolderFile DO NOT go through
-// this entry point and pass fileContent with weight=0; that is by
-// design (those reads are not bounded by readSemaphore today).
+// Synchronous folder-delta reads use readFolderFile directly and have zero
+// weight. readSemaphore does not limit those reads.
 func streamFolderFiles(ctx context.Context, candidates []folderCandidate, parallelism int) <-chan fileContent {
 	workers := fileReadWorkerCount(parallelism, len(candidates))
 	out := make(chan fileContent)
@@ -1293,12 +1304,9 @@ func streamFolderFiles(ctx context.Context, candidates []folderCandidate, parall
 	return out
 }
 
-// readOneFolderFileStreaming is the per-file worker body for
-// streamFolderFiles. It Acquires readSemaphore weight against the
-// candidate's pre-read size, reads the file, then transfers Release
-// ownership to the consumer via fileContent.weight on a successful
-// channel send. Failure paths between Acquire and a successful send
-// run the deferred sentinel and Release the weight here.
+// readOneFolderFileStreaming acquires readSemaphore weight for one candidate.
+// A successful send transfers release ownership to the consumer. On all other
+// paths, this function releases the weight.
 func readOneFolderFileStreaming(ctx context.Context, candidate folderCandidate, out chan<- fileContent) {
 	size := candidate.size
 	if size > maxIndexedDocumentBytes {

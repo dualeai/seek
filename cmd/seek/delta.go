@@ -64,8 +64,8 @@ func indexDeltaDocuments(
 
 	finishErr := builder.Finish()
 
-	// ONLY now is it safe to release readSemaphore weight: Zoekt no
-	// longer reads any of the doc.content slices.
+	// Zoekt no longer reads the document content after Finish returns, so the
+	// reserved readSemaphore weight can now be released.
 	releaseFileContentWeights(files)
 
 	if addErr != nil {
@@ -87,7 +87,7 @@ func indexDeltaDocuments(
 // In practice the newest shard is almost always live (it was just written by
 // the prior cycle), so this is effectively a no-op for rapid-edit chains.
 // Compaction in that scenario is delegated to the per-repo
-// DeltaShardNumberFallbackThreshold guard (Zoekt gitindex/index.go:831-843).
+// DeltaShardNumberFallbackThreshold guard in Zoekt.
 func cleanEmptyShards(ctx context.Context, indexDir, repoName string) {
 	shards := repositoryShardFiles(indexDir, repoName)
 	for i := len(shards) - 1; i > 0; i-- {
@@ -106,8 +106,7 @@ func cleanEmptyShards(ctx context.Context, indexDir, repoName string) {
 }
 
 // shardHasNoLiveDocuments returns true when shard contains no live documents
-// for repoName. Uses Zoekt's query.Const{true} as the cheapest occupancy probe
-// (single-doc cap via SearchOptions).
+// for repoName. It uses query.Const{true} with a one-document result cap.
 func shardHasNoLiveDocuments(ctx context.Context, shard, repoName string) (bool, error) {
 	searcher, err := openShard(shard)
 	if err != nil {
