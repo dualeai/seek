@@ -349,15 +349,24 @@ filtered results with context.
 
 ### Git indexing
 
-Seek uses Git plumbing to index committed data. `git ls-tree` lists files,
-`git cat-file` reads objects, and `git diff-tree` supplies small updates. The
-Git host does not select index behavior or metadata policy. An origin URL does
-not change repository identity, rank, or links. A local `[zoekt]` section can
-set a repository name and one opaque `web-url` explicitly.
+Seek has one reader for committed Git data. Normal full indexing, committed
+delta indexing, and scoped full indexing all use Git plumbing with captured
+full object IDs. `git ls-tree` lists files, `git cat-file --batch-check` reads
+sizes, `git cat-file --batch` reads approved blob bodies, and `git diff-tree`
+lists changed paths for eligible deltas. These commands provide documents to
+`zoekt/index.Builder`, which writes shards in the staging directory. There is
+no go-git, `zoekt/gitindex`, or other committed-data fallback.
 
-This release changes the committed Git cache identity to `native-v1`. The first
-Git search after the upgrade rebuilds that cache. Dirty-file indexing and folder
-indexing do not change.
+Git is the data format and object source. Its hosting service does not select
+index behavior or metadata policy. An origin URL does not change repository
+identity, rank, or links. A local `[zoekt]` section can set a repository name
+and one opaque `web-url` explicitly.
+
+This release replaces the go-git committed reader and adds `native-v1` to the
+Git corpus identity. This is the migration barrier: a native delta cannot seed
+shards made by the removed reader. The first committed build after the upgrade
+is a clean full build. Dirty-file rules do not change, but dirty shards share
+the new Git corpus cache and rebuild there. Folder caches do not change.
 
 Indexes are stored centrally in the user cache, never inside searched folders:
 
@@ -374,17 +383,20 @@ dependency, build, cache, or vendor folders by name. Git ignore rules apply only
 inside Git repos. Files larger than 100 MiB are skipped, and folder scans stop
 at 1,000,000 candidate files or 10 GiB of indexed bytes.
 
-Git applies a limit of 10,000,000 candidate files and 10 GiB of indexed bytes
-separately to the committed and working-tree index families. If the full
-repository exceeds a limit, a scoped search can build a combined fallback for
-its selected paths. An unscoped search reports the limit error.
+Git applies the 10,000,000-file and 10 GiB work limits separately to its
+committed and working-tree index families. The committed family counts
+candidate blob sizes before `.sourcegraph/ignore` filtering. The working-tree
+family counts selected regular-file content. If the full repository exceeds a
+limit, a scoped search can build a combined fallback for its selected paths.
+An unscoped search reports the limit error.
 
 ### Cache maintenance
 
 The cache cleans itself: after each run, seek garbage-collects corpora that
 have not been used for 14 days. A corpus counts as used every time it is
 searched or indexed. The automatic pass runs at most once per day and is
-disabled when the cache lives on a network filesystem.
+disabled when the cache lives on a network filesystem. GC has no total-size
+target, so active or recent corpora can use more than a fixed total size.
 
 Environment knobs:
 
@@ -439,8 +451,8 @@ When multiple `seek` commands search the same repo at the same time:
 | Scenario | Behavior |
 |----------|----------|
 | Index is fresh | All commands search at the same time |
-| Update active | One command updates; others search the published index |
-| Update fails; old index exists | Seek searches the old index and warns |
+| Update active | One command builds while others search the current index. Readers wait during publication; after 10 seconds, Seek warns and can read the shards that remain |
+| Update fails; shards remain | Except for file or byte limit errors, Seek warns and reads the remaining shards. The next build repairs an interrupted swap |
 | No index yet | First command builds it; others wait up to 60s |
 
 ### Search Exit Codes

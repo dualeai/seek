@@ -24,12 +24,8 @@ func TestPoolEnqueueDedupesByCorpusID(t *testing.T) {
 	}
 	pool, g := newTestPool(t, worker, 4)
 	plan := corpusPlan{id: corpusID("dup"), userExplicit: true}
-	if !pool.Enqueue(plan) {
-		t.Fatal("first Enqueue must accept (returned false)")
-	}
-	if pool.Enqueue(plan) {
-		t.Fatal("second Enqueue with same id must reject (returned true)")
-	}
+	pool.Enqueue(plan)
+	pool.Enqueue(plan)
 	if err := g.Wait(); err != nil {
 		t.Fatalf("g.Wait: %v", err)
 	}
@@ -376,7 +372,6 @@ func TestDiscoveryAcceptsManyNestedGitCorpora(t *testing.T) {
 		writeMinimalGitRepo(t, repo)
 		b := gitBoundary{
 			RepoDir:   repo,
-			GitDir:    filepath.Join(repo, ".git"),
 			CommonDir: filepath.Join(repo, ".git"),
 			Mode:      rootTypeDirectory,
 		}
@@ -415,7 +410,6 @@ func TestDiscoverNestedGitDedupSuppressesDescentWhenAlreadyCovered(t *testing.T)
 	writeMinimalGitRepo(t, repo)
 	b := gitBoundary{
 		RepoDir:   repo,
-		GitDir:    filepath.Join(repo, ".git"),
 		CommonDir: filepath.Join(repo, ".git"),
 		Mode:      rootTypeDirectory,
 	}
@@ -423,9 +417,7 @@ func TestDiscoverNestedGitDedupSuppressesDescentWhenAlreadyCovered(t *testing.T)
 	if err != nil {
 		t.Fatalf("planDiscoveredGitCorpus: %v", err)
 	}
-	if !pool.Enqueue(plan) {
-		t.Fatal("initial explicit-equivalent enqueue must accept")
-	}
+	pool.Enqueue(plan)
 
 	if !pool.discoverNestedGit(b) {
 		t.Fatal("covered boundary must suppress descent")

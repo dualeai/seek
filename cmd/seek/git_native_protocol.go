@@ -14,6 +14,15 @@ import (
 	"github.com/sourcegraph/zoekt/index"
 )
 
+// This command protocol is the only reader for committed Git data. Normal
+// full, committed delta, and scoped full indexing all use it with captured
+// full object IDs. There is no go-git or zoekt/gitindex fallback. Git reads
+// the objects; index.Builder writes the resulting documents to staging.
+//
+// Full scans use ls-tree, then batch-check to get blob sizes before batch asks
+// for approved bodies. This keeps oversize bodies out of the content stream.
+// Each cat-file child handles at most gitObjectBatchSize requests. A malformed
+// or short reply, a write error, or a failed child rejects the staged build.
 const (
 	gitObjectBatchSize = 8192
 	gitBatchHeaderMax  = 512
@@ -39,9 +48,7 @@ type gitBlobInfo struct {
 type gitDiffEntry struct {
 	oldMode string
 	newMode string
-	oldOID  gitObjectID
 	newOID  gitObjectID
-	status  byte
 	oldPath string
 	newPath string
 }
@@ -301,6 +308,9 @@ func readNativeGitRootIgnoreEntry(ctx context.Context, repoDir string, snapshot 
 	return &entries[0], nil
 }
 
+// writeNativeGitRequests writes object IDs while the caller reads Git replies,
+// which prevents the input and output pipes from blocking each other. The
+// channel receives the final write, flush, or close error.
 func writeNativeGitRequests(stdin io.WriteCloser, ids []gitObjectID) <-chan error {
 	done := make(chan error, 1)
 	go func() {
@@ -553,6 +563,11 @@ func readNativeGitBlobChunk(
 	return waitNativeGitChild(ctx, cmd, "git cat-file --batch", &stderr)
 }
 
+// readNativeGitBlobs emits entries in input order and does not request oversize
+// bodies. For each other document, it acquires readSemaphore weight before it
+// calls consume. A successful call transfers release ownership to the
+// consumer. This function releases the current weight if reading or consuming
+// fails.
 func readNativeGitBlobs(
 	ctx context.Context,
 	repoDir string,
@@ -589,7 +604,7 @@ func parseNativeGitDiffHeader(header, path []byte, oidLength int) (gitDiffEntry,
 	if !validMode(oldMode) || !validMode(newMode) {
 		return gitDiffEntry{}, fmt.Errorf("unsupported Git raw diff modes %q and %q", oldMode, newMode)
 	}
-	oldOID, err := parseGitObjectID(fields[2])
+	_, err := parseGitObjectID(fields[2])
 	if err != nil || len(fields[2]) != oidLength {
 		return gitDiffEntry{}, fmt.Errorf("invalid old Git raw diff object %q", fields[2])
 	}
@@ -618,9 +633,7 @@ func parseNativeGitDiffHeader(header, path []byte, oidLength int) (gitDiffEntry,
 	return gitDiffEntry{
 		oldMode: oldMode,
 		newMode: newMode,
-		oldOID:  oldOID,
 		newOID:  newOID,
-		status:  status,
 		oldPath: name,
 		newPath: name,
 	}, nil
@@ -648,6 +661,9 @@ func readNativeGitNULRecord(reader *bufio.Reader) ([]byte, bool, error) {
 	}
 }
 
+// readNativeGitDiff returns raw changes from baseOID to targetOID. Rename
+// detection is off, so a rename is one delete and one add. If maxEntries is
+// nonnegative, one extra entry stops Git and returns errNativeGitDeltaTooLarge.
 func readNativeGitDiff(
 	ctx context.Context,
 	repoDir string,

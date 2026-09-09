@@ -68,6 +68,17 @@ func TestFormatCLIError(t *testing.T) {
 				"hint: pass smaller paths after the query; file: and -file: filters apply after indexing",
 		},
 		{
+			name: "git committed candidate blob bytes",
+			err: gitCorpusError("/work/repo", "/cache/index", gitCommittedCapError(
+				"opaque Git committed byte cause",
+				indexCapIndexedBytes,
+				4*gib+1,
+				4*gib,
+			)),
+			want: "seek: cannot index Git repository \"/work/repo\": the total size of committed-tree candidate blobs exceeds the 4 GiB Git index-family limit\n" +
+				"hint: pass smaller paths after the query; file: and -file: filters apply after indexing",
+		},
+		{
 			name: "query syntax",
 			err:  &querySyntaxError{query: "foo or", cause: parseCause},
 			want: "seek: invalid query \"foo or\": parser detail",

@@ -96,10 +96,10 @@ func newRootCmd() *cobra.Command {
 		Short: "BM25-ranked code search with persistent caching",
 		Long: `seek searches the current Git worktree by default, or the files and
 folders you pass. Files and directories inside a Git worktree are searched
-through the Git index, scoped to your selection; paths excluded by .gitignore
-are searched as plain files or folders instead, as is anything outside a Git
-worktree. Visible nested Git worktrees under selected directories are searched
-once.`,
+through Seek's cached Git corpus, scoped to your selection; paths excluded by
+.gitignore are searched as plain files or folders instead, as is anything
+outside a Git worktree. Visible nested Git worktrees under selected directories
+are searched once.`,
 		Example: `  seek 'sym:Foo'              find definitions named Foo (ctags)
   seek 'lang:go func main'    Go files containing both tokens
   seek 'file:cmd -file:test'  paths matching cmd, excluding tests

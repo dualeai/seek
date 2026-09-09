@@ -10,13 +10,12 @@ import (
 	"syscall"
 )
 
-// gitBoundary describes a confirmed git repository boundary. The fields
-// mirror the subset of gitPaths the walker / planner needs to construct a
-// corpusPlan without spawning a subprocess.
+// gitBoundary describes a confirmed git repository boundary. The fields give
+// the walker and planner enough data to construct a corpusPlan without a
+// subprocess.
 type gitBoundary struct {
 	RepoDir   string   // working tree root
-	GitDir    string   // resolved .git directory (worktree marker resolved)
-	CommonDir string   // shared .git common dir; equals GitDir for non-worktree repos
+	CommonDir string   // shared .git common dir; the .git directory for normal repos
 	Mode      rootType // rootTypeDirectory for normal repos, rootTypeWorktree for file-form .git
 }
 
@@ -33,19 +32,6 @@ const (
 	boundaryConfirmed
 	ambiguous
 )
-
-func (s detectStatus) String() string {
-	switch s {
-	case notBoundary:
-		return "notBoundary"
-	case boundaryConfirmed:
-		return "boundaryConfirmed"
-	case ambiguous:
-		return "ambiguous"
-	default:
-		return fmt.Sprintf("detectStatus(%d)", int(s))
-	}
-}
 
 // maxGitFileBytes caps reads of a `.git` worktree pointer file. The git
 // format spec is a single short `gitdir: <path>` line; a pathological or
@@ -99,7 +85,6 @@ func detectGitBoundary(absDir, scanRoot string) (gitBoundary, detectStatus) {
 		}
 		return gitBoundary{
 			RepoDir:   absDir,
-			GitDir:    gitPath,
 			CommonDir: gitPath,
 			Mode:      rootTypeDirectory,
 		}, boundaryConfirmed
@@ -124,7 +109,6 @@ func detectGitBoundary(absDir, scanRoot string) (gitBoundary, detectStatus) {
 			}
 			return gitBoundary{
 				RepoDir:   absDir,
-				GitDir:    resolved,
 				CommonDir: resolved,
 				Mode:      rootTypeWorktree,
 			}, boundaryConfirmed
@@ -145,7 +129,6 @@ func detectGitBoundary(absDir, scanRoot string) (gitBoundary, detectStatus) {
 		}
 		return gitBoundary{
 			RepoDir:   absDir,
-			GitDir:    resolved,
 			CommonDir: commonDir,
 			Mode:      rootTypeWorktree,
 		}, boundaryConfirmed
@@ -336,8 +319,8 @@ func realOrClean(path string) string {
 
 // readCommonDir reads <gitDir>/commondir (a single short line containing
 // a path) and returns the resolved common directory. Returns gitDir
-// unchanged if commondir is absent or unreadable — the common case for
-// non-worktree repos where GitDir already IS the common dir.
+// unchanged if commondir is absent or unreadable. This is the common case for
+// a normal repository, where the resolved .git directory is the common dir.
 func readCommonDir(gitDir string) string {
 	line, err := readFirstLineNoFollow(filepath.Join(gitDir, "commondir"))
 	if err != nil || line == "" || strings.ContainsRune(line, 0) {
@@ -349,13 +332,11 @@ func readCommonDir(gitDir string) string {
 	return filepath.Clean(line)
 }
 
-// toGitPaths upgrades a gitBoundary to the gitPaths shape used by older
-// code paths. ConfigPath is derived from CommonDir at the call site
-// without a subprocess.
+// toGitPaths adds the config path that Git commands need. It derives the path
+// from CommonDir without a subprocess.
 func (b gitBoundary) toGitPaths() gitPaths {
 	return gitPaths{
 		RepoDir:    b.RepoDir,
-		GitDir:     b.GitDir,
 		CommonDir:  b.CommonDir,
 		ConfigPath: filepath.Join(b.CommonDir, "config"),
 	}

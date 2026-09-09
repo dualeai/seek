@@ -107,7 +107,7 @@ func TestIndexDocuments_ReleasesWeightOnFinishError(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root can write to read-only dirs; skipping Finish-error test")
 	}
-	_, done := withReadSemLock(t)
+	done := withReadSemLock(t)
 	defer done()
 
 	indexDir := t.TempDir()
@@ -143,7 +143,7 @@ func TestIndexDocuments_ReleasesWeightWhenMixedDocsSucceed(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
 	}
-	_, done := withReadSemLock(t)
+	done := withReadSemLock(t)
 	defer done()
 
 	indexDir := t.TempDir()
@@ -171,7 +171,7 @@ func TestIndexDocuments_NoConsumerWeightDoubleRelease(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
 	}
-	_, done := withReadSemLock(t)
+	done := withReadSemLock(t)
 	defer done()
 
 	indexDir := t.TempDir()

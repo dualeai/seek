@@ -538,8 +538,6 @@ func TestRunRerankK01FallbackContracts(t *testing.T) {
 			context.Background(),
 			"alpha beta",
 			[]string{folder},
-			0,
-			0,
 			defaultSearchConfig(),
 		)
 	})
@@ -680,7 +678,7 @@ func TestRunRerankUnsupportedQueriesStayByteIdentical(t *testing.T) {
 		t.Run(pattern, func(t *testing.T) {
 			baseline, baselineErr := captureStdout(t, func() error {
 				return runWithSearchConfig(
-					context.Background(), pattern, []string{folder}, 0, 0, defaultSearchConfig(),
+					context.Background(), pattern, []string{folder}, defaultSearchConfig(),
 				)
 			})
 			factoryCalls := 0

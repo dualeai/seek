@@ -19,7 +19,7 @@ import (
 
 const nativeTestOID = "0123456789abcdef0123456789abcdef01234567"
 
-func installFakeGit(t *testing.T) string {
+func installFakeGit(t *testing.T) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("fake Git fixture requires a POSIX shell")
@@ -155,7 +155,6 @@ exit 64
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir)
-	return binDir
 }
 
 func requireProcessGone(t *testing.T, pidFile string) {
@@ -590,7 +589,7 @@ func TestParseNativeGitDiffHeader(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if entry.status != test.status || entry.oldMode != test.oldMode || entry.newMode != test.newMode || entry.oldPath != "a\tpath\n.go" {
+		if entry.oldMode != test.oldMode || entry.newMode != test.newMode || entry.newOID.String() != test.newOID || entry.oldPath != "a\tpath\n.go" {
 			t.Fatalf("entry=%+v", entry)
 		}
 	}

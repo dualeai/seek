@@ -684,6 +684,10 @@ func crossesGitBoundary(parent string, child externalRoot) bool {
 // path (planDiscoveredGitPaths). Both paths use the same corpus identity, so
 // they map one physical repository to one cache directory.
 //
+// git_committed_backend=native-v1 is the committed-reader migration barrier.
+// It makes the first native request use a new cache, so native delta cannot
+// seed a shard family made by the removed reader.
+//
 // rootTypeWorktree is the convention regardless of the on-disk
 // layout: the corpus models the working tree, not the .git layout.
 // Using gitBoundary.Mode (which can be rootTypeDirectory for a normal
@@ -694,15 +698,6 @@ func buildGitCorpusPlan(repoDir, commonDir string, extraIDParts ...string) (corp
 	idParts := []string{"git_worktree", root, "git_common_dir", cdir, "git_committed_backend", "native-v1"}
 	idParts = append(idParts, extraIDParts...)
 	return newCorpusPlan(corpusKindGit, rootTypeWorktree, root, "git", idParts...)
-}
-
-// planDiscoveredGitCorpus builds a plan for a repo the folder walker
-// found mid-flight via detectGitBoundary. userExplicit stays at zero
-// value (false) so the pool's worker wrapper logs and swallows failures
-// instead of aborting the user's search. gitPaths is derived from the
-// boundary without a subprocess.
-func planDiscoveredGitCorpus(b gitBoundary) (corpusPlan, error) {
-	return planDiscoveredGitPaths(b.toGitPaths())
 }
 
 func planDiscoveredGitPaths(paths gitPaths) (corpusPlan, error) {
@@ -721,10 +716,6 @@ func planCurrentGitCorpus(paths gitPaths) (corpusPlan, error) {
 	}
 	plan.gitPaths = &paths
 	return plan, nil
-}
-
-func planFolderCorpus(root string, info os.FileInfo) (corpusPlan, error) {
-	return planFolderCorpusWithExclusions(root, info, nil)
 }
 
 func planFolderCorpusWithExclusions(root string, info os.FileInfo, excludes []string) (corpusPlan, error) {
@@ -790,10 +781,6 @@ func newCorpusPlan(kind corpusKind, rt rootType, root, statSubject string, extra
 		cacheDir:    cacheDir,
 		indexDir:    filepath.Join(cacheDir, "index"),
 	}, nil
-}
-
-func planCurrentGitCorpusWithOperands(paths gitPaths, operands []string) (corpusPlan, error) {
-	return planCurrentGitCorpusWithExclusions(paths, operands, nil)
 }
 
 func planCurrentGitCorpusWithExclusions(paths gitPaths, operands, excludes []string) (corpusPlan, error) {

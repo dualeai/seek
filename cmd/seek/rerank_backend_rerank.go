@@ -302,7 +302,6 @@ func tokenizeLateOnBatch(
 			encoded = encodeLateOnText(
 				tokenizer,
 				lateOnQueryPrefix+queryText,
-				lateOnSequenceLength,
 			)
 		} else {
 			encoded = encodeLateOnDocument(
@@ -408,10 +407,9 @@ func truncateLateOnDocumentTokens(
 func encodeLateOnText(
 	tokenizer *hftokenizer.Tokenizer,
 	text string,
-	limit int,
 ) []int {
 	encoded := tokenizer.Encode(text)
-	return truncateLateOnHead(encoded, limit)
+	return truncateLateOnHead(encoded, lateOnSequenceLength)
 }
 
 func truncateLateOnHead(encoded []int, limit int) []int {

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -17,38 +16,6 @@ import (
 	"github.com/sourcegraph/zoekt/index"
 	"github.com/sourcegraph/zoekt/query"
 )
-
-// gitOracleBlobPaths returns the committed blob paths that Git itself sees.
-// It is the source oracle for the native indexer regression fixtures.
-func gitOracleBlobPaths(t testing.TB, repoDir, commit string) []string {
-	t.Helper()
-	cmd := exec.Command("git", "--no-pager", "--no-replace-objects", "ls-tree", "-r", "-z", "--full-tree", "--no-abbrev", commit)
-	cmd.Dir = repoDir
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("git ls-tree oracle: %v", err)
-	}
-
-	var paths []string
-	for _, record := range bytes.Split(out, []byte{0}) {
-		if len(record) == 0 {
-			continue
-		}
-		header, path, ok := bytes.Cut(record, []byte{'\t'})
-		if !ok {
-			t.Fatalf("git ls-tree oracle record has no path: %q", record)
-		}
-		fields := bytes.Fields(header)
-		if len(fields) != 3 {
-			t.Fatalf("git ls-tree oracle header: %q", header)
-		}
-		if bytes.Equal(fields[1], []byte("blob")) {
-			paths = append(paths, string(path))
-		}
-	}
-	sort.Strings(paths)
-	return paths
-}
 
 func zoektIndexedPaths(t testing.TB, indexDir string) []string {
 	t.Helper()
@@ -113,16 +80,16 @@ func requireCompleteNativeIndex(t *testing.T, repoDir string, want []string) {
 	t.Helper()
 	indexDir := t.TempDir()
 	snapshot := captureHeadForTest(t, repoDir)
-	if _, err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, nil, 1); err != nil {
+	if err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, nil, 1); err != nil {
 		t.Fatalf("native committed index: %v", err)
 	}
 	got := zoektIndexedPaths(t, indexDir)
 	if !slices.Equal(got, want) {
-		t.Fatalf("native index paths=%v, Git paths=%v", got, want)
+		t.Fatalf("native index paths=%v, want %v", got, want)
 	}
 }
 
-func TestNativeGitFullMatchesGitInventory(t *testing.T) {
+func TestNativeGitFullIndexesFixtureInventory(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		files int
@@ -136,8 +103,10 @@ func TestNativeGitFullMatchesGitInventory(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			requireTools(t)
 			repoDir := initEmptyGitRepo(t)
+			want := make([]string, 0, tc.files)
 			for i := range tc.files {
 				name := fmt.Sprintf("file-%03d.txt", i)
+				want = append(want, name)
 				if err := os.WriteFile(filepath.Join(repoDir, name), []byte("inventory\n"), 0o644); err != nil {
 					t.Fatal(err)
 				}
@@ -147,7 +116,6 @@ func TestNativeGitFullMatchesGitInventory(t *testing.T) {
 			if tc.pack {
 				gitRunIn(t, repoDir, "repack", "-a", "-d")
 			}
-			want := gitOracleBlobPaths(t, repoDir, "HEAD")
 			requireCompleteNativeIndex(t, repoDir, want)
 		})
 	}
@@ -155,7 +123,7 @@ func TestNativeGitFullMatchesGitInventory(t *testing.T) {
 
 // moveObjectToLoosePrefixedPack stores one object in a valid Git pack whose
 // name does not start with "pack-", then removes its loose copy. Git reads all
-// *.idx packs. The current go-git filesystem backend reads only pack-* packs.
+// *.idx packs. The former go-git-backed reader read only pack-* packs.
 func moveObjectToLoosePrefixedPack(t *testing.T, repoDir, oid string) {
 	t.Helper()
 	prefix := filepath.Join(repoDir, ".git", "objects", "pack", "loose-native-fixture")
@@ -202,10 +170,7 @@ func TestNativeGitIndexer_LoosePrefixedPackIsComplete(t *testing.T) {
 
 	hiddenTree := gitOutputIn(t, repoDir, "rev-parse", "HEAD:hidden")
 	moveObjectToLoosePrefixedPack(t, repoDir, hiddenTree)
-	want := gitOracleBlobPaths(t, repoDir, "HEAD")
-	if len(want) != 4 {
-		t.Fatalf("Git oracle paths=%v, want four", want)
-	}
+	want := []string{"a.go", "hidden/one.go", "hidden/two.go", "z.go"}
 	requireCompleteNativeIndex(t, repoDir, want)
 }
 
@@ -229,6 +194,28 @@ func TestNativeGitIndexer_AlternatesIsComplete(t *testing.T) {
 
 	clone := filepath.Join(t.TempDir(), "clone")
 	gitRunIn(t, filepath.Dir(clone), "clone", "--shared", source, clone)
+	alternatesPath := filepath.Join(clone, ".git", "objects", "info", "alternates")
+	alternates, err := os.ReadFile(alternatesPath)
+	if err != nil {
+		t.Fatalf("read shared-clone alternates: %v", err)
+	}
+	if strings.TrimSpace(string(alternates)) == "" {
+		t.Fatal("shared clone has an empty alternates file")
+	}
+	sharedBlob := gitOutputIn(t, clone, "rev-parse", "HEAD:shared/one.go")
+	localSharedBlob := filepath.Join(clone, ".git", "objects", sharedBlob[:2], sharedBlob[2:])
+	if _, err := os.Stat(localSharedBlob); err == nil {
+		t.Fatalf("shared blob %s exists in the clone object store", sharedBlob)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("inspect local shared blob: %v", err)
+	}
+	localPacks, err := filepath.Glob(filepath.Join(clone, ".git", "objects", "pack", "*.idx"))
+	if err != nil {
+		t.Fatalf("inspect local clone packs: %v", err)
+	}
+	if len(localPacks) != 0 {
+		t.Fatalf("shared clone has local packs, so object ownership is unclear: %v", localPacks)
+	}
 	gitRunIn(t, clone, "config", "user.email", "test@test.com")
 	gitRunIn(t, clone, "config", "user.name", "Test")
 	if err := os.WriteFile(filepath.Join(clone, "a.go"), []byte("package a\n// NATIVE_ALT_LOCAL\n"), 0o644); err != nil {
@@ -237,10 +224,7 @@ func TestNativeGitIndexer_AlternatesIsComplete(t *testing.T) {
 	gitRunIn(t, clone, "add", "a.go")
 	gitRunIn(t, clone, "commit", "-m", "local commit over alternate")
 
-	want := gitOracleBlobPaths(t, clone, "HEAD")
-	if len(want) != 3 {
-		t.Fatalf("Git oracle paths=%v, want three", want)
-	}
+	want := []string{"a.go", "shared/one.go", "shared/two.go"}
 	requireCompleteNativeIndex(t, clone, want)
 }
 
@@ -286,13 +270,14 @@ func TestNativeGitIndexer_VisibleContract(t *testing.T) {
 	gitRunIn(t, repoDir, "commit", "-m", "golden gitlink")
 	gitRunIn(t, repoDir, "config", "zoekt.name", "native-golden")
 	gitRunIn(t, repoDir, "config", "zoekt.web-url", "https://example.test/native-golden")
+	gitRunIn(t, repoDir, "config", "zoekt.web-url-type", "github")
 	gitRunIn(t, repoDir, "config", "zoekt.repoid", "42")
 	gitRunIn(t, repoDir, "config", "zoekt.tenantID", "7")
 	gitRunIn(t, repoDir, "config", "zoekt.github-stars", "100")
 
 	indexDir := t.TempDir()
 	snapshot := captureHeadForTest(t, repoDir)
-	if _, err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, nil, 1); err != nil {
+	if err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, nil, 1); err != nil {
 		t.Fatalf("native committed index: %v", err)
 	}
 	wantPaths := []string{
@@ -335,12 +320,15 @@ func TestNativeGitIndexer_VisibleContract(t *testing.T) {
 	if repository.RawConfig["name"] != "native-golden" {
 		t.Fatalf("raw config=%v", repository.RawConfig)
 	}
+	if repository.IndexOptions == "" || !repository.HasSymbols {
+		t.Fatalf("repository index options=%q has symbols=%t", repository.IndexOptions, repository.HasSymbols)
+	}
 
 	q, err := parseSearchQuery("branch:HEAD NATIVE_VISIBLE")
 	if err != nil {
 		t.Fatalf("parse branch query: %v", err)
 	}
-	matches, err := executeParsedSearchScoped(context.Background(), indexDir, q, nil, defaultSearchConfig())
+	matches, err := executeParsedShardSearchForTest(context.Background(), indexDir, q, defaultSearchConfig())
 	if err != nil {
 		t.Fatalf("branch search: %v", err)
 	}

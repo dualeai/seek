@@ -42,16 +42,15 @@ type corpusPool struct {
 	seen sync.Map // map[corpusID]struct{}
 }
 
-// Enqueue returns false when the pool already contains the corpus.
-func (p *corpusPool) Enqueue(plan corpusPlan) bool {
+// Enqueue starts one worker for a corpus that the pool has not seen.
+func (p *corpusPool) Enqueue(plan corpusPlan) {
 	if _, loaded := p.seen.LoadOrStore(plan.id, struct{}{}); loaded {
-		return false
+		return
 	}
 	if plan.kind == corpusKindFolder {
 		plan.discover = p.discoverNestedGit
 	}
 	p.g.Go(p.runPlan(plan))
-	return true
 }
 
 func (p *corpusPool) runPlan(plan corpusPlan) func() error {

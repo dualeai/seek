@@ -15,7 +15,6 @@ import (
 const maxNativeGitDeltaPaths = gitObjectBatchSize
 
 type nativeGitDelta struct {
-	baseOID      gitObjectID
 	repository   zoekt.Repository
 	changedPaths []string
 	targetInfos  []gitBlobInfo
@@ -73,6 +72,12 @@ func nativeGitDeltaStaticMetadataEqual(existing, target *zoekt.Repository) bool 
 		existing.Tombstone == target.Tombstone
 }
 
+// prepareNativeGitDelta checks whether target can extend the published
+// committed family. eligible=false with no error selects native full indexing;
+// an error stops the build. It selects full indexing for an incomplete or
+// incompatible base, too many shards or paths, changed ignore rules, a missing
+// base commit, or a delta payload that reaches the window limit. A corpus-limit
+// error stops the build. No other committed-data backend is a fallback.
 func prepareNativeGitDelta(
 	ctx context.Context,
 	repoDir string,
@@ -114,9 +119,9 @@ func prepareNativeGitDelta(
 	if !nativeGitDeltaStaticMetadataEqual(existing, &repository) {
 		return nil, false, nil
 	}
-	// Builder.Finish updates LatestCommitDate in old delta sidecars, but it does
-	// not update their stored Rank. Rebuild when explicit commit-date ranking
-	// crosses a month so every shard keeps one rank.
+	// Builder.Finish updates LatestCommitDate in existing shard sidecars, but it
+	// does not update their stored Rank. Rebuild when explicit commit-date
+	// ranking crosses a month so every shard keeps one rank.
 	if _, ok := repository.RawConfig["latestcommitdate"]; ok && existing.Rank != repository.Rank {
 		return nil, false, nil
 	}
@@ -176,7 +181,6 @@ func prepareNativeGitDelta(
 		}
 	}
 	return &nativeGitDelta{
-		baseOID:      baseOID,
 		repository:   repository,
 		changedPaths: changedPaths,
 		targetInfos:  targetInfos,
@@ -222,7 +226,7 @@ func scanNativeGitDeltaTarget(
 					budget.indexedBytes += info.size
 					if budget.indexedBytes > gitCorpusIndexedByteLimit {
 						return gitCommittedCapError(
-							"git committed indexed byte cap exceeded",
+							"git committed candidate blob byte cap exceeded",
 							indexCapIndexedBytes,
 							budget.indexedBytes,
 							gitCorpusIndexedByteLimit,
@@ -253,15 +257,18 @@ func scanNativeGitDeltaTarget(
 	return targetInfos, nil
 }
 
+// indexNativeGitDelta hard-links the verified committed seed into buildDir and
+// writes one delta there. buildDir is staging owned by the caller; this
+// function does not change or publish the live family.
 func indexNativeGitDelta(
 	ctx context.Context,
 	repoDir string,
 	buildDir string,
 	seedPaths []string,
 	delta *nativeGitDelta,
-) (bool, error) {
+) error {
 	if err := seedFamilyFiles(buildDir, seedPaths); err != nil {
-		return false, err
+		return err
 	}
 	documents := make([]fileContent, 0, len(delta.targetInfos))
 	err := readNativeGitBlobs(ctx, repoDir, delta.targetInfos, func(document fileContent) error {
@@ -271,7 +278,8 @@ func indexNativeGitDelta(
 	})
 	if err != nil {
 		releaseFileContentWeights(documents)
-		return false, err
+		return err
 	}
-	return indexDeltaDocumentsWithRepository(buildDir, delta.repository, documents, 0, delta.changedPaths)
+	_, err = indexDeltaDocumentsWithRepository(buildDir, delta.repository, documents, 0, delta.changedPaths)
+	return err
 }

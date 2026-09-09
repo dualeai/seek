@@ -20,22 +20,6 @@ type gcCmdOptions struct {
 	sort   string
 }
 
-// runGCCommand is the test-facing entry point that mirrors the
-// pre-Cobra signature. It instantiates the gc cobra command, feeds it
-// raw args, and runs it. Production callers go through newGCCmd /
-// rootCmd.Execute; this wrapper exists so the existing gc_test.go
-// table doesn't need a full rewrite of every `runGCCommand(ctx, []string{...})`
-// call site.
-func runGCCommand(ctx context.Context, args []string) error {
-	cmd := newGCCmd()
-	cmd.SilenceErrors = true
-	cmd.SilenceUsage = true
-	cmd.SetArgs(args)
-	cmd.SetOut(os.Stdout)
-	cmd.SetErr(io.Discard)
-	return cmd.ExecuteContext(ctx)
-}
-
 // runGCCommandCmd implements `seek gc`. Flags are parsed by Cobra and
 // passed in via opts. Flag validation and setup failures (cache root,
 // enumeration) return an error and exit non-zero; failures inside the

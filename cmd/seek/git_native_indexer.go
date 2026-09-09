@@ -22,6 +22,8 @@ type gitSnapshot struct {
 	commitTime time.Time
 }
 
+// captureGitSnapshot verifies a full SHA-1 or SHA-256 commit ID and reads its
+// committer time. The "no-head" value returns ok=false without an error.
 func captureGitSnapshot(ctx context.Context, repoDir, captured string) (gitSnapshot, bool, error) {
 	if captured == "no-head" {
 		return gitSnapshot{}, false, nil
@@ -124,6 +126,9 @@ func readNativeGitConfig(ctx context.Context, repoDir string) (nativeGitConfig, 
 	return result, nil
 }
 
+// nativeGitRepository makes provider-neutral metadata for one captured commit.
+// Only explicit local zoekt.* settings can replace its opaque name or set its
+// web URL.
 func nativeGitRepository(ctx context.Context, repoDir string, snapshot gitSnapshot) (zoekt.Repository, error) {
 	repository := zoekt.Repository{
 		Name:             fallbackGitRepositoryName(repoDir),
@@ -143,10 +148,11 @@ func nativeGitRepository(ctx context.Context, repoDir string, snapshot gitSnapsh
 	return repository, nil
 }
 
-// applyNativeGitConfig is provider neutral. The committed reader handles Git
-// objects and Git metadata only. It does not infer a hosting product from a
-// remote, and it does not create host-specific URL templates. Callers can set
-// one opaque web URL and one stable name through the local [zoekt] section.
+// applyNativeGitConfig enforces the provider-neutral architecture. Git is the
+// format and object source; its hosting service does not control index
+// behavior. Seek does not inspect a remote or make host-specific URL
+// templates. The local [zoekt] section can set one repository name and one
+// opaque web URL explicitly.
 func applyNativeGitConfig(repository *zoekt.Repository, config nativeGitConfig) {
 	if name := config.zoektValue("name"); name != "" && !reservedGitRepositoryName(name) {
 		repository.Name = name
@@ -169,8 +175,8 @@ func applyNativeGitConfig(repository *zoekt.Repository, config nativeGitConfig) 
 	}
 }
 
-// nativeGitCommitRank keeps Zoekt's explicit latestCommitDate behavior while
-// RawConfig uses Git's case-insensitive, lowercase option names.
+// nativeGitCommitRank returns Zoekt's month rank when local config enables
+// latestCommitDate ranking.
 func nativeGitCommitRank(commitTime time.Time) uint16 {
 	if commitTime.Before(time.Unix(0, 0)) {
 		return 0
@@ -222,30 +228,23 @@ func readNativeGitIgnore(ctx context.Context, repoDir string, snapshot gitSnapsh
 	return matcher, nil
 }
 
-type nativeGitStreamResult struct {
-	budget   gitIndexBudget
-	selected int
-	err      error
-}
-
 func streamNativeGitDocuments(
 	ctx context.Context,
 	repoDir string,
 	snapshot gitSnapshot,
 	scope *gitDirtyScope,
-) (<-chan fileContent, <-chan nativeGitStreamResult) {
+) (<-chan fileContent, <-chan error) {
 	documents := make(chan fileContent)
-	result := make(chan nativeGitStreamResult, 1)
+	result := make(chan error, 1)
 	go func() {
 		defer close(documents)
 		matcher, err := readNativeGitIgnore(ctx, repoDir, snapshot)
 		if err != nil {
-			result <- nativeGitStreamResult{err: err}
+			result <- err
 			return
 		}
 
 		var budget gitIndexBudget
-		selected := 0
 		headBranch := []string{"HEAD"}
 		err = readNativeGitTree(ctx, repoDir, snapshot, scope, func(entries []gitTreeEntry) error {
 			blobs := make([]gitTreeEntry, 0, len(entries))
@@ -271,7 +270,7 @@ func streamNativeGitDocuments(
 						budget.indexedBytes += info.size
 						if budget.indexedBytes > gitCorpusIndexedByteLimit {
 							return gitCommittedCapError(
-								"git committed indexed byte cap exceeded",
+								"git committed candidate blob byte cap exceeded",
 								indexCapIndexedBytes,
 								budget.indexedBytes,
 								gitCorpusIndexedByteLimit,
@@ -281,7 +280,6 @@ func streamNativeGitDocuments(
 					if matcher.Match(info.entry.path) {
 						continue
 					}
-					selected++
 					selectedInfos = append(selectedInfos, info)
 				}
 				return readNativeGitBlobs(ctx, repoDir, selectedInfos, func(document fileContent) error {
@@ -295,11 +293,16 @@ func streamNativeGitDocuments(
 				})
 			})
 		})
-		result <- nativeGitStreamResult{budget: budget, selected: selected, err: err}
+		result <- err
 	}()
 	return documents, result
 }
 
+// indexNativeGitFull writes one captured commit to indexDir through the shared
+// Builder sink. It applies the root .sourcegraph/ignore file and an optional
+// path scope, skips gitlinks, and emits oversize blob names without their
+// bodies. Candidate and content limits apply before ignore filtering. indexDir
+// is caller-owned staging; the caller validates HEAD and publishes it.
 func indexNativeGitFull(
 	ctx context.Context,
 	repoDir string,
@@ -307,15 +310,15 @@ func indexNativeGitFull(
 	snapshot gitSnapshot,
 	scope *gitDirtyScope,
 	parallelism int,
-) (bool, error) {
+) error {
 	repository, err := nativeGitRepository(ctx, repoDir, snapshot)
 	if err != nil {
-		return false, err
+		return err
 	}
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	documents, result := streamNativeGitDocuments(streamCtx, repoDir, snapshot, scope)
-	indexed, buildErr := indexDocumentsWithRepository(
+	_, buildErr := indexDocumentsWithRepository(
 		streamCtx,
 		indexDir,
 		repository,
@@ -323,15 +326,15 @@ func indexNativeGitFull(
 		parallelism,
 		cancel,
 	)
-	streamResult := <-result
+	streamErr := <-result
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return indexed, ctxErr
+		return ctxErr
 	}
 	if buildErr != nil {
-		return indexed, buildErr
+		return buildErr
 	}
-	if streamResult.err != nil {
-		return indexed, streamResult.err
+	if streamErr != nil {
+		return streamErr
 	}
-	return indexed, nil
+	return nil
 }

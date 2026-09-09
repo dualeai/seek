@@ -126,8 +126,10 @@ func loadShardsOptional(indexDir string) ([]zoekt.Searcher, error) {
 // searchableShardPaths lists the non-directory .zoekt entries that a search
 // will try to open.
 //
-// The caller holds the shared publish lock, so this scan selects one stable
-// shard family. It needs names only and does not load size metadata.
+// The caller normally holds the shared publish lock, so this scan cannot
+// interleave with a successful swap. acquireReadLock can permit an unlocked
+// read after its timeout; that path scans the shards that remain. This
+// function needs names only and does not load size metadata.
 func searchableShardPaths(indexDir string) ([]string, error) {
 	return familyShardNames(indexDir)
 }
@@ -202,11 +204,6 @@ func loadShardPaths(indexDir string, paths []string) ([]zoekt.Searcher, error) {
 // changes.
 var errShardUnloadable = errors.New("index damage")
 
-func parseSearchQuery(pattern string) (query.Q, error) {
-	_, expanded, err := parseSearchQueryForms(pattern)
-	return expanded, err
-}
-
 func parseSearchQueryForms(pattern string) (query.Q, query.Q, error) {
 	raw, err := query.Parse(pattern)
 	if err != nil {
@@ -214,16 +211,6 @@ func parseSearchQueryForms(pattern string) (query.Q, query.Q, error) {
 	}
 	expanded := query.Map(raw, query.ExpandFileContent)
 	return raw, query.Simplify(expanded), nil
-}
-
-func executeParsedSearchScoped(
-	ctx context.Context,
-	indexDir string,
-	userQ query.Q,
-	scope query.Q,
-	config searchConfig,
-) ([]zoekt.FileMatch, error) {
-	return executeParsedSearchScopedDirs(ctx, []string{indexDir}, userQ, scope, config)
 }
 
 func executeParsedSearchScopedDirs(

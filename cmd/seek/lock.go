@@ -27,7 +27,7 @@ var errCorpusEvicted = errors.New("corpus evicted during build")
 //     errCorpusEvicted.
 //   - acquireReadLock: shared lock on cacheDir/.lock, held while the reader
 //     lists, opens, and searches shards. It waits for a bounded time. If the
-//     wait expires and shards remain, it permits a stale read.
+//     wait expires and shards remain, it permits an unlocked read of them.
 
 // acquireBuildLock holds an exclusive cacheDir/.build.lock for the complete
 // build. If another builder holds it and any shard exists, it returns
@@ -103,18 +103,18 @@ func acquirePublishLock(ctx context.Context, cacheDir string) (*os.File, error) 
 
 // acquireReadLock takes the shared lock on the open cacheDir/.lock file. The
 // caller holds it while it lists, opens, and searches shards. If the bounded
-// wait expires and shards remain, the caller can use a stale read.
+// wait expires and shards remain, the caller can read them without the lock.
 func acquireReadLock(ctx context.Context, indexDir string, f *os.File) error {
 	if err := lockFileSharedNB(f); err == nil {
 		return nil
 	}
 	// A publish swap is ms-scale; poll briefly for it to finish.
 	if err := pollLock(ctx, func() error { return lockFileSharedNB(f) }, 20*time.Millisecond, 500*time.Millisecond, readLockTimeout); err != nil {
-		// Wedged swap: serve stale rather than hang, but only if a usable index
-		// is present. This is the sole remaining unlocked read path and fires
-		// only on the degenerate wedged-mid-swap case.
+		// Wedged swap: use the shards that remain rather than hang. This is the
+		// sole unlocked read path and fires only when the publish lock stays held
+		// past the timeout.
 		if shardsExist(indexDir) {
-			slog.Warn("Publish lock contended past timeout; searching stale shards", "index_dir", indexDir)
+			slog.Warn("Publish lock contended past timeout; searching remaining shards without the lock", "index_dir", indexDir)
 			return nil
 		}
 		return fmt.Errorf("timeout waiting for indexer to finish (%v)", readLockTimeout)
@@ -122,9 +122,9 @@ func acquireReadLock(ctx context.Context, indexDir string, f *os.File) error {
 	return nil
 }
 
-// readLockTimeout bounds how long a search waits for an in-progress publish swap
-// before degrading to a stale read. The swap is ms-scale, so this is generous.
-// A var (not const) so tests can shrink the wedged-swap valve wait.
+// readLockTimeout bounds how long a search waits for a publish swap before it
+// can read remaining shards without the lock. The swap is usually ms-scale.
+// This is a variable so tests can shorten the wait.
 var readLockTimeout = 10 * time.Second
 
 // lockPollTimeout bounds how long the build/publish lock acquisitions poll for a

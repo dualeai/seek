@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"maps"
 	"os"
@@ -160,11 +159,11 @@ func TestNativeGitSHA256FullAndDelta(t *testing.T) {
 		t.Fatalf("prepare SHA-256 delta: eligible=%t error=%v", eligible, err)
 	}
 	deltaDir := t.TempDir()
-	if _, err := indexNativeGitDelta(t.Context(), paths.RepoDir, deltaDir, scan.paths(familyCommitted), delta); err != nil {
+	if err := indexNativeGitDelta(t.Context(), paths.RepoDir, deltaDir, scan.paths(familyCommitted), delta); err != nil {
 		t.Fatalf("build SHA-256 delta: %v", err)
 	}
 	fullDir := t.TempDir()
-	if _, err := indexNativeGitFull(t.Context(), paths.RepoDir, fullDir, target, nil, 1); err != nil {
+	if err := indexNativeGitFull(t.Context(), paths.RepoDir, fullDir, target, nil, 1); err != nil {
 		t.Fatalf("build SHA-256 full: %v", err)
 	}
 	if got, want := nativeVisibleDocuments(t, deltaDir), nativeVisibleDocuments(t, fullDir); !slices.Equal(got, want) {
@@ -267,83 +266,6 @@ func TestNativeGitRepositoryRejectsDirtyShardNames(t *testing.T) {
 	}
 }
 
-func TestNativeGitFullVisibleContract(t *testing.T) {
-	requireTools(t)
-	repoDir := initEmptyGitRepo(t)
-	for name, content := range map[string][]byte{
-		".sourcegraph/ignore": []byte("ignored.go\n"),
-		"binary.bin":          {0, 1, 2, 0, 3},
-		"empty.txt":           nil,
-		"ignored.go":          []byte("package ignored\n// NATIVE_IGNORED\n"),
-		"regular.go":          []byte("package regular\n// NATIVE_VISIBLE\n"),
-		"script.sh":           []byte("#!/bin/sh\necho NATIVE_EXECUTABLE\n"),
-	} {
-		path := filepath.Join(repoDir, name)
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, content, 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.Chmod(filepath.Join(repoDir, "script.sh"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("regular.go", filepath.Join(repoDir, "link.go")); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
-	}
-	oversize := filepath.Join(repoDir, "oversize.dat")
-	if err := os.WriteFile(oversize, nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Truncate(oversize, int64(maxIndexedDocumentBytes)+1); err != nil {
-		t.Fatal(err)
-	}
-	gitRunIn(t, repoDir, "add", ".")
-	gitRunIn(t, repoDir, "commit", "-m", "native visible contract")
-	gitlinkOID := gitOutputIn(t, repoDir, "rev-parse", "HEAD")
-	gitRunIn(t, repoDir, "update-index", "--add", "--cacheinfo", "160000,"+gitlinkOID+",submodule")
-	gitRunIn(t, repoDir, "commit", "-m", "native gitlink")
-	gitRunIn(t, repoDir, "config", "zoekt.name", "native-visible")
-	gitRunIn(t, repoDir, "config", "zoekt.web-url", "https://github.com/dualeai/seek")
-	gitRunIn(t, repoDir, "config", "zoekt.web-url-type", "github")
-	gitRunIn(t, repoDir, "config", "zoekt.repoid", "42")
-	gitRunIn(t, repoDir, "config", "zoekt.tenantID", "7")
-	gitRunIn(t, repoDir, "config", "zoekt.github-stars", "100")
-
-	head := gitOutputIn(t, repoDir, "rev-parse", "HEAD")
-	snapshot, ok, err := captureGitSnapshot(t.Context(), repoDir, head)
-	if err != nil || !ok {
-		t.Fatalf("capture snapshot: ok=%t error=%v", ok, err)
-	}
-	indexDir := t.TempDir()
-	indexed, err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, nil, 1)
-	if err != nil || !indexed {
-		t.Fatalf("native full: indexed=%t error=%v", indexed, err)
-	}
-	want := []string{".sourcegraph/ignore", "binary.bin", "empty.txt", "link.go", "oversize.dat", "regular.go", "script.sh"}
-	if got := zoektIndexedPaths(t, indexDir); !slices.Equal(got, want) {
-		t.Fatalf("indexed paths=%v, want %v", got, want)
-	}
-	repository := zoektRepositoryMetadata(t, indexDir)
-	if repository.Name != "native-visible" || repository.Source != repoDir || repository.URL != "https://github.com/dualeai/seek" ||
-		repository.ID != 42 || repository.TenantID != 7 || repository.Rank != 0 || repository.RawConfig["name"] != "native-visible" ||
-		len(repository.Branches) != 1 || repository.Branches[0].Name != "HEAD" || repository.Branches[0].Version != head ||
-		repository.LatestCommitDate.Unix() != snapshot.commitTime.Unix() || repository.IndexOptions == "" || !repository.HasSymbols {
-		t.Fatalf("indexed repository metadata=%+v", repository)
-	}
-	if repository.CommitURLTemplate != "" || repository.FileURLTemplate != "" || repository.LineFragmentTemplate != "" {
-		t.Fatalf("provider-neutral repository has URL templates: %+v", repository)
-	}
-	matches, err := executeUnscopedShardSearchForTest(context.Background(), indexDir, "branch:HEAD NATIVE_VISIBLE")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(matches) != 1 || matches[0].FileName != "regular.go" || !slices.Equal(matches[0].Branches, []string{"HEAD"}) {
-		t.Fatalf("matches=%v", matches)
-	}
-}
-
 func TestNativeGitFullRotatesBuilderWindows(t *testing.T) {
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
@@ -368,9 +290,8 @@ func TestNativeGitFullRotatesBuilderWindows(t *testing.T) {
 	}()
 
 	indexDir := t.TempDir()
-	indexed, err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, nil, 1)
-	if err != nil || !indexed {
-		t.Fatalf("native full: indexed=%t error=%v", indexed, err)
+	if err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, nil, 1); err != nil {
+		t.Fatalf("native full: %v", err)
 	}
 	shards, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
 	if err != nil {
@@ -451,9 +372,8 @@ func TestNativeGitFullScopeUsesRootIgnoreAndExclusions(t *testing.T) {
 	snapshot := captureHeadForTest(t, repoDir)
 	scope := &gitDirtyScope{includeDirs: []string{"scope"}, excludeFiles: []string{"scope/excluded.go"}}
 	indexDir := t.TempDir()
-	indexed, err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, scope, 1)
-	if err != nil || !indexed {
-		t.Fatalf("scoped native full: indexed=%t error=%v", indexed, err)
+	if err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, scope, 1); err != nil {
+		t.Fatalf("scoped native full: %v", err)
 	}
 	if got, want := zoektIndexedPaths(t, indexDir), []string{"scope/keep.go"}; !slices.Equal(got, want) {
 		t.Fatalf("scoped paths=%v, want %v", got, want)
@@ -502,7 +422,7 @@ func TestNativeGitBudgetCountsIgnoredBlobs(t *testing.T) {
 	oldFiles := gitCandidateFileLimit
 	gitCandidateFileLimit = 1
 	t.Cleanup(func() { gitCandidateFileLimit = oldFiles })
-	_, err := indexNativeGitFull(t.Context(), repoDir, t.TempDir(), captureHeadForTest(t, repoDir), nil, 1)
+	err := indexNativeGitFull(t.Context(), repoDir, t.TempDir(), captureHeadForTest(t, repoDir), nil, 1)
 	if !errors.Is(err, errGitCommittedCapExceeded) {
 		t.Fatalf("error=%v, want committed candidate cap", err)
 	}
@@ -528,7 +448,7 @@ func TestNativeGitBudgetCountsIgnoredBlobBytes(t *testing.T) {
 	oldBytes := gitCorpusIndexedByteLimit
 	gitCorpusIndexedByteLimit = int64(len(ignoreContent) + len(ignoredContent) - 1)
 	t.Cleanup(func() { gitCorpusIndexedByteLimit = oldBytes })
-	_, err := indexNativeGitFull(t.Context(), repoDir, t.TempDir(), captureHeadForTest(t, repoDir), nil, 1)
+	err := indexNativeGitFull(t.Context(), repoDir, t.TempDir(), captureHeadForTest(t, repoDir), nil, 1)
 	if !errors.Is(err, errGitCommittedCapExceeded) {
 		t.Fatalf("error=%v, want committed byte cap", err)
 	}

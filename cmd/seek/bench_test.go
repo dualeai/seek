@@ -1526,7 +1526,7 @@ func BenchmarkFolderCorpus_OneFileZoektShardLowerBound(b *testing.B) {
 		} else if !indexedAny {
 			b.Fatal("expected one-file shard to be indexed")
 		}
-		results, err := executeParsedSearchScoped(ctx, indexDir, userQ, nil, defaultSearchConfig())
+		results, err := executeParsedShardSearchForTest(ctx, indexDir, userQ, defaultSearchConfig())
 		if err != nil {
 			b.Fatalf("search one-file shard: %v", err)
 		}
@@ -2089,7 +2089,7 @@ func assertBenchmarkResultsContainPaths(b *testing.B, repoDir string, targets []
 	}
 }
 
-// --- Delta-indexing benches (added with the IsDelta migration) ---
+// --- Delta-indexing benchmarks ---
 
 // BenchmarkGitCommitted_1CommitAhead measures the steady-state cost of
 // indexing a single committed change. Each iteration prepares a new commit
@@ -2642,7 +2642,7 @@ func BenchmarkDetectGitBoundary_LinkedWorktreeBackref(b *testing.B) {
 	writeGitTriadAt(b, parentGit)
 
 	worktree := filepath.Join(root, "feature-wt")
-	wtGit := writeLinkedWorktreeAdmin(b, parentGit, worktree, "feature")
+	wtGit := writeLinkedWorktreeAdmin(b, parentGit, worktree)
 	if err := os.MkdirAll(worktree, 0o755); err != nil {
 		b.Fatal(err)
 	}

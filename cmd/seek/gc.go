@@ -36,12 +36,9 @@ const (
 	envGCInterval = "SEEK_GC_INTERVAL"
 )
 
-// TODO(gc-size-cap): SEEK_GC_MAX_TOTAL_SIZE — journalctl --vacuum-size style
-// budget: after the TTL sweep, evict LRU by .used (oldest first, never
-// biggest-first — big ≠ unused, and big corpora cost the most to reindex)
-// until the cache is under the cap. Env-only knob, parseByteSize sibling to
-// parseGCDuration (base-1024, matching humanBytes). Must not add size walks
-// to the opportunistic path unguarded — gate on a cheap corpus count first.
+// TODO(gc-size-cap): GC is age-based and has no total cache-size limit. A
+// future limit must apply to all corpus types and must not evict an active
+// corpus.
 
 type gcConfig struct {
 	maxAge   time.Duration
@@ -165,9 +162,9 @@ func runOpportunisticGC(ctx context.Context) {
 
 // runGC is the shared GC body. Two callers:
 //   - runOpportunisticGC: writer nil → silent eviction sweep, post-run.
-//   - runGCCommand (manual `seek gc --force` / `--all`): writer os.Stdout →
-//     streams the same banner + table + summary as `--dry-run`, with the
-//     ACTION column reflecting the real per-corpus outcome.
+//   - runGCCommandCmd (`seek gc --force` / `--all`): writer os.Stdout → streams
+//     the same banner + table + summary as `--dry-run`, with the ACTION column
+//     reflecting the real per-corpus outcome.
 //
 // Order of operations:
 //  1. throttle gate (`.last-gc` mtime) unless skipThrottle
@@ -613,9 +610,9 @@ func evictCorpus(e corpusDirEntry, trashDir string, cutoff time.Time) gcRowResul
 
 // pickDisplayShard chooses which shard's metadata to read for display.
 // Prefers a non-uncommitted shard so Repository.Source comes from the committed
-// corpus when available. Repository.Name may be an opaque fallback for local
-// repos without remote metadata. Returns shards[0] when all shards are
-// uncommitted (their Source is still the repo path).
+// corpus when available. Repository.Name uses the opaque default unless local
+// zoekt.name config replaces it. Returns shards[0] when all shards are
+// uncommitted; their Source is still the repository path.
 func pickDisplayShard(shards []string) string {
 	for _, s := range shards {
 		if !isUncommittedShard(filepath.Base(s)) {

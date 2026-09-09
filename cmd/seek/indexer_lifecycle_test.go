@@ -28,14 +28,13 @@ func makeFileContent(t *testing.T, name string, payload []byte) fileContent {
 }
 
 // withReadSemLock serializes accounting tests that observe the shared
-// readSemaphore via availableWeight. Returns a captured baseline and
-// a finalize() that re-checks and reports any delta. Centralizes the
-// before/after pattern so individual tests can't forget to compare.
-func withReadSemLock(t *testing.T) (before int64, finalize func()) {
+// readSemaphore via availableWeight. It returns a function that checks the
+// final weight and unlocks the test mutex.
+func withReadSemLock(t *testing.T) func() {
 	t.Helper()
 	testReadSemMu.Lock()
-	before = availableWeight(readSemaphore)
-	finalize = func() {
+	before := availableWeight(readSemaphore)
+	return func() {
 		t.Helper()
 		defer testReadSemMu.Unlock()
 		after := availableWeight(readSemaphore)
@@ -44,7 +43,6 @@ func withReadSemLock(t *testing.T) (before int64, finalize func()) {
 				before, after, before-after)
 		}
 	}
-	return before, finalize
 }
 
 // TestIndexDocuments_ReleaseAccounting_Success — happy path: every
@@ -53,7 +51,7 @@ func TestIndexDocuments_ReleaseAccounting_Success(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
 	}
-	_, done := withReadSemLock(t)
+	done := withReadSemLock(t)
 	defer done()
 
 	indexDir := t.TempDir()
@@ -80,7 +78,7 @@ func TestIndexDocuments_ReleaseAccounting_Success(t *testing.T) {
 // TestIndexDocuments_EmptyChannel_NoLeak — zero docs received → no
 // Acquire happened on this path → no Release should fire.
 func TestIndexDocuments_EmptyChannel_NoLeak(t *testing.T) {
-	_, done := withReadSemLock(t)
+	done := withReadSemLock(t)
 	defer done()
 
 	indexDir := t.TempDir()
@@ -104,7 +102,7 @@ func TestIndexDocuments_BuilderInitFail_ReleasesWeight(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
 	}
-	_, done := withReadSemLock(t)
+	done := withReadSemLock(t)
 	defer done()
 
 	bogusFile := filepath.Join(t.TempDir(), "not-a-dir")
@@ -145,7 +143,7 @@ func TestIndexDeltaDocuments_ReleaseAccounting_Success(t *testing.T) {
 		testReadSemMu.Unlock()
 	}
 
-	_, done := withReadSemLock(t)
+	done := withReadSemLock(t)
 	defer done()
 
 	docs := []fileContent{
@@ -163,7 +161,7 @@ func TestIndexDeltaDocuments_BuilderInitFail_ReleasesWeight(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
 	}
-	_, done := withReadSemLock(t)
+	done := withReadSemLock(t)
 	defer done()
 
 	bogusFile := filepath.Join(t.TempDir(), "not-a-dir")
@@ -231,7 +229,7 @@ func TestIndexDocuments_StressNoLeakUnderRace(t *testing.T) {
 // Workers must observe ctx.Err() from Acquire and return without
 // touching the semaphore.
 func TestReader_ContextCancelled_NoLeak(t *testing.T) {
-	_, done := withReadSemLock(t)
+	done := withReadSemLock(t)
 	defer done()
 
 	dir := t.TempDir()
@@ -274,7 +272,7 @@ func TestReader_OpenFails_NoLeak(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("chmod 0 cannot block root; skipping unreadable-file test")
 	}
-	_, done := withReadSemLock(t)
+	done := withReadSemLock(t)
 	defer done()
 
 	dir := t.TempDir()
@@ -301,7 +299,7 @@ func TestReader_OpenFails_NoLeak(t *testing.T) {
 // Acquire (they fail the IsRegular check in readOneDirtyFile). No
 // weight should be Acquired and no release needed.
 func TestReader_SymlinkRejected_NoLeak(t *testing.T) {
-	_, done := withReadSemLock(t)
+	done := withReadSemLock(t)
 	defer done()
 
 	dir := t.TempDir()
@@ -471,18 +469,17 @@ func swapIndexWindowBytesForTest(window int64) func() {
 
 // setupPressureTest bundles the boilerplate every pressure test repeats:
 // require ctags, hold testReadSemMu, swap the readSemaphore + window
-// budget, arm the goroutine-leak watchdog. Returns the restore func to
-// defer. Use:
+// budget, and arm the goroutine-leak watchdog. It returns the restore function.
 //
-//	defer setupPressureTest(t, testBudget, 60*time.Second)()
-func setupPressureTest(t *testing.T, budget int64, leakDeadline time.Duration) func() {
+//	defer setupPressureTest(t, testBudget)()
+func setupPressureTest(t *testing.T, budget int64) func() {
 	t.Helper()
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
 	}
 	testReadSemMu.Lock()
 	restoreSem := swapReadSemaphoreForTest(budget)
-	guardCleanup := goroutineLeakGuard(t, leakDeadline)
+	guardCleanup := goroutineLeakGuard(t, 60*time.Second)
 	return func() {
 		guardCleanup()
 		restoreSem()
@@ -495,7 +492,7 @@ func setupPressureTest(t *testing.T, budget int64, leakDeadline time.Duration) f
 // readOneFolderFileStreaming caller must release the semaphore weight
 // it Acquired against the pre-read size.
 func TestFolderReader_FileGrew_NoLeak(t *testing.T) {
-	_, done := withReadSemLock(t)
+	done := withReadSemLock(t)
 	defer done()
 
 	dir := t.TempDir()

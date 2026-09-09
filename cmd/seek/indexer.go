@@ -285,17 +285,20 @@ func checkCtags() error {
 	}
 }
 
-// runIndexingWithCache makes the combined committed+uncommitted git index
+// runIndexingWithCache makes the combined committed and uncommitted Git corpus
 // current with separate build and publish locks:
 //
 //   - .build.lock serializes builders for the complete build.
-//   - The committed family is built outside the publish lock in a temporary
-//     directory seeded with current shards. HEAD is checked before publication.
+//   - The committed family is built outside the publish lock. Native full uses
+//     an empty temporary directory; eligible native delta seeds current shards.
+//     These are the only committed-data routes. HEAD is checked before publish.
 //   - The uncommitted family is rebuilt under the publish lock so its shards,
 //     manifest, and state describe the same generation.
 //
-// Readers hold a shared publish lock while they list, open, and search shards.
-// They therefore see either the old family or the new family.
+// Normal readers hold a shared publish lock while they list, open, and search
+// shards. A successful swap holds the exclusive lock, so it cannot overlap a
+// normal read. A timed-out read can continue without the lock, and a failed
+// swap can leave remaining shards until the next build repairs .swapping.
 func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDir string, state repoState, preState string) error {
 	repoDir := paths.RepoDir
 	// Ensure partial temp files are cleaned up on all exit paths.
@@ -375,9 +378,9 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 		delta, eligible, cErr := prepareNativeGitDelta(ctx, repoDir, indexDir, snapshot, sc)
 		if cErr == nil {
 			if eligible {
-				_, cErr = indexNativeGitDelta(ctx, repoDir, buildDir, sc.paths(familyCommitted), delta)
+				cErr = indexNativeGitDelta(ctx, repoDir, buildDir, sc.paths(familyCommitted), delta)
 			} else {
-				_, cErr = indexNativeGitFull(ctx, repoDir, buildDir, snapshot, nil, parallelism)
+				cErr = indexNativeGitFull(ctx, repoDir, buildDir, snapshot, nil, parallelism)
 			}
 		}
 		if cErr != nil {
@@ -402,8 +405,8 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	}
 
 	// Keep the committed publish, uncommitted build, and state files under one
-	// exclusive publish lock. Readers then see one complete generation. The
-	// state and HEAD writes below must remain inside this lock.
+	// exclusive publish lock. Normal locked readers cannot interleave with these
+	// writes. The state and HEAD writes below must remain inside this lock.
 	var publishedNames []string
 	publishedCommitted := false
 
@@ -455,26 +458,23 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	postState := gitCorpusStateHash(paths, state)
 
 	if postState == preState {
-		finalHasShard := false
 		// Write the manifest under the same publish lock as the state. Use the
 		// committed names returned by the swap and scan the uncommitted files
 		// that this process just wrote. Record dirty-to-clean transitions too.
-		{
-			names := append([]string(nil), publishedNames...)
-			// This process changed the directory, so scan it again.
-			post, postErr := scanFamily(indexDir)
-			if postErr != nil {
-				return postErr
+		names := append([]string(nil), publishedNames...)
+		// This process changed the directory, so scan it again.
+		post, postErr := scanFamily(indexDir)
+		if postErr != nil {
+			return postErr
+		}
+		finalHasShard := post.hasShard()
+		for _, m := range post.members {
+			if m.uncommitted || !publishedCommitted {
+				names = append(names, m.name)
 			}
-			finalHasShard = post.hasShard()
-			for _, m := range post.members {
-				if m.uncommitted || !publishedCommitted {
-					names = append(names, m.name)
-				}
-			}
-			if err := writeFamilyManifest(indexDir, names); err != nil {
-				return fmt.Errorf("write family manifest: %w", err)
-			}
+		}
+		if err := writeFamilyManifest(indexDir, names); err != nil {
+			return fmt.Errorf("write family manifest: %w", err)
 		}
 		if err := writeStateFile(cacheDir, preState); err != nil {
 			return fmt.Errorf("write state file: %w", err)
@@ -496,9 +496,10 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	return nil
 }
 
-// committedSnapshotReady reports whether this family already represents the
-// captured commit. A valid manifest can describe an empty committed family
-// beside live dirty shards, so a committed shard is not always required.
+// committedSnapshotReady reports whether scan has enough committed state for
+// the caller's separate cache-state and full-manifest checks. A valid manifest
+// can describe an empty committed family beside live dirty shards, so a
+// committed shard is not always required.
 func committedSnapshotReady(cacheDir, indexDir string, state repoState, scan familyScan) bool {
 	if state.HeadSHA == "no-head" {
 		return !scan.hasMember(familyCommitted)
@@ -541,21 +542,23 @@ func shardsExist(indexDir string) bool {
 // selects a native full build. It matches maxFolderDeltaShards.
 const maxCommittedDeltaShards = 64
 
-// fallbackGitRepositoryName returns a stable opaque name for Git committed
-// shards when Zoekt cannot derive one from repo metadata. It is intentionally
-// not based on basename: "uncommitted" is reserved for dirty-file shards.
+// fallbackGitRepositoryName returns the default opaque name for committed Git
+// shards. Local zoekt.name config can replace it. It is not based on basename:
+// "uncommitted" is reserved for dirty-file shards.
 func fallbackGitRepositoryName(repoDir string) string {
 	return "git-" + hashParts("git_repository_name", canonicalCorpusPath(repoDir))
 }
 
 // fileContent carries one file's content from reader to consumer.
 //
-// weight is the byte count reserved from readSemaphore. Zoekt can keep the
-// content until Builder.Finish returns, so the consumer releases the weight
-// after that call:
+// weight is the byte count reserved from readSemaphore. A successful producer
+// call transfers ownership to the consumer. If a Builder accepts the content,
+// Zoekt can keep it until Finish returns. The consumer releases the weight on
+// an earlier error or after Finish:
 //
-//   - indexDocuments releases each window after its Finish call.
-//   - indexDeltaDocuments releases the complete set after its one Finish call.
+//   - indexDocumentsWithRepository releases each window after Finish.
+//   - indexDeltaDocumentsWithRepository releases the set before return and,
+//     after Builder creation, only after Finish.
 //
 // Zero weight means that a synchronous folder-delta read did not use the
 // semaphore. Releasing zero has no effect.
@@ -821,8 +824,8 @@ func tryUncommittedDelta(
 		// docs is empty here; no weights to release.
 		return fmt.Errorf("uncommitted delta contains only removals")
 	}
-	// indexDeltaDocuments releases the per-doc readSemaphore weights
-	// after builder.Finish() returns; do not release here.
+	// indexDeltaDocuments releases all per-document readSemaphore weights;
+	// do not release them here.
 	if _, err := indexDeltaDocuments(indexDir, repoUncommitted, repoDir, docs, uncommittedDeltaShardMax, changedPaths); err != nil {
 		return err
 	}
@@ -894,19 +897,8 @@ func readUncommittedCandidates(ctx context.Context, repoDir string, candidates [
 	return docs, nil
 }
 
-// indexDocuments consumes fileContent from fileCh and feeds each
-// Content into a rotating series of *index.Builder windows. Each
-// window accumulates up to indexWindowBytes of doc weight before
-// builder.Finish() runs and the window's pending weight is released
-// to readSemaphore. See fileContent for the per-doc Release contract.
-//
-// Window 0 opens with IsDelta=false so Zoekt's Finish prunes stale
-// shards from prior runs via FindAllShards. Windows 1..N open with
-// IsDelta=true + nil changedPaths: shard deletion + tombstone writes
-// are skipped, and shard numbering resumes from FindAllShards so new
-// shards do not collide with prior ones.
-//
-// Returns (indexed, err); indexed=true means a builder was opened.
+// indexDocuments adapts a repository name and source to the shared Builder
+// sink.
 func indexDocuments(
 	ctx context.Context,
 	indexDir string,
@@ -919,6 +911,14 @@ func indexDocuments(
 	return indexDocumentsWithRepository(ctx, indexDir, repository, fileCh, parallelism, nil)
 }
 
+// indexDocumentsWithRepository consumes fileContent through rotating Builder
+// windows. It calls Finish when a window's document weight reaches or passes
+// indexWindowBytes, then releases that weight to readSemaphore. See fileContent
+// for ownership.
+//
+// Window 0 uses IsDelta=false, so Finish prunes stale shards. Later windows use
+// IsDelta=true with no changed paths, so they skip deletion and tombstone work
+// and continue shard numbering. indexed is true after a Builder opens.
 func indexDocumentsWithRepository(
 	ctx context.Context,
 	indexDir string,

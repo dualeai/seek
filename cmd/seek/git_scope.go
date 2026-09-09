@@ -11,10 +11,11 @@ import (
 	"github.com/sourcegraph/zoekt/query"
 )
 
-// This file builds the scope that restricts a git corpus search to selected
-// paths: gitScopeSpec (the parsed dirs/files), the committed-layer zoekt
-// query, the dirty-layer gitDirtyScope + git pathspecs, and the helpers that
-// collapse/dedupe the selection.
+// This file builds the scope that restricts a Git corpus search to selected
+// paths. gitScopeSpec holds the parsed paths and builds the committed query.
+// gitDirtyScope separately supplies Git pathspecs and filters to the native
+// committed full reader and the dirty reader. The remaining helpers collapse
+// and deduplicate the selection.
 
 type gitDirtyScope struct {
 	includeDirs  []string

@@ -16,7 +16,7 @@ import (
 	"github.com/sourcegraph/zoekt/query"
 )
 
-func TestReadNativeGitDiffFixedStatuses(t *testing.T) {
+func TestReadNativeGitDiffFixedChanges(t *testing.T) {
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
 	for name := range map[string]struct{}{
@@ -63,17 +63,17 @@ func TestReadNativeGitDiffFixedStatuses(t *testing.T) {
 	}
 	got := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		got = append(got, fmt.Sprintf("%c:%s", entry.status, entry.newPath))
+		got = append(got, fmt.Sprintf("%s>%s:%s", entry.oldMode, entry.newMode, entry.newPath))
 	}
 	sort.Strings(got)
 	want := []string{
-		"A:add.go",
-		"A:rename-new.go",
-		"D:delete.go",
-		"D:rename-old.go",
-		"M:mode.go",
-		"M:modify.go",
-		"T:type.go",
+		"000000>100644:add.go",
+		"000000>100644:rename-new.go",
+		"100644>000000:delete.go",
+		"100644>000000:rename-old.go",
+		"100644>100644:modify.go",
+		"100644>100755:mode.go",
+		"100644>120000:type.go",
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("diff=%v, want %v", got, want)
@@ -260,7 +260,7 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 				seedBytes[path] = content
 			}
 			deltaDir := t.TempDir()
-			if _, err := indexNativeGitDelta(t.Context(), paths.RepoDir, deltaDir, scan.paths(familyCommitted), delta); err != nil {
+			if err := indexNativeGitDelta(t.Context(), paths.RepoDir, deltaDir, scan.paths(familyCommitted), delta); err != nil {
 				t.Fatalf("build delta: %v", err)
 			}
 			for path, want := range seedBytes {
@@ -271,7 +271,7 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 			}
 
 			fullDir := t.TempDir()
-			if _, err := indexNativeGitFull(t.Context(), paths.RepoDir, fullDir, target, nil, 1); err != nil {
+			if err := indexNativeGitFull(t.Context(), paths.RepoDir, fullDir, target, nil, 1); err != nil {
 				t.Fatalf("build clean full: %v", err)
 			}
 			if got, want := nativeVisibleDocuments(t, deltaDir), nativeVisibleDocuments(t, fullDir); !slices.Equal(got, want) {

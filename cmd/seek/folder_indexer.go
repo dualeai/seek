@@ -177,8 +177,9 @@ func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexS
 	}
 	isDelta := cachedState != "" && sc.hasShard() && intact
 
-	// Build into a temp dir, then publish atomically. A delta build needs the
-	// prior shards present, so seed them (hardlinks); a full build ignores them.
+	// Build in a temporary directory, then publish under the lock. A delta build
+	// needs the prior shards, so seed them with hardlinks; a full build ignores
+	// them.
 	buildDir, err := newBuildDir(plan.indexDir)
 	if err != nil {
 		return corpusSearchable, folderCorpusError(plan, err)
@@ -901,7 +902,7 @@ func indexFolderDocuments(
 		cleanEmptyShards(ctx, plan.indexDir, repoName)
 		shardCount := repositoryShardCount(plan.indexDir, repoName)
 		if shardCount > 0 && shardCount <= maxFolderDeltaShards {
-			indexedAny, err := indexFolderDocumentsDelta(ctx, plan, repoName, selected, parallelism, cachedState)
+			indexedAny, err := indexFolderDocumentsDelta(ctx, plan, repoName, selected, cachedState)
 			if err == nil {
 				return indexedAny, nil
 			}
@@ -925,7 +926,6 @@ func indexFolderDocumentsDelta(
 	plan corpusPlan,
 	repoName string,
 	selected []folderCandidate,
-	parallelism int,
 	cachedState string,
 ) (bool, error) {
 	changedDocs, changedPaths, err := changedFolderDocumentsSinceCachedState(ctx, plan, repoName, selected, cachedState)

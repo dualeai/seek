@@ -54,17 +54,17 @@ func TestLateOnTokenizerMatchesPyLate(t *testing.T) {
 		50281, 50368, 2811, 310, 253, 1159, 326, 13328,
 		265, 17607, 44673, 43741, 32, 50282,
 	}
-	if got := encodeLateOnText(tokenizer, probe, lateOnSequenceLength); !reflect.DeepEqual(got, want) {
+	if got := encodeLateOnText(tokenizer, probe); !reflect.DeepEqual(got, want) {
 		t.Fatalf("probe IDs = %v, want %v", got, want)
 	}
 
-	upper := encodeLateOnText(tokenizer, "[Q] MyHTTPHandler", lateOnSequenceLength)
-	lower := encodeLateOnText(tokenizer, "[Q] myhttphandler", lateOnSequenceLength)
+	upper := encodeLateOnText(tokenizer, "[Q] MyHTTPHandler")
+	lower := encodeLateOnText(tokenizer, "[Q] myhttphandler")
 	if reflect.DeepEqual(upper, lower) {
 		t.Fatal("tokenizer unexpectedly lowercased the input")
 	}
-	composed := encodeLateOnText(tokenizer, "[Q] café", lateOnSequenceLength)
-	decomposed := encodeLateOnText(tokenizer, "[Q] cafe\u0301", lateOnSequenceLength)
+	composed := encodeLateOnText(tokenizer, "[Q] café")
+	decomposed := encodeLateOnText(tokenizer, "[Q] cafe\u0301")
 	if !reflect.DeepEqual(composed, decomposed) {
 		t.Fatalf("NFC IDs differ: %v and %v", composed, decomposed)
 	}
@@ -72,7 +72,6 @@ func TestLateOnTokenizerMatchesPyLate(t *testing.T) {
 	long := encodeLateOnText(
 		tokenizer,
 		lateOnDocumentPrefix+strings.Repeat("identifier ", 300),
-		lateOnSequenceLength,
 	)
 	if len(long) != lateOnSequenceLength || long[len(long)-1] != lateOnSEPTokenID {
 		t.Fatalf("truncated sequence has length %d and final ID %d", len(long), long[len(long)-1])

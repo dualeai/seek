@@ -148,29 +148,6 @@ func cloneStringSlice(values []string) []string {
 	return out
 }
 
-func run(ctx context.Context, pattern string, pathOperands []string, limit, maxMatches int) error {
-	return runWithSearchConfig(ctx, pattern, pathOperands, limit, maxMatches, defaultSearchConfig())
-}
-
-func runWithSearchConfig(
-	ctx context.Context,
-	pattern string,
-	pathOperands []string,
-	limit int,
-	maxMatches int,
-	config searchConfig,
-) error {
-	return runWithRerankConfig(
-		ctx,
-		pattern,
-		pathOperands,
-		limit,
-		maxMatches,
-		config,
-		rerankRunConfig{},
-	)
-}
-
 func runWithRerankConfig(
 	ctx context.Context,
 	pattern string,
@@ -649,9 +626,9 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 		return state, st, nil
 	}
 
-	// Wholesale rebuild into a temp dir (committed git-* + uncommitted_*), then
-	// publish atomically. The fallback always force-rebuilds uncommitted
-	// (cachedState ""), so there is no delta baseline to seed.
+	// Rebuild committed and uncommitted shard families in a temporary directory,
+	// then publish them under the lock. The fallback always force-rebuilds
+	// uncommitted (cachedState ""), so there is no delta baseline to seed.
 	buildDir, err := newBuildDir(indexDir)
 	if err != nil {
 		return repoState{}, corpusSearchable, err
@@ -667,7 +644,7 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 			deleteStateFiles(cacheDir)
 			return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, indexDir, err)
 		}
-		if _, err := indexNativeGitFull(ctx, paths.RepoDir, buildDir, snapshot, plan.dirtyScope, indexParallelism()); err != nil {
+		if err := indexNativeGitFull(ctx, paths.RepoDir, buildDir, snapshot, plan.dirtyScope, indexParallelism()); err != nil {
 			deleteStateFiles(cacheDir)
 			return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, indexDir, err)
 		}
@@ -693,9 +670,10 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 		return repoState{}, corpusSearchable, err // discard (defer)
 	}
 
-	// Publish the whole fallback generation atomically — shards + state under one
-	// publish-lock hold (see publishGeneration: avoids serving new shards with a
-	// stale-matching state label after a crash + content revert).
+	// Publish the whole fallback generation under one lock hold. On success,
+	// this keeps normal readers from seeing new shards with the prior state label.
+	// See publishGeneration for interrupted-swap recovery and the unlocked-read
+	// timeout.
 	if err := publishGeneration(ctx, cacheDir, indexDir, buildDir, familyAll, func() error {
 		return writeScopedFallbackState(cacheDir, treeish, currentState, !shardsExist(indexDir))
 	}); err != nil {

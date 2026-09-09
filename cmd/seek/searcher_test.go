@@ -246,7 +246,7 @@ func TestExecuteParsedSearch_ContextModes(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			files, err := executeParsedSearchScoped(t.Context(), indexDir, q, nil, tc.config)
+			files, err := executeParsedShardSearchForTest(t.Context(), indexDir, q, tc.config)
 			if err != nil {
 				t.Fatalf("search: %v", err)
 			}

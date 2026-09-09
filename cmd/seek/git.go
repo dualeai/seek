@@ -22,7 +22,6 @@ type repoState struct {
 
 type gitPaths struct {
 	RepoDir    string
-	GitDir     string
 	CommonDir  string
 	ConfigPath string
 }
@@ -125,7 +124,6 @@ func resolveGitPaths(ctx context.Context, dir string) (gitPaths, error) {
 		"rev-parse",
 		"--path-format=absolute",
 		"--show-toplevel",
-		"--git-dir",
 		"--git-common-dir",
 		"--git-path", "config",
 	)
@@ -138,15 +136,14 @@ func resolveGitPaths(ctx context.Context, dir string) (gitPaths, error) {
 	}
 
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) != 4 {
+	if len(lines) != 3 {
 		return gitPaths{}, fmt.Errorf("unexpected git rev-parse output: got %d lines", len(lines))
 	}
 
 	paths := gitPaths{
 		RepoDir:    strings.TrimSpace(lines[0]),
-		GitDir:     strings.TrimSpace(lines[1]),
-		CommonDir:  strings.TrimSpace(lines[2]),
-		ConfigPath: strings.TrimSpace(lines[3]),
+		CommonDir:  strings.TrimSpace(lines[1]),
+		ConfigPath: strings.TrimSpace(lines[2]),
 	}
 	return paths, nil
 }

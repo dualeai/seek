@@ -901,12 +901,9 @@ func TestIndexScopedCommittedUsesCapturedTreeish(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("capture treeish: ok=%t error=%v", ok, err)
 	}
-	indexedAny, err := indexNativeGitFull(context.Background(), dir, indexDir, snapshot, scope, indexParallelism())
+	err = indexNativeGitFull(context.Background(), dir, indexDir, snapshot, scope, indexParallelism())
 	if err != nil {
 		t.Fatalf("index captured treeish: %v", err)
-	}
-	if !indexedAny {
-		t.Fatal("captured treeish should produce a searchable scoped shard")
 	}
 
 	oldMatches, err := executeUnscopedShardSearchForTest(context.Background(), indexDir, "captured_treeish_old_marker")

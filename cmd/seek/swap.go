@@ -16,10 +16,12 @@ import (
 )
 
 // A builder creates a shard generation in a temporary directory, validates its
-// state, and publishes it under the publish lock. Readers hold a shared lock
-// while they list, open, and search shards, so they cannot observe a partial
-// publish.
-// recoverIncompleteSwap uses .swapping to repair an interrupted publish.
+// state, and publishes it under the publish lock. Normal readers hold a shared
+// lock while they list, open, and search shards, so they do not interleave with
+// a successful swap. A read-lock timeout can permit an unlocked read of the
+// shards that remain.
+// recoverIncompleteSwap uses .swapping to repair an interrupted or failed swap
+// on the next build.
 
 // shardFamily selects the shards for a swap or scan. A committed rebuild keeps
 // the uncommitted family. A folder or scoped fallback build replaces all shards.
@@ -449,9 +451,11 @@ func discardBuildDir(buildDir string) {
 }
 
 // publishGeneration replaces a shard family and writes its state while holding
-// the exclusive publish lock. Readers therefore see matching shards and state.
-// If GC removed the corpus during the build, publication returns
-// errCorpusEvicted and discards the build.
+// the exclusive publish lock. On success, normal locked readers cannot
+// interleave with the shard and state writes. This multi-file swap is not one
+// filesystem transaction; .swapping records an interrupted or failed swap for
+// repair on the next build. If GC removed the corpus during the build,
+// publication returns errCorpusEvicted and discards the build.
 func publishGeneration(ctx context.Context, cacheDir, indexDir, buildDir string, fam shardFamily, writeState func() error) error {
 	pub, err := acquirePublishLock(ctx, cacheDir)
 	if err != nil {
@@ -482,9 +486,9 @@ func publishGeneration(ctx context.Context, cacheDir, indexDir, buildDir string,
 }
 
 // publishShardFamilyLocked performs the delete-live-then-rename-new swap for one
-// family. The caller must already hold the publish lock and have confirmed the
-// corpus directory exists. A builder can use it while it holds the lock across
-// a committed swap and an in-place uncommitted build.
+// family. The caller must hold the publish lock and confirm that the corpus
+// directory exists. The operations can fail after a partial replacement;
+// .swapping then makes the next build repair the family.
 func publishShardFamilyLocked(cacheDir, indexDir, buildDir string, fam shardFamily) ([]string, error) {
 	// Mark the swap in progress so a crash mid-rename is repaired next build.
 	if err := writeCacheFile(cacheDir, swappingMarkerFile, fam.label()); err != nil {

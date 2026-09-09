@@ -164,7 +164,7 @@ func TestAcquireReadLock_SharedConcurrent(t *testing.T) {
 	}
 }
 
-func TestAcquireReadLock_WedgedSwapStaleValve(t *testing.T) {
+func TestAcquireReadLock_WedgedSwapUsesRemainingShards(t *testing.T) {
 	old := readLockTimeout
 	readLockTimeout = 150 * time.Millisecond
 	defer func() { readLockTimeout = old }()
@@ -175,7 +175,7 @@ func TestAcquireReadLock_WedgedSwapStaleValve(t *testing.T) {
 	if err := os.MkdirAll(indexDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Shards present so the stale valve is allowed.
+	// Shards are present, so the unlocked fallback is allowed.
 	if err := os.WriteFile(filepath.Join(indexDir, "x_v16.00000.zoekt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -194,9 +194,9 @@ func TestAcquireReadLock_WedgedSwapStaleValve(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = reader.Close() }()
-	// EX wedged + shards exist → after the bounded wait, degrade to stale read.
+	// The exclusive lock is wedged. After the wait, use remaining shards.
 	if err := acquireReadLock(context.Background(), indexDir, reader); err != nil {
-		t.Fatalf("wedged-swap stale valve should return nil, got %v", err)
+		t.Fatalf("wedged-swap remaining-shard fallback should return nil, got %v", err)
 	}
 }
 

@@ -160,8 +160,10 @@ func formatCorpusCapError(root string, git bool, capErr indexCapExceededError) (
 		family := "working-tree"
 		if errors.Is(capErr, errGitCommittedCapExceeded) {
 			family = "committed-tree"
+			indexedSubject = family + " candidate blobs"
+		} else {
+			indexedSubject = family + " indexable files"
 		}
-		indexedSubject = family + " indexable files"
 		candidateSubject = family + " entries"
 		limitScope = "Git index-family"
 	}
