@@ -404,7 +404,9 @@ Latest field benchmarks, generated on Apple M1 Max / macOS with
 | folder | synthetic-10k | 10,000 | 18.1s | 190ms | 410ms | 1.8s |
 | folder | synthetic-100k | 100,000 | 81.6s | 650ms | 2.7s | 17.3s |
 
-Single sample per workload; expect about 10-20% run-to-run variance.
+These local values are diagnostic. CodSpeed is the source for performance
+comparisons. Each field workload has one sample, with about 10-20% run-to-run
+variance.
 
 Cold index is the first search. Warm search reuses the index. Dirty 1% and
 Dirty 10% measure searches after changing that share of files.
