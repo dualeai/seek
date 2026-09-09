@@ -46,6 +46,7 @@ type searchConfig struct {
 	afterOnly         bool
 	contextMatchLimit int
 	contextFileLimit  int
+	resultFileLimit   int
 	contextGitCorpus  bool
 	contextDirtyFiles dirtyFileSet
 }
@@ -202,12 +203,17 @@ func loadShardPaths(indexDir string, paths []string) ([]zoekt.Searcher, error) {
 var errShardUnloadable = errors.New("index damage")
 
 func parseSearchQuery(pattern string) (query.Q, error) {
-	q, err := query.Parse(pattern)
+	_, expanded, err := parseSearchQueryForms(pattern)
+	return expanded, err
+}
+
+func parseSearchQueryForms(pattern string) (query.Q, query.Q, error) {
+	raw, err := query.Parse(pattern)
 	if err != nil {
-		return nil, &querySyntaxError{query: pattern, cause: err}
+		return nil, nil, &querySyntaxError{query: pattern, cause: err}
 	}
-	q = query.Map(q, query.ExpandFileContent)
-	return query.Simplify(q), nil
+	expanded := query.Map(raw, query.ExpandFileContent)
+	return raw, query.Simplify(expanded), nil
 }
 
 func executeParsedSearchScoped(
@@ -311,15 +317,32 @@ func cloneFileMatches(files []zoekt.FileMatch, config searchConfig) []zoekt.File
 		return nil
 	}
 	contextFiles := displayedContextFiles(files, config)
-	out := make([]zoekt.FileMatch, len(files))
+	var resultFiles map[int]struct{}
+	if config.resultFileLimit > 0 {
+		if config.resultFileLimit == config.contextFileLimit {
+			resultFiles = contextFiles
+		} else {
+			resultFiles = selectedFileIndexes(files, config, config.resultFileLimit)
+		}
+	}
+	capacity := len(files)
+	if resultFiles != nil {
+		capacity = len(resultFiles)
+	}
+	out := make([]zoekt.FileMatch, 0, capacity)
 	for i := range files {
+		if resultFiles != nil {
+			if _, keep := resultFiles[i]; !keep {
+				continue
+			}
+		}
 		_, keepContext := contextFiles[i]
-		out[i] = cloneFileMatch(
+		out = append(out, cloneFileMatch(
 			files[i],
 			config.contextMatchLimit,
 			config.afterOnly,
 			contextFiles == nil || keepContext,
-		)
+		))
 	}
 	return out
 }
@@ -329,7 +352,17 @@ func cloneFileMatches(files []zoekt.FileMatch, config searchConfig) []zoekt.File
 // are corpus-local, so a global top N file must be in its corpus's top N. A
 // nil map means that all context must be copied.
 func displayedContextFiles(files []zoekt.FileMatch, config searchConfig) map[int]struct{} {
-	limit := config.contextFileLimit
+	return selectedFileIndexes(files, config, config.contextFileLimit)
+}
+
+// selectedFileIndexes returns the best valid file indexes for one corpus after
+// deduplication and dirty-file suppression. A nil map means that all input
+// files remain selected.
+func selectedFileIndexes(
+	files []zoekt.FileMatch,
+	config searchConfig,
+	limit int,
+) map[int]struct{} {
 	if limit <= 0 || len(files) <= limit {
 		return nil
 	}

@@ -16,6 +16,7 @@ import (
 // rootCmd flags via pflag's Var/BoolVarP/IntVarP helpers.
 type cliFlags struct {
 	verbose      bool
+	rerank       bool
 	limit        int
 	maxMatches   int
 	afterContext int
@@ -124,13 +125,26 @@ once.`,
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runWithSearchConfig(
+			rerank := rerankRunConfig{enabled: flags.rerank}
+			if flags.rerank {
+				if rerankBackendBundled() {
+					rerank.newScorer = newLateOnRerankScorer
+				} else {
+					rerank.enabled = false
+					_, _ = fmt.Fprintln(
+						cmd.ErrOrStderr(),
+						"seek: re-ranking is unavailable in this build; using BM25",
+					)
+				}
+			}
+			return runWithRerankConfig(
 				cmd.Context(),
 				args[0],
 				args[1:],
 				flags.limit,
 				flags.maxMatches,
 				flags.search,
+				rerank,
 			)
 		},
 		SilenceErrors: true,
@@ -138,6 +152,7 @@ once.`,
 	}
 
 	cmd.PersistentFlags().BoolVarP(&flags.verbose, "verbose", "v", false, "show debug logs and detailed errors")
+	cmd.Flags().BoolVar(&flags.rerank, "rerank", false, "re-rank plain multi-word searches with the English-to-code model")
 	cmd.Flags().IntVarP(&flags.limit, "limit", "n", 0, "maximum number of files to display (≥ 0, 0 = unlimited)")
 	cmd.Flags().IntVarP(&flags.maxMatches, "max-matches", "m", 0, "maximum matches per file (≥ 0, 0 = unlimited)")
 	cmd.Flags().IntVarP(&flags.afterContext, "after-context", "A", 0, "lines to display after each match (0–512)")
@@ -243,7 +258,7 @@ func collectFlagNames(cmd *cobra.Command) []string {
 }
 
 // closestFlag returns the candidate whose Levenshtein distance to `want`
-// is minimal AND ≤ 2 (matches Cobra's default SuggestionsMinimumDistance).
+// is minimal and at most 2 (Cobra's default SuggestionsMinimumDistance).
 // Returns "" when no candidate is close enough.
 func closestFlag(want string, candidates []string) string {
 	best := ""

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -1539,17 +1540,19 @@ func TestNormalizeLineMatches(t *testing.T) {
 		{
 			Line:          []byte("line seventy\n"),
 			LineNumber:    70,
+			Score:         4,
 			LineFragments: []zoekt.LineFragmentMatch{{LineOffset: 0, MatchLength: 4}},
 		},
 		{
 			Line:          []byte("line seventy\n"),
 			LineNumber:    70,
+			Score:         4,
 			LineFragments: []zoekt.LineFragmentMatch{{LineOffset: 5, MatchLength: 7}},
 		},
-		{Line: []byte("line ten\n"), LineNumber: 10},
-		{Line: []byte("line thirty\n"), LineNumber: 30},
-		{Line: []byte("line thirty\n"), LineNumber: 30},
-		{Line: []byte("line fifty\n"), LineNumber: 50},
+		{Line: []byte("line ten\n"), LineNumber: 10, Score: 2},
+		{Line: []byte("line thirty\n"), LineNumber: 30, Score: 3},
+		{Line: []byte("line thirty\n"), LineNumber: 30, Score: 3},
+		{Line: []byte("line fifty\n"), LineNumber: 50, Score: 1},
 	}
 	original := append([]zoekt.LineMatch(nil), input...)
 	for i := range original {
@@ -1558,10 +1561,11 @@ func TestNormalizeLineMatches(t *testing.T) {
 
 	got, hidden := normalizeLineMatches(input, 2)
 	want := []zoekt.LineMatch{
-		{Line: []byte("line ten\n"), LineNumber: 10},
+		{Line: []byte("line thirty\n"), LineNumber: 30, Score: 3},
 		{
 			Line:       []byte("line seventy\n"),
 			LineNumber: 70,
+			Score:      4,
 			LineFragments: []zoekt.LineFragmentMatch{
 				{LineOffset: 0, MatchLength: 4},
 				{LineOffset: 5, MatchLength: 7},
@@ -1580,8 +1584,26 @@ func TestNormalizeLineMatches(t *testing.T) {
 	}
 }
 
+func TestNormalizeLineMatchesBreaksScoreTiesByLine(t *testing.T) {
+	for _, input := range [][]zoekt.LineMatch{
+		{
+			{Line: []byte("later\n"), LineNumber: 20, Score: math.Nextafter(5, math.Inf(1))},
+			{Line: []byte("earlier\n"), LineNumber: 10, Score: 5},
+		},
+		{
+			{Line: []byte("earlier\n"), LineNumber: 10, Score: 5},
+			{Line: []byte("later\n"), LineNumber: 20, Score: math.Nextafter(5, math.Inf(1))},
+		},
+	} {
+		got, hidden := normalizeLineMatches(input, 1)
+		if hidden != 1 || len(got) != 1 || got[0].LineNumber != 10 {
+			t.Fatalf("matches=%#v hidden=%d", got, hidden)
+		}
+	}
+}
+
 func TestGitCorpusFormatting_UnorderedOverlappingContext_NoDuplicateLines(t *testing.T) {
-	// The real-world shape: matches arrive out of order AND their context
+	// Matches arrive out of order and their context
 	// windows overlap. Every source line must appear exactly once, ascending.
 	files := []zoekt.FileMatch{
 		{

@@ -160,16 +160,62 @@ func runWithSearchConfig(
 	maxMatches int,
 	config searchConfig,
 ) error {
+	return runWithRerankConfig(
+		ctx,
+		pattern,
+		pathOperands,
+		limit,
+		maxMatches,
+		config,
+		rerankRunConfig{},
+	)
+}
+
+func runWithRerankConfig(
+	ctx context.Context,
+	pattern string,
+	pathOperands []string,
+	limit int,
+	maxMatches int,
+	config searchConfig,
+	rerankConfig rerankRunConfig,
+) error {
 	config.contextMatchLimit = maxMatches
 	config.contextFileLimit = limit
-	userQ, err := parseSearchQuery(pattern)
+	rawQ, userQ, err := parseSearchQueryForms(pattern)
 	if err != nil {
 		return err
+	}
+	rerankPlan, rerankEligible := rerankQueryPlan{}, false
+	if rerankConfig.enabled {
+		rerankPlan, rerankEligible = planRerankQuery(pattern, rawQ)
 	}
 
 	paths, err := resolveDefaultSearchRoot(ctx, pathOperands)
 	if err != nil {
 		return err
+	}
+	type scorerResult struct {
+		scorer rerankScorer
+		err    error
+	}
+	var scorerReady chan scorerResult
+	var scorerTaken bool
+	if rerankEligible && rerankConfig.newScorer != nil {
+		scorerReady = make(chan scorerResult, 1)
+		go func() {
+			scorer, scorerErr := rerankConfig.newScorer(ctx)
+			scorerReady <- scorerResult{scorer: scorer, err: scorerErr}
+		}()
+		defer func() {
+			if scorerTaken {
+				return
+			}
+			result := <-scorerReady
+			if result.scorer != nil {
+				_ = result.scorer.Close()
+			}
+		}()
 	}
 
 	plans, err := planCorpora(ctx, paths, pathOperands)
@@ -177,12 +223,38 @@ func runWithSearchConfig(
 		return err
 	}
 
-	worker := func(wctx context.Context, plan corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
-		return prepareAndSearchCorpus(wctx, plan, paths, userQ, config)
-	}
-	allResults, dirtyByCorpus, err := runCorpusPool(ctx, plans, worker)
+	allResults, dirtyByCorpus, err := searchCorpora(ctx, plans, paths, userQ, config)
 	if err != nil {
 		return err
+	}
+	if rerankEligible {
+		factory := rerankConfig.newScorer
+		if scorerReady != nil {
+			factory = func(context.Context) (rerankScorer, error) {
+				if scorerTaken {
+					return nil, errRerankUnavailable
+				}
+				scorerTaken = true
+				result := <-scorerReady
+				return result.scorer, result.err
+			}
+		}
+		reranked, mergedDirty, rerankErr := tryRerankCorpora(
+			ctx,
+			allResults,
+			dirtyByCorpus,
+			plans,
+			paths,
+			config,
+			rerankPlan,
+			factory,
+			searchCorpora,
+		)
+		allResults = reranked
+		dirtyByCorpus = mergedDirty
+		if rerankErr != nil {
+			slog.Debug("Re-ranking failed; using BM25")
+		}
 	}
 
 	if len(allResults) == 0 {
@@ -213,6 +285,19 @@ func runWithSearchConfig(
 
 	_, _ = os.Stdout.WriteString(output)
 	return nil
+}
+
+func searchCorpora(
+	ctx context.Context,
+	plans []corpusPlan,
+	paths *gitPaths,
+	userQ query.Q,
+	config searchConfig,
+) ([]corpusSearchResult, dirtyFilesByCorpus, error) {
+	worker := func(wctx context.Context, plan corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
+		return prepareAndSearchCorpus(wctx, plan, paths, userQ, config)
+	}
+	return runCorpusPool(ctx, plans, worker)
 }
 
 // useColor decides whether to emit ANSI color on the given stream. Color is ON

@@ -66,6 +66,8 @@ is easy to open.
   corrupting the index
 - **Fast after the first index** -- one-time build, then warm searches in
   milliseconds (benchmarks below)
+- **Optional code re-ranking** -- release binaries can re-rank a small candidate
+  set with an embedded 17M-parameter code model
 
 ## Install
 
@@ -78,6 +80,10 @@ Or with Go:
 ```bash
 go install github.com/dualeai/seek/cmd/seek@latest
 ```
+
+The pre-built archives include the code re-ranker. A normal source build on a
+supported target also includes it. A build with `CGO_ENABLED=0`, or a build for
+another target, keeps the BM25 fallback without the model or runtime.
 
 Or download a pre-built binary from [GitHub Releases](https://github.com/dualeai/seek/releases).
 
@@ -95,6 +101,13 @@ sudo apt-get install universal-ctags  # Linux
 Git is required for Git-backed searches. **Git 2.31+** is required for
 [`git worktree`](https://git-scm.com/docs/git-worktree) setups. On older Git
 versions, normal repositories still work.
+
+The re-ranker does not need a model download, an ONNX Runtime install, or an ML
+service. The executable contains those resources. Release archives support
+macOS 15 or newer on amd64 and arm64, and glibc-based Linux on amd64 and arm64.
+The Linux archives are built on Ubuntu 24.04. Alpine and other musl systems are
+not supported. The re-ranker adds no system dependency. Seek still needs
+Universal Ctags, and it needs Git for Git-backed searches.
 
 ### Agent Integration
 
@@ -258,11 +271,51 @@ is supported by the pinned Zoekt version. Results are ranked by relevance.
 | `seek -C 5 "query"` | Show 5 lines on both sides (`--context`) |
 | `seek -n 5 -m 3 "query"` | Top 5 files, max 3 matches each |
 | `seek -v "query"` | Show debug logs and detailed errors (`--verbose`) |
+| `seek --rerank "find request parser"` | Re-rank a plain multi-word search with the English-to-code model |
 
 Flags compose with query filters and paths. For example,
 `seek -n 3 "sym:handleRequest file:api" ./src` returns the top 3 matching files
 under `./src` containing a `handleRequest` definition under paths matching
 `api`.
+
+### Optional code re-ranking
+
+Release binaries can improve a plain code search with the bundled
+LateOn-Code-edge model:
+
+```bash
+seek --rerank 'find request parser' ./cmd
+```
+
+Re-ranking is off by default. It applies only to a plain query with two or more
+words. Use a short English description because the model was trained for
+English-to-code retrieval. A query with a filter, regular expression, Boolean
+operator, negation, or one word keeps the normal BM25 path.
+
+For an eligible query, Seek scores at most 20 files drawn from matches for any
+query word. It scores their best matched snippets with the code model and
+combines that order with the relaxed BM25 order by reciprocal rank fusion. If
+fewer than two candidate files exist, or if collection, model setup, or
+inference fails, Seek returns the strict BM25 results. A build without the
+bundled backend prints a warning. Add `--verbose` to see other fallback
+messages.
+
+The Seek executable never accesses the network. When the runtime is absent, the
+next eligible query expands the embedded ONNX Runtime into the private Seek
+cache. Later queries reuse that checked file. The backend uses ONNX Runtime on
+the CPU. It does not enable a GPU, NPU, FPGA, Core ML, or OpenVINO provider in
+this version.
+
+The frozen validation used 1,133 queries from 57 held-out Semble repositories.
+Of 854 eligible queries, the OR candidate pass reached 0.873 Recall@20. The
+combined rank reached 0.628 NDCG@10, compared with 0.572 for OR alone, for a
+gain of 0.055. Its MRR@10 was 0.579, compared with 0.517 for OR alone. It
+improved 313 eligible queries, left 463 equal, and made 78 worse (9.1%). Of
+those 78, 25 lost at least 0.25 NDCG@10. On an Apple M5 Pro, a cold query took
+919 ms and 475 warm queries had a 313 ms p95. The release archive was 32.708 MiB
+and the highest measured RSS was 230.594 MiB. These values describe this fixed
+local test, not a performance comparison or a result for all computers.
+CodSpeed is the source for performance comparisons.
 
 ## What seek adds over ripgrep
 
@@ -297,8 +350,12 @@ filtered results with context.
 Indexes are stored centrally in the user cache, never inside searched folders:
 
 - macOS: `~/Library/Caches/seek/corpora/<id>/`
-- Linux: `${XDG_CACHE_HOME:-~/.cache}/seek/corpora/<id>/`
+- Linux: `${XDG_CACHE_HOME:-$HOME/.cache}/seek/corpora/<id>/`
 - Index files live in `index/`; `.state`, `.head`, and `.lock` live next to it.
+
+The re-ranker stores only its extracted runtime under
+`<seek-cache>/reranker/1.29.0/<sha256>/`. The model and tokenizer stay in the
+executable.
 
 Folder searches read regular files and skip `.git` folders. They do not skip
 dependency, build, cache, or vendor folders by name. Git ignore rules apply only

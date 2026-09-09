@@ -123,6 +123,8 @@ type corpusSearchResult struct {
 	// selected file, otherwise the corpus-relative FileName.
 	displayName string
 	file        zoekt.FileMatch
+	// rankOverride is one-based. Zero keeps the normal BM25 ordering.
+	rankOverride int
 }
 
 type corpusIndexState uint8

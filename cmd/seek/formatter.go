@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -70,23 +71,7 @@ func formatCorpusResultsWithContext(
 		return ""
 	}
 
-	deduped := deduplicateCorpusResults(results, dirtyByCorpus)
-
-	// Sort by score descending
-	sort.SliceStable(deduped, func(i, j int) bool {
-		left := deduped[i].file
-		right := deduped[j].file
-		if left.Score != right.Score {
-			return left.Score > right.Score
-		}
-		if left.FileName != right.FileName {
-			return left.FileName < right.FileName
-		}
-		if deduped[i].displayRoot != deduped[j].displayRoot {
-			return deduped[i].displayRoot < deduped[j].displayRoot
-		}
-		return deduped[i].corpusID < deduped[j].corpusID
-	})
+	deduped := rankCorpusResultsForDisplay(results, dirtyByCorpus)
 
 	// Apply file-count limit (0 or negative = unlimited). Remember the full
 	// count so we can tell the consumer how many files were hidden — silent
@@ -105,7 +90,7 @@ func formatCorpusResultsWithContext(
 			normalizeLineMatches(deduped[i].file.LineMatches, maxMatches)
 	}
 
-	// Pre-size the builder: ~200 bytes per file header + ~80 bytes per match.
+	// Pre-size the builder from the number of files and matches.
 	matches := 0
 	for _, result := range deduped {
 		matches += len(result.file.LineMatches)
@@ -130,6 +115,46 @@ func formatCorpusResultsWithContext(
 		return s[:len(s)-1]
 	}
 	return s
+}
+
+func rankCorpusResultsForDisplay(
+	results []corpusSearchResult,
+	dirtyByCorpus dirtyFilesByCorpus,
+) []corpusSearchResult {
+	ranked := deduplicateCorpusResults(results, dirtyByCorpus)
+	sort.SliceStable(ranked, func(i, j int) bool {
+		left := ranked[i]
+		right := ranked[j]
+		if left.rankOverride > 0 && right.rankOverride > 0 && left.rankOverride != right.rankOverride {
+			return left.rankOverride < right.rankOverride
+		}
+		return lessCorpusResultBM25(left, right)
+	})
+	return ranked
+}
+
+func rankCorpusResultsBM25(
+	results []corpusSearchResult,
+	dirtyByCorpus dirtyFilesByCorpus,
+) []corpusSearchResult {
+	ranked := deduplicateCorpusResults(results, dirtyByCorpus)
+	sort.SliceStable(ranked, func(i, j int) bool {
+		return lessCorpusResultBM25(ranked[i], ranked[j])
+	})
+	return ranked
+}
+
+func lessCorpusResultBM25(left, right corpusSearchResult) bool {
+	if left.file.Score != right.file.Score {
+		return left.file.Score > right.file.Score
+	}
+	if left.file.FileName != right.file.FileName {
+		return left.file.FileName < right.file.FileName
+	}
+	if left.displayRoot != right.displayRoot {
+		return left.displayRoot < right.displayRoot
+	}
+	return left.corpusID < right.corpusID
 }
 
 func deduplicateCorpusResults(
@@ -190,49 +215,54 @@ func normalizeLineMatches(lms []zoekt.LineMatch, maxMatches int) ([]zoekt.LineMa
 			break
 		}
 	}
-	if strictlyOrdered {
-		if maxMatches > 0 && len(lms) > maxMatches {
-			return lms[:maxMatches], len(lms) - maxMatches
-		}
+	if strictlyOrdered && (maxMatches <= 0 || len(lms) <= maxMatches) {
 		return lms, 0
-	}
-
-	room := len(lms)
-	if maxMatches > 0 && maxMatches < room {
-		room = maxMatches
 	}
 
 	// Never write through to the caller's slice: it shares backing arrays with
 	// the search result, which the caller may still hold.
-	out := make([]zoekt.LineMatch, 0, room)
+	out := make([]zoekt.LineMatch, 0, len(lms))
 	at := make(map[int]int, len(lms))
-	// Record dropped lines too, so their duplicates do not inflate the hidden
-	// match count. A value of -1 marks a distinct line dropped by the cap.
 	for _, lm := range lms {
 		i, seen := at[lm.LineNumber]
 		if !seen {
-			i = -1
-			if len(out) < room {
-				i = len(out)
-				out = append(out, lm)
-			}
+			i = len(out)
+			out = append(out, lm)
 			at[lm.LineNumber] = i
-			continue
-		}
-		if i < 0 { // duplicate of a line the cap already dropped
 			continue
 		}
 		// Union the fragments so a merged line stays fully colored. Copy
 		// rather than append in place; out[i].LineFragments still aliases the
 		// caller's array at this point.
+		if len(out[i].LineFragments) == 0 && len(lm.LineFragments) == 0 {
+			continue
+		}
 		merged := make([]zoekt.LineFragmentMatch, 0, len(out[i].LineFragments)+len(lm.LineFragments))
 		merged = append(merged, out[i].LineFragments...)
 		merged = append(merged, lm.LineFragments...)
 		out[i].LineFragments = merged
 	}
 
+	unique := len(out)
+	if maxMatches > 0 && len(out) > maxMatches {
+		sort.Slice(out, func(i, j int) bool {
+			leftScore := stableLineMatchScore(out[i].Score)
+			rightScore := stableLineMatchScore(out[j].Score)
+			if leftScore != rightScore {
+				return leftScore > rightScore
+			}
+			return out[i].LineNumber < out[j].LineNumber
+		})
+		out = out[:maxMatches]
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].LineNumber < out[j].LineNumber })
-	return out, len(at) - len(out)
+	return out, unique - len(out)
+}
+
+// Zoekt can add equal term scores in different orders. Round scores to 12
+// decimal places before the line-number tie-break so parallel searches agree.
+func stableLineMatchScore(score float64) float64 {
+	return math.Round(score * 1e12)
 }
 
 func formatCorpusFileMatch(sb *strings.Builder, result corpusSearchResult, displayMode corpusDisplayMode, hiddenMatches int, pal palette) {
@@ -468,7 +498,7 @@ func writeMatchLineContent(sb *strings.Builder, content []byte, frags []zoekt.Li
 			winEnd = n
 		}
 		// 3. Keep cuts on rune boundaries: a mid-rune split would corrupt the
-		// segment AND break sanitize's per-segment distributivity.
+		// segment and break sanitization across separate segments.
 		winStart = backupToRuneBoundary(content, winStart)
 		winEnd = backupToRuneBoundary(content, winEnd)
 		headDropped = winStart
@@ -514,16 +544,13 @@ func writeMatchLineContent(sb *strings.Builder, content []byte, frags []zoekt.Li
 	}
 }
 
-// stripRune reports whether r must be removed from output. It drops C0/C1/DEL
-// control characters (tab excepted) AND the bidirectional-formatting and
-// line/paragraph-separator code points: those enable Trojan-Source-style visual
-// spoofing (CVE-2021-42574) or would break the one-line-per-match layout. Zero-
-// width joiners (U+200C/U+200D) are intentionally kept so legitimate scripts and
-// emoji ZWJ sequences survive.
+// stripRune reports whether output must omit r. It drops C0, C1, and DEL control
+// characters except tab. It also drops bidirectional formatting and line or
+// paragraph separators because they can alter the displayed source layout. It
+// keeps zero-width joiners for scripts and emoji sequences.
 func stripRune(r rune) bool {
 	if r < 0x80 {
-		// ASCII fast path (the overwhelming common case): strip C0 controls and
-		// DEL, keep tab. Avoids unicode.IsControl's range-table lookup per rune.
+		// Strip C0 controls and DEL, but keep tab.
 		return (r < 0x20 || r == 0x7f) && r != '\t'
 	}
 	if unicode.IsControl(r) { // C1 controls (U+0080–U+009F)
@@ -540,15 +567,13 @@ func stripRune(r rune) bool {
 	return false
 }
 
-// writeSanitized writes b with stripRune'd code points removed. Iterating runes
-// is mandatory: C1 controls (U+0080–U+009F) overlap UTF-8 continuation bytes, so
-// a raw byte scan would corrupt multibyte runes. The fast path (nothing to
-// strip — the common case) writes the bytes verbatim with no allocation, keeping
-// the plain path byte-identical to clean input.
+// writeSanitized writes b after it removes code points selected by stripRune.
+// It iterates runes because C1 values overlap UTF-8 continuation bytes. When no
+// rune is removed, it writes the original bytes unchanged.
 //
 // Invalid UTF-8: a clean line is written verbatim (bytes preserved); a line that
 // also needs stripping goes through the rune path, where invalid bytes decode to
-// U+FFFD. Source files are valid UTF-8, so this divergence is immaterial here.
+// U+FFFD.
 func writeSanitized(sb *strings.Builder, b []byte) {
 	clean := true
 	for _, r := range string(b) {

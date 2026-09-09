@@ -1,0 +1,421 @@
+//go:build cgo && (darwin || linux) && (amd64 || arm64)
+
+package main
+
+import (
+	"bytes"
+	"context"
+	"math"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"slices"
+	"strings"
+	"testing"
+)
+
+const lateOnExtractHelperEnv = "SEEK_TEST_RERANK_EXTRACT"
+
+func TestLateOnRuntimeManifestRejectsIncompleteAssets(t *testing.T) {
+	if _, err := lateOnRuntimeBundleFromManifest([]byte(`{}`), []byte{1}); err == nil {
+		t.Fatal("incomplete manifest did not fail")
+	}
+	if _, err := lateOnRuntimeBundleFromManifest(lateOnRuntimeManifestJSON, nil); err == nil {
+		t.Fatal("empty compressed runtime did not fail")
+	}
+	wrongTarget := bytes.Replace(
+		lateOnRuntimeManifestJSON,
+		[]byte(runtime.GOOS+"-"+runtime.GOARCH),
+		[]byte("unsupported-target"),
+		1,
+	)
+	if bytes.Equal(wrongTarget, lateOnRuntimeManifestJSON) {
+		t.Fatal("runtime manifest does not contain the current target")
+	}
+	if _, err := lateOnRuntimeBundleFromManifest(wrongTarget, lateOnCompressedRuntime); err == nil {
+		t.Fatal("wrong runtime target did not fail")
+	}
+}
+
+func TestLateOnTokenizerMatchesPyLate(t *testing.T) {
+	tokenizerJSON, err := decodeLateOnAsset(lateOnCompressedTokenizer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokenizer, _, err := newLateOnTokenizer(tokenizerJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const probe = "[Q] where is the function that parses HTTP请求?"
+	want := []int{
+		50281, 50368, 2811, 310, 253, 1159, 326, 13328,
+		265, 17607, 44673, 43741, 32, 50282,
+	}
+	if got := encodeLateOnText(tokenizer, probe, lateOnSequenceLength); !reflect.DeepEqual(got, want) {
+		t.Fatalf("probe IDs = %v, want %v", got, want)
+	}
+
+	upper := encodeLateOnText(tokenizer, "[Q] MyHTTPHandler", lateOnSequenceLength)
+	lower := encodeLateOnText(tokenizer, "[Q] myhttphandler", lateOnSequenceLength)
+	if reflect.DeepEqual(upper, lower) {
+		t.Fatal("tokenizer unexpectedly lowercased the input")
+	}
+	composed := encodeLateOnText(tokenizer, "[Q] café", lateOnSequenceLength)
+	decomposed := encodeLateOnText(tokenizer, "[Q] cafe\u0301", lateOnSequenceLength)
+	if !reflect.DeepEqual(composed, decomposed) {
+		t.Fatalf("NFC IDs differ: %v and %v", composed, decomposed)
+	}
+
+	long := encodeLateOnText(
+		tokenizer,
+		lateOnDocumentPrefix+strings.Repeat("identifier ", 300),
+		lateOnSequenceLength,
+	)
+	if len(long) != lateOnSequenceLength || long[len(long)-1] != lateOnSEPTokenID {
+		t.Fatalf("truncated sequence has length %d and final ID %d", len(long), long[len(long)-1])
+	}
+}
+
+func TestTokenizeLateOnBatchMasksPunctuationAndPadding(t *testing.T) {
+	tokenizerJSON, err := decodeLateOnAsset(lateOnCompressedTokenizer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokenizer, punctuation, err := newLateOnTokenizer(tokenizerJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ids, attention, mask := tokenizeLateOnBatch(
+		tokenizer,
+		punctuation,
+		"请求?",
+		[]rerankDocument{{Text: "请求;", matchEnd: len("请求")}},
+	)
+	queryIDs := ids[:lateOnSequenceLength]
+	documentIDs := ids[lateOnSequenceLength:]
+	for _, row := range []struct {
+		name      string
+		ids       []int64
+		attention []int64
+		mask      []bool
+		punct     int64
+		keepPunct bool
+	}{
+		{
+			name:      "query",
+			ids:       queryIDs,
+			attention: attention[:lateOnSequenceLength],
+			mask:      mask[0],
+			punct:     32,
+			keepPunct: true,
+		},
+		{
+			name:      "document",
+			ids:       documentIDs,
+			attention: attention[lateOnSequenceLength:],
+			mask:      mask[1],
+			punct:     28,
+			keepPunct: false,
+		},
+	} {
+		punctIndex := slices.Index(row.ids, row.punct)
+		if punctIndex < 0 || row.mask[punctIndex] != row.keepPunct {
+			t.Fatalf("%s punctuation mask = %v at %d", row.name, row.mask, punctIndex)
+		}
+		paddingIndex := slices.Index(row.attention, 0)
+		if paddingIndex < 0 || row.ids[paddingIndex] != lateOnPadTokenID || row.mask[paddingIndex] {
+			t.Fatalf("%s padding is IDs=%v attention=%v mask=%v", row.name, row.ids, row.attention, row.mask)
+		}
+	}
+}
+
+func TestEncodeLateOnDocumentKeepsLateMatch(t *testing.T) {
+	tokenizerJSON, err := decodeLateOnAsset(lateOnCompressedTokenizer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokenizer, _, err := newLateOnTokenizer(tokenizerJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const lateMatch = "needle"
+	markerID, ok := tokenizer.TokenToID("Ġ" + lateMatch)
+	if !ok {
+		t.Fatalf("tokenizer has no single token for %q", lateMatch)
+	}
+	textPrefix := strings.Repeat("identifier_1234567890 ", 900)
+	document := rerankDocument{
+		Path:     strings.Repeat("long-path/", 600),
+		Language: "Go",
+		Text:     textPrefix + lateMatch + "\n",
+		matchAt:  len(textPrefix),
+		matchEnd: len(textPrefix) + len(lateMatch),
+	}
+	selected := encodeLateOnDocument(tokenizer, document, lateOnSequenceLength)
+	if len(selected) != lateOnSequenceLength || !slices.Contains(selected, markerID) {
+		t.Fatalf("selected IDs do not retain the late match token %d: %v", markerID, selected)
+	}
+}
+
+func TestLateOnMaxSimUsesMasksAndNegativeValues(t *testing.T) {
+	// The final zero vector is padding. If MaxSim includes it, the score is 0
+	// instead of -2.
+	embeddings := []float32{
+		1, 0, 0, 1, 0, 0,
+		-1, -1, -2, -2, 0, 0,
+	}
+	masks := [][]bool{{true, true, false}, {true, true, false}}
+	scores, err := lateOnMaxSim(embeddings, masks, 2, 3, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(scores, []float32{-2}) {
+		t.Fatalf("scores = %v, want [-2]", scores)
+	}
+	if _, err := lateOnMaxSim(embeddings[:len(embeddings)-1], masks, 2, 3, 2); err == nil {
+		t.Fatal("short tensor did not fail")
+	}
+}
+
+func TestLateOnRuntimeCacheLifecycle(t *testing.T) {
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	bundle, err := lateOnRuntimeForPlatform()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRuntime, err := decodeLateOnAsset(bundle.compressed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, installed, err := ensureLateOnRuntime(bundle)
+	if err != nil || !installed {
+		t.Fatalf("cold extraction: path=%q installed=%t err=%v", path, installed, err)
+	}
+	gotRuntime, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(gotRuntime, wantRuntime) {
+		t.Fatalf("cold runtime bytes differ: err=%v", err)
+	}
+	warmPath, installed, err := ensureLateOnRuntime(bundle)
+	if err != nil || installed || warmPath != path {
+		t.Fatalf("warm extraction: path=%q installed=%t err=%v", warmPath, installed, err)
+	}
+	corruptRuntime := bytes.Clone(wantRuntime)
+	corruptRuntime[len(corruptRuntime)/2] ^= 0xff
+	if err := os.WriteFile(path, corruptRuntime, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	repairedPath, installed, err := ensureLateOnRuntime(bundle)
+	if err != nil || !installed || repairedPath != path {
+		t.Fatalf("repair: path=%q installed=%t err=%v", repairedPath, installed, err)
+	}
+	gotRuntime, err = os.ReadFile(path)
+	if err != nil || !bytes.Equal(gotRuntime, wantRuntime) {
+		t.Fatalf("repaired runtime bytes differ: err=%v", err)
+	}
+	info, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("cache directory mode = %o, want 700", info.Mode().Perm())
+	}
+}
+
+func TestLateOnRuntimeCacheAcrossProcesses(t *testing.T) {
+	cache := t.TempDir()
+	t.Setenv("SEEK_CACHE_DIR", cache)
+	commands := make([]*exec.Cmd, 2)
+	outputs := make([]bytes.Buffer, len(commands))
+	for i := range commands {
+		commands[i] = exec.Command(os.Args[0], "-test.run=^TestLateOnRuntimeExtractHelper$")
+		commands[i].Stdout = &outputs[i]
+		commands[i].Stderr = &outputs[i]
+		commands[i].Env = append(
+			commands[i].Environ(),
+			lateOnExtractHelperEnv+"=1",
+		)
+		if err := commands[i].Start(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, command := range commands {
+		if err := command.Wait(); err != nil {
+			t.Fatalf("extract helper: %v\n%s", err, outputs[i].String())
+		}
+	}
+	bundle, err := lateOnRuntimeForPlatform()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, installed, err := ensureLateOnRuntime(bundle)
+	if err != nil || installed {
+		t.Fatalf("concurrent extraction did not leave a warm runtime: path=%q installed=%t err=%v", path, installed, err)
+	}
+	wantRuntime, err := decodeLateOnAsset(bundle.compressed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotRuntime, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(gotRuntime, wantRuntime) {
+		t.Fatalf("two-process runtime bytes differ: err=%v", err)
+	}
+}
+
+func TestLateOnRuntimeExtractHelper(t *testing.T) {
+	if os.Getenv(lateOnExtractHelperEnv) != "1" {
+		return
+	}
+	bundle, err := lateOnRuntimeForPlatform()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ensureLateOnRuntime(bundle); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLateOnInferenceMatchesPyLate(t *testing.T) {
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	scorer, err := newLateOnRerankScorer(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := scorer.Close(); err != nil {
+			t.Errorf("close scorer: %v", err)
+		}
+	}()
+
+	documents := []rerankDocument{
+		{
+			Path:     "cmd/seek/searcher.go",
+			Language: "Go",
+			Symbol:   "function executeParsedSearch",
+			Text: "func executeParsedSearchScoped(results []corpusSearchResult, limit int) {\n" +
+				"    ranked := rankCorpusResultsBM25(results, nil)\n" +
+				"    return formatResults(ranked, limit)\n}",
+		},
+		{
+			Path:     "cmd/seek/indexer.go",
+			Language: "Go",
+			Symbol:   "function buildIndex",
+			Text: "func buildIndex(files []string) error {\n" +
+				"    for _, file := range files { parse(file) }\n" +
+				"    return writeShard()\n}",
+		},
+		{
+			Path:     "docs/install.md",
+			Language: "Markdown",
+			Text:     "Install seek with Homebrew. Configure Universal Ctags on the PATH.",
+		},
+	}
+	scores, err := scorer.Scores(
+		context.Background(),
+		"find where search results are ranked before output limit",
+		documents,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// PyLate with the bundled tokenizer and ONNX Runtime 1.29.0 produced
+	// these scores.
+	want := []float32{6.5482426, 4.7140551, 4.5997243}
+	if len(scores) != len(want) {
+		t.Fatalf("scores = %v, want %v", scores, want)
+	}
+	for i := range want {
+		if delta := float64(scores[i] - want[i]); math.Abs(delta) > 0.001 {
+			t.Errorf("score[%d] = %.7f, want %.7f (delta %.7f)", i, scores[i], want[i], delta)
+		}
+		if i > 0 && scores[i-1] <= scores[i] {
+			t.Errorf("rank order = %v, want document order", scores)
+		}
+	}
+}
+
+func TestLateOnInferenceSupportsFullCandidateBatch(t *testing.T) {
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	scorer, err := newLateOnRerankScorer(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := scorer.Close(); err != nil {
+			t.Errorf("close scorer: %v", err)
+		}
+	})
+
+	documents := make([]rerankDocument, rerankCandidateLimit)
+	for i := range documents {
+		documents[i] = rerankDocument{
+			Path:     "cmd/seek/searcher.go",
+			Language: "Go",
+			Symbol:   "function executeParsedSearch",
+			Text:     "func executeParsedSearch() { rankCorpusResultsBM25() }",
+		}
+	}
+	scores, err := scorer.Scores(
+		t.Context(),
+		"find where search results are ranked",
+		documents,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scores) != rerankCandidateLimit {
+		t.Fatalf("scores=%d, want %d", len(scores), rerankCandidateLimit)
+	}
+}
+
+func TestLateOnScorerCanReopen(t *testing.T) {
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	for range 2 {
+		scorer, err := newLateOnRerankScorer(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := scorer.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestCLIProcessLateOnReranks(t *testing.T) {
+	requireTools(t)
+	folder := t.TempDir()
+	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
+	writeFileAt(t, folder, "alpha.go", "package sample\n// alpha\n")
+	writeFileAt(t, folder, "beta.go", "package sample\n// beta\n")
+	cache := t.TempDir()
+
+	baseline := runCLIProcessWithCache(
+		t,
+		cache,
+		t.TempDir(),
+		[]string{"alpha beta", folder},
+		nil,
+	)
+	if baseline.code != 0 || baseline.stderr != "" || baseline.stdout == "" {
+		t.Fatalf("baseline=%+v", baseline)
+	}
+	reranked := runCLIProcessWithCache(
+		t,
+		cache,
+		t.TempDir(),
+		[]string{"--rerank", "alpha beta", folder},
+		nil,
+	)
+	if reranked.code != 0 || reranked.stderr != "" || reranked.stdout == "" {
+		t.Fatalf("reranked=%+v", reranked)
+	}
+	if reranked.stdout == baseline.stdout ||
+		!strings.Contains(reranked.stdout, "## alpha.go") ||
+		!strings.Contains(reranked.stdout, "## beta.go") {
+		t.Fatalf("real backend did not publish the OR-only candidates: %+v", reranked)
+	}
+}
