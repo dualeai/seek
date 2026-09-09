@@ -13,8 +13,28 @@ upgrade:
 	go get -u ./...
 	go mod tidy
 
+# Maintainer-only: download fixed re-ranker sources, print their byte counts and
+# hashes, and update tracked compressed resources. No build or release target
+# invokes this.
+rerank-assets-upgrade:
+	bash ./cicd/rerank-assets-upgrade.sh
+
+VERSION ?= $(shell bash ./cicd/version.sh -g . -c -m)
+BUILD_VERSION = $(patsubst v%,%,$(VERSION))
+OUTPUT ?= seek
+DIST_DIR ?= dist
+TARGET ?= $(shell go env GOOS)_$(shell go env GOARCH)
+USE_PREBUILT ?= 0
+
 build:
-	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=$$($(MAKE) -s version-full)" -o seek ./cmd/seek
+	go build -trimpath \
+		-ldflags="-s -w -X main.version=$(BUILD_VERSION)" \
+		-o "$(OUTPUT)" ./cmd/seek
+
+package:
+	$(MAKE) build OUTPUT=seek
+	mkdir -p "$(DIST_DIR)"
+	tar -czf "$(DIST_DIR)/seek_$(TARGET).tar.gz" seek
 
 test:
 	$(MAKE) test-static
@@ -59,6 +79,6 @@ lint:
 	golangci-lint run --fix ./...
 
 release:
-	VERSION=$$($(MAKE) -s version-full) goreleaser release --clean
+	bash ./cicd/release.sh
 
-.PHONY: install upgrade build test test-static test-plugin test-unit test-bench test-bench-repo test-bench-compare lint release
+.PHONY: install upgrade rerank-assets-upgrade build package test test-static test-plugin test-unit test-bench test-bench-repo test-bench-compare lint release

@@ -22,7 +22,7 @@ var errGitIndexStateChanged = errors.New("git index state changed")
 
 const maxScopedLayerRefreshRetries = 2
 
-// Set via ldflags (-X main.version=...) by make build / GoReleaser.
+// Set via ldflags (-X main.version=...) by the build and release commands.
 var version = ""
 
 func versionString() string {

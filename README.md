@@ -457,11 +457,53 @@ submitting a pull request.
 ```bash
 git clone https://github.com/dualeai/seek.git
 cd seek
-make install       # Download deps + install linter
-make build         # Build binary (requires Go 1.25+)
-make test          # Static analysis + unit tests
-make lint          # golangci-lint --fix
+make install  # Download modules and install test tools
+make build    # Build Seek
+make package  # Build the archive for this native target
+make test     # Run static analysis and unit tests
+make lint     # Run golangci-lint with fixes
 ```
+
+Go 1.27 or newer is required. A normal build on a supported target also needs a
+native C compiler: the Xcode command-line tools on macOS or GCC on glibc-based
+Linux. Use `CGO_ENABLED=0 make build` only when you need the BM25 fallback build.
+
+### Release packaging
+
+`make package` builds Seek and creates the archive for the current native
+target. Each archive contains one `seek` executable. The release workflow runs
+this target on macOS and Linux, on amd64 and arm64. It does not cross-build.
+You can run the target again to replace its output.
+
+The release workflow downloads the four archives, generates the standard
+CycloneDX SBOM, computes `checksums.txt`, and uploads these files. Artifact and
+GitHub release uploads replace files with the same names, so a failed workflow
+can run again.
+
+`RELEASE_TAG=vX.Y.Z make release` repeats only the final upload after the four
+archives and `sbom.cyclonedx.json` exist. It needs the GitHub CLI, `gh`. The
+named GitHub release must already exist, and `gh` must have permission to upload
+to it.
+
+### Re-ranker resource update
+
+`make rerank-assets-upgrade` is a manual maintainer command. It downloads the
+model, tokenizer, and three official ONNX Runtime packages at fixed revisions.
+Microsoft does not publish an ONNX Runtime 1.29.0 macOS amd64 package, so the
+command builds that one library from the fixed source commit when its versioned
+cache entry is absent.
+
+The command needs macOS, `curl`, `zstd`, CMake, Ninja, Python 3.10 or newer, and
+the Xcode command-line tools. It stores downloads, source, and build work under
+`${XDG_CACHE_HOME:-$HOME/.cache}/seek/rerank-assets-upgrade`. Downloads retry and
+resume. A later run reuses completed paths and replaces tracked files only when
+their bytes differ. The command calculates and prints byte counts and SHA-256
+values from the files that it receives or builds. It has no preset remote byte
+counts or checksums.
+
+Review the resource diff and commit it. Normal builds, tests, packages, and
+releases only use the committed files. They never call the update target and
+never download model or runtime resources.
 
 ## License
 

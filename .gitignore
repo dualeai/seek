@@ -118,6 +118,7 @@ $RECYCLE.BIN/
 # Binaries
 /seek
 /*.exe
+/dist/
 
 # Seek cache (generated at runtime)
 .seek-cache/
