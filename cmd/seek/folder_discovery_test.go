@@ -269,13 +269,12 @@ func TestDiscoveryRejectionFallsBackToPlainDescent(t *testing.T) {
 // .venv content appearing in parent folder corpus results on the
 // second consecutive search). The flow:
 //
-//  1. ensureFolderCorpusFresh's fingerprint pass discovers boundary,
-//     pool.Enqueue accepts (sync.Map LoadOrStore stores fresh).
-//  2. ensureFolderCorpusFresh's state pass discovers SAME boundary;
-//     pool.Enqueue LoadOrStore now returns loaded=true → Enqueue
-//     returns false.
-//  3. PRE-FIX: discoverNestedGit returned that false →
-//     tryDiscoverBoundary descended into the nested repo → parent
+//  1. ensureFolderCorpusFresh's fingerprint pass discovers the boundary,
+//     and pool.Enqueue stores it.
+//  2. ensureFolderCorpusFresh's state pass discovers the same boundary,
+//     and pool.Enqueue drops the duplicate.
+//  3. Before the fix, discoverNestedGit returned false for the duplicate,
+//     so tryDiscoverBoundary descended into the nested repo and the parent
 //     corpus ate the entire working tree including gitignored content.
 //
 // Test invokes pool.discoverNestedGit (the real production callback)
@@ -316,8 +315,8 @@ func TestDedupHitMustSuppressDescent(t *testing.T) {
 		}
 	}
 
-	// Second walk: same boundary → pool.seen LoadOrStore returns loaded
-	// → Enqueue returns false. Walker MUST still suppress descent.
+	// The second walk finds the same boundary. The pool drops the duplicate,
+	// but the walker must still suppress descent.
 	_, selected2, _, err := scanFolderCorpus(t.Context(), plan, true)
 	if err != nil {
 		t.Fatalf("second scanFolderCorpus: %v", err)

@@ -10,19 +10,8 @@ import (
 	"github.com/sourcegraph/zoekt/query"
 )
 
-// indexDeltaDocuments writes a delta shard for the given repository: a new
-// shard containing fresh content for changed files, plus tombstone entries in
-// every prior shard's .meta sidecar for paths the caller marks via
-// changedPaths (renames, content changes, deletions).
-//
-// The builder always Finishes (even on Add errors) so prior shards are not
-// left with partial tombstone updates. Concurrent searchers keep the old .meta
-// view until Zoekt's atomic tmp→final rename lands inside Builder.Finish.
-//
-// readSemaphore weights carried on files (from streamFolderFiles or
-// streamFiles) are Released exactly once after builder.Finish() returns —
-// the same lifetime contract as indexDocuments. Synchronous folder-delta
-// reads pass files with weight=0; Release then contributes nothing.
+// indexDeltaDocuments adapts a repository name and source to the shared delta
+// Builder sink.
 func indexDeltaDocuments(
 	indexDir string,
 	repoName string,
@@ -31,9 +20,32 @@ func indexDeltaDocuments(
 	shardMaxBytes int,
 	changedPaths []string,
 ) (bool, error) {
+	repository := zoekt.Repository{Name: repoName, Source: source}
+	return indexDeltaDocumentsWithRepository(indexDir, repository, files, shardMaxBytes, changedPaths)
+}
+
+// indexDeltaDocumentsWithRepository writes fresh content and tombstones for
+// changedPaths to one delta Builder. After it creates the Builder, it always
+// calls Finish, including after an Add error, so prior shards do not keep
+// partial tombstone updates. Zoekt makes each sidecar change visible with its
+// own temporary-file rename.
+//
+// The function releases all readSemaphore weights before it returns. Before it
+// creates a Builder, it releases them on error. After creation, it holds them
+// until Finish returns. Synchronous folder-delta reads use weight zero.
+func indexDeltaDocumentsWithRepository(
+	indexDir string,
+	repository zoekt.Repository,
+	files []fileContent,
+	shardMaxBytes int,
+	changedPaths []string,
+) (bool, error) {
+	if err := checkCtagsCached(); err != nil {
+		releaseFileContentWeights(files)
+		return false, err
+	}
 	opts := indexBuildOptions(indexDir, 1)
-	opts.RepositoryDescription.Name = repoName
-	opts.RepositoryDescription.Source = source
+	opts.RepositoryDescription = repository
 	if shardMaxBytes > 0 {
 		opts.ShardMax = shardMaxBytes
 	}
@@ -54,8 +66,10 @@ func indexDeltaDocuments(
 	for _, doc := range files {
 		if addErr == nil {
 			if err := builder.Add(index.Document{
-				Name:    doc.name,
-				Content: doc.content,
+				Name:       doc.name,
+				Content:    doc.content,
+				Branches:   doc.branches,
+				SkipReason: doc.skipReason,
 			}); err != nil {
 				addErr = fmt.Errorf("add delta document %s: %w", doc.name, err)
 			}
@@ -64,8 +78,8 @@ func indexDeltaDocuments(
 
 	finishErr := builder.Finish()
 
-	// ONLY now is it safe to release readSemaphore weight: Zoekt no
-	// longer reads any of the doc.content slices.
+	// Zoekt no longer reads the document content after Finish returns, so the
+	// reserved readSemaphore weight can now be released.
 	releaseFileContentWeights(files)
 
 	if addErr != nil {
@@ -84,10 +98,9 @@ func indexDeltaDocuments(
 // empty shards, stopping at the first live shard (or at shard 0
 // unconditionally — the base must remain to anchor the numbering).
 //
-// In practice the newest shard is almost always live (it was just written by
-// the prior cycle), so this is effectively a no-op for rapid-edit chains.
-// Compaction in that scenario is delegated to the per-repo
-// DeltaShardNumberFallbackThreshold guard (Zoekt gitindex/index.go:831-843).
+// In practice the newest shard is almost always live, so this is often a no-op
+// for rapid-edit chains. The folder and uncommitted callers enforce their own
+// shard-count caps and select a full rebuild when a family exceeds its cap.
 func cleanEmptyShards(ctx context.Context, indexDir, repoName string) {
 	shards := repositoryShardFiles(indexDir, repoName)
 	for i := len(shards) - 1; i > 0; i-- {
@@ -106,8 +119,7 @@ func cleanEmptyShards(ctx context.Context, indexDir, repoName string) {
 }
 
 // shardHasNoLiveDocuments returns true when shard contains no live documents
-// for repoName. Uses Zoekt's query.Const{true} as the cheapest occupancy probe
-// (single-doc cap via SearchOptions).
+// for repoName. It uses query.Const{true} with a one-document result cap.
 func shardHasNoLiveDocuments(ctx context.Context, shard, repoName string) (bool, error) {
 	searcher, err := openShard(shard)
 	if err != nil {

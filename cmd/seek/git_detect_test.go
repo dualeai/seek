@@ -21,11 +21,8 @@ func TestDetectGitBoundary_DirForm(t *testing.T) {
 	if b.RepoDir != root {
 		t.Errorf("RepoDir=%q, want %q", b.RepoDir, root)
 	}
-	if want := filepath.Join(root, ".git"); b.GitDir != want {
-		t.Errorf("GitDir=%q, want %q", b.GitDir, want)
-	}
-	if b.CommonDir != b.GitDir {
-		t.Errorf("CommonDir=%q, want %q", b.CommonDir, b.GitDir)
+	if want := filepath.Join(root, ".git"); b.CommonDir != want {
+		t.Errorf("CommonDir=%q, want %q", b.CommonDir, want)
 	}
 }
 
@@ -125,8 +122,8 @@ func TestDetectGitBoundary_WorktreeRelative(t *testing.T) {
 	if b.Mode != rootTypeWorktree {
 		t.Errorf("Mode=%v, want rootTypeWorktree", b.Mode)
 	}
-	if b.GitDir != realGitDir {
-		t.Errorf("GitDir=%q, want %q", b.GitDir, realGitDir)
+	if b.CommonDir != realGitDir {
+		t.Errorf("CommonDir=%q, want %q", b.CommonDir, realGitDir)
 	}
 }
 
@@ -147,8 +144,8 @@ func TestDetectGitBoundary_WorktreeAbsolute(t *testing.T) {
 	if status != boundaryConfirmed {
 		t.Fatalf("status=%v, want boundaryConfirmed", status)
 	}
-	if b.GitDir != realGitDir {
-		t.Errorf("GitDir=%q, want %q", b.GitDir, realGitDir)
+	if b.CommonDir != realGitDir {
+		t.Errorf("CommonDir=%q, want %q", b.CommonDir, realGitDir)
 	}
 }
 
@@ -466,23 +463,6 @@ func TestDetectBareRepoAt_FalseOnPlainDir(t *testing.T) {
 	}
 }
 
-func TestDetectStatusString(t *testing.T) {
-	cases := []struct {
-		status detectStatus
-		want   string
-	}{
-		{notBoundary, "notBoundary"},
-		{boundaryConfirmed, "boundaryConfirmed"},
-		{ambiguous, "ambiguous"},
-		{detectStatus(99), "detectStatus(99)"},
-	}
-	for _, c := range cases {
-		if got := c.status.String(); got != c.want {
-			t.Errorf("detectStatus(%d).String()=%q, want %q", c.status, got, c.want)
-		}
-	}
-}
-
 func TestDetectGitBoundary_CommonDirRead(t *testing.T) {
 	// Worktree with explicit commondir file: detector reads it and reports
 	// the resolved common dir.
@@ -491,7 +471,7 @@ func TestDetectGitBoundary_CommonDirRead(t *testing.T) {
 	writeGitTriadAt(t, parentGit)
 
 	worktree := filepath.Join(root, "feature-wt")
-	wtGit := writeLinkedWorktreeAdmin(t, parentGit, worktree, "feature")
+	wtGit := writeLinkedWorktreeAdmin(t, parentGit, worktree)
 	if err := os.MkdirAll(worktree, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -502,9 +482,6 @@ func TestDetectGitBoundary_CommonDirRead(t *testing.T) {
 	b, status := detectGitBoundary(worktree, root)
 	if status != boundaryConfirmed {
 		t.Fatalf("status=%v, want boundaryConfirmed", status)
-	}
-	if b.GitDir != wtGit {
-		t.Errorf("GitDir=%q, want %q", b.GitDir, wtGit)
 	}
 	if b.CommonDir != parentGit {
 		t.Errorf("CommonDir=%q, want %q (resolved from commondir file)", b.CommonDir, parentGit)
@@ -518,7 +495,7 @@ func TestDetectGitBoundary_LinkedWorktreeBackrefAcceptedOutsideScanRoot(t *testi
 	writeGitTriadAt(t, parentGit)
 
 	worktree := filepath.Join(scanRoot, "feature-wt")
-	wtGit := writeLinkedWorktreeAdmin(t, parentGit, worktree, "feature")
+	wtGit := writeLinkedWorktreeAdmin(t, parentGit, worktree)
 	if err := os.MkdirAll(worktree, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -529,9 +506,6 @@ func TestDetectGitBoundary_LinkedWorktreeBackrefAcceptedOutsideScanRoot(t *testi
 	b, status := detectGitBoundary(worktree, scanRoot)
 	if status != boundaryConfirmed {
 		t.Fatalf("status=%v, want boundaryConfirmed", status)
-	}
-	if b.GitDir != wtGit {
-		t.Errorf("GitDir=%q, want %q", b.GitDir, wtGit)
 	}
 	if b.CommonDir != parentGit {
 		t.Errorf("CommonDir=%q, want %q", b.CommonDir, parentGit)
@@ -556,7 +530,7 @@ func TestDetectGitBoundary_LinkedWorktreeMissingBackrefRejected(t *testing.T) {
 			writeGitTriadAt(t, parentGit)
 
 			worktree := filepath.Join(scanRoot, "feature-wt")
-			wtGit := writeLinkedWorktreeAdmin(t, parentGit, worktree, "feature")
+			wtGit := writeLinkedWorktreeAdmin(t, parentGit, worktree)
 			if err := os.Remove(filepath.Join(wtGit, "gitdir")); err != nil {
 				t.Fatal(err)
 			}
@@ -582,7 +556,7 @@ func TestDetectGitBoundary_LinkedWorktreeWrongBackrefRejected(t *testing.T) {
 
 	worktree := filepath.Join(scanRoot, "feature-wt")
 	otherWorktree := filepath.Join(scanRoot, "other-wt")
-	wtGit := writeLinkedWorktreeAdmin(t, parentGit, otherWorktree, "feature")
+	wtGit := writeLinkedWorktreeAdmin(t, parentGit, otherWorktree)
 	if err := os.MkdirAll(worktree, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -595,8 +569,9 @@ func TestDetectGitBoundary_LinkedWorktreeWrongBackrefRejected(t *testing.T) {
 	}
 }
 
-func writeLinkedWorktreeAdmin(t testing.TB, commonDir, worktree, name string) string {
+func writeLinkedWorktreeAdmin(t testing.TB, commonDir, worktree string) string {
 	t.Helper()
+	const name = "feature"
 	wtGit := filepath.Join(commonDir, "worktrees", name)
 	if err := os.MkdirAll(filepath.Join(wtGit, "refs"), 0o755); err != nil {
 		t.Fatal(err)

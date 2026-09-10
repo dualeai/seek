@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,8 +36,8 @@ func requireTools(tb testing.TB) {
 func initEmptyGitRepo(tb testing.TB) string {
 	tb.Helper()
 	dir := initEmptyGitRepoNoRemote(tb)
-	// zoekt's gitindex.IndexGitRepo derives the repo name from the remote URL.
-	// Most tests keep this remote so committed shard prefixes stay stable.
+	// Keep a common remote fixture for tests that inspect Git status or config.
+	// The committed indexer does not use it for identity or link policy.
 	gitRunIn(tb, dir, "remote", "add", "origin", "https://github.com/test/repo.git")
 	return dir
 }
@@ -172,7 +174,7 @@ func runSeekInRepo(t *testing.T, repoDir, pattern string) ([]string, error) {
 	ensureTestUserCache(t)
 	t.Chdir(repoDir)
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), pattern, nil, 0, 0)
+		return run(context.Background(), pattern, nil)
 	})
 	if errors.Is(err, errNoMatch) {
 		return nil, nil
@@ -245,7 +247,7 @@ func assertScopedRunIncludesOnly(t *testing.T, query, operand string) {
 	t.Helper()
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), query, []string{operand}, 0, 0)
+		return run(context.Background(), query, []string{operand})
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -337,9 +339,6 @@ func TestResolveGitPaths_Worktree(t *testing.T) {
 	if paths.RepoDir != resolvedWorktreeDir {
 		t.Fatalf("expected RepoDir %q, got %q", resolvedWorktreeDir, paths.RepoDir)
 	}
-	if !strings.Contains(paths.GitDir, "/.git/worktrees/") {
-		t.Fatalf("expected worktree git dir, got %q", paths.GitDir)
-	}
 	if paths.CommonDir != filepath.Join(resolvedRepoDir, ".git") {
 		t.Fatalf("expected common git dir %q, got %q", filepath.Join(resolvedRepoDir, ".git"), paths.CommonDir)
 	}
@@ -364,7 +363,7 @@ func main() {
 
 	// Search for committed content
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "findme_marker_123", nil, 0, 0)
+		return run(context.Background(), "findme_marker_123", nil)
 	})
 	if err != nil {
 		t.Fatalf("search failed: %v", err)
@@ -375,7 +374,7 @@ func main() {
 
 	// Search for non-existent content
 	out, err = captureStdout(t, func() error {
-		return run(context.Background(), "nothere_xyz_999", nil, 0, 0)
+		return run(context.Background(), "nothere_xyz_999", nil)
 	})
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("expected no-match, got err=%v out=%q", err, out)
@@ -396,7 +395,7 @@ func TestRun_UnbornRepositorySearchesUntrackedFile(t *testing.T) {
 	t.Chdir(dir)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "unborn_untracked_marker", nil, 0, 0)
+		return run(context.Background(), "unborn_untracked_marker", nil)
 	})
 	if err != nil {
 		t.Fatalf("search unborn repository: %v", err)
@@ -413,27 +412,22 @@ func TestRun_EmptyUnbornRepositoryReturnsNoMatch(t *testing.T) {
 	t.Chdir(dir)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "absent_unborn_marker", nil, 0, 0)
+		return run(context.Background(), "absent_unborn_marker", nil)
 	})
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("empty unborn repository: error=%v output=%q, want no match", err, out)
 	}
 }
 
-func TestMarkGitCorpusKnownEmptyRemovesArtifactsAndManifest(t *testing.T) {
-	dir := initEmptyGitRepo(t)
+func TestEnsureCombinedGitCorpusPublishesEmptyNativeSnapshot(t *testing.T) {
+	requireTools(t)
+	dir := initGitRepo(t, "old.go", "package old\n// old_empty_transition_marker\n")
 	paths, plan := planGitTestCorpus(t, dir)
-	for _, name := range []string{
-		"repo_v16.00000.zoekt",
-		"repo_v16.00000.zoekt.meta",
-		"orphan_v16.00001.zoekt.meta",
-		"uncommitted_v16.00000.zoekt",
-		"uncommitted_v16.00000.zoekt.meta",
-	} {
-		if err := os.WriteFile(filepath.Join(plan.indexDir, name), nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
+	state := mustGitRepoStateIn(t, context.Background(), dir)
+	if got, err := ensureCombinedGitCorpus(context.Background(), plan, paths, state); err != nil || got != corpusSearchable {
+		t.Fatalf("warm native corpus: state=%v error=%v", got, err)
 	}
+
 	if err := os.WriteFile(
 		filepath.Join(plan.cacheDir, uncommittedManifestFileName),
 		[]byte("stale"),
@@ -441,22 +435,157 @@ func TestMarkGitCorpusKnownEmptyRemovesArtifactsAndManifest(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+	// A missing manifest rejects the prior family as a delta base. The common
+	// native full path must replace that family with an empty snapshot.
+	removeFamilyManifest(plan.indexDir)
 
-	state := mustGitRepoStateIn(t, context.Background(), dir)
-	marked, err := markGitCorpusKnownEmpty(
-		context.Background(),
-		plan,
-		state,
-		gitCorpusStateHash(paths, state),
-	)
-	if err != nil || !marked {
-		t.Fatalf("mark known empty: marked=%v error=%v", marked, err)
+	gitRun(t, dir, "switch", "--orphan", "empty")
+	gitRun(t, dir, "rm", "-rf", "--ignore-unmatch", ".")
+	gitRun(t, dir, "commit", "--allow-empty", "-m", "empty")
+	state = mustGitRepoStateIn(t, context.Background(), dir)
+	stateHash := gitCorpusStateHash(paths, state)
+	if got, err := ensureCombinedGitCorpus(context.Background(), plan, paths, state); err != nil || got != corpusKnownEmpty {
+		t.Fatalf("publish empty native corpus: state=%v error=%v marker=%q shards=%v", got, err,
+			readEmptyStateFile(plan.cacheDir), familyShardFilesForTest(t, plan.indexDir, familyAll))
 	}
-	if artifacts := familyShardFiles(plan.indexDir, familyAll); len(artifacts) != 0 {
-		t.Fatalf("known-empty corpus retained artifacts: %v", artifacts)
+	if artifacts := familyShardFilesForTest(t, plan.indexDir, familyAll); len(artifacts) != 0 {
+		t.Fatalf("empty native corpus retained artifacts: %v", artifacts)
 	}
 	if _, err := os.Stat(filepath.Join(plan.cacheDir, uncommittedManifestFileName)); !os.IsNotExist(err) {
-		t.Fatalf("known-empty corpus retained manifest: %v", err)
+		t.Fatalf("empty native corpus retained manifest: %v", err)
+	}
+	if got := readEmptyStateFile(plan.cacheDir); got != stateHash {
+		t.Fatalf("empty state=%q, want %q", got, stateHash)
+	}
+	if got := readHeadFile(plan.cacheDir); got != state.HeadSHA {
+		t.Fatalf("empty HEAD=%q, want %q", got, state.HeadSHA)
+	}
+	if got, err := ensureCombinedGitCorpus(context.Background(), plan, paths, state); err != nil || got != corpusKnownEmpty {
+		t.Fatalf("reuse empty native corpus: state=%v error=%v", got, err)
+	}
+}
+
+func publishedGitGenerationBytes(t *testing.T, plan corpusPlan) map[string]string {
+	t.Helper()
+	paths := familyShardFilesForTest(t, plan.indexDir, familyAll)
+	paths = append(paths, filepath.Join(plan.indexDir, familyManifestFile))
+	result := make(map[string]string, len(paths))
+	for _, path := range paths {
+		raw, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("read published artifact %s: %v", path, err)
+		}
+		result[path] = string(raw)
+	}
+	return result
+}
+
+func hideLooseGitObject(t *testing.T, commonDir, oid string) func() {
+	t.Helper()
+	objectPath := filepath.Join(commonDir, "objects", oid[:2], oid[2:])
+	backupPath := filepath.Join(t.TempDir(), "object")
+	if err := os.Rename(objectPath, backupPath); err != nil {
+		t.Fatalf("hide Git object %s: %v", oid, err)
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		if err := os.Rename(backupPath, objectPath); err != nil {
+			t.Fatalf("restore Git object %s: %v", oid, err)
+		}
+		restored = true
+	}
+	t.Cleanup(restore)
+	return restore
+}
+
+func TestNativeGitMissingObjectKeepsPublishedFamily(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		objectSpec string
+	}{
+		{name: "tree", objectSpec: "HEAD:z-missing"},
+		{name: "blob", objectSpec: "HEAD:z-missing/object.go"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requireTools(t)
+			repoDir := initGitRepo(t, "old.go", "package old\n// PUBLISHED_OBJECT_BASE\n")
+			paths, plan := planGitTestCorpus(t, repoDir)
+			reindexGit(t, t.Context(), paths, plan)
+			before := publishedGitGenerationBytes(t, plan)
+
+			if err := os.WriteFile(filepath.Join(repoDir, "old.go"), []byte("package current\n// PUBLISHED_OBJECT_TARGET\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(repoDir, "z-missing"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repoDir, "z-missing", "object.go"), []byte("package missing\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gitRunIn(t, repoDir, "add", ".")
+			gitRunIn(t, repoDir, "commit", "-m", "target with required object")
+			// A metadata change makes admission select native full before it
+			// reads the target tree. The tree case also fails after Git emits and
+			// Seek stages the valid root file.
+			gitRunIn(t, repoDir, "config", "zoekt.web-url", "https://example.test/native-object-test")
+			state := mustGitRepoStateIn(t, t.Context(), repoDir)
+			target := captureHeadForTest(t, paths.RepoDir)
+			oid := gitOutputIn(t, repoDir, "rev-parse", tc.objectSpec)
+			restore := hideLooseGitObject(t, paths.CommonDir, oid)
+			if tc.name == "tree" {
+				stagedDir := t.TempDir()
+				stagedErr := indexNativeGitFull(t.Context(), paths.RepoDir, stagedDir, target, nil, 1)
+				if stagedErr == nil || !shardsExist(stagedDir) {
+					t.Fatalf("late tree failure: error=%v shards=%t", stagedErr, shardsExist(stagedDir))
+				}
+			}
+
+			err := runIndexingWithCache(t.Context(), paths, plan.cacheDir, plan.indexDir, state, gitCorpusStateHash(paths, state))
+			if err == nil {
+				t.Fatal("indexing succeeded with a required Git object missing")
+			}
+			if after := publishedGitGenerationBytes(t, plan); !maps.Equal(after, before) {
+				var changed []string
+				for path, want := range before {
+					if got, ok := after[path]; !ok {
+						changed = append(changed, "removed:"+filepath.Base(path))
+					} else if got != want {
+						changed = append(changed, "changed:"+filepath.Base(path))
+					}
+				}
+				for path := range after {
+					if _, ok := before[path]; !ok {
+						changed = append(changed, "added:"+filepath.Base(path))
+					}
+				}
+				sort.Strings(changed)
+				t.Fatalf("failed native build changed published artifacts: %v; error=%v; shards=%t", changed, err, shardsExist(plan.indexDir))
+			}
+			entries, err := os.ReadDir(plan.indexDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), buildDirPrefix) {
+					t.Fatalf("failed native build left staging directory %q", entry.Name())
+				}
+			}
+			if matches, err := searchPlannedCorpusForTest(t.Context(), plan, "PUBLISHED_OBJECT_BASE"); err != nil || len(matches) != 1 {
+				t.Fatalf("search prior generation: matches=%v error=%v", matches, err)
+			}
+
+			restore()
+			reindexGit(t, t.Context(), paths, plan)
+			if matches, err := searchPlannedCorpusForTest(t.Context(), plan, "PUBLISHED_OBJECT_TARGET"); err != nil || len(matches) != 1 {
+				t.Fatalf("search restored target: matches=%v error=%v", matches, err)
+			}
+		})
 	}
 }
 
@@ -467,7 +596,7 @@ func TestRun_KnownEmptyRemovesCommittedSidecarBeforeShardNameReuse(t *testing.T)
 	t.Chdir(dir)
 
 	if _, err := captureStdout(t, func() error {
-		return run(context.Background(), "sidecar_first_marker", nil, 0, 0)
+		return run(context.Background(), "sidecar_first_marker", nil)
 	}); err != nil {
 		t.Fatalf("warm first commit: %v", err)
 	}
@@ -490,12 +619,12 @@ func TestRun_KnownEmptyRemovesCommittedSidecarBeforeShardNameReuse(t *testing.T)
 	gitRun(t, dir, "add", "same.go")
 	gitRun(t, dir, "commit", "-m", "second")
 	if _, err := captureStdout(t, func() error {
-		return run(context.Background(), "sidecar_second_marker", nil, 0, 0)
+		return run(context.Background(), "sidecar_second_marker", nil)
 	}); err != nil {
 		t.Fatalf("index second commit: %v", err)
 	}
 	foundMeta := false
-	for _, artifact := range familyShardFiles(plan.indexDir, familyCommitted) {
+	for _, artifact := range familyShardFilesForTest(t, plan.indexDir, familyCommitted) {
 		foundMeta = foundMeta || strings.HasSuffix(artifact, ".zoekt.meta")
 	}
 	if !foundMeta {
@@ -504,11 +633,11 @@ func TestRun_KnownEmptyRemovesCommittedSidecarBeforeShardNameReuse(t *testing.T)
 
 	gitRun(t, dir, "switch", "--orphan", "unborn")
 	if _, err := captureStdout(t, func() error {
-		return run(context.Background(), "sidecar_absent_marker", nil, 0, 0)
+		return run(context.Background(), "sidecar_absent_marker", nil)
 	}); !errors.Is(err, errNoMatch) {
 		t.Fatalf("clear empty unborn repository: %v", err)
 	}
-	if artifacts := familyShardFiles(plan.indexDir, familyAll); len(artifacts) != 0 {
+	if artifacts := familyShardFilesForTest(t, plan.indexDir, familyAll); len(artifacts) != 0 {
 		t.Fatalf("empty unborn repository retained artifacts: %v", artifacts)
 	}
 
@@ -522,7 +651,7 @@ func TestRun_KnownEmptyRemovesCommittedSidecarBeforeShardNameReuse(t *testing.T)
 	gitRun(t, dir, "add", "same.go")
 	gitRun(t, dir, "commit", "-m", "third")
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "sidecar_third_marker", nil, 0, 0)
+		return run(context.Background(), "sidecar_third_marker", nil)
 	})
 	if err != nil || !strings.Contains(out, "sidecar_third_marker") {
 		t.Fatalf("search recreated path: error=%v output=%q", err, out)
@@ -536,7 +665,7 @@ func TestRun_UnbornRepositoryClearsWarmCommittedIndex(t *testing.T) {
 	t.Chdir(dir)
 
 	if _, err := captureStdout(t, func() error {
-		return run(context.Background(), "unborn_old_marker", nil, 0, 0)
+		return run(context.Background(), "unborn_old_marker", nil)
 	}); err != nil {
 		t.Fatalf("warm committed index: %v", err)
 	}
@@ -560,21 +689,21 @@ func TestRun_UnbornRepositoryClearsWarmCommittedIndex(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		out, err := captureStdout(t, func() error {
-			return run(context.Background(), "unborn_new_marker", nil, 0, 0)
+			return run(context.Background(), "unborn_new_marker", nil)
 		})
 		if err != nil || !strings.Contains(out, "unborn_new_marker") {
 			t.Fatalf("search new marker, run %d: error=%v output=%q", i+1, err, out)
 		}
 
 		out, err = captureStdout(t, func() error {
-			return run(context.Background(), "unborn_old_marker", nil, 0, 0)
+			return run(context.Background(), "unborn_old_marker", nil)
 		})
 		if !errors.Is(err, errNoMatch) || out != "" {
 			t.Fatalf("search old marker, run %d: error=%v output=%q", i+1, err, out)
 		}
 	}
 
-	if artifacts := familyShardFiles(plan.indexDir, familyCommitted); len(artifacts) != 0 {
+	if artifacts := familyShardFilesForTest(t, plan.indexDir, familyCommitted); len(artifacts) != 0 {
 		t.Fatalf("unborn repository retained committed artifacts: %v", artifacts)
 	}
 }
@@ -594,7 +723,7 @@ func TestRun_UnbornRepositoryRepairsMatchingStateCommittedArtifacts(t *testing.T
 			t.Chdir(dir)
 
 			if _, err := captureStdout(t, func() error {
-				return run(context.Background(), "repair_old_marker", nil, 0, 0)
+				return run(context.Background(), "repair_old_marker", nil)
 			}); err != nil {
 				t.Fatalf("warm committed index: %v", err)
 			}
@@ -626,7 +755,7 @@ func TestRun_UnbornRepositoryRepairsMatchingStateCommittedArtifacts(t *testing.T
 				t.Fatalf("seed no-head file: %v", err)
 			}
 
-			artifacts := familyShardFiles(plan.indexDir, familyCommitted)
+			artifacts := familyShardFilesForTest(t, plan.indexDir, familyCommitted)
 			if len(artifacts) == 0 {
 				t.Fatal("warm cache has no committed artifact")
 			}
@@ -641,18 +770,18 @@ func TestRun_UnbornRepositoryRepairsMatchingStateCommittedArtifacts(t *testing.T
 			}
 
 			out, err := captureStdout(t, func() error {
-				return run(context.Background(), "repair_new_marker", nil, 0, 0)
+				return run(context.Background(), "repair_new_marker", nil)
 			})
 			if err != nil || !strings.Contains(out, "repair_new_marker") {
 				t.Fatalf("search repaired new marker: error=%v output=%q", err, out)
 			}
 			out, err = captureStdout(t, func() error {
-				return run(context.Background(), "repair_old_marker", nil, 0, 0)
+				return run(context.Background(), "repair_old_marker", nil)
 			})
 			if !errors.Is(err, errNoMatch) || out != "" {
 				t.Fatalf("search repaired old marker: error=%v output=%q", err, out)
 			}
-			if artifacts := familyShardFiles(plan.indexDir, familyCommitted); len(artifacts) != 0 {
+			if artifacts := familyShardFilesForTest(t, plan.indexDir, familyCommitted); len(artifacts) != 0 {
 				t.Fatalf("repair retained committed artifacts: %v", artifacts)
 			}
 		})
@@ -667,7 +796,7 @@ func TestRun_UsesUserCache(t *testing.T) {
 	t.Chdir(dir)
 
 	if _, err := captureStdout(t, func() error {
-		return run(context.Background(), "unique_marker_user_cache", nil, 0, 0)
+		return run(context.Background(), "unique_marker_user_cache", nil)
 	}); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -710,7 +839,7 @@ func TestRun_CurrentRepoRootPathOperandSearchesWholeRepo(t *testing.T) {
 	t.Chdir(dir)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "root_scope_marker", []string{"."}, 0, 0)
+		return run(context.Background(), "root_scope_marker", []string{"."})
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -760,7 +889,7 @@ func TestRun_GitRootAndChildOperandsDoNotDuplicateChildResults(t *testing.T) {
 			t.Chdir(t.TempDir())
 
 			out, err := captureStdout(t, func() error {
-				return run(context.Background(), marker, []string{dir, tc.operand(dir, childDir)}, 0, 0)
+				return run(context.Background(), marker, []string{dir, tc.operand(dir, childDir)})
 			})
 			if err != nil {
 				t.Fatalf("run: %v", err)
@@ -788,7 +917,7 @@ func TestRun_ExternalFolderPathWorksOutsideGit(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "external_folder_marker", []string{folder}, 0, 0)
+		return run(context.Background(), "external_folder_marker", []string{folder})
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -819,7 +948,7 @@ func TestRun_ExternalDuplicateAndNestedPathOperandsDeduplicateResults(t *testing
 			root,
 			nested,
 			filepath.Join(nested, "note.txt"),
-		}, 0, 0)
+		})
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -839,7 +968,7 @@ func TestRun_InvalidQueryDoesNotCreateV2Cache(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	_, err := captureStdout(t, func() error {
-		return run(context.Background(), "(", []string{folder}, 0, 0)
+		return run(context.Background(), "(", []string{folder})
 	})
 	if err == nil {
 		t.Fatal("expected invalid query to fail")
@@ -873,7 +1002,7 @@ func TestRun_ExternalGitRepoPathUsesGitCorpus(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "external_git_folder_marker", []string{externalRepo}, 0, 0)
+		return run(context.Background(), "external_git_folder_marker", []string{externalRepo})
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -910,7 +1039,7 @@ func TestRun_ExternalGitRepoPathUsesGitIgnore(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "external_gitignored_marker", []string{externalRepo}, 0, 0)
+		return run(context.Background(), "external_gitignored_marker", []string{externalRepo})
 	})
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("external Git repo should honor .gitignore, got err=%v out=%q", err, out)
@@ -953,7 +1082,7 @@ func TestRun_ExternalGitRepoPathDoesNotBudgetIgnoredFiles(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "external_git_budget_marker", []string{externalRepo}, 0, 0)
+		return run(context.Background(), "external_git_budget_marker", []string{externalRepo})
 	})
 	if err != nil || !strings.Contains(out, "external_git_budget_marker") {
 		t.Fatalf("output=%q error=%v, want tracked result within budget", out, err)
@@ -968,7 +1097,7 @@ func TestRun_ExternalGitSubdirPathScopesSearch(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "external_git_scope_marker", []string{filepath.Join(externalRepo, "a")}, 0, 0)
+		return run(context.Background(), "external_git_scope_marker", []string{filepath.Join(externalRepo, "a")})
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -988,8 +1117,6 @@ func TestRun_ExternalGitExactFilePathScopesSearch(t *testing.T) {
 			context.Background(),
 			"external_git_exact_scope_marker",
 			[]string{filepath.Join(externalRepo, "a", "app.go")},
-			0,
-			0,
 		)
 	})
 	if err != nil {
@@ -1023,7 +1150,7 @@ func TestRun_CurrentGitExactIgnoredFileOperandSearchesLiteralFile(t *testing.T) 
 	t.Chdir(repo)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "literal_ignored_file_marker", []string{target}, 0, 0)
+		return run(context.Background(), "literal_ignored_file_marker", []string{target})
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -1061,7 +1188,7 @@ func TestRun_ExternalGitExactIgnoredFileOperandSearchesLiteralFile(t *testing.T)
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "external_literal_ignored_file_marker", []string{target}, 0, 0)
+		return run(context.Background(), "external_literal_ignored_file_marker", []string{target})
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -1095,7 +1222,7 @@ func TestRun_CurrentGitIgnoredDirectoryOperandSearchesContent(t *testing.T) {
 	t.Chdir(repo)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "literal_ignored_dir_marker", []string{scratch}, 0, 0)
+		return run(context.Background(), "literal_ignored_dir_marker", []string{scratch})
 	})
 	if err != nil {
 		t.Fatalf("explicitly selected ignored directory should be searched as a folder, got err=%v", err)
@@ -1126,7 +1253,7 @@ func TestRun_ExternalGitIgnoredDirectoryOperandSearchesContent(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "external_literal_ignored_dir_marker", []string{scratch}, 0, 0)
+		return run(context.Background(), "external_literal_ignored_dir_marker", []string{scratch})
 	})
 	if err != nil {
 		t.Fatalf("explicitly selected ignored directory should be searched as a folder, got err=%v", err)
@@ -1172,7 +1299,7 @@ func TestRun_GitSubdirOperandDoesNotBudgetIgnoredFolderArtifacts(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "scoped_visible_marker", []string{scope}, 0, 0)
+		return run(context.Background(), "scoped_visible_marker", []string{scope})
 	})
 	if err != nil {
 		t.Fatalf("Git-scoped subdir should ignore large artifacts, got err=%v out=%q", err, out)
@@ -1214,7 +1341,7 @@ func TestRun_GitSubdirOperandDoesNotBudgetUnignoredSiblingDirtyArtifacts(t *test
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "scoped_dirty_visible_marker", []string{scope}, 0, 0)
+		return run(context.Background(), "scoped_dirty_visible_marker", []string{scope})
 	})
 	if err != nil {
 		t.Fatalf("Git-scoped subdir should ignore out-of-scope dirty artifacts, got err=%v out=%q", err, out)
@@ -1254,7 +1381,7 @@ func TestRun_GitSubdirOperandDoesNotBudgetTrackedSiblingArtifacts(t *testing.T) 
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "scoped_tracked_visible_marker", []string{scope}, 0, 0)
+		return run(context.Background(), "scoped_tracked_visible_marker", []string{scope})
 	})
 	if err != nil {
 		t.Fatalf("Git-scoped subdir should ignore out-of-scope tracked artifacts, got err=%v out=%q", err, out)
@@ -1343,7 +1470,7 @@ func TestRun_GitDirectoryOperandTreatsPathspecMetacharactersLiterally(t *testing
 	t.Chdir(repo)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "literal_pathspec_committed_marker", []string{scope}, 0, 0)
+		return run(context.Background(), "literal_pathspec_committed_marker", []string{scope})
 	})
 	if err != nil {
 		t.Fatalf("run committed literal pathspec marker: %v", err)
@@ -1353,7 +1480,7 @@ func TestRun_GitDirectoryOperandTreatsPathspecMetacharactersLiterally(t *testing
 	}
 
 	out, err = captureStdout(t, func() error {
-		return run(context.Background(), "literal_pathspec_dirty_marker", []string{scope}, 0, 0)
+		return run(context.Background(), "literal_pathspec_dirty_marker", []string{scope})
 	})
 	if err != nil {
 		t.Fatalf("run dirty literal pathspec marker: %v", err)
@@ -1399,7 +1526,7 @@ func TestRun_GitDirectoryOperandDiscoversVisibleNestedGit(t *testing.T) {
 	t.Chdir(parent)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "visible_nested_git_marker", []string{scope}, 0, 0)
+		return run(context.Background(), "visible_nested_git_marker", []string{scope})
 	})
 	if err != nil {
 		t.Fatalf("run nested marker: %v", err)
@@ -1415,7 +1542,7 @@ func TestRun_GitDirectoryOperandDiscoversVisibleNestedGit(t *testing.T) {
 	}
 
 	out, err = captureStdout(t, func() error {
-		return run(context.Background(), "visible_nested_ignored_marker", []string{scope}, 0, 0)
+		return run(context.Background(), "visible_nested_ignored_marker", []string{scope})
 	})
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("nested Git ignore should be honored, got err=%v out=%q", err, out)
@@ -1451,7 +1578,7 @@ func TestRun_GitDirectoryOperandDiscoversNestedSubmoduleRecursively(t *testing.T
 	t.Chdir(parent)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "recursive_submodule_marker", []string{scope}, 0, 0)
+		return run(context.Background(), "recursive_submodule_marker", []string{scope})
 	})
 	if err != nil {
 		t.Fatalf("run recursive submodule marker: %v", err)
@@ -1478,7 +1605,7 @@ func TestRun_FolderOperandDiscoversNestedSubmoduleRecursively(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "folder_recursive_submodule_marker", []string{parent}, 0, 0)
+		return run(context.Background(), "folder_recursive_submodule_marker", []string{parent})
 	})
 	if err != nil {
 		t.Fatalf("run folder recursive submodule marker: %v", err)
@@ -1519,7 +1646,7 @@ func TestRun_FolderOperandDiscoversLinkedWorktree(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "folder_linked_worktree_marker", []string{parent}, 0, 0)
+		return run(context.Background(), "folder_linked_worktree_marker", []string{parent})
 	})
 	if err != nil {
 		t.Fatalf("run folder linked worktree marker: %v", err)
@@ -1532,7 +1659,7 @@ func TestRun_FolderOperandDiscoversLinkedWorktree(t *testing.T) {
 	}
 
 	out, err = captureStdout(t, func() error {
-		return run(context.Background(), "folder_linked_worktree_ignored_marker", []string{parent}, 0, 0)
+		return run(context.Background(), "folder_linked_worktree_ignored_marker", []string{parent})
 	})
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("linked worktree ignored file should not match through folder parent, got err=%v out=%q", err, out)
@@ -1579,7 +1706,7 @@ func TestRun_GitDirectoryOperandDiscoversLinkedWorktree(t *testing.T) {
 	t.Chdir(parent)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "git_scope_linked_worktree_marker", []string{scope}, 0, 0)
+		return run(context.Background(), "git_scope_linked_worktree_marker", []string{scope})
 	})
 	if err != nil {
 		t.Fatalf("run scoped linked worktree marker: %v", err)
@@ -1592,7 +1719,7 @@ func TestRun_GitDirectoryOperandDiscoversLinkedWorktree(t *testing.T) {
 	}
 
 	out, err = captureStdout(t, func() error {
-		return run(context.Background(), "git_scope_linked_worktree_ignored_marker", []string{scope}, 0, 0)
+		return run(context.Background(), "git_scope_linked_worktree_ignored_marker", []string{scope})
 	})
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("linked worktree ignored file should not match through scoped Git parent, got err=%v out=%q", err, out)
@@ -1624,7 +1751,7 @@ func TestRun_GitDirectoryOperandDiscoversSubmoduleGitlink(t *testing.T) {
 	t.Chdir(parent)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "submodule_scope_marker", []string{scope}, 0, 0)
+		return run(context.Background(), "submodule_scope_marker", []string{scope})
 	})
 	if err != nil {
 		t.Fatalf("run submodule marker: %v", err)
@@ -1661,7 +1788,7 @@ func TestRun_GitDirectoryOperandDoesNotDiscoverIgnoredNestedGit(t *testing.T) {
 	t.Chdir(parent)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "parent_ignored_nested_marker", []string{scope}, 0, 0)
+		return run(context.Background(), "parent_ignored_nested_marker", []string{scope})
 	})
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("parent-ignored nested Git should not match through scoped parent, got err=%v out=%q", err, out)
@@ -1671,7 +1798,7 @@ func TestRun_GitDirectoryOperandDoesNotDiscoverIgnoredNestedGit(t *testing.T) {
 	}
 
 	out, err = captureStdout(t, func() error {
-		return run(context.Background(), "parent_ignored_nested_marker", []string{nested}, 0, 0)
+		return run(context.Background(), "parent_ignored_nested_marker", []string{nested})
 	})
 	if err != nil {
 		t.Fatalf("explicit ignored nested Git should still work: %v", err)
@@ -1703,7 +1830,7 @@ func TestRun_GitDirectoryAndExactFileOperandDoNotDuplicateExactFile(t *testing.T
 	t.Chdir(repo)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "git_dir_exact_marker", []string{scope, target}, 0, 0)
+		return run(context.Background(), "git_dir_exact_marker", []string{scope, target})
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -1730,7 +1857,7 @@ func TestRun_CurrentGitDefaultDiscoversVisibleNestedGit(t *testing.T) {
 	t.Chdir(parent)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "default_visible_nested_marker", nil, 0, 0)
+		return run(context.Background(), "default_visible_nested_marker", nil)
 	})
 	if err != nil {
 		t.Fatalf("run nested marker: %v", err)
@@ -1755,7 +1882,7 @@ func TestRun_GitRootOperandDiscoversSubmoduleGitlink(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "root_submodule_marker", []string{parent}, 0, 0)
+		return run(context.Background(), "root_submodule_marker", []string{parent})
 	})
 	if err != nil {
 		t.Fatalf("run submodule marker: %v", err)
@@ -1784,7 +1911,7 @@ func TestRun_CurrentGitDefaultDoesNotDiscoverIgnoredNestedGit(t *testing.T) {
 	t.Chdir(parent)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "default_ignored_nested_marker", nil, 0, 0)
+		return run(context.Background(), "default_ignored_nested_marker", nil)
 	})
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("parent-ignored nested Git should not match through default search, got err=%v out=%q", err, out)
@@ -1794,7 +1921,7 @@ func TestRun_CurrentGitDefaultDoesNotDiscoverIgnoredNestedGit(t *testing.T) {
 	}
 
 	out, err = captureStdout(t, func() error {
-		return run(context.Background(), "default_ignored_nested_marker", []string{nested}, 0, 0)
+		return run(context.Background(), "default_ignored_nested_marker", []string{nested})
 	})
 	if err != nil {
 		t.Fatalf("explicit ignored nested Git should still work: %v", err)
@@ -1843,7 +1970,7 @@ func TestRun_IgnoredFolderOperandSearchesContentAndDiscoversNestedGit(t *testing
 	// An explicitly selected ignored folder is searched as a plain folder
 	// corpus, so its own content is found.
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "scratch_plain_marker", []string{scratch}, 0, 0)
+		return run(context.Background(), "scratch_plain_marker", []string{scratch})
 	})
 	if err != nil {
 		t.Fatalf("explicitly selected ignored folder should be searched, got err=%v", err)
@@ -1855,7 +1982,7 @@ func TestRun_IgnoredFolderOperandSearchesContentAndDiscoversNestedGit(t *testing
 	// A nested Git repo under that folder is still discovered and indexed
 	// as its own corpus, so committed nested content is found.
 	out, err = captureStdout(t, func() error {
-		return run(context.Background(), "nested_committed_marker", []string{scratch}, 0, 0)
+		return run(context.Background(), "nested_committed_marker", []string{scratch})
 	})
 	if err != nil {
 		t.Fatalf("nested Git under selected folder should be discovered, got err=%v out=%q", err, out)
@@ -1865,7 +1992,7 @@ func TestRun_IgnoredFolderOperandSearchesContentAndDiscoversNestedGit(t *testing
 	}
 
 	out, err = captureStdout(t, func() error {
-		return run(context.Background(), "nested_committed_marker", []string{nested}, 0, 0)
+		return run(context.Background(), "nested_committed_marker", []string{nested})
 	})
 	if err != nil {
 		t.Fatalf("explicit nested marker run: %v", err)
@@ -1875,7 +2002,7 @@ func TestRun_IgnoredFolderOperandSearchesContentAndDiscoversNestedGit(t *testing
 	}
 
 	out, err = captureStdout(t, func() error {
-		return run(context.Background(), "nested_ignored_marker", []string{nested}, 0, 0)
+		return run(context.Background(), "nested_ignored_marker", []string{nested})
 	})
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("nested git ignored file should not match, got err=%v out=%q", err, out)
@@ -1907,7 +2034,7 @@ func TestRun_ParentFolderAndExplicitNestedGitRootDoNotDuplicateOrLeak(t *testing
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "explicit_nested_marker", []string{parent, nested}, 0, 0)
+		return run(context.Background(), "explicit_nested_marker", []string{parent, nested})
 	})
 	if err != nil {
 		t.Fatalf("nested marker run: %v", err)
@@ -1917,7 +2044,7 @@ func TestRun_ParentFolderAndExplicitNestedGitRootDoNotDuplicateOrLeak(t *testing
 	}
 
 	out, err = captureStdout(t, func() error {
-		return run(context.Background(), "explicit_nested_ignored_marker", []string{parent, nested}, 0, 0)
+		return run(context.Background(), "explicit_nested_ignored_marker", []string{parent, nested})
 	})
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("nested ignored file should not match, got err=%v out=%q", err, out)
@@ -1953,7 +2080,7 @@ func TestRun_ParentFolderAndNestedGitExactIgnoredFileKeepsFileOwner(t *testing.T
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "parent_nested_exact_marker", []string{parent, target}, 0, 0)
+		return run(context.Background(), "parent_nested_exact_marker", []string{parent, target})
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -1977,7 +2104,7 @@ func TestRun_ParentFolderAndNestedGitExactTrackedFileKeepsFileOwner(t *testing.T
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "parent_nested_tracked_exact_marker", []string{parent, target}, 0, 0)
+		return run(context.Background(), "parent_nested_tracked_exact_marker", []string{parent, target})
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -2010,7 +2137,7 @@ func TestRun_ExternalExactFileDoesNotSearchSibling(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "external_exact_marker", []string{target}, 0, 0)
+		return run(context.Background(), "external_exact_marker", []string{target})
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -2040,7 +2167,7 @@ func TestRun_SymlinkPathOperandFollowsTarget(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "symlink_operand_marker", []string{link}, 0, 0)
+		return run(context.Background(), "symlink_operand_marker", []string{link})
 	})
 	if err != nil {
 		t.Fatalf("expected symlink path operand to follow target, got err=%v out=%q", err, out)
@@ -2077,7 +2204,7 @@ func TestRun_ExternalFolderSymlinkDedupesWithTarget(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "symlink_dedup_marker", []string{link, targetDir}, 0, 0)
+		return run(context.Background(), "symlink_dedup_marker", []string{link, targetDir})
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -2104,7 +2231,7 @@ func TestRun_ExternalFolderWalkSkipsDiscoveredSymlinks(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "folder_walk_symlink_marker", []string{root}, 0, 0)
+		return run(context.Background(), "folder_walk_symlink_marker", []string{root})
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -2130,7 +2257,7 @@ func TestRun_SymlinkInsideWorktreeSearchesResolvedFile(t *testing.T) {
 	t.Chdir(dir)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "git_symlink_inside_marker", []string{link}, 0, 0)
+		return run(context.Background(), "git_symlink_inside_marker", []string{link})
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -2162,7 +2289,7 @@ func TestRun_GitScopeSymlinkOutsideWorktreeRoutedExternal(t *testing.T) {
 	t.Chdir(dir)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "git_symlink_outside_marker", []string{link}, 0, 0)
+		return run(context.Background(), "git_symlink_outside_marker", []string{link})
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -2197,7 +2324,7 @@ func TestRun_CurrentGitExactDirtyFileOperandUsesGitDirtyLayer(t *testing.T) {
 	t.Chdir(dir)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "current_exact_dirty_marker", []string{target}, 0, 0)
+		return run(context.Background(), "current_exact_dirty_marker", []string{target})
 	})
 	if err != nil {
 		t.Fatalf("run current exact dirty file: %v", err)
@@ -2230,7 +2357,7 @@ func TestRun_ExternalGitMetadataOnlyFolderReturnsNoMatch(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	_, err := captureStdout(t, func() error {
-		return run(context.Background(), "metadata_only_marker", []string{folder}, 0, 0)
+		return run(context.Background(), "metadata_only_marker", []string{folder})
 	})
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("expected no match, got %v", err)
@@ -2249,14 +2376,14 @@ func TestRun_WarmFolderSearchDoesNotRequireCtags(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	if _, err := captureStdout(t, func() error {
-		return run(context.Background(), "warm_no_ctags_marker", []string{folder}, 0, 0)
+		return run(context.Background(), "warm_no_ctags_marker", []string{folder})
 	}); err != nil {
 		t.Fatalf("initial run: %v", err)
 	}
 
 	forceMissingCtags(t)
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "warm_no_ctags_marker", []string{folder}, 0, 0)
+		return run(context.Background(), "warm_no_ctags_marker", []string{folder})
 	})
 	if err != nil {
 		t.Fatalf("warm run should not require ctags: %v", err)
@@ -2274,20 +2401,180 @@ func TestRun_WarmGitSearchDoesNotRequireCtags(t *testing.T) {
 	t.Chdir(dir)
 
 	if _, err := captureStdout(t, func() error {
-		return run(context.Background(), "warm_git_no_ctags_marker", nil, 0, 0)
+		return run(context.Background(), "warm_git_no_ctags_marker", nil)
 	}); err != nil {
 		t.Fatalf("initial run: %v", err)
 	}
 
 	forceMissingCtags(t)
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "warm_git_no_ctags_marker", nil, 0, 0)
+		return run(context.Background(), "warm_git_no_ctags_marker", nil)
 	})
 	if err != nil {
 		t.Fatalf("warm Git run should not require ctags: %v", err)
 	}
 	if !strings.Contains(out, "warm_git_no_ctags_marker") {
 		t.Fatalf("expected warm Git result, got:\n%s", out)
+	}
+}
+
+func TestRun_EmptyNativeGitSnapshotsDoNotRequireCtags(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Fatal("requires git on PATH")
+	}
+
+	tests := []struct {
+		name  string
+		setup func(*testing.T) string
+	}{
+		{
+			name: "empty_commit",
+			setup: func(t *testing.T) string {
+				dir := initEmptyGitRepo(t)
+				gitRun(t, dir, "commit", "--allow-empty", "-m", "empty")
+				return dir
+			},
+		},
+		{
+			name: "ignored_only",
+			setup: func(t *testing.T) string {
+				dir := initEmptyGitRepo(t)
+				if err := os.MkdirAll(filepath.Join(dir, ".sourcegraph"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, ".sourcegraph", "ignore"), []byte(".sourcegraph/ignore\nignored.go\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "ignored.go"), []byte("package ignored\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				gitRun(t, dir, "add", ".")
+				gitRun(t, dir, "commit", "-m", "ignored only")
+				return dir
+			},
+		},
+		{
+			name: "gitlink_only",
+			setup: func(t *testing.T) string {
+				dir := initEmptyGitRepo(t)
+				gitRun(t, dir, "commit", "--allow-empty", "-m", "gitlink target")
+				gitlinkOID := gitOutputIn(t, dir, "rev-parse", "HEAD")
+				gitRun(t, dir, "update-index", "--add", "--cacheinfo", "160000,"+gitlinkOID+",submodule")
+				gitRun(t, dir, "commit", "-m", "gitlink only")
+				return dir
+			},
+		},
+		{
+			name: "sha256_empty_commit",
+			setup: func(t *testing.T) string {
+				dir := t.TempDir()
+				cmd := exec.Command("git", "init", "--object-format=sha256", dir)
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Skipf("installed Git does not support SHA-256 repositories: %v: %s", err, out)
+				}
+				gitRun(t, dir, "config", "user.email", "test@test.com")
+				gitRun(t, dir, "config", "user.name", "Test")
+				gitRun(t, dir, "commit", "--allow-empty", "-m", "sha256 empty")
+				return dir
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := tc.setup(t)
+			setTestUserCache(t)
+			t.Chdir(dir)
+			forceMissingCtags(t)
+
+			out, err := captureStdout(t, func() error {
+				return run(context.Background(), "absent_empty_native_marker", nil)
+			})
+			if !errors.Is(err, errNoMatch) || out != "" {
+				t.Fatalf("empty native search: error=%v output=%q", err, out)
+			}
+			paths, err := resolveGitPaths(context.Background(), dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, err := planCurrentGitCorpus(paths)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if shardsExist(plan.indexDir) || readEmptyStateFile(plan.cacheDir) == "" {
+				t.Fatalf("empty native cache has shards=%t marker=%q", shardsExist(plan.indexDir), readEmptyStateFile(plan.cacheDir))
+			}
+		})
+	}
+}
+
+func TestRun_EmptyCommittedFamilyWithDirtyShardUsesWarmPath(t *testing.T) {
+	requireTools(t)
+	for _, tc := range []struct {
+		name  string
+		setup func(*testing.T) string
+	}{
+		{
+			name: "ignored_only",
+			setup: func(t *testing.T) string {
+				dir := initEmptyGitRepo(t)
+				if err := os.MkdirAll(filepath.Join(dir, ".sourcegraph"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, ".sourcegraph", "ignore"), []byte(".sourcegraph/ignore\nignored.go\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "ignored.go"), []byte("package ignored\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				gitRun(t, dir, "add", ".")
+				gitRun(t, dir, "commit", "-m", "ignored only")
+				return dir
+			},
+		},
+		{
+			name: "gitlink_only",
+			setup: func(t *testing.T) string {
+				dir := initEmptyGitRepo(t)
+				gitRun(t, dir, "commit", "--allow-empty", "-m", "gitlink target")
+				gitlinkOID := gitOutputIn(t, dir, "rev-parse", "HEAD")
+				gitRun(t, dir, "update-index", "--add", "--cacheinfo", "160000,"+gitlinkOID+",submodule")
+				gitRun(t, dir, "commit", "-m", "gitlink only")
+				return dir
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := tc.setup(t)
+			if err := os.WriteFile(filepath.Join(dir, "dirty.go"), []byte("package dirty\n// empty_committed_dirty_marker\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			setTestUserCache(t)
+			t.Chdir(dir)
+			if out, err := captureStdout(t, func() error {
+				return run(context.Background(), "empty_committed_dirty_marker", nil)
+			}); err != nil || !strings.Contains(out, "empty_committed_dirty_marker") {
+				t.Fatalf("cold dirty search: error=%v output=%q", err, out)
+			}
+
+			paths, err := resolveGitPaths(context.Background(), dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, err := planCurrentGitCorpus(paths)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(plan.cacheDir, uncommittedManifestFileName), []byte("corrupt"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			forceMissingCtags(t)
+			if out, err := captureStdout(t, func() error {
+				return run(context.Background(), "empty_committed_dirty_marker", nil)
+			}); err != nil || !strings.Contains(out, "empty_committed_dirty_marker") {
+				t.Fatalf("warm dirty search: error=%v output=%q", err, out)
+			}
+		})
 	}
 }
 
@@ -2299,7 +2586,7 @@ func TestRun_GitRepoWithoutRemoteIndexesCommittedContent(t *testing.T) {
 	t.Chdir(dir)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "no_remote_committed_marker", nil, 0, 0)
+		return run(context.Background(), "no_remote_committed_marker", nil)
 	})
 	if err != nil {
 		t.Fatalf("run without remote: %v", err)
@@ -2321,7 +2608,7 @@ func TestRun_ExternalGitExactFileWithoutRemoteUsesGitDirtyLayer(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "external_no_remote_marker", []string{filepath.Join(dir, "app.go")}, 0, 0)
+		return run(context.Background(), "external_no_remote_marker", []string{filepath.Join(dir, "app.go")})
 	})
 	if err != nil {
 		t.Fatalf("run external no-remote file: %v", err)
@@ -2331,7 +2618,7 @@ func TestRun_ExternalGitExactFileWithoutRemoteUsesGitDirtyLayer(t *testing.T) {
 	}
 
 	dirtyOut, err := captureStdout(t, func() error {
-		return run(context.Background(), "external_no_remote_dirty_marker", []string{dirtyPath}, 0, 0)
+		return run(context.Background(), "external_no_remote_dirty_marker", []string{dirtyPath})
 	})
 	if err != nil {
 		t.Fatalf("run external no-remote dirty file: %v", err)
@@ -2355,7 +2642,7 @@ func TestRun_GitRepoNamedUncommittedWithoutRemoteLabelsOnlyDirtyResultUncommitte
 	t.Chdir(dir)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "repo_named_uncommitted", nil, 0, 0)
+		return run(context.Background(), "repo_named_uncommitted", nil)
 	})
 	if err != nil {
 		t.Fatalf("run repo named %q without remote: %v", repoUncommitted, err)
@@ -2376,6 +2663,75 @@ func TestRun_GitRepoNamedUncommittedWithoutRemoteLabelsOnlyDirtyResultUncommitte
 	}
 }
 
+func TestRun_ReservedZoektNameKeepsCommittedFamily(t *testing.T) {
+	requireTools(t)
+	dir := initGitRepo(t, "committed.go", "package committed\n// reserved_name_committed_marker\n")
+	gitRun(t, dir, "config", "zoekt.name", repoUncommitted)
+	setTestUserCache(t)
+	t.Chdir(dir)
+
+	out, err := captureStdout(t, func() error {
+		return run(context.Background(), "reserved_name_committed_marker", nil)
+	})
+	if err != nil || !strings.Contains(out, "reserved_name_committed_marker") {
+		t.Fatalf("search committed file with reserved name: error=%v output=%q", err, out)
+	}
+
+	paths, err := resolveGitPaths(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := planCurrentGitCorpus(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := zoektRepositoryMetadata(t, plan.indexDir)
+	if repository.Name != fallbackGitRepositoryName(dir) {
+		t.Fatalf("repository name=%q, want safe fallback", repository.Name)
+	}
+}
+
+func TestRun_FirstNativeFailureDoesNotOpenLegacyGeneration(t *testing.T) {
+	requireTools(t)
+	repoDir := initGitRepo(t, "legacy.go", "package legacy\n// LEGACY_GENERATION_DECOY\n")
+	paths, currentPlan := planGitTestCorpus(t, repoDir)
+	root := canonicalCorpusPath(paths.RepoDir)
+	commonDir := canonicalCorpusPath(paths.CommonDir)
+	legacyPlan, err := newCorpusPlan(
+		corpusKindGit,
+		rootTypeWorktree,
+		root,
+		"git",
+		"git_worktree", root,
+		"git_common_dir", commonDir,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacyPlan.cacheDir == currentPlan.cacheDir {
+		t.Fatal("native Git identity did not rotate the cache")
+	}
+	snapshot := captureHeadForTest(t, paths.RepoDir)
+	if err := indexNativeGitFull(t.Context(), paths.RepoDir, legacyPlan.indexDir, snapshot, nil, 1); err != nil {
+		t.Fatalf("build legacy-generation decoy: %v", err)
+	}
+	if matches, err := executeUnscopedShardSearchForTest(t.Context(), legacyPlan.indexDir, "LEGACY_GENERATION_DECOY"); err != nil || len(matches) != 1 {
+		t.Fatalf("legacy-generation decoy is not searchable: matches=%v error=%v", matches, err)
+	}
+
+	forceMissingCtags(t)
+	t.Chdir(repoDir)
+	out, err := captureStdout(t, func() error {
+		return run(t.Context(), "LEGACY_GENERATION_DECOY", nil)
+	})
+	if err == nil || errors.Is(err, errNoMatch) {
+		t.Fatalf("first native failure returned error=%v output=%q", err, out)
+	}
+	if out != "" || shardsExist(currentPlan.indexDir) {
+		t.Fatalf("first native failure used another generation: output=%q current_shards=%t", out, shardsExist(currentPlan.indexDir))
+	}
+}
+
 func TestRun_GitColdCacheNoShardFailsWhenIndexingFails(t *testing.T) {
 	dir := initGitRepo(t, "app.go", "package main\n// git_no_usable_shard_marker\n")
 	setTestUserCache(t)
@@ -2383,7 +2739,7 @@ func TestRun_GitColdCacheNoShardFailsWhenIndexingFails(t *testing.T) {
 	forceMissingCtags(t)
 
 	_, err := captureStdout(t, func() error {
-		return run(context.Background(), "git_no_usable_shard_marker", nil, 0, 0)
+		return run(context.Background(), "git_no_usable_shard_marker", nil)
 	})
 	if err == nil {
 		t.Fatal("expected Git indexing failure without shards")
@@ -2415,7 +2771,7 @@ func TestRun_GitColdCacheNoShardSurfacesCommittedIndexerFailure(t *testing.T) {
 	forceFailingCtags(t)
 
 	_, err := captureStdout(t, func() error {
-		return run(context.Background(), "git_no_usable_shard_committed_marker", nil, 0, 0)
+		return run(context.Background(), "git_no_usable_shard_committed_marker", nil)
 	})
 	if err == nil {
 		t.Fatal("expected committed indexing failure without shards")
@@ -2438,7 +2794,7 @@ func TestRun_GitWarmCachePreservesIndexWhenStatusFails(t *testing.T) {
 	t.Chdir(dir)
 
 	if _, err := captureStdout(t, func() error {
-		return run(context.Background(), "git_status_failure_marker", nil, 0, 0)
+		return run(context.Background(), "git_status_failure_marker", nil)
 	}); err != nil {
 		t.Fatalf("initial run: %v", err)
 	}
@@ -2478,7 +2834,7 @@ func TestRun_GitWarmCachePreservesIndexWhenStatusFails(t *testing.T) {
 	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	_, err = captureStdout(t, func() error {
-		return run(context.Background(), "git_status_failure_marker", nil, 0, 0)
+		return run(context.Background(), "git_status_failure_marker", nil)
 	})
 	if err == nil {
 		t.Fatal("expected Git status error")
@@ -2518,7 +2874,7 @@ func TestRun_GitWarmCacheReportsIndexerFailureOnce(t *testing.T) {
 			t.Chdir(dir)
 
 			if _, err := captureStdout(t, func() error {
-				return run(context.Background(), marker, nil, 0, 0)
+				return run(context.Background(), marker, nil)
 			}); err != nil {
 				t.Fatalf("initial run: %v", err)
 			}
@@ -2533,7 +2889,7 @@ func TestRun_GitWarmCacheReportsIndexerFailureOnce(t *testing.T) {
 			logs := captureTestLogs(t, slog.LevelWarn)
 
 			out, err := captureStdout(t, func() error {
-				return run(context.Background(), marker, nil, 0, 0)
+				return run(context.Background(), marker, nil)
 			})
 			if tc.wantStaleMatch {
 				if err != nil || !strings.Contains(out, marker) {
@@ -2576,7 +2932,7 @@ func TestRun_MultiCorpusShowsContextEvenWhenOnlyOneCorpusMatches(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "single_corpus_context_marker", []string{matching, other}, 0, 0)
+		return run(context.Background(), "single_corpus_context_marker", []string{matching, other})
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -2604,7 +2960,7 @@ func TestRun_PipedOutputHasNoANSI(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "ansi_probe_marker", []string{folder}, 0, 0)
+		return run(context.Background(), "ansi_probe_marker", []string{folder})
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -2633,7 +2989,7 @@ func TestRun_ExternalFolderFreshStateMissingShardsRebuilds(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	if _, err := captureStdout(t, func() error {
-		return run(context.Background(), "missing_shard_marker", []string{folder}, 0, 0)
+		return run(context.Background(), "missing_shard_marker", []string{folder})
 	}); err != nil {
 		t.Fatalf("initial run: %v", err)
 	}
@@ -2654,7 +3010,7 @@ func TestRun_ExternalFolderFreshStateMissingShardsRebuilds(t *testing.T) {
 	}
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "missing_shard_marker", []string{folder}, 0, 0)
+		return run(context.Background(), "missing_shard_marker", []string{folder})
 	})
 	if err != nil {
 		t.Fatalf("rerun after missing shards: %v", err)
@@ -2677,7 +3033,7 @@ func TestRun_ExternalFolderFallsBackToStaleV2Shards(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	if _, err := captureStdout(t, func() error {
-		return run(context.Background(), "stale_cached_marker", []string{folder}, 0, 0)
+		return run(context.Background(), "stale_cached_marker", []string{folder})
 	}); err != nil {
 		t.Fatalf("initial run: %v", err)
 	}
@@ -2688,7 +3044,7 @@ func TestRun_ExternalFolderFallsBackToStaleV2Shards(t *testing.T) {
 	forceMissingCtags(t)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "stale_cached_marker", []string{folder}, 0, 0)
+		return run(context.Background(), "stale_cached_marker", []string{folder})
 	})
 	if err != nil {
 		t.Fatalf("stale fallback run: %v", err)
@@ -2710,7 +3066,7 @@ func TestRun_ExternalFolderCapErrorDoesNotSearchStaleShards(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	if _, err := captureStdout(t, func() error {
-		return run(context.Background(), "cap_stale_marker", []string{folder}, 0, 0)
+		return run(context.Background(), "cap_stale_marker", []string{folder})
 	}); err != nil {
 		t.Fatalf("initial run: %v", err)
 	}
@@ -2728,7 +3084,7 @@ func TestRun_ExternalFolderCapErrorDoesNotSearchStaleShards(t *testing.T) {
 	}
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "cap_stale_marker", []string{folder}, 0, 0)
+		return run(context.Background(), "cap_stale_marker", []string{folder})
 	})
 	if !errors.Is(err, errFolderCapExceeded) {
 		t.Fatalf("expected folder cap error, got err=%v out=%q", err, out)
@@ -2746,7 +3102,7 @@ func TestRun_GitDirtyCapErrorDoesNotSearchStaleShards(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	if _, err := captureStdout(t, func() error {
-		return run(context.Background(), "git_cap_stale_marker", []string{repo}, 0, 0)
+		return run(context.Background(), "git_cap_stale_marker", []string{repo})
 	}); err != nil {
 		t.Fatalf("initial run: %v", err)
 	}
@@ -2759,7 +3115,7 @@ func TestRun_GitDirtyCapErrorDoesNotSearchStaleShards(t *testing.T) {
 	defer func() { gitCandidateFileLimit = oldLimit }()
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "git_cap_stale_marker", []string{repo}, 0, 0)
+		return run(context.Background(), "git_cap_stale_marker", []string{repo})
 	})
 	if !errors.Is(err, errGitCapExceeded) {
 		t.Fatalf("expected Git cap error, got err=%v out=%q", err, out)
@@ -2784,7 +3140,7 @@ func TestRun_ExternalFolderNoUsableShardFailsWhenIndexingFails(t *testing.T) {
 	forceMissingCtags(t)
 
 	_, err := captureStdout(t, func() error {
-		return run(context.Background(), "no_usable_shard_marker", []string{folder}, 0, 0)
+		return run(context.Background(), "no_usable_shard_marker", []string{folder})
 	})
 	if err == nil {
 		t.Fatal("expected indexing failure without usable shards")
@@ -3107,23 +3463,10 @@ func TestIntegration_Worktree_NestedUntrackedFileWithStatusConfig(t *testing.T) 
 	}
 }
 
-// TestRun_NestedRepoVenvNotLeakedToParent — end-to-end regression
-// guard for the .venv leak bug (95156aa). User searches a PARENT
-// folder containing a nested git repo whose .gitignore excludes
-// `.venv/`. The walker must discover the nested repo as a boundary
-// and carve out its subtree from the parent folder corpus; the
-// nested git corpus must respect .gitignore (gitindex.IndexGitRepo
-// only indexes tracked files). Net: search must NOT match anything
-// inside .venv.
-//
-// Pre-fix bug: walker descended into the nested repo on the second
-// pass (state pass, after fingerprint pass had already enqueued the
-// boundary), and the parent folder corpus ate the whole working tree
-// including .venv content. Today's TestDedupHitMustSuppressDescent
-// catches it at the mid-layer (newTestPool + scanFolderCorpus); this
-// test exercises the same contract through the production run() path
-// so a regression in main.go's pool wiring or in the walker's
-// fingerprint-vs-state-pass interplay surfaces here.
+// TestRun_NestedRepoVenvNotLeakedToParent checks a repeated parent-folder
+// search that contains a nested Git repository. The parent folder must keep the
+// repository boundary on both scans. Git ignore rules must keep .venv content
+// out of the nested corpus.
 func TestRun_NestedRepoVenvNotLeakedToParent(t *testing.T) {
 	parent := t.TempDir()
 	nested := filepath.Join(parent, "nested-repo")
@@ -3143,9 +3486,8 @@ func TestRun_NestedRepoVenvNotLeakedToParent(t *testing.T) {
 	gitRunIn(t, nested, "add", ".")
 	gitRunIn(t, nested, "commit", "-q", "-m", "initial")
 
-	// Plant gitignored content with a unique marker that we will
-	// search for. If the walker descends into nested-repo under the
-	// PARENT corpus, this file gets indexed and the search will hit.
+	// Add ignored content that would match if the parent walker entered the
+	// nested repository.
 	venvDir := filepath.Join(nested, ".venv")
 	if err := os.MkdirAll(venvDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -3155,10 +3497,8 @@ func TestRun_NestedRepoVenvNotLeakedToParent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Parent-level file so the parent folder corpus has at least one
-	// selected entry after the carve-out — otherwise it's classified
-	// corpusKnownEmpty and the cached state file would short-circuit
-	// the second run's walker before the bug can fire.
+	// Keep one selected file in the parent corpus so the second search scans it
+	// again instead of using an empty-corpus marker.
 	if err := os.WriteFile(filepath.Join(parent, "parent-marker.txt"), []byte("seed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -3169,27 +3509,21 @@ func TestRun_NestedRepoVenvNotLeakedToParent(t *testing.T) {
 	// First run: cold cache. Walker discovers nested boundary,
 	// enqueues git corpus, parent folder corpus carves out the subtree.
 	if _, err := captureStdout(t, func() error {
-		return run(context.Background(), marker, []string{parent}, 0, 0)
+		return run(context.Background(), marker, []string{parent})
 	}); err != nil && !errors.Is(err, errNoMatch) {
 		t.Fatalf("first run: %v", err)
 	}
 
-	// Mutate parent-level content so the second run's fingerprint
-	// pass MUST diverge from the cached value, forcing
-	// ensureFolderCorpusFresh past its line-62 cache-hit short-circuit
-	// into the state pass where the dedup-rejection-descent bug
-	// manifests.
+	// Change parent content so the second fingerprint differs from the cached
+	// value and the search performs a new state scan.
 	if err := os.WriteFile(filepath.Join(parent, "parent-marker.txt"), []byte("seed\nedit\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	// Second run: warm cache + mismatch. ensureFolderCorpusFresh runs
-	// walker twice (fingerprint pass + state pass). PRE-fix the second
-	// pass hit pool dedup → returned false → walker descended → .venv
-	// indexed → search returned matches. POST-fix dedup returns true
-	// → descent suppressed → no match.
+	// The second scan must keep the nested repository boundary when the pool has
+	// already seen that corpus. It must not index .venv as parent-folder content.
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), marker, []string{parent}, 0, 0)
+		return run(context.Background(), marker, []string{parent})
 	})
 	if err != nil && !errors.Is(err, errNoMatch) {
 		t.Fatalf("second run: %v", err)
@@ -3201,7 +3535,7 @@ func TestRun_NestedRepoVenvNotLeakedToParent(t *testing.T) {
 
 // I6 (split case) — a tracked file and a gitignored file of the SAME repo,
 // passed together, are searched by exactly one corpus each: the tracked file
-// via the git index, the ignored file via a folder fallback. Both contents
+// through the Git corpus, the ignored file through a folder fallback. Both
 // are found and neither file is duplicated.
 func TestRun_TrackedAndIgnoredFileOperandsBothSearchedOnce(t *testing.T) {
 	requireTools(t)
@@ -3214,13 +3548,13 @@ func TestRun_TrackedAndIgnoredFileOperandsBothSearchedOnce(t *testing.T) {
 	out, err := captureStdout(t, func() error {
 		return run(context.Background(), "splitneedle", []string{
 			filepath.Join(repo, "tracked.go"), filepath.Join(repo, "secret.txt"),
-		}, 0, 0)
+		})
 	})
 	if err != nil {
 		t.Fatalf("run tracked+ignored split: %v", err)
 	}
 	if !strings.Contains(out, "splitneedle tracked") {
-		t.Fatalf("tracked file content missing (git index), got:\n%s", out)
+		t.Fatalf("tracked file content missing (Git corpus), got:\n%s", out)
 	}
 	if !strings.Contains(out, "splitneedle ignored") {
 		t.Fatalf("ignored file content missing (folder fallback), got:\n%s", out)
@@ -3236,16 +3570,13 @@ func TestRun_TrackedAndIgnoredFileOperandsBothSearchedOnce(t *testing.T) {
 	}
 }
 
-// On a case-insensitive filesystem, a file operand typed with different case
-// than git stored must still be found (routed to the git index with the scope
-// corrected to the real on-disk byte name), not silently missed.
+// On a case-insensitive filesystem, a file operand with different letter case
+// must resolve to the on-disk name used by the Git corpus scope.
 func TestRun_CaseMismatchedFileOperandStillFound(t *testing.T) {
 	requireTools(t)
 
 	repo := initGitRepo(t, "readme.md", "MARKER_CASE_FIX\n")
-	// The bug only exists on case/normalization-insensitive filesystems, so
-	// this regression coverage rides on the CI macOS (APFS) legs; on a
-	// case-sensitive FS the mistyped name is a genuinely different file.
+	// On a case-sensitive filesystem, the other letter case is a different path.
 	if _, err := os.Stat(filepath.Join(repo, "README.md")); err != nil {
 		t.Skip("case-sensitive filesystem; mistyped operand cannot resolve")
 	}
@@ -3253,10 +3584,10 @@ func TestRun_CaseMismatchedFileOperandStillFound(t *testing.T) {
 	t.Chdir(repo)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "MARKER_CASE_FIX", []string{filepath.Join(repo, "README.md")}, 0, 0)
+		return run(context.Background(), "MARKER_CASE_FIX", []string{filepath.Join(repo, "README.md")})
 	})
 	if err != nil {
-		t.Fatalf("case-mismatched file operand should be found via the git index: %v", err)
+		t.Fatalf("case-mismatched file operand should be found through the Git corpus: %v", err)
 	}
 	if !strings.Contains(out, "MARKER_CASE_FIX") {
 		t.Fatalf("expected content via case-corrected git scope, got:\n%s", out)
@@ -3275,7 +3606,7 @@ func TestRun_CurrentGitUntrackedFileOperandSearchesContent(t *testing.T) {
 	t.Chdir(repo)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "UNTRACKED_NEW_MARKER", []string{fresh}, 0, 0)
+		return run(context.Background(), "UNTRACKED_NEW_MARKER", []string{fresh})
 	})
 	if err != nil {
 		t.Fatalf("untracked-new file operand should be searched via the git dirty layer: %v", err)
@@ -3288,10 +3619,8 @@ func TestRun_CurrentGitUntrackedFileOperandSearchesContent(t *testing.T) {
 	}
 }
 
-// Run-level symptom for the leading-colon bug: an ignored file whose name
-// starts with ':' must fall back to a folder corpus and have its content
-// searched. Pre-fix it was misparsed as a pathspec, classified visGit, and
-// silently missed (routed to the git index that excludes it).
+// An ignored file whose name starts with ':' must use a folder corpus so Seek
+// can search its content.
 func TestRun_LeadingColonIgnoredFileOperandSearchesContent(t *testing.T) {
 	requireTools(t)
 
@@ -3301,7 +3630,7 @@ func TestRun_LeadingColonIgnoredFileOperandSearchesContent(t *testing.T) {
 	t.Chdir(repo)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "COLON_IGNORED_MARKER", []string{colon}, 0, 0)
+		return run(context.Background(), "COLON_IGNORED_MARKER", []string{colon})
 	})
 	if err != nil {
 		t.Fatalf("leading-colon ignored file operand should be searched via folder fallback: %v", err)
@@ -3327,7 +3656,7 @@ func TestRun_SymlinkToIgnoredFileSearchesContent(t *testing.T) {
 	t.Chdir(repo)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "SYMLINK_IGNORED_MARKER", []string{link}, 0, 0)
+		return run(context.Background(), "SYMLINK_IGNORED_MARKER", []string{link})
 	})
 	if err != nil {
 		t.Fatalf("symlink to an ignored file should search content via folder fallback: %v", err)
@@ -3349,7 +3678,7 @@ func TestRun_CleanScopedSearchElidesDirtyLayer(t *testing.T) {
 	t.Chdir(repo)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "CLEANSCOPE_MARKER", []string{filepath.Join(repo, "sub")}, 0, 0)
+		return run(context.Background(), "CLEANSCOPE_MARKER", []string{filepath.Join(repo, "sub")})
 	})
 	if err != nil {
 		t.Fatalf("clean scoped search: %v", err)
@@ -3379,7 +3708,7 @@ func TestRun_DirtyScopedSearchReusesCombinedIndex(t *testing.T) {
 	t.Chdir(repo)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "DIRTYSCOPE_MARKER", []string{filepath.Join(repo, "sub")}, 0, 0)
+		return run(context.Background(), "DIRTYSCOPE_MARKER", []string{filepath.Join(repo, "sub")})
 	})
 	if err != nil {
 		t.Fatalf("dirty scoped search: %v", err)
@@ -3407,7 +3736,7 @@ func TestRun_ScopedSearchesShareCommittedIndex(t *testing.T) {
 	sibling := map[string]string{"aaa": "bbb", "bbb": "aaa"}
 	for _, dir := range []string{"aaa", "bbb"} {
 		out, err := captureStdout(t, func() error {
-			return run(context.Background(), "SHARED_MARKER", []string{filepath.Join(repo, dir)}, 0, 0)
+			return run(context.Background(), "SHARED_MARKER", []string{filepath.Join(repo, dir)})
 		})
 		if err != nil {
 			t.Fatalf("scoped search %s: %v", dir, err)
@@ -3443,14 +3772,10 @@ func resultFileBasenames(out string) map[string]bool {
 	return set
 }
 
-// TestScoped_EqualsUnscopedIntersectScope is the durable, version-agnostic
-// regression guard for the Path-C collapse: a scoped search's RESULT SET must
-// equal the unscoped search's result set intersected with the scope. It holds
-// on the pre-Path-C scoped layers (result-set equivalence; only ranking drifts)
-// and is a tautology once scoped == unscoped + And(scope) over one combined
-// index. Exercises every git visibility class (committed, modified, deleted,
-// untracked, renamed) plus an out-of-scope sibling that ALSO matches the term
-// as the discriminator that would expose a scope leak.
+// TestScoped_EqualsUnscopedIntersectScope checks that a scoped result set equals
+// the unscoped result set limited to that scope. It covers committed, modified,
+// deleted, untracked, and renamed files, plus a matching sibling outside the
+// scope.
 func TestScoped_EqualsUnscopedIntersectScope(t *testing.T) {
 	requireTools(t)
 
@@ -3509,6 +3834,22 @@ func TestScoped_EqualsUnscopedIntersectScope(t *testing.T) {
 			unscopedAbsent: []string{"gone.go", "old.go"},
 		},
 		{
+			name:           "file",
+			query:          `QTERM file:keep\.go`,
+			scopedHave:     []string{"keep.go"},
+			scopedAbsent:   []string{"also.go", "gone.go", "old.go", "renamed.go", "new.go", "sib.go", "root.go"},
+			unscopedHave:   []string{"keep.go"},
+			unscopedAbsent: []string{"also.go", "gone.go", "old.go", "renamed.go", "new.go", "sib.go", "root.go"},
+		},
+		{
+			name:           "type-file",
+			query:          "type:file keep",
+			scopedHave:     []string{"keep.go"},
+			scopedAbsent:   []string{"also.go", "gone.go", "old.go", "renamed.go", "new.go", "sib.go", "root.go"},
+			unscopedHave:   []string{"keep.go"},
+			unscopedAbsent: []string{"also.go", "gone.go", "old.go", "renamed.go", "new.go", "sib.go", "root.go"},
+		},
+		{
 			name:           "symbol",
 			query:          "sym:Foo",
 			scopedHave:     []string{"keep.go"},
@@ -3521,13 +3862,13 @@ func TestScoped_EqualsUnscopedIntersectScope(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			scopedOut, err := captureStdout(t, func() error {
-				return run(context.Background(), tc.query, []string{filepath.Join(repo, "sub")}, 0, 0)
+				return run(context.Background(), tc.query, []string{filepath.Join(repo, "sub")})
 			})
 			if err != nil {
 				t.Fatalf("scoped search %q: %v", tc.query, err)
 			}
 			unscopedOut, err := captureStdout(t, func() error {
-				return run(context.Background(), tc.query, nil, 0, 0)
+				return run(context.Background(), tc.query, nil)
 			})
 			if err != nil {
 				t.Fatalf("unscoped search %q: %v", tc.query, err)
@@ -3576,7 +3917,7 @@ func TestRun_OverCapScopedSearchFallsBackToPerScope(t *testing.T) {
 	t.Chdir(repo)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "OVERCAP_MARKER", []string{filepath.Join(repo, "small")}, 0, 0)
+		return run(context.Background(), "OVERCAP_MARKER", []string{filepath.Join(repo, "small")})
 	})
 	if err != nil {
 		t.Fatalf("over-cap scoped search must fall back to per-scope, got err=%v out=%q", err, out)
@@ -3613,7 +3954,7 @@ func TestRun_OverCapScopedSearch_DirtyInScope(t *testing.T) {
 	t.Chdir(repo)
 
 	committedOut, err := captureStdout(t, func() error {
-		return run(context.Background(), "OVERCAP_COMMITTED_MARKER", []string{filepath.Join(repo, "small")}, 0, 0)
+		return run(context.Background(), "OVERCAP_COMMITTED_MARKER", []string{filepath.Join(repo, "small")})
 	})
 	if err != nil {
 		t.Fatalf("over-cap committed scoped search: %v", err)
@@ -3623,7 +3964,7 @@ func TestRun_OverCapScopedSearch_DirtyInScope(t *testing.T) {
 	}
 
 	dirtyOut, err := captureStdout(t, func() error {
-		return run(context.Background(), "OVERCAP_DIRTY_MARKER", []string{filepath.Join(repo, "small")}, 0, 0)
+		return run(context.Background(), "OVERCAP_DIRTY_MARKER", []string{filepath.Join(repo, "small")})
 	})
 	if err != nil {
 		t.Fatalf("over-cap dirty scoped search: %v", err)
@@ -3659,7 +4000,7 @@ func TestRun_OverCapScopedSearchRefreshesDirtyFile(t *testing.T) {
 	scope := []string{filepath.Join(repo, "small")}
 
 	if out, err := captureStdout(t, func() error {
-		return run(context.Background(), "OVERCAP_REFRESH_V1", scope, 0, 0)
+		return run(context.Background(), "OVERCAP_REFRESH_V1", scope)
 	}); err != nil || !strings.Contains(out, "OVERCAP_REFRESH_V1") {
 		t.Fatalf("first dirty search: error=%v output=%q", err, out)
 	}
@@ -3668,7 +4009,7 @@ func TestRun_OverCapScopedSearchRefreshesDirtyFile(t *testing.T) {
 	}
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "OVERCAP_REFRESH_V2_LONGER", scope, 0, 0)
+		return run(context.Background(), "OVERCAP_REFRESH_V2_LONGER", scope)
 	})
 	if err != nil {
 		t.Fatalf("second dirty search: %v", err)
@@ -3707,7 +4048,7 @@ func TestRun_DirtyCapFallbackDoesNotWriteCommittedCapMarker(t *testing.T) {
 	}
 
 	if out, err := captureStdout(t, func() error {
-		return run(context.Background(), "DIRTY_CAP_SCOPE_MARKER", []string{scopeDir}, 0, 0)
+		return run(context.Background(), "DIRTY_CAP_SCOPE_MARKER", []string{scopeDir})
 	}); err != nil || !strings.Contains(out, "DIRTY_CAP_SCOPE_MARKER") {
 		t.Fatalf("dirty-cap fallback: error=%v output=%q", err, out)
 	}
@@ -3719,7 +4060,7 @@ func TestRun_DirtyCapFallbackDoesNotWriteCommittedCapMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := captureStdout(t, func() error {
-		return run(context.Background(), "DIRTY_CAP_SCOPE_MARKER", []string{scopeDir}, 0, 0)
+		return run(context.Background(), "DIRTY_CAP_SCOPE_MARKER", []string{scopeDir})
 	}); err != nil {
 		t.Fatalf("search after dirty file shrank: %v", err)
 	}
@@ -3752,7 +4093,7 @@ func TestRun_CommittedCapMarkerSkipsRepeatedBudgetScan(t *testing.T) {
 	}
 
 	if _, err := captureStdout(t, func() error {
-		return run(context.Background(), "COMMITTED_CAP_FAST_MARKER", []string{scopeDir}, 0, 0)
+		return run(context.Background(), "COMMITTED_CAP_FAST_MARKER", []string{scopeDir})
 	}); err != nil {
 		t.Fatalf("initial committed-cap fallback: %v", err)
 	}
@@ -3780,7 +4121,7 @@ func TestRun_CommittedCapMarkerSkipsRepeatedBudgetScan(t *testing.T) {
 	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "COMMITTED_CAP_FAST_MARKER", []string{scopeDir}, 0, 0)
+		return run(context.Background(), "COMMITTED_CAP_FAST_MARKER", []string{scopeDir})
 	})
 	if err != nil || !strings.Contains(out, "COMMITTED_CAP_FAST_MARKER") {
 		t.Fatalf("cached committed-cap fallback: error=%v output=%q", err, out)
@@ -3826,13 +4167,13 @@ func TestScoped_RankingEqualsUnscopedIntersectScope(t *testing.T) {
 	t.Chdir(repo)
 
 	scopedOut, err := captureStdout(t, func() error {
-		return run(context.Background(), "RANKQ", []string{filepath.Join(repo, "sub")}, 0, 0)
+		return run(context.Background(), "RANKQ", []string{filepath.Join(repo, "sub")})
 	})
 	if err != nil {
 		t.Fatalf("scoped search: %v", err)
 	}
 	unscopedOut, err := captureStdout(t, func() error {
-		return run(context.Background(), "RANKQ", nil, 0, 0)
+		return run(context.Background(), "RANKQ", nil)
 	})
 	if err != nil {
 		t.Fatalf("unscoped search: %v", err)
@@ -3854,9 +4195,8 @@ func TestScoped_RankingEqualsUnscopedIntersectScope(t *testing.T) {
 	}
 }
 
-// A single file operand must match exactly that file (anchored regexp path) and
-// must yield the identical result set as the FileNameSet path — guarding the
-// trigram-assisted scope optimization against a correctness regression.
+// A single file operand must give the same result set through the anchored path
+// expression and the FileNameSet path.
 func TestScoped_FileOperandRegexpEqualsFileNameSet(t *testing.T) {
 	requireTools(t)
 
@@ -3869,7 +4209,7 @@ func TestScoped_FileOperandRegexpEqualsFileNameSet(t *testing.T) {
 	target := filepath.Join(repo, "sub", "keep.go")
 	runFileScope := func() map[string]bool {
 		out, err := captureStdout(t, func() error {
-			return run(context.Background(), "FILEQ", []string{target}, 0, 0)
+			return run(context.Background(), "FILEQ", []string{target})
 		})
 		if err != nil {
 			t.Fatalf("file-operand search: %v", err)
@@ -3927,7 +4267,7 @@ func TestRun_StaleCapMarkerIgnoredWhenUnderCap(t *testing.T) {
 	}
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "STALEMARKER_MARKER", []string{filepath.Join(repo, "sub")}, 0, 0)
+		return run(context.Background(), "STALEMARKER_MARKER", []string{filepath.Join(repo, "sub")})
 	})
 	if err != nil {
 		t.Fatalf("scoped search with stale marker: %v", err)
@@ -3980,7 +4320,7 @@ func TestRace_ConcurrentScopedUnscopedSameRepo(t *testing.T) {
 			}
 			runResults <- concurrentRunResult{
 				scoped: scoped,
-				err:    run(context.Background(), "CONCURRENT_MARKER", operands, 0, 0),
+				err:    run(context.Background(), "CONCURRENT_MARKER", operands),
 			}
 		}(scoped)
 	}
@@ -4015,7 +4355,7 @@ func TestRun_SharedCommittedIndexRebuildsOnHeadChange(t *testing.T) {
 	t.Chdir(repo)
 
 	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "SHARED_V1MARKER", []string{filepath.Join(repo, "sub")}, 0, 0)
+		return run(context.Background(), "SHARED_V1MARKER", []string{filepath.Join(repo, "sub")})
 	})
 	if err != nil {
 		t.Fatalf("v1 scoped search: %v", err)
@@ -4032,7 +4372,7 @@ func TestRun_SharedCommittedIndexRebuildsOnHeadChange(t *testing.T) {
 	gitRunIn(t, repo, "commit", "-m", "v2")
 
 	out2, err := captureStdout(t, func() error {
-		return run(context.Background(), "SHARED_V2MARKER", []string{filepath.Join(repo, "sub")}, 0, 0)
+		return run(context.Background(), "SHARED_V2MARKER", []string{filepath.Join(repo, "sub")})
 	})
 	if err != nil {
 		t.Fatalf("v2 scoped search: %v", err)

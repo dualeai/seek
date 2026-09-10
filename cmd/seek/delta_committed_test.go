@@ -11,9 +11,8 @@ import (
 	"time"
 )
 
-// reindexGit runs one full indexing cycle (committed + uncommitted) against
-// the given repo and corpus plan. Returns the post-index shard count for
-// repoUncommitted to let callers assert on shard accumulation.
+// reindexGit runs one full indexing cycle for the committed and uncommitted
+// families in the given repository and corpus plan.
 func reindexGit(t *testing.T, ctx context.Context, paths gitPaths, plan corpusPlan) {
 	t.Helper()
 	state := mustGitRepoStateIn(t, ctx, paths.RepoDir)
@@ -59,7 +58,7 @@ func TestDeltaCommitted_ModifyFileTombstonesOldContent(t *testing.T) {
 	}
 
 	// Delta-path proof: each delta cycle stacks exactly one new shard on
-	// top of the existing set (Zoekt index/builder.go:585). A silent
+	// top of the existing set when the Zoekt builder finishes. A silent
 	// fallback to a non-delta rebuild would leave shardsAfter == shardsBefore
 	// because the old shard would be replaced rather than supplemented.
 	shardsAfter := committedShardCount(t, plan.indexDir)
@@ -159,8 +158,8 @@ func TestDeltaCommitted_HeadRewindFallsBackCleanly(t *testing.T) {
 	}
 
 	// Hard reset to base — the prior indexed commits still exist in the
-	// repo's reflog, so prepareDeltaBuild can diff against them. After reset,
-	// 4 commits' worth of content should disappear from the index.
+	// repository's reflog, so native delta admission can compare them. After
+	// reset, 4 commits' worth of content should disappear from the index.
 	gitRun(t, dir, "reset", "--hard", "HEAD~4")
 	reindexGit(t, ctx, paths, plan)
 
@@ -214,10 +213,10 @@ func TestDeltaCommitted_RebaseLeavesNoDuplicateHits(t *testing.T) {
 		t.Fatalf("setup must accumulate multiple delta shards (got %d) — delta path may not be engaged", shardsBefore)
 	}
 
-	// Squash + recommit equivalent content under a new history. The prior
-	// indexed commits remain reachable via the reflog, so Zoekt's
-	// prepareDeltaBuild succeeds; the working tree contents are unchanged
-	// so the diff reports no changed files and the cycle is a near-noop.
+	// Squash and recommit equivalent content under a new history. The prior
+	// indexed commits remain reachable through the reflog, so native delta
+	// admission succeeds. The working tree content is unchanged, so diff-tree
+	// reports no changed files and the cycle does little work.
 	// The invariant we care about is search correctness: every previously
 	// committed marker still resolves to exactly one file.
 	gitRun(t, dir, "reset", "--soft", "HEAD~10")
@@ -251,9 +250,8 @@ func TestDeltaCommitted_ShardThresholdTriggersFullRebuild(t *testing.T) {
 	// Record shard count every cycle so we can prove three things:
 	//   (a) delta path is engaged and stacks shards (count grows past 1)
 	//   (b) shard count reaches the threshold (proves seek's growth path)
-	//   (c) the (threshold+1)-th cycle drops the count back to a small
-	//       number (proves Zoekt's DeltaShardNumberFallbackThreshold guard
-	//       fired and seek did NOT keep stacking past the cap).
+	//   (c) the cycle after the cap drops the count to a small number (proves
+	//       Seek's native admission selected a full build instead of stacking).
 	cycles := maxCommittedDeltaShards + 2
 	shardSeries := make([]int, 0, cycles)
 	for i := range cycles {
@@ -307,13 +305,8 @@ func TestDeltaCommitted_ShardThresholdTriggersFullRebuild(t *testing.T) {
 func TestDeltaCommitted_SubmoduleHostStaysSearchable(t *testing.T) {
 	requireTools(t)
 
-	// Reuse the submodule fixture pattern from git_edge_test.go:568. Zoekt
-	// only refuses delta builds for submodules when the caller passes
-	// Options.Submodules=true (zoekt/gitindex/index.go:818). Seek does NOT
-	// enable submodule walking, so the host repo's delta path runs normally
-	// — the submodule directory looks like an opaque blob to gitindex. The
-	// invariant we care about is that adding the submodule plus a follow-up
-	// commit does not break search.
+	// The native committed reader skips gitlinks. The host repository's delta
+	// path must remain searchable after a submodule and a later commit are added.
 	dir := initGitRepo(t, "app.go", "package main\n// submodule_delta_marker\n")
 	subSrc := initEmptyGitRepo(t)
 	if err := os.WriteFile(filepath.Join(subSrc, "sub.go"), []byte("package sub\n"), 0o644); err != nil {

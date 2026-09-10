@@ -14,12 +14,12 @@ import (
 // ===========================================================================
 // Regression tests
 //
-// These tests verify that atomic shard swap and LOCK_SH search protection keep
-// search results stable across reindex boundaries.
+// These tests verify that the shard swap and LOCK_SH search protection keep
+// search results stable across normal reindex boundaries.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// Fix #1: Atomic shard swap — no gap during re-indexing
+// Fix #1: Locked shard swap — no gap during re-indexing
 //
 // Planned Git corpus search refreshes dirty content through the normal
 // freshness path before reading Zoekt shards, so there is no visible gap where

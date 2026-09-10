@@ -22,7 +22,7 @@ var errGitIndexStateChanged = errors.New("git index state changed")
 
 const maxScopedLayerRefreshRetries = 2
 
-// Set via ldflags (-X main.version=...) by make build / GoReleaser.
+// Set via ldflags (-X main.version=...) by the build and release commands.
 var version = ""
 
 func versionString() string {
@@ -148,28 +148,54 @@ func cloneStringSlice(values []string) []string {
 	return out
 }
 
-func run(ctx context.Context, pattern string, pathOperands []string, limit, maxMatches int) error {
-	return runWithSearchConfig(ctx, pattern, pathOperands, limit, maxMatches, defaultSearchConfig())
-}
-
-func runWithSearchConfig(
+func runWithRerankConfig(
 	ctx context.Context,
 	pattern string,
 	pathOperands []string,
 	limit int,
 	maxMatches int,
 	config searchConfig,
+	rerankConfig rerankRunConfig,
 ) error {
 	config.contextMatchLimit = maxMatches
 	config.contextFileLimit = limit
-	userQ, err := parseSearchQuery(pattern)
+	rawQ, userQ, err := parseSearchQueryForms(pattern)
 	if err != nil {
 		return err
+	}
+	rerankPlan, rerankEligible := rerankQueryPlan{}, false
+	if rerankConfig.enabled {
+		rerankPlan, rerankEligible = planRerankQuery(pattern, rawQ)
 	}
 
 	paths, err := resolveDefaultSearchRoot(ctx, pathOperands)
 	if err != nil {
 		return err
+	}
+	type scorerResult struct {
+		scorer rerankScorer
+		err    error
+	}
+	// Start scorer setup before corpus planning so setup overlaps planning and
+	// strict search. Taking the result transfers close ownership of a successful
+	// scorer to re-ranking. Otherwise, the deferred receive drains and closes it.
+	var scorerReady chan scorerResult
+	var scorerTaken bool
+	if rerankEligible && rerankConfig.newScorer != nil {
+		scorerReady = make(chan scorerResult, 1)
+		go func() {
+			scorer, scorerErr := rerankConfig.newScorer(ctx)
+			scorerReady <- scorerResult{scorer: scorer, err: scorerErr}
+		}()
+		defer func() {
+			if scorerTaken {
+				return
+			}
+			result := <-scorerReady
+			if result.scorer != nil {
+				_ = result.scorer.Close()
+			}
+		}()
 	}
 
 	plans, err := planCorpora(ctx, paths, pathOperands)
@@ -177,12 +203,44 @@ func runWithSearchConfig(
 		return err
 	}
 
-	worker := func(wctx context.Context, plan corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
-		return prepareAndSearchCorpus(wctx, plan, paths, userQ, config)
+	searchConfig := config
+	if rerankEligible {
+		// Collect model-only context during the strict search. Every exit from
+		// tryRerankCorpora restores the user's display settings.
+		searchConfig = rerankModelSearchConfig(config)
 	}
-	allResults, dirtyByCorpus, err := runCorpusPool(ctx, plans, worker)
+	allResults, dirtyByCorpus, err := searchCorpora(ctx, plans, paths, userQ, searchConfig)
 	if err != nil {
 		return err
+	}
+	if rerankEligible {
+		factory := rerankConfig.newScorer
+		if scorerReady != nil {
+			factory = func(context.Context) (rerankScorer, error) {
+				if scorerTaken {
+					return nil, errRerankUnavailable
+				}
+				scorerTaken = true
+				result := <-scorerReady
+				return result.scorer, result.err
+			}
+		}
+		reranked, mergedDirty, rerankErr := tryRerankCorpora(
+			ctx,
+			allResults,
+			dirtyByCorpus,
+			plans,
+			paths,
+			config,
+			rerankPlan,
+			factory,
+			searchCorpora,
+		)
+		allResults = reranked
+		dirtyByCorpus = mergedDirty
+		if rerankErr != nil {
+			slog.Debug("Re-ranking failed; using BM25")
+		}
 	}
 
 	if len(allResults) == 0 {
@@ -215,6 +273,19 @@ func runWithSearchConfig(
 	return nil
 }
 
+func searchCorpora(
+	ctx context.Context,
+	plans []corpusPlan,
+	paths *gitPaths,
+	userQ query.Q,
+	config searchConfig,
+) ([]corpusSearchResult, dirtyFilesByCorpus, error) {
+	worker := func(wctx context.Context, plan corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
+		return prepareAndSearchCorpus(wctx, plan, paths, userQ, config)
+	}
+	return runCorpusPool(ctx, plans, worker)
+}
+
 // useColor decides whether to emit ANSI color on the given stream. Color is ON
 // by default and disabled only by constraints, in precedence order: NO_COLOR
 // (present and non-empty) forces off; CLICOLOR_FORCE (present, any value)
@@ -242,9 +313,21 @@ func prepareAndSearchCorpus(
 	config searchConfig,
 ) ([]corpusSearchResult, dirtyFileSet, error) {
 	for attempt := 0; ; attempt++ {
-		results, dirty, err := prepareAndSearchCorpusOnce(ctx, plan, paths, userQ, config)
+		// Keep changes to the selected scoped fallback for the repair step below.
+		results, dirty, err := prepareAndSearchCorpusOnce(ctx, &plan, paths, userQ, config)
 		if errors.Is(err, errGitIndexStateChanged) && plan.dirtyScope != nil && attempt < maxScopedLayerRefreshRetries {
 			slog.Debug("scoped git index changed during search; retrying", "root", plan.root, "attempt", attempt+1)
+			continue
+		}
+		// Invalidate the manifest so the retry rebuilds the committed family or a
+		// complete folder or scoped family. Keep current shards until publication.
+		if errors.Is(err, errShardUnloadable) && attempt == 0 {
+			// Repair the dir the search actually read. A scoped over-cap search
+			// is served from scopedIndexDir, so clearing the combined corpus's
+			// manifest would leave the damaged fallback unrepaired and force a
+			// full rebuild of the healthy combined corpus.
+			removeFamilyManifest(plan.searchIndexDir())
+			slog.Warn("Index damage detected; rebuilding the corpus", "root", plan.root, "error", err)
 			continue
 		}
 		return results, dirty, err
@@ -253,11 +336,19 @@ func prepareAndSearchCorpus(
 
 func prepareAndSearchCorpusOnce(
 	ctx context.Context,
-	plan corpusPlan,
+	planp *corpusPlan,
 	paths *gitPaths,
 	userQ query.Q,
 	config searchConfig,
 ) ([]corpusSearchResult, dirtyFileSet, error) {
+	plan := *planp
+	// Each attempt selects its scoped fallback again. Do not reuse the selection
+	// from a prior attempt.
+	plan.scopedStateHash = ""
+	// Publish scoped-fallback selection back to the caller so its damage repair
+	// targets the directory this search actually read.
+	defer func() { *planp = plan }()
+
 	var dirtyFiles dirtyFileSet
 	var indexState corpusIndexState
 
@@ -442,27 +533,29 @@ func ensureCombinedGitCorpus(ctx context.Context, plan corpusPlan, paths gitPath
 	}
 
 	currentState := gitCorpusStateHash(paths, state)
-	hasShards := shardsExist(plan.indexDir)
-	clearCommitted := noHeadHasCommittedArtifacts(plan.indexDir, state.HeadSHA)
+	// Use one directory scan so all integrity checks describe the same state.
+	sc, scErr := scanFamilyOptional(plan.indexDir)
+	hasShards := scErr == nil && sc.hasShard() &&
+		committedSnapshotReady(plan.cacheDir, plan.indexDir, state, sc) &&
+		sc.matchesManifest(plan.indexDir)
+	clearCommitted := state.HeadSHA == "no-head" && sc.hasMember(familyCommitted)
 	// A leftover .swapping marker means a prior publish was interrupted and the
 	// shards may be torn; force the build path so recoverIncompleteSwap runs even
 	// when state otherwise looks current.
 	swapPending := readCacheFile(plan.cacheDir, swappingMarkerFile) != ""
 	needBuild := currentState != cachedState || !hasShards || swapPending || clearCommitted
-	if (currentState != cachedState || !hasShards || clearCommitted) && gitCorpusKnownEmpty(ctx, paths, state) {
-		if cachedState == currentState && !hasShards && !clearCommitted {
-			return corpusKnownEmpty, nil
-		}
-		marked, err := markGitCorpusKnownEmpty(ctx, plan, state, currentState)
-		if err != nil {
-			return corpusSearchable, err
-		}
-		if marked {
-			return corpusKnownEmpty, nil
-		}
+	if !swapPending && !clearCommitted && cachedState == currentState && !hasShards &&
+		readEmptyStateFile(plan.cacheDir) == currentState {
+		return corpusKnownEmpty, nil
 	}
 
 	if needBuild {
+		// Remove a non-directory entry at the index path before MkdirAll.
+		if st, statErr := os.Lstat(plan.indexDir); statErr == nil && !st.IsDir() {
+			if rmErr := os.Remove(plan.indexDir); rmErr != nil {
+				return corpusSearchable, fmt.Errorf("remove non-directory at index path: %w", rmErr)
+			}
+		}
 		if err := os.MkdirAll(plan.indexDir, 0o755); err != nil {
 			return corpusSearchable, fmt.Errorf("create index directory: %w", err)
 		}
@@ -474,6 +567,9 @@ func ensureCombinedGitCorpus(ctx context.Context, plan corpusPlan, paths gitPath
 				return corpusSearchable, err
 			}
 			reportStaleIndexWarning(err)
+		}
+		if readEmptyStateFile(plan.cacheDir) == currentState && !shardsExist(plan.indexDir) {
+			return corpusKnownEmpty, nil
 		}
 	}
 	return corpusSearchable, nil
@@ -539,9 +635,9 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 		return state, st, nil
 	}
 
-	// Wholesale rebuild into a temp dir (committed git-* + uncommitted_*), then
-	// publish atomically. The fallback always force-rebuilds uncommitted
-	// (cachedState ""), so there is no delta baseline to seed.
+	// Rebuild committed and uncommitted shard families in a temporary directory,
+	// then publish them under the lock. The fallback always force-rebuilds
+	// uncommitted (cachedState ""), so there is no delta baseline to seed.
 	buildDir, err := newBuildDir(indexDir)
 	if err != nil {
 		return repoState{}, corpusSearchable, err
@@ -549,20 +645,17 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 	defer discardBuildDir(buildDir)
 
 	if treeish != "no-head" {
-		_, selected, err := scanGitCommittedScopeBudgetAt(ctx, paths.RepoDir, treeish, plan.dirtyScope, gitCandidateFileLimit, gitCorpusIndexedByteLimit)
-		if err != nil {
+		snapshot, ok, err := captureGitSnapshot(ctx, paths.RepoDir, treeish)
+		if err != nil || !ok {
+			if err == nil {
+				err = fmt.Errorf("captured scoped Git state has no commit")
+			}
 			deleteStateFiles(cacheDir)
 			return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, indexDir, err)
 		}
-		if selected > 0 {
-			if err := checkCtagsCached(); err != nil {
-				deleteStateFiles(cacheDir)
-				return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, indexDir, err)
-			}
-			if _, err := indexScopedCommitted(ctx, paths.RepoDir, buildDir, treeish, plan.dirtyScope, indexParallelism()); err != nil {
-				deleteStateFiles(cacheDir)
-				return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, indexDir, err)
-			}
+		if err := indexNativeGitFull(ctx, paths.RepoDir, buildDir, snapshot, plan.dirtyScope, indexParallelism()); err != nil {
+			deleteStateFiles(cacheDir)
+			return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, indexDir, err)
 		}
 	}
 
@@ -586,9 +679,10 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 		return repoState{}, corpusSearchable, err // discard (defer)
 	}
 
-	// Publish the whole fallback generation atomically — shards + state under one
-	// publish-lock hold (see publishGeneration: avoids serving new shards with a
-	// stale-matching state label after a crash + content revert).
+	// Publish the whole fallback generation under one lock hold. On success,
+	// this keeps normal readers from seeing new shards with the prior state label.
+	// See publishGeneration for interrupted-swap recovery and the unlocked-read
+	// timeout.
 	if err := publishGeneration(ctx, cacheDir, indexDir, buildDir, familyAll, func() error {
 		return writeScopedFallbackState(cacheDir, treeish, currentState, !shardsExist(indexDir))
 	}); err != nil {
@@ -611,7 +705,10 @@ func scopedFallbackCached(cacheDir, indexDir, currentState string) (corpusIndexS
 	if readStateFile(cacheDir) != currentState {
 		return corpusSearchable, false
 	}
-	if shardsExist(indexDir) {
+	// A presence check cannot detect a missing shard, a changed size, or a
+	// missing sidecar. Validate the fallback against its family manifest.
+	sc, err := scanFamilyOptional(indexDir)
+	if err == nil && sc.hasShard() && sc.matchesManifest(indexDir) {
 		return corpusSearchable, true
 	}
 	if readEmptyStateFile(cacheDir) == currentState {
@@ -741,78 +838,14 @@ func repoStateForDirtyScope(state repoState, scope *gitDirtyScope) repoState {
 	}
 }
 
-func gitCorpusKnownEmpty(ctx context.Context, paths gitPaths, state repoState) bool {
-	if len(state.Files) > 0 {
-		return false
-	}
-	if state.HeadSHA == "no-head" {
-		return true
-	}
-
-	cmd := gitCmd(ctx, "rev-parse", "HEAD^{tree}")
-	cmd.Dir = paths.RepoDir
-	out, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(out)) == emptyGitTreeSHA
-}
-
-func markGitCorpusKnownEmpty(ctx context.Context, plan corpusPlan, state repoState, stateHash string) (bool, error) {
-	if err := os.MkdirAll(plan.indexDir, 0o755); err != nil {
-		return false, fmt.Errorf("create index directory: %w", err)
-	}
-
-	buildFd, acquired, err := acquireBuildLock(ctx, plan.cacheDir, plan.indexDir)
-	if err != nil {
-		return false, err
-	}
-	if !acquired {
-		slog.Debug("Another process is indexing; serving current index")
-		return false, nil
-	}
-	defer releaseLock(buildFd)
-
-	// Clear shards under the publish lock so readers (SH) never see the empty
-	// dir mid-clean.
-	pub, err := acquirePublishLock(ctx, plan.cacheDir)
-	if err != nil {
-		if errors.Is(err, errCorpusEvicted) {
-			return false, nil
-		}
-		return false, err
-	}
-	defer releaseLock(pub)
-
-	cleanAllShards(plan.indexDir)
-	deleteUncommittedManifest(plan.cacheDir)
-	// cleanAllShards already removed any torn shards a prior interrupted swap
-	// left, so a lingering .swapping marker would only force needless rebuilds
-	// of this now-known-empty corpus — clear it.
-	removeCacheFile(plan.cacheDir, swappingMarkerFile)
-	if state.HeadSHA == "no-head" {
-		_ = os.Remove(filepath.Join(plan.cacheDir, headFile))
-		_ = os.Remove(filepath.Join(plan.cacheDir, headFile+".tmp"))
-	} else if err := writeHeadFile(plan.cacheDir, state.HeadSHA); err != nil {
-		slog.Warn("Failed to write head file", "error", err)
-	}
-	if err := writeStateFile(plan.cacheDir, stateHash); err != nil {
-		return false, fmt.Errorf("write state file: %w", err)
-	}
-	return true, nil
-}
-
 func searchPlannedCorpusParsed(
 	ctx context.Context,
 	plan corpusPlan,
 	userQ query.Q,
 	config searchConfig,
 ) ([]zoekt.FileMatch, error) {
-	// Hold LOCK_SH (the publish/read lock) across the entire glob+open+search so
-	// a concurrent temp-swap publish (brief LOCK_EX) can never interleave and
-	// tear the shard set — readers observe exactly the pre- or post-swap
-	// generation. A long build holds only the separate .build.lock, so it never
-	// blocks a reader; only the ms-scale publish does.
+	// Hold the shared publish lock while listing, opening, and searching shards.
+	// A publisher cannot replace the shard family during that work.
 	targets := searchLockTargets(plan)
 	locks := make([]*os.File, 0, len(targets))
 	for _, target := range targets {

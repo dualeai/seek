@@ -489,7 +489,7 @@ func TestCleanUncommittedShards_RemovesMatching(t *testing.T) {
 
 	cleanUncommittedShards(dir)
 
-	entries := familyShardFiles(dir, familyAll)
+	entries := familyShardFilesForTest(t, dir, familyAll)
 	if len(entries) != 2 {
 		t.Fatalf("remaining artifacts=%v, want committed pair", entries)
 	}
@@ -871,136 +871,6 @@ func requireGit(tb testing.TB) {
 	}
 }
 
-func TestGitCommittedIndexBudget_FileCap(t *testing.T) {
-	requireGit(t)
-
-	dir := initGitRepo(t, "app.go", "package main\n// committed_budget_marker\n")
-	budget, err := scanGitCommittedIndexBudget(context.Background(), dir, 0, maxCorpusIndexedBytes)
-	if !errors.Is(err, errGitCapExceeded) {
-		t.Fatalf("expected git cap error, got budget=%+v err=%v", budget, err)
-	}
-	capErr, ok := errors.AsType[indexCapExceededError](err)
-	if !ok {
-		t.Fatalf("error=%v, want indexCapExceededError", err)
-	}
-	if capErr.metric != indexCapCandidateFiles || capErr.current != 1 || capErr.limit != 0 {
-		t.Fatalf("cap error=%+v, want metric=%q current=1 limit=0", capErr, indexCapCandidateFiles)
-	}
-}
-
-func TestGitCommittedIndexBudget_IndexedByteCap(t *testing.T) {
-	requireGit(t)
-
-	const content = "package main\n// committed_byte_budget_marker\n"
-	dir := initGitRepo(t, "app.go", content)
-	budget, err := scanGitCommittedIndexBudget(context.Background(), dir, maxGitCandidateFiles, 0)
-	if !errors.Is(err, errGitCapExceeded) {
-		t.Fatalf("expected git cap error, got budget=%+v err=%v", budget, err)
-	}
-	capErr, ok := errors.AsType[indexCapExceededError](err)
-	if !ok {
-		t.Fatalf("error=%v, want indexCapExceededError", err)
-	}
-	wantBytes := int64(len(content))
-	if budget.indexedBytes != wantBytes || capErr.metric != indexCapIndexedBytes || capErr.current != wantBytes || capErr.limit != 0 {
-		t.Fatalf("cap error=%+v budget=%+v, want indexed bytes=%d limit=0", capErr, budget, wantBytes)
-	}
-}
-
-func TestGitCommittedIndexBudget_SkipsOversizeBlobsForByteCap(t *testing.T) {
-	requireGit(t)
-
-	dir := initEmptyGitRepo(t)
-	large := filepath.Join(dir, "large.bin")
-	if err := os.WriteFile(large, nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Truncate(large, maxIndexedDocumentBytes+1); err != nil {
-		t.Fatal(err)
-	}
-	gitRun(t, dir, "add", "large.bin")
-	gitRun(t, dir, "commit", "-m", "add large")
-
-	budget, err := scanGitCommittedIndexBudget(context.Background(), dir, maxGitCandidateFiles, 0)
-	if err != nil {
-		t.Fatalf("oversize blob should not consume indexed byte budget, got budget=%+v err=%v", budget, err)
-	}
-	if budget.candidates != 1 {
-		t.Fatalf("expected one candidate blob, got %+v", budget)
-	}
-	if budget.indexedBytes != 0 {
-		t.Fatalf("oversize blob should not count as indexed bytes, got %+v", budget)
-	}
-}
-
-func TestGitCommittedScopeBudget_IgnoresTrackedSibling(t *testing.T) {
-	requireGit(t)
-
-	dir := initEmptyGitRepo(t)
-	platform := filepath.Join(dir, "platform")
-	other := filepath.Join(dir, "other")
-	if err := os.MkdirAll(platform, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(other, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(platform, "empty.go"), nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(other, "large.go"), []byte("package other\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitRun(t, dir, "add", ".")
-	gitRun(t, dir, "commit", "-m", "add scoped and sibling files")
-
-	scope, err := buildGitDirtyScope(dir, []string{platform}, nil)
-	if err != nil {
-		t.Fatalf("build scope: %v", err)
-	}
-	budget, selected, err := scanGitCommittedScopeBudgetAt(context.Background(), dir, "HEAD", scope, maxGitCandidateFiles, 0)
-	if err != nil {
-		t.Fatalf("out-of-scope tracked sibling should not consume scoped byte budget, got budget=%+v err=%v", budget, err)
-	}
-	if selected != 1 || budget.candidates != 1 {
-		t.Fatalf("expected one in-scope committed blob, got selected=%d budget=%+v", selected, budget)
-	}
-}
-
-func TestGitCommittedScopeBudgetAtUsesCapturedTreeish(t *testing.T) {
-	requireGit(t)
-
-	dir := initEmptyGitRepo(t)
-	platform := filepath.Join(dir, "platform")
-	if err := os.MkdirAll(platform, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(platform, "empty.go"), nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitRun(t, dir, "add", ".")
-	gitRun(t, dir, "commit", "-m", "add zero byte scoped file")
-	capturedHead := gitOutputIn(t, dir, "rev-parse", "HEAD")
-
-	if err := os.WriteFile(filepath.Join(platform, "large.go"), []byte("package platform\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitRun(t, dir, "add", ".")
-	gitRun(t, dir, "commit", "-m", "add live head sibling")
-
-	scope, err := buildGitDirtyScope(dir, []string{platform}, nil)
-	if err != nil {
-		t.Fatalf("build scope: %v", err)
-	}
-	budget, selected, err := scanGitCommittedScopeBudgetAt(context.Background(), dir, capturedHead, scope, maxGitCandidateFiles, 0)
-	if err != nil {
-		t.Fatalf("captured treeish budget should ignore later live HEAD files, got budget=%+v err=%v", budget, err)
-	}
-	if selected != 1 || budget.candidates != 1 || budget.indexedBytes != 0 {
-		t.Fatalf("expected only captured zero-byte file, got selected=%d budget=%+v", selected, budget)
-	}
-}
-
 func TestIndexScopedCommittedUsesCapturedTreeish(t *testing.T) {
 	requireTools(t)
 
@@ -1027,12 +897,13 @@ func TestIndexScopedCommittedUsesCapturedTreeish(t *testing.T) {
 		t.Fatalf("build scope: %v", err)
 	}
 	indexDir := filepath.Join(t.TempDir(), "index")
-	indexedAny, err := indexScopedCommitted(context.Background(), dir, indexDir, capturedHead, scope, indexParallelism())
+	snapshot, ok, err := captureGitSnapshot(context.Background(), dir, capturedHead)
+	if err != nil || !ok {
+		t.Fatalf("capture treeish: ok=%t error=%v", ok, err)
+	}
+	err = indexNativeGitFull(context.Background(), dir, indexDir, snapshot, scope, indexParallelism())
 	if err != nil {
 		t.Fatalf("index captured treeish: %v", err)
-	}
-	if !indexedAny {
-		t.Fatal("captured treeish should produce a searchable scoped shard")
 	}
 
 	oldMatches, err := executeUnscopedShardSearchForTest(context.Background(), indexDir, "captured_treeish_old_marker")
@@ -1463,7 +1334,7 @@ func TestStateCaching_BothSucceed_CleanFileChangesAfterStateCapture(t *testing.T
 		t.Fatalf("indexing failed: %v", err)
 	}
 
-	// State file IS written (mutation not visible to re-stat of empty file list).
+	// The state file is written because the metadata check has no files to read.
 	// This is intentional: the next search's git status call will detect the
 	// dirty file, produce a different hash, and trigger re-indexing.
 	cached := readStateFile(plan.cacheDir)
@@ -1649,6 +1520,39 @@ func TestStateCaching_StaleCapturedHeadDiscardsBuild(t *testing.T) {
 	}
 }
 
+func TestStateCaching_ColdUnbornSnapshotRejectsFirstCommit(t *testing.T) {
+	requireTools(t)
+	dir := initEmptyGitRepo(t)
+	ctx := context.Background()
+	paths, plan := planGitTestCorpus(t, dir)
+	state := mustGitRepoStateIn(t, ctx, dir)
+	if state.HeadSHA != "no-head" {
+		t.Fatalf("initial HEAD=%q, want no-head", state.HeadSHA)
+	}
+	stateHash := gitCorpusStateHash(paths, state)
+
+	if err := os.WriteFile(filepath.Join(dir, "first.go"), []byte("package first\n// first_commit_after_unborn_capture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, dir, "add", "first.go")
+	gitRunIn(t, dir, "commit", "-m", "first")
+
+	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
+		t.Fatal(err)
+	}
+	if cached := readStateFile(plan.cacheDir); cached != "" {
+		t.Fatalf("stale unborn snapshot wrote state %q", cached)
+	}
+	if shardsExist(plan.indexDir) {
+		t.Fatal("stale unborn snapshot published shards")
+	}
+
+	files, err := runSeekInPlannedGitCorpus(ctx, "first_commit_after_unborn_capture", paths, plan)
+	if err != nil || len(files) != 1 {
+		t.Fatalf("fresh first-commit search: files=%v error=%v", files, err)
+	}
+}
+
 func TestStateCaching_StaleAValidationKeepsPublishedBState(t *testing.T) {
 	requireTools(t)
 
@@ -1708,7 +1612,8 @@ func TestStateCaching_NewUntrackedFileAfterStateCapture(t *testing.T) {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
-	// Restat doesn't detect new file (not in state.Files) — state IS written
+	// The metadata check does not detect the new file because it is not in
+	// state.Files. The state file is written.
 	cached := readStateFile(plan.cacheDir)
 
 	if cached == "" {
@@ -1741,8 +1646,7 @@ func TestStateCaching_CommittedFailureClearsState(t *testing.T) {
 	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 
-	// Remove the .git directory to make committed indexing fail
-	// (gitindex.IndexGitRepo needs a valid git repo)
+	// Remove .git to make the native committed reader fail.
 	if err := os.RemoveAll(filepath.Join(dir, ".git")); err != nil {
 		t.Fatal(err)
 	}
@@ -1877,8 +1781,8 @@ func TestStateCaching_DoubleCheck_SkipsRedundantIndex(t *testing.T) {
 }
 
 // TestStateCaching_StaleFallback_DoesNotWriteState verifies that when another
-// builder holds the build lock AND a usable index exists, runIndexingWithCache
-// SKIPS the build (serving current shards) and does NOT write state.
+// builder holds the build lock and a usable index exists, runIndexingWithCache
+// skips the build, serves current shards, and does not write state.
 func TestStateCaching_StaleFallback_DoesNotWriteState(t *testing.T) {
 	requireTools(t)
 

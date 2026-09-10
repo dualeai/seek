@@ -7,18 +7,22 @@ import (
 
 const (
 	// maxIndexedDocumentBytes is the shared per-document limit passed to
-	// Zoekt as index.Options.SizeMax. Every seek-side reader rejects files
-	// larger than this so we never read content Zoekt will discard.
+	// Zoekt as index.Options.SizeMax. Seek-side readers do not read bodies above
+	// this limit, so they do not load content that Zoekt will discard.
 	//
 	// 100 MiB accommodates vendored libraries, generated JSON/CSV dumps,
 	// and large data files that occasionally appear in source trees.
-	// Files above this cap are skipped at read time with a slog.Warn.
+	// For a selected oversize blob, committed Git emits a name-only TooLarge
+	// document. Folder and dirty readers skip the file; the dirty reader also
+	// logs a warning.
 	maxIndexedDocumentBytes = 100 * 1024 * 1024 // 100 MiB
 
-	// maxCorpusIndexedBytes limits selected content admitted to one folder
-	// corpus or one Git index family. Git applies the limit separately to its
-	// committed and working-tree families. This is a work limit, not a bound
-	// on process memory.
+	// maxCorpusIndexedBytes limits content work for one folder corpus or one
+	// Git index family. Before ignore filtering, the committed reader counts the
+	// sizes of candidate blobs at or below maxIndexedDocumentBytes. The folder
+	// and dirty readers count selected content.
+	// Git applies the limit separately to its committed and working-tree
+	// families. This is a work limit, not a process-memory bound.
 	maxCorpusIndexedBytes = 10 * 1024 * 1024 * 1024 // 10 GiB
 
 	// Git has a higher file-count budget than raw folders because Git
@@ -28,8 +32,9 @@ const (
 	maxGitCandidateFiles    = 10_000_000
 	maxFolderCandidateFiles = 1_000_000
 
-	// Per-file limits. Both reader paths honor maxIndexedDocumentBytes
-	// directly so there's one source of truth.
+	// maxGitDirtyFileSize keeps the dirty reader on the shared per-document
+	// limit. maxFolderIndexedBytes keeps the folder reader on the shared
+	// aggregate corpus limit.
 	maxGitDirtyFileSize   = maxIndexedDocumentBytes
 	maxFolderIndexedBytes = maxCorpusIndexedBytes
 
@@ -45,20 +50,19 @@ const (
 	// not covered, so this value does not bound process RSS.
 	maxInFlightBytes = 6 * maxIndexedDocumentBytes * corpusWorkerCap
 
-	// defaultIndexWindowBytes caps doc weight per windowed rotation in
-	// indexDocuments. Each of corpusWorkerCap concurrent consumers may
-	// accumulate up to this much pending weight before rotating; the
-	// global semaphore must accommodate every consumer's window plus
-	// one in-rotation max-sized reader Acquire concurrently. The
-	// formula keeps N*window + 2*doc ≤ budget; the compile-time guard below
-	// pins this invariant and caps_invariant_test.go reports readable failures.
+	// defaultIndexWindowBytes sets the document-weight rotation point in
+	// indexDocumentsWithRepository. A consumer rotates when its pending weight
+	// reaches or passes this point, so one document can take it past the point.
+	// The formula keeps headroom beyond N rotation points: N*window + 2*doc is
+	// within the semaphore budget. This is not an exact bound on pending weight
+	// or process memory. The compile-time checks below enforce these limits.
 	defaultIndexWindowBytes = (maxInFlightBytes - 2*maxIndexedDocumentBytes) / (2 * corpusWorkerCap)
 )
 
-// indexWindowBytes is the live rotation threshold consumed by
-// indexDocuments. Var (not const) so tests can shrink it via
-// swapIndexWindowBytesForTest under testReadSemMu — production
-// callers treat as read-only.
+// indexWindowBytes is the live rotation threshold for
+// indexDocumentsWithRepository and the payload limit for native Git delta
+// admission. It is a variable so tests can shrink it through
+// swapIndexWindowBytesForTest; production callers treat it as read-only.
 var indexWindowBytes int64 = defaultIndexWindowBytes
 
 var (
@@ -66,18 +70,17 @@ var (
 	gitCorpusIndexedByteLimit int64 = maxCorpusIndexedBytes
 )
 
-// Compile-time invariant: a single max-sized file fits within the
-// in-flight budget. Without this, a max-sized Acquire could block
-// forever on a non-cancellable context (golang/go#59002). The uint
-// cast underflows at compile time if the difference is negative.
-const _ = uint(maxInFlightBytes - maxIndexedDocumentBytes)
-
-// Compile-time windowed-fit invariant: N concurrent consumers each
-// accumulating up to defaultIndexWindowBytes plus one in-rotation
-// max-sized reader Acquire (= 2 × maxIndexedDocumentBytes for the
-// in-flight tip + the new reader) must fit within maxInFlightBytes.
-// Otherwise readers can wait while every consumer is inside Finish.
-const _ = uint(maxInFlightBytes - (corpusWorkerCap*defaultIndexWindowBytes + 2*maxIndexedDocumentBytes))
+// These casts underflow at compile time if an invariant is false. One worker
+// and one document window are the minimum values that keep indexing useful. A
+// maximum-sized file must fit in the in-flight budget to prevent a permanent
+// Acquire wait on a non-cancellable context (golang/go#59002). The final check
+// keeps N rotation points and two maximum-sized documents within that budget.
+const (
+	_ = uint(corpusWorkerCap - 1)
+	_ = uint(defaultIndexWindowBytes - maxIndexedDocumentBytes)
+	_ = uint(maxInFlightBytes - maxIndexedDocumentBytes)
+	_ = uint(maxInFlightBytes - (corpusWorkerCap*defaultIndexWindowBytes + 2*maxIndexedDocumentBytes))
+)
 
 var (
 	errGitCapExceeded = errors.New("git cap exceeded")

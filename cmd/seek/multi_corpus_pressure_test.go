@@ -35,9 +35,8 @@ func TestSequentialCorpora_SemaphoreDrainsBetweenPlans(t *testing.T) {
 		if err != nil {
 			t.Fatalf("corpus %s ensureFolderCorpusFresh: %v", label, err)
 		}
-		// Indexing-happened guard: a no-op regression would still
-		// pass the leak check below. Asserting shard count rules
-		// out the silent-success class.
+		// A shard proves that this corpus reached the indexing path before the
+		// semaphore check.
 		if n := repositoryShardCount(plan.indexDir, folderRepoName(plan)); n == 0 {
 			t.Fatalf("corpus %s: no shards produced", label)
 		}
@@ -47,10 +46,9 @@ func TestSequentialCorpora_SemaphoreDrainsBetweenPlans(t *testing.T) {
 	}
 }
 
-// TestSequentialCorpora_ThreeWayMix — large + empty + medium folders
-// in sequence. Verifies the empty-corpus branch (zero-doc indexer
-// path, indexer.go:768 cleanRepositoryShards) does not leak weight
-// and that mixing sizes does not break drain between plans.
+// TestSequentialCorpora_ThreeWayMix processes large, empty, and medium folders
+// in sequence. It checks that the known-empty path does not leak weight and
+// that each plan releases its weight.
 func TestSequentialCorpora_ThreeWayMix(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)

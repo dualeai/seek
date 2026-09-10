@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"sync"
@@ -46,6 +46,7 @@ type searchConfig struct {
 	afterOnly         bool
 	contextMatchLimit int
 	contextFileLimit  int
+	resultFileLimit   int
 	contextGitCorpus  bool
 	contextDirtyFiles dirtyFileSet
 }
@@ -95,26 +96,26 @@ func openShard(path string) (zoekt.Searcher, error) {
 	return s, nil
 }
 
-// loadShards opens all .zoekt shard files in indexDir and returns individual
-// zoekt.Searcher instances. This is faster than search.NewDirectorySearcher
-// because it skips directory-watcher goroutines, fsnotify setup, and
-// ready-channel synchronization — overhead that is unnecessary for a
-// one-shot CLI search. Multiple shards are loaded in parallel.
+// loadShards opens all .zoekt entries in indexDir and returns individual
+// zoekt.Searcher instances. A one-shot CLI search does not need directory
+// watchers or ready-channel synchronization. Multiple shards load in parallel.
 func loadShards(indexDir string) ([]zoekt.Searcher, error) {
-	paths, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
+	paths, err := searchableShardPaths(indexDir)
 	if err != nil {
-		return nil, fmt.Errorf("glob shards: %w", err)
+		return nil, err
 	}
 	if len(paths) == 0 {
-		return nil, fmt.Errorf("no index shards in %s", indexDir)
+		// An index dir that holds no shard at all is damage the caller can
+		// repair, not a query failure to report.
+		return nil, fmt.Errorf("%w: no index shards in %s", errShardUnloadable, indexDir)
 	}
 	return loadShardPaths(indexDir, paths)
 }
 
 func loadShardsOptional(indexDir string) ([]zoekt.Searcher, error) {
-	paths, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
+	paths, err := searchableShardPaths(indexDir)
 	if err != nil {
-		return nil, fmt.Errorf("glob shards: %w", err)
+		return nil, err
 	}
 	if len(paths) == 0 {
 		return nil, nil
@@ -122,12 +123,24 @@ func loadShardsOptional(indexDir string) ([]zoekt.Searcher, error) {
 	return loadShardPaths(indexDir, paths)
 }
 
+// searchableShardPaths lists the non-directory .zoekt entries that a search
+// will try to open.
+//
+// The caller normally holds the shared publish lock, so this scan cannot
+// interleave with a successful swap. acquireReadLock can permit an unlocked
+// read after its timeout; that path scans the shards that remain. This
+// function needs names only and does not load size metadata.
+func searchableShardPaths(indexDir string) ([]string, error) {
+	return familyShardNames(indexDir)
+}
+
 func loadShardPaths(indexDir string, paths []string) ([]zoekt.Searcher, error) {
 	// Single shard — skip goroutine overhead.
 	if len(paths) == 1 {
 		s, err := openShard(paths[0])
 		if err != nil {
-			return nil, fmt.Errorf("load shard %s: %w", paths[0], err)
+			// Mark a single-shard load failure as index damage too.
+			return nil, fmt.Errorf("%w: load shard %s: %w", errShardUnloadable, paths[0], err)
 		}
 		return []zoekt.Searcher{s}, nil
 	}
@@ -171,31 +184,33 @@ func loadShardPaths(indexDir string, paths []string) ([]zoekt.Searcher, error) {
 		for _, s := range searchers {
 			s.Close()
 		}
-		return nil, loadErr
+		return nil, fmt.Errorf("%w: %w", errShardUnloadable, loadErr)
 	}
 	if len(searchers) == 0 {
-		return nil, fmt.Errorf("no loadable shards in %s", indexDir)
+		return nil, fmt.Errorf("%w: no loadable shards in %s", errShardUnloadable, indexDir)
 	}
 	return searchers, nil
 }
 
-func parseSearchQuery(pattern string) (query.Q, error) {
-	q, err := query.Parse(pattern)
-	if err != nil {
-		return nil, &querySyntaxError{query: pattern, cause: err}
-	}
-	q = query.Map(q, query.ExpandFileContent)
-	return query.Simplify(q), nil
-}
+// errShardUnloadable marks a shard that exists but cannot be opened: truncated,
+// unreadable, a directory, or a dangling symlink. The caller treats this as
+// index damage, invalidates the family manifest, and retries the search.
+//
+// This repair covers the committed family: dropping the manifest makes
+// needCommitted fire and that family be rebuilt. It does not cover the
+// uncommitted family, whose rebuild is driven by the working tree's own state
+// hash and shard contiguity, none of which notices a present, contiguous,
+// corrupt shard. Such an uncommitted shard can fail until the working tree
+// changes.
+var errShardUnloadable = errors.New("index damage")
 
-func executeParsedSearchScoped(
-	ctx context.Context,
-	indexDir string,
-	userQ query.Q,
-	scope query.Q,
-	config searchConfig,
-) ([]zoekt.FileMatch, error) {
-	return executeParsedSearchScopedDirs(ctx, []string{indexDir}, userQ, scope, config)
+func parseSearchQueryForms(pattern string) (query.Q, query.Q, error) {
+	raw, err := query.Parse(pattern)
+	if err != nil {
+		return nil, nil, &querySyntaxError{query: pattern, cause: err}
+	}
+	expanded := query.Map(raw, query.ExpandFileContent)
+	return raw, query.Simplify(expanded), nil
 }
 
 func executeParsedSearchScopedDirs(
@@ -223,7 +238,7 @@ func executeParsedSearchScopedDirs(
 		searchers = append(searchers, loaded...)
 	}
 	if len(searchers) == 0 {
-		return nil, fmt.Errorf("no loadable shards")
+		return nil, fmt.Errorf("%w: no loadable shards", errShardUnloadable)
 	}
 	defer func() {
 		for _, s := range searchers {
@@ -289,15 +304,32 @@ func cloneFileMatches(files []zoekt.FileMatch, config searchConfig) []zoekt.File
 		return nil
 	}
 	contextFiles := displayedContextFiles(files, config)
-	out := make([]zoekt.FileMatch, len(files))
+	var resultFiles map[int]struct{}
+	if config.resultFileLimit > 0 {
+		if config.resultFileLimit == config.contextFileLimit {
+			resultFiles = contextFiles
+		} else {
+			resultFiles = selectedFileIndexes(files, config, config.resultFileLimit)
+		}
+	}
+	capacity := len(files)
+	if resultFiles != nil {
+		capacity = len(resultFiles)
+	}
+	out := make([]zoekt.FileMatch, 0, capacity)
 	for i := range files {
+		if resultFiles != nil {
+			if _, keep := resultFiles[i]; !keep {
+				continue
+			}
+		}
 		_, keepContext := contextFiles[i]
-		out[i] = cloneFileMatch(
+		out = append(out, cloneFileMatch(
 			files[i],
 			config.contextMatchLimit,
 			config.afterOnly,
 			contextFiles == nil || keepContext,
-		)
+		))
 	}
 	return out
 }
@@ -307,7 +339,17 @@ func cloneFileMatches(files []zoekt.FileMatch, config searchConfig) []zoekt.File
 // are corpus-local, so a global top N file must be in its corpus's top N. A
 // nil map means that all context must be copied.
 func displayedContextFiles(files []zoekt.FileMatch, config searchConfig) map[int]struct{} {
-	limit := config.contextFileLimit
+	return selectedFileIndexes(files, config, config.contextFileLimit)
+}
+
+// selectedFileIndexes returns the best valid file indexes for one corpus after
+// deduplication and dirty-file suppression. A nil map means that all input
+// files remain selected.
+func selectedFileIndexes(
+	files []zoekt.FileMatch,
+	config searchConfig,
+	limit int,
+) map[int]struct{} {
 	if limit <= 0 || len(files) <= limit {
 		return nil
 	}

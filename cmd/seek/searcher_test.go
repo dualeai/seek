@@ -31,9 +31,9 @@ func TestCloneFileMatchesCopiesContextOnlyForDisplayedLines(t *testing.T) {
 	input := []zoekt.FileMatch{{
 		FileName: "many.go",
 		LineMatches: []zoekt.LineMatch{
-			{LineNumber: 30, Line: []byte("third\n"), Before: context, After: context},
-			{LineNumber: 10, Line: []byte("first\n"), Before: context, After: context},
-			{LineNumber: 20, Line: []byte("second\n"), Before: context, After: context},
+			{LineNumber: 30, Line: []byte("third\n"), Before: context, After: context, Score: 3},
+			{LineNumber: 10, Line: []byte("first\n"), Before: context, After: context, Score: 2},
+			{LineNumber: 20, Line: []byte("second\n"), Before: context, After: context, Score: 1},
 		},
 	}}
 
@@ -132,6 +132,24 @@ func TestCloneFileMatchesCopiesContextOnlyForPossibleDisplayedFiles(t *testing.T
 	if selected[2].LineMatches[0].Before[0] == 'X' {
 		t.Fatal("selected file context aliases shard memory")
 	}
+
+	config.resultFileLimit = 2
+	retained := cloneFileMatches(input, config)
+	if len(retained) != 2 || retained[0].FileName != "b.go" || retained[1].FileName != "c.go" {
+		t.Fatalf("retained files=%v, want b.go and c.go", fileMatchNames(retained))
+	}
+	if len(retained[0].LineMatches[0].Before) == 0 ||
+		len(retained[1].LineMatches[0].After) == 0 {
+		t.Fatal("retained files lost display context")
+	}
+}
+
+func fileMatchNames(files []zoekt.FileMatch) []string {
+	names := make([]string, len(files))
+	for i := range files {
+		names[i] = files[i].FileName
+	}
+	return names
 }
 
 func TestDisplayedContextFilesUsesFormatterTieOrder(t *testing.T) {
@@ -228,7 +246,7 @@ func TestExecuteParsedSearch_ContextModes(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			files, err := executeParsedSearchScoped(t.Context(), indexDir, q, nil, tc.config)
+			files, err := executeParsedShardSearchForTest(t.Context(), indexDir, q, tc.config)
 			if err != nil {
 				t.Fatalf("search: %v", err)
 			}

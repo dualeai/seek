@@ -27,7 +27,13 @@ const (
 	rootTypeDirectory rootType = "directory"
 	rootTypeFile      rootType = "file"
 
-	seekIndexGeneration = "v2"
+	// v3 bumped when the published-family manifest landed: a corpus built by an
+	// older binary has no .family-v1, and treating that absence as damage would
+	// rebuild every corpus on every machine at once. Rotating the id instead
+	// means a manifest-writing binary only ever meets corpora it built, and it
+	// also stops two binary versions sharing one corpus directory — the version
+	// skew that would otherwise republish without a manifest on every other run.
+	seekIndexGeneration = "v3"
 	// v3 bumped when the "git-boundary" namespace marker landed: it
 	// changes the folder state-hash formula for any parent containing
 	// nested git repos. Without the bump, users upgrading would inherit
@@ -68,11 +74,11 @@ type corpusPlan struct {
 	// dirtyScope is the Git pathspec defining a scoped search (nil = unscoped).
 	// Retained only to key/build the over-cap fallback below.
 	dirtyScope *gitDirtyScope
-	// scoped* is the over-cap fallback: a single per-scope COMBINED index
-	// (committed+dirty in one dir) built ONLY when the whole repo exceeds the
-	// index caps, so a huge sibling cannot cap a small scope. The dir is keyed
-	// by dirtyScope.key; the generation (scopedStateHash) by HEAD + scope +
-	// in-scope working tree. Empty on unscoped plans and on under-cap scoped
+	// scoped* is the over-cap fallback: a single per-scope combined index
+	// (committed and dirty in one directory) built only when the repository
+	// exceeds the index caps. A large sibling cannot cap a small scope. The
+	// directory is keyed by dirtyScope.key. The generation, scopedStateHash, is
+	// keyed by HEAD, scope, and the in-scope working tree. Empty on unscoped plans and on under-cap scoped
 	// searches; scopedStateHash != "" means the fallback was built and must be
 	// searched (and validated) instead of the combined index.
 	scopedCacheDir  string
@@ -98,6 +104,17 @@ type corpusPlan struct {
 	discover func(gitBoundary) bool
 }
 
+// searchIndexDir is the directory a search of this plan actually reads. The
+// over-cap scoped fallback serves from its own dir, so anything that repairs or
+// inspects "the index this query used" must ask here rather than assume
+// indexDir.
+func (p corpusPlan) searchIndexDir() string {
+	if p.scopedStateHash != "" && p.scopedIndexDir != "" {
+		return p.scopedIndexDir
+	}
+	return p.indexDir
+}
+
 type corpusSearchResult struct {
 	corpusID    corpusID
 	kind        corpusKind
@@ -106,6 +123,8 @@ type corpusSearchResult struct {
 	// selected file, otherwise the corpus-relative FileName.
 	displayName string
 	file        zoekt.FileMatch
+	// rankOverride is one-based. Zero keeps the normal BM25 ordering.
+	rankOverride int
 }
 
 type corpusIndexState uint8
@@ -662,10 +681,12 @@ func crossesGitBoundary(parent string, child externalRoot) bool {
 
 // buildGitCorpusPlan is the shared constructor for both the
 // explicit-operand path (planCurrentGitCorpus) and the walker-discovery
-// path (planDiscoveredGitPaths). Both flows mint a corpus with the
-// same identity (kind, root, dev:ino) so the same physical repo
-// reached via multiple paths — e.g. CLI operand AND walker
-// discovery — collapses to one cache dir.
+// path (planDiscoveredGitPaths). Both paths use the same corpus identity, so
+// they map one physical repository to one cache directory.
+//
+// git_committed_backend=native-v1 is the committed-reader migration barrier.
+// It makes the first native request use a new cache, so native delta cannot
+// seed a shard family made by the removed reader.
 //
 // rootTypeWorktree is the convention regardless of the on-disk
 // layout: the corpus models the working tree, not the .git layout.
@@ -674,18 +695,9 @@ func crossesGitBoundary(parent string, child externalRoot) bool {
 func buildGitCorpusPlan(repoDir, commonDir string, extraIDParts ...string) (corpusPlan, error) {
 	root := canonicalCorpusPath(repoDir)
 	cdir := canonicalCorpusPath(commonDir)
-	idParts := []string{"git_worktree", root, "git_common_dir", cdir}
+	idParts := []string{"git_worktree", root, "git_common_dir", cdir, "git_committed_backend", "native-v1"}
 	idParts = append(idParts, extraIDParts...)
 	return newCorpusPlan(corpusKindGit, rootTypeWorktree, root, "git", idParts...)
-}
-
-// planDiscoveredGitCorpus builds a plan for a repo the folder walker
-// found mid-flight via detectGitBoundary. userExplicit stays at zero
-// value (false) so the pool's worker wrapper logs and swallows failures
-// instead of aborting the user's search. gitPaths is derived from the
-// boundary without a subprocess.
-func planDiscoveredGitCorpus(b gitBoundary) (corpusPlan, error) {
-	return planDiscoveredGitPaths(b.toGitPaths())
 }
 
 func planDiscoveredGitPaths(paths gitPaths) (corpusPlan, error) {
@@ -704,10 +716,6 @@ func planCurrentGitCorpus(paths gitPaths) (corpusPlan, error) {
 	}
 	plan.gitPaths = &paths
 	return plan, nil
-}
-
-func planFolderCorpus(root string, info os.FileInfo) (corpusPlan, error) {
-	return planFolderCorpusWithExclusions(root, info, nil)
 }
 
 func planFolderCorpusWithExclusions(root string, info os.FileInfo, excludes []string) (corpusPlan, error) {
@@ -773,10 +781,6 @@ func newCorpusPlan(kind corpusKind, rt rootType, root, statSubject string, extra
 		cacheDir:    cacheDir,
 		indexDir:    filepath.Join(cacheDir, "index"),
 	}, nil
-}
-
-func planCurrentGitCorpusWithOperands(paths gitPaths, operands []string) (corpusPlan, error) {
-	return planCurrentGitCorpusWithExclusions(paths, operands, nil)
 }
 
 func planCurrentGitCorpusWithExclusions(paths gitPaths, operands, excludes []string) (corpusPlan, error) {
@@ -869,8 +873,7 @@ func sortedCanonicalRoots(roots []string) []string {
 
 func seekUserCacheRoot() (string, error) {
 	// SEEK_CACHE_DIR overrides the default user-cache location.
-	// Primary use case: benchmarks and tests that need a sandboxed
-	// cache so they don't wipe the developer's dev cache.
+	// Benchmarks, tests, and package checks use it for an isolated cache.
 	if dir := os.Getenv("SEEK_CACHE_DIR"); dir != "" {
 		return dir, nil
 	}
@@ -929,16 +932,14 @@ func realCaseComponent(parent, name string) string {
 	if err != nil {
 		return name
 	}
-	// Fast path: the typed name is already the on-disk byte name. This is the
-	// common case and the ONLY possibility on a case-sensitive filesystem, so
-	// it must cost no per-entry Lstat/Info syscalls — just the name scan.
+	// First check for an exact on-disk byte name.
 	for _, e := range entries {
 		if e.Name() == name {
 			return name
 		}
 	}
-	// Case/normalization mismatch (insensitive FS): find the entry that IS
-	// this file by identity (device+inode), robust to case and NFC/NFD.
+	// For a case or normalization mismatch on an insensitive filesystem, find
+	// the same file by device and inode.
 	target, err := os.Lstat(filepath.Join(parent, name))
 	if err != nil {
 		return name

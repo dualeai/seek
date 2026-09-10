@@ -1,0 +1,7 @@
+{
+  "target": "linux-arm64",
+  "file_name": "libonnxruntime.so",
+  "version": "1.29.0",
+  "bytes": 24538024,
+  "sha256": "a27d21126db312aa8f02f3d5eaebe466e991f51f469882e6d0407d5a8b64afda"
+}

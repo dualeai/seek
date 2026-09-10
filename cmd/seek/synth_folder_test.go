@@ -9,11 +9,11 @@ import (
 	"testing"
 )
 
-// planSynthCorpus wraps the recurring "os.Lstat + planFolderCorpus +
+// planSynthCorpus wraps the recurring "os.Lstat + folder plan +
 // fresh cache/index dirs" sequence used by every E2E folder test.
 // Returns a plan with empty caches so each test exercises a cold path.
 //
-// Internal invariants check: production planFolderCorpus regression
+// Internal invariants check: a production folder-plan regression
 // (e.g. root mismatch, cacheDir == indexDir collision) would otherwise
 // be invisible to callers that treat the plan as an opaque token.
 func planSynthCorpus(t *testing.T, root string) corpusPlan {
@@ -28,7 +28,7 @@ func planSynthCorpus(t *testing.T, root string) corpusPlan {
 	}
 	plan.cacheDir = t.TempDir()
 	plan.indexDir = t.TempDir()
-	// Invariants: catch a regression where planFolderCorpus loses
+	// Invariants: catch a regression where folder planning loses
 	// the root, collides cache and index dirs, or returns blanks.
 	if plan.root == "" {
 		t.Fatal("planSynthCorpus: production returned empty plan.root")

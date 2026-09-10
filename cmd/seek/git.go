@@ -22,7 +22,6 @@ type repoState struct {
 
 type gitPaths struct {
 	RepoDir    string
-	GitDir     string
 	CommonDir  string
 	ConfigPath string
 }
@@ -39,12 +38,9 @@ func (e *gitUnavailableError) Unwrap() error {
 	return e.cause
 }
 
-// gitCmd creates an exec.Cmd for git with graceful shutdown.
-// Uses a graceful signal on context cancellation so git can release locks.
-// Note: we intentionally do NOT set GIT_OPTIONAL_LOCKS=0. While it
-// prevents lock contention on .git/index, it also prevents git from
-// refreshing its stat cache, which can cause same-second edits to be
-// invisible (same mtime + same size = git thinks file is unchanged).
+// gitCmd creates a Git command that uses a graceful signal on cancellation so
+// Git can release its locks. It does not set GIT_OPTIONAL_LOCKS=0 because Git
+// must refresh its stat cache to detect some same-second edits.
 func gitCmd(ctx context.Context, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	if errors.Is(cmd.Err, exec.ErrNotFound) {
@@ -58,26 +54,40 @@ func gitCmd(ctx context.Context, args ...string) *exec.Cmd {
 	return cmd
 }
 
+// gitLocationEnv names the variables that redirect git at a different
+// repository than the one Seek resolved from the filesystem. Seek removes them
+// from all Git commands.
+var gitLocationEnv = [5]string{
+	"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
+}
+
 func sanitizedGitEnv(env []string) []string {
 	filtered := env[:0]
 	for _, kv := range env {
 		name, _, _ := strings.Cut(kv, "=")
 		switch name {
-		case "GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS":
+		case "GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS",
+			"GIT_TERMINAL_PROMPT", "LC_ALL", "LANG":
+			continue
+		// Corpus identity comes from the filesystem. A location variable could
+		// make Git describe a different repository from the indexed corpus.
+		case gitLocationEnv[0], gitLocationEnv[1], gitLocationEnv[2], gitLocationEnv[3], gitLocationEnv[4]:
 			continue
 		default:
 			filtered = append(filtered, kv)
 		}
 	}
+	filtered = append(filtered,
+		"GIT_TERMINAL_PROMPT=0",
+		"LC_ALL=C",
+		"LANG=C",
+	)
 	return filtered
 }
 
-// resolveGitPathsFromCWD resolves git paths from the current working
-// directory. The fast path (fastResolveGitPaths → detectGitBoundary)
-// handles both `.git` dirs AND worktree-form `.git` files without a
-// subprocess. Falls back to git rev-parse only when CWD is unreadable,
-// no `.git` exists in any ancestor, or a structurally invalid `.git`
-// triggers ambiguous detection (corrupt or partially-initialized repo).
+// resolveGitPathsFromCWD resolves Git paths from the current directory. It
+// first checks .git directories and worktree .git files without a subprocess.
+// It uses git rev-parse when that check cannot give a clear result.
 func resolveGitPathsFromCWD(ctx context.Context) (gitPaths, error) {
 	if paths, ok := fastResolveGitPaths(); ok {
 		return paths, nil
@@ -85,11 +95,9 @@ func resolveGitPathsFromCWD(ctx context.Context) (gitPaths, error) {
 	return resolveGitPaths(ctx, "")
 }
 
-// fastResolveGitPaths attempts to resolve git paths without spawning a
-// subprocess. Walks up from CWD calling detectGitBoundary at each level so
-// both `.git` directories AND worktree-form `.git` files are handled
-// without falling back to `git rev-parse`. Returns false only when CWD is
-// unreadable, no `.git` exists in any ancestor, or detection is ambiguous.
+// fastResolveGitPaths walks from the current directory to its ancestors and
+// checks each Git boundary without a subprocess. It returns false when the
+// current directory is unreadable, no boundary exists, or detection is unclear.
 func fastResolveGitPaths() (gitPaths, bool) {
 	dir, err := os.Getwd()
 	if err != nil {
@@ -116,7 +124,6 @@ func resolveGitPaths(ctx context.Context, dir string) (gitPaths, error) {
 		"rev-parse",
 		"--path-format=absolute",
 		"--show-toplevel",
-		"--git-dir",
 		"--git-common-dir",
 		"--git-path", "config",
 	)
@@ -129,15 +136,14 @@ func resolveGitPaths(ctx context.Context, dir string) (gitPaths, error) {
 	}
 
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) != 4 {
+	if len(lines) != 3 {
 		return gitPaths{}, fmt.Errorf("unexpected git rev-parse output: got %d lines", len(lines))
 	}
 
 	paths := gitPaths{
 		RepoDir:    strings.TrimSpace(lines[0]),
-		GitDir:     strings.TrimSpace(lines[1]),
-		CommonDir:  strings.TrimSpace(lines[2]),
-		ConfigPath: strings.TrimSpace(lines[3]),
+		CommonDir:  strings.TrimSpace(lines[1]),
+		ConfigPath: strings.TrimSpace(lines[2]),
 	}
 	return paths, nil
 }
@@ -254,12 +260,9 @@ func parseGitStatusV2(raw string) repoState {
 
 // ensureUntrackedCache enables core.untrackedCache if not already set.
 // The untracked cache stores directory mtimes in the git index so that
-// git status can skip scanning unchanged directories. On a 17k-file repo
-// this reduces git status from ~400ms to ~70ms (6-7x). The setting is
-// safe, reversible, and stored in .git/config (per-repo only).
-//
-// Reads .git/config directly (~14µs) instead of spawning git config
-// (~8ms) to avoid subprocess overhead on the hot path.
+// git status can skip unchanged directories. The setting is stored in the
+// repository's .git/config and can be disabled there. Read that file directly
+// before running `git config`.
 func ensureUntrackedCache(ctx context.Context, paths gitPaths) {
 	configPath := paths.ConfigPath
 	data, err := os.ReadFile(configPath)
@@ -315,6 +318,10 @@ func gitVersionAtLeast(ctx context.Context, dir string, major, minor int) bool {
 	if err != nil {
 		return false
 	}
+	return gitVersionOutputAtLeast(out, major, minor)
+}
+
+func gitVersionOutputAtLeast(out []byte, major, minor int) bool {
 	// Parse "git version 2.43.0" or "git version 2.43.0.windows.1"
 	s := strings.TrimSpace(string(out))
 	s = strings.TrimPrefix(s, "git version ")

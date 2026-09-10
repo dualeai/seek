@@ -36,12 +36,9 @@ const (
 	envGCInterval = "SEEK_GC_INTERVAL"
 )
 
-// TODO(gc-size-cap): SEEK_GC_MAX_TOTAL_SIZE — journalctl --vacuum-size style
-// budget: after the TTL sweep, evict LRU by .used (oldest first, never
-// biggest-first — big ≠ unused, and big corpora cost the most to reindex)
-// until the cache is under the cap. Env-only knob, parseByteSize sibling to
-// parseGCDuration (base-1024, matching humanBytes). Must not add size walks
-// to the opportunistic path unguarded — gate on a cheap corpus count first.
+// TODO(gc-size-cap): GC is age-based and has no total cache-size limit. A
+// future limit must apply to all corpus types and must not evict an active
+// corpus.
 
 type gcConfig struct {
 	maxAge   time.Duration
@@ -165,9 +162,9 @@ func runOpportunisticGC(ctx context.Context) {
 
 // runGC is the shared GC body. Two callers:
 //   - runOpportunisticGC: writer nil → silent eviction sweep, post-run.
-//   - runGCCommand (manual `seek gc --force` / `--all`): writer os.Stdout →
-//     streams the same banner + table + summary as `--dry-run`, with the
-//     ACTION column reflecting the real per-corpus outcome.
+//   - runGCCommandCmd (`seek gc --force` / `--all`): writer os.Stdout → streams
+//     the same banner + table + summary as `--dry-run`, with the ACTION column
+//     reflecting the real per-corpus outcome.
 //
 // Order of operations:
 //  1. throttle gate (`.last-gc` mtime) unless skipThrottle
@@ -194,7 +191,7 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 	if !opts.skipThrottle && !shouldRunGC(cacheRoot, interval) {
 		// Opportunistic path (writer nil) silently no-ops; manual
 		// `seek gc` callers (writer != nil) get a one-line hint so
-		// they know nothing ran AND how to force.
+		// they know that nothing ran and how to force a run.
 		if opts.writer != nil {
 			_, _ = fmt.Fprintln(opts.writer, "seek gc: throttled — pass --force to run anyway")
 		}
@@ -311,10 +308,8 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 	touchStamp(cacheRoot)
 }
 
-// touchStamp bumps the .last-gc mtime to now. Steady-state cost: one
-// utimensat (~µs). On first ever run the file doesn't exist yet, so we fall
-// back to writeCacheFile (tmp + rename, ~3 syscalls). Subsequent calls take
-// the fast path.
+// touchStamp updates the .last-gc modification time. If the file does not yet
+// exist, it creates the file with an atomic rename.
 func touchStamp(cacheRoot string) {
 	stampPath := filepath.Join(cacheRoot, gcStampFile)
 	now := time.Now()
@@ -383,17 +378,12 @@ func shouldRunGC(cacheRoot string, interval time.Duration) bool {
 	return time.Since(st.ModTime()) >= interval
 }
 
-// sweepOrphanManifestTmps removes leftover .tmp manifest files in a
-// corpus cache directory whose mtime is older than threshold. Both the
-// folder manifest writer (folder_indexer.go:771-797) and the
-// uncommitted manifest writer (uncommitted_manifest.go) write to a
-// tmp path and then Rename — on SIGKILL between the WriteFile and the
-// Rename, the tmp persists forever. They are not picked up by any
-// reader (manifest readers open the canonical filename), but they
-// accumulate disk usage and confuse manual cache inspection.
+// sweepOrphanManifestTmps removes old temporary manifest files from a corpus
+// cache or index directory. Each manifest writer writes a temporary file and
+// renames it. A forced stop can leave the temporary file. Readers use only the
+// canonical names.
 //
-// Conservatively only sweeps known suffixes so we never collide with a
-// legitimate in-flight write.
+// Restrict cleanup to known names so it cannot remove an unrelated file.
 // buildTmpMaxAge is the age past which a leftover temp build dir is considered
 // orphaned (its builder crashed). A live builder writes shards continuously, so
 // its temp dir's mtime stays fresh well within this bound even for a large cold
@@ -447,7 +437,8 @@ func sweepOrphanManifestTmps(cacheDir string, before time.Time) {
 func isOrphanManifestTmpName(name string) bool {
 	switch name {
 	case folderManifestFileName + ".tmp",
-		uncommittedManifestFileName + ".tmp":
+		uncommittedManifestFileName + ".tmp",
+		familyManifestFile + ".tmp":
 		return true
 	}
 	return false
@@ -529,6 +520,9 @@ func readUsedAt(cacheDir string) (time.Time, bool) {
 //     uses.
 func sweepCorpusOrphans(e corpusDirEntry, now time.Time) {
 	sweepOrphanManifestTmps(e.path, now.Add(-1*time.Hour))
+	// .family-v1 is published beside the shards, not in cacheDir, so its
+	// interrupted tmp needs the index dir swept too.
+	sweepOrphanManifestTmps(filepath.Join(e.path, "index"), now.Add(-1*time.Hour))
 	if bf, ok, _ := tryBuildLock(e.path); ok {
 		releaseLock(bf)
 		sweepOrphanBuildDirs(filepath.Join(e.path, "index"), now.Add(-buildTmpMaxAge))
@@ -616,9 +610,9 @@ func evictCorpus(e corpusDirEntry, trashDir string, cutoff time.Time) gcRowResul
 
 // pickDisplayShard chooses which shard's metadata to read for display.
 // Prefers a non-uncommitted shard so Repository.Source comes from the committed
-// corpus when available. Repository.Name may be an opaque fallback for local
-// repos without remote metadata. Returns shards[0] when all shards are
-// uncommitted (their Source is still the repo path).
+// corpus when available. Repository.Name uses the opaque default unless local
+// zoekt.name config replaces it. Returns shards[0] when all shards are
+// uncommitted; their Source is still the repository path.
 func pickDisplayShard(shards []string) string {
 	for _, s := range shards {
 		if !isUncommittedShard(filepath.Base(s)) {
@@ -638,13 +632,11 @@ type corpusDisplayInfo struct {
 	gone   bool
 }
 
-// readCorpusDisplayInfo reads the first non-uncommitted shard's
-// Repository.Source to recover the original root path. Zero new schema — the
-// data was already persisted by every index cycle (indexer.go:653,
-// folder_indexer.go:627/649, zoekt gitindex sets Source = repoDir).
+// readCorpusDisplayInfo reads Repository.Source from a committed shard when one
+// exists. It uses an uncommitted shard when that is the only available shard.
 //
-// Returns zero corpusDisplayInfo when no shards exist (empty corpus, crashed
-// indexer) — callers should fall back to the hash.
+// It returns an empty value when no readable shard exists. Callers then show the
+// corpus hash.
 func readCorpusDisplayInfo(corpusDir string) corpusDisplayInfo {
 	indexDir := filepath.Join(corpusDir, "index")
 	shards, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
@@ -681,9 +673,8 @@ func drainTrash(trashDir string) {
 	}
 }
 
-// touchUsed bumps the mtime of <cacheDir>/.used to time.Now(). Best-effort:
-// errors are logged at Debug. Hot-path; sub-millisecond per call. Skips when
-// the cache lives on a network filesystem (gated once per process).
+// touchUsed updates <cacheDir>/.used. It logs errors at Debug level and skips
+// caches on network filesystems.
 var (
 	nfsCheckOnce sync.Once
 	nfsCached    bool

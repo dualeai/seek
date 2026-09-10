@@ -14,7 +14,6 @@ import unittest
 
 
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[1]
-REPO_ROOT = PLUGIN_ROOT.parents[1]
 ROUTER = PLUGIN_ROOT / "bin" / "router.sh"
 
 
@@ -635,27 +634,6 @@ class RouterContractTest(unittest.TestCase):
             with self.subTest(command=command):
                 actual, _ = self.routed(command, configured)
                 self.assertEqual(actual[5], expected_query)
-
-    def test_router_implementation_is_outside_seek(self) -> None:
-        self.assertFalse((REPO_ROOT / "cmd" / "seek" / "hook_router.go").exists())
-        main_source = (REPO_ROOT / "cmd" / "seek" / "main.go").read_text(encoding="utf-8")
-        module = (REPO_ROOT / "go.mod").read_text(encoding="utf-8")
-        seek_binary = REPO_ROOT / "seek"
-        self.assertTrue(seek_binary.is_file())
-        result = subprocess.run(
-            [str(seek_binary), "--hook-route"],
-            text=True,
-            capture_output=True,
-            timeout=5,
-            check=False,
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("unknown flag: --hook-route", result.stderr)
-        self.assertNotIn("hook-route", main_source)
-        self.assertNotIn("routeHookPayload", main_source)
-        self.assertNotIn("mvdan.cc/sh", module)
-        self.assertTrue((PLUGIN_ROOT / "lib" / "router.awk").is_file())
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

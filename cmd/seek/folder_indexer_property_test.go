@@ -15,9 +15,8 @@ import (
 // arbitrary file-size distributions (within caps) drive the streaming
 // pipeline to completion without leaking weight.
 //
-// Sparse files via Truncate keep each iteration cheap. We use a small
-// test-local readSemaphore budget so even modest payloads exercise
-// back-pressure.
+// Sparse files limit fixture I/O. A small test-local readSemaphore budget lets
+// modest payloads exercise back pressure.
 func TestEnsureFolderCorpusFresh_RandomDistribution(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
@@ -32,10 +31,8 @@ func TestEnsureFolderCorpusFresh_RandomDistribution(t *testing.T) {
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
 
-	// Per-file size cap MUST be <= testBudget so semaphore.Acquire can
-	// be satisfied. With testBudget=4 MiB, we cap files at ~1 MiB so
-	// up to 4 readers can hold weight concurrently — exercising real
-	// back-pressure without unsatisfiable Acquires.
+	// Keep each file within testBudget so semaphore.Acquire can succeed. A
+	// quarter-budget limit lets up to four readers hold weight at the same time.
 	const perFileCap = testBudget / 4
 	// Total corpus cap = a multiple of testBudget so rotation fires
 	// multiple times across the run. Kept modest (8×) because each iteration
@@ -71,23 +68,23 @@ func TestEnsureFolderCorpusFresh_RandomDistribution(t *testing.T) {
 		return availableWeight(readSemaphore) == testBudget
 	}
 
-	// 10 random distributions exercise the back-pressure property without
-	// making this real-indexing test a multi-minute outlier under -race.
+	// Ten random distributions exercise back pressure while keeping the test
+	// bounded under the race detector.
 	cfg := &quick.Config{MaxCount: 10}
 	if err := quick.Check(check, cfg); err != nil {
 		t.Fatal(err)
 	}
 }
 
-// FuzzReadOneFolderFileStreaming_Sizes — fuzz the per-file size
-// boundary of readOneFolderFileStreaming (folder_indexer.go:997). For
-// any size in [0, maxIndexedDocumentBytes+1] the function must either
+// FuzzReadOneFolderFileStreaming_Sizes checks the per-file size boundary of
+// readOneFolderFileStreaming. For any size in [0, maxIndexedDocumentBytes+1],
+// the function must either
 // (a) send exactly one fileContent with weight=size and never leak,
 // or (b) skip silently without touching the semaphore.
 //
-// Uses a sparse tempfile so each fuzz input runs cheaply regardless
-// of size. The shared readSemaphore is left at production budget —
-// a single Acquire of <=maxIndexedDocumentBytes always fits.
+// The test uses a sparse temporary file to limit fixture I/O. It keeps the
+// shared readSemaphore at the production budget, which accepts one file up to
+// maxIndexedDocumentBytes.
 func FuzzReadOneFolderFileStreaming_Sizes(f *testing.F) {
 	for _, s := range []int64{0, 1, 1024, 64 * 1024, int64(maxIndexedDocumentBytes) - 1, int64(maxIndexedDocumentBytes), int64(maxIndexedDocumentBytes) + 1} {
 		f.Add(s)

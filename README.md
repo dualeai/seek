@@ -66,6 +66,10 @@ is easy to open.
   corrupting the index
 - **Fast after the first index** -- one-time build, then warm searches in
   milliseconds (benchmarks below)
+- **Optional code re-ranking** -- release binaries can re-rank a small candidate
+  set with the embedded 17M-parameter
+  [LateOn-Code-edge](https://huggingface.co/lightonai/LateOn-Code-edge/tree/4bcdf5ed93f791259eb130b577a240f753d68dd8)
+  code model
 
 ## Install
 
@@ -78,6 +82,10 @@ Or with Go:
 ```bash
 go install github.com/dualeai/seek/cmd/seek@latest
 ```
+
+The pre-built archives include the code re-ranker. A normal source build on a
+supported target also includes it. A build with `CGO_ENABLED=0`, or a build for
+another target, keeps the BM25 fallback without the model or runtime.
 
 Or download a pre-built binary from [GitHub Releases](https://github.com/dualeai/seek/releases).
 
@@ -92,9 +100,16 @@ brew install universal-ctags       # macOS
 sudo apt-get install universal-ctags  # Linux
 ```
 
-Git is required for Git-backed searches. **Git 2.31+** is required for
-[`git worktree`](https://git-scm.com/docs/git-worktree) setups. On older Git
-versions, normal repositories still work.
+Git 2.36 or later is required for Git-backed searches. Seek uses the buffered
+[`git cat-file --batch-command`](https://git-scm.com/docs/git-cat-file)
+protocol added in Git 2.36 for normal repositories and `git worktree` setups.
+
+The re-ranker does not need a model download, an ONNX Runtime install, or an ML
+service. The executable contains those resources. Release archives support
+macOS 15 or newer on amd64 and arm64, and glibc-based Linux on amd64 and arm64.
+The Linux archives are built on Ubuntu 24.04. Alpine and other musl systems are
+not supported. The re-ranker adds no system dependency. Seek still needs
+Universal Ctags, and it needs Git for Git-backed searches.
 
 ### Agent Integration
 
@@ -258,11 +273,52 @@ is supported by the pinned Zoekt version. Results are ranked by relevance.
 | `seek -C 5 "query"` | Show 5 lines on both sides (`--context`) |
 | `seek -n 5 -m 3 "query"` | Top 5 files, max 3 matches each |
 | `seek -v "query"` | Show debug logs and detailed errors (`--verbose`) |
+| `seek --rerank "find request parser"` | Re-rank a plain multi-word search with the English-to-code model |
 
 Flags compose with query filters and paths. For example,
 `seek -n 3 "sym:handleRequest file:api" ./src` returns the top 3 matching files
 under `./src` containing a `handleRequest` definition under paths matching
 `api`.
+
+### Optional code re-ranking
+
+Use `--rerank` when you know what the code does but do not know its exact name
+or location. Seek uses its bundled code-search model to move files that best
+match the meaning of the query toward the top.
+
+```bash
+seek --rerank 'find request parser' ./cmd
+seek --rerank 'remove expired cache entries' ./cmd
+seek --rerank -n 5 -m 2 -C 1 'validate search query syntax' ./cmd
+```
+
+Re-ranking is off by default. It works with plain English queries of two or
+more words. It is most useful for a description of a behavior or feature. Use
+normal search for an exact identifier, an exact phrase expression such as
+`seek '"two words"'`, a `sym:` query, or a query with filters, regular
+expressions, Boolean operators, or negation. Those query forms keep the normal
+BM25 path even when you pass `--rerank`.
+
+Seek checks a small set of files that match parts of the query. It scores the
+best nearby code and combines that signal with the normal text rank. This can
+find a useful file that does not contain every query word. Seek keeps normal
+BM25 matches in the result set, subject to the output limits.
+
+**Ranking warning:** Re-ranking can move a less useful file upward. Compare the
+results with and without `--rerank` when rank quality is important.
+
+Re-ranking does not change the displayed file, match, or context limits. The
+`-n`, `-m`, `-C`, and `-A` flags continue to control the output. Seek uses
+nearby source context internally without adding it to the displayed result.
+
+The model runs locally. Seek does not send code or queries to a service, and it
+does not download a model. Every eligible re-ranked command uses more time and
+memory than normal BM25. The first command can take longer when Seek must
+extract its embedded runtime to the private cache. Later commands reuse only
+that extracted runtime file and still set up the scorer. If re-ranking is
+unavailable or fails, Seek returns the normal BM25 results that match all query
+terms. A build without the bundled backend prints a warning. Add `--verbose`
+to see other fallback messages.
 
 ## What seek adds over ripgrep
 
@@ -294,28 +350,75 @@ filtered results with context.
 4. **Search** -- reads the index for every selected repo or folder, runs one
    query, merges duplicate results, sorts by relevance, then applies limits.
 
+### Git indexing
+
+Seek has one reader for committed Git data. Normal full indexing, committed
+delta indexing, and scoped full indexing all use Git plumbing with captured
+full object IDs. `git ls-tree` lists files. During a full or scoped full scan,
+one buffered `git cat-file --batch-command` session reads sizes and approved
+blob bodies. `git diff-tree` lists changed paths for eligible deltas. A delta
+uses the same checked protocol in separate bounded phases for its ignore file,
+blob sizes, and blob bodies. These commands provide documents to
+`zoekt/index.Builder`, which writes shards in the staging directory. There is
+no go-git, `zoekt/gitindex`, or other committed-data fallback.
+
+A normal whole-repository full build saves its candidate count, indexed byte
+count, commit, and base shard count. Before a delta, Seek checks the target root
+`.sourcegraph/ignore` file. Delta budget admission then checks only the old and
+new blobs from `git diff-tree` and updates the saved totals. The 64-shard value
+is a pre-admission threshold for shards added after the full base, not a hard
+maximum for the resulting family. A large full index can therefore use deltas.
+After the added-shard count goes above 64, the next update selects compaction.
+
+Seek does not reduce index quality to save memory. It sends every supported
+file up to 100 MiB through the same content and symbol-analysis path. A file
+larger than one normal shard still gets full content and ctags analysis. Seek
+only limits large shard and ctags jobs to three at a time across active
+corpora.
+
+Git is the data format and object source. Its hosting service does not select
+index behavior or metadata policy. An origin URL does not change repository
+identity, rank, or links. A local `[zoekt]` section can set a repository name
+and one opaque `web-url` explicitly.
+
+This release replaces the go-git committed reader and adds `native-v1` to the
+Git corpus identity. This is the migration barrier: a native delta cannot seed
+shards made by the removed reader. The first committed build after the upgrade
+is a clean full build. Dirty-file rules do not change, but dirty shards share
+the new Git corpus cache and rebuild there. Folder caches do not change.
+
 Indexes are stored centrally in the user cache, never inside searched folders:
 
 - macOS: `~/Library/Caches/seek/corpora/<id>/`
-- Linux: `${XDG_CACHE_HOME:-~/.cache}/seek/corpora/<id>/`
-- Index files live in `index/`; `.state`, `.head`, and `.lock` live next to it.
+- Linux: `${XDG_CACHE_HOME:-$HOME/.cache}/seek/corpora/<id>/`
+- Index files live in `index/`; `.state`, `.head`, `.git-committed-v1`, and
+  `.lock` live next to it.
+
+The re-ranker stores only its extracted runtime under
+`<seek-cache>/reranker/1.29.0/<sha256>/`. The model and tokenizer stay in the
+executable.
 
 Folder searches read regular files and skip `.git` folders. They do not skip
 dependency, build, cache, or vendor folders by name. Git ignore rules apply only
 inside Git repos. Files larger than 100 MiB are skipped, and folder scans stop
 at 1,000,000 candidate files or 10 GiB of indexed bytes.
 
-Git applies a limit of 10,000,000 candidate files and 10 GiB of indexed bytes
-separately to the committed and working-tree index families. If the full
-repository exceeds a limit, a scoped search can build a combined fallback for
-its selected paths. An unscoped search reports the limit error.
+Git applies the 10,000,000-file and 10 GiB work limits separately to its
+committed and working-tree index families. The committed family counts all
+candidate blobs. Its byte total includes candidate blobs at or below the
+100 MiB document limit. It calculates both totals before
+`.sourcegraph/ignore` filtering. The working-tree family counts selected
+regular-file content. If the full repository exceeds a limit, a scoped search
+can build a combined fallback for its selected paths. An unscoped search
+reports the limit error.
 
 ### Cache maintenance
 
 The cache cleans itself: after each run, seek garbage-collects corpora that
 have not been used for 14 days. A corpus counts as used every time it is
 searched or indexed. The automatic pass runs at most once per day and is
-disabled when the cache lives on a network filesystem.
+disabled when the cache lives on a network filesystem. GC has no total-size
+target, so active or recent corpora can use more than a fixed total size.
 
 Environment knobs:
 
@@ -335,8 +438,9 @@ seek gc --all                   # evict every corpus not actively in use
 
 ### Benchmarks
 
-Latest field benchmarks, generated on Apple M1 Max / macOS with
-`./cicd/bench-field.sh --keep` on 2026-06-21:
+Pre-cutover field benchmarks, generated on Apple M1 Max / macOS with
+`./cicd/bench-field.sh --keep` on 2026-06-21. The Git rows use the former
+go-git committed reader; the folder rows are not part of that reader change:
 
 | Kind | Workload | Files | Cold index | Warm search | Dirty 1% | Dirty 10% |
 |------|----------|-------|------------|-------------|----------|-----------|
@@ -347,7 +451,9 @@ Latest field benchmarks, generated on Apple M1 Max / macOS with
 | folder | synthetic-10k | 10,000 | 18.1s | 190ms | 410ms | 1.8s |
 | folder | synthetic-100k | 100,000 | 81.6s | 650ms | 2.7s | 17.3s |
 
-Single sample per workload; expect about 10-20% run-to-run variance.
+These local values are diagnostic. CodSpeed is the source for performance
+comparisons. Each field workload has one sample, with about 10-20% run-to-run
+variance.
 
 Cold index is the first search. Warm search reuses the index. Dirty 1% and
 Dirty 10% measure searches after changing that share of files.
@@ -368,8 +474,8 @@ When multiple `seek` commands search the same repo at the same time:
 | Scenario | Behavior |
 |----------|----------|
 | Index is fresh | All commands search at the same time |
-| Update active | One command updates; others search the published index |
-| Update fails; old index exists | Seek searches the old index and warns |
+| Update active | One command builds while others search the current index. Readers wait during publication; after 10 seconds, Seek warns and can read the shards that remain |
+| Update fails; shards remain | Except for file or byte limit errors, Seek warns and reads the remaining shards. The next build repairs an interrupted swap |
 | No index yet | First command builds it; others wait up to 60s |
 
 ### Search Exit Codes
@@ -400,11 +506,53 @@ submitting a pull request.
 ```bash
 git clone https://github.com/dualeai/seek.git
 cd seek
-make install       # Download deps + install linter
-make build         # Build binary (requires Go 1.25+)
-make test          # Static analysis + unit tests
-make lint          # golangci-lint --fix
+make install  # Download modules and install test tools
+make build    # Build Seek
+make package  # Build the archive for this native target
+make test     # Run static analysis and unit tests
+make lint     # Run golangci-lint with fixes
 ```
+
+Go 1.27 or newer is required. A normal build on a supported target also needs a
+native C compiler: the Xcode command-line tools on macOS or GCC on glibc-based
+Linux. Use `CGO_ENABLED=0 make build` only when you need the BM25 fallback build.
+
+### Release packaging
+
+`make package` builds Seek and creates the archive for the current native
+target. Each archive contains one `seek` executable. The release workflow runs
+this target on macOS and Linux, on amd64 and arm64. It does not cross-build.
+You can run the target again to replace its output.
+
+The release workflow downloads the four archives, generates the standard
+CycloneDX SBOM, computes `checksums.txt`, and uploads these files. Artifact and
+GitHub release uploads replace files with the same names, so a failed workflow
+can run again.
+
+`RELEASE_TAG=vX.Y.Z make release` repeats only the final upload after the four
+archives and `sbom.cyclonedx.json` exist. It needs the GitHub CLI, `gh`. The
+named GitHub release must already exist, and `gh` must have permission to upload
+to it.
+
+### Re-ranker resource update
+
+`make rerank-assets-upgrade` is a manual maintainer command. It downloads the
+model, tokenizer, and three official ONNX Runtime packages at fixed revisions.
+Microsoft does not publish an ONNX Runtime 1.29.0 macOS amd64 package, so the
+command builds that one library from the fixed source commit when its versioned
+cache entry is absent.
+
+The command needs macOS, `curl`, `zstd`, CMake, Ninja, Python 3.10 or newer, and
+the Xcode command-line tools. It stores downloads, source, and build work under
+`${XDG_CACHE_HOME:-$HOME/.cache}/seek/rerank-assets-upgrade`. Downloads retry and
+resume. A later run reuses completed paths and replaces tracked files only when
+their bytes differ. The command calculates and prints byte counts and SHA-256
+values from the files that it receives or builds. It has no preset remote byte
+counts or checksums.
+
+Review the resource diff and commit it. Normal builds, tests, packages, and
+releases only use the committed files. They never call the update target and
+never download model or runtime resources.
 
 ## License
 

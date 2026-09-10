@@ -90,7 +90,7 @@ func TestRun_EmptyGitRepoReturnsNoMatch(t *testing.T) {
 	t.Chdir(dir)
 
 	_, err := captureStdout(t, func() error {
-		return run(context.Background(), "absent_empty_repo_marker", nil, 0, 0)
+		return run(context.Background(), "absent_empty_repo_marker", nil)
 	})
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("expected no match for empty git repo, got %v", err)

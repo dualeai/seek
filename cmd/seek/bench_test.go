@@ -19,6 +19,21 @@ import (
 var benchmarkStringSink string
 var benchmarkPlansSink []corpusPlan
 
+func benchmarkRefreshGit(ctx context.Context, paths gitPaths, plan corpusPlan) error {
+	state, err := gitRepoStateIn(ctx, paths.RepoDir)
+	if err != nil {
+		return err
+	}
+	return runIndexingWithCache(
+		ctx,
+		paths,
+		plan.cacheDir,
+		plan.indexDir,
+		state,
+		gitCorpusStateHash(paths, state),
+	)
+}
+
 // --- Hot-path microbenchmarks ---
 // These cover every function called on each search invocation.
 
@@ -905,10 +920,10 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 		}
 	})
 
-	b.Run("indexCommitted_incremental", func(b *testing.B) {
+	b.Run("refreshCommitted_cached", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			if err := indexCommitted(dir, plan.indexDir, indexParallelism()); err != nil {
+			if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
 				b.Fatalf("index committed: %v", err)
 			}
 		}
@@ -1511,7 +1526,7 @@ func BenchmarkFolderCorpus_OneFileZoektShardLowerBound(b *testing.B) {
 		} else if !indexedAny {
 			b.Fatal("expected one-file shard to be indexed")
 		}
-		results, err := executeParsedSearchScoped(ctx, indexDir, userQ, nil, defaultSearchConfig())
+		results, err := executeParsedShardSearchForTest(ctx, indexDir, userQ, defaultSearchConfig())
 		if err != nil {
 			b.Fatalf("search one-file shard: %v", err)
 		}
@@ -1697,6 +1712,10 @@ func cloneBenchRepoAt(b *testing.B, sourceRepo, ref string) string {
 	want := gitOutputIn(b, sourceAbs, "rev-parse", ref)
 	repoDir := filepath.Join(b.TempDir(), "repo")
 	gitRunIn(b, filepath.Dir(repoDir), "clone", "--no-checkout", sourceAbs, repoDir)
+	// A local clone can copy core.fsmonitor=true while its daemon socket still
+	// points at the source worktree. Disable it so the benchmark measures Seek
+	// instead of a failed fsmonitor IPC request.
+	gitRunIn(b, repoDir, "config", "core.fsmonitor", "false")
 	gitRunIn(b, repoDir, "checkout", "-B", "seek-bench", want)
 	if got := gitOutputIn(b, repoDir, "rev-parse", "HEAD"); got != want {
 		b.Fatalf("bench clone HEAD mismatch: source=%s clone=%s", want, got)
@@ -1723,7 +1742,7 @@ func BenchmarkLargeRepo_ColdIndex(b *testing.B) {
 		}
 		b.StartTimer()
 
-		if results, err := runSeekInPlannedGitCorpus(ctx, "func main", paths, plan); err != nil {
+		if results, err := runSeekInPlannedGitCorpus(ctx, "type:file", paths, plan); err != nil {
 			b.Fatalf("cold large-repo search: %v", err)
 		} else if len(results) == 0 {
 			b.Fatal("expected cold large-repo result")
@@ -1736,7 +1755,7 @@ func BenchmarkLargeRepo_WarmSearch(b *testing.B) {
 	ctx := context.Background()
 	b.ResetTimer()
 	for b.Loop() {
-		if results, err := runSeekInPlannedGitCorpus(ctx, "func main", paths, plan); err != nil {
+		if results, err := runSeekInPlannedGitCorpus(ctx, "type:file", paths, plan); err != nil {
 			b.Fatalf("warm large-repo search: %v", err)
 		} else if len(results) == 0 {
 			b.Fatal("expected warm large-repo result")
@@ -1838,10 +1857,10 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		}
 	})
 
-	b.Run("indexCommitted_incremental", func(b *testing.B) {
+	b.Run("refreshCommitted_cached", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			if err := indexCommitted(paths.RepoDir, plan.indexDir, indexParallelism()); err != nil {
+			if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
 				b.Fatalf("index committed: %v", err)
 			}
 		}
@@ -2074,13 +2093,12 @@ func assertBenchmarkResultsContainPaths(b *testing.B, repoDir string, targets []
 	}
 }
 
-// --- Delta-indexing benches (added with the IsDelta migration) ---
+// --- Delta-indexing benchmarks ---
 
 // BenchmarkGitCommitted_1CommitAhead measures the steady-state cost of
 // indexing a single committed change. Each iteration prepares a new commit
-// outside the timed section, then runs indexCommitted with IsDelta=true. The
-// expected gain vs a hypothetical IsDelta=false build comes from Zoekt's
-// tree-to-tree diff (only the new blob is hashed + ctags-parsed).
+// outside the timed section, then runs the production native refresh. The
+// refresh uses a native delta when the new commit passes admission.
 func BenchmarkGitCommitted_1CommitAhead(b *testing.B) {
 	if testing.Short() {
 		b.Skip("skipping end-to-end benchmark in short mode")
@@ -2088,8 +2106,9 @@ func BenchmarkGitCommitted_1CommitAhead(b *testing.B) {
 	requireTools(b)
 
 	dir := initGitRepo(b, "seed.go", "package main\n// commit_ahead_seed\n")
+	ctx := context.Background()
 	paths, plan := planGitTestCorpus(b, dir)
-	if err := indexCommitted(paths.RepoDir, plan.indexDir, indexParallelism()); err != nil {
+	if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
 		b.Fatalf("initial commit index: %v", err)
 	}
 
@@ -2105,7 +2124,7 @@ func BenchmarkGitCommitted_1CommitAhead(b *testing.B) {
 		gitRunIn(b, dir, "add", ".")
 		gitRunIn(b, dir, "commit", "-m", "delta step")
 		b.StartTimer()
-		if err := indexCommitted(paths.RepoDir, plan.indexDir, indexParallelism()); err != nil {
+		if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
 			b.Fatalf("delta commit index: %v", err)
 		}
 	}
@@ -2183,7 +2202,8 @@ func BenchmarkGitBranch_Switch_Unrelated(b *testing.B) {
 	gitRunIn(b, dir, "commit", "-am", "feature churn")
 
 	paths, plan := planGitTestCorpus(b, dir)
-	if err := indexCommitted(paths.RepoDir, plan.indexDir, indexParallelism()); err != nil {
+	ctx := context.Background()
+	if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
 		b.Fatalf("initial index: %v", err)
 	}
 
@@ -2195,7 +2215,7 @@ func BenchmarkGitBranch_Switch_Unrelated(b *testing.B) {
 			target = "feature"
 		}
 		gitRunIn(b, dir, "checkout", target)
-		if err := indexCommitted(paths.RepoDir, plan.indexDir, indexParallelism()); err != nil {
+		if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
 			b.Fatalf("post-switch index: %v", err)
 		}
 	}
@@ -2626,7 +2646,7 @@ func BenchmarkDetectGitBoundary_LinkedWorktreeBackref(b *testing.B) {
 	writeGitTriadAt(b, parentGit)
 
 	worktree := filepath.Join(root, "feature-wt")
-	wtGit := writeLinkedWorktreeAdmin(b, parentGit, worktree, "feature")
+	wtGit := writeLinkedWorktreeAdmin(b, parentGit, worktree)
 	if err := os.MkdirAll(worktree, 0o755); err != nil {
 		b.Fatal(err)
 	}

@@ -127,7 +127,7 @@ func TestIndexDocuments_CancelDuringRange(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
 	}
-	_, done := withReadSemLock(t)
+	done := withReadSemLock(t)
 	defer done()
 
 	indexDir := t.TempDir()

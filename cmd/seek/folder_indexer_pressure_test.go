@@ -21,7 +21,7 @@ func TestEnsureFolderCorpusFresh_BeyondInFlightBudget(t *testing.T) {
 	const testBudget int64 = 4 * 1024 * 1024  // 4 MiB
 	const fileSize int64 = 512 * 1024         // 512 KiB
 	const totalBytes int64 = 12 * 1024 * 1024 // 12 MiB > budget
-	defer setupPressureTest(t, testBudget, 60*time.Second)()
+	defer setupPressureTest(t, testBudget)()
 
 	root := writeRandomFolder(t, totalBytes, fileSize)
 	// Marker file so we can verify post-index searchability — pressure
@@ -69,7 +69,7 @@ func TestEnsureFolderCorpusFresh_AtBudgetBoundary(t *testing.T) {
 	const testBudget int64 = 4 * 1024 * 1024
 	const fileSize int64 = 1024 * 1024       // 1 MiB
 	const totalBytes int64 = 8 * 1024 * 1024 // 2× budget
-	defer setupPressureTest(t, testBudget, 60*time.Second)()
+	defer setupPressureTest(t, testBudget)()
 
 	root := writeRandomFolder(t, totalBytes, fileSize)
 	const beacon = "AT_BUDGET_BOUNDARY_BEACON_BADC0DE"
@@ -104,7 +104,7 @@ func TestEnsureFolderCorpusFresh_ManySmallFilesOverBudget(t *testing.T) {
 	const testBudget int64 = 2 * 1024 * 1024 // 2 MiB
 	const fileSize int64 = 64 * 1024         // 64 KiB
 	const totalBytes int64 = 8 * 1024 * 1024 // 8 MiB > 4× budget
-	defer setupPressureTest(t, testBudget, 60*time.Second)()
+	defer setupPressureTest(t, testBudget)()
 
 	root := writeRandomFolder(t, totalBytes, fileSize)
 	const beacon = "MANY_SMALL_FILES_BEACON_FEEDFACE"
@@ -138,7 +138,7 @@ func TestEnsureFolderCorpusFresh_ManySmallFilesOverBudget(t *testing.T) {
 // chain produces queryable output even when reads return zero bytes.
 func TestEnsureFolderCorpusFresh_SparseFiles(t *testing.T) {
 	const testBudget int64 = 4 * 1024 * 1024
-	defer setupPressureTest(t, testBudget, 60*time.Second)()
+	defer setupPressureTest(t, testBudget)()
 
 	root := t.TempDir()
 	const fileSize int64 = 1024 * 1024

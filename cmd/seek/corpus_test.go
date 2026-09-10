@@ -931,7 +931,6 @@ func fakeGitPathsForPlanTest(repoDir string) gitPaths {
 	gitDir := filepath.Join(absRepoDir, ".git")
 	return gitPaths{
 		RepoDir:    absRepoDir,
-		GitDir:     gitDir,
 		CommonDir:  gitDir,
 		ConfigPath: filepath.Join(gitDir, "config"),
 	}

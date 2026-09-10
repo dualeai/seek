@@ -18,26 +18,21 @@ import (
 // it. The caller must not recreate the lock file and its missing corpus.
 var errCorpusEvicted = errors.New("corpus evicted during build")
 
-// Two-lock protocol (single-flight build + brief publish, non-blocking reads):
+// The build and publish locks have separate scopes:
 //
-//   - acquireBuildLock: LOCK_EX on cacheDir/.build.lock, held across the WHOLE
-//     build. Serializes builders (single-flight). Readers never take it, so a
-//     long build never blocks a search.
-//   - acquirePublishLock: LOCK_EX on cacheDir/.lock, held only for the ms-scale
-//     swap. O_RDWR without O_CREATE so an evicted corpus surfaces as
-//     errCorpusEvicted instead of resurrecting the lock file.
-//   - acquireReadLock: LOCK_SH on cacheDir/.lock, held across the reader's full
-//     glob+open+search, so a concurrent publish (LOCK_EX) can never interleave
-//     and tear the shard set. Bounded wait, then a stale-serve valve only if a
-//     swap is wedged.
+//   - acquireBuildLock holds an exclusive cacheDir/.build.lock for the complete
+//     build. Readers do not take this lock.
+//   - acquirePublishLock holds an exclusive cacheDir/.lock while data is
+//     published. It opens an existing file so an evicted corpus returns
+//     errCorpusEvicted.
+//   - acquireReadLock: shared lock on cacheDir/.lock, held while the reader
+//     lists, opens, and searches shards. It waits for a bounded time. If the
+//     wait expires and shards remain, it permits an unlocked read of them.
 
-// acquireBuildLock takes the single-flight build lock (LOCK_EX on
-// cacheDir/.build.lock), held across the whole build. Returns (fd, acquired,
-// error). When another builder holds it AND a usable index already exists,
-// returns (nil, false, nil): the caller SKIPS building and serves the current
-// shards (the active builder will publish fresh ones) — readers are never
-// blocked on a peer's long build. Only a cold corpus (no shards) polls/waits, so
-// the first build is not skipped.
+// acquireBuildLock holds an exclusive cacheDir/.build.lock for the complete
+// build. If another builder holds it and any shard exists, it returns
+// (nil, false, nil), and the caller uses the current shards. A corpus with no
+// shards waits for the lock so its first build is not skipped.
 func acquireBuildLock(ctx context.Context, cacheDir, indexDir string) (*os.File, bool, error) {
 	lockPath := filepath.Join(cacheDir, buildLockFile)
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
@@ -106,21 +101,20 @@ func acquirePublishLock(ctx context.Context, cacheDir string) (*os.File, error) 
 	return f, nil
 }
 
-// acquireReadLock takes the shared read lock (LOCK_SH on the already-open f =
-// cacheDir/.lock) and holds it across the caller's full glob+open+search. It
-// polls a bounded time; if a swap is wedged past the bound AND shards exist, it
-// degrades to an unlocked stale read rather than failing.
+// acquireReadLock takes the shared lock on the open cacheDir/.lock file. The
+// caller holds it while it lists, opens, and searches shards. If the bounded
+// wait expires and shards remain, the caller can read them without the lock.
 func acquireReadLock(ctx context.Context, indexDir string, f *os.File) error {
 	if err := lockFileSharedNB(f); err == nil {
 		return nil
 	}
 	// A publish swap is ms-scale; poll briefly for it to finish.
 	if err := pollLock(ctx, func() error { return lockFileSharedNB(f) }, 20*time.Millisecond, 500*time.Millisecond, readLockTimeout); err != nil {
-		// Wedged swap: serve stale rather than hang, but only if a usable index
-		// is present. This is the sole remaining unlocked read path and fires
-		// only on the degenerate wedged-mid-swap case.
+		// Wedged swap: use the shards that remain rather than hang. This is the
+		// sole unlocked read path and fires only when the publish lock stays held
+		// past the timeout.
 		if shardsExist(indexDir) {
-			slog.Warn("Publish lock contended past timeout; searching stale shards", "index_dir", indexDir)
+			slog.Warn("Publish lock contended past timeout; searching remaining shards without the lock", "index_dir", indexDir)
 			return nil
 		}
 		return fmt.Errorf("timeout waiting for indexer to finish (%v)", readLockTimeout)
@@ -128,9 +122,9 @@ func acquireReadLock(ctx context.Context, indexDir string, f *os.File) error {
 	return nil
 }
 
-// readLockTimeout bounds how long a search waits for an in-progress publish swap
-// before degrading to a stale read. The swap is ms-scale, so this is generous.
-// A var (not const) so tests can shrink the wedged-swap valve wait.
+// readLockTimeout bounds how long a search waits for a publish swap before it
+// can read remaining shards without the lock. The swap is usually ms-scale.
+// This is a variable so tests can shorten the wait.
 var readLockTimeout = 10 * time.Second
 
 // lockPollTimeout bounds how long the build/publish lock acquisitions poll for a
