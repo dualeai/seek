@@ -34,6 +34,7 @@ const (
 	lateOnPadTokenID       = 50_284
 	lateOnCLSTokenID       = 50_281
 	lateOnSEPTokenID       = 50_282
+	lateOnX64PrecisionKey  = "session.x64quantprecision"
 )
 
 //go:embed rerank_assets/model_int8.onnx.zst
@@ -141,11 +142,16 @@ func newLateOnRerankScorer(ctx context.Context) (rerankScorer, error) {
 	if err := ensureLateOnEnvironment(runtimePath); err != nil {
 		return nil, err
 	}
+	sessionOptions, err := newLateOnSessionOptions()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = sessionOptions.Destroy() }()
 	session, err := ort.NewDynamicAdvancedSessionWithONNXData(
 		model,
 		[]string{"input_ids", "attention_mask"},
 		[]string{"output"},
-		nil,
+		sessionOptions,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create LateOn session: %w", err)
@@ -155,6 +161,26 @@ func newLateOnRerankScorer(ctx context.Context) (rerankScorer, error) {
 		tokenizer:   tokenizer,
 		punctuation: punctuation,
 	}, nil
+}
+
+func newLateOnSessionOptions() (*ort.SessionOptions, error) {
+	options, err := ort.NewSessionOptions()
+	if err != nil {
+		return nil, fmt.Errorf("create ONNX Runtime session options: %w", err)
+	}
+	if err := options.SetGraphOptimizationLevel(ort.GraphOptimizationLevelEnableAll); err != nil {
+		_ = options.Destroy()
+		return nil, fmt.Errorf("enable ONNX Runtime graph optimizations: %w", err)
+	}
+	// ONNX Runtime can overflow during x64 U8S8 matrix multiplication. At the
+	// maximum graph optimization level set above, this setting converts S8
+	// weights to U8 on affected AVX2 and AVX512 paths, so ONNX Runtime uses its
+	// slower U8U8 path. It does not cover SSE4.1-only paths.
+	if err := options.AddSessionConfigEntry(lateOnX64PrecisionKey, "1"); err != nil {
+		_ = options.Destroy()
+		return nil, fmt.Errorf("enable precise x64 quantization: %w", err)
+	}
+	return options, nil
 }
 
 func ensureLateOnEnvironment(runtimePath string) error {

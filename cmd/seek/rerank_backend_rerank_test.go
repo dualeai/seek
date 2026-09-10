@@ -278,7 +278,38 @@ func TestLateOnRuntimeExtractHelper(t *testing.T) {
 	}
 }
 
-func TestLateOnInferenceMatchesPyLate(t *testing.T) {
+func TestLateOnSessionOptionsEnableX64Precision(t *testing.T) {
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	bundle, err := lateOnRuntimeForPlatform()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimePath, _, err := ensureLateOnRuntime(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureLateOnEnvironment(runtimePath); err != nil {
+		t.Fatal(err)
+	}
+	options, err := newLateOnSessionOptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := options.Destroy(); err != nil {
+			t.Errorf("destroy session options: %v", err)
+		}
+	})
+	got, err := options.GetSessionConfigEntry(lateOnX64PrecisionKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "1" {
+		t.Fatalf("%s = %q, want 1", lateOnX64PrecisionKey, got)
+	}
+}
+
+func TestLateOnInferenceMatchesReferenceScores(t *testing.T) {
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
 	scorer, err := newLateOnRerankScorer(context.Background())
 	if err != nil {
@@ -321,16 +352,37 @@ func TestLateOnInferenceMatchesPyLate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// PyLate with the bundled tokenizer and ONNX Runtime 1.29.0 produced
-	// these scores.
-	want := []float32{6.5482426, 4.7140551, 4.5997243}
-	if len(scores) != len(want) {
-		t.Fatalf("scores = %v, want %v", scores, want)
+	// ONNX Runtime 1.29.0 uses row-wise activation quantization on the tested
+	// ARM SME/SME2 path. Its tested generic path quantizes the full activation
+	// tensor. The bundled model and tokenizer produce both stable references.
+	references := []struct {
+		name   string
+		scores []float32
+	}{
+		{name: "tensor-wide", scores: []float32{6.1823421, 5.1173959, 4.8599272}},
+		{name: "KleidiAI row-wise", scores: []float32{6.5482426, 4.7140551, 4.5997243}},
 	}
-	for i := range want {
-		if delta := float64(scores[i] - want[i]); math.Abs(delta) > 0.001 {
-			t.Errorf("score[%d] = %.7f, want %.7f (delta %.7f)", i, scores[i], want[i], delta)
+	if len(scores) != len(references[0].scores) {
+		t.Fatalf("scores = %v, want %d scores", scores, len(references[0].scores))
+	}
+	matchesReference := false
+	for _, reference := range references {
+		matches := true
+		for i := range reference.scores {
+			if math.Abs(float64(scores[i]-reference.scores[i])) > 0.001 {
+				matches = false
+				break
+			}
 		}
+		if matches {
+			matchesReference = true
+			break
+		}
+	}
+	if !matchesReference {
+		t.Errorf("scores = %v, want one of %v", scores, references)
+	}
+	for i := range scores {
 		if i > 0 && scores[i-1] <= scores[i] {
 			t.Errorf("rank order = %v, want document order", scores)
 		}
