@@ -541,7 +541,12 @@ func TestCheckNativeGitBlobReplyFailures(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			installFakeGit(t)
 			t.Setenv("FAKE_GIT_MODE", mode)
-			_, err := checkNativeGitBlobChunk(t.Context(), t.TempDir(), []gitTreeEntry{fakeTreeEntry(nativeTestOID)})
+			err := checkNativeGitBlobs(
+				t.Context(),
+				t.TempDir(),
+				[]gitTreeEntry{fakeTreeEntry(nativeTestOID)},
+				func([]gitBlobInfo) error { return nil },
+			)
 			if err == nil {
 				t.Fatal("malformed cat-file info reply succeeded")
 			}
@@ -553,10 +558,19 @@ func TestCheckNativeGitBlobExactLimitAndOversize(t *testing.T) {
 	installFakeGit(t)
 	t.Setenv("FAKE_GIT_MODE", "batch_check_limits")
 	secondOID := strings.Repeat("a", 40)
-	infos, err := checkNativeGitBlobChunk(t.Context(), t.TempDir(), []gitTreeEntry{
-		fakeTreeEntry(nativeTestOID),
-		fakeTreeEntry(secondOID),
-	})
+	var infos []gitBlobInfo
+	err := checkNativeGitBlobs(
+		t.Context(),
+		t.TempDir(),
+		[]gitTreeEntry{
+			fakeTreeEntry(nativeTestOID),
+			fakeTreeEntry(secondOID),
+		},
+		func(chunk []gitBlobInfo) error {
+			infos = append(infos, chunk...)
+			return nil
+		},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -594,9 +608,13 @@ func TestCheckNativeGitBlobsReadsAndWritesConcurrently(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	infos, err := checkNativeGitBlobChunk(ctx, t.TempDir(), entries)
-	if err != nil || len(infos) != gitObjectBatchSize {
-		t.Fatalf("infos=%d error=%v", len(infos), err)
+	count := 0
+	err := checkNativeGitBlobs(ctx, t.TempDir(), entries, func(infos []gitBlobInfo) error {
+		count += len(infos)
+		return nil
+	})
+	if err != nil || count != gitObjectBatchSize {
+		t.Fatalf("infos=%d error=%v", count, err)
 	}
 }
 
@@ -607,7 +625,12 @@ func TestCheckNativeGitBlobCancellationKillsChild(t *testing.T) {
 	t.Setenv("FAKE_GIT_MODE", "hang")
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	_, err := checkNativeGitBlobChunk(ctx, t.TempDir(), []gitTreeEntry{fakeTreeEntry(nativeTestOID)})
+	err := checkNativeGitBlobs(
+		ctx,
+		t.TempDir(),
+		[]gitTreeEntry{fakeTreeEntry(nativeTestOID)},
+		func([]gitBlobInfo) error { return nil },
+	)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error=%v, want deadline", err)
 	}
@@ -691,7 +714,7 @@ func TestReadNativeGitBlobsReadsAndWritesConcurrently(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	count := 0
-	err := readNativeGitBlobChunk(ctx, t.TempDir(), infos, func(document fileContent) error {
+	err := readNativeGitBlobs(ctx, t.TempDir(), infos, func(document fileContent) error {
 		count++
 		readSemaphore.Release(document.weight)
 		return nil

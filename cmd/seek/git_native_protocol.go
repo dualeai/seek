@@ -456,24 +456,6 @@ func parseNativeGitBatchHeader(header []byte, want gitObjectID, wantSize *int64)
 	return size, nil
 }
 
-func checkNativeGitBlobChunk(ctx context.Context, repoDir string, entries []gitTreeEntry) ([]gitBlobInfo, error) {
-	if len(entries) == 0 {
-		return nil, nil
-	}
-	batch, err := startNativeGitBatch(ctx, repoDir)
-	if err != nil {
-		return nil, err
-	}
-	infos, err := batch.check(entries)
-	if err != nil {
-		return nil, err
-	}
-	if err := batch.close(); err != nil {
-		return nil, err
-	}
-	return infos, nil
-}
-
 func checkNativeGitBlobs(
 	ctx context.Context,
 	repoDir string,
@@ -501,40 +483,6 @@ func checkNativeGitBlobs(
 		if err := consume(infos); err != nil {
 			return err
 		}
-	}
-	return batch.close()
-}
-
-func readNativeGitBlobChunk(
-	ctx context.Context,
-	repoDir string,
-	infos []gitBlobInfo,
-	consume func(fileContent) error,
-) error {
-	if len(infos) == 0 {
-		return nil
-	}
-	allOversize := true
-	for _, info := range infos {
-		if !info.oversize {
-			allOversize = false
-			break
-		}
-	}
-	if allOversize {
-		for _, info := range infos {
-			if err := consume(fileContent{name: info.entry.path, skipReason: index.SkipReasonTooLarge}); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	batch, err := startNativeGitBatch(ctx, repoDir)
-	if err != nil {
-		return err
-	}
-	if err := batch.read(infos, consume); err != nil {
-		return err
 	}
 	return batch.close()
 }
