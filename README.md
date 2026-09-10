@@ -67,7 +67,9 @@ is easy to open.
 - **Fast after the first index** -- one-time build, then warm searches in
   milliseconds (benchmarks below)
 - **Optional code re-ranking** -- release binaries can re-rank a small candidate
-  set with an embedded 17M-parameter code model
+  set with the embedded 17M-parameter
+  [LateOn-Code-edge](https://huggingface.co/lightonai/LateOn-Code-edge/tree/4bcdf5ed93f791259eb130b577a240f753d68dd8)
+  code model
 
 ## Install
 
@@ -280,42 +282,43 @@ under `./src` containing a `handleRequest` definition under paths matching
 
 ### Optional code re-ranking
 
-Release binaries can improve a plain code search with the bundled
-LateOn-Code-edge model:
+Use `--rerank` when you know what the code does but do not know its exact name
+or location. Seek uses its bundled code-search model to move files that best
+match the meaning of the query toward the top.
 
 ```bash
 seek --rerank 'find request parser' ./cmd
+seek --rerank 'remove expired cache entries' ./cmd
+seek --rerank -n 5 -m 2 -C 1 'validate search query syntax' ./cmd
 ```
 
-Re-ranking is off by default. It applies only to a plain query with two or more
-words. Use a short English description because the model was trained for
-English-to-code retrieval. A query with a filter, regular expression, Boolean
-operator, negation, or one word keeps the normal BM25 path.
+Re-ranking is off by default. It works with plain English queries of two or
+more words. It is most useful for a description of a behavior or feature. Use
+normal search for an exact identifier, an exact phrase expression such as
+`seek '"two words"'`, a `sym:` query, or a query with filters, regular
+expressions, Boolean operators, or negation. Those query forms keep the normal
+BM25 path even when you pass `--rerank`.
 
-For an eligible query, Seek scores at most 20 files drawn from matches for any
-query word. It scores their best matched snippets with the code model and
-combines that order with the relaxed BM25 order by reciprocal rank fusion. If
-fewer than two candidate files exist, or if collection, model setup, or
-inference fails, Seek returns the strict BM25 results. A build without the
-bundled backend prints a warning. Add `--verbose` to see other fallback
-messages.
+Seek checks a small set of files that match parts of the query. It scores the
+best nearby code and combines that signal with the normal text rank. This can
+find a useful file that does not contain every query word. Seek keeps normal
+BM25 matches in the result set, subject to the output limits.
 
-The Seek executable never accesses the network. When the runtime is absent, the
-next eligible query expands the embedded ONNX Runtime into the private Seek
-cache. Later queries reuse that checked file. The backend uses ONNX Runtime on
-the CPU. It does not enable a GPU, NPU, FPGA, Core ML, or OpenVINO provider in
-this version.
+**Ranking warning:** Re-ranking can move a less useful file upward. Compare the
+results with and without `--rerank` when rank quality is important.
 
-The frozen validation used 1,133 queries from 57 held-out Semble repositories.
-Of 854 eligible queries, the OR candidate pass reached 0.873 Recall@20. The
-combined rank reached 0.628 NDCG@10, compared with 0.572 for OR alone, for a
-gain of 0.055. Its MRR@10 was 0.579, compared with 0.517 for OR alone. It
-improved 313 eligible queries, left 463 equal, and made 78 worse (9.1%). Of
-those 78, 25 lost at least 0.25 NDCG@10. On an Apple M5 Pro, a cold query took
-919 ms and 475 warm queries had a 313 ms p95. The release archive was 32.708 MiB
-and the highest measured RSS was 230.594 MiB. These values describe this fixed
-local test, not a performance comparison or a result for all computers.
-CodSpeed is the source for performance comparisons.
+Re-ranking does not change the displayed file, match, or context limits. The
+`-n`, `-m`, `-C`, and `-A` flags continue to control the output. Seek uses
+nearby source context internally without adding it to the displayed result.
+
+The model runs locally. Seek does not send code or queries to a service, and it
+does not download a model. Every eligible re-ranked command uses more time and
+memory than normal BM25. The first command can take longer when Seek must
+extract its embedded runtime to the private cache. Later commands reuse only
+that extracted runtime file and still set up the scorer. If re-ranking is
+unavailable or fails, Seek returns the normal BM25 results that match all query
+terms. A build without the bundled backend prints a warning. Add `--verbose`
+to see other fallback messages.
 
 ## What seek adds over ripgrep
 
