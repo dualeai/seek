@@ -94,16 +94,17 @@ func newRootCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "seek [flags] <query> [path...]",
 		Short: "BM25-ranked code search with persistent caching",
-		Long: `seek searches the current Git worktree by default, or the files and
-folders you pass. Files and directories inside a Git worktree are searched
-through Seek's cached Git corpus, scoped to your selection; paths excluded by
-.gitignore are searched as plain files or folders instead, as is anything
-outside a Git worktree. Visible nested Git worktrees under selected directories
-are searched once.`,
+		Long: `seek searches the current Git worktree or the files and folders you
+pass. Git paths use a cached Git corpus. Results stay in your selection.
+Explicit paths excluded by .gitignore and paths outside Git are searched as
+plain files or folders. Seek searches each visible nested Git worktree in the
+selected directories once. On supported builds, --rerank combines BM25 with a
+bundled local code-search model for plain multi-word descriptions.`,
 		Example: `  seek 'sym:Foo'              find definitions named Foo (ctags)
   seek 'lang:go func main'    Go files containing both tokens
   seek 'file:cmd -file:test'  paths matching cmd, excluding tests
-  seek 'TODO' ./src           search a specific subtree`,
+  seek 'TODO' ./src           search a specific subtree
+  seek --rerank 'request auth flow'  rank a description with the local model`,
 		Args: rootArgsValidator,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			configureCLILogging(os.Stderr, flags.verbose)
@@ -152,9 +153,9 @@ are searched once.`,
 	}
 
 	cmd.PersistentFlags().BoolVarP(&flags.verbose, "verbose", "v", false, "show debug logs and detailed errors")
-	cmd.Flags().BoolVar(&flags.rerank, "rerank", false, "re-rank plain multi-word searches with the English-to-code model")
-	cmd.Flags().IntVarP(&flags.limit, "limit", "n", 0, "maximum number of files to display (≥ 0, 0 = unlimited)")
-	cmd.Flags().IntVarP(&flags.maxMatches, "max-matches", "m", 0, "maximum matches per file (≥ 0, 0 = unlimited)")
+	cmd.Flags().BoolVar(&flags.rerank, "rerank", false, "re-rank eligible plain queries with the bundled local model")
+	cmd.Flags().IntVarP(&flags.limit, "limit", "n", 0, "maximum displayed files (≥ 0, 0 = no display limit)")
+	cmd.Flags().IntVarP(&flags.maxMatches, "max-matches", "m", 0, "maximum displayed matches per file (≥ 0, 0 = no display limit)")
 	cmd.Flags().IntVarP(&flags.afterContext, "after-context", "A", 0, "lines to display after each match (0–512)")
 	cmd.Flags().IntVarP(&flags.context, "context", "C", 0, "lines to display before and after each match (0–512)")
 
