@@ -16,7 +16,12 @@ import (
 
 const seekBenchmarkBinaryEnv = "SEEK_BENCH_BINARY"
 
-var benchmarkLateOnScores []float32
+var (
+	benchmarkLateOnScores    []float32
+	benchmarkLateOnInputIDs  []int64
+	benchmarkLateOnAttention []int64
+	benchmarkLateOnScoreMask [][]bool
+)
 
 func BenchmarkCLIProcess(b *testing.B) {
 	binary := seekBenchmarkBinary(b)
@@ -50,6 +55,7 @@ func BenchmarkCLIProcess(b *testing.B) {
 	defaultArgs := []string{queryText, fixture}
 	ineligibleArgs := []string{"--rerank", "content:parse request handler", fixture}
 	eligibleArgs := []string{"--rerank", queryText, fixture}
+	eligibleDisplayContextZeroArgs := []string{"--rerank", "-C", "0", queryText, fixture}
 	// The first term matches one file. The second term matches its path only,
 	// so the content-only relaxed query has one candidate and skips scoring.
 	oneCandidateArgs := []string{"--rerank", "candidate0 candidate_00", fixture}
@@ -112,6 +118,11 @@ func BenchmarkCLIProcess(b *testing.B) {
 	b.Run("RerankEligibleWarm", func(b *testing.B) {
 		for b.Loop() {
 			mustRunSeekBenchmark(b, binary, cache, fixture, eligibleArgs)
+		}
+	})
+	b.Run("RerankEligibleWarmDisplayContextZero", func(b *testing.B) {
+		for b.Loop() {
+			mustRunSeekBenchmark(b, binary, cache, fixture, eligibleDisplayContextZeroArgs)
 		}
 	})
 	b.Run("RerankEligibleOneCandidateWarm", func(b *testing.B) {
@@ -179,6 +190,41 @@ func BenchmarkLateOnScoring_Top20(b *testing.B) {
 	}
 }
 
+func BenchmarkLateOnTokenization_Top20Truncated(b *testing.B) {
+	tokenizerJSON, err := decodeLateOnAsset(lateOnCompressedTokenizer)
+	if err != nil {
+		b.Fatal(err)
+	}
+	tokenizer, punctuation, err := newLateOnTokenizer(tokenizerJSON)
+	if err != nil {
+		b.Fatal(err)
+	}
+	documents := lateOnBenchmarkTruncatedDocuments()
+	serialized, _, _, _ := serializeLateOnDocumentWithMatch(documents[0])
+	if encoded := tokenizer.EncodeWithAnnotations(lateOnDocumentPrefix + serialized); len(encoded.IDs) <= lateOnSequenceLength {
+		b.Fatalf("benchmark document has %d tokens; want more than %d", len(encoded.IDs), lateOnSequenceLength)
+	}
+
+	benchmarkLateOnInputIDs, benchmarkLateOnAttention, benchmarkLateOnScoreMask =
+		tokenizeLateOnBatch(
+			tokenizer,
+			punctuation,
+			"find the request parser and handler",
+			documents,
+		)
+	b.SetBytes(int64(len(documents) * len(documents[0].Text)))
+	b.ReportAllocs()
+	for b.Loop() {
+		benchmarkLateOnInputIDs, benchmarkLateOnAttention, benchmarkLateOnScoreMask =
+			tokenizeLateOnBatch(
+				tokenizer,
+				punctuation,
+				"find the request parser and handler",
+				documents,
+			)
+	}
+}
+
 func BenchmarkLateOnRuntimeCache(b *testing.B) {
 	bundle, err := lateOnRuntimeForPlatform()
 	if err != nil {
@@ -233,6 +279,28 @@ func lateOnBenchmarkDocuments() []rerankDocument {
 			Text:     text,
 			matchAt:  matchAt,
 			matchEnd: matchAt + len("parseRequest"),
+		}
+	}
+	return documents
+}
+
+func lateOnBenchmarkTruncatedDocuments() []rerankDocument {
+	const match = "parseRequestHandler"
+	before := strings.Repeat("prefixContextValue ", 55)
+	after := strings.Repeat(" suffixContextValue", 55)
+	text := before + match + after
+	documents := make([]rerankDocument, rerankCandidateLimit)
+	for i := range documents {
+		documents[i] = rerankDocument{
+			Path: fmt.Sprintf(
+				"platform/services/router/src/internal/request/handlers/component_%02d/parse_request_handler.go",
+				i,
+			),
+			Language: "Go",
+			Symbol:   "function parseRequestHandler",
+			Text:     text,
+			matchAt:  len(before),
+			matchEnd: len(before) + len(match),
 		}
 	}
 	return documents
