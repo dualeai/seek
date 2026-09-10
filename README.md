@@ -1,13 +1,13 @@
 # seek
 
-Ranked local search for AI coding agents. `seek` searches your current repo by
-default, plus any files or folders you point it at, and returns the best
-matches first with definitions and context. Single binary, no server, no API
-key.
+Ranked local search for AI coding agents. `seek` searches the current Git repo
+or the paths you pass, then returns relevant matches with definitions and
+context. When you do not know the exact name, use `--rerank` with a plain
+English description. Supported builds bundle the local code-search model; no
+server or API key is needed.
 
-Built for repeated searches while coding: compact output, fast re-runs after
-the first index, and safe use by several agents at once. Works as a tool call
-or as a regular shell command.
+Seek caches indexes for fast repeat searches and safe concurrent use. Run it as
+a tool call or shell command.
 
 <!-- Status -->
 [![CI](https://github.com/dualeai/seek/actions/workflows/ci.yml/badge.svg)](https://github.com/dualeai/seek/actions/workflows/ci.yml)
@@ -20,10 +20,13 @@ or as a regular shell command.
 cd your-project
 
 seek 'handleRequest'                 # current repo
+seek 'sym:handleRequest'             # definition, not calls
 seek 'handleRequest' ./src ./cmd     # selected paths
 seek 'TODO' ../notes                 # folder outside Git
 seek 'needle' ./src/server.go        # exact file
 ```
+
+The first command returns output like this:
 
 ```text
 ## src/server.go (Go)
@@ -42,22 +45,31 @@ seek 'needle' ./src/server.go        # exact file
 44 }
 ```
 
-Results are grouped by file and sorted by relevance. Each match includes 3
-nearby lines. Tags like `[func]` and `[class]` mark definitions. Terminal output
-uses color; piped output is plain text, so agents and CI get clean results.
-Across multiple folders or repos, file headers use absolute paths so each match
-is easy to open.
+Results are grouped by file and sorted by relevance. By default, each match
+includes up to 3 lines before and after it. Tags like `[func]` and `[class]`
+mark definitions. Terminal output uses color; piped output is plain text, so
+agents and CI get clean results. Across multiple folders or repos, file headers
+use absolute paths so each match is easy to open.
+
+When you know the behavior but not the name, use `--rerank`:
+
+```bash
+seek --rerank 'request authentication flow' ./src
+```
 
 ## Highlights
 
 - **Search what you point at** -- current repo by default; pass files,
   folders, selected paths, or another repo when you need a narrower search.
 - **Best match first** -- ranked by relevance, not file-path order
+- **Plain-English re-ranking** -- when you do not know the name, `--rerank`
+  combines text rank with a bundled local model on supported builds
 - **Find definitions, not mentions** -- `sym:` searches functions, classes,
   methods, and other symbols
 - **Compact output** -- no padding, long lines shortened around the match,
   plain when piped, color on a terminal
-- **Context included** -- 3 surrounding lines per match, no extra read step
+- **Context included** -- up to 3 lines before and after each match by default,
+  no extra read step
 - **Filters that cut noise** -- `lang:python`, `file:api`, `-file:test`,
   `content:regex` in one query
 - **Sees local changes** -- committed files and local edits are searchable
@@ -66,10 +78,6 @@ is easy to open.
   corrupting the index
 - **Fast after the first index** -- one-time build, then warm searches in
   milliseconds (benchmarks below)
-- **Optional code re-ranking** -- release binaries can re-rank a small candidate
-  set with the embedded 17M-parameter
-  [LateOn-Code-edge](https://huggingface.co/lightonai/LateOn-Code-edge/tree/4bcdf5ed93f791259eb130b577a240f753d68dd8)
-  code model
 
 ## Install
 
@@ -83,9 +91,9 @@ Or with Go:
 go install github.com/dualeai/seek/cmd/seek@latest
 ```
 
-The pre-built archives include the code re-ranker. A normal source build on a
-supported target also includes it. A build with `CGO_ENABLED=0`, or a build for
-another target, keeps the BM25 fallback without the model or runtime.
+Pre-built archives and normal source builds on supported targets include the
+re-ranker. `CGO_ENABLED=0` and other targets use BM25 without the model or
+runtime.
 
 Or download a pre-built binary from [GitHub Releases](https://github.com/dualeai/seek/releases).
 
@@ -134,21 +142,22 @@ codex plugin add seek-router@seek
 To update the plugin after a new release:
 
 ```sh
-codex plugin marketplace upgrade seek
+claude plugin update seek-router@seek  # Claude Code
+codex plugin marketplace upgrade seek # OpenAI Codex
 ```
 
-Start a new Codex session after each install or update. Open `/hooks` and trust
-`seek-router` once. Claude Code has no equivalent step.
+Start a new session in either client after each install or update. In Codex,
+open `/hooks` and trust `seek-router` once. Claude Code does not require this
+trust step.
 
 The package does not use an Agent Plugins 1.0 root manifest because that
 standard does not define portable hooks. See the
 [compatibility note](plugins/seek-router/README.md#why-there-is-no-agent-plugins-manifest).
 
-The router requires `seek`, `jq`, and a POSIX `awk`. Building or updating a seek
-index also requires Universal Ctags on `PATH` or through `CTAGS_COMMAND`. The
-router is implemented inside the plugin and calls only the public seek CLI.
-Seek does not contain hook parsing or command adapters. If a hook dependency is
-missing, the hook leaves the original command unchanged.
+The router requires `seek`, `jq`, and a POSIX `awk`. Index updates also require
+Universal Ctags on `PATH` or through `CTAGS_COMMAND`. The router stays inside
+the plugin and uses the public seek CLI. If a dependency is missing, the hook
+leaves the command unchanged.
 
 Try it without installing: `claude --plugin-dir ./plugins/seek-router`.
 
@@ -169,6 +178,9 @@ converts a final `head` limit for file-name results. Unsupported flags and
 dynamic shell syntax stay unchanged. See the
 [full contract](plugins/seek-router/README.md#routing-contract).
 
+The router does not add `--rerank`. Call `seek --rerank` directly when you want
+to search from a plain English description of two or more words.
+
 #### Ranked, not exhaustive
 
 The router caps ranked results at 20 files and three matches per file. It
@@ -188,10 +200,14 @@ Add a short note to your agent's instruction file (`CLAUDE.md`, `AGENTS.md`,
 `.cursor/rules`) naming seek and its main filters:
 
 ```text
-Use `seek` for code search, not grep/rg. Usage: seek [flags] '<query>' [path...]
+Use `seek` for ranked code navigation. Usage: seek [flags] '<query>' [path...]
 Filters stay in ONE quoted argument: sym:Name (definitions), content:REGEX,
 file:path, -file:path, lang:go, type:file. Paths come after the query.
 Examples: seek 'sym:ParseToken'   seek 'content:TODO lang:go -file:test' ./cmd
+Use --rerank only for a plain description with two or more words and no filters:
+seek --rerank 'request auth flow'
+For all occurrences, counts, or renames, run: grep -rn 'PATTERN' .
+If the seek router is installed, prefix this command with SEEK_ROUTER=off.
 ```
 
 ## Usage
@@ -222,9 +238,9 @@ Paths must exist. Symlinks passed on the command line are resolved to their
 targets. Broken symlinks and invalid paths exit with code 2. Symlinks found
 while walking folders are skipped.
 
-Path operands constrain what Seek indexes. Query filters such as `file:api` and
-`-file:test` filter search results after indexing. They do not reduce index
-limits.
+Path operands constrain the search results. They can also enable a scoped index
+when a whole Git repo exceeds an index limit. Query filters such as `file:api`
+and `-file:test` filter results after indexing. They do not reduce index limits.
 
 ## Query Syntax
 
@@ -273,52 +289,53 @@ is supported by the pinned Zoekt version. Results are ranked by relevance.
 | `seek -C 5 "query"` | Show 5 lines on both sides (`--context`) |
 | `seek -n 5 -m 3 "query"` | Top 5 files, max 3 matches each |
 | `seek -v "query"` | Show debug logs and detailed errors (`--verbose`) |
-| `seek --rerank "find request parser"` | Re-rank a plain multi-word search with the English-to-code model |
+| `seek --rerank "find request parser"` | Re-rank an eligible plain query with the local model |
 
-Flags compose with query filters and paths. For example,
-`seek -n 3 "sym:handleRequest file:api" ./src` returns the top 3 matching files
-under `./src` containing a `handleRequest` definition under paths matching
-`api`.
+`-n` and `-m` use `0` by default, which adds no display limit. `-A` and `-C`
+accept values from 0 to 512 and cannot be used together.
+
+Flags combine with filters and paths. For example,
+`seek -n 3 "sym:handleRequest file:api" ./src` returns up to 3 files under
+`./src` with `api` in the path that define `handleRequest`.
 
 ### Optional code re-ranking
 
-Use `--rerank` when you know what the code does but do not know its exact name
-or location. Seek uses its bundled code-search model to move files that best
-match the meaning of the query toward the top.
+Use `--rerank` when you know the behavior but not its name or location. Seek
+uses its bundled
+[LateOn-Code-edge](https://huggingface.co/lightonai/LateOn-Code-edge/tree/4bcdf5ed93f791259eb130b577a240f753d68dd8)
+model to move likely code toward the top.
 
 ```bash
 seek --rerank 'find request parser' ./cmd
-seek --rerank 'remove expired cache entries' ./cmd
 seek --rerank -n 5 -m 2 -C 1 'validate search query syntax' ./cmd
 ```
 
-Re-ranking is off by default. It works with plain English queries of two or
-more words. It is most useful for a description of a behavior or feature. Use
-normal search for an exact identifier, an exact phrase expression such as
-`seek '"two words"'`, a `sym:` query, or a query with filters, regular
-expressions, Boolean operators, or negation. Those query forms keep the normal
-BM25 path even when you pass `--rerank`.
+Re-ranking is off by default. It accepts only plain queries with two or more
+words. Exact identifiers and phrases, `sym:` queries, filters, regular
+expressions, Boolean operators, negation, and one-word queries stay on the BM25
+path, even with `--rerank`.
 
-Seek checks a small set of files that match parts of the query. It scores the
-best nearby code and combines that signal with the normal text rank. This can
-find a useful file that does not contain every query word. Seek keeps normal
-BM25 matches in the result set, subject to the output limits.
+Seek scores up to 20 candidate files that match at least one query word. The
+model scores each path with its best nearby code. Seek combines the model and
+BM25 orders with weighted reciprocal rank fusion; BM25 has twice the model
+weight. This can find a useful file that lacks some query words. Normal
+all-word BM25 matches remain, subject to the display limits.
 
-**Ranking warning:** Re-ranking can move a less useful file upward. Compare the
-results with and without `--rerank` when rank quality is important.
+**Ranking warning:** Re-ranking can lower result quality. Compare the query with
+and without `--rerank` when order matters.
 
-Re-ranking does not change the displayed file, match, or context limits. The
-`-n`, `-m`, `-C`, and `-A` flags continue to control the output. Seek uses
-nearby source context internally without adding it to the displayed result.
+The `-n`, `-m`, `-C`, and `-A` flags still control displayed output. The model
+can use nearby source context that these flags do not display.
 
-The model runs locally. Seek does not send code or queries to a service, and it
-does not download a model. Every eligible re-ranked command uses more time and
-memory than normal BM25. The first command can take longer when Seek must
-extract its embedded runtime to the private cache. Later commands reuse only
-that extracted runtime file and still set up the scorer. If re-ranking is
-unavailable or fails, Seek returns the normal BM25 results that match all query
-terms. A build without the bundled backend prints a warning. Add `--verbose`
-to see other fallback messages.
+The model runs locally and needs no download or service. Re-ranking uses more
+time and memory than BM25. Its first use can be slower while Seek extracts the
+embedded runtime; later searches reuse it. If re-ranking is unavailable or
+fails, Seek returns the normal all-word BM25 results. If the build has no model,
+`--rerank` prints a warning. Use `--verbose` for other fallback messages.
+
+### Shell completion
+
+Run `seek completion <shell> --help` to set up Bash, Zsh, fish, or PowerShell.
 
 ## What seek adds over ripgrep
 
@@ -327,28 +344,36 @@ search. seek adds the parts agents usually need when they search repeatedly:
 
 | | ripgrep | seek |
 |---|---|---|
-| **Search model** | Scans files per query | Builds and reuses an index |
-| **Relevance ranking** | Results in file-path order | Best matches first |
-| **Definitions** | Text matches only | Tags such as `[func]` and `[class]` |
-| **Context lines** | None by default | 3 lines around each match |
-| **Local changes** | No local-change label | Includes and labels local changes |
-| **Language detection** | Extension-based `--type` | Labels files via [go-enry](https://github.com/go-enry/go-enry) |
-| **Parallel agents** | Each command scans | Agents share one index safely |
+| **Search method** | Scans files for each command | Builds, then reuses a local index |
+| **Default directory scope** | Current directory | Current Git worktree; outside Git, pass a path |
+| **Default order** | Unspecified; `--sort path` gives stable path order | BM25 relevance |
+| **Plain descriptions** | Literal (`-F`) or regular expression | `--rerank` combines BM25 and a local model for plain multi-word queries |
+| **Symbols** | No symbol index | `sym:` finds definitions and tags symbols |
+| **Context** | None by default; use `-A`, `-B`, or `-C` | Up to 3 lines on each side by default |
+| **Local changes** | Current file contents; no status label | Committed and working-tree content; changed results get `[uncommitted]` |
+| **Languages** | Built-in and custom file-type globs | [go-enry](https://github.com/go-enry/go-enry) detection and `lang:` filters |
+| **Concurrent use** | Stateless | Agents share locked indexes |
 
-Use ripgrep for quick raw regex searches. Use seek when you want ranked,
-filtered results with context.
+Use ripgrep for all matching lines, counts, multiline regular expressions,
+optional PCRE2 features, or replacement output. Replacement changes output,
+not files. Use seek for ranked navigation, definitions, compact context, or a
+description of the code.
 
 ## How It Works
 
-1. **Choose where to search** -- no paths means the current Git repo. Exact
-   files search only that file. Folders outside Git use normal filesystem
-   rules.
+1. **Choose where to search** -- no paths means the current Git repo; outside
+   Git, pass a path. Exact files search only that file. Folders outside Git use
+   normal filesystem rules.
 2. **Check what changed** -- Git repos use `git status` and the current commit.
    Folders use file size and modification time.
 3. **Update the index** -- Git repos keep committed files and local changes
    separate. Folders index regular files directly.
-4. **Search** -- reads the index for every selected repo or folder, runs one
-   query, merges duplicate results, sorts by relevance, then applies limits.
+4. **Search** -- reads the index for every selected repo or folder, runs the
+   normal query, merges duplicate results, and sorts by BM25 relevance.
+5. **Optionally re-rank** -- for an eligible query, scores up to 20 relaxed
+   candidates and combines the model and BM25 orders.
+6. **Format** -- applies the display limits and writes grouped results with the
+   requested context.
 
 ### Git indexing
 

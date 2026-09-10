@@ -19,6 +19,19 @@ the hook JSON and `lib/router.awk` owns shell parsing and command adapters. Seek
 does not import, call, or expose the router. The plugin invokes only normal
 public seek commands.
 
+## Descriptive searches
+
+The skill recommends `seek --rerank` for plain descriptions with two or more
+words. The router preserves mapped search patterns but never adds this flag.
+Call `seek` directly:
+
+```sh
+seek --rerank 'request authentication flow' ./src
+```
+
+See the [seek-search skill](skills/seek-search/SKILL.md#re-rank-descriptive-searches)
+for limits and fallback behavior.
+
 ## Routing contract
 
 `bin/router.sh` accepts a hook payload on standard input. It has two results:

@@ -73,6 +73,21 @@ seek 'content:func.*Test lang:go -file:bench'
 seek 'type:file config'
 ```
 
+### Descriptive search
+
+Use `--rerank` when you know the behavior but not its identifier or file:
+
+```sh
+seek --rerank 'validate search query syntax' ./cmd/seek
+```
+
+`--rerank` accepts only plain queries with two or more words. Exact identifiers
+and phrases, filters, regular expressions, Boolean operators, and negation stay
+on the BM25 path. Re-ranked results can lack query words. Use normal seek for
+exact ranked navigation and `SEEK_ROUTER=off grep` for absence checks, renames,
+counts, and complete call-site lists. The router never adds `--rerank`; call
+`seek` directly.
+
 ### Pitfalls
 
 - **Query filters in one argument**: `seek 'sym:Foo file:bar'`
@@ -93,8 +108,10 @@ Requires `universal-ctags` (`brew install universal-ctags` on macOS).
 ### Sub-agents
 
 When spawning sub-agents that don't inherit this config, pass:
-"Use `seek 'pattern' [path...]` for code search. Keep query filters in one
-quoted string. Never use grep/rg."
+"Use `seek 'pattern' [path...]` for ranked code navigation. Keep query filters
+in one quoted string. Use `seek --rerank 'plain multi-word description'
+[path...]` only when you do not know the identifier. Use `SEEK_ROUTER=off grep`
+only for all occurrences, counts, or renames."
 
 ## GitHub Actions
 
