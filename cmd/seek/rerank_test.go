@@ -133,8 +133,33 @@ func TestRerankCandidateSearchConfig(t *testing.T) {
 	}
 }
 
+func TestRerankModelSearchConfigKeepsLimitsAndAddsInternalContext(t *testing.T) {
+	config := searchConfig{
+		opts:              &zoekt.SearchOptions{NumContextLines: 1},
+		afterOnly:         true,
+		contextMatchLimit: 2,
+		contextFileLimit:  7,
+		resultFileLimit:   9,
+	}
+	got := rerankModelSearchConfig(config)
+	if got.opts.NumContextLines != searchContextLines || got.afterOnly ||
+		got.contextMatchLimit != 2 {
+		t.Fatalf("internal context config=%+v", got)
+	}
+	if got.contextFileLimit != 7 || got.resultFileLimit != 9 {
+		t.Fatalf(
+			"internal file limits=context:%d result:%d, want 7 and 9",
+			got.contextFileLimit,
+			got.resultFileLimit,
+		)
+	}
+	if config.opts.NumContextLines != 1 || !config.afterOnly || config.contextMatchLimit != 2 {
+		t.Fatalf("internal context conversion mutated its input: %+v", config)
+	}
+}
+
 func TestTryRerankCorporaCandidateErrorKeepsStrictResults(t *testing.T) {
-	strict := []corpusSearchResult{rerankTestResult("strict.go", 10)}
+	strict := []corpusSearchResult{rerankTestResultWithModelContext("strict.go", 10)}
 	strictDirty := dirtyFilesByCorpus{"repo": testDirtyFileSet("dirty.go")}
 	wantErr := errors.New("candidate failure")
 	relaxedQ := &query.Or{Children: []query.Q{
@@ -173,16 +198,17 @@ func TestTryRerankCorporaCandidateErrorKeepsStrictResults(t *testing.T) {
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("error=%v, want wrapped candidate error", err)
 	}
-	if !reflect.DeepEqual(got, strict) || !reflect.DeepEqual(gotDirty, strictDirty) {
+	if !reflect.DeepEqual(gotDirty, strictDirty) {
 		t.Fatalf("fallback changed strict results: results=%#v dirty=%#v", got, gotDirty)
 	}
+	assertRerankFallbackHidesModelContext(t, got, strict)
 	if strict[0].rankOverride != 0 {
 		t.Fatal("fallback mutated the strict slice")
 	}
 }
 
 func TestTryRerankCorporaMissingBackendSkipsCandidateSearch(t *testing.T) {
-	strict := []corpusSearchResult{rerankTestResult("strict.go", 10)}
+	strict := []corpusSearchResult{rerankTestResultWithModelContext("strict.go", 10)}
 	searchCalls := 0
 	got, _, err := tryRerankCorpora(
 		context.Background(),
@@ -204,13 +230,14 @@ func TestTryRerankCorporaMissingBackendSkipsCandidateSearch(t *testing.T) {
 			return nil, nil, nil
 		},
 	)
-	if !errors.Is(err, errRerankUnavailable) || searchCalls != 0 || !reflect.DeepEqual(got, strict) {
+	if !errors.Is(err, errRerankUnavailable) || searchCalls != 0 {
 		t.Fatalf("missing backend: error=%v search calls=%d results=%#v", err, searchCalls, got)
 	}
+	assertRerankFallbackHidesModelContext(t, got, strict)
 }
 
 func TestTryRerankCorporaScorerErrorClosesAndKeepsStrictResults(t *testing.T) {
-	strict := []corpusSearchResult{rerankTestResult("strict.go", 10)}
+	strict := []corpusSearchResult{rerankTestResultWithModelContext("strict.go", 10)}
 	strictDirty := dirtyFilesByCorpus{"repo": testDirtyFileSet("dirty.go")}
 	relaxed := []corpusSearchResult{
 		rerankTestResult("alpha.go", 2),
@@ -243,9 +270,10 @@ func TestTryRerankCorporaScorerErrorClosesAndKeepsStrictResults(t *testing.T) {
 	if !errors.Is(err, wantErr) || !closed {
 		t.Fatalf("scorer failure: error=%v closed=%t", err, closed)
 	}
-	if !reflect.DeepEqual(got, strict) || !reflect.DeepEqual(gotDirty, strictDirty) {
+	if !reflect.DeepEqual(gotDirty, strictDirty) {
 		t.Fatalf("scorer fallback changed strict results: results=%#v dirty=%#v", got, gotDirty)
 	}
+	assertRerankFallbackHidesModelContext(t, got, strict)
 }
 
 func TestRerankCorpusResultsPromotesORCandidateAndAppendsStrictTail(t *testing.T) {
@@ -311,6 +339,137 @@ func TestRerankCorpusResultsPromotesORCandidateAndAppendsStrictTail(t *testing.T
 	}
 }
 
+func TestBuildRerankCandidatesIncludesStrictLeaderWithinLimit(t *testing.T) {
+	relaxed := make([]corpusSearchResult, rerankCandidateLimit)
+	for i := range relaxed {
+		relaxed[i] = rerankTestResult(
+			"relaxed-"+string(rune('a'+i))+".go",
+			float64(rerankCandidateLimit-i),
+		)
+	}
+	strictLeader := rerankTestResult("strict-leader.go", 100)
+	strict := []corpusSearchResult{strictLeader, relaxed[0]}
+
+	candidates := buildRerankCandidates(strict, relaxed)
+	if len(candidates) != rerankCandidateLimit {
+		t.Fatalf("candidate count=%d, want %d", len(candidates), rerankCandidateLimit)
+	}
+	if got := candidates[0].result.file.FileName; got != "strict-leader.go" {
+		t.Fatalf("first candidate=%q, want strict leader", got)
+	}
+	if candidates[0].lexicalRank != 1 {
+		t.Fatalf("strict leader lexical rank=%d, want 1", candidates[0].lexicalRank)
+	}
+	if got := candidates[1].result.file.FileName; got != relaxed[0].file.FileName {
+		t.Fatalf("second candidate=%q, want %q", got, relaxed[0].file.FileName)
+	}
+	if candidates[1].lexicalRank != 1 {
+		t.Fatalf("relaxed rank-one candidate rank=%d, want 1", candidates[1].lexicalRank)
+	}
+	for _, candidate := range candidates {
+		if candidate.result.file.FileName == relaxed[len(relaxed)-1].file.FileName {
+			t.Fatalf("relaxed rank %d must be outside the model limit", len(relaxed))
+		}
+	}
+}
+
+func TestBuildRerankCandidatesHandlesEmptyAndOverlappingStrictResults(t *testing.T) {
+	relaxed := []corpusSearchResult{
+		rerankTestResult("one.go", 3),
+		rerankTestResult("two.go", 2),
+		rerankTestResult("three.go", 1),
+	}
+	withoutStrict := buildRerankCandidates(nil, relaxed)
+	if len(withoutStrict) != len(relaxed) {
+		t.Fatalf("candidate count without strict results=%d, want %d", len(withoutStrict), len(relaxed))
+	}
+	for i, candidate := range withoutStrict {
+		if candidate.result.file.FileName != relaxed[i].file.FileName ||
+			candidate.lexicalRank != i+1 || candidate.preservedStrictLeader {
+			t.Fatalf("candidate %d without strict results=%+v", i, candidate)
+		}
+	}
+
+	strictLeader := rerankTestResult("two.go", 100)
+	strictLeader.file.LineMatches[0].Before = []byte("strict context")
+	relaxed[1].file.LineMatches[0].Before = []byte("richer relaxed context")
+	overlap := buildRerankCandidates([]corpusSearchResult{strictLeader}, relaxed)
+	if len(overlap) != len(relaxed) {
+		t.Fatalf("overlap candidate count=%d, want %d", len(overlap), len(relaxed))
+	}
+	if overlap[0].result.file.FileName != "two.go" || overlap[0].lexicalRank != 1 ||
+		overlap[0].preservedStrictLeader {
+		t.Fatalf("overlapping strict leader=%+v", overlap[0])
+	}
+	if got := string(overlap[0].result.file.LineMatches[0].Before); got != "richer relaxed context" {
+		t.Fatalf("overlapping strict leader context=%q", got)
+	}
+	if overlap[1].result.file.FileName != "one.go" ||
+		overlap[2].result.file.FileName != "three.go" {
+		t.Fatalf("relaxed order after overlap=%q, %q", overlap[1].result.file.FileName, overlap[2].result.file.FileName)
+	}
+}
+
+func TestRerankCorpusResultsScoresStrictLeaderAndKeepsDisplacedRelaxedTail(t *testing.T) {
+	relaxed := make([]corpusSearchResult, rerankCandidateLimit)
+	for i := range relaxed {
+		relaxed[i] = rerankTestResult(
+			"relaxed-"+string(rune('a'+i))+".go",
+			float64(rerankCandidateLimit-i),
+		)
+	}
+	strictLeader := rerankTestResult("strict-leader.go", 100)
+	var documents []rerankDocument
+
+	got, _, err := rerankCorpusResults(
+		context.Background(),
+		[]corpusSearchResult{strictLeader},
+		nil,
+		relaxed,
+		nil,
+		"alpha beta",
+		func(context.Context) (rerankScorer, error) {
+			return &fixedRerankScorer{
+				scores:    make([]float32, rerankCandidateLimit),
+				documents: &documents,
+			}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(documents) != rerankCandidateLimit {
+		t.Fatalf("scored documents=%d, want %d", len(documents), rerankCandidateLimit)
+	}
+	if documents[0].Path != strictLeader.file.FileName {
+		t.Fatalf("first scored document=%q, want %q", documents[0].Path, strictLeader.file.FileName)
+	}
+	for _, document := range documents {
+		if document.Path == relaxed[len(relaxed)-1].file.FileName {
+			t.Fatalf("relaxed rank %d was scored over the strict leader", len(relaxed))
+		}
+	}
+	if len(got) != rerankCandidateLimit+1 {
+		t.Fatalf("result count=%d, want %d", len(got), rerankCandidateLimit+1)
+	}
+	if got[0].file.FileName != relaxed[0].file.FileName ||
+		got[1].file.FileName != strictLeader.file.FileName {
+		t.Fatalf(
+			"leading results=%q, %q; want relaxed leader then strict leader",
+			got[0].file.FileName,
+			got[1].file.FileName,
+		)
+	}
+	if got[len(got)-1].file.FileName != relaxed[len(relaxed)-1].file.FileName {
+		t.Fatalf("unscored tail=%q, want %q", got[len(got)-1].file.FileName, relaxed[len(relaxed)-1].file.FileName)
+	}
+	for i, result := range got {
+		if result.rankOverride != i+1 {
+			t.Fatalf("rank override at %d=%d", i, result.rankOverride)
+		}
+	}
+}
+
 func TestRerankCorpusResultsRejectsInvalidScores(t *testing.T) {
 	relaxed := []corpusSearchResult{
 		rerankTestResult("a.go", 2),
@@ -340,18 +499,21 @@ func TestRerankCorpusResultsRejectsInvalidScores(t *testing.T) {
 
 func TestNewRerankDocumentUsesBestMatchAndThreeLineContext(t *testing.T) {
 	symbol := &zoekt.Symbol{Sym: "Serve", Kind: "method", Parent: "API"}
+	const matchedText = "Serve"
 	result := rerankTestResult("api/server.go", 1)
 	result.file.Language = "Go"
 	result.file.LineMatches = []zoekt.LineMatch{
 		{Line: []byte("low\n"), LineNumber: 2, Score: 1},
 		{
 			Before:     []byte("before-1\nbefore-2\nbefore-3\nbefore-4\n"),
-			Line:       []byte("Serve()\n"),
+			Line:       []byte("return Serve(request)\n"),
 			After:      []byte("after-1\nafter-2\nafter-3\nafter-4\n"),
 			LineNumber: 8,
 			Score:      3,
 			LineFragments: []zoekt.LineFragmentMatch{{
-				SymbolInfo: symbol,
+				LineOffset:  len("return "),
+				MatchLength: len(matchedText),
+				SymbolInfo:  symbol,
 			}},
 		},
 	}
@@ -362,8 +524,74 @@ func TestNewRerankDocumentUsesBestMatchAndThreeLineContext(t *testing.T) {
 	if document.Symbol != "API method Serve" {
 		t.Fatalf("symbol=%q", document.Symbol)
 	}
-	if document.Text != "before-2\nbefore-3\nbefore-4\nServe()\nafter-1\nafter-2\nafter-3\n" {
+	if document.Text != "before-2\nbefore-3\nbefore-4\nreturn Serve(request)\nafter-1\nafter-2\nafter-3\n" {
 		t.Fatalf("text=%q", document.Text)
+	}
+	if document.matchAt < 0 || document.matchEnd > len(document.Text) ||
+		document.matchAt >= document.matchEnd {
+		t.Fatalf(
+			"match bounds=[%d:%d] are invalid for %d bytes",
+			document.matchAt,
+			document.matchEnd,
+			len(document.Text),
+		)
+	}
+	if got := document.Text[document.matchAt:document.matchEnd]; got != matchedText {
+		t.Fatalf("match bounds select %q, want %q", got, matchedText)
+	}
+}
+
+func TestSerializeLateOnDocumentIncludesCompactMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		path     string
+		wantPath string
+	}{
+		{
+			name:     "long path",
+			path:     "platform/services/web/src/handler.go",
+			wantPath: "services/web/src/handler.go",
+		},
+		{
+			name:     "short path",
+			path:     "src/handler.go",
+			wantPath: "src/handler.go",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const matchedText = "Serve"
+			const body = "call Serve now\n"
+			wantMetadata := "path: " + tc.wantPath +
+				"\nlanguage: Go\nsymbol: API method Serve\n"
+			serialized, metadataEnd, matchAt, matchEnd := serializeLateOnDocumentWithMatch(
+				rerankDocument{
+					Path:     tc.path,
+					Language: "Go",
+					Symbol:   "API method Serve",
+					Text:     body,
+					matchAt:  len("call "),
+					matchEnd: len("call ") + len(matchedText),
+				},
+			)
+			if metadataEnd < 0 || metadataEnd > len(serialized) {
+				t.Fatalf("metadata end=%d is invalid for %d bytes", metadataEnd, len(serialized))
+			}
+			if gotMetadata := serialized[:metadataEnd]; metadataEnd != len(wantMetadata) || gotMetadata != wantMetadata {
+				t.Fatalf(
+					"metadata end=%d metadata=%q, want end=%d metadata=%q",
+					metadataEnd,
+					gotMetadata,
+					len(wantMetadata),
+					wantMetadata,
+				)
+			}
+			if matchAt < 0 || matchAt > matchEnd || matchEnd > len(serialized) {
+				t.Fatalf("serialized match bounds [%d:%d] are invalid for %d bytes", matchAt, matchEnd, len(serialized))
+			}
+			if serialized[matchAt:matchEnd] != matchedText {
+				t.Fatalf("serialized match=%q, want %q", serialized[matchAt:matchEnd], matchedText)
+			}
+		})
 	}
 }
 
@@ -390,7 +618,7 @@ func TestSerializeLateOnDocumentKeepsMatchWithinByteLimit(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			text := tc.before + tc.match + tc.after
-			serialized, matchAt, matchEnd := serializeLateOnDocumentWithMatch(
+			serialized, metadataEnd, matchAt, matchEnd := serializeLateOnDocumentWithMatch(
 				rerankDocument{
 					Path:     tc.path,
 					Language: "Go",
@@ -407,6 +635,9 @@ func TestSerializeLateOnDocumentKeepsMatchWithinByteLimit(t *testing.T) {
 			}
 			if serialized[matchAt:matchEnd] != tc.match {
 				t.Fatalf("serialized match [%d:%d] = %q, want %q", matchAt, matchEnd, serialized[matchAt:matchEnd], tc.match)
+			}
+			if metadataEnd <= 0 || metadataEnd > matchAt {
+				t.Fatalf("metadata end %d is outside (0:%d]", metadataEnd, matchAt)
 			}
 		})
 	}
@@ -826,6 +1057,66 @@ func TestRunRerankModelContextStaysOutOfDisplay(t *testing.T) {
 	}
 }
 
+func TestRunRerankFailureKeepsModelContextOutOfDisplay(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+	folder := t.TempDir()
+	writeFileAt(t, folder, "target.go", strings.Join([]string{
+		"package sample",
+		"// hidden before one",
+		"// hidden before two",
+		"// hidden before three",
+		"// alpha beta target",
+		"// hidden after one",
+		"// hidden after two",
+		"// hidden after three",
+		"",
+	}, "\n"))
+	writeFileAt(t, folder, "relaxed.go", "package sample\n// alpha only\n")
+
+	var documents []rerankDocument
+	output, err := captureStdout(t, func() error {
+		return runWithRerankConfig(
+			context.Background(),
+			"alpha beta",
+			[]string{folder},
+			0,
+			0,
+			explicitSearchConfig(0, false),
+			rerankRunConfig{
+				enabled: true,
+				newScorer: func(context.Context) (rerankScorer, error) {
+					return &fixedRerankScorer{
+						err:       errors.New("score failure"),
+						documents: &documents,
+					}, nil
+				},
+			},
+		)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(output, "hidden before") || strings.Contains(output, "hidden after") {
+		t.Fatalf("internal model context reached fallback output:\n%s", output)
+	}
+	if !strings.Contains(output, "alpha beta target") {
+		t.Fatalf("fallback lost the strict match:\n%s", output)
+	}
+	modelSawContext := false
+	for _, document := range documents {
+		if document.Path == "target.go" &&
+			strings.Contains(document.Text, "hidden before three") &&
+			strings.Contains(document.Text, "hidden after three") {
+			modelSawContext = true
+		}
+	}
+	if !modelSawContext {
+		t.Fatalf("failed scorer did not receive fixed context: %+v", documents)
+	}
+}
+
 func rerankTestResult(name string, score float64) corpusSearchResult {
 	return corpusSearchResult{
 		corpusID: "repo",
@@ -839,5 +1130,33 @@ func rerankTestResult(name string, score float64) corpusSearchResult {
 				Score:      score,
 			}},
 		},
+	}
+}
+
+func rerankTestResultWithModelContext(name string, score float64) corpusSearchResult {
+	result := rerankTestResult(name, score)
+	result.file.LineMatches[0].Before = []byte("model-only before\n")
+	result.file.LineMatches[0].After = []byte("model-only after\n")
+	return result
+}
+
+func assertRerankFallbackHidesModelContext(
+	t *testing.T,
+	got []corpusSearchResult,
+	source []corpusSearchResult,
+) {
+	t.Helper()
+	if len(got) != 1 || got[0].file.FileName != "strict.go" ||
+		len(got[0].file.LineMatches) != 1 {
+		t.Fatalf("fallback results=%#v, want strict.go", got)
+	}
+	match := got[0].file.LineMatches[0]
+	if len(match.Before) != 0 || len(match.After) != 0 {
+		t.Fatalf("fallback exposed model context: before=%q after=%q", match.Before, match.After)
+	}
+	sourceMatch := source[0].file.LineMatches[0]
+	if string(sourceMatch.Before) != "model-only before\n" ||
+		string(sourceMatch.After) != "model-only after\n" {
+		t.Fatal("fallback context conversion mutated its input")
 	}
 }

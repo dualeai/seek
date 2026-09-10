@@ -132,7 +132,7 @@ func TestTokenizeLateOnBatchMasksPunctuationAndPadding(t *testing.T) {
 	}
 }
 
-func TestEncodeLateOnDocumentKeepsLateMatch(t *testing.T) {
+func TestEncodeLateOnDocumentKeepsMetadataAndLateMatch(t *testing.T) {
 	tokenizerJSON, err := decodeLateOnAsset(lateOnCompressedTokenizer)
 	if err != nil {
 		t.Fatal(err)
@@ -143,14 +143,18 @@ func TestEncodeLateOnDocumentKeepsLateMatch(t *testing.T) {
 	}
 
 	const lateMatch = "needle"
+	const wantMetadata = "path: services/web/src/handler.go\n" +
+		"language: Go\n" +
+		"symbol: function HandleNeedle"
 	markerID, ok := tokenizer.TokenToID("Ġ" + lateMatch)
 	if !ok {
 		t.Fatalf("tokenizer has no single token for %q", lateMatch)
 	}
 	textPrefix := strings.Repeat("identifier_1234567890 ", 900)
 	document := rerankDocument{
-		Path:     strings.Repeat("long-path/", 600),
+		Path:     "workspace/platform/services/web/src/handler.go",
 		Language: "Go",
+		Symbol:   "function HandleNeedle",
 		Text:     textPrefix + lateMatch + "\n",
 		matchAt:  len(textPrefix),
 		matchEnd: len(textPrefix) + len(lateMatch),
@@ -159,6 +163,28 @@ func TestEncodeLateOnDocumentKeepsLateMatch(t *testing.T) {
 	if len(selected) != lateOnSequenceLength || !slices.Contains(selected, markerID) {
 		t.Fatalf("selected IDs do not retain the late match token %d: %v", markerID, selected)
 	}
+	wantMetadataIDs := tokenizer.Encode(lateOnDocumentPrefix + wantMetadata)
+	if len(wantMetadataIDs) == 0 {
+		t.Fatal("tokenizer returned no metadata IDs")
+	}
+	if wantMetadataIDs[len(wantMetadataIDs)-1] == lateOnSEPTokenID {
+		wantMetadataIDs = wantMetadataIDs[:len(wantMetadataIDs)-1]
+	}
+	if !containsTokenSequence(selected, wantMetadataIDs) {
+		t.Fatalf("selected IDs do not retain metadata %v: %v", wantMetadataIDs, selected)
+	}
+}
+
+func containsTokenSequence(values, sequence []int) bool {
+	if len(sequence) == 0 {
+		return false
+	}
+	for i := 0; i+len(sequence) <= len(values); i++ {
+		if slices.Equal(values[i:i+len(sequence)], sequence) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestLateOnMaxSimUsesMasksAndNegativeValues(t *testing.T) {

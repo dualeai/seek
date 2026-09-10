@@ -176,6 +176,9 @@ func runWithRerankConfig(
 		scorer rerankScorer
 		err    error
 	}
+	// Start scorer setup before corpus planning so setup overlaps planning and
+	// strict search. Taking the result transfers close ownership of a successful
+	// scorer to re-ranking. Otherwise, the deferred receive drains and closes it.
 	var scorerReady chan scorerResult
 	var scorerTaken bool
 	if rerankEligible && rerankConfig.newScorer != nil {
@@ -200,7 +203,13 @@ func runWithRerankConfig(
 		return err
 	}
 
-	allResults, dirtyByCorpus, err := searchCorpora(ctx, plans, paths, userQ, config)
+	searchConfig := config
+	if rerankEligible {
+		// Collect model-only context during the strict search. Every exit from
+		// tryRerankCorpora restores the user's display settings.
+		searchConfig = rerankModelSearchConfig(config)
+	}
+	allResults, dirtyByCorpus, err := searchCorpora(ctx, plans, paths, userQ, searchConfig)
 	if err != nil {
 		return err
 	}

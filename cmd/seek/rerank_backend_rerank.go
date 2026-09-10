@@ -28,6 +28,8 @@ import (
 )
 
 const (
+	// lateOnSequenceLength is Seek's fixed row width, not the upstream model
+	// maximum. This lower limit bounds local inference time and memory.
 	lateOnSequenceLength   = 128
 	lateOnEmbeddingSize    = 48
 	lateOnQueryPrefix      = "[Q] "
@@ -315,6 +317,8 @@ func newLateOnTokenizer(
 	return tokenizer, punctuation, nil
 }
 
+// tokenizeLateOnBatch stores the query in row zero and documents in later
+// rows. Padding never scores. Punctuation is masked only in document rows.
 func tokenizeLateOnBatch(
 	tokenizer *hftokenizer.Tokenizer,
 	punctuation map[int]struct{},
@@ -361,22 +365,29 @@ func encodeLateOnDocument(
 	document rerankDocument,
 	limit int,
 ) []int {
-	serialized, matchAt, matchEnd := serializeLateOnDocumentWithMatch(document)
+	serialized, metadataEnd, matchAt, matchEnd := serializeLateOnDocumentWithMatch(document)
 	text := lateOnDocumentPrefix + serialized
 	prefixBytes := len(lateOnDocumentPrefix)
 	encoded := tokenizer.EncodeWithAnnotations(text)
 	return truncateLateOnDocumentTokens(
 		encoded.IDs,
 		encoded.Spans,
+		prefixBytes+metadataEnd,
 		prefixBytes+matchAt,
 		prefixBytes+matchEnd,
 		limit,
 	)
 }
 
+// truncateLateOnDocumentTokens packs one annotated document into limit tokens.
+// The byte offsets refer to the prefixed serialized text. It keeps the model
+// prefix and separator, uses at most one quarter of the content slots for
+// metadata, and centers the remaining evidence on the match. An invalid
+// annotated layout uses head truncation.
 func truncateLateOnDocumentTokens(
 	ids []int,
 	spans []api.TokenSpan,
+	metadataEnd int,
 	matchAt int,
 	matchEnd int,
 	limit int,
@@ -396,16 +407,23 @@ func truncateLateOnDocumentTokens(
 		}
 	}
 	contentEnd := len(ids)
-	if contentEnd > 0 && ids[contentEnd-1] == lateOnSEPTokenID {
+	if ids[contentEnd-1] == lateOnSEPTokenID {
 		contentEnd--
 	}
 	contentBudget := limit - prefixEnd - 1
-	if prefixEnd == 0 || prefixEnd >= contentEnd || contentBudget <= 0 {
+	if prefixEnd == 0 || contentBudget <= 0 {
 		return truncateLateOnHead(ids, limit)
 	}
+	metadataTokenEnd := prefixEnd
+	for metadataTokenEnd < contentEnd && spans[metadataTokenEnd].Start < metadataEnd {
+		metadataTokenEnd++
+	}
+	metadataBudget := min(metadataTokenEnd-prefixEnd, contentBudget/4)
+	bodyStart := metadataTokenEnd
+	evidenceBudget := contentBudget - metadataBudget
 
 	matchFirst, matchLast := -1, -1
-	for i := prefixEnd; i < contentEnd; i++ {
+	for i := bodyStart; i < contentEnd; i++ {
 		span := spans[i]
 		if span.End > matchAt && span.Start < matchEnd {
 			if matchFirst < 0 {
@@ -415,19 +433,26 @@ func truncateLateOnDocumentTokens(
 		}
 	}
 	if matchFirst < 0 {
-		return truncateLateOnHead(ids, limit)
+		windowEnd := min(contentEnd, bodyStart+evidenceBudget)
+		out := make([]int, 0, limit)
+		out = append(out, ids[:prefixEnd]...)
+		out = append(out, ids[prefixEnd:prefixEnd+metadataBudget]...)
+		out = append(out, ids[bodyStart:windowEnd]...)
+		out = append(out, lateOnSEPTokenID)
+		return out
 	}
 
 	windowStart := matchFirst
 	matchTokens := matchLast - matchFirst + 1
-	if matchTokens < contentBudget {
-		windowStart = max(prefixEnd, matchFirst-(contentBudget-matchTokens)/2)
+	if matchTokens < evidenceBudget {
+		windowStart = max(bodyStart, matchFirst-(evidenceBudget-matchTokens)/2)
 	}
-	windowEnd := min(contentEnd, windowStart+contentBudget)
-	windowStart = max(prefixEnd, windowEnd-contentBudget)
+	windowEnd := min(contentEnd, windowStart+evidenceBudget)
+	windowStart = max(bodyStart, windowEnd-evidenceBudget)
 
 	out := make([]int, 0, limit)
 	out = append(out, ids[:prefixEnd]...)
+	out = append(out, ids[prefixEnd:prefixEnd+metadataBudget]...)
 	out = append(out, ids[windowStart:windowEnd]...)
 	out = append(out, lateOnSEPTokenID)
 	return out
@@ -453,6 +478,8 @@ func truncateLateOnHead(encoded []int, limit int) []int {
 	return encoded
 }
 
+// lateOnMaxSim treats row zero as the query. For each later document row, it
+// sums each query token's largest dot product with a scoreable document token.
 func lateOnMaxSim(
 	embeddings []float32,
 	scoreMask [][]bool,

@@ -16,9 +16,11 @@ import (
 )
 
 const (
-	rerankCandidateLimit   = 20
-	rerankRRFConstant      = 60.0
-	rerankLexicalWeight    = 2.0
+	rerankCandidateLimit     = 20
+	rerankRRFConstant        = 60.0
+	rerankLexicalWeight      = 2.0
+	rerankPathComponentLimit = 4
+	// maxRerankDocumentBytes bounds work before the backend packs model tokens.
 	maxRerankDocumentBytes = 16 << 10
 )
 
@@ -37,6 +39,7 @@ type rerankDocument struct {
 	Language string
 	Symbol   string
 	Text     string
+	// matchAt and matchEnd are byte offsets in Text.
 	matchAt  int
 	matchEnd int
 }
@@ -60,6 +63,14 @@ type rerankSearchFunc func(
 	query.Q,
 	searchConfig,
 ) ([]corpusSearchResult, dirtyFilesByCorpus, error)
+
+type rerankCandidate struct {
+	result      corpusSearchResult
+	lexicalRank int
+	// preservedStrictLeader is true when the strict leader was absent from
+	// the relaxed candidate set and was added as a separate candidate.
+	preservedStrictLeader bool
+}
 
 // planRerankQuery accepts only a plain multi-word AND query. Any syntax node
 // outside that form keeps the existing BM25 path.
@@ -97,6 +108,16 @@ func planRerankQuery(pattern string, raw query.Q) (rerankQueryPlan, bool) {
 }
 
 func rerankCandidateSearchConfig(config searchConfig) searchConfig {
+	out := rerankModelSearchConfig(config)
+	out.contextMatchLimit = 0
+	out.contextFileLimit = rerankCandidateLimit
+	out.resultFileLimit = rerankCandidateLimit
+	return out
+}
+
+// rerankModelSearchConfig collects at least the standard symmetric context for
+// model input. The original config must be applied again before display.
+func rerankModelSearchConfig(config searchConfig) searchConfig {
 	out := config
 	opts := searchOpts
 	if config.opts != nil {
@@ -107,12 +128,11 @@ func rerankCandidateSearchConfig(config searchConfig) searchConfig {
 	}
 	out.opts = &opts
 	out.afterOnly = false
-	out.contextMatchLimit = 0
-	out.contextFileLimit = rerankCandidateLimit
-	out.resultFileLimit = rerankCandidateLimit
 	return out
 }
 
+// tryRerankCorpora returns re-ranked results on success. On each failure, it
+// returns normal all-term results with the user's display context restored.
 func tryRerankCorpora(
 	ctx context.Context,
 	strictResults []corpusSearchResult,
@@ -125,7 +145,7 @@ func tryRerankCorpora(
 	search rerankSearchFunc,
 ) ([]corpusSearchResult, dirtyFilesByCorpus, error) {
 	if newScorer == nil {
-		return strictResults, strictDirty, errRerankUnavailable
+		return applyRerankDisplayConfig(strictResults, config), strictDirty, errRerankUnavailable
 	}
 	relaxedResults, relaxedDirty, err := search(
 		ctx,
@@ -135,7 +155,8 @@ func tryRerankCorpora(
 		rerankCandidateSearchConfig(config),
 	)
 	if err != nil {
-		return strictResults, strictDirty, fmt.Errorf("collect re-rank candidates: %w", err)
+		return applyRerankDisplayConfig(strictResults, config), strictDirty,
+			fmt.Errorf("collect re-rank candidates: %w", err)
 	}
 
 	reranked, mergedDirty, err := rerankCorpusResults(
@@ -148,11 +169,15 @@ func tryRerankCorpora(
 		newScorer,
 	)
 	if err != nil {
-		return strictResults, strictDirty, err
+		return applyRerankDisplayConfig(strictResults, config), strictDirty, err
 	}
 	return applyRerankDisplayConfig(reranked, config), mergedDirty, nil
 }
 
+// rerankCorpusResults scores at most 20 files from the normal all-term leader
+// and the relaxed any-term BM25 order. Weighted reciprocal rank fusion gives
+// lexical rank twice the model-rank weight. A strict-only injected leader
+// cannot take first place. Unscored relaxed and normal tails remain available.
 func rerankCorpusResults(
 	ctx context.Context,
 	strictResults []corpusSearchResult,
@@ -171,16 +196,17 @@ func rerankCorpusResults(
 	if len(relaxedRanked) > rerankCandidateLimit {
 		relaxedRanked = relaxedRanked[:rerankCandidateLimit]
 	}
-	if len(relaxedRanked) < 2 {
+	candidates := buildRerankCandidates(strictRanked, relaxedRanked)
+	if len(candidates) < 2 {
 		return nil, nil, errRerankNotUseful
 	}
 	if newScorer == nil {
 		return nil, nil, errRerankUnavailable
 	}
 
-	documents := make([]rerankDocument, len(relaxedRanked))
-	for i := range relaxedRanked {
-		documents[i] = newRerankDocument(relaxedRanked[i])
+	documents := make([]rerankDocument, len(candidates))
+	for i := range candidates {
+		documents[i] = newRerankDocument(candidates[i].result)
 	}
 
 	scorer, err := newScorer(ctx)
@@ -195,11 +221,11 @@ func rerankCorpusResults(
 	if closeErr != nil {
 		return nil, nil, closeErr
 	}
-	if len(scores) != len(relaxedRanked) {
+	if len(scores) != len(candidates) {
 		return nil, nil, fmt.Errorf(
 			"invalid semantic score count: got %d, want %d",
 			len(scores),
-			len(relaxedRanked),
+			len(candidates),
 		)
 	}
 	for _, score := range scores {
@@ -219,24 +245,31 @@ func rerankCorpusResults(
 	for rank, index := range semanticOrder {
 		semanticRanks[index] = rank + 1
 	}
-
 	type fusedCandidate struct {
-		result corpusSearchResult
-		score  float64
+		result                corpusSearchResult
+		score                 float64
+		preservedStrictLeader bool
 	}
-	fused := make([]fusedCandidate, len(relaxedRanked))
-	for i, result := range relaxedRanked {
-		orRank := i + 1
+	fused := make([]fusedCandidate, len(candidates))
+	for i, candidate := range candidates {
 		semanticRank := semanticRanks[i]
 		fused[i] = fusedCandidate{
-			result: result,
-			score: rerankLexicalWeight/(rerankRRFConstant+float64(orRank)) +
+			result:                candidate.result,
+			preservedStrictLeader: candidate.preservedStrictLeader,
+			score: rerankLexicalWeight/(rerankRRFConstant+float64(candidate.lexicalRank)) +
 				1/(rerankRRFConstant+float64(semanticRank)),
 		}
 	}
 	sort.SliceStable(fused, func(i, j int) bool {
 		return fused[i].score > fused[j].score
 	})
+	// A strict-only leader adds all-term lexical evidence, but one such file must
+	// not replace the best result selected from both relaxed and semantic
+	// evidence. It can still rank second or rise naturally when it was already
+	// part of the relaxed candidate set.
+	if fused[0].preservedStrictLeader {
+		fused[0], fused[1] = fused[1], fused[0]
+	}
 
 	out := make([]corpusSearchResult, 0, len(fused)+len(strictRanked))
 	seen := make(map[corpusResultKey]struct{}, len(fused)+len(strictRanked))
@@ -245,6 +278,17 @@ func rerankCorpusResults(
 		result.rankOverride = len(out) + 1
 		out = append(out, result)
 		seen[corpusResultKey{corpusID: result.corpusID, fileName: result.file.FileName}] = struct{}{}
+	}
+	// A strict-only leader can displace the last relaxed candidate from a full
+	// model set. Keep any such file in the final result set as an unscored tail.
+	for _, result := range relaxedRanked {
+		key := corpusResultKey{corpusID: result.corpusID, fileName: result.file.FileName}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		result.rankOverride = len(out) + 1
+		out = append(out, result)
+		seen[key] = struct{}{}
 	}
 	for _, result := range strictRanked {
 		key := corpusResultKey{corpusID: result.corpusID, fileName: result.file.FileName}
@@ -259,6 +303,58 @@ func rerankCorpusResults(
 	return out, mergeDirtyFilesByCorpus(strictDirty, relaxedDirty), nil
 }
 
+// buildRerankCandidates adds strict BM25 rank one when present, then fills the
+// fixed model set in relaxed BM25 order with stable file deduplication.
+func buildRerankCandidates(
+	strictRanked []corpusSearchResult,
+	relaxedRanked []corpusSearchResult,
+) []rerankCandidate {
+	candidates := make([]rerankCandidate, 0, rerankCandidateLimit)
+	seen := make(map[corpusResultKey]struct{}, rerankCandidateLimit)
+	add := func(result corpusSearchResult, lexicalRank int, preservedStrictLeader bool) {
+		if len(candidates) >= rerankCandidateLimit {
+			return
+		}
+		key := corpusResultKey{corpusID: result.corpusID, fileName: result.file.FileName}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		candidates = append(candidates, rerankCandidate{
+			result:                result,
+			lexicalRank:           lexicalRank,
+			preservedStrictLeader: preservedStrictLeader,
+		})
+		seen[key] = struct{}{}
+	}
+
+	if len(strictRanked) > 0 {
+		strictLeader := strictRanked[0]
+		preservedStrictLeader := true
+		strictLeaderKey := corpusResultKey{
+			corpusID: strictLeader.corpusID,
+			fileName: strictLeader.file.FileName,
+		}
+		// The relaxed result keeps context for every candidate match. Use it when
+		// it represents the same strict leader.
+		for _, result := range relaxedRanked {
+			key := corpusResultKey{corpusID: result.corpusID, fileName: result.file.FileName}
+			if key == strictLeaderKey {
+				strictLeader = result
+				preservedStrictLeader = false
+				break
+			}
+		}
+		add(strictLeader, 1, preservedStrictLeader)
+	}
+	for i, result := range relaxedRanked {
+		add(result, i+1, false)
+	}
+	return candidates
+}
+
+// newRerankDocument selects the highest-scoring match, with its line number as
+// the tie-breaker. It includes at most three context lines on each side. The
+// matchAt and matchEnd fields identify the matched bytes in the selected text.
 func newRerankDocument(result corpusSearchResult) rerankDocument {
 	document := rerankDocument{
 		Path:     result.file.FileName,
@@ -333,12 +429,14 @@ func rerankLineMatchSpan(
 	return start, end
 }
 
+// serializeLateOnDocumentWithMatch returns valid UTF-8 text and three byte
+// offsets in that text: the metadata end, match start, and match end.
 func serializeLateOnDocumentWithMatch(
 	document rerankDocument,
-) (string, int, int) {
+) (string, int, int, int) {
 	var metadata strings.Builder
 	if document.Path != "" {
-		fmt.Fprintf(&metadata, "path: %s\n", document.Path)
+		fmt.Fprintf(&metadata, "path: %s\n", rerankPathTail(document.Path))
 	}
 	if document.Language != "" {
 		fmt.Fprintf(&metadata, "language: %s\n", document.Language)
@@ -368,8 +466,18 @@ func serializeLateOnDocumentWithMatch(
 		keptMatchAt, keptMatchEnd = bodyStart, bodyEnd
 	}
 	return header + body,
+		len(header),
 		len(header) + keptMatchAt - bodyStart,
 		len(header) + keptMatchEnd - bodyStart
+}
+
+// rerankPathTail limits path metadata to the final path components.
+func rerankPathTail(value string) string {
+	parts := strings.Split(value, "/")
+	if len(parts) <= rerankPathComponentLimit {
+		return value
+	}
+	return strings.Join(parts[len(parts)-rerankPathComponentLimit:], "/")
 }
 
 func rerankValidTextSpan(text string, matchAt, matchEnd int) (string, int, int) {
@@ -403,12 +511,7 @@ func rerankTextWindowBounds(text string, matchAt, matchEnd, limit int) (int, int
 	before := min(matchAt, remaining/2)
 	after := min(len(text)-matchEnd, remaining-before)
 	remaining -= before + after
-	if remaining > 0 {
-		extraBefore := min(matchAt-before, remaining)
-		before += extraBefore
-		remaining -= extraBefore
-		after += min(len(text)-matchEnd-after, remaining)
-	}
+	before += remaining
 	start := matchAt - before
 	for start < matchAt && !utf8.RuneStart(text[start]) {
 		start++
@@ -425,6 +528,8 @@ func rerankUTF8Prefix(text string, limit int) string {
 	return text[:end]
 }
 
+// applyRerankDisplayConfig copies line matches and removes model-only context
+// that the user did not request.
 func applyRerankDisplayConfig(
 	results []corpusSearchResult,
 	config searchConfig,
