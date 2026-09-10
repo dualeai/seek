@@ -21,6 +21,9 @@ import (
 	"github.com/gomlx/go-huggingface/tokenizers/api"
 	"github.com/gomlx/go-huggingface/tokenizers/hftokenizer"
 	"github.com/klauspost/compress/zstd"
+	// TODO(https://github.com/microsoft/onnxruntime/issues/32535): Migrate to
+	// the official Go binding and refactor native runtime packaging after
+	// upstream publishes a tagged module and documents the release mapping.
 	ort "github.com/yalue/onnxruntime_go"
 )
 
