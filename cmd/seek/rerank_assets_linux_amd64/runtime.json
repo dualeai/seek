@@ -1,7 +1,7 @@
 {
   "target": "linux-amd64",
   "file_name": "libonnxruntime.so",
-  "version": "1.29.0",
-  "bytes": 28497752,
-  "sha256": "5715f06d8992ca8eeeddcce43df3a7d38f97d537052126f558e912cb312460ca"
+  "version": "1.30.0",
+  "bytes": 28985152,
+  "sha256": "245a6f8c38127551057a1cd1ffd59f0a186a227ade4f3492dea2494eb565542e"
 }

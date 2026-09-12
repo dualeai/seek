@@ -19,9 +19,12 @@
 # another binary. WORKDIR is scratch-owned; deletes, resets, cleans, and dirty
 # mutations are confined to workload subdirs under it.
 #
-# Requires: git, go (unless SEEK_BIN is set), universal-ctags.
+# The default exact query still builds or updates both index parts. Pass an
+# already-built binary through SEEK_BIN when the build tools are unavailable.
+#
+# Requires: git and universal-ctags. The default build also needs make, Go, and
+# a native C compiler. Set SEEK_BIN to skip that build.
 # Optional for token columns: uv (pulls tiktoken in an ephemeral env).
-# Time budget: ~3-15 min depending on linux inclusion.
 #:HELP_END
 
 set -euo pipefail
@@ -82,9 +85,10 @@ fi
 
 if [ -z "$SEEK_BIN" ]; then
   need go
+  need make
   SEEK_BIN="$WORKDIR/seek-bench-bin"
   echo "building seek: $SEEK_BIN" >&2
-  (cd "$REPO_ROOT" && go build -trimpath -o "$SEEK_BIN" ./cmd/seek)
+  (cd "$REPO_ROOT" && make build OUTPUT="$SEEK_BIN")
 elif [ ! -x "$SEEK_BIN" ]; then
   echo "SEEK_BIN is not executable: $SEEK_BIN" >&2
   exit 2
@@ -175,7 +179,7 @@ clone_repo() {
 # shardMax (10 MiB content) yields multiple shards at the 100k scale —
 # without this realism a single-shard fixture serializes the cold-index
 # build into one goroutine and skews bench numbers vs real repos
-# (see indexer.go shardMax TODO).
+# (see shardMax in cmd/seek/indexer.go).
 #
 # Uses printf (builtin) instead of `cat <<EOF` (subprocess fork per
 # file) — heredoc spawn cost is multi-minutes at 100k scale.
@@ -270,6 +274,7 @@ echo "## Field benchmarks"
 echo
 echo "Machine: $(uname -sm) — $(date -u +%Y-%m-%d)"
 echo "Seek: $SEEK_BIN — $("$SEEK_BIN" --version 2>/dev/null || echo unknown)"
+echo "Mode: default index build; exact query execution"
 echo
 echo "| Kind | Workload | Files | Cold index | Warm search | Dirty 1% | Dirty 10% | Tok(content) | Tok(sym) |"
 echo "|------|----------|-------|------------|-------------|----------|-----------|--------------|----------|"

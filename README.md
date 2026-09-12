@@ -2,9 +2,10 @@
 
 Ranked local search for AI coding agents. `seek` searches the current Git repo
 or the paths you pass, then returns relevant matches with definitions and
-context. When you do not know the exact name, use `--rerank` with a plain
-English description. Supported builds bundle the local code-search model; no
-server or API key is needed.
+context. Plain multi-word descriptions use local model re-ranking by default.
+When one stable corpus supports combined lexical and semantic retrieval, Seek
+also adds semantic candidates. Seek bundles the code-search model; no server or
+API key is needed.
 
 Seek caches indexes for fast repeat searches and safe concurrent use. Run it as
 a tool call or shell command.
@@ -24,7 +25,15 @@ seek 'sym:handleRequest'             # definition, not calls
 seek 'handleRequest' ./src ./cmd     # selected paths
 seek 'TODO' ../notes                 # folder outside Git
 seek 'needle' ./src/server.go        # exact file
+seek 'request authentication flow'   # plain description of this repo
+seek --lexical-only 'handleRequest'  # Zoekt only; skip all model work
 ```
+
+By default, every supported search builds or updates both the Zoekt and
+semantic index parts, even when an exact query uses only BM25 results. A first
+search of a large repo can take tens of seconds or longer, use several GiB of
+memory, and create about 1 GiB of cache data. Use `--lexical-only` when you need
+a fast Zoekt-only search with no semantic index or model work.
 
 The first command returns output like this:
 
@@ -51,10 +60,13 @@ mark definitions. Terminal output uses color; piped output is plain text, so
 agents and CI get clean results. Across multiple folders or repos, file headers
 use absolute paths so each match is easy to open.
 
-When you know the behavior but not the name, use `--rerank`:
+Set `NO_COLOR` to a non-empty value to disable color. Set `CLICOLOR_FORCE` to
+force color through a pipe. `NO_COLOR` takes precedence when both are set.
+
+When you know the behavior but not the name, write a plain description:
 
 ```bash
-seek --rerank 'request authentication flow' ./src
+seek 'request authentication flow'
 ```
 
 ## Highlights
@@ -62,8 +74,8 @@ seek --rerank 'request authentication flow' ./src
 - **Search what you point at** -- current repo by default; pass files,
   folders, selected paths, or another repo when you need a narrower search.
 - **Best match first** -- ranked by relevance, not file-path order
-- **Plain-English re-ranking** -- when you do not know the name, `--rerank`
-  combines text rank with a bundled local model on supported builds
+- **Semantic search by default** -- an eligible plain description combines
+  text and vector indexes with the bundled local model
 - **Find definitions, not mentions** -- `sym:` searches functions, classes,
   methods, and other symbols
 - **Compact output** -- no padding, long lines shortened around the match,
@@ -76,24 +88,16 @@ seek --rerank 'request authentication flow' ./src
   together; changed files are refreshed between searches
 - **Safe for parallel agents** -- several agents can search at once without
   corrupting the index
-- **Fast after the first index** -- one-time build, then warm searches in
-  milliseconds (benchmarks below)
+- **Index reuse** -- repeat searches reuse the local Zoekt and semantic
+  indexes; plain descriptions also run the local model
+- **One default index** -- supported builds and updates maintain both index
+  parts unless `--lexical-only` is set
 
 ## Install
 
 ```bash
 curl -sSfL https://raw.githubusercontent.com/dualeai/seek/main/install.sh | sh
 ```
-
-Or with Go:
-
-```bash
-go install github.com/dualeai/seek/cmd/seek@latest
-```
-
-Pre-built archives and normal source builds on supported targets include the
-re-ranker. `CGO_ENABLED=0` and other targets use BM25 without the model or
-runtime.
 
 Or download a pre-built binary from [GitHub Releases](https://github.com/dualeai/seek/releases).
 
@@ -112,11 +116,11 @@ Git 2.36 or later is required for Git-backed searches. Seek uses the buffered
 [`git cat-file --batch-command`](https://git-scm.com/docs/git-cat-file)
 protocol added in Git 2.36 for normal repositories and `git worktree` setups.
 
-The re-ranker does not need a model download, an ONNX Runtime install, or an ML
-service. The executable contains those resources. Release archives support
+The search model does not need a model download, an ONNX Runtime install, or an
+ML service. The executable contains those resources. Release archives support
 macOS 15 or newer on amd64 and arm64, and glibc-based Linux on amd64 and arm64.
 The Linux archives are built on Ubuntu 24.04. Alpine and other musl systems are
-not supported. The re-ranker adds no system dependency. Seek still needs
+not supported. The search model adds no system dependency. Seek still needs
 Universal Ctags, and it needs Git for Git-backed searches.
 
 ### Agent Integration
@@ -178,8 +182,11 @@ converts a final `head` limit for file-name results. Unsupported flags and
 dynamic shell syntax stay unchanged. See the
 [full contract](plugins/seek-router/README.md#routing-contract).
 
-The router does not add `--rerank`. Call `seek --rerank` directly when you want
-to search from a plain English description of two or more words.
+The router keeps the source command's exact query form. It does not add
+`--lexical-only`, so a routed exact search still builds or updates both index
+parts while keeping strict BM25 order. Call `seek` directly with a plain
+description of two or more words for model re-ranking. Run it with no path in a
+clean Git worktree to also use combined lexical and semantic retrieval.
 
 #### Ranked, not exhaustive
 
@@ -204,8 +211,12 @@ Use `seek` for ranked code navigation. Usage: seek [flags] '<query>' [path...]
 Filters stay in ONE quoted argument: sym:Name (definitions), content:REGEX,
 file:path, -file:path, lang:go, type:file. Paths come after the query.
 Examples: seek 'sym:ParseToken'   seek 'content:TODO lang:go -file:test' ./cmd
-Use --rerank only for a plain description with two or more words and no filters:
-seek --rerank 'request auth flow'
+Use a plain description with two or more words for model re-ranking. With no
+path in a clean Git worktree, or with one stable plain file or folder, it also
+uses semantic retrieval:
+seek 'request auth flow'
+Every default search maintains Zoekt and semantic data for a supported corpus.
+Use --lexical-only to skip semantic index and model work.
 For all occurrences, counts, or renames, run: grep -rn 'PATTERN' .
 If the seek router is installed, prefix this command with SEEK_ROUTER=off.
 ```
@@ -276,7 +287,7 @@ and `-file:test` filter results after indexing. They do not reduce index limits.
 | `seek "(foo or bar) lang:go"` | Group expressions with parentheses |
 | `seek "handleError file:api -file:test"` | Combine content and path filters |
 
-More [query syntax](https://github.com/sourcegraph/zoekt/blob/a0f5789d25cb/doc/query_syntax.md)
+More [query syntax](https://github.com/sourcegraph/zoekt/blob/df97bab6f7bb/doc/query_syntax.md)
 is supported by the pinned Zoekt version. Results are ranked by relevance.
 
 ### Flags
@@ -289,7 +300,7 @@ is supported by the pinned Zoekt version. Results are ranked by relevance.
 | `seek -C 5 "query"` | Show 5 lines on both sides (`--context`) |
 | `seek -n 5 -m 3 "query"` | Top 5 files, max 3 matches each |
 | `seek -v "query"` | Show debug logs and detailed errors (`--verbose`) |
-| `seek --rerank "find request parser"` | Re-rank an eligible plain query with the local model |
+| `seek --lexical-only "query"` | Skip semantic indexing, search, and model re-ranking |
 
 `-n` and `-m` use `0` by default, which adds no display limit. `-A` and `-C`
 accept values from 0 to 512 and cannot be used together.
@@ -298,40 +309,69 @@ Flags combine with filters and paths. For example,
 `seek -n 3 "sym:handleRequest file:api" ./src` returns up to 3 files under
 `./src` with `api` in the path that define `handleRequest`.
 
-### Optional code re-ranking
+### Semantic search and code re-ranking
 
-Use `--rerank` when you know the behavior but not its name or location. Seek
-uses its bundled
+Use a plain description when you know the behavior but not its name or
+location. Seek uses its bundled
 [LateOn-Code-edge](https://huggingface.co/lightonai/LateOn-Code-edge/tree/4bcdf5ed93f791259eb130b577a240f753d68dd8)
-model to move likely code toward the top.
+model for semantic retrieval and final re-ranking.
 
 ```bash
-seek --rerank 'find request parser' ./cmd
-seek --rerank -n 5 -m 2 -C 1 'validate search query syntax' ./cmd
+seek 'find request parser'
+seek -n 5 -m 2 -C 1 'validate search query syntax'
 ```
 
-Re-ranking is off by default. It accepts only plain queries with two or more
-words. Exact identifiers and phrases, `sym:` queries, filters, regular
-expressions, Boolean operators, negation, and one-word queries stay on the BM25
-path, even with `--rerank`.
+Model re-ranking is on by default for plain queries with two or more words.
+Combined lexical and semantic retrieval also runs when the search has one
+unscoped, clean Git worktree; one stable plain file; or one stable plain folder
+with no nested Git worktree. A scoped Git path, dirty Git state, multiple
+corpora, or a nested corpus uses lexical retrieval and can use model re-ranking
+when the model and enough candidates are available. Verbose diagnostics and
+cache names call the combined path the joined path.
 
-Seek scores up to 20 candidate files that match at least one query word. The
-model scores each path with its best nearby code. Seek combines the model and
-BM25 orders with weighted reciprocal rank fusion; BM25 has twice the model
-weight. This can find a useful file that lacks some query words. Normal
-all-word BM25 matches remain, subject to the display limits.
+Exact identifiers and phrases, `sym:` queries, filters, regular expressions,
+Boolean operators, negation, and one-word queries use strict BM25 retrieval and
+order. They still build or update both index parts by default for a supported
+committed Git or folder corpus. Use `--lexical-only` to avoid that semantic
+index work.
 
-**Ranking warning:** Re-ranking can lower result quality. Compare the query with
-and without `--rerank` when order matters.
+Seek collects up to 20 candidate files from strict lexical, relaxed lexical,
+and semantic retrieval. The model scores each path with its best nearby code.
+Seek combines the lexical and model orders with weighted reciprocal rank
+fusion; lexical rank has twice the model weight. This can find a useful file
+that has none of the query words. Normal all-word lexical matches remain,
+subject to the display limits.
+
+Use `--lexical-only` when you need the strict BM25 fast path. This flag skips
+semantic index build, update, open, query, and model re-ranking work.
 
 The `-n`, `-m`, `-C`, and `-A` flags still control displayed output. The model
 can use nearby source context that these flags do not display.
 
-The model runs locally and needs no download or service. Re-ranking uses more
-time and memory than BM25. Its first use can be slower while Seek extracts the
-embedded runtime; later searches reuse it. If re-ranking is unavailable or
-fails, Seek returns the normal all-word BM25 results. If the build has no model,
-`--rerank` prints a warning. Use `--verbose` for other fallback messages.
+The model runs locally and needs no download or service. Semantic indexing uses
+more time and memory than BM25. Its first use is slower while Seek prepares the
+embedded runtime and builds both index parts. Later searches reuse them.
+Seek runs the Zoekt and semantic builders at the same time and gives them the
+complete effective compute budget. During a build, it sets Go worker and model
+call limits from `GOMAXPROCS` and available memory. It tests wider concurrency,
+keeps a faster width, and reduces or restores work when resource limits change.
+It does not use a fixed worker target. Set `GOMAXPROCS=N` to reduce Go-side
+concurrency. This is not a hard process CPU limit: Core ML, native libraries,
+and ctags can use compute outside the Go scheduler. On Apple silicon, Core ML
+can put most model work on the GPU, so CPU use alone does not show total compute
+use.
+
+Fallback behavior is specific:
+
+- `--lexical-only` uses strict Zoekt/BM25 only.
+- If joined retrieval is ineligible or unavailable, Seek can use strict and
+  relaxed lexical candidates with LateOn re-ranking.
+- If USearch cannot open or search a valid generation, Seek uses an exact scan
+  of the stored vectors.
+- If the model or re-ranking fails, Seek returns the strict all-word BM25
+  results.
+
+Use `--verbose` to show the error that caused a fallback.
 
 ### Shell completion
 
@@ -346,8 +386,8 @@ search. seek adds the parts agents usually need when they search repeatedly:
 |---|---|---|
 | **Search method** | Scans files for each command | Builds, then reuses a local index |
 | **Default directory scope** | Current directory | Current Git worktree; outside Git, pass a path |
-| **Default order** | Unspecified; `--sort path` gives stable path order | BM25 relevance |
-| **Plain descriptions** | Literal (`-F`) or regular expression | `--rerank` combines BM25 and a local model for plain multi-word queries |
+| **Default order** | Unspecified; `--sort path` gives stable path order | BM25 for exact queries; fused lexical and model order for eligible descriptions |
+| **Plain descriptions** | Literal (`-F`) or regular expression | Uses a local model by default and adds semantic retrieval for one eligible corpus |
 | **Symbols** | No symbol index | `sym:` finds definitions and tags symbols |
 | **Context** | None by default; use `-A`, `-B`, or `-C` | Up to 3 lines on each side by default |
 | **Local changes** | Current file contents; no status label | Committed and working-tree content; changed results get `[uncommitted]` |
@@ -366,12 +406,15 @@ description of the code.
    normal filesystem rules.
 2. **Check what changed** -- Git repos use `git status` and the current commit.
    Folders use file size and modification time.
-3. **Update the index** -- Git repos keep committed files and local changes
-   separate. Folders index regular files directly.
-4. **Search** -- reads the index for every selected repo or folder, runs the
-   normal query, merges duplicate results, and sorts by BM25 relevance.
-5. **Optionally re-rank** -- for an eligible query, scores up to 20 relaxed
-   candidates and combines the model and BM25 orders.
+3. **Update both index parts** -- by default, a supported committed Git or
+   folder corpus builds Zoekt and semantic data at the same time. An unborn Git
+   worktree has no committed semantic source. `--lexical-only` skips all
+   semantic index and model work and uses only Zoekt.
+4. **Search** -- exact query forms use strict lexical retrieval. For one
+   unscoped, stable corpus, an eligible plain description starts strict
+   lexical, relaxed lexical, and semantic work together.
+5. **Re-rank** -- for a plain description, the same local model scores the
+   bounded candidate union when the model and enough candidates are available.
 6. **Format** -- applies the display limits and writes grouped results with the
    requested context.
 
@@ -395,10 +438,10 @@ is a pre-admission threshold for shards added after the full base, not a hard
 maximum for the resulting family. A large full index can therefore use deltas.
 After the added-shard count goes above 64, the next update selects compaction.
 
-Seek does not reduce index quality to save memory. It sends every supported
-file up to 100 MiB through the same content and symbol-analysis path. A file
-larger than one normal shard still gets full content and ctags analysis. Seek
-only limits large shard and ctags jobs to three at a time across active
+Zoekt indexing does not reduce index quality to save memory. It sends every
+supported file up to 100 MiB through the same content and symbol-analysis path.
+A file larger than one normal shard still gets full content and ctags analysis.
+Seek only limits large shard and ctags jobs to three at a time across active
 corpora.
 
 Git is the data format and object source. Its hosting service does not select
@@ -412,21 +455,41 @@ shards made by the removed reader. The first committed build after the upgrade
 is a clean full build. Dirty-file rules do not change, but dirty shards share
 the new Git corpus cache and rebuild there. Folder caches do not change.
 
-Indexes are stored centrally in the user cache, never inside searched folders:
+Indexes are stored centrally in the user cache, never inside searched folders.
+Set `SEEK_CACHE_DIR` to use a different root for the complete Seek cache. When
+it is not set, Seek uses these paths:
 
 - macOS: `~/Library/Caches/seek/corpora/<id>/`
 - Linux: `${XDG_CACHE_HOME:-$HOME/.cache}/seek/corpora/<id>/`
 - Index files live in `index/`; `.state`, `.head`, `.git-committed-v1`, and
   `.lock` live next to it.
 
-The re-ranker stores only its extracted runtime under
-`<seek-cache>/reranker/1.29.0/<sha256>/`. The model and tokenizer stay in the
-executable.
+Joined corpora also store semantic generations in `index/` and a `.joined-v1`
+attachment next to the lexical state. Normal corpus eviction removes both.
+
+The model stores its extracted runtime under
+`<seek-cache>/reranker/<runtime-version>/<sha256>/`. The model and tokenizer
+stay in the executable. Darwin arm64 uses the ONNX Runtime Core ML provider and
+requests all Core ML compute units. If that provider cannot start, Seek uses
+the CPU provider. Darwin amd64 and both Linux targets use the CPU provider.
+Core ML can create its compiled model under `<seek-cache>/reranker/coreml/`.
+The cache key includes the model bytes, loaded ONNX Runtime version, and Core ML
+settings. This setting does not prove Neural Engine use; device placement must
+be measured on the host.
+
+Seek stores its extracted USearch library under
+`<seek-cache>/semantic/usearch/<asset-id>/`. Seek reads the USearch version from
+the loaded library and records it in each semantic generation.
 
 Folder searches read regular files and skip `.git` folders. They do not skip
 dependency, build, cache, or vendor folders by name. Git ignore rules apply only
 inside Git repos. Files larger than 100 MiB are skipped, and folder scans stop
 at 1,000,000 candidate files or 10 GiB of indexed bytes.
+
+The semantic branch skips empty files, files that contain a NUL byte, and files
+with the standard `// Code generated ... DO NOT EDIT.` marker in the first
+4 KiB. These files remain available through Zoekt when the lexical index accepts
+them; they do not supply semantic candidates.
 
 Git applies the 10,000,000-file and 10 GiB work limits separately to its
 committed and working-tree index families. The committed family counts all
@@ -434,8 +497,10 @@ candidate blobs. Its byte total includes candidate blobs at or below the
 100 MiB document limit. It calculates both totals before
 `.sourcegraph/ignore` filtering. The working-tree family counts selected
 regular-file content. If the full repository exceeds a limit, a scoped search
-can build a combined fallback for its selected paths. An unscoped search
-reports the limit error.
+can build a combined fallback for its selected paths. With a committed HEAD,
+the default fallback builds scoped Zoekt and semantic data together. Dirty
+files remain searchable through Zoekt and make joined retrieval ineligible.
+An unscoped search reports the limit error.
 
 ### Cache maintenance
 
@@ -461,29 +526,20 @@ seek gc --all                   # evict every corpus not actively in use
 `--sort` orders the table by `name` (default), `age` (oldest first), or
 `size` (largest first).
 
+`seek gc` manages only `<seek-cache>/corpora/`. It does not remove the extracted
+model runtime, compiled Core ML models, or extracted USearch libraries. Those
+provider caches are rebuildable. Remove their `reranker/` and
+`semantic/usearch/` directories only when no `seek` process is running.
+
 ### Benchmarks
 
-Pre-cutover field benchmarks, generated on Apple M1 Max / macOS with
-`./cicd/bench-field.sh --keep` on 2026-06-21. The Git rows use the former
-go-git committed reader; the folder rows are not part of that reader change:
+Do not compare results unless the binary, Seek revision, corpus revision, query
+set, provider, CPU allowance, and memory limit are the same. Do not publish a
+result from an uncommitted development binary as a result for its base commit.
 
-| Kind | Workload | Files | Cold index | Warm search | Dirty 1% | Dirty 10% |
-|------|----------|-------|------------|-------------|----------|-----------|
-| git | spf13/cobra | 66 | 1.1s | 210ms | 260ms | 270ms |
-| git | prometheus/prometheus | 1,635 | 2.8s | 250ms | 360ms | 680ms |
-| git | kubernetes/kubernetes | 30,507 | 24.8s | 1.4s | 2.1s | 8.8s |
-| git | torvalds/linux | 94,541 | 231.6s | 2.4s | 9.8s | 85.7s |
-| folder | synthetic-10k | 10,000 | 18.1s | 190ms | 410ms | 1.8s |
-| folder | synthetic-100k | 100,000 | 81.6s | 650ms | 2.7s | 17.3s |
-
-These local values are diagnostic. CodSpeed is the source for performance
-comparisons. Each field workload has one sample, with about 10-20% run-to-run
-variance.
-
-Cold index is the first search. Warm search reuses the index. Dirty 1% and
-Dirty 10% measure searches after changing that share of files.
-
-To reproduce the table, run:
+Every default query, including an exact or one-word query, builds or updates
+semantic data for a supported corpus. Use `--lexical-only` when you need to
+measure only Zoekt. To run the field matrix on your host, use:
 
 ```bash
 ./cicd/bench-field.sh                    # all workloads (includes Linux clone)
@@ -491,6 +547,38 @@ To reproduce the table, run:
 ./cicd/bench-field.sh --keep             # retain workdir for re-runs
 SEEK_BIN=./seek ./cicd/bench-field.sh    # benchmark an explicit binary
 ```
+
+The field script reports the current checkout. It does not reproduce results
+from an older implementation.
+
+The retained large-repository gate uses Kubernetes commit
+[`912ec35`](https://github.com/kubernetes/kubernetes/commit/912ec3583d7733a240dad6a3755f5f2f6b76be3e).
+The recorded reference host for its limits is an Apple M5 Pro with 18 logical
+CPUs and 64 GiB RAM. Label results from other hosts separately. Run the gate
+only on a clean, pinned checkout. It builds the current checkout when
+`SEEK_BIN` is not set and stores timing, process-tree CPU, RSS, swap, logs, and
+the last cache in a new temporary folder. Record the full Seek revision and
+`seek --version` output with any published result:
+
+```bash
+make test-bench-semantic \
+  SEEK_BENCH_REPO=/path/to/kubernetes
+```
+
+Each cold run must cover 31,250 files and 204,694 semantic rows. The fine-vector
+file alone uses 786,024,960 bytes: 3,840 bytes per row from 20 FP32 centroids of
+48 values. Metadata, Zoekt, and USearch files add more space.
+
+The gate requires at least 10 cold application runs and 10 fixed 100,000-row
+model runs. It requires a cold nearest-rank p95 of at most 60 seconds, a model
+p50 below 30 seconds, mean and median process-tree CPU use of at least 90% of
+the effective CPU budget, every covered five-second window at least 85%, and
+no new swap. Its generated summary reports the measured CPU, GPU, memory,
+cache, scheduler, and limit values. These are proof limits, not runtime settings
+or performance guarantees. Use
+`SEEK_BENCH_REPO=/path/to/kubernetes uv run --script ./cicd/bench-semantic.py --samples 1 --report-only`
+for a wiring check. A CPU failure stays a failure; GPU or memory samples do not
+hide it.
 
 ### Parallel Safety
 
@@ -520,6 +608,8 @@ in scripts.
   timeline
 - [SBOM](https://github.com/dualeai/seek/releases) -- CycloneDX Software Bill
   of Materials attached to each release
+- [Third-party notices](THIRD_PARTY_NOTICES.md) -- model and native runtime
+  sources, versions, and licenses
 - [GitHub Attestations](https://github.com/dualeai/seek/attestations) -- verify
   build provenance with `gh attestation verify`
 
@@ -538,16 +628,18 @@ make test     # Run static analysis and unit tests
 make lint     # Run golangci-lint with fixes
 ```
 
-Go 1.27 or newer is required. A normal build on a supported target also needs a
-native C compiler: the Xcode command-line tools on macOS or GCC on glibc-based
-Linux. Use `CGO_ENABLED=0 make build` only when you need the BM25 fallback build.
+Go 1.27 or newer is required. A build also needs a native C compiler: the Xcode
+command-line tools on macOS or GCC on glibc-based Linux. Use `make build` so the
+build prepares the native tokenizer library. Seek does not support a reduced
+non-CGO binary.
 
 ### Release packaging
 
 `make package` builds Seek and creates the archive for the current native
-target. Each archive contains one `seek` executable. The release workflow runs
-this target on macOS and Linux, on amd64 and arm64. It does not cross-build.
-You can run the target again to replace its output.
+target. Each archive contains the `seek` executable, `LICENSE`, and
+the two third-party notice files. The release workflow runs this target on
+macOS and Linux, on amd64 and arm64. It does not cross-build. You can run the
+target again to replace its output.
 
 The release workflow downloads the four archives, generates the standard
 CycloneDX SBOM, computes `checksums.txt`, and uploads these files. Artifact and
@@ -559,17 +651,18 @@ archives and `sbom.cyclonedx.json` exist. It needs the GitHub CLI, `gh`. The
 named GitHub release must already exist, and `gh` must have permission to upload
 to it.
 
-### Re-ranker resource update
+### Search resource update
 
-`make rerank-assets-upgrade` is a manual maintainer command. It downloads the
-model, tokenizer, and three official ONNX Runtime packages at fixed revisions.
-Microsoft does not publish an ONNX Runtime 1.29.0 macOS amd64 package, so the
-command builds that one library from the fixed source commit when its versioned
-cache entry is absent.
+`make search-assets-upgrade` is a manual maintainer command. It downloads the
+model, tokenizer, native tokenizer archives, USearch libraries, and official
+ONNX Runtime packages at fixed revisions. Microsoft does not publish an ONNX
+Runtime 1.30.0 macOS amd64 package, so the command builds that library from the
+fixed source commit when its versioned cache entry is absent.
 
-The command needs macOS, `curl`, `zstd`, CMake, Ninja, Python 3.10 or newer, and
-the Xcode command-line tools. It stores downloads, source, and build work under
-`${XDG_CACHE_HOME:-$HOME/.cache}/seek/rerank-assets-upgrade`. Downloads retry and
+The command needs macOS, `curl`, `zstd`, `unzip`, `uv`, CMake, Ninja, and the
+Xcode command-line tools. `uv` selects the declared Python version and installs
+the exact conversion dependencies. The command stores its work under
+`${XDG_CACHE_HOME:-$HOME/.cache}/seek/search-assets-upgrade`. Downloads retry and
 resume. A later run reuses completed paths and replaces tracked files only when
 their bytes differ. The command calculates and prints byte counts and SHA-256
 values from the files that it receives or builds. It has no preset remote byte
@@ -581,4 +674,5 @@ never download model or runtime resources.
 
 ## License
 
-[Apache-2.0](LICENSE)
+[Apache-2.0](LICENSE). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for
+the resources included in the executable.

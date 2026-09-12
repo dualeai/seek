@@ -190,10 +190,7 @@ func deleteStateFiles(cacheDir string) {
 
 // indexParallelism returns the number of parallel indexing workers.
 func indexParallelism() int {
-	p := runtime.NumCPU()
-	if p > 16 {
-		p = 16
-	}
+	p := runtime.GOMAXPROCS(0)
 	if p < 1 {
 		p = 1
 	}
@@ -292,21 +289,35 @@ func checkCtags() error {
 	}
 }
 
-// runIndexingWithCache makes the combined committed and uncommitted Git corpus
-// current with separate build and publish locks:
+// runIndexingWithCacheExecution makes the joined Git index current with
+// separate build and publish locks. Zoekt covers committed and uncommitted
+// files. The semantic generation covers the captured commit:
 //
 //   - .build.lock serializes builders for the complete build.
 //   - The committed family is built outside the publish lock. Native full uses
 //     an empty temporary directory; eligible native delta seeds current shards.
 //     These are the only committed-data routes. HEAD is checked before publish.
+//   - A required semantic generation builds beside the committed Zoekt branch.
+//     Each branch reads its own bounded stream from the same captured commit.
 //   - The uncommitted family is rebuilt under the publish lock so its shards,
 //     manifest, and state describe the same generation.
+//   - The joined descriptor is written last under the publish lock. A semantic
+//     failure keeps the Zoekt generation searchable without joined retrieval.
 //
-// Normal readers hold a shared publish lock while they list, open, and search
-// shards. A successful swap holds the exclusive lock, so it cannot overlap a
-// normal read. A timed-out read can continue without the lock, and a failed
-// swap can leave remaining shards until the next build repairs .swapping.
-func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDir string, state repoState, preState string) error {
+// Lexical readers normally hold a shared publish lock while they list, open,
+// and search shards. A timed-out lexical read can continue without the lock.
+// Joined readers require the strict shared lock because both indexes must name
+// the same generation. A failed swap can leave shards until the next build
+// repairs .swapping.
+func runIndexingWithCacheExecution(
+	ctx context.Context,
+	paths gitPaths,
+	cacheDir string,
+	indexDir string,
+	state repoState,
+	preState string,
+	execution searchExecution,
+) error {
 	repoDir := paths.RepoDir
 	// Ensure partial temp files are cleaned up on all exit paths.
 	defer func() {
@@ -345,11 +356,20 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	committedIntact := sc.matchesManifestFamily(indexDir, familyCommitted)
 	noHeadArtifacts := state.HeadSHA == "no-head" && sc.hasMember(familyCommitted)
 	committedPresent := committedSnapshotReady(cacheDir, indexDir, state, sc)
-	if cachedState == preState && !noHeadArtifacts && committedPresent && familyIntact {
+	semanticSource := state.HeadSHA
+	semanticRequired := execution.policy.semanticEnabled() &&
+		execution.model != nil && state.HeadSHA != "no-head"
+	joinedReady := !semanticRequired || joinedGenerationMatches(
+		cacheDir,
+		indexDir,
+		preState,
+		semanticSource,
+	)
+	if cachedState == preState && !noHeadArtifacts && committedPresent && familyIntact && joinedReady {
 		return nil
 	}
 
-	parallelism := indexParallelism()
+	parallelism := execution.resources.cpuLimit()
 
 	if err := checkGitDirtyFileBudget(repoDir, indexDir, state.Files); err != nil {
 		deleteStateFiles(cacheDir)
@@ -362,64 +382,86 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	needCommitted := state.HeadSHA != "no-head" &&
 		(state.HeadSHA != readHeadFile(cacheDir) || !committedIntact)
 	clearCommitted := noHeadArtifacts
+	semanticPresent := semanticRequired && semanticGenerationPresent(indexDir, semanticSource)
+	needSemantic := semanticRequired && !semanticPresent
 
-	// Build the next committed family outside the publish lock. An unborn
-	// repository publishes an empty family so shards from its former HEAD cannot
-	// remain searchable.
+	// Build Zoekt and semantic data together outside the publish lock. Each
+	// branch reads the same captured commit through its own bounded Git stream.
 	var buildDir string
 	var nextCommittedState *committedGitState
-	if needCommitted || clearCommitted {
+	if needCommitted || clearCommitted || needSemantic {
 		buildDir, err = newBuildDir(indexDir)
 		if err != nil {
 			return err
 		}
 		defer discardBuildDir(buildDir)
 	}
-	if needCommitted {
-		snapshot, ok, cErr := captureGitSnapshot(ctx, repoDir, state.HeadSHA)
-		if cErr != nil || !ok {
-			if cErr == nil {
-				cErr = fmt.Errorf("captured committed Git state has no commit")
+	var snapshot gitSnapshot
+	if needCommitted || needSemantic {
+		var ok bool
+		snapshot, ok, err = captureGitSnapshot(ctx, repoDir, state.HeadSHA)
+		if err != nil || !ok {
+			if err == nil {
+				err = fmt.Errorf("captured committed Git state has no commit")
 			}
 			deleteStateFiles(cacheDir)
-			return gitCorpusError(repoDir, indexDir, cErr)
+			return gitCorpusError(repoDir, indexDir, err)
 		}
-		delta, eligible, cErr := prepareNativeGitDelta(ctx, repoDir, cacheDir, indexDir, snapshot, sc)
-		if cErr == nil {
-			if eligible {
-				cErr = indexNativeGitDelta(ctx, repoDir, buildDir, sc.paths(familyCommitted), delta)
-				if cErr == nil {
-					state := delta.nextState
-					nextCommittedState = &state
-				}
-			} else {
-				var budget gitIndexBudget
-				budget, cErr = indexNativeGitFullWithBudget(ctx, repoDir, buildDir, snapshot, nil, parallelism)
-				if cErr == nil {
-					buildScan, scanErr := scanFamily(buildDir)
-					if scanErr != nil {
-						cErr = scanErr
-					} else {
-						nextCommittedState = &committedGitState{
-							head:       snapshot.commitOID,
-							baseHead:   snapshot.commitOID,
-							budget:     budget,
-							baseShards: nativeCommittedShardCount(buildScan),
-						}
-					}
-				}
-			}
+	}
+	var lexicalErr error
+	var semanticErr error
+	semanticBuilt := false
+	semanticStaging := filepath.Join(buildDir, "semantic")
+	var lexicalBuild func()
+	if needCommitted {
+		lexicalBuild = func() {
+			nextCommittedState, lexicalErr = buildCommittedGitStage(
+				ctx,
+				repoDir,
+				cacheDir,
+				indexDir,
+				buildDir,
+				snapshot,
+				sc,
+				parallelism,
+			)
 		}
-		if cErr != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			if !shardsExist(indexDir) {
-				deleteStateFiles(cacheDir)
-			}
-			// The caller decides whether existing shards make a stale search safe.
-			return gitCorpusError(repoDir, indexDir, cErr)
+	}
+	var semanticBuild func()
+	if needSemantic {
+		semanticBuild = func() {
+			semanticErr = runSemanticBuild(ctx, execution.model, func(embedder semanticModel) error {
+				_, err := buildSemanticGitGeneration(
+					ctx,
+					repoDir,
+					snapshot,
+					nil,
+					semanticStaging,
+					semanticSource,
+					embedder,
+					execution.resources,
+				)
+				return err
+			})
+			semanticBuilt = semanticErr == nil
 		}
+	}
+	runJoinedIndexBuilds(lexicalBuild, semanticBuild)
+	if lexicalErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if !shardsExist(indexDir) {
+			deleteStateFiles(cacheDir)
+		}
+		// The caller decides whether existing shards make a stale search safe.
+		return gitCorpusError(repoDir, indexDir, lexicalErr)
+	}
+	if semanticErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		slog.Debug("Semantic index build failed; keeping lexical search", "error", semanticErr)
 	}
 	// HEAD must still equal the captured value before publication. This check
 	// also covers an unborn snapshot that had no committed Builder work.
@@ -447,6 +489,11 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 	defer releaseLock(pub)
 	if _, sErr := os.Stat(indexDir); sErr != nil {
 		return nil // evicted; discard
+	}
+	if execution.policy.semanticEnabled() &&
+		(needCommitted || clearCommitted || hasDirty) {
+		// The old descriptor must not name a family while that family changes.
+		removeJoinedGeneration(cacheDir)
 	}
 
 	if needCommitted || clearCommitted {
@@ -481,8 +528,14 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 		return ctxErr
 	}
 
-	// Read dirty-file metadata again to detect changes during the build.
-	postState := gitCorpusStateHash(paths, state)
+	// Read Git state again. Reusing the pre-build clean state cannot detect a
+	// file that became dirty while both branches ran.
+	postRepoState, postStateErr := gitRepoStateIn(ctx, repoDir)
+	if postStateErr != nil {
+		deleteStateFiles(cacheDir)
+		return postStateErr
+	}
+	postState := gitCorpusStateHash(paths, postRepoState)
 
 	if postState == preState {
 		// Write the manifest under the same publish lock as the state. Use the
@@ -532,12 +585,83 @@ func runIndexingWithCache(ctx context.Context, paths gitPaths, cacheDir, indexDi
 			deleteStateFiles(cacheDir)
 			slog.Warn("Failed to write head file", "error", err)
 		}
+		if semanticRequired {
+			var activationErr error
+			if semanticBuilt {
+				activationErr = publishAndBindSemanticGeneration(
+					cacheDir, indexDir, preState, semanticSource, semanticStaging,
+				)
+			} else if semanticPresent {
+				activationErr = bindSemanticGeneration(cacheDir, indexDir, preState, semanticSource)
+			}
+			if activationErr != nil {
+				removeJoinedGeneration(cacheDir)
+				slog.Debug("Semantic index activation failed; keeping lexical search", "error", activationErr)
+			}
+		}
 	} else {
 		deleteStateFiles(cacheDir)
 		slog.Warn("Index may be stale, will re-index on next search")
 	}
 
 	return nil
+}
+
+func buildCommittedGitStage(
+	ctx context.Context,
+	repoDir string,
+	cacheDir string,
+	indexDir string,
+	buildDir string,
+	snapshot gitSnapshot,
+	scan familyScan,
+	parallelism int,
+) (*committedGitState, error) {
+	delta, eligible, err := prepareNativeGitDelta(
+		ctx,
+		repoDir,
+		cacheDir,
+		indexDir,
+		snapshot,
+		scan,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if eligible {
+		if err := indexNativeGitDelta(
+			ctx,
+			repoDir,
+			buildDir,
+			scan.paths(familyCommitted),
+			delta,
+		); err != nil {
+			return nil, err
+		}
+		state := delta.nextState
+		return &state, nil
+	}
+	budget, err := indexNativeGitFullWithBudget(
+		ctx,
+		repoDir,
+		buildDir,
+		snapshot,
+		nil,
+		parallelism,
+	)
+	if err != nil {
+		return nil, err
+	}
+	buildScan, err := scanFamily(buildDir)
+	if err != nil {
+		return nil, err
+	}
+	return &committedGitState{
+		head:       snapshot.commitOID,
+		baseHead:   snapshot.commitOID,
+		budget:     budget,
+		baseShards: nativeCommittedShardCount(buildScan),
+	}, nil
 }
 
 // committedSnapshotReady reports whether scan has enough committed state for

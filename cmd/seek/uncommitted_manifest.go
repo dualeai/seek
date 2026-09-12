@@ -44,21 +44,15 @@ type uncommittedManifestEntry struct {
 // matches expectedState. Returns ok=false on any mismatch, missing file, or
 // unmarshal error — callers fall back to a full rebuild in that case.
 func readUncommittedManifest(cacheDir, expectedState string) (uncommittedManifest, bool) {
+	var manifest uncommittedManifest
 	if expectedState == "" {
-		return uncommittedManifest{}, false
+		return manifest, false
 	}
 	data, err := os.ReadFile(filepath.Join(cacheDir, uncommittedManifestFileName))
-	if err != nil {
+	if err != nil || json.Unmarshal(data, &manifest) != nil {
 		return uncommittedManifest{}, false
 	}
-	var manifest uncommittedManifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		return uncommittedManifest{}, false
-	}
-	if manifest.Version != uncommittedManifestVersion || manifest.State != expectedState {
-		return uncommittedManifest{}, false
-	}
-	return manifest, true
+	return manifest, manifest.Version == uncommittedManifestVersion && manifest.State == expectedState
 }
 
 // writeUncommittedManifest persists entries (sorted by name) bound to state.

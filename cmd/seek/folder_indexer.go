@@ -30,8 +30,6 @@ const (
 	maxFolderDeltaShards   = 64
 	folderManifestVersion  = 1
 	folderManifestFileName = ".folder-manifest-v1"
-	// Bound the number of concurrent root-entry scans.
-	maxFolderFingerprintWorkers = 6
 )
 
 var folderChecksumTable = crc64.MakeTable(crc64.ISO)
@@ -54,7 +52,17 @@ func folderFamilyUsable(indexDir string) bool {
 	return err == nil && sc.hasShard() && sc.matchesManifest(indexDir)
 }
 
-func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexState, error) {
+// ensureFolderCorpusFreshWithExecution makes the Zoekt family and, when
+// enabled, its semantic generation describe one captured folder state. Missing
+// branches build concurrently. The joined descriptor is activated last under
+// the publish lock. A semantic failure leaves the Zoekt family searchable.
+func ensureFolderCorpusFreshWithExecution(
+	ctx context.Context,
+	plan corpusPlan,
+	execution searchExecution,
+) (corpusIndexState, error) {
+	semanticRequired := execution.policy.semanticEnabled() &&
+		execution.model != nil
 	cachedState := readStateFile(plan.cacheDir)
 	// One scan checks both shard presence and manifest agreement. Presence alone
 	// accepts any one surviving shard; the manifest detects missing or changed
@@ -87,7 +95,12 @@ func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexS
 			if selectedCount == 0 {
 				return corpusKnownEmpty, nil
 			}
-			if hasShards {
+			if hasShards && (!semanticRequired || joinedGenerationMatches(
+				plan.cacheDir,
+				plan.indexDir,
+				stateHash,
+				stateHash,
+			)) {
 				return corpusSearchable, nil
 			}
 		}
@@ -131,7 +144,13 @@ func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexS
 		// family is picked up; the pre-lock scan may be stale by now. Same
 		// gate as the warm path — presence alone would accept one survivor of
 		// a torn family.
-		if hasShards || folderFamilyUsable(plan.indexDir) {
+		if (hasShards || folderFamilyUsable(plan.indexDir)) &&
+			(!semanticRequired || joinedGenerationMatches(
+				plan.cacheDir,
+				plan.indexDir,
+				stateHash,
+				stateHash,
+			)) {
 			return corpusSearchable, nil
 		}
 	} else if latestState != cachedState {
@@ -157,7 +176,12 @@ func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexS
 		if selectedCount == 0 {
 			return corpusKnownEmpty, nil
 		}
-		if hasShards {
+		if hasShards && (!semanticRequired || joinedGenerationMatches(
+			plan.cacheDir,
+			plan.indexDir,
+			stateHash,
+			stateHash,
+		)) {
 			return corpusSearchable, nil
 		}
 	}
@@ -175,16 +199,24 @@ func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexS
 		slog.Warn("Folder shard family does not match its manifest; rebuilding it in full",
 			"index_dir", plan.indexDir)
 	}
-	isDelta := cachedState != "" && sc.hasShard() && intact
+	currentState := readStateFile(plan.cacheDir)
+	needLexical := currentState != stateHash || !sc.hasShard() || !intact
+	isDelta := needLexical && currentState != "" && sc.hasShard() && intact
+	semanticSource := stateHash
+	semanticPresent := semanticRequired && semanticGenerationPresent(plan.indexDir, semanticSource)
+	needSemantic := semanticRequired && !semanticPresent
 
 	// Build in a temporary directory, then publish under the lock. A delta build
 	// needs the prior shards, so seed them with hardlinks; a full build ignores
 	// them.
-	buildDir, err := newBuildDir(plan.indexDir)
-	if err != nil {
-		return corpusSearchable, folderCorpusError(plan, err)
+	var buildDir string
+	if needLexical || needSemantic {
+		buildDir, err = newBuildDir(plan.indexDir)
+		if err != nil {
+			return corpusSearchable, folderCorpusError(plan, err)
+		}
+		defer discardBuildDir(buildDir)
 	}
-	defer discardBuildDir(buildDir)
 	if isDelta {
 		if err := seedFamilyFiles(buildDir, sc.paths(familyAll)); err != nil {
 			return corpusSearchable, folderCorpusError(plan, err)
@@ -193,29 +225,131 @@ func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexS
 	bp := plan
 	bp.indexDir = buildDir // Shards go here; folder state stays in plan.cacheDir.
 
-	indexedAny := false
-	if selectedCount > 0 {
+	indexedAny := !needLexical && selectedCount > 0
+	semanticBuilt := false
+	semanticStaging := filepath.Join(buildDir, "semantic")
+	var lexicalErr, semanticErr error
+	if (needLexical || needSemantic) && selectedCount > 0 {
 		if err := checkCtagsCached(); err != nil {
 			deleteStateFiles(plan.cacheDir)
 			return corpusSearchable, folderCorpusError(plan, err)
 		}
-		indexedAny, err = indexFolderDocuments(ctx, bp, repoName, selected, indexParallelism(), isDelta, cachedState)
-		if err != nil {
-			deleteStateFiles(plan.cacheDir)
-			return corpusSearchable, folderCorpusError(plan, err)
+	}
+	var lexicalBuild func()
+	if needLexical && selectedCount > 0 {
+		lexicalBuild = func() {
+			indexedAny, lexicalErr = indexFolderDocuments(
+				ctx,
+				bp,
+				repoName,
+				selected,
+				execution.resources.cpuLimit(),
+				isDelta,
+				currentState,
+			)
+		}
+	}
+	var semanticBuild func()
+	if needSemantic && selectedCount > 0 {
+		semanticBuild = func() {
+			semanticErr = runSemanticBuild(ctx, execution.model, func(embedder semanticModel) error {
+				_, err := buildSemanticFolderGeneration(
+					ctx,
+					selected,
+					semanticStaging,
+					semanticSource,
+					embedder,
+					execution.resources,
+				)
+				return err
+			})
+			semanticBuilt = semanticErr == nil
+		}
+	}
+	runJoinedIndexBuilds(lexicalBuild, semanticBuild)
+	if lexicalErr != nil {
+		deleteStateFiles(plan.cacheDir)
+		return corpusSearchable, folderCorpusError(plan, lexicalErr)
+	}
+	if semanticErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return corpusSearchable, ctxErr
+		}
+		slog.Debug("Semantic folder index build failed; keeping lexical search", "error", semanticErr)
+	}
+
+	postState, _, postStateErr := folderCorpusFingerprint(ctx, plan)
+	if postStateErr != nil {
+		deleteStateFiles(plan.cacheDir)
+		return corpusSearchable, folderCorpusError(plan, postStateErr)
+	}
+	if postState != stateHash {
+		deleteStateFiles(plan.cacheDir)
+		return corpusSearchable, folderCorpusError(
+			plan,
+			fmt.Errorf("folder changed during index build"),
+		)
+	}
+
+	activateSemantic := func() {
+		removeJoinedGeneration(plan.cacheDir)
+		if !semanticRequired {
+			return
+		}
+		var activationErr error
+		if semanticBuilt {
+			activationErr = publishAndBindSemanticGeneration(
+				plan.cacheDir, plan.indexDir, stateHash, semanticSource, semanticStaging,
+			)
+		} else if semanticPresent {
+			activationErr = bindSemanticGeneration(
+				plan.cacheDir, plan.indexDir, stateHash, semanticSource,
+			)
+		}
+		if activationErr != nil {
+			semanticErr = activationErr
+			slog.Debug("Semantic folder index activation failed; keeping lexical search", "error", activationErr)
 		}
 	}
 
-	// Publish the shard family and state while readers are excluded by the
-	// publish lock.
-	if err := publishGeneration(ctx, plan.cacheDir, plan.indexDir, buildDir, familyAll, func() error {
-		return writeStateFile(plan.cacheDir, stateHash)
-	}); err != nil {
-		if errors.Is(err, errCorpusEvicted) {
-			return corpusSearchable, nil
+	if needLexical {
+		// Publish the shard family and state while readers are excluded by the
+		// publish lock. The joined descriptor is the last activation record.
+		if err := publishGeneration(ctx, plan.cacheDir, plan.indexDir, buildDir, familyAll, func() error {
+			if err := writeStateFile(plan.cacheDir, stateHash); err != nil {
+				return err
+			}
+			activateSemantic()
+			return nil
+		}); err != nil {
+			if errors.Is(err, errCorpusEvicted) {
+				return corpusSearchable, nil
+			}
+			return corpusSearchable, folderCorpusError(plan, err)
 		}
-		return corpusSearchable, folderCorpusError(plan, err)
+	} else if semanticRequired && (needSemantic || !joinedGenerationMatches(
+		plan.cacheDir,
+		plan.indexDir,
+		stateHash,
+		semanticSource,
+	)) {
+		pub, publishErr := acquirePublishLock(ctx, plan.cacheDir)
+		if publishErr != nil {
+			if errors.Is(publishErr, errCorpusEvicted) {
+				return corpusSearchable, nil
+			}
+			return corpusSearchable, folderCorpusError(plan, publishErr)
+		}
+		if readStateFile(plan.cacheDir) == stateHash && folderFamilyUsable(plan.indexDir) {
+			activateSemantic()
+		}
+		releaseLock(pub)
 	}
+
+	if semanticErr != nil && !needLexical {
+		return corpusSearchable, nil
+	}
+
 	// Only a later build reads the folder state manifest. Searchers do not read
 	// it, so it can be written after the publish lock is released.
 	if selectedCount > 0 {
@@ -600,7 +734,7 @@ func (s *folderCorpusScanner) tryDiscoverBoundary(path, rel string) bool {
 
 // emitBoundaryMarker mixes a "git-boundary" namespaced contribution
 // into the parent's state hash. The marker payload includes the boundary's
-// relative path and the .git entry's device, inode, and modification time so:
+// relative path and the .git entry's device and inode so:
 //
 //   - boundary appears   → marker absent before, present after → hash flips
 //   - boundary disappears → marker present before, absent after → hash flips
@@ -612,33 +746,26 @@ func (s *folderCorpusScanner) tryDiscoverBoundary(path, rel string) bool {
 func (s *folderCorpusScanner) emitBoundaryMarker(rel string, b gitBoundary) {
 	appendFolderFingerprintPart(s.stateHasher, "git-boundary")
 	appendFolderFingerprintPart(s.stateHasher, rel)
-	// Stat the .git entry for dev:ino:mtime. Best-effort: any error
+	// Stat the .git entry for dev:ino. Best-effort: any error
 	// degrades to a marker that still includes the boundary's relative
 	// path so appearance/disappearance still flips the hash; only
 	// re-init detection requires the dev:ino part.
 	if info, err := os.Lstat(filepath.Join(b.RepoDir, ".git")); err == nil {
-		dev, ino, mtime := fileInfoIdentity(info)
-		// Single stack buffer reused across the four numeric fields
-		// via the helpers below — heap-free even though we write four
+		dev, ino, _ := fileInfoIdentity(info)
+		// Single stack buffer reused across the three numeric fields
+		// via the helper below — heap-free even though we write three
 		// labelled parts.
 		var buf [20]byte
 		appendBoundaryUintField(s.stateHasher, buf[:], "mode", uint64(info.Mode()))
-		appendBoundaryIntField(s.stateHasher, buf[:], "mtime", mtime)
 		appendBoundaryUintField(s.stateHasher, buf[:], "dev", dev)
 		appendBoundaryUintField(s.stateHasher, buf[:], "ino", ino)
 	}
 }
 
-// appendBoundaryUintField and appendBoundaryIntField write one labeled numeric
-// field using the boundary hash's signed or unsigned decimal encoding.
+// appendBoundaryUintField writes one labeled numeric field.
 func appendBoundaryUintField(h *xxhash.Digest, buf []byte, label string, value uint64) {
 	appendFolderFingerprintPart(h, label)
 	appendFolderFingerprintBytes(h, strconv.AppendUint(buf[:0], value, 10))
-}
-
-func appendBoundaryIntField(h *xxhash.Digest, buf []byte, label string, value int64) {
-	appendFolderFingerprintPart(h, label)
-	appendFolderFingerprintBytes(h, strconv.AppendInt(buf[:0], value, 10))
 }
 
 func selectFolderCandidate(
@@ -700,7 +827,7 @@ func scanFolderRootEntriesParallel(
 	// fingerprintRootEntry runs once per root entry.
 	discoveryEnabled := discoveryEnabledForPlan(plan)
 
-	workers := fileReadWorkerCount(maxFolderFingerprintWorkers, len(entries))
+	workers := fileReadWorkerCount(indexParallelism(), len(entries))
 	// Size jobs to len(entries) so the feeder can send every entry without
 	// waiting for a worker.
 	jobs := make(chan int, len(entries))
@@ -1046,21 +1173,15 @@ type folderManifestEntry struct {
 }
 
 func readFolderManifest(cacheDir, expectedState string) (folderManifest, bool) {
+	var manifest folderManifest
 	if expectedState == "" {
-		return folderManifest{}, false
+		return manifest, false
 	}
 	data, err := os.ReadFile(filepath.Join(cacheDir, folderManifestFileName))
-	if err != nil {
+	if err != nil || json.Unmarshal(data, &manifest) != nil {
 		return folderManifest{}, false
 	}
-	var manifest folderManifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		return folderManifest{}, false
-	}
-	if manifest.Version != folderManifestVersion || manifest.State != expectedState {
-		return folderManifest{}, false
-	}
-	return manifest, true
+	return manifest, manifest.Version == folderManifestVersion && manifest.State == expectedState
 }
 
 func writeFolderManifest(cacheDir, state string, selected []folderCandidate) error {

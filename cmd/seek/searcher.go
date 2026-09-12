@@ -7,8 +7,10 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/index"
@@ -207,10 +209,73 @@ var errShardUnloadable = errors.New("index damage")
 func parseSearchQueryForms(pattern string) (query.Q, query.Q, error) {
 	raw, err := query.Parse(pattern)
 	if err != nil {
-		return nil, nil, &querySyntaxError{query: pattern, cause: err}
+		var ok bool
+		raw, ok = parsePlainDescriptionFallback(pattern)
+		if !ok {
+			return nil, nil, &querySyntaxError{query: pattern, cause: err}
+		}
 	}
 	expanded := query.Map(raw, query.ExpandFileContent)
 	return raw, query.Simplify(expanded), nil
+}
+
+// parsePlainDescriptionFallback keeps programming names such as C++ usable in
+// descriptive search. Zoekt parses bare terms as regular expressions, so a
+// valid programming name can otherwise fail before the semantic path starts.
+// Only use this path after Zoekt rejects the query, and reject all explicit
+// query syntax so malformed filters and regular expressions stay errors.
+func parsePlainDescriptionFallback(pattern string) (query.Q, bool) {
+	terms := strings.Fields(pattern)
+	if len(terms) < 2 {
+		return nil, false
+	}
+	children := make([]query.Q, 0, len(terms))
+	for _, term := range terms {
+		if strings.EqualFold(term, "or") {
+			return nil, false
+		}
+		parsed, err := query.Parse(term)
+		if err == nil {
+			if substring, ok := parsed.(*query.Substring); ok &&
+				!substring.FileName && !substring.Content && substring.Pattern == term {
+				children = append(children, substring)
+				continue
+			}
+		}
+		if !plainProgrammingName(term) {
+			return nil, false
+		}
+		children = append(children, &query.Substring{
+			Pattern:       term,
+			CaseSensitive: strings.ToLower(term) != term,
+		})
+	}
+	return query.NewAnd(children...), true
+}
+
+func plainProgrammingName(term string) bool {
+	for _, suffix := range []string{"++", "[]", "()"} {
+		if strings.HasSuffix(term, suffix) {
+			return plainQualifiedIdentifier(strings.TrimSuffix(term, suffix))
+		}
+	}
+	return false
+}
+
+func plainQualifiedIdentifier(name string) bool {
+	for _, part := range strings.Split(name, "::") {
+		if part == "" {
+			return false
+		}
+		for index, character := range part {
+			if character == '_' || unicode.IsLetter(character) ||
+				(index > 0 && unicode.IsDigit(character)) {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }
 
 func executeParsedSearchScopedDirs(
@@ -260,7 +325,7 @@ func executeParsedSearchScopedDirs(
 	// the windowed indexer's rotation can drive into the hundreds for
 	// multi-GiB corpora. Parallel dispatch turns the per-shard query
 	// cost from sum-of-shards into max-of-shards (up to GOMAXPROCS).
-	parallelism := runtime.NumCPU()
+	parallelism := runtime.GOMAXPROCS(0)
 	if parallelism < 1 {
 		parallelism = 1
 	}

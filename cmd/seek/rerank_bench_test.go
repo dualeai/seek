@@ -10,8 +10,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 const seekBenchmarkBinaryEnv = "SEEK_BENCH_BINARY"
@@ -52,23 +54,23 @@ func BenchmarkCLIProcess(b *testing.B) {
 	}
 
 	const queryText = "parse request handler"
-	defaultArgs := []string{queryText, fixture}
-	ineligibleArgs := []string{"--rerank", "content:parse request handler", fixture}
-	eligibleArgs := []string{"--rerank", queryText, fixture}
-	eligibleDisplayContextZeroArgs := []string{"--rerank", "-C", "0", queryText, fixture}
+	lexicalArgs := []string{"--lexical-only", queryText, fixture}
+	ineligibleArgs := []string{"content:parse request handler", fixture}
+	eligibleArgs := []string{queryText, fixture}
+	eligibleDisplayContextZeroArgs := []string{"-C", "0", queryText, fixture}
 	// The first term matches one file. The second term matches its path only,
 	// so the content-only relaxed query has one candidate and skips scoring.
-	oneCandidateArgs := []string{"--rerank", "candidate0 candidate_00", fixture}
+	oneCandidateArgs := []string{"candidate0 candidate_00", fixture}
 
 	// Build the index and check each public path before the timer starts.
-	for _, args := range [][]string{defaultArgs, ineligibleArgs} {
+	for _, args := range [][]string{lexicalArgs, ineligibleArgs} {
 		output, err := runSeekBenchmarkCommand(b.Context(), binary, cache, fixture, args, false)
 		if err != nil || len(output) == 0 {
 			b.Fatalf("warm seek %q: output=%q err=%v", args, output, err)
 		}
 	}
 	if _, err := os.Stat(filepath.Join(cache, "reranker")); !os.IsNotExist(err) {
-		b.Fatalf("default or ineligible search initialized the re-ranker: %v", err)
+		b.Fatalf("lexical or ineligible search initialized the re-ranker: %v", err)
 	}
 	probeArgs := append([]string{"--verbose"}, eligibleArgs...)
 	output, err := runSeekBenchmarkCommand(
@@ -95,9 +97,9 @@ func BenchmarkCLIProcess(b *testing.B) {
 		b.Fatalf("warm seek %q: output=%q err=%v", oneCandidateProbeArgs, output, err)
 	}
 
-	b.Run("DefaultSearchWarm", func(b *testing.B) {
+	b.Run("LexicalOnlyWarm", func(b *testing.B) {
 		for b.Loop() {
-			mustRunSeekBenchmark(b, binary, cache, fixture, defaultArgs)
+			mustRunSeekBenchmark(b, binary, cache, fixture, lexicalArgs)
 		}
 	})
 	b.Run("RerankIneligibleWarm", func(b *testing.B) {
@@ -132,9 +134,9 @@ func BenchmarkCLIProcess(b *testing.B) {
 	})
 }
 
-func BenchmarkLateOnScorerStartup_WarmRuntime(b *testing.B) {
+func BenchmarkLateOnModelStartup_WarmRuntime(b *testing.B) {
 	b.Setenv("SEEK_CACHE_DIR", b.TempDir())
-	warm, err := newLateOnRerankScorer(b.Context())
+	warm, err := newLateOnSemanticModel(b.Context())
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -144,7 +146,7 @@ func BenchmarkLateOnScorerStartup_WarmRuntime(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		scorer, err := newLateOnRerankScorer(b.Context())
+		scorer, err := newLateOnSemanticModel(b.Context())
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -159,7 +161,7 @@ func BenchmarkLateOnScorerStartup_WarmRuntime(b *testing.B) {
 
 func BenchmarkLateOnScoring_Top20(b *testing.B) {
 	b.Setenv("SEEK_CACHE_DIR", b.TempDir())
-	scorer, err := newLateOnRerankScorer(b.Context())
+	scorer, err := newLateOnSemanticModel(b.Context())
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -171,7 +173,7 @@ func BenchmarkLateOnScoring_Top20(b *testing.B) {
 
 	documents := lateOnBenchmarkDocuments()
 	const modelQuery = "find the request parser and handler"
-	scores, err := scorer.Scores(b.Context(), modelQuery, documents)
+	scores, err := scoreWithTestSemanticEmbedder(b.Context(), scorer, modelQuery, documents)
 	if err != nil || len(scores) != len(documents) {
 		b.Fatalf("warm scorer: scores=%d err=%v", len(scores), err)
 	}
@@ -179,8 +181,9 @@ func BenchmarkLateOnScoring_Top20(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		benchmarkLateOnScores, err = scorer.Scores(
+		benchmarkLateOnScores, err = scoreWithTestSemanticEmbedder(
 			b.Context(),
+			scorer,
 			modelQuery,
 			documents,
 		)
@@ -190,38 +193,116 @@ func BenchmarkLateOnScoring_Top20(b *testing.B) {
 	}
 }
 
-func BenchmarkLateOnTokenization_Top20Truncated(b *testing.B) {
-	tokenizerJSON, err := decodeLateOnAsset(lateOnCompressedTokenizer)
+// BenchmarkSemanticModelPass100k measures the production indexing scheduler
+// with a fixed set of prepared model rows. Setup, model creation, and one warm
+// provider call stay outside the timer. The timed pass includes input packing,
+// model inference, and the production coarse and fine vector calculation.
+func BenchmarkSemanticModelPass100k(b *testing.B) {
+	b.Setenv("SEEK_CACHE_DIR", b.TempDir())
+	b.StopTimer()
+	scorer, err := newLateOnSemanticModel(b.Context())
 	if err != nil {
 		b.Fatal(err)
 	}
-	tokenizer, punctuation, err := newLateOnTokenizer(tokenizerJSON)
-	if err != nil {
-		b.Fatal(err)
+	embedder := scorer
+	b.Cleanup(func() {
+		if err := scorer.Close(); err != nil {
+			b.Errorf("close scorer: %v", err)
+		}
+	})
+
+	const rowCount = 100_000
+	units := make([]semanticUnit, rowCount)
+	modelInputs := make([]int, rowCount*lateOnSequenceLength)
+	for row := range units {
+		modelInput := modelInputs[row*lateOnSequenceLength : (row+1)*lateOnSequenceLength]
+		modelInput[0] = lateOnCLSTokenID
+		for index := 1; index < len(modelInput)-1; index++ {
+			modelInput[index] = 100 + (row*17+index*31)%49_000
+		}
+		modelInput[len(modelInput)-1] = lateOnSEPTokenID
+		units[row] = semanticUnit{row: uint64(row), modelInput: modelInput}
 	}
+	if vectors, err := embedder.EmbedSemanticUnits(b.Context(), units[:semanticModelBatchRows]); err != nil ||
+		len(vectors) != semanticModelBatchRows {
+		b.Fatalf("warm semantic model: vectors=%d error=%v", len(vectors), err)
+	}
+	callCPUs := semanticModelCallCPUs(b.Context(), embedder)
+	b.ResetTimer()
+	b.StartTimer()
+
+	for b.Loop() {
+		b.StopTimer()
+		batchCount := (len(units) + semanticModelBatchRows - 1) / semanticModelBatchRows
+		batches := make(chan semanticBuildBatch, batchCount)
+		for sequence := range batchCount {
+			start := sequence * semanticModelBatchRows
+			end := min(start+semanticModelBatchRows, len(units))
+			batches <- semanticBuildBatch{sequence: sequence, units: units[start:end]}
+		}
+		close(batches)
+		encoded := make(chan semanticEncodedBatch)
+		ctx, cancel := context.WithCancel(b.Context())
+		b.StartTimer()
+		go encodeSemanticBatches(ctx, embedder, batches, encoded, cancel, searchResources{
+			now:             time.Now,
+			effectiveCPUs:   func() int { return runtime.GOMAXPROCS(0) },
+			availableMemory: semanticHostAvailableMemory,
+			callCPUs:        callCPUs,
+		})
+		completed := 0
+		var modelErr error
+		for batch := range encoded {
+			completed += len(batch.embeddings)
+			if modelErr == nil && batch.err != nil {
+				modelErr = batch.err
+			}
+		}
+		b.StopTimer()
+		cancel()
+		if modelErr != nil {
+			b.Fatal(modelErr)
+		}
+		if completed != rowCount {
+			b.Fatalf("completed model rows=%d, want %d", completed, rowCount)
+		}
+		b.StartTimer()
+	}
+}
+
+func BenchmarkLateOnDocumentTokenization_Top20Truncated(b *testing.B) {
+	tokenizer, punctuation := openLateOnTestTokenizer(b)
 	documents := lateOnBenchmarkTruncatedDocuments()
 	serialized, _, _, _ := serializeLateOnDocumentWithMatch(documents[0])
-	if encoded := tokenizer.EncodeWithAnnotations(lateOnDocumentPrefix + serialized); len(encoded.IDs) <= lateOnSequenceLength {
-		b.Fatalf("benchmark document has %d tokens; want more than %d", len(encoded.IDs), lateOnSequenceLength)
+	encoded, _, err := tokenizer.encode(lateOnDocumentPrefix+serialized, true, true)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(encoded) <= lateOnSequenceLength {
+		b.Fatalf("benchmark document has %d tokens; want more than %d", len(encoded), lateOnSequenceLength)
 	}
 
-	benchmarkLateOnInputIDs, benchmarkLateOnAttention, benchmarkLateOnScoreMask =
-		tokenizeLateOnBatch(
+	benchmarkLateOnInputIDs, benchmarkLateOnAttention, benchmarkLateOnScoreMask, err =
+		tokenizeLateOnDocuments(
 			tokenizer,
 			punctuation,
-			"find the request parser and handler",
 			documents,
 		)
+	if err != nil {
+		b.Fatal(err)
+	}
 	b.SetBytes(int64(len(documents) * len(documents[0].Text)))
 	b.ReportAllocs()
 	for b.Loop() {
-		benchmarkLateOnInputIDs, benchmarkLateOnAttention, benchmarkLateOnScoreMask =
-			tokenizeLateOnBatch(
+		benchmarkLateOnInputIDs, benchmarkLateOnAttention, benchmarkLateOnScoreMask, err =
+			tokenizeLateOnDocuments(
 				tokenizer,
 				punctuation,
-				"find the request parser and handler",
 				documents,
 			)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

@@ -23,10 +23,10 @@ Arguments:
 
 Examples:
   # Install latest to ~/.local/bin
-  curl -sSfL https://raw.githubusercontent.com/${REPO}/develop/install.sh | sh
+  curl -sSfL https://raw.githubusercontent.com/${REPO}/main/install.sh | sh
 
   # Install specific version to /usr/local/bin
-  curl -sSfL https://raw.githubusercontent.com/${REPO}/develop/install.sh | sh -s -- -b /usr/local/bin v1.2.3
+  curl -sSfL https://raw.githubusercontent.com/${REPO}/main/install.sh | sh -s -- -b /usr/local/bin v1.2.3
 EOF
 }
 

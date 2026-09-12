@@ -21,8 +21,8 @@ documentation, comments, commit messages, issues, and pull requests:
 
 ## Code search — use `seek`
 
-Prefer `seek` over grep/ripgrep for all code search. It returns BM25-ranked
-results with context, grouped by file, with symbol tags.
+Prefer `seek` over grep/ripgrep for all code search. It returns
+relevance-ranked results with context, grouped by file, with symbol tags.
 
 Usage: `seek [flags] '<query>' [path...]`. Keep query filters in one
 single-quoted argument; tokens after the query are filesystem path operands.
@@ -75,18 +75,25 @@ seek 'type:file config'
 
 ### Descriptive search
 
-Use `--rerank` when you know the behavior but not its identifier or file:
+Use a plain query when you know the behavior but not its identifier or file:
 
 ```sh
-seek --rerank 'validate search query syntax' ./cmd/seek
+seek 'validate search query syntax'
 ```
 
-`--rerank` accepts only plain queries with two or more words. Exact identifiers
-and phrases, filters, regular expressions, Boolean operators, and negation stay
-on the BM25 path. Re-ranked results can lack query words. Use normal seek for
-exact ranked navigation and `SEEK_ROUTER=off grep` for absence checks, renames,
-counts, and complete call-site lists. The router never adds `--rerank`; call
-`seek` directly.
+Plain queries with two or more words use local model re-ranking by default.
+One unscoped clean Git worktree, one stable plain file, or one stable plain
+folder also uses semantic retrieval. Scoped or dirty Git and multi-corpus
+searches can still use model re-ranking when enough candidates exist, but not
+semantic retrieval. Exact identifiers, phrases, filters, regular expressions,
+Boolean operators, negation, and one-word queries use strict BM25 order.
+Unless `--lexical-only` is set, every supported search builds or updates both
+Zoekt and semantic data, including exact and router-generated queries. A first
+large-repo search can take tens of seconds or longer and use all available
+compute, several GiB of memory, and significant cache space. Use
+`--lexical-only` to skip all semantic index and model work. Use
+`SEEK_ROUTER=off grep` for absence checks, renames, counts, and complete
+call-site lists.
 
 ### Pitfalls
 
@@ -94,8 +101,9 @@ counts, and complete call-site lists. The router never adds `--rerank`; call
 - **Single quotes**: prevent shell expansion of `|`, `(`, `)`
 - **Flags before query**: `seek -n 5 'Foo' ./cmd`
 - **Paths after query**: tokens after the query are path operands, not filters
-- **Multi-word = AND**: `seek 'foo bar'` matches files containing both
-  independently
+- **Strict lexical terms use AND**: the strict branch of `seek 'foo bar'`
+  matches files containing both terms. A final reranked result can lack one or
+  both terms.
 
 ### Install (if missing)
 
@@ -109,9 +117,11 @@ Requires `universal-ctags` (`brew install universal-ctags` on macOS).
 
 When spawning sub-agents that don't inherit this config, pass:
 "Use `seek 'pattern' [path...]` for ranked code navigation. Keep query filters
-in one quoted string. Use `seek --rerank 'plain multi-word description'
-[path...]` only when you do not know the identifier. Use `SEEK_ROUTER=off grep`
-only for all occurrences, counts, or renames."
+in one quoted string. Plain multi-word descriptions use model re-ranking by
+default. A supported default search maintains both Zoekt and semantic data; use
+`--lexical-only` to skip all semantic and model work. An unscoped clean Git
+worktree or one stable plain file or folder also uses semantic retrieval. Use
+`SEEK_ROUTER=off grep` only for all occurrences, counts, or renames."
 
 ## GitHub Actions
 

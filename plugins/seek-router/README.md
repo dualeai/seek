@@ -21,16 +21,25 @@ public seek commands.
 
 ## Descriptive searches
 
-The skill recommends `seek --rerank` for plain descriptions with two or more
-words. The router preserves mapped search patterns but never adds this flag.
-Call `seek` directly:
+The skill recommends a plain description with two or more words. Seek uses
+local model re-ranking by default. One unscoped clean Git worktree, one stable
+plain file, or one stable plain folder also uses semantic retrieval. The router
+preserves mapped search patterns. Call `seek` directly:
 
 ```sh
-seek --rerank 'request authentication flow' ./src
+seek 'request authentication flow'
 ```
 
-See the [seek-search skill](skills/seek-search/SKILL.md#re-rank-descriptive-searches)
+See the [seek-search skill](skills/seek-search/SKILL.md#search-from-descriptions)
 for limits and fallback behavior.
+
+The router uses Seek's normal index policy and does not add `--lexical-only`.
+A routed exact search keeps strict BM25 order, but it still builds or updates
+both Zoekt and semantic data for a supported corpus. A first search of a large
+repo can take tens of seconds or longer and use all available compute, several
+GiB of memory, and significant cache space. Call `seek --lexical-only` directly
+when you want the Zoekt-only fast path, or set `SEEK_ROUTER=off` to run the
+original search command.
 
 ## Routing contract
 

@@ -200,6 +200,39 @@ func TestAcquireReadLock_WedgedSwapUsesRemainingShards(t *testing.T) {
 	}
 }
 
+func TestAcquireStrictReadLock_WedgedSwapRejectsUnlockedRead(t *testing.T) {
+	old := readLockTimeout
+	readLockTimeout = 50 * time.Millisecond
+	defer func() { readLockTimeout = old }()
+
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, lockFile)
+	indexDir := filepath.Join(dir, "index")
+	if err := os.MkdirAll(indexDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(indexDir, "x_v16.00000.zoekt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockFileExclusive(holder); err != nil {
+		t.Fatalf("hold exclusive lock: %v", err)
+	}
+	defer releaseLock(holder)
+
+	reader, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reader.Close() }()
+	if err := acquireStrictReadLock(context.Background(), indexDir, reader); err == nil {
+		t.Fatal("strict read must not use shards without the generation lock")
+	}
+}
+
 // TestAcquireBuildLock_TouchesUsedAtStart covers FIX B: a build bumps the
 // corpus .used at start so a concurrent gc cannot evict it in the window between
 // the build releasing the lock and the search re-opening the corpus.

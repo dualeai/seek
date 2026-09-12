@@ -105,6 +105,22 @@ func acquirePublishLock(ctx context.Context, cacheDir string) (*os.File, error) 
 // caller holds it while it lists, opens, and searches shards. If the bounded
 // wait expires and shards remain, the caller can read them without the lock.
 func acquireReadLock(ctx context.Context, indexDir string, f *os.File) error {
+	return acquireReadLockWithFallback(ctx, indexDir, f, true)
+}
+
+// acquireStrictReadLock takes the shared publish lock or returns an error. A
+// joined query cannot use the unlocked stale-shard fallback because its Zoekt
+// and semantic data must name the same generation.
+func acquireStrictReadLock(ctx context.Context, indexDir string, f *os.File) error {
+	return acquireReadLockWithFallback(ctx, indexDir, f, false)
+}
+
+func acquireReadLockWithFallback(
+	ctx context.Context,
+	indexDir string,
+	f *os.File,
+	allowUnlocked bool,
+) error {
 	if err := lockFileSharedNB(f); err == nil {
 		return nil
 	}
@@ -113,7 +129,7 @@ func acquireReadLock(ctx context.Context, indexDir string, f *os.File) error {
 		// Wedged swap: use the shards that remain rather than hang. This is the
 		// sole unlocked read path and fires only when the publish lock stays held
 		// past the timeout.
-		if shardsExist(indexDir) {
+		if allowUnlocked && shardsExist(indexDir) {
 			slog.Warn("Publish lock contended past timeout; searching remaining shards without the lock", "index_dir", indexDir)
 			return nil
 		}

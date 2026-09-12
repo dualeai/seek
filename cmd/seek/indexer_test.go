@@ -236,11 +236,12 @@ func TestExtractV2Path(t *testing.T) {
 
 func TestIndexParallelism_Bounds(t *testing.T) {
 	p := indexParallelism()
-	if p < 1 {
-		t.Errorf("parallelism should be at least 1, got %d", p)
+	want := runtime.GOMAXPROCS(0)
+	if want < 1 {
+		want = 1
 	}
-	if p > 16 {
-		t.Errorf("parallelism should be at most 16, got %d", p)
+	if p != want {
+		t.Errorf("parallelism=%d, want current Go CPU limit %d", p, want)
 	}
 }
 
@@ -1310,45 +1311,20 @@ func TestStateCaching_BothSucceed_DirtyFileChangedAfterStateCapture(t *testing.T
 }
 
 // TestStateCaching_BothSucceed_CleanFileChangesAfterStateCapture verifies that
-// a new dirty path absent from the captured file list is found on the next
-// search through normal freshness detection.
+// the final full-state check finds a new dirty path that was absent from the
+// captured file list.
 func TestStateCaching_BothSucceed_CleanFileChangesAfterStateCapture(t *testing.T) {
-	requireTools(t)
-
-	dir := initGitRepo(t, "app.go", "package main\n// original\n")
-
-	ctx := context.Background()
-	paths, plan := planGitTestCorpus(t, dir)
-
-	// Capture pre-state (clean repo, state.Files is empty)
-	state := mustGitRepoStateIn(t, ctx, dir)
-	stateHash := gitCorpusStateHash(paths, state)
-
-	// Mutate a file that was not in the captured state.Files list.
-	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// mutated\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	deleteStateFiles(plan.cacheDir)
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
-		t.Fatalf("indexing failed: %v", err)
-	}
-
-	// The state file is written because the metadata check has no files to read.
-	// This is intentional: the next search's git status call will detect the
-	// dirty file, produce a different hash, and trigger re-indexing.
-	cached := readStateFile(plan.cacheDir)
-	if cached == "" {
-		t.Fatal("expected state file to be written (clean→dirty not detected by restat)")
-	}
-
-	files, err := runSeekInPlannedGitCorpus(ctx, "mutated", paths, plan)
-	if err != nil {
-		t.Fatalf("next search after clean-to-dirty edit failed: %v", err)
-	}
-	if len(files) == 0 {
-		t.Fatal("next search should find the mutated content")
-	}
+	testStateCachingNewDirtyPathAfterCapture(t, func(dir string) string {
+		const marker = "mutated"
+		if err := os.WriteFile(
+			filepath.Join(dir, "app.go"),
+			[]byte("package main\n// "+marker+"\n"),
+			0o644,
+		); err != nil {
+			t.Fatal(err)
+		}
+		return marker
+	})
 }
 
 // TestStateCaching_DirtyFileDeletedAfterStateCapture verifies that
@@ -1588,9 +1564,27 @@ func TestStateCaching_StaleAValidationKeepsPublishedBState(t *testing.T) {
 	}
 }
 
-// TestStateCaching_NewUntrackedFileAfterStateCapture verifies that a new path
-// absent from the captured file list is found by the next search.
+// TestStateCaching_NewUntrackedFileAfterStateCapture verifies that the final
+// full-state check finds a new path absent from the captured file list.
 func TestStateCaching_NewUntrackedFileAfterStateCapture(t *testing.T) {
+	testStateCachingNewDirtyPathAfterCapture(t, func(dir string) string {
+		const marker = "brand_new"
+		if err := os.WriteFile(
+			filepath.Join(dir, "new_file.go"),
+			[]byte("package main\n// "+marker+"\n"),
+			0o644,
+		); err != nil {
+			t.Fatal(err)
+		}
+		return marker
+	})
+}
+
+func testStateCachingNewDirtyPathAfterCapture(
+	t *testing.T,
+	mutate func(string) string,
+) {
+	t.Helper()
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// original\n")
@@ -1598,33 +1592,25 @@ func TestStateCaching_NewUntrackedFileAfterStateCapture(t *testing.T) {
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
 
-	// Capture pre-state (clean repo)
 	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
-
-	// Add a file after capturing the state passed to the indexer.
-	if err := os.WriteFile(filepath.Join(dir, "new_file.go"), []byte("package main\n// brand_new\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	marker := mutate(dir)
 
 	deleteStateFiles(plan.cacheDir)
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
-	// The metadata check does not detect the new file because it is not in
-	// state.Files. The state file is written.
 	cached := readStateFile(plan.cacheDir)
-
-	if cached == "" {
-		t.Fatal("expected state file to be written before next-search correction")
+	if cached != "" {
+		t.Fatalf("expected no state file after a new dirty path, got %q", cached)
 	}
-	files, err := runSeekInPlannedGitCorpus(ctx, "brand_new", paths, plan)
+	files, err := runSeekInPlannedGitCorpus(ctx, marker, paths, plan)
 	if err != nil {
-		t.Fatalf("next search after new untracked file failed: %v", err)
+		t.Fatalf("next search after the new dirty path failed: %v", err)
 	}
 	if len(files) == 0 {
-		t.Fatal("next search should find the new untracked file")
+		t.Fatalf("next search did not find %q", marker)
 	}
 }
 

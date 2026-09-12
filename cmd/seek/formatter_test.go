@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -1397,31 +1398,13 @@ func TestGitCorpusFormatting_LimitAndMaxMatches_Combined(t *testing.T) {
 }
 
 func TestFormatCorpusResults_SameRelativePathDifferentCorpora(t *testing.T) {
-	results := []corpusSearchResult{
-		{
-			corpusID:    corpusID("corpus-a"),
-			kind:        corpusKindFolder,
-			displayRoot: "/tmp/a",
-			file: zoekt.FileMatch{FileName: "same.txt", Language: "Text", Score: 10,
-				LineMatches: []zoekt.LineMatch{{Line: []byte("needle a\n"), LineNumber: 1}}},
-		},
-		{
-			corpusID:    corpusID("corpus-b"),
-			kind:        corpusKindFolder,
-			displayRoot: "/tmp/b",
-			file: zoekt.FileMatch{FileName: "same.txt", Language: "Text", Score: 9,
-				LineMatches: []zoekt.LineMatch{{Line: []byte("needle b\n"), LineNumber: 1}}},
-		},
-	}
-
-	out := formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext, plainPalette)
-	if !strings.Contains(out, "## /tmp/a/same.txt") ||
-		!strings.Contains(out, "## /tmp/b/same.txt") {
-		t.Fatalf("expected absolute same-path headers, got:\n%s", out)
-	}
-	if strings.Count(out, "[folder]") != 2 {
-		t.Fatalf("expected folder corpus tags, got:\n%s", out)
-	}
+	testFormatSamePathAcrossCorpora(
+		t,
+		corpusKindFolder,
+		[]string{"/tmp/a", "/tmp/b"},
+		"same.txt",
+		"folder",
+	)
 }
 
 func TestFormatCorpusResults_FileCorpusContextUsesExactRoot(t *testing.T) {
@@ -1459,30 +1442,49 @@ func TestFormatCorpusResults_FileCorpusContextUsesExactRoot(t *testing.T) {
 }
 
 func TestFormatCorpusResults_GitCorpusContext(t *testing.T) {
-	results := []corpusSearchResult{
-		{
-			corpusID:    corpusID("git-a"),
-			kind:        corpusKindGit,
-			displayRoot: "/tmp/repo-a",
-			file: zoekt.FileMatch{FileName: "same.go", Language: "Go", Score: 10,
-				LineMatches: []zoekt.LineMatch{{Line: []byte("needle a\n"), LineNumber: 1}}},
-		},
-		{
-			corpusID:    corpusID("git-b"),
-			kind:        corpusKindGit,
-			displayRoot: "/tmp/repo-b",
-			file: zoekt.FileMatch{FileName: "same.go", Language: "Go", Score: 9,
-				LineMatches: []zoekt.LineMatch{{Line: []byte("needle b\n"), LineNumber: 1}}},
-		},
+	testFormatSamePathAcrossCorpora(
+		t,
+		corpusKindGit,
+		[]string{"/tmp/repo-a", "/tmp/repo-b"},
+		"same.go",
+		"git",
+	)
+}
+
+func testFormatSamePathAcrossCorpora(
+	t *testing.T,
+	kind corpusKind,
+	roots []string,
+	fileName string,
+	tag string,
+) {
+	t.Helper()
+	results := make([]corpusSearchResult, len(roots))
+	for index, root := range roots {
+		results[index] = corpusSearchResult{
+			corpusID:    corpusID(fmt.Sprintf("corpus-%d", index)),
+			kind:        kind,
+			displayRoot: root,
+			file: zoekt.FileMatch{
+				FileName: fileName,
+				Language: "Text",
+				Score:    float64(len(roots) - index),
+				LineMatches: []zoekt.LineMatch{{
+					Line:       []byte(fmt.Sprintf("needle %d\n", index)),
+					LineNumber: 1,
+				}},
+			},
+		}
 	}
 
 	out := formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext, plainPalette)
-	if !strings.Contains(out, "## /tmp/repo-a/same.go") ||
-		!strings.Contains(out, "## /tmp/repo-b/same.go") {
-		t.Fatalf("expected absolute git paths, got:\n%s", out)
+	for _, root := range roots {
+		if !strings.Contains(out, "## "+filepath.Join(root, fileName)) {
+			t.Fatalf("expected absolute path for %s, got:\n%s", root, out)
+		}
 	}
-	if strings.Count(out, "[git]") != 2 {
-		t.Fatalf("expected git corpus tags, got:\n%s", out)
+	if strings.Count(out, "["+tag+"]") != len(roots) {
+		t.Fatalf("expected %s corpus tags, got:\n%s", tag, out)
 	}
 }
 
