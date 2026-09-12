@@ -21,44 +21,13 @@ func TestEnsureFolderCorpusFresh_BeyondInFlightBudget(t *testing.T) {
 	const testBudget int64 = 4 * 1024 * 1024  // 4 MiB
 	const fileSize int64 = 512 * 1024         // 512 KiB
 	const totalBytes int64 = 12 * 1024 * 1024 // 12 MiB > budget
-	defer setupPressureTest(t, testBudget)()
-
-	root := writeRandomFolder(t, totalBytes, fileSize)
-	// Marker file so we can verify post-index searchability — pressure
-	// tests must prove the produced shards are queryable, not merely
-	// that the run did not leak.
-	const beacon = "BEYOND_BUDGET_BEACON_F00DCAFE"
-	beaconPath := filepath.Join(root, "z_beacon.txt")
-	if err := os.WriteFile(beaconPath, []byte(beacon+"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	plan := planSynthCorpus(t, root)
-
-	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
-	defer cancel()
-
-	state, err := ensureFolderCorpusFresh(ctx, plan)
-	if err != nil {
-		t.Fatalf("ensureFolderCorpusFresh: %v", err)
-	}
-	if state != corpusSearchable {
-		t.Fatalf("expected corpusSearchable, got %d", state)
-	}
-	if got := availableWeight(readSemaphore); got != testBudget {
-		t.Fatalf("semaphore leak after corpus index: got=%d want=%d", got, testBudget)
-	}
-	// Cross-window correctness: the beacon was written last, so it
-	// lands in the LAST shard window. Searching for it proves that
-	// (a) all windows successfully flushed, (b) IsDelta=true on
-	// windows >0 did not corrupt the shard chain, (c) the post-rotation
-	// search path can read across all rotated shards.
-	results, err := searchPlannedCorpusForTest(ctx, plan, beacon)
-	if err != nil {
-		t.Fatalf("post-index search: %v", err)
-	}
-	if len(results) == 0 {
-		t.Fatal("beacon not found post-index; rotated shards may be corrupt or not flushed")
-	}
+	testFolderIndexUnderBudgetPressure(
+		t,
+		testBudget,
+		totalBytes,
+		fileSize,
+		"BEYOND_BUDGET_BEACON_F00DCAFE",
+	)
 }
 
 // TestEnsureFolderCorpusFresh_AtBudgetBoundary — cumulative content
@@ -69,31 +38,13 @@ func TestEnsureFolderCorpusFresh_AtBudgetBoundary(t *testing.T) {
 	const testBudget int64 = 4 * 1024 * 1024
 	const fileSize int64 = 1024 * 1024       // 1 MiB
 	const totalBytes int64 = 8 * 1024 * 1024 // 2× budget
-	defer setupPressureTest(t, testBudget)()
-
-	root := writeRandomFolder(t, totalBytes, fileSize)
-	const beacon = "AT_BUDGET_BOUNDARY_BEACON_BADC0DE"
-	beaconPath := filepath.Join(root, "z_beacon.txt")
-	if err := os.WriteFile(beaconPath, []byte(beacon+"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	plan := planSynthCorpus(t, root)
-
-	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
-	defer cancel()
-	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
-		t.Fatalf("ensureFolderCorpusFresh: %v", err)
-	}
-	if got := availableWeight(readSemaphore); got != testBudget {
-		t.Fatalf("semaphore leak: got=%d want=%d", got, testBudget)
-	}
-	results, err := searchPlannedCorpusForTest(ctx, plan, beacon)
-	if err != nil {
-		t.Fatalf("post-index search: %v", err)
-	}
-	if len(results) == 0 {
-		t.Fatal("boundary beacon not found post-index; rotated shards may be corrupt")
-	}
+	testFolderIndexUnderBudgetPressure(
+		t,
+		testBudget,
+		totalBytes,
+		fileSize,
+		"AT_BUDGET_BOUNDARY_BEACON_BADC0DE",
+	)
 }
 
 // TestEnsureFolderCorpusFresh_ManySmallFilesOverBudget — verifies the
@@ -104,10 +55,26 @@ func TestEnsureFolderCorpusFresh_ManySmallFilesOverBudget(t *testing.T) {
 	const testBudget int64 = 2 * 1024 * 1024 // 2 MiB
 	const fileSize int64 = 64 * 1024         // 64 KiB
 	const totalBytes int64 = 8 * 1024 * 1024 // 8 MiB > 4× budget
+	testFolderIndexUnderBudgetPressure(
+		t,
+		testBudget,
+		totalBytes,
+		fileSize,
+		"MANY_SMALL_FILES_BEACON_FEEDFACE",
+	)
+}
+
+func testFolderIndexUnderBudgetPressure(
+	t *testing.T,
+	testBudget int64,
+	totalBytes int64,
+	fileSize int64,
+	beacon string,
+) {
+	t.Helper()
 	defer setupPressureTest(t, testBudget)()
 
 	root := writeRandomFolder(t, totalBytes, fileSize)
-	const beacon = "MANY_SMALL_FILES_BEACON_FEEDFACE"
 	beaconPath := filepath.Join(root, "z_beacon.txt")
 	if err := os.WriteFile(beaconPath, []byte(beacon+"\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -116,8 +83,12 @@ func TestEnsureFolderCorpusFresh_ManySmallFilesOverBudget(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
 	defer cancel()
-	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
+	state, err := ensureFolderCorpusFresh(ctx, plan)
+	if err != nil {
 		t.Fatalf("ensureFolderCorpusFresh: %v", err)
+	}
+	if state != corpusSearchable {
+		t.Fatalf("folder state=%d, want searchable", state)
 	}
 	if got := availableWeight(readSemaphore); got != testBudget {
 		t.Fatalf("semaphore leak: got=%d want=%d", got, testBudget)
@@ -127,7 +98,7 @@ func TestEnsureFolderCorpusFresh_ManySmallFilesOverBudget(t *testing.T) {
 		t.Fatalf("post-index search: %v", err)
 	}
 	if len(results) == 0 {
-		t.Fatal("many-small beacon not found post-index; rotated shards may be corrupt")
+		t.Fatal("beacon not found after indexing")
 	}
 }
 

@@ -16,10 +16,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 
-	"github.com/gomlx/go-huggingface/tokenizers/api"
-	"github.com/gomlx/go-huggingface/tokenizers/hftokenizer"
+	"github.com/daulet/tokenizers"
 	"github.com/klauspost/compress/zstd"
 	// TODO(https://github.com/microsoft/onnxruntime/issues/32535): Migrate to
 	// the official Go binding and refactor native runtime packaging after
@@ -31,7 +31,6 @@ const (
 	// lateOnSequenceLength is Seek's fixed row width, not the upstream model
 	// maximum. This lower limit bounds local inference time and memory.
 	lateOnSequenceLength   = 128
-	lateOnEmbeddingSize    = 48
 	lateOnQueryPrefix      = "[Q] "
 	lateOnDocumentPrefix   = "[D] "
 	lateOnQueryPrefixID    = 50_368
@@ -39,10 +38,9 @@ const (
 	lateOnPadTokenID       = 50_284
 	lateOnCLSTokenID       = 50_281
 	lateOnSEPTokenID       = 50_282
-	lateOnX64PrecisionKey  = "session.x64quantprecision"
 )
 
-//go:embed rerank_assets/model_int8.onnx.zst
+//go:embed rerank_assets/model_fp16_static_b128.onnx.zst
 var lateOnCompressedModel []byte
 
 //go:embed rerank_assets/tokenizer.json.zst
@@ -64,10 +62,25 @@ type lateOnRuntimeManifest struct {
 	SHA256   string `json:"sha256"`
 }
 
-type lateOnScorer struct {
-	session     *ort.DynamicAdvancedSession
-	tokenizer   *hftokenizer.Tokenizer
-	punctuation map[int]struct{}
+// lateOnModel owns the command-wide tokenizer pool and lazily creates one row
+// encoder and ONNX session. Active methods can run concurrently. The command
+// closes the model only after all borrowers have finished.
+type lateOnModel struct {
+	tokenizers     chan *lateOnTokenizer
+	tokenizerCount int
+	punctuation    map[int]struct{}
+	encoderOnce    sync.Once
+	encoder        *lateOnStaticRowEncoder
+	encoderErr     error
+}
+
+type lateOnTokenizer struct {
+	native *tokenizers.Tokenizer
+}
+
+type lateOnTokenSpan struct {
+	Start int
+	End   int
 }
 
 var (
@@ -114,12 +127,7 @@ func lateOnRuntimeBundleFromManifest(
 	}, nil
 }
 
-func rerankBackendBundled() bool {
-	_, err := lateOnRuntimeForPlatform()
-	return err == nil
-}
-
-func newLateOnRerankScorer(ctx context.Context) (rerankScorer, error) {
+func newLateOnSemanticModel(ctx context.Context) (semanticModel, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -131,10 +139,6 @@ func newLateOnRerankScorer(ctx context.Context) (rerankScorer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("prepare ONNX Runtime: %w", err)
 	}
-	model, err := decodeLateOnAsset(lateOnCompressedModel)
-	if err != nil {
-		return nil, fmt.Errorf("load LateOn model: %w", err)
-	}
 	tokenizerJSON, err := decodeLateOnAsset(lateOnCompressedTokenizer)
 	if err != nil {
 		return nil, fmt.Errorf("load LateOn tokenizer: %w", err)
@@ -143,28 +147,30 @@ func newLateOnRerankScorer(ctx context.Context) (rerankScorer, error) {
 	if err != nil {
 		return nil, err
 	}
+	tokenizerCount := max(1, runtime.GOMAXPROCS(0))
+	tokenizerPool := make(chan *lateOnTokenizer, tokenizerCount)
+	tokenizerPool <- tokenizer
+	for range tokenizerCount - 1 {
+		copyTokenizer, _, tokenizerErr := newLateOnTokenizer(tokenizerJSON)
+		if tokenizerErr != nil {
+			return nil, errors.Join(
+				tokenizerErr,
+				closeLateOnTokenizers(tokenizerPool, len(tokenizerPool)),
+			)
+		}
+		tokenizerPool <- copyTokenizer
+	}
 
 	if err := ensureLateOnEnvironment(runtimePath); err != nil {
-		return nil, err
+		return nil, errors.Join(
+			err,
+			closeLateOnTokenizers(tokenizerPool, tokenizerCount),
+		)
 	}
-	sessionOptions, err := newLateOnSessionOptions()
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = sessionOptions.Destroy() }()
-	session, err := ort.NewDynamicAdvancedSessionWithONNXData(
-		model,
-		[]string{"input_ids", "attention_mask"},
-		[]string{"output"},
-		sessionOptions,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("create LateOn session: %w", err)
-	}
-	return &lateOnScorer{
-		session:     session,
-		tokenizer:   tokenizer,
-		punctuation: punctuation,
+	return &lateOnModel{
+		tokenizers:     tokenizerPool,
+		tokenizerCount: tokenizerCount,
+		punctuation:    punctuation,
 	}, nil
 }
 
@@ -176,14 +182,6 @@ func newLateOnSessionOptions() (*ort.SessionOptions, error) {
 	if err := options.SetGraphOptimizationLevel(ort.GraphOptimizationLevelEnableAll); err != nil {
 		_ = options.Destroy()
 		return nil, fmt.Errorf("enable ONNX Runtime graph optimizations: %w", err)
-	}
-	// ONNX Runtime can overflow during x64 U8S8 matrix multiplication. At the
-	// maximum graph optimization level set above, this setting converts S8
-	// weights to U8 on affected AVX2 and AVX512 paths, so ONNX Runtime uses its
-	// slower U8U8 path. It does not cover SSE4.1-only paths.
-	if err := options.AddSessionConfigEntry(lateOnX64PrecisionKey, "1"); err != nil {
-		_ = options.Destroy()
-		return nil, fmt.Errorf("enable precise x64 quantization: %w", err)
 	}
 	return options, nil
 }
@@ -202,77 +200,233 @@ func ensureLateOnEnvironment(runtimePath string) error {
 	return lateOnEnvironmentErr
 }
 
-func (s *lateOnScorer) Scores(
-	ctx context.Context,
-	modelQuery string,
-	documents []rerankDocument,
-) ([]float32, error) {
-	if s.session == nil || s.tokenizer == nil {
-		return nil, errRerankUnavailable
+func (s *lateOnModel) takeTokenizer(ctx context.Context) (*lateOnTokenizer, error) {
+	select {
+	case tokenizer := <-s.tokenizers:
+		return tokenizer, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if len(documents) == 0 {
-		return nil, nil
-	}
+}
 
-	inputIDs, attention, scoreMask := tokenizeLateOnBatch(
-		s.tokenizer,
-		s.punctuation,
-		modelQuery,
-		documents,
-	)
-	batchSize := len(documents) + 1
+func (s *lateOnModel) releaseTokenizer(tokenizer *lateOnTokenizer) {
+	if tokenizer != nil {
+		s.tokenizers <- tokenizer
+	}
+}
+
+func runLateOnSessionRows(
+	ctx context.Context,
+	session *ort.DynamicAdvancedSession,
+	inputIDs []int64,
+	attention []int64,
+	batchSize int,
+	outputTensor *ort.Tensor[float32],
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	shape := ort.NewShape(int64(batchSize), lateOnSequenceLength)
 	idsTensor, err := ort.NewTensor(shape, inputIDs)
 	if err != nil {
-		return nil, fmt.Errorf("create input IDs: %w", err)
+		return fmt.Errorf("create input IDs: %w", err)
 	}
 	defer func() { _ = idsTensor.Destroy() }()
 	attentionTensor, err := ort.NewTensor(shape, attention)
 	if err != nil {
-		return nil, fmt.Errorf("create attention mask: %w", err)
+		return fmt.Errorf("create attention mask: %w", err)
 	}
 	defer func() { _ = attentionTensor.Destroy() }()
-
-	outputShape := ort.NewShape(
-		int64(batchSize),
-		lateOnSequenceLength,
-		lateOnEmbeddingSize,
-	)
-	outputTensor, err := ort.NewEmptyTensor[float32](outputShape)
+	runOptions, err := ort.NewRunOptions()
 	if err != nil {
-		return nil, fmt.Errorf("create LateOn output: %w", err)
+		return fmt.Errorf("create LateOn run options: %w", err)
 	}
-	defer func() { _ = outputTensor.Destroy() }()
-	if err := s.session.Run(
+	defer func() { _ = runOptions.Destroy() }()
+	watchStop := make(chan struct{})
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		select {
+		case <-ctx.Done():
+			_ = runOptions.Terminate()
+		case <-watchStop:
+		}
+	}()
+	runErr := session.RunWithOptions(
 		[]ort.Value{idsTensor, attentionTensor},
 		[]ort.Value{outputTensor},
-	); err != nil {
-		return nil, fmt.Errorf("run LateOn model: %w", err)
-	}
-	scores, err := lateOnMaxSim(
-		outputTensor.GetData(),
-		scoreMask,
-		batchSize,
-		lateOnSequenceLength,
-		lateOnEmbeddingSize,
+		runOptions,
 	)
+	close(watchStop)
+	<-watchDone
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if runErr != nil {
+		return fmt.Errorf("run LateOn model: %w", runErr)
+	}
+	return nil
+}
+
+func (s *lateOnModel) EmbedSemanticUnits(
+	ctx context.Context,
+	units []semanticUnit,
+) ([]semanticUnitEmbedding, error) {
+	if len(units) == 0 {
+		return nil, ctx.Err()
+	}
+	if len(units) > semanticModelBatchRows {
+		return nil, fmt.Errorf(
+			"semantic model batch has %d rows, limit is %d",
+			len(units),
+			semanticModelBatchRows,
+		)
+	}
+	encoder, err := s.semanticRowEncoder(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if err := ctx.Err(); err != nil {
+	return s.embedSemanticUnitBatch(ctx, encoder, units)
+}
+
+func (s *lateOnModel) SemanticCallCPUs(ctx context.Context) int {
+	encoder, err := s.semanticRowEncoder(ctx)
+	if err != nil {
+		return 1
+	}
+	return max(0, encoder.CallCPUs())
+}
+
+func (s *lateOnModel) embedSemanticUnitBatch(
+	ctx context.Context,
+	encoder *lateOnStaticRowEncoder,
+	units []semanticUnit,
+) ([]semanticUnitEmbedding, error) {
+	tokenizer, err := s.takeTokenizer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	inputIDs, attention, masks, tokenizeErr := tokenizeLateOnSemanticUnits(
+		tokenizer,
+		s.punctuation,
+		units,
+	)
+	s.releaseTokenizer(tokenizer)
+	if tokenizeErr != nil {
+		return nil, tokenizeErr
+	}
+	vectors := make([]semanticUnitEmbedding, len(units))
+	err = encoder.Run(ctx, inputIDs, attention, len(units), func(embeddings []float32) error {
+		var workspace semanticCentroidWorkspace
+		for row := range vectors {
+			vector, rowErr := workspace.makeUnitEmbedding(embeddings, masks[row], row)
+			if rowErr != nil {
+				return fmt.Errorf("semantic unit %d: %w", units[row].row, rowErr)
+			}
+			vectors[row] = vector
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return vectors, nil
+}
+
+func (s *lateOnModel) PrepareSemanticQuery(
+	ctx context.Context,
+	modelQuery string,
+) (*semanticQueryEmbedding, error) {
+	tokenizer, err := s.takeTokenizer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	encoded, encodeErr := encodeLateOnText(tokenizer, lateOnQueryPrefix+modelQuery)
+	s.releaseTokenizer(tokenizer)
+	if encodeErr != nil {
+		return nil, encodeErr
+	}
+	inputIDs, attention, mask := packLateOnRows([][]int{encoded}, nil, true)
+	encoder, err := s.semanticRowEncoder(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var embeddings []float32
+	err = encoder.Run(ctx, inputIDs, attention, 1, func(output []float32) error {
+		embeddings = append([]float32(nil), output...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &semanticQueryEmbedding{
+		tokens:     embeddings,
+		scoreMask:  mask[0],
+		modelQuery: modelQuery,
+	}, nil
+}
+
+func (s *lateOnModel) ScoresWithSemanticQuery(
+	ctx context.Context,
+	prepared *semanticQueryEmbedding,
+	documents []rerankDocument,
+) ([]float32, error) {
+	if prepared == nil || len(prepared.tokens) != lateOnSequenceLength*semanticEmbeddingDimensions ||
+		len(prepared.scoreMask) != lateOnSequenceLength {
+		return nil, fmt.Errorf("semantic query embedding is invalid")
+	}
+	if len(documents) == 0 {
+		return nil, nil
+	}
+	tokenizer, err := s.takeTokenizer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	inputIDs, attention, masks, tokenizeErr := tokenizeLateOnDocuments(
+		tokenizer,
+		s.punctuation,
+		documents,
+	)
+	s.releaseTokenizer(tokenizer)
+	if tokenizeErr != nil {
+		return nil, tokenizeErr
+	}
+	encoder, err := s.semanticRowEncoder(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var scores []float32
+	err = encoder.Run(ctx, inputIDs, attention, len(documents), func(embeddings []float32) error {
+		var scoreErr error
+		scores, scoreErr = lateOnMaxSimPrepared(prepared.tokens, prepared.scoreMask, embeddings, masks)
+		return scoreErr
+	})
+	if err != nil {
 		return nil, err
 	}
 	return scores, nil
 }
 
-func (s *lateOnScorer) Close() error {
+func (s *lateOnModel) semanticRowEncoder(ctx context.Context) (*lateOnStaticRowEncoder, error) {
+	s.encoderOnce.Do(func() {
+		s.encoder, s.encoderErr = newLateOnRowEncoder(ctx)
+	})
+	return s.encoder, s.encoderErr
+}
+
+func (s *lateOnModel) Close() error {
 	var closeErr error
-	if s.session != nil {
-		closeErr = s.session.Destroy()
-		s.session = nil
+	if s.encoder != nil {
+		closeErr = s.encoder.Close()
+		s.encoder = nil
+	}
+	if s.tokenizers != nil {
+		closeErr = errors.Join(
+			closeErr,
+			closeLateOnTokenizers(s.tokenizers, s.tokenizerCount),
+		)
+		s.tokenizers = nil
+		s.tokenizerCount = 0
 	}
 	// Keep the shared environment loaded for the process lifetime. Unloading the
 	// ONNX library after inference can race with its native thread cleanup.
@@ -281,17 +435,18 @@ func (s *lateOnScorer) Close() error {
 
 func newLateOnTokenizer(
 	content []byte,
-) (*hftokenizer.Tokenizer, map[int]struct{}, error) {
-	tokenizer, err := hftokenizer.NewFromContent(nil, content)
+) (*lateOnTokenizer, map[int]struct{}, error) {
+	// Serialized rerank input is at most 16 KiB. This larger tokenizer bound
+	// keeps match-centered truncation under Seek's control.
+	native, err := tokenizers.FromBytesWithTruncation(
+		content,
+		uint32(maxRerankDocumentBytes*4),
+		tokenizers.TruncationDirectionRight,
+	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse LateOn tokenizer: %w", err)
 	}
-	if err := tokenizer.With(api.EncodeOptions{
-		AddSpecialTokens: true,
-		IncludeSpans:     true,
-	}); err != nil {
-		return nil, nil, fmt.Errorf("configure LateOn tokenizer: %w", err)
-	}
+	tokenizer := &lateOnTokenizer{native: native}
 	for _, special := range []struct {
 		token string
 		want  int
@@ -303,80 +458,384 @@ func newLateOnTokenizer(
 		{token: "[SEP]", want: lateOnSEPTokenID},
 	} {
 		token, want := special.token, special.want
-		got, ok := tokenizer.TokenToID(token)
-		if !ok || got != want {
-			return nil, nil, fmt.Errorf("LateOn token %q has ID %d, want %d", token, got, want)
+		ids, _, encodeErr := tokenizer.encode(token, false, false)
+		if encodeErr != nil {
+			_ = tokenizer.Close()
+			return nil, nil, fmt.Errorf("encode LateOn token %q: %w", token, encodeErr)
+		}
+		if len(ids) != 1 || ids[0] != want {
+			_ = tokenizer.Close()
+			return nil, nil, fmt.Errorf("LateOn token %q has IDs %v, want [%d]", token, ids, want)
 		}
 	}
 	punctuation := make(map[int]struct{})
 	for _, char := range `!"#$%&'()*+,-./:;<=>?@[\]^_` + "`" + `{|}~` {
-		if id, ok := tokenizer.TokenToID(string(char)); ok {
-			punctuation[id] = struct{}{}
+		ids, _, encodeErr := tokenizer.encode(string(char), false, false)
+		if encodeErr != nil {
+			_ = tokenizer.Close()
+			return nil, nil, fmt.Errorf("encode LateOn punctuation %q: %w", char, encodeErr)
+		}
+		if len(ids) == 1 {
+			punctuation[ids[0]] = struct{}{}
 		}
 	}
 	return tokenizer, punctuation, nil
 }
 
-// tokenizeLateOnBatch stores the query in row zero and documents in later
-// rows. Padding never scores. Punctuation is masked only in document rows.
-func tokenizeLateOnBatch(
-	tokenizer *hftokenizer.Tokenizer,
+func (t *lateOnTokenizer) encode(
+	text string,
+	addSpecialTokens bool,
+	includeOffsets bool,
+) ([]int, []lateOnTokenSpan, error) {
+	if t == nil || t.native == nil {
+		return nil, nil, fmt.Errorf("LateOn tokenizer is closed")
+	}
+	text = sanitizeLateOnTokenizerInput(text)
+	var options []tokenizers.EncodeOption
+	if includeOffsets {
+		options = append(options, tokenizers.WithReturnOffsets())
+	}
+	encoded, err := t.native.EncodeWithOptionsErr(text, addSpecialTokens, options...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("encode LateOn input: %w", err)
+	}
+	ids := make([]int, len(encoded.IDs))
+	for index, id := range encoded.IDs {
+		ids[index] = int(id)
+	}
+	if !includeOffsets {
+		return ids, nil, nil
+	}
+	if len(encoded.Offsets) != len(encoded.IDs) {
+		return nil, nil, fmt.Errorf("LateOn tokenizer returned invalid offsets")
+	}
+	spans := make([]lateOnTokenSpan, len(encoded.Offsets))
+	for index, offset := range encoded.Offsets {
+		spans[index] = lateOnTokenSpan{Start: int(offset[0]), End: int(offset[1])}
+	}
+	return ids, spans, nil
+}
+
+func (t *lateOnTokenizer) Close() error {
+	if t == nil || t.native == nil {
+		return nil
+	}
+	err := t.native.Close()
+	t.native = nil
+	return err
+}
+
+func closeLateOnTokenizers(pool chan *lateOnTokenizer, count int) error {
+	var closeErr error
+	for range count {
+		closeErr = errors.Join(closeErr, (<-pool).Close())
+	}
+	return closeErr
+}
+
+func sanitizeLateOnTokenizerInput(text string) string {
+	text = strings.ToValidUTF8(text, "\uFFFD")
+	return strings.ReplaceAll(text, "\x00", "\uFFFD")
+}
+
+func tokenizeLateOnSemanticUnits(
+	tokenizer *lateOnTokenizer,
 	punctuation map[int]struct{},
-	queryText string,
-	documents []rerankDocument,
-) ([]int64, []int64, [][]bool) {
-	rows := len(documents) + 1
-	inputIDs := make([]int64, rows*lateOnSequenceLength)
-	attention := make([]int64, len(inputIDs))
-	scoreMask := make([][]bool, rows)
-	for row := range rows {
-		var encoded []int
-		if row == 0 {
-			encoded = encodeLateOnText(
+	units []semanticUnit,
+) ([]int64, []int64, [][]bool, error) {
+	encoded := make([][]int, len(units))
+	for index, unit := range units {
+		if len(unit.modelInput) > 0 {
+			encoded[index] = unit.modelInput
+			continue
+		}
+		var err error
+		encoded[index], err = encodeLateOnDocument(
+			tokenizer,
+			lateOnSemanticDocument(unit),
+			lateOnSequenceLength,
+		)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	inputIDs, attention, masks := packLateOnRows(encoded, punctuation, false)
+	return inputIDs, attention, masks, nil
+}
+
+// lateOnSemanticDocument keeps file context but does not repeat ctags symbol
+// metadata in the proxy input. A symbol unit starts at its source definition,
+// so its name and signature are already present. The stored symbol remains in
+// the checked document used by final MaxSim scoring.
+func lateOnSemanticDocument(unit semanticUnit) rerankDocument {
+	text := strings.ToValidUTF8(string(unit.text), "\uFFFD")
+	return rerankDocument{
+		Path:     unit.path,
+		Language: unit.language,
+		Text:     text,
+		matchEnd: len(text),
+	}
+}
+
+func (s *lateOnModel) PackSemanticUnits(
+	ctx context.Context,
+	units []semanticUnit,
+) ([]semanticUnit, error) {
+	if len(units) == 0 {
+		return units, ctx.Err()
+	}
+	tokenizer, err := s.takeTokenizer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	packed, packErr := packLateOnSemanticUnits(ctx, tokenizer, units)
+	s.releaseTokenizer(tokenizer)
+	return packed, packErr
+}
+
+// packLateOnSemanticUnits joins adjacent source units only when their complete
+// serialized document fits in one model row. It removes repeated metadata and
+// model padding without dropping source tokens that the unpacked rows kept.
+func packLateOnSemanticUnits(
+	ctx context.Context,
+	tokenizer *lateOnTokenizer,
+	units []semanticUnit,
+) ([]semanticUnit, error) {
+	if len(units) == 0 {
+		return units, ctx.Err()
+	}
+	packed := make([]semanticUnit, 0, len(units))
+	for at := 0; at < len(units); {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		current := units[at]
+		var currentInput []int
+		next := at + 1
+		for next < len(units) {
+			candidate, ok := mergeSemanticUnits(current, units[next])
+			if !ok {
+				break
+			}
+			input, err := encodeCompleteLateOnSemanticUnit(tokenizer, candidate)
+			if err != nil {
+				return nil, err
+			}
+			if len(input) > lateOnSequenceLength {
+				break
+			}
+			current = candidate
+			currentInput = input
+			next++
+		}
+		if len(currentInput) == 0 {
+			var err error
+			currentInput, err = encodeLateOnDocument(
 				tokenizer,
-				lateOnQueryPrefix+queryText,
-			)
-		} else {
-			encoded = encodeLateOnDocument(
-				tokenizer,
-				documents[row-1],
+				lateOnSemanticDocument(current),
 				lateOnSequenceLength,
 			)
+			if err != nil {
+				return nil, err
+			}
 		}
-		scoreMask[row] = make([]bool, lateOnSequenceLength)
+		current.modelInput = currentInput
+		packed = append(packed, current)
+		at = next
+	}
+	return packed, nil
+}
+
+func mergeSemanticUnits(left, right semanticUnit) (semanticUnit, bool) {
+	if left.path == "" || left.path != right.path || left.contentID != right.contentID ||
+		left.end != right.start || left.parserResult != right.parserResult ||
+		right.end <= left.start || right.end-left.start > semanticUnitMaxBytes {
+		return semanticUnit{}, false
+	}
+	spanBytes := int(right.end - left.start)
+	if spanBytes < len(left.text) || len(left.text)+len(right.text) != spanBytes {
+		return semanticUnit{}, false
+	}
+	if cap(left.text) >= spanBytes &&
+		bytes.Equal(left.text[:spanBytes][len(left.text):], right.text) {
+		left.text = left.text[:spanBytes]
+	} else {
+		text := make([]byte, 0, spanBytes)
+		text = append(text, left.text...)
+		text = append(text, right.text...)
+		left.text = text
+	}
+	left.end = right.end
+	left.kind = semanticUnitPacked
+	left.modelInput = nil
+	if left.language != right.language {
+		left.language = ""
+	}
+	if right.symbol != "" {
+		if left.symbol != "" {
+			left.symbol += " "
+		}
+		left.symbol += right.symbol
+	}
+	left.id = makeSemanticUnitID(left)
+	return left, true
+}
+
+func encodeCompleteLateOnSemanticUnit(
+	tokenizer *lateOnTokenizer,
+	unit semanticUnit,
+) ([]int, error) {
+	document := lateOnSemanticDocument(unit)
+	serialized, _, _, _ := serializeLateOnDocumentWithMatch(document)
+	ids, _, err := tokenizer.encode(lateOnDocumentPrefix+serialized, true, false)
+	return ids, err
+}
+
+func tokenizeLateOnDocuments(
+	tokenizer *lateOnTokenizer,
+	punctuation map[int]struct{},
+	documents []rerankDocument,
+) ([]int64, []int64, [][]bool, error) {
+	encoded := make([][]int, len(documents))
+	for index, document := range documents {
+		var err error
+		encoded[index], err = encodeLateOnDocument(
+			tokenizer,
+			document,
+			lateOnSequenceLength,
+		)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	inputIDs, attention, masks := packLateOnRows(encoded, punctuation, false)
+	return inputIDs, attention, masks, nil
+}
+
+func packLateOnRows(
+	encoded [][]int,
+	punctuation map[int]struct{},
+	query bool,
+) ([]int64, []int64, [][]bool) {
+	inputIDs := make([]int64, len(encoded)*lateOnSequenceLength)
+	attention := make([]int64, len(inputIDs))
+	masks := make([][]bool, len(encoded))
+	for row, ids := range encoded {
+		masks[row] = make([]bool, lateOnSequenceLength)
 		for column := range lateOnSequenceLength {
 			position := row*lateOnSequenceLength + column
 			inputIDs[position] = lateOnPadTokenID
-			if column >= len(encoded) {
+			if column >= len(ids) {
 				continue
 			}
-			id := encoded[column]
+			id := ids[column]
 			inputIDs[position] = int64(id)
 			attention[position] = 1
 			_, isPunctuation := punctuation[id]
-			scoreMask[row][column] = row == 0 || !isPunctuation
+			masks[row][column] = query || !isPunctuation
 		}
 	}
-	return inputIDs, attention, scoreMask
+	return inputIDs, attention, masks
+}
+
+func lateOnMaxSimPrepared(
+	query []float32,
+	queryMask []bool,
+	documents []float32,
+	documentMasks [][]bool,
+) ([]float32, error) {
+	queryRowBytes := lateOnSequenceLength * semanticEmbeddingDimensions
+	if len(query) != queryRowBytes || len(queryMask) != lateOnSequenceLength ||
+		len(documents) != len(documentMasks)*queryRowBytes {
+		return nil, fmt.Errorf("invalid prepared LateOn tensor size")
+	}
+	scores := make([]float32, len(documentMasks))
+	for document, mask := range documentMasks {
+		if len(mask) != lateOnSequenceLength {
+			return nil, fmt.Errorf("invalid prepared LateOn mask size")
+		}
+		var sum float32
+		for queryToken, keepQuery := range queryMask {
+			if !keepQuery {
+				continue
+			}
+			maximum := float32(math.Inf(-1))
+			queryOffset := queryToken * semanticEmbeddingDimensions
+			for documentToken, keepDocument := range mask {
+				if !keepDocument {
+					continue
+				}
+				documentOffset := (document*lateOnSequenceLength + documentToken) * semanticEmbeddingDimensions
+				var dot float32
+				for dimension := range semanticEmbeddingDimensions {
+					dot += query[queryOffset+dimension] * documents[documentOffset+dimension]
+				}
+				if dot > maximum {
+					maximum = dot
+				}
+			}
+			if math.IsInf(float64(maximum), -1) {
+				return nil, fmt.Errorf("LateOn document has no scoreable token")
+			}
+			sum += maximum
+		}
+		if math.IsNaN(float64(sum)) || math.IsInf(float64(sum), 0) {
+			return nil, fmt.Errorf("LateOn score is not finite")
+		}
+		scores[document] = sum
+	}
+	return scores, nil
 }
 
 func encodeLateOnDocument(
-	tokenizer *hftokenizer.Tokenizer,
+	tokenizer *lateOnTokenizer,
 	document rerankDocument,
 	limit int,
-) []int {
+) ([]int, error) {
 	serialized, metadataEnd, matchAt, matchEnd := serializeLateOnDocumentWithMatch(document)
+	serialized, metadataEnd, matchAt, matchEnd = sanitizeLateOnDocumentInput(
+		serialized,
+		metadataEnd,
+		matchAt,
+		matchEnd,
+	)
 	text := lateOnDocumentPrefix + serialized
 	prefixBytes := len(lateOnDocumentPrefix)
-	encoded := tokenizer.EncodeWithAnnotations(text)
+	ids, spans, err := tokenizer.encode(text, true, true)
+	if err != nil {
+		return nil, err
+	}
 	return truncateLateOnDocumentTokens(
-		encoded.IDs,
-		encoded.Spans,
+		ids,
+		spans,
 		prefixBytes+metadataEnd,
 		prefixBytes+matchAt,
 		prefixBytes+matchEnd,
 		limit,
-	)
+	), nil
+}
+
+func sanitizeLateOnDocumentInput(
+	text string,
+	metadataEnd int,
+	matchAt int,
+	matchEnd int,
+) (string, int, int, int) {
+	if metadataEnd < 0 || metadataEnd > matchAt || matchAt > matchEnd || matchEnd > len(text) {
+		sanitized := sanitizeLateOnTokenizerInput(text)
+		return sanitized, 0, 0, len(sanitized)
+	}
+	metadata := sanitizeLateOnTokenizerInput(text[:metadataEnd])
+	beforeMatch := sanitizeLateOnTokenizerInput(text[metadataEnd:matchAt])
+	match := sanitizeLateOnTokenizerInput(text[matchAt:matchEnd])
+	afterMatch := sanitizeLateOnTokenizerInput(text[matchEnd:])
+	sanitizedMetadataEnd := len(metadata)
+	sanitizedMatchAt := sanitizedMetadataEnd + len(beforeMatch)
+	sanitizedMatchEnd := sanitizedMatchAt + len(match)
+	return metadata + beforeMatch + match + afterMatch,
+		sanitizedMetadataEnd,
+		sanitizedMatchAt,
+		sanitizedMatchEnd
 }
 
 // truncateLateOnDocumentTokens packs one annotated document into limit tokens.
@@ -386,7 +845,7 @@ func encodeLateOnDocument(
 // annotated layout uses head truncation.
 func truncateLateOnDocumentTokens(
 	ids []int,
-	spans []api.TokenSpan,
+	spans []lateOnTokenSpan,
 	metadataEnd int,
 	matchAt int,
 	matchEnd int,
@@ -459,11 +918,14 @@ func truncateLateOnDocumentTokens(
 }
 
 func encodeLateOnText(
-	tokenizer *hftokenizer.Tokenizer,
+	tokenizer *lateOnTokenizer,
 	text string,
-) []int {
-	encoded := tokenizer.Encode(text)
-	return truncateLateOnHead(encoded, lateOnSequenceLength)
+) ([]int, error) {
+	encoded, _, err := tokenizer.encode(text, true, false)
+	if err != nil {
+		return nil, err
+	}
+	return truncateLateOnHead(encoded, lateOnSequenceLength), nil
 }
 
 func truncateLateOnHead(encoded []int, limit int) []int {
@@ -476,59 +938,6 @@ func truncateLateOnHead(encoded []int, limit int) []int {
 	encoded = append([]int(nil), encoded[:limit]...)
 	encoded[len(encoded)-1] = lateOnSEPTokenID
 	return encoded
-}
-
-// lateOnMaxSim treats row zero as the query. For each later document row, it
-// sums each query token's largest dot product with a scoreable document token.
-func lateOnMaxSim(
-	embeddings []float32,
-	scoreMask [][]bool,
-	batchSize int,
-	sequenceLength int,
-	embeddingSize int,
-) ([]float32, error) {
-	want := batchSize * sequenceLength * embeddingSize
-	if len(embeddings) != want || len(scoreMask) != batchSize {
-		return nil, fmt.Errorf("invalid LateOn tensor size")
-	}
-	for _, mask := range scoreMask {
-		if len(mask) != sequenceLength {
-			return nil, fmt.Errorf("invalid LateOn mask size")
-		}
-	}
-
-	scores := make([]float32, batchSize-1)
-	for document := 1; document < batchSize; document++ {
-		var sum float32
-		for queryToken := range sequenceLength {
-			if !scoreMask[0][queryToken] {
-				continue
-			}
-			maximum := float32(math.Inf(-1))
-			queryOffset := queryToken * embeddingSize
-			for documentToken := range sequenceLength {
-				if !scoreMask[document][documentToken] {
-					continue
-				}
-				documentOffset :=
-					(document*sequenceLength + documentToken) * embeddingSize
-				var dot float32
-				for dimension := range embeddingSize {
-					dot += embeddings[queryOffset+dimension] *
-						embeddings[documentOffset+dimension]
-				}
-				if dot > maximum {
-					maximum = dot
-				}
-			}
-			if math.IsInf(float64(maximum), -1) {
-				return nil, fmt.Errorf("LateOn document has no scoreable token")
-			}
-			sum += maximum
-		}
-		scores[document-1] = sum
-	}
-	return scores, nil
 }
 
 func decodeLateOnAsset(compressed []byte) ([]byte, error) {
@@ -558,54 +967,36 @@ func ensureLateOnRuntime(bundle lateOnRuntimeBundle) (string, bool, error) {
 		bundle.version,
 		bundle.sha256,
 	)
-	path := filepath.Join(directory, bundle.fileName)
-	if validFileDigest(path, bundle.bytes, bundle.sha256) {
-		return path, false, nil
-	}
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return "", false, err
-	}
-	if err := os.Chmod(directory, 0o700); err != nil {
-		return "", false, err
-	}
-	temporary, err := os.CreateTemp(directory, ".onnxruntime-*.tmp")
-	if err != nil {
-		return "", false, err
-	}
-	temporaryPath := temporary.Name()
-	defer func() { _ = os.Remove(temporaryPath) }()
-	if err := temporary.Chmod(0o700); err != nil {
-		_ = temporary.Close()
-		return "", false, err
-	}
-	decoder, err := zstd.NewReader(
-		bytes.NewReader(bundle.compressed),
-		zstd.WithDecoderConcurrency(1),
+	return installPrivateAsset(
+		directory,
+		bundle.fileName,
+		".onnxruntime-*.tmp",
+		func(path string) bool {
+			return validFileDigest(path, bundle.bytes, bundle.sha256)
+		},
+		func(writer io.Writer) error {
+			decoder, err := zstd.NewReader(
+				bytes.NewReader(bundle.compressed),
+				zstd.WithDecoderConcurrency(1),
+			)
+			if err != nil {
+				return err
+			}
+			defer decoder.Close()
+			hash := sha256.New()
+			written, err := io.Copy(
+				io.MultiWriter(writer, hash),
+				io.LimitReader(decoder, bundle.bytes+1),
+			)
+			if err != nil {
+				return err
+			}
+			if written != bundle.bytes || hex.EncodeToString(hash.Sum(nil)) != bundle.sha256 {
+				return fmt.Errorf("extracted runtime digest mismatch")
+			}
+			return nil
+		},
 	)
-	if err != nil {
-		_ = temporary.Close()
-		return "", false, err
-	}
-	hash := sha256.New()
-	written, copyErr := io.Copy(
-		io.MultiWriter(temporary, hash),
-		io.LimitReader(decoder, bundle.bytes+1),
-	)
-	decoder.Close()
-	closeErr := temporary.Close()
-	if copyErr != nil || closeErr != nil {
-		return "", false, errors.Join(copyErr, closeErr)
-	}
-	if written != bundle.bytes || hex.EncodeToString(hash.Sum(nil)) != bundle.sha256 {
-		return "", false, fmt.Errorf("extracted runtime digest mismatch")
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		if validFileDigest(path, bundle.bytes, bundle.sha256) {
-			return path, false, nil
-		}
-		return "", false, err
-	}
-	return path, true, nil
 }
 
 func validFileDigest(path string, wantBytes int64, wantSHA256 string) bool {

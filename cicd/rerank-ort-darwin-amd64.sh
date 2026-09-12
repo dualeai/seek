@@ -5,12 +5,16 @@
 set -euo pipefail
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-cache_root=${RERANK_ASSET_CACHE:-${XDG_CACHE_HOME:-${HOME}/.cache}/seek/rerank-assets-upgrade}
+# shellcheck source=cicd/search-assets-common.sh
+source "${repo_root}/cicd/search-assets-common.sh"
+ort_version=$(search_assets_ort_version)
+cache_root=${SEARCH_ASSET_CACHE:-${XDG_CACHE_HOME:-${HOME}/.cache}/seek/search-assets-upgrade}
 source_root="${cache_root}/sources"
 build_root="${cache_root}/build"
 internal_root="${cache_root}/internal"
 
-ort_version=1.29.0
+# This commit must be the release commit for ort_version. Update both values
+# together so the locally built resource matches the other platform resources.
 ort_commit=2e2543fbe9fae542f921d47a72d21d5a4ef0b710
 ort_source_url="https://github.com/microsoft/onnxruntime/archive/${ort_commit}.tar.gz"
 ort_source_archive="${source_root}/onnxruntime-${ort_commit}.tar.gz"
@@ -19,60 +23,12 @@ ort_build_dir="${build_root}/onnxruntime-${ort_commit}-darwin-amd64"
 ort_output_dir="${internal_root}/onnxruntime-osx-x64-${ort_version}"
 ort_output="${ort_output_dir}/libonnxruntime.${ort_version}.dylib"
 
-fail() {
-	echo "rerank-ort-darwin-amd64: $*" >&2
-	exit 1
-}
-
 if [[ $(uname -s) != Darwin ]]; then
 	fail "this resource build requires macOS"
 fi
 for command_name in awk file lipo nm wc; do
 	command -v "${command_name}" >/dev/null 2>&1 || fail "missing command: ${command_name}"
 done
-if command -v shasum >/dev/null 2>&1; then
-	hash_command=shasum
-elif command -v sha256sum >/dev/null 2>&1; then
-	hash_command=sha256sum
-else
-	fail "missing command: shasum or sha256sum"
-fi
-
-file_sha256() {
-	if [[ ${hash_command} == shasum ]]; then
-		shasum -a 256 "$1" | awk '{print $1}'
-	else
-		sha256sum "$1" | awk '{print $1}'
-	fi
-}
-
-show_metadata() {
-	local bytes
-	bytes=$(wc -c < "$2" | awk '{print $1}')
-	echo "$1: ${bytes} bytes; SHA-256: $(file_sha256 "$2")"
-}
-
-download() {
-	local url=$1
-	local destination=$2
-	local partial="${destination}.part"
-
-	if [[ -f ${destination} ]]; then
-		echo "Using cached ONNX Runtime source: ${destination}"
-		show_metadata "ONNX Runtime source archive" "${destination}"
-		return
-	fi
-	echo "Downloading ONNX Runtime source: ${url}"
-	if ! curl --fail --location --silent --show-error --continue-at - \
-		--connect-timeout 30 --retry 5 --retry-all-errors --retry-delay 1 \
-		--output "${partial}" "${url}"; then
-		fail "download failed; run this command again to resume ${partial}"
-	fi
-	mv -f "${partial}" "${destination}"
-	chmod 0644 "${destination}"
-	show_metadata "ONNX Runtime source archive" "${destination}"
-}
-
 validate_runtime() {
 	[[ $(lipo -archs "$1") == x86_64 ]] || fail "runtime is not macOS amd64: $1"
 	file "$1" | awk '/Mach-O 64-bit dynamically linked shared library x86_64/ {found=1} END {exit !found}' ||
@@ -99,7 +55,7 @@ python_version=$(
 ) || fail "cannot read the Python version"
 ((python_version >= 310)) || fail "Python 3.10 or newer is required"
 
-download "${ort_source_url}" "${ort_source_archive}"
+download "ONNX Runtime source archive" "${ort_source_url}" "${ort_source_archive}"
 if [[ ! -x ${ort_source_dir}/build.sh ]]; then
 	temporary_source=$(mktemp -d "${source_root}/onnxruntime-source.XXXXXX")
 	tar -xzf "${ort_source_archive}" -C "${temporary_source}" --strip-components=1

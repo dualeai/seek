@@ -710,12 +710,7 @@ func planDiscoveredGitPaths(paths gitPaths) (corpusPlan, error) {
 }
 
 func planCurrentGitCorpus(paths gitPaths) (corpusPlan, error) {
-	plan, err := buildGitCorpusPlan(paths.RepoDir, paths.CommonDir)
-	if err != nil {
-		return corpusPlan{}, err
-	}
-	plan.gitPaths = &paths
-	return plan, nil
+	return planDiscoveredGitPaths(paths)
 }
 
 func planFolderCorpusWithExclusions(root string, info os.FileInfo, excludes []string) (corpusPlan, error) {

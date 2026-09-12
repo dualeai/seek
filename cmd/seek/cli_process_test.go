@@ -60,6 +60,14 @@ func TestCLIProcessErrorsAndExitCodes(t *testing.T) {
 			code:           2,
 		},
 		{
+			name:           "removed rerank flag",
+			args:           []string{"--rerank", "needle"},
+			dir:            empty,
+			stderrPrefix:   "seek: ",
+			stderrContains: []string{"unknown flag: --rerank"},
+			code:           2,
+		},
+		{
 			name:       "no arguments",
 			dir:        empty,
 			wantStderr: "seek: missing query (try 'seek --help' for usage)\n",
@@ -269,6 +277,61 @@ func TestCLIProcess_GCRemainsSubcommand(t *testing.T) {
 				t.Fatalf("stdout=%q stderr=%q code=%d, want gc help on stdout", result.stdout, result.stderr, result.code)
 			}
 		})
+	}
+}
+
+func TestCLIProcess_LexicalOnlySkipsSemanticCacheAndModel(t *testing.T) {
+	requireTools(t)
+	folder := t.TempDir()
+	writeFileAt(t, folder, "app.go", "package sample\n// alpha beta\n")
+	cacheDir := t.TempDir()
+	result := runCLIProcessWithCache(
+		t,
+		cacheDir,
+		t.TempDir(),
+		[]string{"--verbose", "--lexical-only", "alpha beta", folder},
+		nil,
+	)
+	if result.code != 0 || !strings.Contains(result.stdout, "## app.go") {
+		t.Fatalf(
+			"lexical-only stdout=%q stderr=%q code=%d",
+			result.stdout,
+			result.stderr,
+			result.code,
+		)
+	}
+	for _, marker := range []string{
+		"Built semantic index",
+		"semantic inference",
+		"USearch",
+		"LateOn",
+	} {
+		if strings.Contains(result.stderr, marker) {
+			t.Errorf("lexical-only stderr contains %q: %s", marker, result.stderr)
+		}
+	}
+	var semanticPaths []string
+	err := filepath.WalkDir(cacheDir, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		name := entry.Name()
+		if name == joinedGenerationFile ||
+			strings.HasPrefix(name, semanticGenerationPrefix) ||
+			name == "semantic" || name == "reranker" {
+			relative, err := filepath.Rel(cacheDir, path)
+			if err != nil {
+				return err
+			}
+			semanticPaths = append(semanticPaths, relative)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(semanticPaths) != 0 {
+		t.Fatalf("lexical-only command created semantic cache paths: %v", semanticPaths)
 	}
 }
 

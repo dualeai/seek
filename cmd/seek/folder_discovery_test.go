@@ -109,7 +109,7 @@ func TestFolderFingerprintStableUnderNestedCommit(t *testing.T) {
 	before, _ := scanFolderForTest(t, root)
 
 	// Simulate a "commit" inside the nested repo by adding content.
-	// The .git entry's dev:ino:mtime is what controls the marker; the
+	// The .git entry's dev:ino is what controls the marker; the
 	// working-tree file changes alone must NOT affect the parent's
 	// fingerprint contribution.
 	if err := os.WriteFile(filepath.Join(nested, "a.go"), []byte("package main\n// changed\n"), 0o644); err != nil {
@@ -122,6 +122,26 @@ func TestFolderFingerprintStableUnderNestedCommit(t *testing.T) {
 
 	if before != after {
 		t.Fatalf("parent fingerprint changed under nested working-tree edit: before=%s after=%s", before, after)
+	}
+}
+
+func TestFolderFingerprintStableUnderNestedGitLockFile(t *testing.T) {
+	root := canonTempDir(t)
+	nested := filepath.Join(root, "repo")
+	writeMinimalGitRepo(t, nested)
+	before, _ := scanFolderForTest(t, root)
+
+	lockPath := filepath.Join(nested, ".git", "index.lock")
+	if err := os.WriteFile(lockPath, []byte("temporary"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := scanFolderForTest(t, root)
+
+	if before != after {
+		t.Fatalf("nested Git lock changed parent fingerprint: before=%s after=%s", before, after)
 	}
 }
 

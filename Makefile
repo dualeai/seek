@@ -13,11 +13,14 @@ upgrade:
 	go get -u ./...
 	go mod tidy
 
-# Maintainer-only: download fixed re-ranker sources, print their byte counts and
-# hashes, and update tracked compressed resources. No build or release target
-# invokes this.
-rerank-assets-upgrade:
+# Maintainer-only: download fixed search sources, derive the model, and update
+# tracked model, tokenizer, ONNX Runtime, and USearch resources. No build or
+# release target invokes this.
+search-assets-upgrade:
 	bash ./cicd/rerank-assets-upgrade.sh
+
+# Keep the old target as a compatibility alias for maintainer scripts.
+rerank-assets-upgrade: search-assets-upgrade
 
 VERSION ?= $(shell bash ./cicd/version.sh -g . -c -m)
 BUILD_VERSION = $(patsubst v%,%,$(VERSION))
@@ -25,8 +28,34 @@ OUTPUT ?= seek
 DIST_DIR ?= dist
 TARGET ?= $(shell go env GOOS)_$(shell go env GOARCH)
 USE_PREBUILT ?= 0
+TOKENIZER_TARGET := $(shell go env GOOS)_$(shell go env GOARCH)
+TOKENIZER_SUPPORTED_TARGETS := darwin_amd64 darwin_arm64 linux_amd64 linux_arm64
+BUILD_CGO_ENABLED := $(shell go env CGO_ENABLED)
 
-build:
+ifeq ($(BUILD_CGO_ENABLED),1)
+ifneq ($(filter $(TOKENIZER_TARGET),$(TOKENIZER_SUPPORTED_TARGETS)),)
+TOKENIZER_ARCHIVE := cmd/seek/rerank_tokenizer_assets_$(TOKENIZER_TARGET)/libtokenizers.tar.gz
+TOKENIZER_NATIVE_DIR := cmd/seek/rerank_tokenizer_native_$(TOKENIZER_TARGET)
+TOKENIZER_LIBRARY := $(TOKENIZER_NATIVE_DIR)/libtokenizers.a
+
+$(TOKENIZER_LIBRARY): $(TOKENIZER_ARCHIVE)
+	mkdir -p "$(TOKENIZER_NATIVE_DIR)"
+	tar -xzf "$(TOKENIZER_ARCHIVE)" -C "$(TOKENIZER_NATIVE_DIR)" libtokenizers.a
+	touch "$(TOKENIZER_LIBRARY)"
+
+tokenizer-native: $(TOKENIZER_LIBRARY)
+else
+tokenizer-native:
+	@echo "Seek supports builds only on: $(TOKENIZER_SUPPORTED_TARGETS)" >&2
+	@exit 1
+endif
+else
+tokenizer-native:
+	@echo "Seek requires CGO_ENABLED=1; reduced lexical-only binaries are not supported" >&2
+	@exit 1
+endif
+
+build: tokenizer-native
 	go build -trimpath \
 		-ldflags="-s -w -X main.version=$(BUILD_VERSION)" \
 		-o "$(OUTPUT)" ./cmd/seek
@@ -34,13 +63,14 @@ build:
 package:
 	$(MAKE) build OUTPUT=seek
 	mkdir -p "$(DIST_DIR)"
-	tar -czf "$(DIST_DIR)/seek_$(TARGET).tar.gz" seek
+	tar -czf "$(DIST_DIR)/seek_$(TARGET).tar.gz" seek LICENSE \
+		THIRD_PARTY_NOTICES.md ONNXRUNTIME_THIRD_PARTY_NOTICES.txt
 
 test:
 	$(MAKE) test-static
 	$(MAKE) test-unit
 
-test-static:
+test-static: tokenizer-native
 	go vet ./...
 	golangci-lint run ./...
 
@@ -58,14 +88,14 @@ COVERPROFILE ?= cover.out
 BENCH_COUNT ?= 10
 BENCH_REPO_COUNT ?= 3
 
-test-unit: test-plugin
+test-unit: tokenizer-native test-plugin
 	gotestsum --junitfile $(JUNIT_XML) -- ./... -v -race -timeout 18m -covermode=atomic -coverprofile=$(COVERPROFILE)
 
 # Local benchmark output is diagnostic. CodSpeed is the source for comparisons.
 test-bench: build
 	SEEK_BENCH_BINARY="$(abspath $(OUTPUT))" SEEK_BENCH_REPO= go test ./cmd/seek/ -run='^$$' -bench=. -benchmem -count=$(BENCH_COUNT)
 
-test-bench-repo:
+test-bench-repo: tokenizer-native
 	@if [ -z "$(SEEK_BENCH_REPO)" ]; then echo "Usage: make test-bench-repo SEEK_BENCH_REPO=/path/to/repo"; exit 1; fi
 	SEEK_BENCH_REPO="$(SEEK_BENCH_REPO)" go test ./cmd/seek/ -run='^$$' -bench=BenchmarkLargeRepo -benchmem -count=$(BENCH_REPO_COUNT) -timeout=600s
 
@@ -81,10 +111,10 @@ test-bench-compare:
 	@if [ -z "$(BASE)" ] || [ -z "$(NEW)" ]; then echo "Usage: BASE=baseline.txt NEW=after.txt make test-bench-compare"; exit 1; fi
 	go run golang.org/x/perf/cmd/benchstat@latest $(BASE) $(NEW)
 
-lint:
+lint: tokenizer-native
 	golangci-lint run --fix ./...
 
 release:
 	bash ./cicd/release.sh
 
-.PHONY: install upgrade rerank-assets-upgrade build package test test-static test-plugin test-unit test-bench test-bench-repo test-bench-compare lint release
+.PHONY: install upgrade search-assets-upgrade rerank-assets-upgrade tokenizer-native build package test test-static test-plugin test-unit test-bench test-bench-repo test-bench-compare lint release

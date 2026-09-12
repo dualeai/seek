@@ -16,7 +16,7 @@ import (
 // rootCmd flags via pflag's Var/BoolVarP/IntVarP helpers.
 type cliFlags struct {
 	verbose      bool
-	rerank       bool
+	lexicalOnly  bool
 	limit        int
 	maxMatches   int
 	afterContext int
@@ -93,18 +93,23 @@ func newRootCmd() *cobra.Command {
 	flags := &cliFlags{search: defaultSearchConfig()}
 	cmd := &cobra.Command{
 		Use:   "seek [flags] <query> [path...]",
-		Short: "BM25-ranked code search with persistent caching",
+		Short: "Ranked lexical and semantic code search with persistent caching",
 		Long: `seek searches the current Git worktree or the files and folders you
 pass. Git paths use a cached Git corpus. Results stay in your selection.
 Explicit paths excluded by .gitignore and paths outside Git are searched as
 plain files or folders. Seek searches each visible nested Git worktree in the
-selected directories once. On supported builds, --rerank combines BM25 with a
-bundled local code-search model for plain multi-word descriptions.`,
+selected directories once. Plain multi-word descriptions use local model
+re-ranking by default. One unscoped clean Git worktree, one stable plain file,
+or one stable plain folder also uses combined lexical and semantic retrieval.
+Unless --lexical-only is set, every supported corpus build or update maintains
+both index parts, including for exact queries. A cold large-corpus build runs
+both parts in parallel. It can take tens of seconds or longer and use all
+available compute, several GiB of memory, and significant cache space.`,
 		Example: `  seek 'sym:Foo'              find definitions named Foo (ctags)
   seek 'lang:go func main'    Go files containing both tokens
   seek 'file:cmd -file:test'  paths matching cmd, excluding tests
   seek 'TODO' ./src           search a specific subtree
-  seek --rerank 'request auth flow'  rank a description with the local model`,
+  seek 'request auth flow'    search a description with the local model`,
 		Args: rootArgsValidator,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			configureCLILogging(os.Stderr, flags.verbose)
@@ -126,26 +131,22 @@ bundled local code-search model for plain multi-word descriptions.`,
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			rerank := rerankRunConfig{enabled: flags.rerank}
-			if flags.rerank {
-				if rerankBackendBundled() {
-					rerank.newScorer = newLateOnRerankScorer
-				} else {
-					rerank.enabled = false
-					_, _ = fmt.Fprintln(
-						cmd.ErrOrStderr(),
-						"seek: re-ranking is unavailable in this build; using BM25",
-					)
-				}
+			policy := defaultSearchPolicy()
+			if flags.lexicalOnly {
+				policy = lexicalOnlySearchPolicy()
 			}
-			return runWithRerankConfig(
+			runConfig := searchRunConfig{policy: policy}
+			if policy.semanticEnabled() {
+				runConfig.newModel = newLateOnSemanticModel
+			}
+			return runSearchCommand(
 				cmd.Context(),
 				args[0],
 				args[1:],
 				flags.limit,
 				flags.maxMatches,
 				flags.search,
-				rerank,
+				runConfig,
 			)
 		},
 		SilenceErrors: true,
@@ -153,7 +154,7 @@ bundled local code-search model for plain multi-word descriptions.`,
 	}
 
 	cmd.PersistentFlags().BoolVarP(&flags.verbose, "verbose", "v", false, "show debug logs and detailed errors")
-	cmd.Flags().BoolVar(&flags.rerank, "rerank", false, "re-rank eligible plain queries with the bundled local model")
+	cmd.Flags().BoolVar(&flags.lexicalOnly, "lexical-only", false, "disable semantic indexing, search, and model re-ranking")
 	cmd.Flags().IntVarP(&flags.limit, "limit", "n", 0, "maximum displayed files (≥ 0, 0 = no display limit)")
 	cmd.Flags().IntVarP(&flags.maxMatches, "max-matches", "m", 0, "maximum displayed matches per file (≥ 0, 0 = no display limit)")
 	cmd.Flags().IntVarP(&flags.afterContext, "after-context", "A", 0, "lines to display after each match (0–512)")

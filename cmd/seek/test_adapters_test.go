@@ -13,14 +13,14 @@ import (
 var testGitCorpusPlan = corpusPlan{id: "test-git", kind: corpusKindGit}
 
 func run(ctx context.Context, pattern string, pathOperands []string) error {
-	return runWithRerankConfig(
+	return runSearchCommand(
 		ctx,
 		pattern,
 		pathOperands,
 		0,
 		0,
 		defaultSearchConfig(),
-		rerankRunConfig{},
+		searchRunConfig{},
 	)
 }
 
@@ -30,7 +30,7 @@ func runWithSearchConfig(
 	pathOperands []string,
 	config searchConfig,
 ) error {
-	return runWithRerankConfig(ctx, pattern, pathOperands, 0, 0, config, rerankRunConfig{})
+	return runSearchCommand(ctx, pattern, pathOperands, 0, 0, config, searchRunConfig{})
 }
 
 func runGCCommand(ctx context.Context, args []string) error {

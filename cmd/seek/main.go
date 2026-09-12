@@ -148,14 +148,14 @@ func cloneStringSlice(values []string) []string {
 	return out
 }
 
-func runWithRerankConfig(
+func runSearchCommand(
 	ctx context.Context,
 	pattern string,
 	pathOperands []string,
 	limit int,
 	maxMatches int,
 	config searchConfig,
-	rerankConfig rerankRunConfig,
+	runConfig searchRunConfig,
 ) error {
 	config.contextMatchLimit = maxMatches
 	config.contextFileLimit = limit
@@ -164,7 +164,7 @@ func runWithRerankConfig(
 		return err
 	}
 	rerankPlan, rerankEligible := rerankQueryPlan{}, false
-	if rerankConfig.enabled {
+	if runConfig.policy.semanticEnabled() {
 		rerankPlan, rerankEligible = planRerankQuery(pattern, rawQ)
 	}
 
@@ -172,58 +172,73 @@ func runWithRerankConfig(
 	if err != nil {
 		return err
 	}
-	type scorerResult struct {
-		scorer rerankScorer
-		err    error
-	}
-	// Start scorer setup before corpus planning so setup overlaps planning and
-	// strict search. Taking the result transfers close ownership of a successful
-	// scorer to re-ranking. Otherwise, the deferred receive drains and closes it.
-	var scorerReady chan scorerResult
-	var scorerTaken bool
-	if rerankEligible && rerankConfig.newScorer != nil {
-		scorerReady = make(chan scorerResult, 1)
-		go func() {
-			scorer, scorerErr := rerankConfig.newScorer(ctx)
-			scorerReady <- scorerResult{scorer: scorer, err: scorerErr}
-		}()
-		defer func() {
-			if scorerTaken {
-				return
-			}
-			result := <-scorerReady
-			if result.scorer != nil {
-				_ = result.scorer.Close()
-			}
-		}()
-	}
-
 	plans, err := planCorpora(ctx, paths, pathOperands)
 	if err != nil {
 		return err
 	}
+	execution := searchExecution{policy: runConfig.policy, resources: liveSearchResources()}
+	if runConfig.newModel != nil && runConfig.policy.semanticEnabled() {
+		execution.model = newSemanticModelFuture(runConfig.newModel)
+		if rerankEligible {
+			// Model setup overlaps index preparation and lexical search.
+			execution.model.start(ctx)
+		}
+		defer func() { _ = execution.model.Close() }()
+	}
 
-	searchConfig := config
+	strictConfig := config
 	if rerankEligible {
 		// Collect model-only context during the strict search. Every exit from
 		// tryRerankCorpora restores the user's display settings.
-		searchConfig = rerankModelSearchConfig(config)
+		strictConfig = rerankModelSearchConfig(config)
 	}
-	allResults, dirtyByCorpus, err := searchCorpora(ctx, plans, paths, userQ, searchConfig)
-	if err != nil {
-		return err
+	search := func(
+		searchCtx context.Context,
+		searchPlans []corpusPlan,
+		searchPaths *gitPaths,
+		searchQuery query.Q,
+		searchOptions searchConfig,
+	) ([]corpusSearchResult, dirtyFilesByCorpus, error) {
+		return searchCorporaWithExecution(
+			searchCtx,
+			searchPlans,
+			searchPaths,
+			searchQuery,
+			searchOptions,
+			execution,
+		)
 	}
+	var allResults []corpusSearchResult
+	var dirtyByCorpus dirtyFilesByCorpus
+	hybridUsed := false
 	if rerankEligible {
-		factory := rerankConfig.newScorer
-		if scorerReady != nil {
-			factory = func(context.Context) (rerankScorer, error) {
-				if scorerTaken {
-					return nil, errRerankUnavailable
-				}
-				scorerTaken = true
-				result := <-scorerReady
-				return result.scorer, result.err
+		var hybridErr error
+		allResults, dirtyByCorpus, hybridUsed, hybridErr = tryHybridSearch(
+			ctx,
+			plans,
+			paths,
+			userQ,
+			config,
+			rerankPlan,
+			execution,
+		)
+		if hybridErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
 			}
+			slog.Debug("Joined search failed; using the lexical path", "error", hybridErr)
+		}
+	}
+	if !hybridUsed {
+		allResults, dirtyByCorpus, err = search(ctx, plans, paths, userQ, strictConfig)
+		if err != nil {
+			return err
+		}
+	}
+	if rerankEligible && !hybridUsed {
+		var score rerankScoreFunc
+		if execution.model != nil {
+			score = execution.model.scores
 		}
 		reranked, mergedDirty, rerankErr := tryRerankCorpora(
 			ctx,
@@ -233,13 +248,13 @@ func runWithRerankConfig(
 			paths,
 			config,
 			rerankPlan,
-			factory,
-			searchCorpora,
+			score,
+			search,
 		)
 		allResults = reranked
 		dirtyByCorpus = mergedDirty
 		if rerankErr != nil {
-			slog.Debug("Re-ranking failed; using BM25")
+			slog.Debug("Re-ranking failed; using BM25", "error", rerankErr)
 		}
 	}
 
@@ -273,15 +288,16 @@ func runWithRerankConfig(
 	return nil
 }
 
-func searchCorpora(
+func searchCorporaWithExecution(
 	ctx context.Context,
 	plans []corpusPlan,
 	paths *gitPaths,
 	userQ query.Q,
 	config searchConfig,
+	execution searchExecution,
 ) ([]corpusSearchResult, dirtyFilesByCorpus, error) {
 	worker := func(wctx context.Context, plan corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
-		return prepareAndSearchCorpus(wctx, plan, paths, userQ, config)
+		return prepareAndSearchCorpusWithExecution(wctx, plan, paths, userQ, config, execution)
 	}
 	return runCorpusPool(ctx, plans, worker)
 }
@@ -305,16 +321,17 @@ func useColor(f *os.File) bool {
 	return term.IsTerminal(int(f.Fd()))
 }
 
-func prepareAndSearchCorpus(
+func prepareAndSearchCorpusWithExecution(
 	ctx context.Context,
 	plan corpusPlan,
 	paths *gitPaths,
 	userQ query.Q,
 	config searchConfig,
+	execution searchExecution,
 ) ([]corpusSearchResult, dirtyFileSet, error) {
 	for attempt := 0; ; attempt++ {
 		// Keep changes to the selected scoped fallback for the repair step below.
-		results, dirty, err := prepareAndSearchCorpusOnce(ctx, &plan, paths, userQ, config)
+		results, dirty, err := prepareAndSearchCorpusOnceWithExecution(ctx, &plan, paths, userQ, config, execution)
 		if errors.Is(err, errGitIndexStateChanged) && plan.dirtyScope != nil && attempt < maxScopedLayerRefreshRetries {
 			slog.Debug("scoped git index changed during search; retrying", "root", plan.root, "attempt", attempt+1)
 			continue
@@ -334,12 +351,13 @@ func prepareAndSearchCorpus(
 	}
 }
 
-func prepareAndSearchCorpusOnce(
+func prepareAndSearchCorpusOnceWithExecution(
 	ctx context.Context,
 	planp *corpusPlan,
 	paths *gitPaths,
 	userQ query.Q,
 	config searchConfig,
+	execution searchExecution,
 ) ([]corpusSearchResult, dirtyFileSet, error) {
 	plan := *planp
 	// Each attempt selects its scoped fallback again. Do not reuse the selection
@@ -365,14 +383,14 @@ func prepareAndSearchCorpusOnce(
 		// searches; scope is applied at search time. ensureGitCorpusFresh may
 		// set plan.scoped* (the over-cap fallback) via the pointer, which the
 		// search/lock/validate/touch sites below then target.
-		state, readyState, err := ensureGitCorpusFresh(ctx, &plan, *planPaths)
+		state, readyState, err := ensureGitCorpusFreshWithExecution(ctx, &plan, *planPaths, execution)
 		if err != nil {
 			return nil, nil, err
 		}
 		indexState = readyState
 		dirtyFiles = dirtyFileSetFromState(state)
 	case corpusKindFolder:
-		readyState, err := ensureFolderCorpusFresh(ctx, plan)
+		readyState, err := ensureFolderCorpusFreshWithExecution(ctx, plan, execution)
 		if err != nil {
 			if errors.Is(err, errFolderCapExceeded) {
 				return nil, nil, err
@@ -468,12 +486,17 @@ func wrapCorpusResults(plan corpusPlan, files []zoekt.FileMatch) []corpusSearchR
 	return results
 }
 
-// ensureGitCorpusFresh makes the one combined whole-repo index current and, for
+// ensureGitCorpusFreshWithExecution makes the one combined whole-repo index current and, for
 // a scoped search whose whole repo is over the index caps, builds and selects
 // the per-scope over-cap fallback instead (so a huge tracked sibling cannot cap
 // a small scope). It mutates *plan to point search/lock/validate at the fallback
 // (plan.scopedStateHash != "") when that path is taken.
-func ensureGitCorpusFresh(ctx context.Context, plan *corpusPlan, paths gitPaths) (repoState, corpusIndexState, error) {
+func ensureGitCorpusFreshWithExecution(
+	ctx context.Context,
+	plan *corpusPlan,
+	paths gitPaths,
+	execution searchExecution,
+) (repoState, corpusIndexState, error) {
 	state, err := gitRepoStateIn(ctx, paths.RepoDir)
 	if err != nil {
 		return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, plan.indexDir, err)
@@ -485,10 +508,10 @@ func ensureGitCorpusFresh(ctx context.Context, plan *corpusPlan, paths gitPaths)
 	// scan and serve the per-scope fallback directly. A HEAD or cap-limit change
 	// invalidates the marker.
 	if plan.dirtyScope != nil && readGitCapMarker(plan.cacheDir) == gitCapMarkerValue(treeish) {
-		return ensureScopedGitCorpusFallback(ctx, plan, paths, state)
+		return ensureScopedGitCorpusFallback(ctx, plan, paths, state, execution)
 	}
 
-	indexState, err := ensureCombinedGitCorpus(ctx, *plan, paths, state)
+	indexState, err := ensureCombinedGitCorpusWithExecution(ctx, *plan, paths, state, execution)
 	if err != nil {
 		if errors.Is(err, errGitCapExceeded) && plan.dirtyScope != nil {
 			if errors.Is(err, errGitCommittedCapExceeded) {
@@ -505,7 +528,7 @@ func ensureGitCorpusFresh(ctx context.Context, plan *corpusPlan, paths gitPaths)
 				// combined corpus on the next search.
 				removeGitCapMarker(plan.cacheDir)
 			}
-			return ensureScopedGitCorpusFallback(ctx, plan, paths, state)
+			return ensureScopedGitCorpusFallback(ctx, plan, paths, state, execution)
 		}
 		return repoState{}, corpusSearchable, err
 	}
@@ -514,12 +537,20 @@ func ensureGitCorpusFresh(ctx context.Context, plan *corpusPlan, paths gitPaths)
 	return state, indexState, nil
 }
 
-// ensureCombinedGitCorpus refreshes the single combined committed and dirty
-// whole-repo index that serves scoped and unscoped searches. Cap failures are
-// always returned so a scoped caller can select its fallback. Other update
-// failures are returned when no shards exist; with published shards, the
-// function warns and leaves the prior generation searchable.
-func ensureCombinedGitCorpus(ctx context.Context, plan corpusPlan, paths gitPaths, state repoState) (corpusIndexState, error) {
+// ensureCombinedGitCorpusWithExecution refreshes the whole-repository index
+// that serves scoped and unscoped searches. Zoekt combines committed and dirty
+// files. When semantic search is enabled, a joined semantic generation describes
+// the captured commit. Cap failures are always returned so a scoped caller can
+// select its fallback. Other update failures are returned when no shards exist;
+// with published shards, the function warns and leaves the prior generation
+// searchable.
+func ensureCombinedGitCorpusWithExecution(
+	ctx context.Context,
+	plan corpusPlan,
+	paths gitPaths,
+	state repoState,
+	execution searchExecution,
+) (corpusIndexState, error) {
 	// Check for existing index state. If present, the cache directory
 	// exists and one-time setup (ensureUntrackedCache, ensureFSMonitor) was
 	// already applied. Skip MkdirAll + setup on the warm path.
@@ -533,6 +564,14 @@ func ensureCombinedGitCorpus(ctx context.Context, plan corpusPlan, paths gitPath
 	}
 
 	currentState := gitCorpusStateHash(paths, state)
+	semanticRequired := execution.policy.semanticEnabled() &&
+		execution.model != nil && state.HeadSHA != "no-head"
+	joinedReady := !semanticRequired || joinedGenerationMatches(
+		plan.cacheDir,
+		plan.indexDir,
+		currentState,
+		state.HeadSHA,
+	)
 	// Use one directory scan so all integrity checks describe the same state.
 	sc, scErr := scanFamilyOptional(plan.indexDir)
 	hasShards := scErr == nil && sc.hasShard() &&
@@ -543,9 +582,9 @@ func ensureCombinedGitCorpus(ctx context.Context, plan corpusPlan, paths gitPath
 	// shards may be torn; force the build path so recoverIncompleteSwap runs even
 	// when state otherwise looks current.
 	swapPending := readCacheFile(plan.cacheDir, swappingMarkerFile) != ""
-	needBuild := currentState != cachedState || !hasShards || swapPending || clearCommitted
+	needBuild := currentState != cachedState || !hasShards || swapPending || clearCommitted || !joinedReady
 	if !swapPending && !clearCommitted && cachedState == currentState && !hasShards &&
-		readEmptyStateFile(plan.cacheDir) == currentState {
+		readEmptyStateFile(plan.cacheDir) == currentState && joinedReady {
 		return corpusKnownEmpty, nil
 	}
 
@@ -559,7 +598,15 @@ func ensureCombinedGitCorpus(ctx context.Context, plan corpusPlan, paths gitPath
 		if err := os.MkdirAll(plan.indexDir, 0o755); err != nil {
 			return corpusSearchable, fmt.Errorf("create index directory: %w", err)
 		}
-		if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, currentState); err != nil {
+		if err := runIndexingWithCacheExecution(
+			ctx,
+			paths,
+			plan.cacheDir,
+			plan.indexDir,
+			state,
+			currentState,
+			execution,
+		); err != nil {
 			if errors.Is(err, errGitCapExceeded) {
 				return corpusSearchable, err
 			}
@@ -577,10 +624,17 @@ func ensureCombinedGitCorpus(ctx context.Context, plan corpusPlan, paths gitPath
 
 // ensureScopedGitCorpusFallback builds (and selects, via plan.scopedStateHash)
 // the over-cap fallback: one per-scope generation holding the in-scope
-// committed tree and dirty working files. The build lock serializes builders;
-// the publish lock covers only publication. The fallback is rebuilt whenever
-// HEAD, the scope, or the in-scope working tree changes.
-func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths gitPaths, state repoState) (repoState, corpusIndexState, error) {
+// committed tree and dirty working files. Default execution builds the scoped
+// committed Zoekt and semantic branches together. The build lock serializes
+// builders; the publish lock covers only publication. The fallback is rebuilt
+// whenever HEAD, the scope, or the in-scope working tree changes.
+func ensureScopedGitCorpusFallback(
+	ctx context.Context,
+	plan *corpusPlan,
+	paths gitPaths,
+	state repoState,
+	execution searchExecution,
+) (repoState, corpusIndexState, error) {
 	if plan.scopedCacheDir == "" || plan.scopedIndexDir == "" {
 		return repoState{}, corpusSearchable, fmt.Errorf("scoped git corpus missing fallback paths")
 	}
@@ -589,6 +643,9 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 	treeish := normalizeCommittedTreeish(state.HeadSHA)
 	scopedState := repoStateForDirtyScope(state, plan.dirtyScope)
 	currentState := scopedFallbackStateHash(paths, scopedState)
+	semanticRequired := execution.policy.semanticEnabled() &&
+		execution.model != nil && treeish != "no-head"
+	semanticPresent := semanticRequired && semanticGenerationPresent(indexDir, treeish)
 
 	if readStateFile(cacheDir) == "" {
 		ensureUntrackedCache(ctx, paths)
@@ -599,7 +656,13 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 	// leftover .swapping marker means a prior publish was interrupted and the
 	// family may be torn — skip the fast path so the build lock + recovery run.
 	if readCacheFile(cacheDir, swappingMarkerFile) == "" {
-		if st, ok := scopedFallbackCached(cacheDir, indexDir, currentState); ok {
+		if st, ok := scopedFallbackCached(cacheDir, indexDir, currentState); ok &&
+			(!semanticRequired || joinedGenerationMatches(
+				cacheDir,
+				indexDir,
+				currentState,
+				treeish,
+			)) {
 			plan.scopedStateHash = currentState
 			return state, st, nil
 		}
@@ -629,10 +692,32 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 
 	recoverIncompleteSwap(cacheDir, indexDir)
 
-	// Re-check under the build lock (another process may have built it).
+	// Re-check under the build lock. If only the joined descriptor is missing,
+	// bind the existing semantic generation without rebuilding either index.
 	if st, ok := scopedFallbackCached(cacheDir, indexDir, currentState); ok {
-		plan.scopedStateHash = currentState
-		return state, st, nil
+		if !semanticRequired || joinedGenerationMatches(cacheDir, indexDir, currentState, treeish) {
+			plan.scopedStateHash = currentState
+			return state, st, nil
+		}
+		semanticPresent = semanticGenerationPresent(indexDir, treeish)
+		if semanticPresent && st == corpusSearchable {
+			pub, publishErr := acquirePublishLock(ctx, cacheDir)
+			if publishErr != nil {
+				return repoState{}, corpusSearchable, publishErr
+			}
+			currentIndexState, stillCurrent := scopedFallbackCached(cacheDir, indexDir, currentState)
+			if stillCurrent {
+				removeJoinedGeneration(cacheDir)
+				activationErr := bindSemanticGeneration(cacheDir, indexDir, currentState, treeish)
+				releaseLock(pub)
+				if activationErr != nil {
+					slog.Debug("Semantic scoped index activation failed; keeping lexical search", "error", activationErr)
+				}
+				plan.scopedStateHash = currentState
+				return state, currentIndexState, nil
+			}
+			releaseLock(pub)
+		}
 	}
 
 	// Rebuild committed and uncommitted shard families in a temporary directory,
@@ -644,6 +729,10 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 	}
 	defer discardBuildDir(buildDir)
 
+	semanticBuilt := false
+	needSemantic := semanticRequired && !semanticPresent
+	semanticStaging := filepath.Join(buildDir, "semantic")
+	var lexicalErr, semanticErr error
 	if treeish != "no-head" {
 		snapshot, ok, err := captureGitSnapshot(ctx, paths.RepoDir, treeish)
 		if err != nil || !ok {
@@ -653,9 +742,49 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 			deleteStateFiles(cacheDir)
 			return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, indexDir, err)
 		}
-		if err := indexNativeGitFull(ctx, paths.RepoDir, buildDir, snapshot, plan.dirtyScope, indexParallelism()); err != nil {
+		lexicalBuild := func() {
+			lexicalErr = indexNativeGitFull(
+				ctx,
+				paths.RepoDir,
+				buildDir,
+				snapshot,
+				plan.dirtyScope,
+				execution.resources.cpuLimit(),
+			)
+		}
+		var semanticBuild func()
+		if needSemantic {
+			semanticBuild = func() {
+				semanticErr = runSemanticBuild(ctx, execution.model, func(embedder semanticModel) error {
+					_, err := buildSemanticGitGeneration(
+						ctx,
+						paths.RepoDir,
+						snapshot,
+						plan.dirtyScope,
+						semanticStaging,
+						treeish,
+						embedder,
+						execution.resources,
+					)
+					return err
+				})
+				semanticBuilt = semanticErr == nil
+			}
+		}
+		runJoinedIndexBuilds(lexicalBuild, semanticBuild)
+		if lexicalErr != nil {
 			deleteStateFiles(cacheDir)
-			return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, indexDir, err)
+			return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, indexDir, lexicalErr)
+		}
+		if semanticErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return repoState{}, corpusSearchable, ctxErr
+			}
+			slog.Debug(
+				"Semantic scoped index build failed; keeping lexical search",
+				"error",
+				semanticErr,
+			)
 		}
 	}
 
@@ -668,7 +797,7 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 			deleteStateFiles(cacheDir)
 			return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, indexDir, err)
 		}
-		if err := indexUncommitted(ctx, paths.RepoDir, buildDir, cacheDir, scopedState, "", currentState, indexParallelism()); err != nil {
+		if err := indexUncommitted(ctx, paths.RepoDir, buildDir, cacheDir, scopedState, "", currentState, execution.resources.cpuLimit()); err != nil {
 			deleteStateFiles(cacheDir)
 			return repoState{}, corpusSearchable, err
 		}
@@ -684,7 +813,34 @@ func ensureScopedGitCorpusFallback(ctx context.Context, plan *corpusPlan, paths 
 	// See publishGeneration for interrupted-swap recovery and the unlocked-read
 	// timeout.
 	if err := publishGeneration(ctx, cacheDir, indexDir, buildDir, familyAll, func() error {
-		return writeScopedFallbackState(cacheDir, treeish, currentState, !shardsExist(indexDir))
+		removeJoinedGeneration(cacheDir)
+		if err := writeScopedFallbackState(
+			cacheDir,
+			treeish,
+			currentState,
+			!shardsExist(indexDir),
+		); err != nil {
+			return err
+		}
+		if !semanticRequired {
+			return nil
+		}
+		var activationErr error
+		if semanticBuilt {
+			activationErr = publishAndBindSemanticGeneration(
+				cacheDir, indexDir, currentState, treeish, semanticStaging,
+			)
+		} else if semanticPresent {
+			activationErr = bindSemanticGeneration(cacheDir, indexDir, currentState, treeish)
+		}
+		if activationErr != nil {
+			slog.Debug(
+				"Semantic scoped index activation failed; keeping lexical search",
+				"error",
+				activationErr,
+			)
+		}
+		return nil
 	}); err != nil {
 		if errors.Is(err, errCorpusEvicted) {
 			return state, corpusSearchable, nil

@@ -21,6 +21,37 @@ type fixedRerankScorer struct {
 	documents *[]rerankDocument
 }
 
+func (*fixedRerankScorer) PackSemanticUnits(
+	_ context.Context,
+	units []semanticUnit,
+) ([]semanticUnit, error) {
+	return units, nil
+}
+
+func (*fixedRerankScorer) EmbedSemanticUnits(
+	context.Context,
+	[]semanticUnit,
+) ([]semanticUnitEmbedding, error) {
+	return nil, errRerankUnavailable
+}
+
+func (s *fixedRerankScorer) PrepareSemanticQuery(
+	_ context.Context,
+	query string,
+) (*semanticQueryEmbedding, error) {
+	return &semanticQueryEmbedding{modelQuery: query}, nil
+}
+
+func (s *fixedRerankScorer) ScoresWithSemanticQuery(
+	ctx context.Context,
+	query *semanticQueryEmbedding,
+	documents []rerankDocument,
+) ([]float32, error) {
+	return s.Scores(ctx, query.modelQuery, documents)
+}
+
+func (*fixedRerankScorer) SemanticCallCPUs(context.Context) int { return 1 }
+
 func (s *fixedRerankScorer) Scores(
 	_ context.Context,
 	_ string,
@@ -67,6 +98,45 @@ func TestPlanRerankQuery(t *testing.T) {
 		if term.Pattern != want[i] || !term.Content || term.FileName {
 			t.Fatalf("child %d=%+v", i, term)
 		}
+	}
+}
+
+func TestPlanRerankQueryAcceptsPlainProgrammingName(t *testing.T) {
+	for _, pattern := range []string{
+		"how from_json populates a custom C++ type from JSON",
+		"how operator[] and at() access and create nested JSON values",
+		"find std::vector handling in C++ code",
+	} {
+		t.Run(pattern, func(t *testing.T) {
+			raw, _, err := parseSearchQueryForms(pattern)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, ok := planRerankQuery(pattern, raw)
+			if !ok {
+				t.Fatal("plain description with a programming name must be eligible")
+			}
+			if plan.modelQuery != pattern {
+				t.Fatalf("model query=%q, want %q", plan.modelQuery, pattern)
+			}
+		})
+	}
+}
+
+func TestPlainDescriptionFallbackRejectsExplicitSyntax(t *testing.T) {
+	for _, pattern := range []string{
+		"find C++ file:[",
+		"find C++ [broken",
+		"find C++ (broken",
+		"find C++ OR handler",
+		"find C++ -handler",
+		"find C++ foo**",
+	} {
+		t.Run(pattern, func(t *testing.T) {
+			if _, _, err := parseSearchQueryForms(pattern); err == nil {
+				t.Fatal("malformed explicit syntax must stay an error")
+			}
+		})
 	}
 }
 
@@ -190,9 +260,7 @@ func TestTryRerankCorporaCandidateErrorKeepsStrictResults(t *testing.T) {
 		nil,
 		searchConfig{contextFileLimit: 1},
 		rerankQueryPlan{modelQuery: "alpha beta", relaxedQ: relaxedQ},
-		func(context.Context) (rerankScorer, error) {
-			return &fixedRerankScorer{}, nil
-		},
+		(&fixedRerankScorer{}).Scores,
 		search,
 	)
 	if !errors.Is(err, wantErr) {
@@ -236,7 +304,7 @@ func TestTryRerankCorporaMissingBackendSkipsCandidateSearch(t *testing.T) {
 	assertRerankFallbackHidesModelContext(t, got, strict)
 }
 
-func TestTryRerankCorporaScorerErrorClosesAndKeepsStrictResults(t *testing.T) {
+func TestTryRerankCorporaScorerErrorKeepsStrictResults(t *testing.T) {
 	strict := []corpusSearchResult{rerankTestResultWithModelContext("strict.go", 10)}
 	strictDirty := dirtyFilesByCorpus{"repo": testDirtyFileSet("dirty.go")}
 	relaxed := []corpusSearchResult{
@@ -244,7 +312,6 @@ func TestTryRerankCorporaScorerErrorClosesAndKeepsStrictResults(t *testing.T) {
 		rerankTestResult("beta.go", 1),
 	}
 	wantErr := errors.New("score failure")
-	closed := false
 
 	got, gotDirty, err := tryRerankCorpora(
 		context.Background(),
@@ -254,9 +321,7 @@ func TestTryRerankCorporaScorerErrorClosesAndKeepsStrictResults(t *testing.T) {
 		nil,
 		searchConfig{},
 		rerankQueryPlan{modelQuery: "alpha beta", relaxedQ: &query.Or{}},
-		func(context.Context) (rerankScorer, error) {
-			return &fixedRerankScorer{err: wantErr, closed: &closed}, nil
-		},
+		(&fixedRerankScorer{err: wantErr}).Scores,
 		func(
 			context.Context,
 			[]corpusPlan,
@@ -267,8 +332,8 @@ func TestTryRerankCorporaScorerErrorClosesAndKeepsStrictResults(t *testing.T) {
 			return relaxed, nil, nil
 		},
 	)
-	if !errors.Is(err, wantErr) || !closed {
-		t.Fatalf("scorer failure: error=%v closed=%t", err, closed)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("scorer failure: error=%v", err)
 	}
 	if !reflect.DeepEqual(gotDirty, strictDirty) {
 		t.Fatalf("scorer fallback changed strict results: results=%#v dirty=%#v", got, gotDirty)
@@ -288,10 +353,7 @@ func TestRerankCorpusResultsPromotesORCandidateAndAppendsStrictTail(t *testing.T
 		relaxed[0],
 		rerankTestResult("strict-only.go", 90),
 	}
-	closed := false
-	newScorer := func(context.Context) (rerankScorer, error) {
-		return &fixedRerankScorer{scores: scores, closed: &closed}, nil
-	}
+	scorer := &fixedRerankScorer{scores: scores}
 
 	got, _, err := rerankCorpusResults(
 		context.Background(),
@@ -300,13 +362,10 @@ func TestRerankCorpusResultsPromotesORCandidateAndAppendsStrictTail(t *testing.T
 		relaxed,
 		nil,
 		"alpha beta",
-		newScorer,
+		scorer.Scores,
 	)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if !closed {
-		t.Fatal("scorer was not closed")
 	}
 	if got[0].file.FileName != relaxed[1].file.FileName {
 		t.Fatalf("first=%q, want promoted OR rank 2 %q", got[0].file.FileName, relaxed[1].file.FileName)
@@ -428,12 +487,10 @@ func TestRerankCorpusResultsScoresStrictLeaderAndKeepsDisplacedRelaxedTail(t *te
 		relaxed,
 		nil,
 		"alpha beta",
-		func(context.Context) (rerankScorer, error) {
-			return &fixedRerankScorer{
-				scores:    make([]float32, rerankCandidateLimit),
-				documents: &documents,
-			}, nil
-		},
+		(&fixedRerankScorer{
+			scores:    make([]float32, rerankCandidateLimit),
+			documents: &documents,
+		}).Scores,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -486,9 +543,7 @@ func TestRerankCorpusResultsRejectsInvalidScores(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			_, _, err := rerankCorpusResults(
 				context.Background(), nil, nil, relaxed, nil, "a b",
-				func(context.Context) (rerankScorer, error) {
-					return &fixedRerankScorer{scores: tc.scores}, nil
-				},
+				(&fixedRerankScorer{scores: tc.scores}).Scores,
 			)
 			if err == nil {
 				t.Fatal("invalid scores must fail")
@@ -694,9 +749,7 @@ func TestRerankCorpusResultsKeepsDirtyAndMultiCorpusIdentity(t *testing.T) {
 		[]corpusSearchResult{committed, uncommitted, other, second},
 		relaxedDirty,
 		"alpha beta",
-		func(context.Context) (rerankScorer, error) {
-			return &fixedRerankScorer{scores: []float32{3, 2, 1}}, nil
-		},
+		(&fixedRerankScorer{scores: []float32{3, 2, 1}}).Scores,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -749,9 +802,9 @@ func TestRunRerankK01FallbackContracts(t *testing.T) {
 	writeFileAt(t, folder, "strict.go", "package strict\n// alpha beta\n")
 	writeFileAt(t, folder, "relaxed.go", "package relaxed\n// alpha\n")
 
-	runQuery := func(pattern string, rerankConfig rerankRunConfig) (string, error) {
+	runQuery := func(pattern string, rerankConfig searchRunConfig) (string, error) {
 		return captureStdout(t, func() error {
-			return runWithRerankConfig(
+			return runSearchCommand(
 				context.Background(),
 				pattern,
 				[]string{folder},
@@ -780,8 +833,8 @@ func TestRunRerankK01FallbackContracts(t *testing.T) {
 	}
 
 	factoryCalls := 0
-	disabled, err := runQuery("alpha beta", rerankRunConfig{
-		newScorer: func(context.Context) (rerankScorer, error) {
+	disabled, err := runQuery("alpha beta", searchRunConfig{
+		newModel: func(context.Context) (semanticModel, error) {
 			factoryCalls++
 			return nil, errors.New("must not start")
 		},
@@ -790,27 +843,29 @@ func TestRunRerankK01FallbackContracts(t *testing.T) {
 		t.Fatalf("disabled path: error=%v calls=%d\nwant=%q\ngot=%q", err, factoryCalls, baseline, disabled)
 	}
 
-	protectedBaseline, err := runQuery(`"alpha beta"`, rerankRunConfig{})
+	protectedBaseline, err := runQuery(`"alpha beta"`, searchRunConfig{})
 	if err != nil {
 		t.Fatalf("protected baseline: %v", err)
 	}
 	if protectedBaseline != expected {
 		t.Fatalf("protected output changed:\nwant=%q\ngot=%q", expected, protectedBaseline)
 	}
-	protected, err := runQuery(`"alpha beta"`, rerankRunConfig{
-		enabled: true,
-		newScorer: func(context.Context) (rerankScorer, error) {
+	protected, err := runQuery(`"alpha beta"`, searchRunConfig{
+		policy: defaultSearchPolicy(),
+		newModel: func(context.Context) (semanticModel, error) {
 			factoryCalls++
 			return nil, errors.New("must not start")
 		},
 	})
-	if err != nil || protected != protectedBaseline || factoryCalls != 0 {
+	wantIndexCalls := 1
+	if err != nil || protected != protectedBaseline || factoryCalls != wantIndexCalls {
 		t.Fatalf("protected path: error=%v calls=%d\nwant=%q\ngot=%q", err, factoryCalls, protectedBaseline, protected)
 	}
 
-	backendFailure, err := runQuery("alpha beta", rerankRunConfig{
-		enabled: true,
-		newScorer: func(context.Context) (rerankScorer, error) {
+	factoryCalls = 0
+	backendFailure, err := runQuery("alpha beta", searchRunConfig{
+		policy: defaultSearchPolicy(),
+		newModel: func(context.Context) (semanticModel, error) {
 			factoryCalls++
 			return nil, errors.New("backend failure")
 		},
@@ -830,16 +885,16 @@ func TestRunRerankClosesPreparedScorerWhenPoolIsTooSmall(t *testing.T) {
 	factoryCalls := 0
 	closed := false
 	output, err := captureStdout(t, func() error {
-		return runWithRerankConfig(
+		return runSearchCommand(
 			context.Background(),
 			"alpha beta",
 			[]string{folder},
 			0,
 			0,
 			defaultSearchConfig(),
-			rerankRunConfig{
-				enabled: true,
-				newScorer: func(context.Context) (rerankScorer, error) {
+			searchRunConfig{
+				policy: defaultSearchPolicy(),
+				newModel: func(context.Context) (semanticModel, error) {
 					factoryCalls++
 					return &fixedRerankScorer{closed: &closed}, nil
 				},
@@ -857,7 +912,7 @@ func TestRunRerankClosesPreparedScorerWhenPoolIsTooSmall(t *testing.T) {
 	}
 }
 
-func TestRunRerankClosesPreparedScorerWhenCorpusPlanningFails(t *testing.T) {
+func TestRunRerankDoesNotStartScorerWhenCorpusPlanningFails(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
 	t.Chdir(t.TempDir())
@@ -865,16 +920,16 @@ func TestRunRerankClosesPreparedScorerWhenCorpusPlanningFails(t *testing.T) {
 
 	factoryCalls := 0
 	closed := false
-	err := runWithRerankConfig(
+	err := runSearchCommand(
 		context.Background(),
 		"alpha beta",
 		[]string{missing},
 		0,
 		0,
 		defaultSearchConfig(),
-		rerankRunConfig{
-			enabled: true,
-			newScorer: func(context.Context) (rerankScorer, error) {
+		searchRunConfig{
+			policy: defaultSearchPolicy(),
+			newModel: func(context.Context) (semanticModel, error) {
 				factoryCalls++
 				return &fixedRerankScorer{closed: &closed}, nil
 			},
@@ -883,8 +938,8 @@ func TestRunRerankClosesPreparedScorerWhenCorpusPlanningFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("missing corpus must fail")
 	}
-	if factoryCalls != 1 || !closed {
-		t.Fatalf("prepared scorer: calls=%d closed=%t error=%v", factoryCalls, closed, err)
+	if factoryCalls != 0 || closed {
+		t.Fatalf("scorer started before planning: calls=%d closed=%t error=%v", factoryCalls, closed, err)
 	}
 }
 
@@ -914,23 +969,24 @@ func TestRunRerankUnsupportedQueriesStayByteIdentical(t *testing.T) {
 			})
 			factoryCalls := 0
 			got, gotErr := captureStdout(t, func() error {
-				return runWithRerankConfig(
+				return runSearchCommand(
 					context.Background(),
 					pattern,
 					[]string{folder},
 					0,
 					0,
 					defaultSearchConfig(),
-					rerankRunConfig{
-						enabled: true,
-						newScorer: func(context.Context) (rerankScorer, error) {
+					searchRunConfig{
+						policy: defaultSearchPolicy(),
+						newModel: func(context.Context) (semanticModel, error) {
 							factoryCalls++
 							return nil, errors.New("must not start")
 						},
 					},
 				)
 			})
-			if baseline != got || factoryCalls != 0 ||
+			wantIndexCalls := 1
+			if baseline != got || factoryCalls != wantIndexCalls ||
 				(baselineErr == nil) != (gotErr == nil) ||
 				(baselineErr != nil && baselineErr.Error() != gotErr.Error()) {
 				t.Fatalf(
@@ -957,16 +1013,16 @@ func TestRunRerankWithDirtyFilesAcrossCorpora(t *testing.T) {
 
 	var documents []rerankDocument
 	output, err := captureStdout(t, func() error {
-		return runWithRerankConfig(
+		return runSearchCommand(
 			context.Background(),
 			"alpha beta",
 			[]string{repoOne, repoTwo},
 			0,
 			0,
 			defaultSearchConfig(),
-			rerankRunConfig{
-				enabled: true,
-				newScorer: func(context.Context) (rerankScorer, error) {
+			searchRunConfig{
+				policy: defaultSearchPolicy(),
+				newModel: func(context.Context) (semanticModel, error) {
 					return &fixedRerankScorer{documents: &documents}, nil
 				},
 			},
@@ -1023,16 +1079,16 @@ func TestRunRerankModelContextStaysOutOfDisplay(t *testing.T) {
 
 	var documents []rerankDocument
 	output, err := captureStdout(t, func() error {
-		return runWithRerankConfig(
+		return runSearchCommand(
 			context.Background(),
 			"alpha beta",
 			[]string{folder},
 			0,
 			0,
 			explicitSearchConfig(0, false),
-			rerankRunConfig{
-				enabled: true,
-				newScorer: func(context.Context) (rerankScorer, error) {
+			searchRunConfig{
+				policy: defaultSearchPolicy(),
+				newModel: func(context.Context) (semanticModel, error) {
 					return &fixedRerankScorer{documents: &documents}, nil
 				},
 			},
@@ -1077,16 +1133,16 @@ func TestRunRerankFailureKeepsModelContextOutOfDisplay(t *testing.T) {
 
 	var documents []rerankDocument
 	output, err := captureStdout(t, func() error {
-		return runWithRerankConfig(
+		return runSearchCommand(
 			context.Background(),
 			"alpha beta",
 			[]string{folder},
 			0,
 			0,
 			explicitSearchConfig(0, false),
-			rerankRunConfig{
-				enabled: true,
-				newScorer: func(context.Context) (rerankScorer, error) {
+			searchRunConfig{
+				policy: defaultSearchPolicy(),
+				newModel: func(context.Context) (semanticModel, error) {
 					return &fixedRerankScorer{
 						err:       errors.New("score failure"),
 						documents: &documents,

@@ -44,16 +44,11 @@ type rerankDocument struct {
 	matchEnd int
 }
 
-type rerankScorer interface {
-	Scores(ctx context.Context, query string, documents []rerankDocument) ([]float32, error)
-	Close() error
-}
+type rerankScoreFunc func(context.Context, string, []rerankDocument) ([]float32, error)
 
-type rerankScorerFactory func(ctx context.Context) (rerankScorer, error)
-
-type rerankRunConfig struct {
-	enabled   bool
-	newScorer rerankScorerFactory
+type searchRunConfig struct {
+	policy   searchPolicy
+	newModel semanticModelFactory
 }
 
 type rerankSearchFunc func(
@@ -67,6 +62,11 @@ type rerankSearchFunc func(
 type rerankCandidate struct {
 	result      corpusSearchResult
 	lexicalRank int
+	document    rerankDocument
+	// hasDocument is true when the semantic branch supplied the exact checked
+	// source unit that selected this file. Otherwise the lexical match supplies
+	// the final-score input.
+	hasDocument bool
 	// preservedStrictLeader is true when the strict leader was absent from
 	// the relaxed candidate set and was added as a separate candidate.
 	preservedStrictLeader bool
@@ -141,10 +141,10 @@ func tryRerankCorpora(
 	paths *gitPaths,
 	config searchConfig,
 	plan rerankQueryPlan,
-	newScorer rerankScorerFactory,
+	score rerankScoreFunc,
 	search rerankSearchFunc,
 ) ([]corpusSearchResult, dirtyFilesByCorpus, error) {
-	if newScorer == nil {
+	if score == nil {
 		return applyRerankDisplayConfig(strictResults, config), strictDirty, errRerankUnavailable
 	}
 	relaxedResults, relaxedDirty, err := search(
@@ -166,7 +166,7 @@ func tryRerankCorpora(
 		relaxedResults,
 		relaxedDirty,
 		plan.modelQuery,
-		newScorer,
+		score,
 	)
 	if err != nil {
 		return applyRerankDisplayConfig(strictResults, config), strictDirty, err
@@ -185,7 +185,7 @@ func rerankCorpusResults(
 	relaxedResults []corpusSearchResult,
 	relaxedDirty dirtyFilesByCorpus,
 	modelQuery string,
-	newScorer rerankScorerFactory,
+	score rerankScoreFunc,
 ) ([]corpusSearchResult, dirtyFilesByCorpus, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
@@ -200,29 +200,43 @@ func rerankCorpusResults(
 	if len(candidates) < 2 {
 		return nil, nil, errRerankNotUseful
 	}
-	if newScorer == nil {
+	if score == nil {
 		return nil, nil, errRerankUnavailable
 	}
 
-	documents := make([]rerankDocument, len(candidates))
-	for i := range candidates {
-		documents[i] = newRerankDocument(candidates[i].result)
-	}
+	documents := rerankCandidateDocuments(candidates)
 
-	scorer, err := newScorer(ctx)
+	scores, err := score(ctx, modelQuery, documents)
 	if err != nil {
 		return nil, nil, err
 	}
-	scores, scoreErr := scorer.Scores(ctx, modelQuery, documents)
-	closeErr := scorer.Close()
-	if scoreErr != nil {
-		return nil, nil, scoreErr
+	out, err := fuseRerankCandidates(candidates, scores, strictRanked, relaxedRanked)
+	if err != nil {
+		return nil, nil, err
 	}
-	if closeErr != nil {
-		return nil, nil, closeErr
+	return out, mergeDirtyFilesByCorpus(strictDirty, relaxedDirty), nil
+}
+
+func rerankCandidateDocuments(candidates []rerankCandidate) []rerankDocument {
+	documents := make([]rerankDocument, len(candidates))
+	for index, candidate := range candidates {
+		if candidate.hasDocument {
+			documents[index] = candidate.document
+			continue
+		}
+		documents[index] = newRerankDocument(candidate.result)
 	}
+	return documents
+}
+
+func fuseRerankCandidates(
+	candidates []rerankCandidate,
+	scores []float32,
+	strictRanked []corpusSearchResult,
+	relaxedRanked []corpusSearchResult,
+) ([]corpusSearchResult, error) {
 	if len(scores) != len(candidates) {
-		return nil, nil, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"invalid semantic score count: got %d, want %d",
 			len(scores),
 			len(candidates),
@@ -230,13 +244,13 @@ func rerankCorpusResults(
 	}
 	for _, score := range scores {
 		if math.IsNaN(float64(score)) || math.IsInf(float64(score), 0) {
-			return nil, nil, fmt.Errorf("invalid semantic score")
+			return nil, fmt.Errorf("invalid semantic score")
 		}
 	}
 
 	semanticOrder := make([]int, len(scores))
-	for i := range semanticOrder {
-		semanticOrder[i] = i
+	for index := range semanticOrder {
+		semanticOrder[index] = index
 	}
 	sort.SliceStable(semanticOrder, func(i, j int) bool {
 		return scores[semanticOrder[i]] > scores[semanticOrder[j]]
@@ -251,13 +265,12 @@ func rerankCorpusResults(
 		preservedStrictLeader bool
 	}
 	fused := make([]fusedCandidate, len(candidates))
-	for i, candidate := range candidates {
-		semanticRank := semanticRanks[i]
-		fused[i] = fusedCandidate{
+	for index, candidate := range candidates {
+		fused[index] = fusedCandidate{
 			result:                candidate.result,
 			preservedStrictLeader: candidate.preservedStrictLeader,
 			score: rerankLexicalWeight/(rerankRRFConstant+float64(candidate.lexicalRank)) +
-				1/(rerankRRFConstant+float64(semanticRank)),
+				1/(rerankRRFConstant+float64(semanticRanks[index])),
 		}
 	}
 	sort.SliceStable(fused, func(i, j int) bool {
@@ -267,40 +280,33 @@ func rerankCorpusResults(
 	// not replace the best result selected from both relaxed and semantic
 	// evidence. It can still rank second or rise naturally when it was already
 	// part of the relaxed candidate set.
-	if fused[0].preservedStrictLeader {
+	if len(fused) > 1 && fused[0].preservedStrictLeader {
 		fused[0], fused[1] = fused[1], fused[0]
 	}
 
 	out := make([]corpusSearchResult, 0, len(fused)+len(strictRanked))
 	seen := make(map[corpusResultKey]struct{}, len(fused)+len(strictRanked))
-	for _, candidate := range fused {
-		result := candidate.result
+	add := func(result corpusSearchResult) {
+		key := corpusResultKey{corpusID: result.corpusID, fileName: result.file.FileName}
+		if _, ok := seen[key]; ok {
+			return
+		}
 		result.rankOverride = len(out) + 1
 		out = append(out, result)
-		seen[corpusResultKey{corpusID: result.corpusID, fileName: result.file.FileName}] = struct{}{}
+		seen[key] = struct{}{}
+	}
+	for _, candidate := range fused {
+		add(candidate.result)
 	}
 	// A strict-only leader can displace the last relaxed candidate from a full
 	// model set. Keep any such file in the final result set as an unscored tail.
 	for _, result := range relaxedRanked {
-		key := corpusResultKey{corpusID: result.corpusID, fileName: result.file.FileName}
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		result.rankOverride = len(out) + 1
-		out = append(out, result)
-		seen[key] = struct{}{}
+		add(result)
 	}
 	for _, result := range strictRanked {
-		key := corpusResultKey{corpusID: result.corpusID, fileName: result.file.FileName}
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		result.rankOverride = len(out) + 1
-		out = append(out, result)
-		seen[key] = struct{}{}
+		add(result)
 	}
-
-	return out, mergeDirtyFilesByCorpus(strictDirty, relaxedDirty), nil
+	return out, nil
 }
 
 // buildRerankCandidates adds strict BM25 rank one when present, then fills the
