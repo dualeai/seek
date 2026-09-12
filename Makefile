@@ -87,6 +87,7 @@ JUNIT_XML ?= junit.xml
 COVERPROFILE ?= cover.out
 BENCH_COUNT ?= 10
 BENCH_REPO_COUNT ?= 3
+SEMANTIC_BENCH_SAMPLES ?= 10
 
 test-unit: tokenizer-native test-plugin
 	gotestsum --junitfile $(JUNIT_XML) -- ./... -v -race -timeout 18m -covermode=atomic -coverprofile=$(COVERPROFILE)
@@ -98,6 +99,12 @@ test-bench: build
 test-bench-repo: tokenizer-native
 	@if [ -z "$(SEEK_BENCH_REPO)" ]; then echo "Usage: make test-bench-repo SEEK_BENCH_REPO=/path/to/repo"; exit 1; fi
 	SEEK_BENCH_REPO="$(SEEK_BENCH_REPO)" go test ./cmd/seek/ -run='^$$' -bench=BenchmarkLargeRepo -benchmem -count=$(BENCH_REPO_COUNT) -timeout=600s
+
+# Run the retained production-binary cold-build gates on one pinned checkout.
+test-bench-semantic: build
+	@if [ -z "$(SEEK_BENCH_REPO)" ]; then echo "Usage: make test-bench-semantic SEEK_BENCH_REPO=/path/to/pinned-kubernetes"; exit 1; fi
+	SEEK_BIN="$(abspath $(OUTPUT))" SEEK_BENCH_REPO="$(SEEK_BENCH_REPO)" SEEK_BENCH_HEAD="$(SEEK_BENCH_HEAD)" \
+		uv run --script ./cicd/bench-semantic.py --samples $(SEMANTIC_BENCH_SAMPLES)
 
 # Make a local diagnostic comparison with golang.org/x/perf/cmd/benchstat.
 # Workflow:
@@ -117,4 +124,4 @@ lint: tokenizer-native
 release:
 	bash ./cicd/release.sh
 
-.PHONY: install upgrade search-assets-upgrade rerank-assets-upgrade tokenizer-native build package test test-static test-plugin test-unit test-bench test-bench-repo test-bench-compare lint release
+.PHONY: install upgrade search-assets-upgrade rerank-assets-upgrade tokenizer-native build package test test-static test-plugin test-unit test-bench test-bench-repo test-bench-semantic test-bench-compare lint release
