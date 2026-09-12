@@ -1,7 +1,7 @@
 {
   "target": "darwin-arm64",
   "file_name": "libonnxruntime.dylib",
-  "version": "1.29.0",
-  "bytes": 43184400,
-  "sha256": "68f6e54e695583adc371aef610ec4abb1ffaa3df656582922de7690f7e2000eb"
+  "version": "1.30.0",
+  "bytes": 43879424,
+  "sha256": "bcc9110f9d638a119de2db7afb3ba9a1da8085f0cb3401e1c48ae1caf450b6fa"
 }

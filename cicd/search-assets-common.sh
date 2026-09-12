@@ -5,7 +5,7 @@
 asset_script_name=$(basename "$0")
 
 search_assets_ort_version() {
-	echo "1.29.0"
+	echo "1.30.0"
 }
 
 fail() {

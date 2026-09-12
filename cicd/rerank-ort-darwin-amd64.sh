@@ -15,7 +15,7 @@ internal_root="${cache_root}/internal"
 
 # This commit must be the release commit for ort_version. Update both values
 # together so the locally built resource matches the other platform resources.
-ort_commit=2e2543fbe9fae542f921d47a72d21d5a4ef0b710
+ort_commit=f2c39fe2f838cf35ce7da92824f5a5e3ee6e88a7
 ort_source_url="https://github.com/microsoft/onnxruntime/archive/${ort_commit}.tar.gz"
 ort_source_archive="${source_root}/onnxruntime-${ort_commit}.tar.gz"
 ort_source_dir="${source_root}/onnxruntime-${ort_commit}"

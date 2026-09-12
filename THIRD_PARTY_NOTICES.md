@@ -22,13 +22,13 @@ converts its floating-point weights to FP16. The conversion source is
 
 The full Apache-2.0 terms are in Seek's `LICENSE` file.
 
-## ONNX Runtime 1.29.0
+## ONNX Runtime 1.30.0
 
-- Source: <https://github.com/microsoft/onnxruntime/tree/v1.29.0>
+- Source: <https://github.com/microsoft/onnxruntime/tree/v1.30.0>
 - Included resources: native runtime libraries for the four release targets
 - License: MIT
 - Included upstream notices: [ONNXRUNTIME_THIRD_PARTY_NOTICES.txt](ONNXRUNTIME_THIRD_PARTY_NOTICES.txt)
-- Notice source: <https://github.com/microsoft/onnxruntime/blob/v1.29.0/ThirdPartyNotices.txt>
+- Notice source: <https://github.com/microsoft/onnxruntime/blob/v1.30.0/ThirdPartyNotices.txt>
 
 Copyright (c) Microsoft Corporation
 

@@ -656,7 +656,7 @@ to it.
 `make search-assets-upgrade` is a manual maintainer command. It downloads the
 model, tokenizer, native tokenizer archives, USearch libraries, and official
 ONNX Runtime packages at fixed revisions. Microsoft does not publish an ONNX
-Runtime 1.29.0 macOS amd64 package, so the command builds that library from the
+Runtime 1.30.0 macOS amd64 package, so the command builds that library from the
 fixed source commit when its versioned cache entry is absent.
 
 The command needs macOS, `curl`, `zstd`, `unzip`, `uv`, CMake, Ninja, and the

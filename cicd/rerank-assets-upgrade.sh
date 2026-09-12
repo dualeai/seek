@@ -33,6 +33,7 @@ usearch_linux_arm64_url="${usearch_release}/usearch_linux_arm64_${usearch_versio
 ort_darwin_arm64_url="https://github.com/microsoft/onnxruntime/releases/download/v${ort_version}/onnxruntime-osx-arm64-${ort_version}.tgz"
 ort_linux_amd64_url="https://github.com/microsoft/onnxruntime/releases/download/v${ort_version}/onnxruntime-linux-x64-${ort_version}.tgz"
 ort_linux_arm64_url="https://github.com/microsoft/onnxruntime/releases/download/v${ort_version}/onnxruntime-linux-aarch64-${ort_version}.tgz"
+ort_notices_url="https://raw.githubusercontent.com/microsoft/onnxruntime/v${ort_version}/ThirdPartyNotices.txt"
 
 for command_name in awk cmp curl tar unzip uv wc zstd; do
 	command -v "${command_name}" >/dev/null 2>&1 || fail "missing command: ${command_name}"
@@ -64,7 +65,7 @@ package_asset() {
 	replace_if_changed "${label}" "${temporary}" "${destination}" 0644
 }
 
-track_release_archive() {
+track_file() {
 	local label=$1
 	local source=$2
 	local destination=$3
@@ -124,6 +125,7 @@ ort_darwin_amd64_source="${cache_root}/internal/onnxruntime-osx-x64-${ort_versio
 ort_darwin_arm64_archive="${source_dir}/onnxruntime-osx-arm64-${ort_version}.tgz"
 ort_linux_amd64_archive="${source_dir}/onnxruntime-linux-x64-${ort_version}.tgz"
 ort_linux_arm64_archive="${source_dir}/onnxruntime-linux-aarch64-${ort_version}.tgz"
+ort_notices_source="${source_dir}/onnxruntime-${ort_version}-ThirdPartyNotices.txt"
 ort_darwin_arm64_source="${work_dir}/libonnxruntime-darwin-arm64-${ort_version}.dylib"
 ort_linux_amd64_source="${work_dir}/libonnxruntime-linux-amd64-${ort_version}.so"
 ort_linux_arm64_source="${work_dir}/libonnxruntime-linux-arm64-${ort_version}.so"
@@ -146,6 +148,8 @@ download "ONNX Runtime linux-amd64 archive" "${ort_linux_amd64_url}" \
 	"${ort_linux_amd64_archive}"
 download "ONNX Runtime linux-arm64 archive" "${ort_linux_arm64_url}" \
 	"${ort_linux_arm64_archive}"
+download "ONNX Runtime third-party notices" "${ort_notices_url}" \
+	"${ort_notices_source}"
 download "tokenizers darwin-amd64 archive" "${tokenizers_darwin_amd64_url}" \
 	"${tokenizers_darwin_amd64_archive}"
 download "tokenizers darwin-arm64 archive" "${tokenizers_darwin_arm64_url}" \
@@ -219,19 +223,21 @@ package_asset "tracked USearch linux-amd64" "${usearch_linux_amd64_source}" \
 	"${repo_root}/cmd/seek/semantic_assets_linux_amd64/libusearch_c.so.zst"
 package_asset "tracked USearch linux-arm64" "${usearch_linux_arm64_source}" \
 	"${repo_root}/cmd/seek/semantic_assets_linux_arm64/libusearch_c.so.zst"
+track_file "tracked ONNX Runtime third-party notices" \
+	"${ort_notices_source}" "${repo_root}/ONNXRUNTIME_THIRD_PARTY_NOTICES.txt"
 
 # Keep the upstream release archives unchanged. Make extracts the current
 # target before Go links the native tokenizer into Seek.
-track_release_archive "tracked tokenizers darwin-amd64 archive" \
+track_file "tracked tokenizers darwin-amd64 archive" \
 	"${tokenizers_darwin_amd64_archive}" \
 	"${repo_root}/cmd/seek/rerank_tokenizer_assets_darwin_amd64/libtokenizers.tar.gz"
-track_release_archive "tracked tokenizers darwin-arm64 archive" \
+track_file "tracked tokenizers darwin-arm64 archive" \
 	"${tokenizers_darwin_arm64_archive}" \
 	"${repo_root}/cmd/seek/rerank_tokenizer_assets_darwin_arm64/libtokenizers.tar.gz"
-track_release_archive "tracked tokenizers linux-amd64 archive" \
+track_file "tracked tokenizers linux-amd64 archive" \
 	"${tokenizers_linux_amd64_archive}" \
 	"${repo_root}/cmd/seek/rerank_tokenizer_assets_linux_amd64/libtokenizers.tar.gz"
-track_release_archive "tracked tokenizers linux-arm64 archive" \
+track_file "tracked tokenizers linux-arm64 archive" \
 	"${tokenizers_linux_arm64_archive}" \
 	"${repo_root}/cmd/seek/rerank_tokenizer_assets_linux_arm64/libtokenizers.tar.gz"
 
