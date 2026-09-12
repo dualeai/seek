@@ -479,6 +479,7 @@ func TestLateOnRuntimeExtractHelper(t *testing.T) {
 }
 
 func TestLateOnInferenceMatchesReferenceScores(t *testing.T) {
+	skipLateOnReferenceScoreKnownIssue(t)
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
 	scorer, err := newLateOnSemanticModel(context.Background())
 	if err != nil {
@@ -536,6 +537,23 @@ func TestLateOnInferenceMatchesReferenceScores(t *testing.T) {
 		if i > 0 && scores[i-1] <= scores[i] {
 			t.Errorf("rank order = %v, want document order", scores)
 		}
+	}
+}
+
+func skipLateOnReferenceScoreKnownIssue(t *testing.T) {
+	t.Helper()
+	// ONNX Runtime CoreML returns incorrect FP16 scores on macOS 15 ARM64.
+	// TODO: Remove this skip after ONNX Runtime fixes
+	// https://github.com/microsoft/onnxruntime/issues/32569.
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		return
+	}
+	version, err := exec.Command("sw_vers", "-productVersion").Output()
+	if err != nil {
+		return
+	}
+	if strings.HasPrefix(strings.TrimSpace(string(version)), "15.") {
+		t.Skip("macOS 15 ARM64 Core ML score parity: https://github.com/microsoft/onnxruntime/issues/32569")
 	}
 }
 
