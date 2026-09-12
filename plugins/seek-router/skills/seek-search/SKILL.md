@@ -1,6 +1,6 @@
 ---
 name: seek-search
-description: Search code with seek, a local BM25 search with optional code re-ranking and ctags symbols. Use it for ranked navigation of definitions, callers, configuration, and unfamiliar code. Use an exhaustive tool for renames, counts, and complete result lists.
+description: Search code with seek, a local relevance-ranked search with lexical retrieval, default code re-ranking, eligible semantic retrieval, and ctags symbols. Use it for ranked navigation of definitions, callers, configuration, and unfamiliar code. Use an exhaustive tool for renames, counts, and complete result lists.
 ---
 
 # Search code with seek
@@ -25,8 +25,8 @@ All filters go inside ONE quoted argument. Paths come after it.
 | `lang:go` | one language |
 | `type:file` | filenames only, no content |
 
-Bare words are matched independently and combined with AND: `seek 'parse token'`
-returns files containing both.
+The strict lexical branch matches bare words independently and combines them
+with AND. A final reranked result can lack one or both words.
 
 ## Flags
 
@@ -36,7 +36,7 @@ returns files containing both.
 | `-m N` | display at most N matches per file (0 = no display limit) |
 | `-A N` | N lines after each match (0-512) |
 | `-C N` | N lines before and after each match (0-512) |
-| `--rerank` | rank an eligible plain query with the local model |
+| `--lexical-only` | skip semantic indexing, search, and model re-ranking |
 
 Flags go before the query. Do not combine `-A` and `-C`.
 
@@ -52,35 +52,43 @@ seek -n 5 'retry backoff'                   # top 5 files only
 seek -n 5 -m 1 -A 20 'sym:executeParsedSearchScoped' ./cmd/seek
 ```
 
-## Re-rank descriptive searches
+## Search from descriptions
 
-Use `--rerank` when you know the behavior but not its identifier or file. Write
-a short English description with two or more words:
+When you know the behavior but not its identifier or file, write a short
+English description with two or more words:
 
 ```sh
-seek --rerank 'find request parser' ./cmd
-seek --rerank -n 5 -m 2 -C 1 'validate search query syntax' ./cmd
+seek 'find request parser'
+seek -n 5 -m 2 -C 1 'validate search query syntax'
 ```
 
-Seek scores up to 20 files that match at least one query word. The model scores
-each path with its best nearby code. Seek combines the model and BM25 orders
-with weighted reciprocal rank fusion; BM25 has twice the model weight. Results
-can lack some query words.
+Seek collects up to 20 files from strict lexical, relaxed lexical, and semantic
+retrieval. The model scores each path with its best nearby code. Seek combines
+the lexical and model orders with weighted reciprocal rank fusion; lexical rank
+has twice the model weight. Results can have none of the query words.
 
-**Ranking warning:** Re-ranking can reduce result quality. Compare the query
-with and without `--rerank` when order matters.
+Plain queries with two or more words use model re-ranking by default. One
+unscoped clean Git worktree, one stable plain file, or one stable plain folder
+also uses semantic retrieval. Scoped or dirty Git and multi-corpus searches can
+use model re-ranking when enough candidates exist, but not semantic retrieval.
+Exact identifiers and phrases, `sym:` queries, filters, regular expressions,
+Boolean operators, negation, and one-word queries use strict BM25 order.
 
-`--rerank` accepts only plain queries with two or more words. Exact identifiers
-and phrases, `sym:` queries, filters, regular expressions, Boolean operators,
-negation, and one-word queries stay on the BM25 path. The router never adds
-`--rerank`; call `seek` directly.
+Unless `--lexical-only` is set, every supported search builds or updates both
+Zoekt and semantic data. This includes exact queries and commands rewritten by
+the router. A first search of a large repo can take tens of seconds or longer
+and use all available compute, several GiB of memory, and significant cache
+space. Use `--lexical-only` only when you want the Zoekt-only fast path with no
+model work.
 
 Use normal seek for exact ranked navigation. For absence checks, renames,
 counts, and complete call-site lists, use the exhaustive command below.
 
 The model runs locally and can use context that is not in the output. Display
-flags still apply. If re-ranking fails or is unavailable, Seek returns the
-normal all-word BM25 results.
+flags still apply. If semantic retrieval is unavailable, model re-ranking can
+still use lexical candidates. If the model fails, Seek returns the strict
+all-word BM25 results. A damaged USearch graph uses an exact vector scan when
+the stored vectors are valid.
 
 ## Paths
 
