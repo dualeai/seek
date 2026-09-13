@@ -99,14 +99,15 @@ pass. Git paths use a cached Git corpus. Results stay in your selection.
 Explicit paths excluded by .gitignore and paths outside Git are searched as
 plain files or folders. Seek searches each visible nested Git worktree in the
 selected directories once. Plain multi-word descriptions use local model
-re-ranking by default. One unscoped clean Git worktree, one stable plain file,
-or one stable plain folder also uses combined lexical and semantic retrieval.
+re-ranking by default and can include lang:, file:, and -file: filters. One
+unscoped clean Git worktree, one stable plain file, or one stable plain folder
+also uses combined lexical and semantic retrieval.
 Unless --lexical-only is set, every supported corpus build or update maintains
 both index parts, including for exact queries. A cold large-corpus build runs
 both parts in parallel. It can take tens of seconds or longer and use all
 available compute, several GiB of memory, and significant cache space.`,
 		Example: `  seek 'sym:Foo'              find definitions named Foo (ctags)
-  seek 'lang:go func main'    Go files containing both tokens
+  seek 'lang:go func main'    rank Go files for this description
   seek 'file:cmd -file:test'  paths matching cmd, excluding tests
   seek 'TODO' ./src           search a specific subtree
   seek 'request auth flow'    search a description with the local model`,

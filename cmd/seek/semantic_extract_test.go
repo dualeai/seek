@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"reflect"
 	"testing"
@@ -163,5 +164,45 @@ func TestExtractSemanticUnitsIsDeterministic(t *testing.T) {
 	second := extractSemanticUnits("x.go", content, right, nil)
 	if !reflect.DeepEqual(first, second) {
 		t.Fatalf("entry order changed units:\nfirst=%+v\nsecond=%+v", first, second)
+	}
+}
+
+func TestSemanticUnitIDIncludesFileLanguage(t *testing.T) {
+	unit := semanticUnit{
+		path:         "main.go",
+		start:        1,
+		end:          2,
+		kind:         semanticUnitSymbol,
+		parserResult: semanticParserCTags,
+		language:     "Go",
+		fileLanguage: "Go",
+		symbol:       "function Main",
+	}
+	goID := makeSemanticUnitID(unit)
+	unit.fileLanguage = "Python"
+	pythonID := makeSemanticUnitID(unit)
+	if goID == pythonID {
+		t.Fatal("file language did not change the semantic unit ID")
+	}
+}
+
+func TestSemanticUnitIDEncodingIsStable(t *testing.T) {
+	unit := semanticUnit{
+		path:         "main.go",
+		start:        1,
+		end:          2,
+		kind:         semanticUnitSymbol,
+		parserResult: semanticParserCTags,
+		language:     "Go",
+		fileLanguage: "Go",
+		symbol:       "function Main",
+	}
+	for index := range unit.contentID {
+		unit.contentID[index] = byte(index)
+	}
+	want := "9bc18f8ed096c40ef6dc11c2aed3cb2d177ad55f9ea182619fdd4961e06750ad"
+	got := makeSemanticUnitID(unit)
+	if encoded := hex.EncodeToString(got[:]); encoded != want {
+		t.Fatalf("semantic unit ID=%s, want %s", encoded, want)
 	}
 }

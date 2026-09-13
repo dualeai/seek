@@ -30,8 +30,9 @@ var (
 )
 
 type rerankQueryPlan struct {
-	modelQuery string
-	relaxedQ   query.Q
+	modelQuery     string
+	relaxedQ       query.Q
+	semanticFilter *semanticFilterPlan
 }
 
 type rerankDocument struct {
@@ -72,9 +73,29 @@ type rerankCandidate struct {
 	preservedStrictLeader bool
 }
 
-// planRerankQuery accepts only a plain multi-word AND query. Any syntax node
-// outside that form keeps the existing BM25 path.
+// planRerankQuery accepts a plain multi-word AND query, with an optional closed
+// set of file and language filters. Other syntax keeps the strict BM25 path.
 func planRerankQuery(pattern string, raw query.Q) (rerankQueryPlan, bool) {
+	if plan, ok := planPlainRerankQuery(pattern, raw); ok {
+		return plan, true
+	}
+	return planFilteredRerankQuery(raw)
+}
+
+func rerankDescriptionTerm(node query.Q) (*query.Substring, bool) {
+	substring, ok := node.(*query.Substring)
+	if !ok || substring == nil || substring.FileName || substring.Content ||
+		substring.Pattern == "" || strings.IndexFunc(substring.Pattern, unicode.IsSpace) >= 0 {
+		return nil, false
+	}
+	term := *substring
+	term.FileName = false
+	term.Content = true
+	return &term, true
+}
+
+// planPlainRerankQuery keeps a query without filters out of the filter compiler.
+func planPlainRerankQuery(pattern string, raw query.Q) (rerankQueryPlan, bool) {
 	and, ok := raw.(*query.And)
 	if !ok || len(and.Children) < 2 {
 		return rerankQueryPlan{}, false
@@ -87,23 +108,54 @@ func planRerankQuery(pattern string, raw query.Q) (rerankQueryPlan, bool) {
 	terms := make([]string, 0, len(and.Children))
 	children := make([]query.Q, 0, len(and.Children))
 	for i, child := range and.Children {
-		substring, ok := child.(*query.Substring)
-		if !ok || substring.FileName || substring.Content ||
-			substring.Pattern == "" ||
-			strings.IndexFunc(substring.Pattern, unicode.IsSpace) >= 0 ||
-			originalTerms[i] != substring.Pattern {
+		term, ok := rerankDescriptionTerm(child)
+		if !ok || originalTerms[i] != term.Pattern {
 			return rerankQueryPlan{}, false
 		}
-		term := *substring
-		term.FileName = false
-		term.Content = true
 		terms = append(terms, term.Pattern)
-		children = append(children, &term)
+		children = append(children, term)
 	}
 
 	return rerankQueryPlan{
 		modelQuery: strings.Join(terms, " "),
 		relaxedQ:   query.Simplify(query.NewOr(children...)),
+	}, true
+}
+
+// planFilteredRerankQuery accepts a top-level AND with at least two description
+// terms and at least one supported typed filter. It returns false for every
+// unsupported node.
+func planFilteredRerankQuery(raw query.Q) (rerankQueryPlan, bool) {
+	and, ok := raw.(*query.And)
+	if !ok {
+		return rerankQueryPlan{}, false
+	}
+
+	terms := make([]string, 0, len(and.Children))
+	descriptions := make([]query.Q, 0, len(and.Children))
+	filters := make([]query.Q, 0, len(and.Children))
+	for _, child := range and.Children {
+		if term, ok := rerankDescriptionTerm(child); ok {
+			terms = append(terms, term.Pattern)
+			descriptions = append(descriptions, term)
+			continue
+		}
+		filters = append(filters, child)
+	}
+	if len(terms) < 2 || len(filters) == 0 {
+		return rerankQueryPlan{}, false
+	}
+	semanticFilter, err := compileSemanticFilterPlan(filters)
+	if err != nil {
+		return rerankQueryPlan{}, false
+	}
+	relaxedChildren := make([]query.Q, 0, len(filters)+1)
+	relaxedChildren = append(relaxedChildren, query.NewOr(descriptions...))
+	relaxedChildren = append(relaxedChildren, filters...)
+	return rerankQueryPlan{
+		modelQuery:     strings.Join(terms, " "),
+		relaxedQ:       query.Simplify(query.NewAnd(relaxedChildren...)),
+		semanticFilter: semanticFilter,
 	}, true
 }
 

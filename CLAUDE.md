@@ -85,8 +85,12 @@ Plain queries with two or more words use local model re-ranking by default.
 One unscoped clean Git worktree, one stable plain file, or one stable plain
 folder also uses semantic retrieval. Scoped or dirty Git and multi-corpus
 searches can still use model re-ranking when enough candidates exist, but not
-semantic retrieval. Exact identifiers, phrases, filters, regular expressions,
-Boolean operators, negation, and one-word queries use strict BM25 order.
+semantic retrieval. A description can contain `lang:`, `file:`, and `-file:`
+filters; Seek keeps them in lexical and semantic retrieval. Eligibility follows
+Zoekt's parsed and simplified query tree, so equivalent spellings and aliases
+can use the same route. Exact identifiers, phrases, one-word queries, and trees
+that retain other filters, Boolean alternatives, or general negation use strict
+BM25 order.
 Unless `--lexical-only` is set, every supported search builds or updates both
 Zoekt and semantic data, including exact and router-generated queries. A first
 large-repo search can take tens of seconds or longer and use all available
@@ -120,7 +124,8 @@ When spawning sub-agents that don't inherit this config, pass:
 in one quoted string. Plain multi-word descriptions use model re-ranking by
 default. A supported default search maintains both Zoekt and semantic data; use
 `--lexical-only` to skip all semantic and model work. An unscoped clean Git
-worktree or one stable plain file or folder also uses semantic retrieval. Use
+worktree or one stable plain file or folder also uses semantic retrieval.
+Descriptions can include `lang:`, `file:`, and `-file:` filters. Use
 `SEEK_ROUTER=off grep` only for all occurrences, counts, or renames."
 
 ## GitHub Actions

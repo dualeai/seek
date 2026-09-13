@@ -12,6 +12,7 @@ import (
 	"time"
 
 	ctags "github.com/sourcegraph/go-ctags"
+	"github.com/sourcegraph/zoekt/index"
 )
 
 type semanticSourceDocument struct {
@@ -368,6 +369,8 @@ func buildSemanticGeneration(
 		return semanticManifest{}, err
 	}
 	workerCount := resources.cpuLimit()
+	indexOptions := indexBuildOptions("", workerCount)
+	indexOptions.SetDefaults()
 	parsers := make([]semanticTagParser, workerCount)
 	for index := range parsers {
 		parser, err := ctags.New(ctags.Options{Bin: os.Getenv("CTAGS_COMMAND")})
@@ -401,7 +404,18 @@ func buildSemanticGeneration(
 		extractWait.Add(1)
 		go func(parser semanticTagParser) {
 			defer extractWait.Done()
-			extractSemanticDocuments(buildCtx, parser, embedder, resources, jobs, extracted, cancel)
+			checker := &index.DocChecker{}
+			extractSemanticDocuments(
+				buildCtx,
+				parser,
+				checker,
+				indexOptions,
+				embedder,
+				resources,
+				jobs,
+				extracted,
+				cancel,
+			)
 		}(parser)
 	}
 	go func() {
@@ -610,6 +624,8 @@ func dispatchSemanticDocuments(
 func extractSemanticDocuments(
 	ctx context.Context,
 	parser semanticTagParser,
+	checker *index.DocChecker,
+	indexOptions index.Options,
 	packer semanticModel,
 	resources searchResources,
 	jobs <-chan semanticSourceDocument,
@@ -627,11 +643,17 @@ func extractSemanticDocuments(
 		}
 		var entries []*ctags.Entry
 		var parseErr error
-		if len(document.content) > 0 && !semanticContentIsBinary(document.content) &&
-			!semanticContentIsGenerated(document.content) {
+		eligible := semanticContentIsEligible(document.content)
+		if eligible {
 			entries, parseErr = parser.Parse(document.name, document.content)
 		}
-		units := extractSemanticUnits(document.name, document.content, entries, parseErr)
+		var units []semanticUnit
+		if eligible {
+			fileLanguage := semanticDocumentLanguage(checker, indexOptions, document)
+			units = extractEligibleSemanticUnits(
+				document.name, document.content, entries, parseErr, fileLanguage,
+			)
+		}
 		var packErr error
 		if len(units) > 0 {
 			units, packErr = packer.PackSemanticUnits(ctx, units)
@@ -655,6 +677,31 @@ func extractSemanticDocuments(
 			return
 		}
 	}
+}
+
+// semanticDocumentLanguage follows Zoekt's document checks before language
+// detection so lang: filters use the same whole-file value. The caller must
+// supply its worker-local DocChecker and the lexical build's index options.
+func semanticDocumentLanguage(
+	checker *index.DocChecker,
+	options index.Options,
+	document fileContent,
+) string {
+	indexed := index.Document{
+		Name:       document.name,
+		Content:    document.content,
+		SkipReason: document.skipReason,
+	}
+	if indexed.SkipReason == index.SkipReasonNone {
+		allowLarge := options.IgnoreSizeMax(indexed.Name)
+		if len(indexed.Content) > options.SizeMax && !allowLarge {
+			indexed.SkipReason = index.SkipReasonTooLarge
+		} else if checker != nil {
+			indexed.SkipReason = checker.Check(indexed.Content, options.TrigramMax, allowLarge)
+		}
+	}
+	index.DetermineLanguageIfUnknown(&indexed)
+	return indexed.Language
 }
 
 func encodeSemanticBatches(

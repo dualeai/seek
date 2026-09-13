@@ -319,9 +319,23 @@ model for semantic retrieval and final re-ranking.
 ```bash
 seek 'find request parser'
 seek -n 5 -m 2 -C 1 'validate search query syntax'
+seek 'find request parser lang:go -file:_test\.go$'
+seek 'validate cache generation file:^cmd/seek/'
 ```
 
 Model re-ranking is on by default for plain queries with two or more words.
+Such a description can also contain `lang:`, `file:`, and `-file:` filters. Seek
+keeps these filters in strict, relaxed, and semantic retrieval. It sends only
+the description text to the model. For semantic retrieval, Seek builds an
+allowed-row bitmap and plans each shard separately. It skips shards with no
+allowed rows, uses normal USearch for full shards, scores bounded sparse partial
+shards exactly, and gives other partial shards to USearch with the bitmap
+predicate. The predicate admits only matching keys to the candidate set; other
+keys can still guide graph navigation. A filter that selects every row uses
+normal semantic retrieval. Native USearch routes remain approximate. An
+exact-only route scores every selected stored row. Eligibility follows Zoekt's
+parsed and simplified query tree. An equivalent spelling or alias that Zoekt
+reduces to the same supported nodes can use this route too.
 Combined lexical and semantic retrieval also runs when the search has one
 unscoped, clean Git worktree; one stable plain file; or one stable plain folder
 with no nested Git worktree. A scoped Git path, dirty Git state, multiple
@@ -329,9 +343,11 @@ corpora, or a nested corpus uses lexical retrieval and can use model re-ranking
 when the model and enough candidates are available. Verbose diagnostics and
 cache names call the combined path the joined path.
 
-Exact identifiers and phrases, `sym:` queries, filters, regular expressions,
-Boolean operators, negation, and one-word queries use strict BM25 retrieval and
-order. They still build or update both index parts by default for a supported
+Exact identifiers and phrases, one-word queries, and queries whose simplified
+tree still contains `sym:`, another filter node, a Boolean alternative, or
+general negation use strict BM25 retrieval and order. A filename regular
+expression inside `file:` or `-file:` can use the filtered description route.
+Exact queries still build or update both index parts by default for a supported
 committed Git or folder corpus. Use `--lexical-only` to avoid that semantic
 index work.
 
@@ -366,8 +382,11 @@ Fallback behavior is specific:
 - `--lexical-only` uses strict Zoekt/BM25 only.
 - If joined retrieval is ineligible or unavailable, Seek can use strict and
   relaxed lexical candidates with LateOn re-ranking.
-- If USearch cannot open or search a valid generation, Seek uses an exact scan
-  of the stored vectors.
+- For an unfiltered description, if USearch cannot search a valid generation,
+  Seek uses an exact scan only when its row and query-token work is bounded.
+  A larger failure returns to the lexical and model re-rank path.
+- For a filtered description, a filtered USearch error returns to the same
+  filtered lexical and model re-rank path. Seek does not widen the filter.
 - If the model or re-ranking fails, Seek returns the strict all-word BM25
   results.
 
@@ -411,9 +430,10 @@ description of the code.
    worktree has no committed semantic source. `--lexical-only` skips all
    semantic index and model work and uses only Zoekt.
 4. **Search** -- exact query forms use strict lexical retrieval. For one
-   unscoped, stable corpus, an eligible plain description starts strict
-   lexical, relaxed lexical, and semantic work together.
-5. **Re-rank** -- for a plain description, the same local model scores the
+   unscoped, stable corpus, an eligible description, with or without supported
+   file and language filters, starts strict lexical, relaxed lexical, and
+   semantic work together.
+5. **Re-rank** -- for an eligible description, the same local model scores the
    bounded candidate union when the model and enough candidates are available.
 6. **Format** -- applies the display limits and writes grouped results with the
    requested context.
@@ -466,6 +486,8 @@ it is not set, Seek uses these paths:
 
 Joined corpora also store semantic generations in `index/` and a `.joined-v1`
 attachment next to the lexical state. Normal corpus eviction removes both.
+Seek rebuilds an older semantic generation once so each row has the same
+canonical file language as Zoekt.
 
 The model stores its extracted runtime under
 `<seek-cache>/reranker/<runtime-version>/<sha256>/`. The model and tokenizer

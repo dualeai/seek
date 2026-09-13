@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -255,11 +257,10 @@ func TestMaterializeSemanticCandidatesChecksCommittedBytes(t *testing.T) {
 		t.Fatalf("semantic evidence line=%q number=%d", match.Line, match.LineNumber)
 	}
 
-	broken := *generation
-	broken.rows = append([]semanticUnit(nil), generation.rows...)
+	broken := &semanticGeneration{rows: append([]semanticUnit(nil), generation.rows...)}
 	broken.rows[0].contentID = semanticContentID(sha256.Sum256([]byte("different")))
 	if _, err := materializeSemanticCandidates(
-		t.Context(), plan, paths, state.HeadSHA, &broken,
+		t.Context(), plan, paths, state.HeadSHA, broken,
 		[]semanticHit{{row: 0, score: 1}}, 0,
 	); err == nil {
 		t.Fatal("wrong content ID must reject semantic evidence")
@@ -364,6 +365,207 @@ func TestRunDefaultFolderJoinedSearchAddsSemanticOnlyFile(t *testing.T) {
 	}
 	if !joinedGenerationMatches(plan.cacheDir, plan.indexDir, state, state) {
 		t.Fatal("default folder search did not keep a joined generation")
+	}
+}
+
+func TestRunDefaultJoinedSearchAppliesSemanticFilters(t *testing.T) {
+	requireTools(t)
+	t.Chdir(t.TempDir())
+	folder := t.TempDir()
+	writeFileAt(t, folder, "allowed/strict.go", "package sample\n// alpha beta\n")
+	writeFileAt(t, folder, "allowed/semantic.go",
+		"package sample\n// SEMANTIC_ALLOWED dispatches a request\n")
+	writeFileAt(t, folder, "allowed/semantic_test.go",
+		"package sample\n// FILTERED_TEST_TARGET\n")
+	writeFileAt(t, folder, "allowed/semantic.py", "# FILTERED_LANGUAGE_TARGET\n")
+	writeFileAt(t, folder, "blocked/semantic.go",
+		"package sample\n// FILTERED_PATH_TARGET\n")
+	planFolderTestCorpus(t, folder)
+
+	queryVector := semanticVector{0: 1}
+	scorer := &hybridTestScorer{
+		queryVector: &queryVector,
+		vectorForUnit: func(unit semanticUnit) semanticVector {
+			if unit.path == "allowed/semantic.go" {
+				return semanticVector{0: 0.9, 1: float32(math.Sqrt(0.19))}
+			}
+			if unit.path != "allowed/strict.go" {
+				return semanticVector{0: 1}
+			}
+			return semanticVector{1: 1}
+		},
+	}
+	output, err := runHybridTestSearch(
+		t,
+		`alpha beta lang:go file:^allowed/ -file:_test\.go$`,
+		[]string{folder},
+		defaultSearchPolicy(),
+		func(context.Context) (semanticModel, error) { return scorer, nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output, "## allowed/semantic.go") ||
+		!strings.Contains(output, "SEMANTIC_ALLOWED") {
+		t.Fatalf("filtered joined output omitted the allowed semantic file:\n%s", output)
+	}
+	for _, blocked := range []string{
+		"allowed/semantic_test.go",
+		"allowed/semantic.py",
+		"blocked/semantic.go",
+		"FILTERED_TEST_TARGET",
+		"FILTERED_LANGUAGE_TARGET",
+		"FILTERED_PATH_TARGET",
+	} {
+		if strings.Contains(output, blocked) {
+			t.Fatalf("filtered joined output contains %q:\n%s", blocked, output)
+		}
+	}
+	scorer.mu.Lock()
+	defer scorer.mu.Unlock()
+	for _, document := range scorer.documents {
+		if !strings.HasPrefix(document.Path, "allowed/") ||
+			document.Language != "Go" || strings.HasSuffix(document.Path, "_test.go") {
+			t.Fatalf("model received filtered document: %+v", document)
+		}
+	}
+}
+
+func TestRunDefaultFilteredNativeFailureUsesFilteredLexicalRerank(t *testing.T) {
+	requireTools(t)
+	t.Chdir(t.TempDir())
+	folder := t.TempDir()
+	writeFileAt(t, folder, "allowed/strict.go", "package sample\n// seed alpha beta\n")
+	for index := range semanticFilteredExactRows + 8 {
+		writeFileAt(
+			t,
+			folder,
+			fmt.Sprintf("allowed/candidate-%03d.go", index),
+			"package sample\n// alpha lexical candidate\n",
+		)
+	}
+	writeFileAt(t, folder, "allowed/leak_test.go", "package sample\n// alpha beta TEST_LEAK\n")
+	writeFileAt(t, folder, "allowed/leak.py", "# alpha beta LANGUAGE_LEAK\n")
+	writeFileAt(t, folder, "blocked/leak.go", "package sample\n// alpha beta PATH_LEAK\n")
+	plan := planFolderTestCorpus(t, folder)
+
+	if _, err := runHybridTestSearch(
+		t,
+		"seed",
+		[]string{folder},
+		defaultSearchPolicy(),
+		func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil },
+	); err != nil {
+		t.Fatal(err)
+	}
+	state, _, err := folderCorpusFingerprint(t.Context(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	semanticDir := semanticGenerationDir(plan.indexDir, state)
+	generation, err := openSemanticGeneration(semanticDir, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _, err := parseSearchQueryForms(
+		`alpha beta lang:go file:^allowed/ -file:_test\.go$`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rerankPlan, ok := planRerankQuery("", raw)
+	if !ok || rerankPlan.semanticFilter == nil {
+		t.Fatal("filtered fallback query is not eligible")
+	}
+	mask, err := buildSemanticFilterMask(t.Context(), generation, rerankPlan.semanticFilter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mask.mode != semanticFilterPartial || mask.allowed <= semanticFilteredExactRows {
+		t.Fatalf("fallback fixture mask=%+v", mask)
+	}
+	if err := generation.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest, err := readSemanticManifest(semanticDir, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Damage the graph, then refresh its manifest digest. This bypasses the
+	// open-time artifact check so the query reaches the native search error and
+	// filtered lexical fallback.
+	shardPath := filepath.Join(semanticDir, manifest.USearchFiles[0].Name)
+	shard, err := os.OpenFile(shardPath, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := shard.WriteAt([]byte("damaged"), 0); err != nil {
+		_ = shard.Close()
+		t.Fatal(err)
+	}
+	if err := shard.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manifest.USearchFiles[0].semanticArtifact, err = inspectSemanticArtifact(shardPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestBytes = append(manifestBytes, '\n')
+	if err := os.WriteFile(
+		filepath.Join(semanticDir, semanticManifestFile), manifestBytes, 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !joinedGenerationMatches(plan.cacheDir, plan.indexDir, state, state) {
+		t.Fatal("fault fixture did not keep the joined generation eligible")
+	}
+
+	scorer := &hybridTestScorer{}
+	logs := captureTestLogs(t, slog.LevelDebug)
+	output, err := runHybridTestSearch(
+		t,
+		`alpha beta lang:go file:^allowed/ -file:_test\.go$`,
+		[]string{folder},
+		defaultSearchPolicy(),
+		func(context.Context) (semanticModel, error) { return scorer, nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output, "## allowed/strict.go") {
+		t.Fatalf("filtered fallback omitted its strict result:\n%s", output)
+	}
+	for _, leak := range []string{"leak_test.go", "leak.py", "blocked/leak.go", "TEST_LEAK", "LANGUAGE_LEAK", "PATH_LEAK"} {
+		if strings.Contains(output, leak) {
+			t.Fatalf("filtered fallback contains %q:\n%s", leak, output)
+		}
+	}
+	if scorer.scoreCalls.Load() != 1 {
+		t.Fatalf("filtered lexical re-rank calls=%d, want 1", scorer.scoreCalls.Load())
+	}
+	scorer.mu.Lock()
+	for _, document := range scorer.documents {
+		if !strings.HasPrefix(document.Path, "allowed/") ||
+			document.Language != "Go" || strings.HasSuffix(document.Path, "_test.go") {
+			scorer.mu.Unlock()
+			t.Fatalf("fallback model received filtered document: %+v", document)
+		}
+	}
+	scorer.mu.Unlock()
+	foundFallbackLog := false
+	for _, record := range logs.Records() {
+		if record.Message == "Joined search failed; using the lexical path" {
+			foundFallbackLog = true
+			break
+		}
+	}
+	if !foundFallbackLog {
+		t.Fatal("filtered native failure did not enter the lexical fallback")
 	}
 }
 

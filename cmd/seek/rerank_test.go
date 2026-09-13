@@ -85,6 +85,9 @@ func TestPlanRerankQuery(t *testing.T) {
 	if plan.modelQuery != "Handle shell completion" {
 		t.Fatalf("model query=%q", plan.modelQuery)
 	}
+	if plan.semanticFilter != nil {
+		t.Fatal("plain query entered the semantic filter path")
+	}
 	or, ok := plan.relaxedQ.(*query.Or)
 	if !ok || len(or.Children) != 3 {
 		t.Fatalf("relaxed query=%#v, want three-child Or", plan.relaxedQ)
@@ -98,6 +101,46 @@ func TestPlanRerankQuery(t *testing.T) {
 		if term.Pattern != want[i] || !term.Content || term.FileName {
 			t.Fatalf("child %d=%+v", i, term)
 		}
+	}
+}
+
+func TestPlanRerankQueryCombinesRepeatedAndContradictoryFilters(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		pattern string
+		path    string
+		lang    string
+		want    bool
+	}{
+		{
+			name:    "repeated filename filters",
+			pattern: "find request file:cmd file:seek parser",
+			path:    "cmd/seek/main.go", lang: "Go", want: true,
+		},
+		{
+			name:    "repeated filename filter miss",
+			pattern: "find request file:cmd file:seek parser",
+			path:    "cmd/main.go", lang: "Go", want: false,
+		},
+		{
+			name:    "contradictory language filters",
+			pattern: "find request lang:go lang:python parser",
+			path:    "cmd/seek/main.go", lang: "Go", want: false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw, _, err := parseSearchQueryForms(test.pattern)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, ok := planRerankQuery(test.pattern, raw)
+			if !ok || plan.semanticFilter == nil {
+				t.Fatal("filtered query is not eligible")
+			}
+			if got := plan.semanticFilter.matches(test.path, test.lang); got != test.want {
+				t.Fatalf("matches=%t, want %t", got, test.want)
+			}
+		})
 	}
 }
 
@@ -118,6 +161,102 @@ func TestPlanRerankQueryAcceptsPlainProgrammingName(t *testing.T) {
 			}
 			if plan.modelQuery != pattern {
 				t.Fatalf("model query=%q, want %q", plan.modelQuery, pattern)
+			}
+		})
+	}
+}
+
+func TestPlanRerankQueryAcceptsFileAndLanguageFilters(t *testing.T) {
+	tests := []struct {
+		name           string
+		pattern        string
+		wantModel      string
+		allowPath      string
+		allowLanguage  string
+		rejectPath     string
+		rejectLanguage string
+	}{
+		{
+			name:      "language",
+			pattern:   "find request parser lang:go",
+			wantModel: "find request parser",
+			allowPath: "cmd/seek/main.go", allowLanguage: "Go",
+			rejectPath: "cmd/seek/main.py", rejectLanguage: "Python",
+		},
+		{
+			name:      "file",
+			pattern:   `find request parser file:^cmd/seek/`,
+			wantModel: "find request parser",
+			allowPath: "cmd/seek/main.go", allowLanguage: "Go",
+			rejectPath: "internal/main.go", rejectLanguage: "Go",
+		},
+		{
+			name:      "quoted file",
+			pattern:   `find request parser file:"my file"`,
+			wantModel: "find request parser",
+			allowPath: "docs/my file.go", allowLanguage: "Go",
+			rejectPath: "docs/other.go", rejectLanguage: "Go",
+		},
+		{
+			name:      "negative file",
+			pattern:   `find request parser -file:_test\.go$`,
+			wantModel: "find request parser",
+			allowPath: "cmd/seek/main.go", allowLanguage: "Go",
+			rejectPath: "cmd/seek/main_test.go", rejectLanguage: "Go",
+		},
+		{
+			name:      "combined and reordered",
+			pattern:   `lang:go find file:^cmd/ request -file:_test\.go$ parser`,
+			wantModel: "find request parser",
+			allowPath: "cmd/seek/main.go", allowLanguage: "Go",
+			rejectPath: "cmd/seek/main_test.go", rejectLanguage: "Go",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			raw, _, err := parseSearchQueryForms(test.pattern)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, ok := planRerankQuery(test.pattern, raw)
+			if !ok || plan.semanticFilter == nil {
+				t.Fatalf("filtered query is not eligible: %#v", plan)
+			}
+			if plan.modelQuery != test.wantModel {
+				t.Fatalf("model query=%q, want %q", plan.modelQuery, test.wantModel)
+			}
+			freshRaw, _, err := parseSearchQueryForms(test.pattern)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(raw, freshRaw) {
+				t.Fatalf("planning mutated the strict query:\nbefore=%#v\nafter=%#v", freshRaw, raw)
+			}
+			if !plan.semanticFilter.matches(test.allowPath, test.allowLanguage) {
+				t.Fatalf("filter rejected %q (%s)", test.allowPath, test.allowLanguage)
+			}
+			if plan.semanticFilter.matches(test.rejectPath, test.rejectLanguage) {
+				t.Fatalf("filter accepted %q (%s)", test.rejectPath, test.rejectLanguage)
+			}
+		})
+	}
+}
+
+func TestPlanRerankQueryUsesZoektNormalizedTree(t *testing.T) {
+	for _, pattern := range []string{
+		"alpha beta f:go",
+		"case:yes alpha beta file:go",
+		"regex:alpha beta file:go",
+		"(alpha beta) file:go",
+	} {
+		t.Run(pattern, func(t *testing.T) {
+			raw, _, err := parseSearchQueryForms(pattern)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, ok := planRerankQuery(pattern, raw)
+			if !ok || plan.semanticFilter == nil || plan.modelQuery != "alpha beta" {
+				t.Fatalf("normalized query plan=%#v eligible=%t", plan, ok)
 			}
 		})
 	}
@@ -152,6 +291,8 @@ func TestPlanRerankQueryRejectsSyntax(t *testing.T) {
 		"alpha -beta",
 		"sym:Alpha beta",
 		"case:yes Alpha beta",
+		"alpha beta lang:definitely-not-a-language",
+		"alpha beta -lang:go",
 	}
 	for _, pattern := range tests {
 		t.Run(pattern, func(t *testing.T) {

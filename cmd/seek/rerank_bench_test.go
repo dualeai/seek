@@ -33,7 +33,8 @@ func BenchmarkCLIProcess(b *testing.B) {
 
 	root := b.TempDir()
 	fixture := filepath.Join(root, "fixture")
-	cache := filepath.Join(root, "cache")
+	lexicalCache := filepath.Join(root, "lexical-cache")
+	semanticCache := filepath.Join(root, "semantic-cache")
 	// Use more than the model pool so the timed relaxed search also covers the
 	// candidate bound before deep result cloning.
 	for i := range 256 {
@@ -58,25 +59,32 @@ func BenchmarkCLIProcess(b *testing.B) {
 	ineligibleArgs := []string{"content:parse request handler", fixture}
 	eligibleArgs := []string{queryText, fixture}
 	eligibleDisplayContextZeroArgs := []string{"-C", "0", queryText, fixture}
-	// The first term matches one file. The second term matches its path only,
-	// so the content-only relaxed query has one candidate and skips scoring.
-	oneCandidateArgs := []string{"candidate0 candidate_00", fixture}
+	// The relaxed lexical query starts with one content candidate. Semantic
+	// retrieval can expand it before final scoring.
+	semanticExpansionArgs := []string{"candidate0 candidate_00", fixture}
 
-	// Build the index and check each public path before the timer starts.
-	for _, args := range [][]string{lexicalArgs, ineligibleArgs} {
-		output, err := runSeekBenchmarkCommand(b.Context(), binary, cache, fixture, args, false)
-		if err != nil || len(output) == 0 {
-			b.Fatalf("warm seek %q: output=%q err=%v", args, output, err)
-		}
+	// Keep the lexical-only no-model check independent from default searches,
+	// which can build semantic data even when a query is not eligible to rerank.
+	output, err := runSeekBenchmarkCommand(
+		b.Context(), binary, lexicalCache, fixture, lexicalArgs, false,
+	)
+	if err != nil || len(output) == 0 {
+		b.Fatalf("warm seek %q: output=%q err=%v", lexicalArgs, output, err)
 	}
-	if _, err := os.Stat(filepath.Join(cache, "reranker")); !os.IsNotExist(err) {
-		b.Fatalf("lexical or ineligible search initialized the re-ranker: %v", err)
+	if _, err := os.Stat(filepath.Join(lexicalCache, "reranker")); !os.IsNotExist(err) {
+		b.Fatalf("lexical-only search initialized the re-ranker: %v", err)
+	}
+	output, err = runSeekBenchmarkCommand(
+		b.Context(), binary, semanticCache, fixture, ineligibleArgs, false,
+	)
+	if err != nil || len(output) == 0 {
+		b.Fatalf("warm seek %q: output=%q err=%v", ineligibleArgs, output, err)
 	}
 	probeArgs := append([]string{"--verbose"}, eligibleArgs...)
-	output, err := runSeekBenchmarkCommand(
+	output, err = runSeekBenchmarkCommand(
 		b.Context(),
 		binary,
-		cache,
+		semanticCache,
 		fixture,
 		probeArgs,
 		false,
@@ -84,52 +92,52 @@ func BenchmarkCLIProcess(b *testing.B) {
 	if err != nil || len(output) == 0 || bytes.Contains(output, []byte("Re-ranking failed")) {
 		b.Fatalf("warm seek %q: output=%q err=%v", probeArgs, output, err)
 	}
-	oneCandidateProbeArgs := append([]string{"--verbose"}, oneCandidateArgs...)
+	semanticExpansionProbeArgs := append([]string{"--verbose"}, semanticExpansionArgs...)
 	output, err = runSeekBenchmarkCommand(
 		b.Context(),
 		binary,
-		cache,
+		semanticCache,
 		fixture,
-		oneCandidateProbeArgs,
+		semanticExpansionProbeArgs,
 		false,
 	)
-	if err != nil || len(output) == 0 || !bytes.Contains(output, []byte("Re-ranking failed")) {
-		b.Fatalf("warm seek %q: output=%q err=%v", oneCandidateProbeArgs, output, err)
+	if err != nil || len(output) == 0 || bytes.Contains(output, []byte("Re-ranking failed")) {
+		b.Fatalf("warm seek %q: output=%q err=%v", semanticExpansionProbeArgs, output, err)
 	}
 
 	b.Run("LexicalOnlyWarm", func(b *testing.B) {
 		for b.Loop() {
-			mustRunSeekBenchmark(b, binary, cache, fixture, lexicalArgs)
+			mustRunSeekBenchmark(b, binary, lexicalCache, fixture, lexicalArgs)
 		}
 	})
 	b.Run("RerankIneligibleWarm", func(b *testing.B) {
 		for b.Loop() {
-			mustRunSeekBenchmark(b, binary, cache, fixture, ineligibleArgs)
+			mustRunSeekBenchmark(b, binary, semanticCache, fixture, ineligibleArgs)
 		}
 	})
 	b.Run("RerankEligibleFirstUse", func(b *testing.B) {
 		for b.Loop() {
 			b.StopTimer()
-			if err := os.RemoveAll(filepath.Join(cache, "reranker")); err != nil {
+			if err := os.RemoveAll(filepath.Join(semanticCache, "reranker")); err != nil {
 				b.Fatal(err)
 			}
 			b.StartTimer()
-			mustRunSeekBenchmark(b, binary, cache, fixture, eligibleArgs)
+			mustRunSeekBenchmark(b, binary, semanticCache, fixture, eligibleArgs)
 		}
 	})
 	b.Run("RerankEligibleWarm", func(b *testing.B) {
 		for b.Loop() {
-			mustRunSeekBenchmark(b, binary, cache, fixture, eligibleArgs)
+			mustRunSeekBenchmark(b, binary, semanticCache, fixture, eligibleArgs)
 		}
 	})
 	b.Run("RerankEligibleWarmDisplayContextZero", func(b *testing.B) {
 		for b.Loop() {
-			mustRunSeekBenchmark(b, binary, cache, fixture, eligibleDisplayContextZeroArgs)
+			mustRunSeekBenchmark(b, binary, semanticCache, fixture, eligibleDisplayContextZeroArgs)
 		}
 	})
-	b.Run("RerankEligibleOneCandidateWarm", func(b *testing.B) {
+	b.Run("RerankSemanticExpansionWarm", func(b *testing.B) {
 		for b.Loop() {
-			mustRunSeekBenchmark(b, binary, cache, fixture, oneCandidateArgs)
+			mustRunSeekBenchmark(b, binary, semanticCache, fixture, semanticExpansionArgs)
 		}
 	})
 }

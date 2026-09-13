@@ -137,6 +137,50 @@ func TestJoinedGenerationDescriptorBindsBothIndexParts(t *testing.T) {
 	}
 }
 
+func TestJoinedGenerationInvalidatesDescriptorOnLazyGraphDamage(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	indexDir := filepath.Join(root, "index")
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(indexDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(indexDir, familyManifestFile), []byte("family\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const source = "lazy-graph-source"
+	semanticDir := semanticGenerationDir(indexDir, source)
+	units, embeddings := testSemanticRowsAndVectors(t)
+	if _, err := writeTestSemanticGeneration(
+		t.Context(), semanticDir, source, units, embeddings,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJoinedGeneration(cacheDir, indexDir, "state", source); err != nil {
+		t.Fatal(err)
+	}
+	graphPath := filepath.Join(semanticDir, semanticUSearchShardName(0))
+	if err := os.WriteFile(graphPath, []byte("damaged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	generation, err := openJoinedSemanticGeneration(cacheDir, indexDir, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = generation.Close() })
+	if _, err := os.Stat(filepath.Join(cacheDir, joinedGenerationFile)); err != nil {
+		t.Fatal("lazy open removed the descriptor before graph use")
+	}
+	if err := generation.validateUSearchShard(0); err == nil {
+		t.Fatal("lazy graph validation accepted damage")
+	}
+	if _, err := os.Stat(filepath.Join(cacheDir, joinedGenerationFile)); !os.IsNotExist(err) {
+		t.Fatalf("graph damage kept its joined descriptor: %v", err)
+	}
+}
+
 func TestReadJoinedGenerationRejectsInvalidJSON(t *testing.T) {
 	const digest = "0000000000000000000000000000000000000000000000000000000000000000"
 	tests := []struct {

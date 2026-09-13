@@ -8,7 +8,9 @@ import (
 const (
 	// These values define the stored representation. Each unit puts four
 	// once-refined centroids in USearch and stores 20 direct centroids for exact
-	// scoring. A change requires new representation and USearch layout IDs.
+	// scoring. A change requires new representation and USearch layout IDs. A
+	// coarse-count change must remain a power of two for the bitmap-filter key
+	// shift in semantic_usearch_cgo.go.
 	semanticCoarseCentroidsPerUnit = 4
 	semanticFineCentroidsPerUnit   = 20
 	semanticCoarseRefinementPasses = 1
@@ -268,9 +270,25 @@ func semanticVectorDot(left, right semanticVector) float32 {
 }
 
 func semanticQueryTokenVectors(query *semanticQueryEmbedding) ([]semanticVector, error) {
-	if query == nil || len(query.tokens) != lateOnSequenceLength*semanticEmbeddingDimensions ||
-		len(query.scoreMask) != lateOnSequenceLength {
-		return nil, fmt.Errorf("semantic query embedding is invalid")
+	if _, err := semanticQueryTokenCount(query); err != nil {
+		return nil, err
 	}
 	return normalizedLateOnSemanticTokens(query.tokens, query.scoreMask, 0)
+}
+
+func semanticQueryTokenCount(query *semanticQueryEmbedding) (int, error) {
+	if query == nil || len(query.tokens) != lateOnSequenceLength*semanticEmbeddingDimensions ||
+		len(query.scoreMask) != lateOnSequenceLength {
+		return 0, fmt.Errorf("semantic query embedding is invalid")
+	}
+	count := 0
+	for _, score := range query.scoreMask {
+		if score {
+			count++
+		}
+	}
+	if count == 0 {
+		return 0, fmt.Errorf("semantic query embedding has no scoring token")
+	}
+	return count, nil
 }
