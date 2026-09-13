@@ -146,8 +146,9 @@ load it. The wrapper has a 5-second timeout and exits quickly for commands
 outside its contract. The emitted Seek command runs after the hook and is not
 limited by this timeout.
 
-Codex asks the user to trust plugin hooks before it runs them. Both hosts set
-`CLAUDE_PLUGIN_ROOT`, so the shared hook command can locate the wrapper.
+Codex asks the user to trust plugin hooks before it runs them. It asks again if
+an update changes the hook definition. Both hosts set `CLAUDE_PLUGIN_ROOT`, so
+the shared hook command can locate the wrapper.
 
 ## Layout
 

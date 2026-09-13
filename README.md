@@ -151,8 +151,9 @@ codex plugin marketplace upgrade seek # OpenAI Codex
 ```
 
 Start a new session in either client after each install or update. In Codex,
-open `/hooks` and trust `seek-router` once. Claude Code does not require this
-trust step.
+open `/hooks` and review and trust `seek-router` when Codex asks. Codex asks
+again if an update changes the hook definition. Claude Code does not require
+this trust step.
 
 The package does not use an Agent Plugins 1.0 root manifest because that
 standard does not define portable hooks. See the
