@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -201,6 +203,42 @@ func TestSemanticGenerationRoundTrip(t *testing.T) {
 		if info.Mode().Perm()&0o077 != 0 {
 			t.Fatalf("%s mode=%o, want private", name, info.Mode().Perm())
 		}
+	}
+}
+
+type semanticCountingReader struct {
+	reader io.Reader
+	bytes  int
+}
+
+func (reader *semanticCountingReader) Read(buffer []byte) (int, error) {
+	read, err := reader.reader.Read(buffer)
+	reader.bytes += read
+	return read, err
+}
+
+func TestReadVerifiedSemanticRowsReadsInputOnce(t *testing.T) {
+	rows := []semanticUnit{{
+		row: 0, path: "main.go", start: 1, end: 2, kind: semanticUnitSymbol,
+		parserResult: semanticParserCTags, language: "Go", fileLanguage: "Go",
+	}}
+	rows[0].id = makeSemanticUnitID(rows[0])
+	path := filepath.Join(t.TempDir(), semanticRowsFile)
+	artifact, err := writeSemanticRows(path, rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &semanticCountingReader{reader: bytes.NewReader(encoded)}
+	decoded, err := readVerifiedSemanticRows(reader, artifact.SHA256, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded) != 1 || reader.bytes != len(encoded) {
+		t.Fatalf("decoded rows=%d bytes=%d, want 1 and %d", len(decoded), reader.bytes, len(encoded))
 	}
 }
 

@@ -316,8 +316,8 @@ func tryHybridFolderSearch(
 }
 
 // runHybridBranches starts strict Zoekt, relaxed Zoekt, and semantic retrieval
-// together. Semantic retrieval prepares the shared query once, searches every
-// USearch shard, and exact-scores its candidate rows. Any branch error asks the
+// together. Semantic retrieval prepares the shared query once, plans each
+// shard, and exact-scores the resulting row union. Any branch error asks the
 // caller to use its normal fallback path.
 func runHybridBranches(
 	ctx context.Context,
@@ -367,10 +367,11 @@ func runHybridBranches(
 		if semantic.err != nil {
 			return
 		}
-		semantic.hits, semantic.err = semanticUSearchExactFallback(
+		semantic.hits, semantic.err = semanticUSearchFiltered(
 			ctx,
 			generation,
 			semantic.query,
+			rerankPlan.semanticFilter,
 			hybridSemanticUnitLimit,
 		)
 	}()

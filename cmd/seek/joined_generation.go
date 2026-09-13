@@ -110,8 +110,8 @@ func writeJoinedGeneration(
 // joinedGenerationMatches performs the fast activation check for a joined
 // index. It checks the descriptor, the Zoekt family-manifest digest, and the
 // semantic manifest compatibility. It does not open the semantic row or vector
-// data or validate USearch shards; openJoinedSemanticGeneration does those
-// checks before a search uses the generation.
+// data or validate USearch shards. openJoinedSemanticGeneration checks row and
+// vector data before search and checks each graph before its first native use.
 func joinedGenerationMatches(
 	cacheDir string,
 	indexDir string,
@@ -180,20 +180,20 @@ func validateSemanticGeneration(indexDir, source string) error {
 
 // openJoinedSemanticGeneration opens the source generation after the caller
 // has matched its joined descriptor while holding the strict read lock. This
-// function does not read or select the descriptor itself. Damage clears the
-// descriptor so the next run repairs the index. A damaged USearch shard can use
-// exact vectors for the current search.
+// function does not read or select the descriptor itself. It defers each graph
+// checksum until a native plan first needs that shard. Graph damage clears the
+// descriptor so the next run repairs the index.
 func openJoinedSemanticGeneration(
 	cacheDir string,
 	indexDir string,
 	source string,
 ) (*semanticGeneration, error) {
-	generation, err := openSemanticGeneration(semanticGenerationDir(indexDir, source), source)
+	generation, err := openSemanticGenerationForSearch(semanticGenerationDir(indexDir, source), source)
 	if err != nil {
 		removeJoinedGeneration(cacheDir)
 		return nil, err
 	}
-	if generation.usearchErr != nil {
+	generation.onUSearchDamage = func() {
 		removeJoinedGeneration(cacheDir)
 	}
 	return generation, nil

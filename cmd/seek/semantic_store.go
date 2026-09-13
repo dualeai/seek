@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"sync"
 	"unsafe"
@@ -107,15 +108,24 @@ type semanticManifest struct {
 }
 
 // semanticGeneration owns one open semantic generation. vectors aliases the
-// memory in vectorMap and must not be used after Close. usearchErr keeps the
-// exact mapped vectors available when only the approximate index is damaged.
+// memory in vectorMap and must not be used after Close. A search-opened
+// generation validates each graph before its first native use. A fully opened
+// generation records aggregate graph validation in usearchErr.
 type semanticGeneration struct {
-	manifest   semanticManifest
-	rows       []semanticUnit
-	vectors    []semanticFineVectors
-	vectorMap  []byte
-	usearch    []string
-	usearchErr error
+	manifest          semanticManifest
+	rows              []semanticUnit
+	vectors           []semanticFineVectors
+	vectorMap         []byte
+	usearch           []string
+	usearchErr        error
+	usearchValidation []semanticUSearchValidation
+	onUSearchDamage   func()
+	usearchDamageOnce sync.Once
+}
+
+type semanticUSearchValidation struct {
+	once sync.Once
+	err  error
 }
 
 func semanticGenerationKey(source string) string {
@@ -337,31 +347,42 @@ func inspectSemanticArtifact(path string) (semanticArtifact, error) {
 	return semanticArtifact{Bytes: uint64(info.Size()), SHA256: hex.EncodeToString(hash.Sum(nil))}, nil
 }
 
-// openSemanticGeneration validates the manifest and row data, checks the vector
-// file length before mapping it, and records validation failure for any USearch
-// shard. It does not hash the rebuildable vector file.
+// openSemanticGeneration fully validates stored artifacts. Search opens use
+// openSemanticGenerationForSearch so an exact-only plan does not hash unused
+// graph shards.
 func openSemanticGeneration(dir, source string) (*semanticGeneration, error) {
+	return openSemanticGenerationWithOptions(dir, source, true)
+}
+
+func openSemanticGenerationForSearch(dir, source string) (*semanticGeneration, error) {
+	return openSemanticGenerationWithOptions(dir, source, false)
+}
+
+func openSemanticGenerationWithOptions(
+	dir string,
+	source string,
+	validateGraphs bool,
+) (*semanticGeneration, error) {
 	manifest, err := readSemanticManifest(dir, source)
 	if err != nil {
 		return nil, err
 	}
-	rowsFile, err := openCheckedSemanticArtifact(
+	rows, err := readCheckedSemanticRows(
 		filepath.Join(dir, semanticRowsFile),
 		manifest.RowsFile,
+		manifest.Rows,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("validate %s: %w", semanticRowsFile, err)
 	}
-	defer func() { _ = rowsFile.Close() }()
+	if err := validateSemanticUSearchShardMetadata(manifest.Rows, manifest.USearchFiles); err != nil {
+		return nil, err
+	}
 	vectorsFile, err := openRegularSemanticFile(filepath.Join(dir, semanticVectorsFile))
 	if err != nil {
 		return nil, fmt.Errorf("validate %s: %w", semanticVectorsFile, err)
 	}
 	defer func() { _ = vectorsFile.Close() }()
-	rows, err := readSemanticRowsFrom(rowsFile, manifest.Rows)
-	if err != nil {
-		return nil, err
-	}
 	vectors, vectorMap, err := mapSemanticVectors(vectorsFile, manifest.Rows)
 	if err != nil {
 		return nil, err
@@ -377,10 +398,40 @@ func openSemanticGeneration(dir, source string) (*semanticGeneration, error) {
 		vectorMap: vectorMap,
 		usearch:   usearchPaths,
 	}
-	if err := validateSemanticUSearchShards(dir, manifest.Rows, manifest.USearchFiles); err != nil {
-		generation.usearchErr = err
+	if validateGraphs {
+		generation.usearchErr = validateSemanticUSearchShardArtifacts(dir, manifest.USearchFiles)
+	} else {
+		generation.usearchValidation = make([]semanticUSearchValidation, len(manifest.USearchFiles))
 	}
 	return generation, nil
+}
+
+func (generation *semanticGeneration) validateUSearchShard(index int) error {
+	if generation == nil || index < 0 || index >= len(generation.usearch) ||
+		index >= len(generation.manifest.USearchFiles) {
+		return fmt.Errorf("USearch semantic shard %d is unavailable", index)
+	}
+	if generation.usearchErr != nil {
+		return generation.usearchErr
+	}
+	if len(generation.usearchValidation) == 0 {
+		return nil
+	}
+	if len(generation.usearchValidation) != len(generation.usearch) {
+		return fmt.Errorf("USearch semantic validation state is invalid")
+	}
+	validation := &generation.usearchValidation[index]
+	validation.once.Do(func() {
+		shard := generation.manifest.USearchFiles[index]
+		validation.err = validateSemanticArtifact(generation.usearch[index], shard.semanticArtifact)
+		if validation.err != nil && generation.onUSearchDamage != nil {
+			generation.usearchDamageOnce.Do(generation.onUSearchDamage)
+		}
+	})
+	if validation.err != nil {
+		return fmt.Errorf("validate %s: %w", generation.manifest.USearchFiles[index].Name, validation.err)
+	}
+	return nil
 }
 
 func readSemanticManifest(dir, source string) (semanticManifest, error) {
@@ -541,6 +592,13 @@ func semanticUSearchShardName(index int) string {
 }
 
 func validateSemanticUSearchShards(dir string, rows uint64, shards []semanticUSearchShard) error {
+	if err := validateSemanticUSearchShardMetadata(rows, shards); err != nil {
+		return err
+	}
+	return validateSemanticUSearchShardArtifacts(dir, shards)
+}
+
+func validateSemanticUSearchShardMetadata(rows uint64, shards []semanticUSearchShard) error {
 	if rows == 0 {
 		if len(shards) != 0 {
 			return fmt.Errorf("empty semantic generation has USearch shards")
@@ -559,13 +617,19 @@ func validateSemanticUSearchShards(dir string, rows uint64, shards []semanticUSe
 		if _, err := decodeSemanticDigest(shard.SHA256); err != nil {
 			return err
 		}
-		if err := validateSemanticArtifact(filepath.Join(dir, shard.Name), shard.semanticArtifact); err != nil {
-			return fmt.Errorf("validate %s: %w", shard.Name, err)
-		}
 		next += shard.Rows
 	}
 	if next != rows {
 		return fmt.Errorf("USearch shards cover %d rows, want %d", next, rows)
+	}
+	return nil
+}
+
+func validateSemanticUSearchShardArtifacts(dir string, shards []semanticUSearchShard) error {
+	for _, shard := range shards {
+		if err := validateSemanticArtifact(filepath.Join(dir, shard.Name), shard.semanticArtifact); err != nil {
+			return fmt.Errorf("validate %s: %w", shard.Name, err)
+		}
 	}
 	return nil
 }
@@ -617,33 +681,41 @@ func validateSemanticArtifact(path string, want semanticArtifact) error {
 	return nil
 }
 
-func openCheckedSemanticArtifact(path string, want semanticArtifact) (*os.File, error) {
+func readCheckedSemanticRows(
+	path string,
+	want semanticArtifact,
+	count uint64,
+) ([]semanticUnit, error) {
 	file, err := openRegularSemanticFile(path)
 	if err != nil {
 		return nil, err
 	}
-	valid := false
-	defer func() {
-		if !valid {
-			_ = file.Close()
-		}
-	}()
+	defer func() { _ = file.Close() }()
 	info, err := file.Stat()
 	if err != nil || uint64(info.Size()) != want.Bytes {
 		return nil, fmt.Errorf("semantic artifact length mismatch")
 	}
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
+	rows, err := readVerifiedSemanticRows(file, want.SHA256, count)
+	if err != nil {
 		return nil, err
 	}
-	if hex.EncodeToString(hash.Sum(nil)) != want.SHA256 {
+	return rows, nil
+}
+
+func readVerifiedSemanticRows(
+	reader io.Reader,
+	wantSHA256 string,
+	count uint64,
+) ([]semanticUnit, error) {
+	hash := sha256.New()
+	rows, err := readSemanticRowsFrom(io.TeeReader(reader, hash), count)
+	if err != nil {
+		return nil, err
+	}
+	if hex.EncodeToString(hash.Sum(nil)) != wantSHA256 {
 		return nil, fmt.Errorf("semantic artifact checksum mismatch")
 	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return nil, err
-	}
-	valid = true
-	return file, nil
+	return rows, nil
 }
 
 func readSemanticRowsFrom(reader io.Reader, count uint64) ([]semanticUnit, error) {
@@ -783,14 +855,12 @@ func exactSemanticSearch(
 	if limit <= 0 || len(vectors) == 0 {
 		return nil, nil
 	}
-	rows := make([]uint64, len(vectors))
-	for row := range vectors {
-		rows[row] = uint64(row)
-	}
-	return exactSemanticRows(ctx, vectors, queryVectors, rows, limit)
+	return exactSemanticRowSelection(ctx, vectors, queryVectors, nil, len(vectors), limit)
 }
 
-func exactSemanticCandidates(
+// exactSemanticSortedCandidates scores a sorted set of unique row IDs. Search
+// planning already produces this order, which keeps vector reads sequential.
+func exactSemanticSortedCandidates(
 	ctx context.Context,
 	vectors []semanticFineVectors,
 	query *semanticQueryEmbedding,
@@ -804,17 +874,30 @@ func exactSemanticCandidates(
 	if err != nil {
 		return nil, err
 	}
+	return exactSemanticSortedRows(ctx, vectors, queryVectors, rows, limit)
+}
+
+// exactSemanticSortedRows scores checked query vectors against sorted unique
+// row IDs.
+func exactSemanticSortedRows(
+	ctx context.Context,
+	vectors []semanticFineVectors,
+	query []semanticVector,
+	rows []uint64,
+	limit int,
+) ([]semanticHit, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if limit <= 0 || len(rows) == 0 {
 		return nil, nil
 	}
-	rows = append([]uint64(nil), rows...)
-	sort.Slice(rows, func(left, right int) bool { return rows[left] < rows[right] })
 	for index, row := range rows {
-		if row >= uint64(len(vectors)) || (index > 0 && row == rows[index-1]) {
+		if row >= uint64(len(vectors)) || (index > 0 && row <= rows[index-1]) {
 			return nil, fmt.Errorf("semantic candidate row %d is invalid", row)
 		}
 	}
-	return exactSemanticRows(ctx, vectors, queryVectors, rows, limit)
+	return exactSemanticRows(ctx, vectors, query, rows, limit)
 }
 
 func exactSemanticRows(
@@ -824,9 +907,27 @@ func exactSemanticRows(
 	rows []uint64,
 	limit int,
 ) ([]semanticHit, error) {
-	workers := min(runtime.GOMAXPROCS(0), max(1, len(rows)/256))
+	return exactSemanticRowSelection(ctx, vectors, query, rows, len(rows), limit)
+}
+
+// exactSemanticRowSelection uses implicit consecutive row IDs when rows is nil.
+// This keeps a full recovery scan from allocating one uint64 for every row.
+func exactSemanticRowSelection(
+	ctx context.Context,
+	vectors []semanticFineVectors,
+	query []semanticVector,
+	rows []uint64,
+	rowCount int,
+	limit int,
+) ([]semanticHit, error) {
+	// One row-token pair compares all fine centroids. Include query length in the
+	// worker count so long descriptive queries do not run large exact routes on
+	// one or two CPUs.
+	const rowTokenPairsPerWorker = 512
+	work := rowCount * max(1, len(query))
+	workers := min(runtime.GOMAXPROCS(0), max(1, work/rowTokenPairsPerWorker))
 	if workers == 1 {
-		hits, err := exactSemanticRange(ctx, vectors, query, rows, limit)
+		hits, err := exactSemanticRange(ctx, vectors, query, rows, 0, rowCount, limit)
 		return hits, errors.Join(err, ctx.Err())
 	}
 	type result struct {
@@ -835,14 +936,14 @@ func exactSemanticRows(
 	}
 	results := make(chan result, workers)
 	for worker := range workers {
-		start := len(rows) * worker / workers
-		end := len(rows) * (worker + 1) / workers
+		start := rowCount * worker / workers
+		end := rowCount * (worker + 1) / workers
 		go func() {
-			hits, err := exactSemanticRange(ctx, vectors, query, rows[start:end], limit)
+			hits, err := exactSemanticRange(ctx, vectors, query, rows, start, end, limit)
 			results <- result{hits: hits, err: err}
 		}()
 	}
-	merged := make([]semanticHit, 0, workers*limit)
+	merged := make([]semanticHit, 0, min(rowCount, workers*limit))
 	var searchErr error
 	for range workers {
 		result := <-results
@@ -878,12 +979,24 @@ func exactSemanticRange(
 	vectors []semanticFineVectors,
 	query []semanticVector,
 	rows []uint64,
+	start int,
+	end int,
 	limit int,
 ) ([]semanticHit, error) {
-	hits := make([]semanticHit, 0, min(limit, len(rows)))
-	for index, row := range rows {
-		if index&4095 == 0 && ctx.Err() != nil {
-			return nil, ctx.Err()
+	hits := make([]semanticHit, 0, min(limit, end-start))
+	contextCheckRows := max(1, 4096/max(1, len(query)))
+	nextContextCheck := 0
+	for index := start; index < end; index++ {
+		progress := index - start
+		if progress == nextContextCheck {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			nextContextCheck += contextCheckRows
+		}
+		row := uint64(index)
+		if rows != nil {
+			row = rows[index]
 		}
 		for centroid, vector := range vectors[row] {
 			if err := validateNormalizedSemanticVector(vector); err != nil {
@@ -919,12 +1032,25 @@ func exactSemanticRange(
 }
 
 func sortSemanticHits(hits []semanticHit) {
-	sort.SliceStable(hits, func(i, j int) bool { return semanticHitLess(hits[i], hits[j]) })
+	slices.SortFunc(hits, compareSemanticHits)
 }
 
 func semanticHitLess(left, right semanticHit) bool {
-	if left.score != right.score {
-		return left.score > right.score
+	return compareSemanticHits(left, right) < 0
+}
+
+func compareSemanticHits(left, right semanticHit) int {
+	if left.score > right.score {
+		return -1
 	}
-	return left.row < right.row
+	if left.score < right.score {
+		return 1
+	}
+	if left.row < right.row {
+		return -1
+	}
+	if left.row > right.row {
+		return 1
+	}
+	return 0
 }
