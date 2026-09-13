@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	semanticFormatVersion = 3
+	semanticFormatVersion = 4
 	// Compatibility revisions are cache barriers for behavior that asset hashes
 	// and typed format settings cannot describe.
 	semanticRepresentationRevision = "anchored-spherical-f32-v1"
@@ -35,6 +35,8 @@ const (
 	semanticUSearchFilePrefix      = "index-"
 	semanticUSearchFileSuffix      = ".usearch"
 	semanticRowsMagic              = "SEEKSROW"
+	semanticRowsHeaderBytes        = len(semanticRowsMagic) + 8
+	semanticRowFixedBytes          = 3*8 + 2*sha256.Size + 4 + 2 + 2 + 2 + 2
 	semanticManifestMaxBytes       = 64 << 10
 	semanticMetadataFieldMax       = 1 << 20
 	semanticMaxRows                = 10_000_000
@@ -205,21 +207,28 @@ func writeSemanticGenerationFromParts(
 	return manifest, nil
 }
 
+// The stored row layout starts with magic and a little-endian uint64 row count.
+// Each row then stores row, start, and end as uint64 values; two SHA-256 values;
+// path length as uint32; language, file-language, and symbol lengths as uint16;
+// and kind and parser result as bytes. The path, language, file-language, and
+// symbol bytes follow in that order with no padding. Keep readSemanticRowsFrom
+// and checkedSemanticRowsMinimumBytes in sync with this layout.
 func writeSemanticRows(path string, units []semanticUnit) (semanticArtifact, error) {
 	return writeSemanticArtifact(path, func(writer io.Writer) error {
 		buffered := bufio.NewWriterSize(writer, 256<<10)
-		var fileHeader [len(semanticRowsMagic) + 8]byte
+		var fileHeader [semanticRowsHeaderBytes]byte
 		copy(fileHeader[:], semanticRowsMagic)
 		binary.LittleEndian.PutUint64(fileHeader[len(semanticRowsMagic):], uint64(len(units)))
 		if _, err := buffered.Write(fileHeader[:]); err != nil {
 			return err
 		}
-		const fixedRowBytes = 3*8 + 2*sha256.Size + 4 + 2 + 2 + 2
-		var fixed [fixedRowBytes]byte
+		var fixed [semanticRowFixedBytes]byte
 		for index, unit := range units {
 			if unit.row != uint64(index) || unit.end <= unit.start ||
 				len(unit.path) > semanticMetadataFieldMax ||
-				len(unit.language) > math.MaxUint16 || len(unit.symbol) > math.MaxUint16 {
+				len(unit.language) > math.MaxUint16 ||
+				len(unit.fileLanguage) > math.MaxUint16 ||
+				len(unit.symbol) > math.MaxUint16 {
 				return fmt.Errorf("invalid semantic row %d", index)
 			}
 			binary.LittleEndian.PutUint64(fixed[0:8], unit.row)
@@ -229,13 +238,14 @@ func writeSemanticRows(path string, units []semanticUnit) (semanticArtifact, err
 			copy(fixed[24+sha256.Size:24+2*sha256.Size], unit.contentID[:])
 			binary.LittleEndian.PutUint32(fixed[88:92], uint32(len(unit.path)))
 			binary.LittleEndian.PutUint16(fixed[92:94], uint16(len(unit.language)))
-			binary.LittleEndian.PutUint16(fixed[94:96], uint16(len(unit.symbol)))
-			fixed[96] = byte(unit.kind)
-			fixed[97] = byte(unit.parserResult)
+			binary.LittleEndian.PutUint16(fixed[94:96], uint16(len(unit.fileLanguage)))
+			binary.LittleEndian.PutUint16(fixed[96:98], uint16(len(unit.symbol)))
+			fixed[98] = byte(unit.kind)
+			fixed[99] = byte(unit.parserResult)
 			if _, err := buffered.Write(fixed[:]); err != nil {
 				return err
 			}
-			for _, value := range []string{unit.path, unit.language, unit.symbol} {
+			for _, value := range []string{unit.path, unit.language, unit.fileLanguage, unit.symbol} {
 				if _, err := buffered.WriteString(value); err != nil {
 					return err
 				}
@@ -518,8 +528,8 @@ func validateSemanticManifest(manifest semanticManifest, source string) error {
 }
 
 func checkedSemanticRowsMinimumBytes(rows uint64) (uint64, bool) {
-	const headerBytes = uint64(len(semanticRowsMagic) + 8)
-	const fixedRowBytes = uint64(3*8 + 2*sha256.Size + 4 + 2 + 2 + 2)
+	headerBytes := uint64(semanticRowsHeaderBytes)
+	fixedRowBytes := uint64(semanticRowFixedBytes)
 	if rows > (math.MaxUint64-headerBytes)/fixedRowBytes {
 		return 0, false
 	}
@@ -638,64 +648,71 @@ func openCheckedSemanticArtifact(path string, want semanticArtifact) (*os.File, 
 
 func readSemanticRowsFrom(reader io.Reader, count uint64) ([]semanticUnit, error) {
 	buffered := bufio.NewReaderSize(reader, 256<<10)
-	magic := make([]byte, len(semanticRowsMagic))
-	if _, err := io.ReadFull(buffered, magic); err != nil || string(magic) != semanticRowsMagic {
+	var header [semanticRowsHeaderBytes]byte
+	if _, err := io.ReadFull(buffered, header[:]); err != nil ||
+		string(header[:len(semanticRowsMagic)]) != semanticRowsMagic {
 		return nil, fmt.Errorf("semantic row header is invalid")
 	}
-	var storedCount uint64
-	if err := binary.Read(buffered, binary.LittleEndian, &storedCount); err != nil || storedCount != count {
+	storedCount := binary.LittleEndian.Uint64(header[len(semanticRowsMagic):])
+	if storedCount != count {
 		return nil, fmt.Errorf("semantic row count is invalid")
 	}
 	rows := make([]semanticUnit, int(count))
+	var fixed [semanticRowFixedBytes]byte
+	var fields []byte
+	var idBuffer []byte
+	internedLanguages := make(map[string]string)
+	var previousPath string
 	for index := range rows {
 		unit := &rows[index]
-		for _, target := range []*uint64{&unit.row, &unit.start, &unit.end} {
-			if err := binary.Read(buffered, binary.LittleEndian, target); err != nil {
-				return nil, fmt.Errorf("read semantic row %d: %w", index, err)
-			}
+		if _, err := io.ReadFull(buffered, fixed[:]); err != nil {
+			return nil, fmt.Errorf("read semantic row %d: %w", index, err)
 		}
-		if _, err := io.ReadFull(buffered, unit.id[:]); err != nil {
-			return nil, err
-		}
-		if _, err := io.ReadFull(buffered, unit.contentID[:]); err != nil {
-			return nil, err
-		}
-		var pathBytes uint32
-		var languageBytes, symbolBytes uint16
-		if err := binary.Read(buffered, binary.LittleEndian, &pathBytes); err != nil {
-			return nil, err
-		}
-		if err := binary.Read(buffered, binary.LittleEndian, &languageBytes); err != nil {
-			return nil, err
-		}
-		if err := binary.Read(buffered, binary.LittleEndian, &symbolBytes); err != nil {
-			return nil, err
-		}
-		kinds := make([]byte, 2)
-		if _, err := io.ReadFull(buffered, kinds); err != nil {
-			return nil, err
-		}
+		unit.row = binary.LittleEndian.Uint64(fixed[0:8])
+		unit.start = binary.LittleEndian.Uint64(fixed[8:16])
+		unit.end = binary.LittleEndian.Uint64(fixed[16:24])
+		copy(unit.id[:], fixed[24:24+sha256.Size])
+		copy(unit.contentID[:], fixed[24+sha256.Size:24+2*sha256.Size])
+		pathBytes := binary.LittleEndian.Uint32(fixed[88:92])
+		languageBytes := binary.LittleEndian.Uint16(fixed[92:94])
+		fileLanguageBytes := binary.LittleEndian.Uint16(fixed[94:96])
+		symbolBytes := binary.LittleEndian.Uint16(fixed[96:98])
 		if pathBytes > semanticMetadataFieldMax {
 			return nil, fmt.Errorf("semantic row path is too large")
 		}
-		fieldsBytes := uint64(pathBytes) + uint64(languageBytes) + uint64(symbolBytes)
+		fieldsBytes := uint64(pathBytes) + uint64(languageBytes) +
+			uint64(fileLanguageBytes) + uint64(symbolBytes)
 		if fieldsBytes > 2*semanticMetadataFieldMax {
 			return nil, fmt.Errorf("semantic row fields are too large")
 		}
-		fields := make([]byte, int(fieldsBytes))
+		if cap(fields) < int(fieldsBytes) {
+			fields = make([]byte, int(fieldsBytes))
+		} else {
+			fields = fields[:int(fieldsBytes)]
+		}
 		if _, err := io.ReadFull(buffered, fields); err != nil {
 			return nil, err
 		}
 		languageAt := int(pathBytes)
-		symbolAt := languageAt + int(languageBytes)
-		unit.path = string(fields[:languageAt])
-		unit.language = string(fields[languageAt:symbolAt])
+		fileLanguageAt := languageAt + int(languageBytes)
+		symbolAt := fileLanguageAt + int(fileLanguageBytes)
+		pathField := fields[:languageAt]
+		if previousPath != "" && previousPath == string(pathField) {
+			unit.path = previousPath
+		} else {
+			unit.path = string(pathField)
+			previousPath = unit.path
+		}
+		unit.language = internSemanticRowLanguage(internedLanguages, fields[languageAt:fileLanguageAt])
+		unit.fileLanguage = internSemanticRowLanguage(internedLanguages, fields[fileLanguageAt:symbolAt])
 		unit.symbol = string(fields[symbolAt:])
-		unit.kind = semanticUnitKind(kinds[0])
-		unit.parserResult = semanticParserResult(kinds[1])
+		unit.kind = semanticUnitKind(fixed[98])
+		unit.parserResult = semanticParserResult(fixed[99])
+		var wantID semanticUnitID
+		wantID, idBuffer = makeSemanticUnitIDBuffered(*unit, idBuffer)
 		if unit.row != uint64(index) || unit.path == "" || unit.end <= unit.start ||
 			unit.end-unit.start > semanticUnitMaxBytes ||
-			unit.id != makeSemanticUnitID(*unit) ||
+			unit.id != wantID ||
 			unit.kind < semanticUnitGap || unit.kind > semanticUnitPacked ||
 			unit.parserResult < semanticParserCTags || unit.parserResult > semanticParserInvalidUTF8 {
 			return nil, fmt.Errorf("semantic row %d is invalid", index)
@@ -705,6 +722,18 @@ func readSemanticRowsFrom(reader io.Reader, count uint64) ([]semanticUnit, error
 		return nil, fmt.Errorf("semantic row file has trailing data")
 	}
 	return rows, nil
+}
+
+func internSemanticRowLanguage(interned map[string]string, raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	if value, ok := interned[string(raw)]; ok {
+		return value
+	}
+	value := string(raw)
+	interned[value] = value
+	return value
 }
 
 func mapSemanticVectors(file *os.File, count uint64) ([]semanticFineVectors, []byte, error) {

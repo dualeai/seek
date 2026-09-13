@@ -246,6 +246,10 @@ func TestPackLateOnSemanticUnitsJoinsOnlyCompleteRows(t *testing.T) {
 		{Name: "Alpha", Kind: "function", Language: "Go", Line: 1},
 		{Name: "Beta", Kind: "function", Language: "Go", Line: 2},
 	}, nil)
+	for index := range shortUnits {
+		shortUnits[index].fileLanguage = "Go"
+		shortUnits[index].id = makeSemanticUnitID(shortUnits[index])
+	}
 	packed, err := packLateOnSemanticUnits(t.Context(), tokenizer, shortUnits)
 	if err != nil {
 		t.Fatal(err)
@@ -253,6 +257,9 @@ func TestPackLateOnSemanticUnitsJoinsOnlyCompleteRows(t *testing.T) {
 	if len(packed) != 1 || packed[0].kind != semanticUnitPacked ||
 		packed[0].symbol != "function Alpha function Beta" {
 		t.Fatalf("packed units=%+v", packed)
+	}
+	if packed[0].fileLanguage != "Go" {
+		t.Fatalf("packed file language=%q, want Go", packed[0].fileLanguage)
 	}
 	if len(packed[0].modelInput) == 0 || len(packed[0].modelInput) > lateOnSequenceLength {
 		t.Fatalf("packed model input has %d tokens", len(packed[0].modelInput))
@@ -297,6 +304,26 @@ func TestPackLateOnSemanticUnitsJoinsOnlyCompleteRows(t *testing.T) {
 	cancel()
 	if _, err := packLateOnSemanticUnits(canceled, tokenizer, shortUnits); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled pack error=%v", err)
+	}
+}
+
+func TestLateOnSemanticDocumentKeepsFileLanguageOutOfModelInput(t *testing.T) {
+	unit := semanticUnit{
+		path:         "main.go",
+		language:     "Go",
+		fileLanguage: "Go",
+		text:         []byte("package main\n"),
+	}
+	first, firstMetadataEnd, firstMatchAt, firstMatchEnd := serializeLateOnDocumentWithMatch(
+		lateOnSemanticDocument(unit),
+	)
+	unit.fileLanguage = "Python"
+	second, secondMetadataEnd, secondMatchAt, secondMatchEnd := serializeLateOnDocumentWithMatch(
+		lateOnSemanticDocument(unit),
+	)
+	if first != second || firstMetadataEnd != secondMetadataEnd ||
+		firstMatchAt != secondMatchAt || firstMatchEnd != secondMatchEnd {
+		t.Fatalf("file language changed model input:\nfirst=%q\nsecond=%q", first, second)
 	}
 }
 

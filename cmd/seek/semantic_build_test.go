@@ -12,7 +12,54 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/sourcegraph/zoekt/index"
 )
+
+func TestSemanticDocumentLanguageMatchesZoektDetection(t *testing.T) {
+	options := indexBuildOptions("", 1)
+	options.SetDefaults()
+	checker := &index.DocChecker{}
+	tests := []struct {
+		name     string
+		document fileContent
+		want     string
+	}{
+		{
+			name: "Go source",
+			document: fileContent{
+				name:    "cmd/seek/main.go",
+				content: []byte("package main\nfunc main() {}\n"),
+			},
+			want: "Go",
+		},
+		{
+			name: "skipped Python source",
+			document: fileContent{
+				name:       "tool.py",
+				content:    []byte("print('ignored')\n"),
+				skipReason: index.SkipReasonTooLarge,
+			},
+			want: "Python",
+		},
+		{
+			name: "unknown extension",
+			document: fileContent{
+				name:    "NOTICE.unknown-seek-test",
+				content: []byte("plain words with no source markers\n"),
+			},
+			want: "",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := semanticDocumentLanguage(checker, options, test.document)
+			if got != test.want {
+				t.Fatalf("language=%q, want %q", got, test.want)
+			}
+		})
+	}
+}
 
 type semanticBuildTestEmbedder struct {
 	embed func(context.Context, []semanticUnit) ([]semanticUnitEmbedding, error)

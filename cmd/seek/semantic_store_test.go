@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -35,6 +36,8 @@ func testSemanticRowsAndVectors(t *testing.T) ([]semanticUnit, []semanticUnitEmb
 		t.Fatalf("units=%d", len(units))
 	}
 	units[0].row = 0
+	units[0].fileLanguage = "Go"
+	units[0].id = makeSemanticUnitID(units[0])
 	vector := semanticVector{}
 	vector[0] = 0.6
 	vector[1] = 0.8
@@ -214,6 +217,20 @@ func TestSemanticGenerationKeyIncludesSource(t *testing.T) {
 	}
 }
 
+func TestSemanticFormatThreeManifestIsIncompatible(t *testing.T) {
+	units, embeddings := testSemanticRowsAndVectors(t)
+	manifest, err := writeTestSemanticGeneration(
+		t.Context(), t.TempDir(), "head-format", units, embeddings,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Format = 3
+	if err := validateSemanticManifest(manifest, "head-format"); err == nil {
+		t.Fatal("format 3 semantic manifest stayed compatible")
+	}
+}
+
 func TestOpenSemanticGenerationRejectsDamage(t *testing.T) {
 	units, embeddings := testSemanticRowsAndVectors(t)
 	tests := []struct {
@@ -357,6 +374,20 @@ func TestWriteSemanticGenerationRejectsInvalidRows(t *testing.T) {
 	_, err := writeTestSemanticGeneration(t.Context(), t.TempDir(), "head", units, embeddings)
 	if err == nil {
 		t.Fatal("out-of-order row must fail")
+	}
+}
+
+func TestWriteSemanticRowsRejectsLongFileLanguage(t *testing.T) {
+	units := []semanticUnit{{
+		row:          0,
+		path:         "main.go",
+		start:        0,
+		end:          1,
+		fileLanguage: strings.Repeat("x", math.MaxUint16+1),
+	}}
+	_, err := writeSemanticRows(filepath.Join(t.TempDir(), semanticRowsFile), units)
+	if err == nil {
+		t.Fatal("oversize file language must fail")
 	}
 }
 

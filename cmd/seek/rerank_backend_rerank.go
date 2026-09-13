@@ -649,6 +649,7 @@ func packLateOnSemanticUnits(
 func mergeSemanticUnits(left, right semanticUnit) (semanticUnit, bool) {
 	if left.path == "" || left.path != right.path || left.contentID != right.contentID ||
 		left.end != right.start || left.parserResult != right.parserResult ||
+		left.fileLanguage != right.fileLanguage ||
 		right.end <= left.start || right.end-left.start > semanticUnitMaxBytes {
 		return semanticUnit{}, false
 	}
