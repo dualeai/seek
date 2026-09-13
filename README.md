@@ -536,11 +536,13 @@ An unscoped search reports the limit error.
 
 ### Cache maintenance
 
-The cache cleans itself: after each run, seek garbage-collects corpora that
-have not been used for 14 days. A corpus counts as used every time it is
-searched or indexed. The automatic pass runs at most once per day and is
-disabled when the cache lives on a network filesystem. GC has no total-size
-target, so active or recent corpora can use more than a fixed total size.
+The cache cleans itself. By default, after each run, seek garbage-collects
+corpora that have not been used for 14 days. A corpus counts as used every time
+it is searched or indexed. By default, the automatic pass runs at most once per
+24 hours. It is disabled when the cache lives on a network filesystem. Set
+`SEEK_CACHE_DIR` to a local directory to enable it. On Linux, you can instead
+unset `SEEK_CACHE_DIR` and set `XDG_CACHE_HOME`. GC has no total-size target, so
+active or recent corpora can use more than a fixed total size.
 
 Environment knobs:
 
@@ -551,7 +553,7 @@ Manual control:
 
 ```sh
 seek gc --dry-run --sort=size   # what is eating my disk? (no changes made)
-seek gc --force                 # run now, ignore the daily throttle
+seek gc --force                 # run now, ignore the interval throttle
 seek gc --all                   # evict every corpus not actively in use
 ```
 

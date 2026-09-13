@@ -34,6 +34,9 @@ const (
 
 	envGCMaxAge   = "SEEK_GC_MAX_AGE"
 	envGCInterval = "SEEK_GC_INTERVAL"
+
+	gcLocalCacheHint = "Set SEEK_CACHE_DIR to a local directory. " +
+		"On Linux, you can instead unset SEEK_CACHE_DIR and set XDG_CACHE_HOME."
 )
 
 // TODO(gc-size-cap): GC is age-based and has no total cache-size limit. A
@@ -325,8 +328,7 @@ func warnNFSOnce(cacheRoot string) {
 	stampPath := filepath.Join(cacheRoot, gcStampFile)
 	if _, err := os.Stat(stampPath); errors.Is(err, fs.ErrNotExist) {
 		slog.Warn(
-			"seek cache on network filesystem; auto-GC disabled. "+
-				"Set XDG_CACHE_HOME to a local directory to enable.",
+			"seek cache on network filesystem; auto-GC disabled. "+gcLocalCacheHint,
 			"cache_root", cacheRoot,
 		)
 		touchStamp(cacheRoot)

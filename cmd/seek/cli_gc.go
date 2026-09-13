@@ -13,8 +13,8 @@ func newGCCmd() *cobra.Command {
 		Aliases: []string{"garbage-collect"},
 		Short:   "Garbage-collect the seek cache",
 		Long: fmt.Sprintf(`Evict per-corpus caches older than the TTL (default %s) or all
-non-locked corpora with --all. Honors a per-process throttle gate
-unless --force is passed. --dry-run prints the plan without mutating
+non-locked corpora with --all. Normal runs honor the .last-gc interval;
+--force and --all bypass it. --dry-run prints the plan without mutating
 anything. --sort orders the table by name, age, or size — use
 --dry-run --sort=size to see what takes space.`, humanDuration(defaultGCMaxAge)),
 		Args: func(_ *cobra.Command, args []string) error {

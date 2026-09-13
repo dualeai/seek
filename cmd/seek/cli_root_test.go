@@ -326,10 +326,15 @@ func TestShouldRunOpportunisticGC(t *testing.T) {
 		{name: "help command", args: []string{"help"}},
 		{name: "verbose help command", args: []string{"-v", "help", "gc"}},
 		{name: "numeric bool verbose help command", args: []string{"--verbose=0", "help"}},
+		{name: "gc command", args: []string{"gc"}},
+		{name: "gc dry run", args: []string{"gc", "--dry-run"}},
+		{name: "verbose gc alias", args: []string{"--verbose", "garbage-collect"}},
+		{name: "completion command", args: []string{"completion", "zsh"}},
 		{name: "version", args: []string{"--version"}},
 		{name: "short bool version", args: []string{"--version=t"}},
 		{name: "help path", args: []string{"needle", "help"}, want: true},
 		{name: "help query after separator", args: []string{"--", "--help"}, want: true},
+		{name: "gc query after separator", args: []string{"--", "gc"}, want: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

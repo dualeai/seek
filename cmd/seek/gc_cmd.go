@@ -37,19 +37,6 @@ func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 	if err != nil {
 		return fmt.Errorf("resolve cache root: %w", err)
 	}
-	if err := os.MkdirAll(cacheRoot, 0o755); err != nil {
-		return fmt.Errorf("create cache root: %w", err)
-	}
-
-	if isOnNFS(cacheRoot) {
-		slog.Warn(
-			"seek cache on network filesystem; gc disabled. "+
-				"Set XDG_CACHE_HOME to a local directory to enable.",
-			"cache_root", cacheRoot,
-		)
-		return nil
-	}
-
 	cfg := gcConfigFromEnv()
 	maxAge := cfg.maxAge
 	if opts.all {
@@ -57,13 +44,28 @@ func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 	}
 
 	corporaPath := filepath.Join(cacheRoot, corporaDir)
-	entries, err := enumerateCorpusDirs(corporaPath)
-	if err != nil {
-		return fmt.Errorf("enumerate corpora: %w", err)
+	if opts.dryRun {
+		// An absent cache is an empty plan. Do not create it only to report that
+		// it contains no corpora.
+		entries, err := enumerateCorpusDirs(corporaPath)
+		if err != nil {
+			return fmt.Errorf("enumerate corpora: %w", err)
+		}
+		return reportGCPlan(ctx, os.Stdout, cacheRoot, entries, time.Now().Add(-maxAge), sortKey)
 	}
 
-	if opts.dryRun {
-		return reportGCPlan(ctx, os.Stdout, cacheRoot, entries, time.Now().Add(-maxAge), sortKey)
+	if err := os.MkdirAll(cacheRoot, 0o755); err != nil {
+		return fmt.Errorf("create cache root: %w", err)
+	}
+	if isOnNFS(cacheRoot) {
+		slog.Warn(
+			"seek cache on network filesystem; gc disabled. "+gcLocalCacheHint,
+			"cache_root", cacheRoot,
+		)
+		return nil
+	}
+	if _, err := enumerateCorpusDirs(corporaPath); err != nil {
+		return fmt.Errorf("enumerate corpora: %w", err)
 	}
 
 	// Live eviction: reuse runGC for trash drain + lock + per-corpus

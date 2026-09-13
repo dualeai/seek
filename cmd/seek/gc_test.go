@@ -446,6 +446,22 @@ func TestGCCmd_DryRun_NoEvictions(t *testing.T) {
 	}
 }
 
+// TestGCCmd_DryRun_DoesNotCreateMissingCacheRoot checks the user-facing
+// promise that a dry run does not change the filesystem.
+func TestGCCmd_DryRun_DoesNotCreateMissingCacheRoot(t *testing.T) {
+	clearGCEnvForTest(t)
+	root := filepath.Join(t.TempDir(), "missing-cache")
+	t.Setenv("SEEK_CACHE_DIR", root)
+
+	out := runGCCapture(t, "--dry-run")
+	if !strings.Contains(out, "no corpora") {
+		t.Fatalf("missing cache plan should report no corpora; got:\n%s", out)
+	}
+	if _, err := os.Lstat(root); !os.IsNotExist(err) {
+		t.Fatalf("dry-run created missing cache root: %v", err)
+	}
+}
+
 func TestGCCmd_Force_BypassesThrottle(t *testing.T) {
 	root := cacheRootForTest(t)
 	hash := fakeCorpusHash(17)

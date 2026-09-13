@@ -60,9 +60,9 @@ func main() {
 	root.SetArgs(args)
 	err := root.ExecuteContext(ctx)
 
-	// Informational calls do not touch an index, so they must not wait for cache
-	// maintenance. Search and management calls still run opportunistic GC after
-	// their output is flushed.
+	// Help, completion, and explicit GC calls do not start automatic GC. A GC
+	// command already owns cache maintenance, and its dry-run form must remain
+	// read-only. Search calls run automatic GC after their output is flushed.
 	if shouldRunOpportunisticGC(args) {
 		fireOpportunisticGC(runOpportunisticGC, gcRunTimeout)
 	}
@@ -99,7 +99,8 @@ func shouldRunOpportunisticGC(args []string) bool {
 		if knownBool {
 			continue
 		}
-		if arg == "help" {
+		switch arg {
+		case "help", "completion", "gc", "garbage-collect":
 			return false
 		}
 		return true
