@@ -57,12 +57,22 @@ func testSemanticUnitEmbedding(vector semanticVector) semanticUnitEmbedding {
 	return embedding
 }
 
-func testSemanticFineVectors(embeddings []semanticUnitEmbedding) []semanticFineVectors {
-	vectors := make([]semanticFineVectors, len(embeddings))
+func testSemanticFineVectors(embeddings []semanticUnitEmbedding) []semanticFineSNORM16Vectors {
+	vectors := make([]semanticFineSNORM16Vectors, len(embeddings))
 	for row := range embeddings {
-		vectors[row] = embeddings[row].fine
+		for centroid := range embeddings[row].fine {
+			stored, err := encodeSemanticSNORM16Vector(&embeddings[row].fine[centroid])
+			if err != nil {
+				panic(err)
+			}
+			vectors[row][centroid] = stored
+		}
 	}
 	return vectors
+}
+
+func testSemanticStoredFineVectors(vector semanticVector) semanticFineSNORM16Vectors {
+	return testSemanticFineVectors([]semanticUnitEmbedding{testSemanticUnitEmbedding(vector)})[0]
 }
 
 func testSemanticQuery(vector semanticVector) *semanticQueryEmbedding {
@@ -117,10 +127,13 @@ func writeTestSemanticGeneration(
 	}
 	close(encoded)
 	done := make(chan semanticBuildOutput, 1)
+	buildCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	collectSemanticBatches(
 		encoded,
 		filepath.Join(dir, semanticVectorsFile),
 		nil,
+		cancel,
 		done,
 	)
 	output := <-done
@@ -133,7 +146,7 @@ func writeTestSemanticGeneration(
 		return semanticManifest{}, err
 	}
 	return writeSemanticGenerationFromParts(
-		ctx,
+		buildCtx,
 		dir,
 		source,
 		output.units,
@@ -167,12 +180,15 @@ func writeTestUSearchShard(dir string, rows int) ([]semanticUSearchShard, error)
 
 func TestSemanticGenerationRoundTrip(t *testing.T) {
 	units, embeddings := testSemanticRowsAndVectors(t)
+	embeddings[0] = testSemanticSNORM16GoldenEmbedding()
 	dir := filepath.Join(t.TempDir(), ".build-semantic")
 	manifest, err := writeTestSemanticGeneration(t.Context(), dir, "head-1", units, embeddings)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Rows != 1 || manifest.Dimensions != semanticEmbeddingDimensions {
+	if manifest.Format != 5 || manifest.Rows != 1 || manifest.Dimensions != 48 ||
+		manifest.VectorCodec != "snorm16-le-rne-s32767-v1" ||
+		manifest.VectorStride != 1_920 {
 		t.Fatalf("manifest=%+v", manifest)
 	}
 	got, err := openSemanticGeneration(dir, "head-1")
@@ -203,6 +219,27 @@ func TestSemanticGenerationRoundTrip(t *testing.T) {
 		if info.Mode().Perm()&0o077 != 0 {
 			t.Fatalf("%s mode=%o, want private", name, info.Mode().Perm())
 		}
+	}
+}
+
+func TestSemanticGenerationZeroRowsRoundTrip(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "semantic")
+	manifest, err := writeTestSemanticGeneration(t.Context(), dir, "head-empty", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Rows != 0 || manifest.VectorsFile.Bytes != 0 {
+		t.Fatalf("manifest=%+v", manifest)
+	}
+	generation, err := openSemanticGeneration(dir, "head-empty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(generation.rows) != 0 || len(generation.vectors) != 0 || len(generation.vectorMap) != 0 {
+		t.Fatalf("empty generation has rows=%d vectors=%d mapped=%d", len(generation.rows), len(generation.vectors), len(generation.vectorMap))
+	}
+	if err := generation.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -407,7 +444,7 @@ func TestSemanticGenerationKeyIncludesSource(t *testing.T) {
 	}
 }
 
-func TestSemanticFormatThreeManifestIsIncompatible(t *testing.T) {
+func TestSemanticFormatFourManifestIsIncompatible(t *testing.T) {
 	units, embeddings := testSemanticRowsAndVectors(t)
 	manifest, err := writeTestSemanticGeneration(
 		t.Context(), t.TempDir(), "head-format", units, embeddings,
@@ -415,9 +452,37 @@ func TestSemanticFormatThreeManifestIsIncompatible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest.Format = 3
+	manifest.Format = 4
 	if err := validateSemanticManifest(manifest, "head-format"); err == nil {
-		t.Fatal("format 3 semantic manifest stayed compatible")
+		t.Fatal("format 4 semantic manifest stayed compatible")
+	}
+}
+
+func TestSemanticManifestRejectsWrongVectorContract(t *testing.T) {
+	units, embeddings := testSemanticRowsAndVectors(t)
+	manifest, err := writeTestSemanticGeneration(
+		t.Context(), t.TempDir(), "head-contract", units, embeddings,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		change func(*semanticManifest)
+	}{
+		{name: "codec", change: func(value *semanticManifest) { value.VectorCodec = "f32-le-v1" }},
+		{name: "stride", change: func(value *semanticManifest) { value.VectorStride++ }},
+		{name: "bytes", change: func(value *semanticManifest) { value.VectorsFile.Bytes++ }},
+		{name: "representation", change: func(value *semanticManifest) { value.Representation = "anchored-spherical-f32-v1" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			changed := manifest
+			test.change(&changed)
+			if err := validateSemanticManifest(changed, "head-contract"); err == nil {
+				t.Fatal("wrong vector contract stayed compatible")
+			}
+		})
 	}
 }
 
@@ -433,6 +498,18 @@ func TestOpenSemanticGenerationRejectsDamage(t *testing.T) {
 			t.Helper()
 			path := filepath.Join(dir, semanticVectorsFile)
 			if err := os.Truncate(path, 4); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "extra vector byte", source: "head-1", damage: func(t *testing.T, dir string) {
+			t.Helper()
+			path := filepath.Join(dir, semanticVectorsFile)
+			file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, writeErr := file.Write([]byte{0})
+			if err := errors.Join(writeErr, file.Close()); err != nil {
 				t.Fatal(err)
 			}
 		}},
@@ -525,6 +602,43 @@ func TestOpenSemanticGenerationKeepsExactDataAfterUSearchDamage(t *testing.T) {
 	}
 }
 
+func TestMappedSemanticSNORM16RejectsAccessedDamage(t *testing.T) {
+	units, embeddings := testSemanticRowsAndVectors(t)
+	tests := []struct {
+		name   string
+		damage []byte
+	}{
+		{name: "reserved code", damage: []byte{0x00, 0x80}},
+		{name: "zero norm", damage: make([]byte, semanticEmbeddingDimensions*2)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "semantic")
+			if _, err := writeTestSemanticGeneration(t.Context(), dir, "head-damage", units, embeddings); err != nil {
+				t.Fatal(err)
+			}
+			file, err := os.OpenFile(filepath.Join(dir, semanticVectorsFile), os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, writeErr := file.WriteAt(test.damage, 0)
+			if err := errors.Join(writeErr, file.Close()); err != nil {
+				t.Fatal(err)
+			}
+			generation, err := openSemanticGeneration(dir, "head-damage")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = generation.Close() })
+			if _, err := exactSemanticSearch(
+				t.Context(), generation.vectors, testSemanticQuery(embeddings[0].fine[0]), 1,
+			); err == nil {
+				t.Fatal("damaged accessed vector was accepted")
+			}
+		})
+	}
+}
+
 func TestDecodeSemanticManifestRejectsUnknownAndDuplicateFields(t *testing.T) {
 	for _, content := range []string{
 		`{"format":1,"format":1}`,
@@ -544,6 +658,8 @@ func TestValidateSemanticManifestChecksMinimumRowsLength(t *testing.T) {
 		Model:          semanticModelCompatibility(),
 		Extractor:      semanticExtractorID,
 		Representation: semanticRepresentationCompatibility(),
+		VectorCodec:    semanticVectorCodec,
+		VectorStride:   semanticFineVectorBytesPerUnit,
 		USearch:        testSemanticUSearchCompatibility(t),
 		Dimensions:     semanticEmbeddingDimensions,
 		Rows:           semanticMaxRows,
@@ -591,42 +707,41 @@ func TestWriteSemanticGenerationHonorsCancellation(t *testing.T) {
 }
 
 func TestExactSemanticSearchStableOrder(t *testing.T) {
-	vectors := make([]semanticFineVectors, 4)
-	for centroid := range semanticFineCentroidsPerUnit {
-		vectors[0][centroid][0] = 1
-		vectors[1][centroid][0] = 0.5
-		vectors[1][centroid][1] = float32(math.Sqrt(0.75))
-		vectors[2][centroid][0] = 1
-		vectors[3][centroid][0] = -1
-	}
+	vectors := make([]semanticFineSNORM16Vectors, 4)
+	vectors[0] = testSemanticStoredFineVectors(semanticVector{0: 1})
+	vectors[1] = testSemanticStoredFineVectors(semanticVector{0: 0.5, 1: float32(math.Sqrt(0.75))})
+	vectors[2] = testSemanticStoredFineVectors(semanticVector{0: 1})
+	vectors[3] = testSemanticStoredFineVectors(semanticVector{0: -1})
 	query := semanticVector{}
 	query[0] = 1
 	hits, err := exactSemanticSearch(t.Context(), vectors, testSemanticQuery(query), 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []semanticHit{{row: 0, score: 1}, {row: 2, score: 1}, {row: 1, score: 0.5}}
+	half := float32(16384) * semanticSNORM16InverseScale
+	want := []semanticHit{{row: 0, score: 1}, {row: 2, score: 1}, {row: 1, score: half}}
 	if !reflect.DeepEqual(hits, want) {
 		t.Fatalf("hits=%+v, want %+v", hits, want)
 	}
 }
 
 func TestExactSemanticSearchParallelMatchesSerialExpected(t *testing.T) {
-	vectors := make([]semanticFineVectors, 600)
+	vectors := make([]semanticFineSNORM16Vectors, 600)
 	defaultVector := semanticVector{2: 1}
 	for row := range vectors {
-		vectors[row] = testSemanticUnitEmbedding(defaultVector).fine
+		vectors[row] = testSemanticStoredFineVectors(defaultVector)
 	}
 	best := semanticVector{0: 1}
-	vectors[17] = testSemanticUnitEmbedding(best).fine
-	vectors[300] = testSemanticUnitEmbedding(best).fine
+	vectors[17] = testSemanticStoredFineVectors(best)
+	vectors[300] = testSemanticStoredFineVectors(best)
 	third := semanticVector{0: 0.5, 1: float32(math.Sqrt(0.75))}
-	vectors[599] = testSemanticUnitEmbedding(third).fine
+	vectors[599] = testSemanticStoredFineVectors(third)
 	query := testSemanticQuery(best)
+	half := float32(16384) * semanticSNORM16InverseScale
 	want := []semanticHit{
 		{row: 17, score: 1},
 		{row: 300, score: 1},
-		{row: 599, score: 0.5},
+		{row: 599, score: half},
 	}
 
 	previous := runtime.GOMAXPROCS(1)
@@ -651,22 +766,61 @@ func TestExactSemanticSearchParallelMatchesSerialExpected(t *testing.T) {
 func TestExactSemanticSearchCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := exactSemanticSearch(ctx, make([]semanticFineVectors, 10_000), nil, 10)
+	_, err := exactSemanticSearch(ctx, make([]semanticFineSNORM16Vectors, 10_000), nil, 10)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error=%v, want cancellation", err)
 	}
 }
 
 func TestExactSemanticSearchRejectsInvalidMappedVector(t *testing.T) {
-	vectors := make([]semanticFineVectors, 1)
-	for centroid := range vectors[0] {
-		vectors[0][centroid][0] = 1
-	}
-	vectors[0][3][0] = float32(math.NaN())
+	vectors := []semanticFineSNORM16Vectors{testSemanticStoredFineVectors(semanticVector{0: 1})}
+	vectors[0][3][0] = math.MinInt16
 	query := semanticVector{}
 	query[0] = 1
 	if _, err := exactSemanticSearch(t.Context(), vectors, testSemanticQuery(query), 1); err == nil {
 		t.Fatal("invalid semantic vector must fail")
+	}
+}
+
+var semanticExactBenchmarkHits []semanticHit
+
+// BenchmarkExactSemanticRange isolates stored-vector validation and MaxSim
+// scoring. It keeps vectors resident in heap memory, so it does not measure
+// route planning, worker merge, mmap page faults, or query preparation.
+func BenchmarkExactSemanticRange(b *testing.B) {
+	const rowCount = 328
+	vectors := make([]semanticFineSNORM16Vectors, rowCount)
+	for row := range vectors {
+		for centroid := range vectors[row] {
+			vector := semanticUSearchTestVector(row*semanticFineCentroidsPerUnit + centroid + 1)
+			stored, err := encodeSemanticSNORM16Vector(&vector)
+			if err != nil {
+				b.Fatal(err)
+			}
+			vectors[row][centroid] = stored
+		}
+	}
+	for _, tokenCount := range []int{2, 32, 128} {
+		b.Run(fmt.Sprintf("tokens-%d", tokenCount), func(b *testing.B) {
+			query := make([]semanticVector, tokenCount)
+			for token := range query {
+				query[token] = semanticUSearchTestVector(token*31 + 11)
+			}
+			scaled, err := prepareSemanticSNORM16Query(query)
+			if err != nil {
+				b.Fatal(err)
+			}
+			ctx := context.Background()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				hits, err := exactSemanticRange(ctx, vectors, scaled, nil, 0, len(vectors), 10)
+				if err != nil {
+					b.Fatal(err)
+				}
+				semanticExactBenchmarkHits = hits
+			}
+		})
 	}
 }
 

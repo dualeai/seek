@@ -318,7 +318,7 @@ func TestSemanticUSearchExactFallbackRejectsExcessWork(t *testing.T) {
 				Name: "unavailable.usearch", Rows: uint64(rowCount),
 			}},
 		},
-		vectors:    make([]semanticFineVectors, rowCount),
+		vectors:    make([]semanticFineSNORM16Vectors, rowCount),
 		usearch:    []string{"unavailable.usearch"},
 		usearchErr: errors.New("damaged graph"),
 	}
@@ -515,7 +515,7 @@ func TestSemanticUSearchVectorKeyFormatExamples(t *testing.T) {
 func TestSemanticFilteredRouteBoundaryAndNativeFailure(t *testing.T) {
 	const rows = semanticFilteredExactRows + 2
 	units := make([]semanticUnit, rows)
-	vectors := make([]semanticFineVectors, rows)
+	vectors := make([]semanticFineSNORM16Vectors, rows)
 	vector := semanticVector{0: 1}
 	for row := range rows {
 		path := fmt.Sprintf("small/%03d.go", row)
@@ -526,7 +526,7 @@ func TestSemanticFilteredRouteBoundaryAndNativeFailure(t *testing.T) {
 			path = "drop/final.go"
 		}
 		units[row] = semanticUnit{row: uint64(row), path: path, fileLanguage: "Go"}
-		vectors[row] = testSemanticUnitEmbedding(vector).fine
+		vectors[row] = testSemanticStoredFineVectors(vector)
 	}
 	wantErr := errors.New("damaged filtered graph")
 	generation := &semanticGeneration{
@@ -675,9 +675,6 @@ func TestRunDefaultJoinedSearchUsesUSearchAboveExactThreshold(t *testing.T) {
 	}
 	if targetRow < 0 {
 		t.Fatal("semantic generation omitted the target row")
-	}
-	if !reflect.DeepEqual(generation.vectors[targetRow][0], targetVector) {
-		t.Fatalf("target vector=%v", generation.vectors[targetRow][0][:2])
 	}
 	rows, err := searchSemanticUSearchCandidates(
 		t.Context(),

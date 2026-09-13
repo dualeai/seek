@@ -590,7 +590,7 @@ func buildSemanticUSearchShard(
 		unitRow := uint64(rowBase + row)
 		for centroid := range coarse {
 			vector := &coarse[centroid]
-			if err := validateNormalizedSemanticVector(*vector); err != nil {
+			if err := validateNormalizedSemanticVector(vector); err != nil {
 				return fmt.Errorf("USearch row %d centroid %d: %w", unitRow, centroid, err)
 			}
 			key := semanticUSearchVectorKey(unitRow, centroid)

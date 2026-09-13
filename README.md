@@ -486,8 +486,18 @@ it is not set, Seek uses these paths:
 
 Joined corpora also store semantic generations in `index/` and a `.joined-v1`
 attachment next to the lexical state. Normal corpus eviction removes both.
-Seek rebuilds an older semantic generation once so each row has the same
-canonical file language as Zoekt.
+Seek rejects an older semantic format. The first search that enables semantic
+indexing after an upgrade rebuilds it. Semantic rows keep the same canonical
+file language as Zoekt. Seek rounds each normalized FP32 fine-vector component
+to a signed 16-bit integer. This storage is lossy. It can change semantic scores
+and the order of close semantic matches after an upgrade. Rows and USearch graph
+shards keep their existing formats.
+The old and new semantic generations exist at the same time during the rebuild.
+Both need disk space during this period. After activation, Seek tries to remove
+older generations. After a rollback, an older Seek binary can rebuild its
+float32 format. Seek does not support alternating old and new binaries with one
+cache. Each switch can cause another rebuild. Use `--lexical-only` when semantic
+rebuild or recovery is not wanted.
 
 The model stores its extracted runtime under
 `<seek-cache>/reranker/<runtime-version>/<sha256>/`. The model and tokenizer

@@ -254,9 +254,22 @@ func normalizeSemanticVector(vector *semanticVector) error {
 	if squaredNorm == 0 || math.IsNaN(squaredNorm) || math.IsInf(squaredNorm, 0) {
 		return fmt.Errorf("vector has zero or invalid norm")
 	}
-	scale := float32(1 / math.Sqrt(squaredNorm))
-	for dimension := range vector {
-		vector[dimension] *= scale
+	scale64 := 1 / math.Sqrt(squaredNorm)
+	scale32 := float32(scale64)
+	if !math.IsInf(float64(scale32), 0) {
+		// Keep the established float32 operation for normal model output. This
+		// preserves its bytes while the float64 path handles a scale that cannot
+		// fit in float32.
+		for dimension := range vector {
+			vector[dimension] *= scale32
+		}
+	} else {
+		for dimension, value := range vector {
+			vector[dimension] = float32(float64(value) * scale64)
+		}
+	}
+	if err := validateNormalizedSemanticVector(vector); err != nil {
+		return fmt.Errorf("normalized vector %w", err)
 	}
 	return nil
 }
