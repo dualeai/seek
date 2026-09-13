@@ -707,6 +707,267 @@ func TestRunDefaultJoinedSearchUsesUSearchAboveExactThreshold(t *testing.T) {
 	t.Fatal("joined command did not report the USearch retrieval backend")
 }
 
+func BenchmarkSemanticFilteredRetrieval(b *testing.B) {
+	b.Setenv("SEEK_CACHE_DIR", b.TempDir())
+	embeddings := make([]semanticUnitEmbedding, semanticUSearchUnitsPerShard*2)
+	for row := range embeddings {
+		embeddings[row] = testSemanticUnitEmbedding(semanticUSearchTestVector(row))
+	}
+	dir := b.TempDir()
+	input := make(chan semanticCoarseBatch, len(embeddings)/semanticModelBatchRows+1)
+	done := make(chan semanticUSearchBuildResult, 1)
+	ctx, cancel := context.WithCancel(b.Context())
+	b.Cleanup(cancel)
+	go buildSemanticUSearchStream(ctx, dir, input, cancel, searchResources{}, done)
+	for sequence, start := 0, 0; start < len(embeddings); sequence, start = sequence+1, start+semanticModelBatchRows {
+		end := min(start+semanticModelBatchRows, len(embeddings))
+		coarse := make([]semanticCoarseVectors, end-start)
+		for row := start; row < end; row++ {
+			coarse[row-start] = embeddings[row].coarse
+		}
+		input <- semanticCoarseBatch{sequence: sequence, coarse: coarse}
+	}
+	close(input)
+	built := <-done
+	if built.err != nil {
+		b.Fatal(built.err)
+	}
+	paths := make([]string, len(built.shards))
+	for index, shard := range built.shards {
+		paths[index] = filepath.Join(dir, shard.Name)
+	}
+
+	for _, test := range []struct {
+		name    string
+		percent int
+		tokens  int
+	}{
+		{name: "small-1-percent-2-tokens", percent: 1, tokens: 2},
+		{name: "low-4-percent-2-tokens", percent: 4, tokens: 2},
+		{name: "medium-25-percent-2-tokens", percent: 25, tokens: 2},
+		{name: "upper-45-percent-2-tokens", percent: 45, tokens: 2},
+		{name: "high-90-percent-2-tokens", percent: 90, tokens: 2},
+		{name: "low-4-percent-32-tokens", percent: 4, tokens: 32},
+		{name: "medium-25-percent-32-tokens", percent: 25, tokens: 32},
+		{name: "high-90-percent-32-tokens", percent: 90, tokens: 32},
+		{name: "low-4-percent-128-tokens", percent: 4, tokens: 128},
+		{name: "medium-25-percent-128-tokens", percent: 25, tokens: 128},
+		{name: "upper-45-percent-128-tokens", percent: 45, tokens: 128},
+		{name: "high-90-percent-128-tokens", percent: 90, tokens: 128},
+	} {
+		rows := make([]semanticUnit, len(embeddings))
+		allowedRows := make([]uint64, 0, len(rows)*test.percent/100+1)
+		for row := range rows {
+			prefix := "blocked"
+			if row%100 < test.percent {
+				prefix = "allowed"
+				allowedRows = append(allowedRows, uint64(row))
+			}
+			rows[row] = semanticUnit{
+				row:          uint64(row),
+				path:         fmt.Sprintf("%s/%04d.go", prefix, row),
+				fileLanguage: "Go",
+			}
+		}
+		generation := &semanticGeneration{
+			manifest: semanticManifest{
+				Rows:         uint64(len(rows)),
+				USearchFiles: built.shards,
+			},
+			rows:    rows,
+			vectors: testSemanticFineVectors(embeddings),
+			usearch: paths,
+		}
+		filter := semanticFilterForTest(b, "file:^allowed/")
+		target := int(allowedRows[len(allowedRows)-1])
+		prepared := testSemanticQuery(embeddings[target].fine[0])
+		for token := 1; token < test.tokens; token++ {
+			start := token * semanticEmbeddingDimensions
+			copy(prepared.tokens[start:start+semanticEmbeddingDimensions], embeddings[target].fine[0][:])
+			prepared.scoreMask[token] = true
+		}
+		benchmarkMask, err := buildSemanticFilterMask(b.Context(), generation, filter)
+		if err != nil {
+			b.Fatal(err)
+		}
+		plannedRoute, err := planSemanticUSearchShards(
+			b.Context(), generation, &benchmarkMask, test.tokens,
+		)
+		if err != nil {
+			b.Fatal(err)
+		}
+		forcedNativeShards := 0
+		for _, allowed := range benchmarkMask.shardAllowed {
+			if allowed > 0 {
+				forcedNativeShards++
+			}
+		}
+		exact, err := exactSemanticSortedCandidates(
+			b.Context(), generation.vectors, prepared, allowedRows, 10,
+		)
+		if err != nil {
+			b.Fatal(err)
+		}
+		wantRows := make(map[uint64]struct{}, len(exact))
+		for _, hit := range exact {
+			wantRows[hit.row] = struct{}{}
+		}
+		routes := []struct {
+			name         string
+			exactRows    int
+			nativeShards int
+			run          func(context.Context) ([]semanticHit, error)
+		}{
+			{
+				name:         "planned",
+				exactRows:    len(plannedRoute.exactRows),
+				nativeShards: len(plannedRoute.jobs),
+				run: func(ctx context.Context) ([]semanticHit, error) {
+					return semanticUSearchFiltered(ctx, generation, prepared, filter, 10)
+				},
+			},
+			{
+				name:         "forced-native",
+				nativeShards: forcedNativeShards,
+				run: func(ctx context.Context) ([]semanticHit, error) {
+					return benchmarkForcedNativeSemanticFilter(
+						ctx, generation, prepared, filter, 10,
+					)
+				},
+			},
+			{
+				name:      "forced-exact",
+				exactRows: len(allowedRows),
+				run: func(ctx context.Context) ([]semanticHit, error) {
+					mask, err := buildSemanticFilterMask(ctx, generation, filter)
+					if err != nil {
+						return nil, err
+					}
+					return exactSemanticSortedCandidates(ctx, generation.vectors, prepared, mask.selectedRows(), 10)
+				},
+			},
+		}
+		for _, route := range routes {
+			b.Run(test.name+"/"+route.name, func(b *testing.B) {
+				if _, err := route.run(b.Context()); err != nil {
+					b.Fatal(err)
+				}
+				b.ResetTimer()
+				var hits []semanticHit
+				for b.Loop() {
+					hits, err = route.run(b.Context())
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.ReportMetric(float64(len(allowedRows))/float64(len(rows)), "allowed/row")
+				b.ReportMetric(float64(route.exactRows), "exact-rows")
+				b.ReportMetric(float64(route.nativeShards), "native-shards")
+				foundTarget, recalled := false, 0
+				for _, hit := range hits {
+					if hit.row >= uint64(len(rows)) || hit.row%100 >= uint64(test.percent) {
+						b.Fatalf("filtered retrieval returned row %d", hit.row)
+					}
+					foundTarget = foundTarget || hit.row == uint64(target)
+					if _, ok := wantRows[hit.row]; ok {
+						recalled++
+					}
+				}
+				if !foundTarget {
+					b.Fatalf("filtered retrieval omitted target row %d", target)
+				}
+				b.ReportMetric(float64(recalled)/float64(len(exact)), "top10-recall")
+				b.ReportMetric(float64(max(0, len(exact)-len(hits))), "underfill")
+			})
+		}
+	}
+}
+
+func benchmarkForcedNativeSemanticFilter(
+	ctx context.Context,
+	generation *semanticGeneration,
+	query *semanticQueryEmbedding,
+	filter *semanticFilterPlan,
+	limit int,
+) ([]semanticHit, error) {
+	mask, err := buildSemanticFilterMask(ctx, generation, filter)
+	if err != nil {
+		return nil, err
+	}
+	queryVectors, err := semanticQueryTokenVectors(query)
+	if err != nil {
+		return nil, err
+	}
+	plan := semanticUSearchQueryPlan{
+		jobs: make([]semanticUSearchQueryShard, 0, len(generation.manifest.USearchFiles)),
+	}
+	for shardIndex, shard := range generation.manifest.USearchFiles {
+		allowed := mask.shardAllowed[shardIndex]
+		if allowed == 0 {
+			continue
+		}
+		job := semanticUSearchQueryShard{index: shardIndex, limit: semanticUSearchVectorsPerQuery}
+		if allowed != shard.Rows {
+			job.filtered = true
+			job.limit = int(min(
+				uint64(semanticUSearchVectorsPerQuery),
+				allowed*semanticCoarseCentroidsPerUnit,
+			))
+		}
+		plan.jobs = append(plan.jobs, job)
+	}
+	candidates, err := executeSemanticUSearchPlan(ctx, generation, queryVectors, &mask, plan)
+	if err != nil {
+		return nil, err
+	}
+	return exactSemanticSortedRows(ctx, generation.vectors, queryVectors, candidates.rows, limit)
+}
+
+func BenchmarkPlanSemanticUSearchShardsScale(b *testing.B) {
+	for _, shardCount := range []int{2, 50, 2_442} {
+		b.Run(fmt.Sprintf("shards-%d", shardCount), func(b *testing.B) {
+			shards := make([]semanticUSearchShard, shardCount)
+			rows := uint64(0)
+			for shard := range shards {
+				shardRows := uint64(semanticUSearchUnitsPerShard)
+				if remaining := uint64(semanticMaxRows) - rows; shardRows > remaining {
+					shardRows = remaining
+				}
+				shards[shard] = semanticUSearchShard{Start: rows, Rows: shardRows}
+				rows += shardRows
+			}
+			mask := semanticFilterMask{
+				mode: semanticFilterPartial, rows: rows,
+				bits: make([]byte, (rows+7)/8), shardAllowed: make([]uint64, shardCount),
+			}
+			for shardIndex, shard := range shards {
+				allowed := max(uint64(1), shard.Rows*4/100)
+				mask.shardAllowed[shardIndex] = allowed
+				mask.allowed += allowed
+				setSemanticFilterRange(mask.bits, shard.Start, shard.Start+allowed)
+			}
+			generation := &semanticGeneration{
+				manifest: semanticManifest{Rows: rows, USearchFiles: shards},
+			}
+			b.ReportAllocs()
+			var plan semanticUSearchQueryPlan
+			b.ResetTimer()
+			for b.Loop() {
+				var err error
+				plan, err = planSemanticUSearchShards(
+					b.Context(), generation, &mask, lateOnSequenceLength,
+				)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(len(plan.jobs)), "native-jobs")
+			b.ReportMetric(float64(len(plan.exactRows)), "exact-rows")
+		})
+	}
+}
+
 func semanticUSearchTestVector(row int) semanticVector {
 	var vector semanticVector
 	var norm float64

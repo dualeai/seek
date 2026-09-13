@@ -206,6 +206,158 @@ func TestSemanticGenerationRoundTrip(t *testing.T) {
 	}
 }
 
+func BenchmarkReadSemanticRows(b *testing.B) {
+	encoded, _ := semanticRowsBenchmarkFixture(b)
+	b.SetBytes(int64(len(encoded)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		decoded, err := readSemanticRowsFrom(bytes.NewReader(encoded), 4_096)
+		if err != nil {
+			b.Fatal(err)
+		}
+		runtime.KeepAlive(decoded)
+	}
+}
+
+func BenchmarkReadVerifiedSemanticRows(b *testing.B) {
+	encoded, artifact := semanticRowsBenchmarkFixture(b)
+	b.SetBytes(int64(len(encoded)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		decoded, err := readVerifiedSemanticRows(bytes.NewReader(encoded), artifact.SHA256, 4_096)
+		if err != nil {
+			b.Fatal(err)
+		}
+		runtime.KeepAlive(decoded)
+	}
+}
+
+func BenchmarkOpenSemanticGeneration(b *testing.B) {
+	for _, rowCount := range []int{4_096, 204_694} {
+		b.Run(fmt.Sprintf("rows-%d", rowCount), func(b *testing.B) {
+			dir, source, shardCount := writeSemanticOpenBenchmarkGeneration(b, rowCount)
+			b.ReportMetric(float64(shardCount), "shards")
+			b.Run("full-validation", func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					generation, err := openSemanticGeneration(dir, source)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if err := generation.Close(); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+			b.Run("search-lazy-graphs", func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					generation, err := openSemanticGenerationForSearch(dir, source)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if err := generation.Close(); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		})
+	}
+}
+
+func writeSemanticOpenBenchmarkGeneration(
+	b *testing.B,
+	rowCount int,
+) (string, string, int) {
+	b.Helper()
+	dir := b.TempDir()
+	source := fmt.Sprintf("open-benchmark-%d", rowCount)
+	units := make([]semanticUnit, rowCount)
+	for row := range units {
+		units[row] = semanticUnit{
+			row: uint64(row), path: fmt.Sprintf("pkg/%06d/source.go", row/4),
+			start: uint64(row % 4), end: uint64(row%4 + 1),
+			kind: semanticUnitSymbol, parserResult: semanticParserCTags,
+			language: "Go", fileLanguage: "Go", symbol: fmt.Sprintf("Symbol%d", row),
+		}
+		units[row].id = makeSemanticUnitID(units[row])
+	}
+	vectorBytes, ok := checkedSemanticVectorBytes(uint64(rowCount))
+	if !ok {
+		b.Fatal("vector byte count overflow")
+	}
+	vectorsPath := filepath.Join(dir, semanticVectorsFile)
+	vectorsFile, err := os.OpenFile(vectorsPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := vectorsFile.Truncate(int64(vectorBytes)); err != nil {
+		_ = vectorsFile.Close()
+		b.Fatal(err)
+	}
+	if err := vectorsFile.Close(); err != nil {
+		b.Fatal(err)
+	}
+	const shardRows = 4_096
+	shardCount := (rowCount + shardRows - 1) / shardRows
+	shards := make([]semanticUSearchShard, shardCount)
+	graphBytes := bytes.Repeat([]byte{0x5a}, 256<<10)
+	for shardIndex := range shards {
+		start := shardIndex * shardRows
+		rows := min(shardRows, rowCount-start)
+		name := semanticUSearchShardName(shardIndex)
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, graphBytes, 0o600); err != nil {
+			b.Fatal(err)
+		}
+		artifact, err := inspectSemanticArtifact(path)
+		if err != nil {
+			b.Fatal(err)
+		}
+		shards[shardIndex] = semanticUSearchShard{
+			Name: name, Start: uint64(start), Rows: uint64(rows), semanticArtifact: artifact,
+		}
+	}
+	if _, err := writeSemanticGenerationFromParts(
+		b.Context(), dir, source, units, semanticSizedArtifact{Bytes: vectorBytes}, shards,
+	); err != nil {
+		b.Fatal(err)
+	}
+	return dir, source, shardCount
+}
+
+func semanticRowsBenchmarkFixture(b *testing.B) ([]byte, semanticArtifact) {
+	b.Helper()
+	const rowCount = 4_096
+	rows := make([]semanticUnit, rowCount)
+	for row := range rows {
+		rows[row] = semanticUnit{
+			row:          uint64(row),
+			path:         fmt.Sprintf("pkg/%04d/source.go", row/4),
+			start:        uint64(row % 4),
+			end:          uint64(row%4 + 1),
+			kind:         semanticUnitSymbol,
+			parserResult: semanticParserCTags,
+			language:     "Go",
+			fileLanguage: "Go",
+			symbol:       fmt.Sprintf("function Symbol%d", row),
+		}
+		rows[row].id = makeSemanticUnitID(rows[row])
+	}
+	path := filepath.Join(b.TempDir(), semanticRowsFile)
+	artifact, err := writeSemanticRows(path, rows)
+	if err != nil {
+		b.Fatal(err)
+	}
+	encoded, err := os.ReadFile(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	return encoded, artifact
+}
+
 type semanticCountingReader struct {
 	reader io.Reader
 	bytes  int
