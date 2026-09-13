@@ -565,9 +565,12 @@ provider caches are rebuildable. Remove their `reranker/` and
 
 ### Benchmarks
 
-Do not compare results unless the binary, Seek revision, corpus revision, query
-set, provider, CPU allowance, and memory limit are the same. Do not publish a
-result from an uncommitted development binary as a result for its base commit.
+For repeat measurements of one build, keep the binary, Seek revision, corpus
+revision, query set, provider, CPU allowance, and memory limit the same. For a
+before-and-after comparison, record both binary hashes and Seek revisions. Keep
+the corpus revision, query set, provider, CPU allowance, and memory limit fixed.
+Do not publish a result from an uncommitted development binary as a result for
+its base commit.
 
 Every default query, including an exact or one-word query, builds or updates
 semantic data for a supported corpus. Use `--lexical-only` when you need to
@@ -587,19 +590,25 @@ The retained large-repository gate uses Kubernetes commit
 [`912ec35`](https://github.com/kubernetes/kubernetes/commit/912ec3583d7733a240dad6a3755f5f2f6b76be3e).
 The recorded reference host for its limits is an Apple M5 Pro with 18 logical
 CPUs and 64 GiB RAM. Label results from other hosts separately. Run the gate
-only on a clean, pinned checkout. It builds the current checkout when
-`SEEK_BIN` is not set and stores timing, process-tree CPU, RSS, swap, logs, and
-the last cache in a new temporary folder. Record the full Seek revision and
-`seek --version` output with any published result:
+only on a clean, pinned checkout. The gate restores the native tokenizer
+library from its tracked archive, then builds its own binary from the current
+checkout. It rejects `SEEK_BIN` so the source model benchmark and cold binary
+cannot use different revisions. It records and rechecks the source revision,
+binary build revision and hash, native asset hashes, and corpus revision. It
+also stores timing, process-tree CPU, RSS, swap, logs, and the last cache in a
+new temporary folder. Keep the retained summary with any published result:
 
 ```bash
 make test-bench-semantic \
   SEEK_BENCH_REPO=/path/to/kubernetes
 ```
 
-Each cold run must cover 31,250 files and 204,694 semantic rows. The fine-vector
-file alone uses 786,024,960 bytes: 3,840 bytes per row from 20 FP32 centroids of
-48 values. Metadata, Zoekt, and USearch files add more space.
+Each cold run must cover 31,250 files and 204,694 semantic rows. Format 5 uses
+393,012,480 fine-vector bytes instead of format 4's 786,024,960 bytes: 1,920
+bytes per row from 20 centroids of 48 signed 16-bit values. The format layout
+makes this an exact 50% reduction and saves 393,012,480 logical bytes for this
+row count. Filesystem allocation can differ. Zoekt and other corpus files add
+more space.
 
 The gate requires at least 10 cold application runs and 10 fixed 100,000-row
 model runs. It requires a cold nearest-rank p95 of at most 60 seconds, a model
@@ -609,8 +618,9 @@ no new swap. Its generated summary reports the measured CPU, GPU, memory,
 cache, scheduler, and limit values. These are proof limits, not runtime settings
 or performance guarantees. Use
 `SEEK_BENCH_REPO=/path/to/kubernetes uv run --script ./cicd/bench-semantic.py --samples 1 --report-only`
-for a wiring check. A CPU failure stays a failure; GPU or memory samples do not
-hide it.
+for a wiring check. Report-only mode can use `SEEK_BIN=/path/to/seek` for a
+diagnostic run, but it does not apply the limits. A CPU failure stays a failure;
+GPU or memory samples do not hide it.
 
 ### Parallel Safety
 
