@@ -60,6 +60,7 @@ English description with two or more words:
 ```sh
 seek 'find request parser'
 seek -n 5 -m 2 -C 1 'validate search query syntax'
+seek 'find request parser lang:go -file:_test\.go$'
 ```
 
 Seek collects up to 20 files from strict lexical, relaxed lexical, and semantic
@@ -71,8 +72,20 @@ Plain queries with two or more words use model re-ranking by default. One
 unscoped clean Git worktree, one stable plain file, or one stable plain folder
 also uses semantic retrieval. Scoped or dirty Git and multi-corpus searches can
 use model re-ranking when enough candidates exist, but not semantic retrieval.
-Exact identifiers and phrases, `sym:` queries, filters, regular expressions,
-Boolean operators, negation, and one-word queries use strict BM25 order.
+A description can contain `lang:`, `file:`, and `-file:` filters. Seek keeps
+these filters in strict, relaxed, and semantic retrieval and sends only the
+description to the model. For semantic retrieval, Seek builds an allowed-row
+bitmap and plans each shard separately. It skips shards with no allowed rows,
+uses normal USearch for full shards, scores bounded sparse partial shards
+exactly, and gives other partial shards to USearch with the bitmap predicate.
+The predicate admits only matching keys to the candidate set; other keys can
+still guide graph navigation. A filter that selects every row uses normal
+semantic retrieval. Native USearch routes remain approximate. An exact-only
+route scores every selected stored row. Eligibility follows Zoekt's parsed and
+simplified query tree, so equivalent spellings and aliases can use the same
+route. Exact identifiers, phrases, one-word queries, and trees that retain
+`sym:`, other filters, Boolean alternatives, or general negation use strict
+BM25 order.
 
 Unless `--lexical-only` is set, every supported search builds or updates both
 Zoekt and semantic data. This includes exact queries and commands rewritten by
@@ -87,8 +100,10 @@ counts, and complete call-site lists, use the exhaustive command below.
 The model runs locally and can use context that is not in the output. Display
 flags still apply. If semantic retrieval is unavailable, model re-ranking can
 still use lexical candidates. If the model fails, Seek returns the strict
-all-word BM25 results. A damaged USearch graph uses an exact vector scan when
-the stored vectors are valid.
+all-word BM25 results. An unfiltered search can use an exact vector scan for a
+bounded USearch graph failure. A larger failure returns to the lexical and
+model re-rank path. A filtered USearch error returns to the filtered lexical
+path and never removes the filter.
 
 ## Paths
 
