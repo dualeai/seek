@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 	"unicode"
@@ -16,12 +15,17 @@ import (
 )
 
 const (
-	rerankCandidateLimit     = 20
+	// One final score call always runs the model's full static batch. Use every
+	// row so a separate presentation limit does not hide retrieval candidates.
+	rerankCandidateLimit     = semanticModelBatchRows
 	rerankRRFConstant        = 60.0
 	rerankLexicalWeight      = 2.0
 	rerankPathComponentLimit = 4
 	// maxRerankDocumentBytes bounds work before the backend packs model tokens.
 	maxRerankDocumentBytes = 16 << 10
+	// A query has CLS, Q, and SEP tokens. Each whitespace-separated term that
+	// has an ASCII letter or digit adds at least one tokenizer token.
+	rerankQueryMaximumUntruncatedTerms = lateOnSequenceLength - 3
 )
 
 var (
@@ -45,11 +49,21 @@ type rerankDocument struct {
 	matchEnd int
 }
 
-type rerankScoreFunc func(context.Context, string, []rerankDocument) ([]float32, error)
+type rerankScoreFunc func(context.Context, string, []rerankDocument) (rerankScoreBatch, error)
+
+type rerankAcceptancePolicies struct {
+	rerank *rerankAcceptancePolicy
+	hybrid *rerankAcceptancePolicy
+}
+
+type rerankAcceptancePolicyFactory func() rerankAcceptancePolicies
 
 type searchRunConfig struct {
-	policy   searchPolicy
-	newModel semanticModelFactory
+	policy                searchPolicy
+	rerankAcceptance      *rerankAcceptancePolicy
+	hybridAcceptance      *rerankAcceptancePolicy
+	newAcceptancePolicies rerankAcceptancePolicyFactory
+	newModel              semanticModelFactory
 }
 
 type rerankSearchFunc func(
@@ -80,6 +94,22 @@ func planRerankQuery(pattern string, raw query.Q) (rerankQueryPlan, bool) {
 		return plan, true
 	}
 	return planFilteredRerankQuery(raw)
+}
+
+func rerankQueryGuaranteedTruncated(modelQuery string) bool {
+	terms := 0
+	for _, field := range strings.Fields(modelQuery) {
+		for index := range len(field) {
+			char := field[index]
+			if (char >= 'a' && char <= 'z') ||
+				(char >= 'A' && char <= 'Z') ||
+				(char >= '0' && char <= '9') {
+				terms++
+				break
+			}
+		}
+	}
+	return terms > rerankQueryMaximumUntruncatedTerms
 }
 
 func rerankDescriptionTerm(node query.Q) (*query.Substring, bool) {
@@ -194,6 +224,7 @@ func tryRerankCorpora(
 	config searchConfig,
 	plan rerankQueryPlan,
 	score rerankScoreFunc,
+	acceptance *rerankAcceptancePolicy,
 	search rerankSearchFunc,
 ) ([]corpusSearchResult, dirtyFilesByCorpus, error) {
 	if score == nil {
@@ -219,6 +250,7 @@ func tryRerankCorpora(
 		relaxedDirty,
 		plan.modelQuery,
 		score,
+		acceptance,
 	)
 	if err != nil {
 		return applyRerankDisplayConfig(strictResults, config), strictDirty, err
@@ -226,10 +258,11 @@ func tryRerankCorpora(
 	return applyRerankDisplayConfig(reranked, config), mergedDirty, nil
 }
 
-// rerankCorpusResults scores at most 20 files from the normal all-term leader
-// and the relaxed any-term BM25 order. Weighted reciprocal rank fusion gives
-// lexical rank twice the model-rank weight. A strict-only injected leader
-// cannot take first place. Unscored relaxed and normal tails remain available.
+// rerankCorpusResults scores at most one full static model batch from the normal
+// all-term leader and the relaxed any-term BM25 order. Weighted reciprocal rank
+// fusion gives lexical rank twice the model-rank weight. When expansion is
+// admitted, an injected strict leader cannot take first place and relaxed tails
+// remain available. Rejection returns strict BM25 results only.
 func rerankCorpusResults(
 	ctx context.Context,
 	strictResults []corpusSearchResult,
@@ -238,6 +271,7 @@ func rerankCorpusResults(
 	relaxedDirty dirtyFilesByCorpus,
 	modelQuery string,
 	score rerankScoreFunc,
+	acceptance *rerankAcceptancePolicy,
 ) ([]corpusSearchResult, dirtyFilesByCorpus, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
@@ -258,11 +292,17 @@ func rerankCorpusResults(
 
 	documents := rerankCandidateDocuments(candidates)
 
-	scores, err := score(ctx, modelQuery, documents)
+	batch, err := score(ctx, modelQuery, documents)
 	if err != nil {
 		return nil, nil, err
 	}
-	out, err := fuseRerankCandidates(candidates, scores, strictRanked, relaxedRanked)
+	out, err := fuseRerankCandidates(
+		candidates,
+		batch,
+		strictRanked,
+		relaxedRanked,
+		acceptance,
+	)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -283,22 +323,21 @@ func rerankCandidateDocuments(candidates []rerankCandidate) []rerankDocument {
 
 func fuseRerankCandidates(
 	candidates []rerankCandidate,
-	scores []float32,
+	batch rerankScoreBatch,
 	strictRanked []corpusSearchResult,
 	relaxedRanked []corpusSearchResult,
+	acceptance *rerankAcceptancePolicy,
 ) ([]corpusSearchResult, error) {
-	if len(scores) != len(candidates) {
-		return nil, fmt.Errorf(
-			"invalid semantic score count: got %d, want %d",
-			len(scores),
-			len(candidates),
-		)
+	candidates, batch, appendRelaxedTail, err := applyRerankAcceptance(
+		candidates,
+		batch,
+		strictRanked,
+		acceptance,
+	)
+	if err != nil {
+		return nil, err
 	}
-	for _, score := range scores {
-		if math.IsNaN(float64(score)) || math.IsInf(float64(score), 0) {
-			return nil, fmt.Errorf("invalid semantic score")
-		}
-	}
+	scores := batch.values
 
 	semanticOrder := make([]int, len(scores))
 	for index := range semanticOrder {
@@ -352,8 +391,10 @@ func fuseRerankCandidates(
 	}
 	// A strict-only leader can displace the last relaxed candidate from a full
 	// model set. Keep any such file in the final result set as an unscored tail.
-	for _, result := range relaxedRanked {
-		add(result)
+	if appendRelaxedTail {
+		for _, result := range relaxedRanked {
+			add(result)
+		}
 	}
 	for _, result := range strictRanked {
 		add(result)

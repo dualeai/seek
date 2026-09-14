@@ -167,6 +167,42 @@ func TestRootCmd_RejectsNegativeLimit(t *testing.T) {
 	}
 }
 
+func TestDefaultSearchRunConfigBindsAcceptancePolicies(t *testing.T) {
+	config := defaultSearchRunConfig(defaultSearchPolicy())
+	if config.newModel == nil || config.newAcceptancePolicies == nil {
+		t.Fatalf("default run config is incomplete: %+v", config)
+	}
+	if config.rerankAcceptance != nil || config.hybridAcceptance != nil {
+		t.Fatalf("default run config resolved acceptance eagerly: %+v", config)
+	}
+	policies := config.newAcceptancePolicies()
+	if policies.rerank == nil || policies.hybrid == nil {
+		t.Fatalf("default acceptance policies are incomplete: %+v", policies)
+	}
+	if policies.rerank.route != "lexical-rerank" ||
+		policies.hybrid.route != "joined" {
+		t.Fatalf(
+			"acceptance routes=%q and %q",
+			policies.rerank.route,
+			policies.hybrid.route,
+		)
+	}
+	if policies.rerank.minimumMeanMaxSim != 0.575 ||
+		policies.hybrid.minimumMeanMaxSim != 0.600 {
+		t.Fatalf(
+			"acceptance minimums=%g and %g",
+			policies.rerank.minimumMeanMaxSim,
+			policies.hybrid.minimumMeanMaxSim,
+		)
+	}
+
+	lexical := defaultSearchRunConfig(lexicalOnlySearchPolicy())
+	if lexical.newModel != nil || lexical.rerankAcceptance != nil ||
+		lexical.hybridAcceptance != nil || lexical.newAcceptancePolicies != nil {
+		t.Fatalf("lexical-only run config started model policy: %+v", lexical)
+	}
+}
+
 func TestSelectSearchConfig(t *testing.T) {
 	cases := []struct {
 		name      string

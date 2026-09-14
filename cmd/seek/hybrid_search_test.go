@@ -18,17 +18,18 @@ import (
 )
 
 type hybridTestScorer struct {
-	prepareCalls  atomic.Int32
-	embedCalls    atomic.Int32
-	scoreCalls    atomic.Int32
-	closeCalls    atomic.Int32
-	embedErr      error
-	prepareErr    error
-	vectorForUnit func(semanticUnit) semanticVector
-	queryVector   *semanticVector
-	mu            sync.Mutex
-	documents     []rerankDocument
-	embeddedPaths []string
+	prepareCalls   atomic.Int32
+	embedCalls     atomic.Int32
+	scoreCalls     atomic.Int32
+	closeCalls     atomic.Int32
+	embedErr       error
+	prepareErr     error
+	queryTruncated bool
+	vectorForUnit  func(semanticUnit) semanticVector
+	queryVector    *semanticVector
+	mu             sync.Mutex
+	documents      []rerankDocument
+	embeddedPaths  []string
 }
 
 func (*hybridTestScorer) PackSemanticUnits(
@@ -46,6 +47,13 @@ func runHybridTestSearch(
 	newModel semanticModelFactory,
 ) (string, error) {
 	t.Helper()
+	runConfig := searchRunConfig{policy: policy, newModel: newModel}
+	if policy.semanticEnabled() {
+		// These tests isolate joined retrieval and index behavior. Process tests
+		// cover the calibrated production policies.
+		runConfig.rerankAcceptance = alwaysAcceptRerankPolicyForTest()
+		runConfig.hybridAcceptance = alwaysAcceptRerankPolicyForTest()
+	}
 	return captureStdout(t, func() error {
 		return runSearchCommand(
 			t.Context(),
@@ -54,7 +62,7 @@ func runHybridTestSearch(
 			0,
 			0,
 			defaultSearchConfig(),
-			searchRunConfig{policy: policy, newModel: newModel},
+			runConfig,
 		)
 	})
 }
@@ -123,6 +131,7 @@ func (scorer *hybridTestScorer) PrepareSemanticQuery(
 		tokens:     make([]float32, lateOnSequenceLength*semanticEmbeddingDimensions),
 		scoreMask:  make([]bool, lateOnSequenceLength),
 		modelQuery: query,
+		truncated:  scorer.queryTruncated,
 	}
 	if scorer.queryVector == nil {
 		prepared.tokens[0] = 1
@@ -332,6 +341,80 @@ func TestRunDefaultJoinedSearchAddsSemanticOnlyFile(t *testing.T) {
 		plan.cacheDir, plan.indexDir, stateHash, state.HeadSHA,
 	) {
 		t.Fatalf("default build did not publish %s", filepath.Join(plan.cacheDir, joinedGenerationFile))
+	}
+}
+
+func TestRunJoinedAcceptanceRejectionDoesNotUseLexicalFallback(t *testing.T) {
+	requireTools(t)
+	t.Chdir(t.TempDir())
+	folder := t.TempDir()
+	writeFileAt(t, folder, "alpha.go", "package sample\n// alpha only\n")
+	writeFileAt(t, folder, "beta.go", "package sample\n// beta only\n")
+	setTestUserCache(t)
+
+	scorer := &hybridTestScorer{}
+	output, err := captureStdout(t, func() error {
+		return runSearchCommand(
+			t.Context(),
+			"alpha beta",
+			[]string{folder},
+			0,
+			0,
+			defaultSearchConfig(),
+			searchRunConfig{
+				policy:           defaultSearchPolicy(),
+				hybridAcceptance: newRerankAcceptancePolicy(0.6),
+				newModel: func(context.Context) (semanticModel, error) {
+					return scorer, nil
+				},
+			},
+		)
+	})
+	if !errors.Is(err, errNoMatch) || output != "" {
+		t.Fatalf("joined rejection output=%q error=%v, want no match", output, err)
+	}
+	if scorer.scoreCalls.Load() != 1 {
+		t.Fatalf("joined score calls=%d, want 1", scorer.scoreCalls.Load())
+	}
+}
+
+func TestRunJoinedTruncatedQuerySkipsExpansionBranches(t *testing.T) {
+	requireTools(t)
+	t.Chdir(t.TempDir())
+	folder := t.TempDir()
+	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
+	writeFileAt(t, folder, "relaxed.go", "package sample\n// alpha only\n")
+	setTestUserCache(t)
+	planFolderTestCorpus(t, folder)
+
+	if _, err := runHybridTestSearch(
+		t,
+		"alpha",
+		[]string{folder},
+		defaultSearchPolicy(),
+		func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil },
+	); err != nil {
+		t.Fatal(err)
+	}
+	scorer := &hybridTestScorer{queryTruncated: true}
+	output, err := runHybridTestSearch(
+		t,
+		"alpha beta",
+		[]string{folder},
+		defaultSearchPolicy(),
+		func(context.Context) (semanticModel, error) { return scorer, nil },
+	)
+	if err != nil || !strings.Contains(output, "strict.go") || strings.Contains(output, "relaxed.go") {
+		t.Fatalf("truncated joined output=%q error=%v", output, err)
+	}
+	if scorer.prepareCalls.Load() != 1 || scorer.scoreCalls.Load() != 0 ||
+		scorer.embedCalls.Load() != 0 {
+		t.Fatalf(
+			"model calls: prepare=%d score=%d embed=%d, want 1, 0, 0",
+			scorer.prepareCalls.Load(),
+			scorer.scoreCalls.Load(),
+			scorer.embedCalls.Load(),
+		)
 	}
 }
 

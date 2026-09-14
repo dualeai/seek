@@ -136,10 +136,6 @@ available compute, several GiB of memory, and significant cache space.`,
 			if flags.lexicalOnly {
 				policy = lexicalOnlySearchPolicy()
 			}
-			runConfig := searchRunConfig{policy: policy}
-			if policy.semanticEnabled() {
-				runConfig.newModel = newLateOnSemanticModel
-			}
 			return runSearchCommand(
 				cmd.Context(),
 				args[0],
@@ -147,7 +143,7 @@ available compute, several GiB of memory, and significant cache space.`,
 				flags.limit,
 				flags.maxMatches,
 				flags.search,
-				runConfig,
+				defaultSearchRunConfig(policy),
 			)
 		},
 		SilenceErrors: true,
@@ -182,6 +178,16 @@ available compute, several GiB of memory, and significant cache space.`,
 	gc.SetFlagErrorFunc(suggestFlagError)
 	cmd.AddCommand(gc)
 	return cmd
+}
+
+func defaultSearchRunConfig(policy searchPolicy) searchRunConfig {
+	config := searchRunConfig{policy: policy}
+	if !policy.semanticEnabled() {
+		return config
+	}
+	config.newModel = newLateOnSemanticModel
+	config.newAcceptancePolicies = defaultRerankAcceptancePolicies
+	return config
 }
 
 func configureCLILogging(w io.Writer, verbose bool) {

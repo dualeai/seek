@@ -636,7 +636,8 @@ func TestRunDefaultJoinedSearchUsesUSearchAboveExactThreshold(t *testing.T) {
 			0,
 			defaultSearchConfig(),
 			searchRunConfig{
-				policy: defaultSearchPolicy(),
+				policy:           defaultSearchPolicy(),
+				hybridAcceptance: alwaysAcceptRerankPolicyForTest(),
 				newModel: func(context.Context) (semanticModel, error) {
 					return scorer, nil
 				},

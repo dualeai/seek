@@ -81,7 +81,6 @@ func TestLateOnTokenizerMatchesPyLate(t *testing.T) {
 	if got := mustEncodeLateOnText(t, tokenizer, probe); !reflect.DeepEqual(got, want) {
 		t.Fatalf("probe IDs = %v, want %v", got, want)
 	}
-
 	upper := mustEncodeLateOnText(t, tokenizer, "[Q] MyHTTPHandler")
 	lower := mustEncodeLateOnText(t, tokenizer, "[Q] myhttphandler")
 	if reflect.DeepEqual(upper, lower) {
@@ -100,6 +99,73 @@ func TestLateOnTokenizerMatchesPyLate(t *testing.T) {
 	)
 	if len(long) != lateOnSequenceLength || long[len(long)-1] != lateOnSEPTokenID {
 		t.Fatalf("truncated sequence has length %d and final ID %d", len(long), long[len(long)-1])
+	}
+}
+
+func TestLateOnPrepareSemanticQueryReportsTruncation(t *testing.T) {
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	scorer, err := newLateOnSemanticModel(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := scorer.Close(); err != nil {
+			t.Errorf("close scorer: %v", err)
+		}
+	})
+
+	for _, test := range []struct {
+		name      string
+		query     string
+		truncated bool
+	}{
+		{name: "short", query: "request authentication flow"},
+		{name: "long", query: strings.Repeat("identifier ", 300), truncated: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			prepared, err := scorer.PrepareSemanticQuery(t.Context(), test.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if prepared.modelQuery != test.query || prepared.truncated != test.truncated {
+				t.Fatalf(
+					"prepared query text match=%t truncated=%t, want %t",
+					prepared.modelQuery == test.query,
+					prepared.truncated,
+					test.truncated,
+				)
+			}
+			active := 0
+			for _, keep := range prepared.scoreMask {
+				if keep {
+					active++
+				}
+			}
+			if active == 0 {
+				t.Fatal("prepared query has no active score tokens")
+			}
+		})
+	}
+}
+
+func TestRerankCertainTermBoundAgreesWithTokenizer(t *testing.T) {
+	tokenizer, _ := openLateOnTestTokenizer(t)
+	query := strings.TrimSpace(strings.Repeat(
+		"identifier ",
+		rerankQueryMaximumUntruncatedTerms+1,
+	))
+	if !rerankQueryGuaranteedTruncated(query) {
+		t.Fatal("term preflight did not detect certain truncation")
+	}
+	_, truncated, err := encodeLateOnTextWithTruncation(
+		tokenizer,
+		lateOnQueryPrefix+query,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !truncated {
+		t.Fatal("tokenizer did not truncate a query above the certain term bound")
 	}
 }
 
@@ -569,7 +635,8 @@ func TestLateOnInferenceMatchesReferenceScores(t *testing.T) {
 
 func skipLateOnReferenceScoreKnownIssue(t *testing.T) {
 	t.Helper()
-	// ONNX Runtime CoreML returns incorrect FP16 scores on macOS 15 ARM64.
+	// ONNX Runtime 1.30.0 can return incorrect FP16 scores on macOS 15 ARM64
+	// with the static CoreML MLProgram path.
 	// TODO: Remove this skip after ONNX Runtime fixes
 	// https://github.com/microsoft/onnxruntime/issues/32569.
 	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
@@ -580,7 +647,7 @@ func skipLateOnReferenceScoreKnownIssue(t *testing.T) {
 		return
 	}
 	if strings.HasPrefix(strings.TrimSpace(string(version)), "15.") {
-		t.Skip("macOS 15 ARM64 Core ML score parity: https://github.com/microsoft/onnxruntime/issues/32569")
+		t.Skip("macOS 15 ARM64 static CoreML MLProgram FP16 score parity: https://github.com/microsoft/onnxruntime/issues/32569")
 	}
 }
 
@@ -751,7 +818,7 @@ func TestLateOnModelCanReopen(t *testing.T) {
 	}
 }
 
-func TestCLIProcessLateOnReranks(t *testing.T) {
+func TestCLIProcessLateOnStrictEvidenceContract(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
 	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
@@ -783,5 +850,89 @@ func TestCLIProcessLateOnReranks(t *testing.T) {
 		!strings.Contains(reranked.stdout, "## alpha.go") ||
 		!strings.Contains(reranked.stdout, "## beta.go") {
 		t.Fatalf("real backend did not publish the OR-only candidates: %+v", reranked)
+	}
+}
+
+func TestCLIProcessLateOnAcceptanceBoundary(t *testing.T) {
+	requireTools(t)
+	folder := t.TempDir()
+	writeFileAt(
+		t,
+		folder,
+		"auth.go",
+		"package sample\nfunc authenticateRequest(request Request) error { return validateToken(request.Token) }\n",
+	)
+	writeFileAt(
+		t,
+		folder,
+		"colors.go",
+		"package sample\nfunc terminalColorCode(name string) int { return ansiColors[name] }\n",
+	)
+	cache := t.TempDir()
+	const nonexistent = "zqxvplor blingwazzle nyoomphastic"
+
+	rejected := runCLIProcessWithCache(
+		t,
+		cache,
+		t.TempDir(),
+		[]string{nonexistent, folder},
+		nil,
+	)
+	if rejected.code != 1 || rejected.stdout != "" || rejected.stderr != "" {
+		t.Fatalf("nonexistent query=%+v, want silent no match", rejected)
+	}
+
+	verbose := runCLIProcessWithCache(
+		t,
+		cache,
+		t.TempDir(),
+		[]string{"--verbose", nonexistent, folder},
+		nil,
+	)
+	if verbose.code != 1 || verbose.stdout != "" {
+		t.Fatalf("verbose nonexistent query=%+v, want no match", verbose)
+	}
+	for _, want := range []string{`msg="Rejected model expansion"`, "route=joined"} {
+		if !strings.Contains(verbose.stderr, want) {
+			t.Fatalf("verbose rejection lacks %q:\n%s", want, verbose.stderr)
+		}
+	}
+	for _, want := range []string{`reason="score not above minimum"`, "minimum_mean_max_sim="} {
+		if !strings.Contains(verbose.stderr, want) {
+			t.Fatalf("score rejection lacks %q:\n%s", want, verbose.stderr)
+		}
+	}
+
+	const supportedQuery = "request authentication flow"
+	lexical := runCLIProcessWithCache(
+		t,
+		cache,
+		t.TempDir(),
+		[]string{"--lexical-only", supportedQuery, folder},
+		nil,
+	)
+	if lexical.code != 1 || lexical.stdout != "" || lexical.stderr != "" {
+		t.Fatalf("positive lexical control=%+v, want silent no match", lexical)
+	}
+
+	accepted := runCLIProcessWithCache(
+		t,
+		cache,
+		t.TempDir(),
+		[]string{"--verbose", supportedQuery, folder},
+		nil,
+	)
+	if accepted.code != 0 ||
+		!strings.Contains(accepted.stdout, "## auth.go") {
+		t.Fatalf("accepted query=%+v", accepted)
+	}
+	for _, want := range []string{
+		`msg="Accepted model expansion"`,
+		"route=joined",
+		`reason="score above minimum"`,
+	} {
+		if !strings.Contains(accepted.stderr, want) {
+			t.Fatalf("acceptance lacks %q:\n%s", want, accepted.stderr)
+		}
 	}
 }

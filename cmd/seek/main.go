@@ -168,6 +168,8 @@ func runSearchCommand(
 	if runConfig.policy.semanticEnabled() {
 		rerankPlan, rerankEligible = planRerankQuery(pattern, rawQ)
 	}
+	guaranteedTruncated := rerankEligible &&
+		rerankQueryGuaranteedTruncated(rerankPlan.modelQuery)
 
 	paths, err := resolveDefaultSearchRoot(ctx, pathOperands)
 	if err != nil {
@@ -177,7 +179,29 @@ func runSearchCommand(
 	if err != nil {
 		return err
 	}
-	execution := searchExecution{policy: runConfig.policy, resources: liveSearchResources()}
+	if guaranteedTruncated {
+		slog.Debug(
+			"Rejected model expansion",
+			"route", "all",
+			"reason", "query truncated",
+		)
+		rerankEligible = false
+		runConfig.newModel = nil
+	}
+	if rerankEligible && runConfig.newAcceptancePolicies != nil {
+		policies := runConfig.newAcceptancePolicies()
+		if runConfig.rerankAcceptance == nil {
+			runConfig.rerankAcceptance = policies.rerank
+		}
+		if runConfig.hybridAcceptance == nil {
+			runConfig.hybridAcceptance = policies.hybrid
+		}
+	}
+	execution := searchExecution{
+		policy:     runConfig.policy,
+		acceptance: runConfig.hybridAcceptance,
+		resources:  liveSearchResources(),
+	}
 	if runConfig.newModel != nil && runConfig.policy.semanticEnabled() {
 		execution.model = newSemanticModelFuture(runConfig.newModel)
 		if rerankEligible {
@@ -236,7 +260,25 @@ func runSearchCommand(
 			return err
 		}
 	}
-	if rerankEligible && !hybridUsed {
+	rerankAfterLexical := rerankEligible && !hybridUsed
+	if rerankAfterLexical && execution.model != nil {
+		_, prepared, prepareErr := execution.model.prepareQuery(ctx, rerankPlan.modelQuery)
+		switch {
+		case prepareErr != nil:
+			allResults = applyRerankDisplayConfig(allResults, config)
+			slog.Debug("Re-ranking failed; using BM25", "error", prepareErr)
+			rerankAfterLexical = false
+		case prepared == nil:
+			allResults = applyRerankDisplayConfig(allResults, config)
+			slog.Debug("Re-ranking failed; using BM25", "error", errRerankUnavailable)
+			rerankAfterLexical = false
+		case prepared.truncated:
+			allResults = applyRerankDisplayConfig(allResults, config)
+			logRerankExpansionRejection(runConfig.rerankAcceptance, "query truncated")
+			rerankAfterLexical = false
+		}
+	}
+	if rerankAfterLexical {
 		var score rerankScoreFunc
 		if execution.model != nil {
 			score = execution.model.scores
@@ -250,6 +292,7 @@ func runSearchCommand(
 			config,
 			rerankPlan,
 			score,
+			runConfig.rerankAcceptance,
 			search,
 		)
 		allResults = reranked

@@ -341,7 +341,10 @@ func (s *lateOnModel) PrepareSemanticQuery(
 	if err != nil {
 		return nil, err
 	}
-	encoded, encodeErr := encodeLateOnText(tokenizer, lateOnQueryPrefix+modelQuery)
+	encoded, truncated, encodeErr := encodeLateOnTextWithTruncation(
+		tokenizer,
+		lateOnQueryPrefix+modelQuery,
+	)
 	s.releaseTokenizer(tokenizer)
 	if encodeErr != nil {
 		return nil, encodeErr
@@ -363,6 +366,7 @@ func (s *lateOnModel) PrepareSemanticQuery(
 		tokens:     embeddings,
 		scoreMask:  mask[0],
 		modelQuery: modelQuery,
+		truncated:  truncated,
 	}, nil
 }
 
@@ -922,11 +926,20 @@ func encodeLateOnText(
 	tokenizer *lateOnTokenizer,
 	text string,
 ) ([]int, error) {
+	encoded, _, err := encodeLateOnTextWithTruncation(tokenizer, text)
+	return encoded, err
+}
+
+func encodeLateOnTextWithTruncation(
+	tokenizer *lateOnTokenizer,
+	text string,
+) ([]int, bool, error) {
 	encoded, _, err := tokenizer.encode(text, true, false)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return truncateLateOnHead(encoded, lateOnSequenceLength), nil
+	truncated := len(encoded) > lateOnSequenceLength
+	return truncateLateOnHead(encoded, lateOnSequenceLength), truncated, nil
 }
 
 func truncateLateOnHead(encoded []int, limit int) []int {

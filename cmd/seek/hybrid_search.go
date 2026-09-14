@@ -135,6 +135,22 @@ func tryHybridSearch(
 	) {
 		return nil, nil, false, fmt.Errorf("joined generation does not match the current Git state")
 	}
+	_, prepared, err := execution.model.prepareQuery(ctx, rerankPlan.modelQuery)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("prepare joined semantic query: %w", err)
+	}
+	if prepared == nil {
+		return nil, nil, false, fmt.Errorf("prepare joined semantic query: %w", errRerankUnavailable)
+	}
+	if prepared.truncated {
+		files, searchErr := runJoinedStrictSearch(ctx, plan, strictQ, config)
+		if searchErr != nil {
+			return nil, nil, false, searchErr
+		}
+		logRerankExpansionRejection(execution.acceptance, "query truncated")
+		touchPlanUsed(plan)
+		return wrapCorpusResults(plan, files), nil, true, nil
+	}
 	generation, err := openJoinedSemanticGeneration(
 		plan.cacheDir,
 		plan.indexDir,
@@ -191,6 +207,7 @@ func tryHybridSearch(
 		relaxedFiles,
 		semanticFiles,
 		semantic,
+		execution.acceptance,
 	)
 	if err != nil {
 		return nil, nil, false, err
@@ -263,6 +280,22 @@ func tryHybridFolderSearch(
 	if !joinedGenerationMatches(plan.cacheDir, plan.indexDir, state, state) {
 		return nil, nil, false, fmt.Errorf("joined generation does not match the current folder state")
 	}
+	_, prepared, err := execution.model.prepareQuery(ctx, rerankPlan.modelQuery)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("prepare joined folder semantic query: %w", err)
+	}
+	if prepared == nil {
+		return nil, nil, false, fmt.Errorf("prepare joined folder semantic query: %w", errRerankUnavailable)
+	}
+	if prepared.truncated {
+		files, searchErr := runJoinedStrictSearch(ctx, plan, strictQ, config)
+		if searchErr != nil {
+			return nil, nil, false, searchErr
+		}
+		logRerankExpansionRejection(execution.acceptance, "query truncated")
+		touchPlanUsed(plan)
+		return wrapCorpusResults(plan, files), nil, true, nil
+	}
 	generation, err := openJoinedSemanticGeneration(plan.cacheDir, plan.indexDir, state)
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("open folder semantic generation: %w", err)
@@ -307,6 +340,7 @@ func tryHybridFolderSearch(
 		relaxedFiles,
 		semanticFiles,
 		semantic,
+		execution.acceptance,
 	)
 	if err != nil {
 		return nil, nil, false, err
@@ -388,6 +422,26 @@ func runHybridBranches(
 	return strictFiles, relaxedFiles, semantic, nil
 }
 
+func runJoinedStrictSearch(
+	ctx context.Context,
+	plan corpusPlan,
+	strictQ query.Q,
+	config searchConfig,
+) ([]zoekt.FileMatch, error) {
+	config.contextGitCorpus = plan.kind == corpusKindGit
+	files, err := executeParsedSearchScopedDirs(
+		ctx,
+		searchIndexDirs(plan),
+		strictQ,
+		plan.scope,
+		config,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("joined strict search: %w", err)
+	}
+	return files, nil
+}
+
 func finishHybridSearch(
 	ctx context.Context,
 	plan corpusPlan,
@@ -395,6 +449,7 @@ func finishHybridSearch(
 	relaxedFiles []zoekt.FileMatch,
 	semanticFiles []semanticFileCandidate,
 	semantic hybridSemanticResult,
+	acceptance *rerankAcceptancePolicy,
 ) ([]corpusSearchResult, error) {
 	strictResults := wrapCorpusResults(plan, strictFiles)
 	relaxedResults := wrapCorpusResults(plan, relaxedFiles)
@@ -415,7 +470,17 @@ func finishHybridSearch(
 	if err != nil {
 		return nil, fmt.Errorf("score joined candidates: %w", err)
 	}
-	return fuseRerankCandidates(candidates, scores, strictRanked, relaxedRanked)
+	batch, err := newRerankScoreBatch(semantic.query, scores)
+	if err != nil {
+		return nil, fmt.Errorf("score joined candidates: %w", err)
+	}
+	return fuseRerankCandidates(
+		candidates,
+		batch,
+		strictRanked,
+		relaxedRanked,
+		acceptance,
+	)
 }
 
 func hybridSearchEligible(plans []corpusPlan, execution searchExecution) bool {

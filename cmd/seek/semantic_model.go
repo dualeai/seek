@@ -19,6 +19,7 @@ type semanticQueryEmbedding struct {
 	tokens     []float32
 	scoreMask  []bool
 	modelQuery string
+	truncated  bool
 }
 
 // semanticModel is the command-wide LateOn model used by indexing, retrieval,
@@ -171,16 +172,21 @@ func (future *semanticModelFuture) scores(
 	ctx context.Context,
 	query string,
 	documents []rerankDocument,
-) ([]float32, error) {
+) (rerankScoreBatch, error) {
 	model, prepared, err := future.prepareQuery(ctx, query)
 	if err != nil {
-		return nil, err
+		return rerankScoreBatch{}, err
 	}
-	return model.ScoresWithSemanticQuery(ctx, prepared, documents)
+	values, err := model.ScoresWithSemanticQuery(ctx, prepared, documents)
+	if err != nil {
+		return rerankScoreBatch{}, err
+	}
+	return newRerankScoreBatch(prepared, values)
 }
 
 type searchExecution struct {
-	policy    searchPolicy
-	model     *semanticModelFuture
-	resources searchResources
+	policy     searchPolicy
+	acceptance *rerankAcceptancePolicy
+	model      *semanticModelFuture
+	resources  searchResources
 }
