@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -1217,6 +1218,39 @@ func BenchmarkMultiCorpus_WarmSearchAndFormat(b *testing.B) {
 }
 
 func BenchmarkFormatCorpusResults_Dedupe(b *testing.B) {
+	results := benchmarkCorpusResultsForFormatting()
+
+	b.ReportAllocs()
+	for b.Loop() {
+		benchmarkStringSink = formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext, plainPalette)
+	}
+}
+
+func BenchmarkWriteCorpusResults_Dedupe(b *testing.B) {
+	results := benchmarkCorpusResultsForFormatting()
+
+	b.ReportAllocs()
+	for b.Loop() {
+		output := bufio.NewWriter(io.Discard)
+		wrote, err := writeCorpusResultsWithContext(
+			output,
+			results,
+			nil,
+			0,
+			0,
+			showCorpusContext,
+			plainPalette,
+		)
+		if err == nil {
+			err = output.Flush()
+		}
+		if err != nil || !wrote {
+			b.Fatalf("write results: wrote=%t error=%v", wrote, err)
+		}
+	}
+}
+
+func benchmarkCorpusResultsForFormatting() []corpusSearchResult {
 	results := make([]corpusSearchResult, 0, 200)
 	for i := range 100 {
 		name := fmt.Sprintf("src/file_%03d.go", i)
@@ -1235,11 +1269,7 @@ func BenchmarkFormatCorpusResults_Dedupe(b *testing.B) {
 			},
 		)
 	}
-
-	b.ReportAllocs()
-	for b.Loop() {
-		benchmarkStringSink = formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext, plainPalette)
-	}
+	return results
 }
 
 func BenchmarkFolderCorpusState_200Files(b *testing.B) {

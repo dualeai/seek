@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -323,12 +324,25 @@ func runSearchCommand(
 	if useColor(os.Stdout) {
 		pal = ansiPalette
 	}
-	output := formatCorpusResultsWithContext(allResults, dirtyByCorpus, limit, maxMatches, displayMode, pal)
-	if output == "" {
+	output := bufio.NewWriter(os.Stdout)
+	wrote, err := writeCorpusResultsWithContext(
+		output,
+		allResults,
+		dirtyByCorpus,
+		limit,
+		maxMatches,
+		displayMode,
+		pal,
+	)
+	if err == nil {
+		err = output.Flush()
+	}
+	if err != nil {
+		return fmt.Errorf("write search results: %w", err)
+	}
+	if !wrote {
 		return errNoMatch
 	}
-
-	_, _ = os.Stdout.WriteString(output)
 	return nil
 }
 
