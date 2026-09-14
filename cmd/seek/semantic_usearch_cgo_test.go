@@ -739,6 +739,7 @@ func BenchmarkSemanticFilteredRetrieval(b *testing.B) {
 		name    string
 		percent int
 		tokens  int
+		limit   int
 	}{
 		{name: "small-1-percent-2-tokens", percent: 1, tokens: 2},
 		{name: "low-4-percent-2-tokens", percent: 4, tokens: 2},
@@ -752,7 +753,17 @@ func BenchmarkSemanticFilteredRetrieval(b *testing.B) {
 		{name: "medium-25-percent-128-tokens", percent: 25, tokens: 128},
 		{name: "upper-45-percent-128-tokens", percent: 45, tokens: 128},
 		{name: "high-90-percent-128-tokens", percent: 90, tokens: 128},
+		{
+			name:    "production-limit-medium-25-percent-32-tokens",
+			percent: 25,
+			tokens:  32,
+			limit:   hybridSemanticUnitLimit,
+		},
 	} {
+		limit := test.limit
+		if limit == 0 {
+			limit = 10
+		}
 		rows := make([]semanticUnit, len(embeddings))
 		allowedRows := make([]uint64, 0, len(rows)*test.percent/100+1)
 		for row := range rows {
@@ -801,7 +812,7 @@ func BenchmarkSemanticFilteredRetrieval(b *testing.B) {
 			}
 		}
 		exact, err := exactSemanticSortedCandidates(
-			b.Context(), generation.vectors, prepared, allowedRows, 10,
+			b.Context(), generation.vectors, prepared, allowedRows, limit,
 		)
 		if err != nil {
 			b.Fatal(err)
@@ -821,7 +832,7 @@ func BenchmarkSemanticFilteredRetrieval(b *testing.B) {
 				exactRows:    len(plannedRoute.exactRows),
 				nativeShards: len(plannedRoute.jobs),
 				run: func(ctx context.Context) ([]semanticHit, error) {
-					return semanticUSearchFiltered(ctx, generation, prepared, filter, 10)
+					return semanticUSearchFiltered(ctx, generation, prepared, filter, limit)
 				},
 			},
 			{
@@ -829,7 +840,7 @@ func BenchmarkSemanticFilteredRetrieval(b *testing.B) {
 				nativeShards: forcedNativeShards,
 				run: func(ctx context.Context) ([]semanticHit, error) {
 					return benchmarkForcedNativeSemanticFilter(
-						ctx, generation, prepared, filter, 10,
+						ctx, generation, prepared, filter, limit,
 					)
 				},
 			},
@@ -841,7 +852,7 @@ func BenchmarkSemanticFilteredRetrieval(b *testing.B) {
 					if err != nil {
 						return nil, err
 					}
-					return exactSemanticSortedCandidates(ctx, generation.vectors, prepared, mask.selectedRows(), 10)
+					return exactSemanticSortedCandidates(ctx, generation.vectors, prepared, mask.selectedRows(), limit)
 				},
 			},
 		}
@@ -874,7 +885,10 @@ func BenchmarkSemanticFilteredRetrieval(b *testing.B) {
 				if !foundTarget {
 					b.Fatalf("filtered retrieval omitted target row %d", target)
 				}
-				b.ReportMetric(float64(recalled)/float64(len(exact)), "top10-recall")
+				b.ReportMetric(
+					float64(recalled)/float64(len(exact)),
+					fmt.Sprintf("top%d-recall", limit),
+				)
 				b.ReportMetric(float64(max(0, len(exact)-len(hits))), "underfill")
 			})
 		}

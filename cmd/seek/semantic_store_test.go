@@ -725,6 +725,31 @@ func TestExactSemanticSearchStableOrder(t *testing.T) {
 	}
 }
 
+func TestKeepBestSemanticHitKeepsStableTopK(t *testing.T) {
+	input := []semanticHit{
+		{row: 7, score: 0.5},
+		{row: 4, score: 1},
+		{row: 9, score: -1},
+		{row: 2, score: 1},
+		{row: 3, score: 0.75},
+		{row: 1, score: 0.75},
+	}
+	var hits []semanticHit
+	for _, hit := range input {
+		hits = keepBestSemanticHit(hits, hit, 4)
+	}
+	sortSemanticHits(hits)
+	want := []semanticHit{
+		{row: 2, score: 1},
+		{row: 4, score: 1},
+		{row: 1, score: 0.75},
+		{row: 3, score: 0.75},
+	}
+	if !reflect.DeepEqual(hits, want) {
+		t.Fatalf("hits=%+v, want %+v", hits, want)
+	}
+}
+
 func TestExactSemanticSearchParallelMatchesSerialExpected(t *testing.T) {
 	vectors := make([]semanticFineSNORM16Vectors, 600)
 	defaultVector := semanticVector{2: 1}
@@ -815,6 +840,47 @@ func BenchmarkExactSemanticRange(b *testing.B) {
 			b.ResetTimer()
 			for b.Loop() {
 				hits, err := exactSemanticRange(ctx, vectors, scaled, nil, 0, len(vectors), 10)
+				if err != nil {
+					b.Fatal(err)
+				}
+				semanticExactBenchmarkHits = hits
+			}
+		})
+	}
+}
+
+// BenchmarkExactSemanticRangeCandidateLimits compares a moderate result limit
+// with the semantic unit limit used before file collapse.
+func BenchmarkExactSemanticRangeCandidateLimits(b *testing.B) {
+	const rowCount = 2_048
+	vectors := make([]semanticFineSNORM16Vectors, rowCount)
+	for row := range vectors {
+		for centroid := range vectors[row] {
+			vector := semanticUSearchTestVector(row*semanticFineCentroidsPerUnit + centroid + 1)
+			stored, err := encodeSemanticSNORM16Vector(&vector)
+			if err != nil {
+				b.Fatal(err)
+			}
+			vectors[row][centroid] = stored
+		}
+	}
+	query := []semanticVector{
+		semanticUSearchTestVector(11),
+		semanticUSearchTestVector(42),
+	}
+	scaled, err := prepareSemanticSNORM16Query(query)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, limit := range []int{160, hybridSemanticUnitLimit} {
+		b.Run(fmt.Sprintf("limit-%d", limit), func(b *testing.B) {
+			ctx := context.Background()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				hits, err := exactSemanticRange(
+					ctx, vectors, scaled, nil, 0, len(vectors), limit,
+				)
 				if err != nil {
 					b.Fatal(err)
 				}

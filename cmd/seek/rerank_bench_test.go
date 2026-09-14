@@ -168,6 +168,14 @@ func BenchmarkLateOnModelStartup_WarmRuntime(b *testing.B) {
 }
 
 func BenchmarkLateOnScoring_Top20(b *testing.B) {
+	benchmarkLateOnScoring(b, 20)
+}
+
+func BenchmarkLateOnScoring_FullBatch(b *testing.B) {
+	benchmarkLateOnScoring(b, rerankCandidateLimit)
+}
+
+func benchmarkLateOnScoring(b *testing.B, documentCount int) {
 	b.Setenv("SEEK_CACHE_DIR", b.TempDir())
 	scorer, err := newLateOnSemanticModel(b.Context())
 	if err != nil {
@@ -179,7 +187,7 @@ func BenchmarkLateOnScoring_Top20(b *testing.B) {
 		}
 	})
 
-	documents := lateOnBenchmarkDocuments()
+	documents := lateOnBenchmarkDocuments(documentCount)
 	const modelQuery = "find the request parser and handler"
 	scores, err := scoreWithTestSemanticEmbedder(b.Context(), scorer, modelQuery, documents)
 	if err != nil || len(scores) != len(documents) {
@@ -279,8 +287,16 @@ func BenchmarkSemanticModelPass100k(b *testing.B) {
 }
 
 func BenchmarkLateOnDocumentTokenization_Top20Truncated(b *testing.B) {
+	benchmarkLateOnDocumentTokenization(b, 20)
+}
+
+func BenchmarkLateOnDocumentTokenization_FullBatchTruncated(b *testing.B) {
+	benchmarkLateOnDocumentTokenization(b, rerankCandidateLimit)
+}
+
+func benchmarkLateOnDocumentTokenization(b *testing.B, documentCount int) {
 	tokenizer, punctuation := openLateOnTestTokenizer(b)
-	documents := lateOnBenchmarkTruncatedDocuments()
+	documents := lateOnBenchmarkTruncatedDocuments(documentCount)
 	serialized, _, _, _ := serializeLateOnDocumentWithMatch(documents[0])
 	encoded, _, err := tokenizer.encode(lateOnDocumentPrefix+serialized, true, true)
 	if err != nil {
@@ -349,8 +365,8 @@ func BenchmarkLateOnRuntimeCache(b *testing.B) {
 	})
 }
 
-func lateOnBenchmarkDocuments() []rerankDocument {
-	documents := make([]rerankDocument, rerankCandidateLimit)
+func lateOnBenchmarkDocuments(count int) []rerankDocument {
+	documents := make([]rerankDocument, count)
 	for i := range documents {
 		text := fmt.Sprintf(
 			"func parseRequestHandler%d(request Request) error {\n"+
@@ -373,12 +389,12 @@ func lateOnBenchmarkDocuments() []rerankDocument {
 	return documents
 }
 
-func lateOnBenchmarkTruncatedDocuments() []rerankDocument {
+func lateOnBenchmarkTruncatedDocuments(count int) []rerankDocument {
 	const match = "parseRequestHandler"
 	before := strings.Repeat("prefixContextValue ", 55)
 	after := strings.Repeat(" suffixContextValue", 55)
 	text := before + match + after
-	documents := make([]rerankDocument, rerankCandidateLimit)
+	documents := make([]rerankDocument, count)
 	for i := range documents {
 		documents[i] = rerankDocument{
 			Path: fmt.Sprintf(

@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
-	"sort"
 	"sync"
 	"unsafe"
 
@@ -989,6 +988,9 @@ func exactSemanticRange(
 	end int,
 	limit int,
 ) ([]semanticHit, error) {
+	if limit <= 0 || start >= end {
+		return nil, nil
+	}
 	hits := make([]semanticHit, 0, min(limit, end-start))
 	contextCheckRows := max(1, 4096/max(1, len(scaledQuery)))
 	nextContextCheck := 0
@@ -1025,21 +1027,60 @@ func exactSemanticRange(
 			score += maximum
 		}
 		hit := semanticHit{row: row, score: score}
-		position := sort.Search(len(hits), func(i int) bool {
-			return semanticHitLess(hit, hits[i])
-		})
-		if position >= limit {
-			continue
-		}
-		if len(hits) < limit {
-			hits = append(hits, semanticHit{})
-			copy(hits[position+1:], hits[position:])
-		} else {
-			copy(hits[position+1:], hits[position:len(hits)-1])
-		}
-		hits[position] = hit
+		hits = keepBestSemanticHit(hits, hit, limit)
 	}
+	sortSemanticHits(hits)
 	return hits, nil
+}
+
+// keepBestSemanticHit maintains a bounded worst-first heap. The root is the
+// least useful retained hit. Updating the retained set costs O(log limit)
+// instead of moving an ordered slice on every insertion.
+func keepBestSemanticHit(hits []semanticHit, hit semanticHit, limit int) []semanticHit {
+	if limit <= 0 {
+		return hits
+	}
+	if len(hits) < limit {
+		hits = append(hits, hit)
+		semanticHitHeapUp(hits, len(hits)-1)
+		return hits
+	}
+	if !semanticHitLess(hit, hits[0]) {
+		return hits
+	}
+	hits[0] = hit
+	semanticHitHeapDown(hits, 0)
+	return hits
+}
+
+func semanticHitHeapUp(hits []semanticHit, index int) {
+	for index > 0 {
+		parent := (index - 1) / 2
+		if !semanticHitWorse(hits[index], hits[parent]) {
+			return
+		}
+		hits[index], hits[parent] = hits[parent], hits[index]
+		index = parent
+	}
+}
+
+func semanticHitHeapDown(hits []semanticHit, index int) {
+	for {
+		left := index*2 + 1
+		if left >= len(hits) {
+			return
+		}
+		worst := left
+		right := left + 1
+		if right < len(hits) && semanticHitWorse(hits[right], hits[left]) {
+			worst = right
+		}
+		if !semanticHitWorse(hits[worst], hits[index]) {
+			return
+		}
+		hits[index], hits[worst] = hits[worst], hits[index]
+		index = worst
+	}
 }
 
 func sortSemanticHits(hits []semanticHit) {
@@ -1048,6 +1089,10 @@ func sortSemanticHits(hits []semanticHit) {
 
 func semanticHitLess(left, right semanticHit) bool {
 	return compareSemanticHits(left, right) < 0
+}
+
+func semanticHitWorse(left, right semanticHit) bool {
+	return compareSemanticHits(left, right) > 0
 }
 
 func compareSemanticHits(left, right semanticHit) int {

@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/sourcegraph/zoekt"
 )
 
 type hybridTestScorer struct {
@@ -242,14 +244,20 @@ func TestMaterializeSemanticCandidatesChecksCommittedBytes(t *testing.T) {
 	units[0].row = 0
 	units[0].text = nil
 	generation := &semanticGeneration{rows: units}
+	selected, err := selectSemanticFileCandidates(
+		generation,
+		[]semanticHit{{row: 0, score: 0.75}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	candidates, err := materializeSemanticCandidates(
 		t.Context(),
 		plan,
 		paths,
 		state.HeadSHA,
-		generation,
-		[]semanticHit{{row: 0, score: 0.75}},
+		selected,
 		2,
 	)
 	if err != nil {
@@ -268,11 +276,52 @@ func TestMaterializeSemanticCandidatesChecksCommittedBytes(t *testing.T) {
 
 	broken := &semanticGeneration{rows: append([]semanticUnit(nil), generation.rows...)}
 	broken.rows[0].contentID = semanticContentID(sha256.Sum256([]byte("different")))
+	brokenSelected, err := selectSemanticFileCandidates(
+		broken,
+		[]semanticHit{{row: 0, score: 1}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := materializeSemanticCandidates(
-		t.Context(), plan, paths, state.HeadSHA, broken,
-		[]semanticHit{{row: 0, score: 1}}, 0,
+		t.Context(), plan, paths, state.HeadSHA, brokenSelected, 0,
 	); err == nil {
 		t.Fatal("wrong content ID must reject semantic evidence")
+	}
+}
+
+func TestSelectHybridSemanticCandidatesSkipsUnusedFiles(t *testing.T) {
+	plan := corpusPlan{id: "test", kind: corpusKindFolder}
+	strict := []zoekt.FileMatch{{FileName: "lex-000.go", Score: 200}}
+	relaxed := make([]zoekt.FileMatch, rerankCandidateLimit)
+	semantic := make([]semanticFileCandidate, rerankCandidateLimit)
+	for index := range rerankCandidateLimit {
+		relaxed[index] = zoekt.FileMatch{
+			FileName: fmt.Sprintf("lex-%03d.go", index),
+			Score:    float64(rerankCandidateLimit - index),
+		}
+		semantic[index].unit.path = fmt.Sprintf("sem-%03d.go", index)
+	}
+
+	selected := selectHybridSemanticCandidates(plan, strict, relaxed, semantic)
+	if len(selected) != hybridBranchQuota {
+		t.Fatalf("selected semantic files=%d, want %d", len(selected), hybridBranchQuota)
+	}
+	for index, candidate := range selected {
+		want := fmt.Sprintf("sem-%03d.go", index)
+		if candidate.unit.path != want {
+			t.Fatalf("selected semantic file %d=%q, want %q", index, candidate.unit.path, want)
+		}
+	}
+
+	for index := range semantic {
+		semantic[index].unit.path = relaxed[index].FileName
+	}
+	selected = selectHybridSemanticCandidates(plan, strict, relaxed, semantic)
+	// The last lexical file fills the batch before its semantic duplicate is
+	// visited, so that file uses lexical evidence and needs no source read.
+	if len(selected) != rerankCandidateLimit-1 {
+		t.Fatalf("overlapping semantic files=%d, want %d", len(selected), rerankCandidateLimit-1)
 	}
 }
 
