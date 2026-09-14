@@ -93,19 +93,23 @@ func newRootCmd() *cobra.Command {
 	flags := &cliFlags{search: defaultSearchConfig()}
 	cmd := &cobra.Command{
 		Use:   "seek [flags] <query> [path...]",
-		Short: "Ranked lexical and semantic code search with persistent caching",
-		Long: `seek searches the current Git worktree or the files and folders you
-pass. Git paths use a cached Git corpus. Results stay in your selection.
-Explicit paths excluded by .gitignore and paths outside Git are searched as
-plain files or folders. Seek searches each visible nested Git worktree in the
-selected directories once. Plain multi-word descriptions use local model
-re-ranking by default and can include lang:, file:, and -file: filters. One
-unscoped clean Git worktree, one stable plain file, or one stable plain folder
-also uses combined lexical and semantic retrieval.
-Unless --lexical-only is set, every supported corpus build or update maintains
-both index parts, including for exact queries. A cold large-corpus build runs
-both parts in parallel. It can take tens of seconds or longer and use all
-available compute, several GiB of memory, and significant cache space.`,
+		Short: "Ranked local code search with exact and descriptive queries",
+		Long: `Seek searches the current Git worktree or selected files and folders.
+Descriptions of two or more words can use the bundled local model to find and
+rank code by meaning.
+
+Results are ranked, not exhaustive. A description considers at most 128 files.
+Each text-search pass is limited to 10,000 matches and 60 seconds. With -n 0,
+Seek displays every file returned within these bounds. Use an exhaustive search
+for counts, renames, and absence checks.
+
+If model-added results are too weak, Seek keeps results that contain every query
+word. If none remain, it prints nothing and exits with code 1. This does not
+prove absence.
+
+The first search of a large repository can take tens of seconds and use several
+GiB while Seek builds text and meaning-based indexes. Use --lexical-only to skip
+the meaning-based index and all model work.`,
 		Example: `  seek 'sym:Foo'              find definitions named Foo (ctags)
   seek 'lang:go func main'    rank Go files for this description
   seek 'file:cmd -file:test'  paths matching cmd, excluding tests
@@ -151,9 +155,9 @@ available compute, several GiB of memory, and significant cache space.`,
 	}
 
 	cmd.PersistentFlags().BoolVarP(&flags.verbose, "verbose", "v", false, "show debug logs and detailed errors")
-	cmd.Flags().BoolVar(&flags.lexicalOnly, "lexical-only", false, "disable semantic indexing, search, and model re-ranking")
-	cmd.Flags().IntVarP(&flags.limit, "limit", "n", 0, "maximum displayed files (≥ 0, 0 = no display limit)")
-	cmd.Flags().IntVarP(&flags.maxMatches, "max-matches", "m", 0, "maximum displayed matches per file (≥ 0, 0 = no display limit)")
+	cmd.Flags().BoolVar(&flags.lexicalOnly, "lexical-only", false, "text search only; skip the meaning-based index and model")
+	cmd.Flags().IntVarP(&flags.limit, "limit", "n", 0, "maximum files to display (0 = all returned files)")
+	cmd.Flags().IntVarP(&flags.maxMatches, "max-matches", "m", 0, "maximum matches per file (0 = all returned matches)")
 	cmd.Flags().IntVarP(&flags.afterContext, "after-context", "A", 0, "lines to display after each match (0–512)")
 	cmd.Flags().IntVarP(&flags.context, "context", "C", 0, "lines to display before and after each match (0–512)")
 

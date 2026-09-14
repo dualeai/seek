@@ -272,9 +272,9 @@ func TestCLIProcess_GCRemainsSubcommand(t *testing.T) {
 		t.Run(command, func(t *testing.T) {
 			result := runCLIProcess(t, t.TempDir(), []string{command, "--help"}, nil)
 			if result.code != 0 || result.stderr != "" ||
-				!strings.Contains(result.stdout, "Evict per-corpus caches older than the TTL") ||
-				!strings.Contains(result.stdout, "Normal runs honor the .last-gc interval") ||
-				strings.Contains(result.stdout, "per-process throttle") ||
+				!strings.Contains(result.stdout, "Delete search indexes that have not been used") ||
+				!strings.Contains(result.stdout, "run cleanup even if it ran recently") ||
+				strings.Contains(result.stdout, ".last-gc") ||
 				!strings.Contains(result.stdout, "--dry-run") {
 				t.Fatalf("stdout=%q stderr=%q code=%d, want gc help on stdout", result.stdout, result.stderr, result.code)
 			}

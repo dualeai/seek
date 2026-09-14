@@ -91,13 +91,21 @@ Zoekt's parsed and simplified query tree, so equivalent spellings and aliases
 can use the same route. Exact identifiers, phrases, one-word queries, and trees
 that retain other filters, Boolean alternatives, or general negation use strict
 BM25 order.
-Unless `--lexical-only` is set, every supported search builds or updates both
-Zoekt and semantic data, including exact and router-generated queries. A first
-large-repo search can take tens of seconds or longer and use all available
-compute, several GiB of memory, and significant cache space. Use
+Unless `--lexical-only` is set, a supported search builds or updates both Zoekt
+and semantic data, including exact and router-generated queries. An eligible
+description uses Zoekt only when truncation is certain before model start. A
+first large-repo search can take tens of seconds or longer and use all
+available compute, several GiB of memory, and significant cache space. Use
 `--lexical-only` to skip all semantic index and model work. Use
 `SEEK_ROUTER=off grep` for absence checks, renames, counts, and complete
 call-site lists.
+
+An eligible description scores at most 128 candidate files before display
+limits. If it has no strict all-word result, the best normalized model score
+must clear the route's support boundary. Rejection returns no output and status
+1. This is not proof of absence. A non-truncated strict all-word result admits
+the complete model-expanded set without the score check. Semantic retrieval
+remains approximate and bounded.
 
 ### Pitfalls
 
@@ -125,8 +133,12 @@ in one quoted string. Plain multi-word descriptions use model re-ranking by
 default. A supported default search maintains both Zoekt and semantic data; use
 `--lexical-only` to skip all semantic and model work. An unscoped clean Git
 worktree or one stable plain file or folder also uses semantic retrieval.
-Descriptions can include `lang:`, `file:`, and `-file:` filters. Use
-`SEEK_ROUTER=off grep` only for all occurrences, counts, or renames."
+Descriptions can include `lang:`, `file:`, and `-file:` filters. Eligible
+descriptions score at most 128 candidate files. Without a strict all-word
+result, the best normalized score must clear a support boundary; a
+non-truncated strict result admits expansion without that score check. Use
+`SEEK_ROUTER=off grep` for absence checks, all occurrences, counts, renames, or
+complete call-site lists. A descriptive no-result is not proof of absence."
 
 ## GitHub Actions
 

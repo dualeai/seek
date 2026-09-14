@@ -11,12 +11,11 @@ func newGCCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "gc",
 		Aliases: []string{"garbage-collect"},
-		Short:   "Garbage-collect the seek cache",
-		Long: fmt.Sprintf(`Evict per-corpus caches older than the TTL (default %s) or all
-non-locked corpora with --all. Normal runs honor the .last-gc interval;
---force and --all bypass it. --dry-run prints the plan without mutating
-anything. --sort orders the table by name, age, or size — use
---dry-run --sort=size to see what takes space.`, humanDuration(defaultGCMaxAge)),
+		Short:   "Delete old search indexes from the Seek cache",
+		Long: fmt.Sprintf(`Delete search indexes that have not been used for %s.
+Use --all to delete every index that is not in use. Use --dry-run to show what
+would be deleted. Use --force to run cleanup even if it ran recently. Use
+--sort=size with --dry-run to find the largest indexes.`, humanDuration(defaultGCMaxAge)),
 		Args: func(_ *cobra.Command, args []string) error {
 			if len(args) > 0 {
 				return fmt.Errorf("seek gc takes no positional arguments (got %q)", args[0])
@@ -33,10 +32,10 @@ anything. --sort orders the table by name, age, or size — use
 			return runGCCommandCmd(cmd.Context(), *opts)
 		},
 	}
-	cmd.Flags().BoolVar(&opts.force, "force", false, "bypass throttle gate (.last-gc)")
-	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false, "print plan, evict nothing")
-	cmd.Flags().BoolVar(&opts.all, "all", false, "evict every corpus not actively locked (TTL=0)")
-	cmd.Flags().StringVar(&opts.sort, "sort", "name", "row order: name|age|size (age = oldest first, size = largest first)")
+	cmd.Flags().BoolVar(&opts.force, "force", false, "run cleanup even if it ran recently")
+	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false, "show what would be deleted")
+	cmd.Flags().BoolVar(&opts.all, "all", false, "delete every search index that is not in use")
+	cmd.Flags().StringVar(&opts.sort, "sort", "name", "sort by name, age, or size")
 	// Registration can only fail if the flag above is missing — programmer
 	// error, not a runtime condition.
 	_ = cmd.RegisterFlagCompletionFunc("sort",
