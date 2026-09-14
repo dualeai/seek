@@ -1,3 +1,7 @@
+# Go installs command tools outside PATH on some hosts. Resolve that directory
+# only for recipes that use the installed tools.
+GO_BIN = $(shell go env GOBIN GOPATH | awk 'NR == 1 { gobin = $$0 } NR == 2 { split($$0, paths, ":"); print (gobin != "" ? gobin : paths[1] "/bin") }')
+
 version:
 	@bash ./cicd/version.sh -g . -c
 
@@ -78,7 +82,7 @@ test:
 
 test-static: tokenizer-native
 	go vet ./...
-	golangci-lint run ./...
+	PATH="$(GO_BIN):$$PATH" golangci-lint run ./...
 
 # Plugin tests use the normal build target and exercise only seek's public CLI.
 # CI sets USE_PREBUILT=1 after it downloads the build job's executable.
@@ -96,7 +100,7 @@ BENCH_REPO_COUNT ?= 3
 SEMANTIC_BENCH_SAMPLES ?= 10
 
 test-unit: tokenizer-native test-plugin
-	gotestsum --junitfile $(JUNIT_XML) -- ./... -v -race -timeout 18m -covermode=atomic -coverprofile=$(COVERPROFILE)
+	PATH="$(GO_BIN):$$PATH" gotestsum --junitfile $(JUNIT_XML) -- ./... -v -race -timeout 18m -covermode=atomic -coverprofile=$(COVERPROFILE)
 
 # Local benchmark output is diagnostic. CodSpeed is the source for comparisons.
 test-bench: build
@@ -127,7 +131,7 @@ test-bench-compare:
 	go run golang.org/x/perf/cmd/benchstat@latest $(BASE) $(NEW)
 
 lint: tokenizer-native
-	golangci-lint run --fix ./...
+	PATH="$(GO_BIN):$$PATH" golangci-lint run --fix ./...
 
 release:
 	bash ./cicd/release.sh
