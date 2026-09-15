@@ -380,3 +380,35 @@ func TestShouldRunOpportunisticGC(t *testing.T) {
 		})
 	}
 }
+
+func TestBadProviderPinOnlyStopsCommandsThatUseTheModel(t *testing.T) {
+	// A typo in SEEK_PROVIDER must be loud for a search that would use the
+	// model, and must not stop commands that never read the setting.
+	t.Setenv(lateOnProviderEnv, "gpu")
+	for _, test := range []struct {
+		name        string
+		lexicalOnly bool
+		subcommand  bool
+		wantErr     bool
+	}{
+		{name: "search", wantErr: true},
+		{name: "lexical only", lexicalOnly: true},
+		{name: "subcommand", subcommand: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := &cobra.Command{Use: "seek"}
+			cmd := root
+			if test.subcommand {
+				cmd = &cobra.Command{Use: "gc"}
+				root.AddCommand(cmd)
+			}
+			var err error
+			if !test.lexicalOnly && commandUsesSemanticModel(cmd) {
+				_, err = lateOnForcedProvider()
+			}
+			if (err != nil) != test.wantErr {
+				t.Fatalf("error = %v, want an error: %t", err, test.wantErr)
+			}
+		})
+	}
+}

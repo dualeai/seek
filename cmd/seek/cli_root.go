@@ -118,6 +118,20 @@ the meaning-based index and all model work.`,
 		Args: rootArgsValidator,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			configureCLILogging(os.Stderr, flags.verbose)
+			// Report a bad provider pin here, at the default log level. Left to
+			// the encoder, it would surface as one more reason to keep lexical
+			// search, which the fallback path hides behind --verbose.
+			//
+			// Only for commands that can use the model. Stopping `gc`,
+			// `completion` or a --lexical-only search over a setting none of them
+			// reads would turn a typo into an outage on paths that do no model
+			// work.
+			if flags.lexicalOnly || !commandUsesSemanticModel(cmd) {
+				return nil
+			}
+			if _, err := lateOnForcedProvider(); err != nil {
+				return err
+			}
 			return nil
 		},
 		PreRunE: func(cmd *cobra.Command, args []string) error {
@@ -310,4 +324,10 @@ func levenshtein(a, b string) int {
 		prev, curr = curr, prev
 	}
 	return prev[len(b)]
+}
+
+// commandUsesSemanticModel reports whether this command can load the model. Only
+// the root search command does; every subcommand is management or output.
+func commandUsesSemanticModel(cmd *cobra.Command) bool {
+	return cmd != nil && !cmd.HasParent()
 }

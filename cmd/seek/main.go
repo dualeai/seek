@@ -252,7 +252,12 @@ func runSearchCommand(
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
-			slog.Debug("Joined search failed; using the lexical path", "error", hybridErr)
+			slog.Debug(
+				"Joined search failed; using the lexical path",
+				"provider", semanticProviderName(),
+				"error", hybridErr,
+			)
+			recordSemanticProviderFault(hybridErr)
 		}
 	}
 	if !hybridUsed {
@@ -267,11 +272,20 @@ func runSearchCommand(
 		switch {
 		case prepareErr != nil:
 			allResults = applyRerankDisplayConfig(allResults, config)
-			slog.Debug("Re-ranking failed; using BM25", "error", prepareErr)
+			slog.Debug(
+				"Re-ranking failed; using BM25",
+				"provider", semanticProviderName(),
+				"error", prepareErr,
+			)
+			recordSemanticProviderFault(prepareErr)
 			rerankAfterLexical = false
 		case prepared == nil:
 			allResults = applyRerankDisplayConfig(allResults, config)
-			slog.Debug("Re-ranking failed; using BM25", "error", errRerankUnavailable)
+			slog.Debug(
+				"Re-ranking failed; using BM25",
+				"provider", semanticProviderName(),
+				"error", errRerankUnavailable,
+			)
 			rerankAfterLexical = false
 		case prepared.truncated:
 			allResults = applyRerankDisplayConfig(allResults, config)
@@ -299,7 +313,12 @@ func runSearchCommand(
 		allResults = reranked
 		dirtyByCorpus = mergedDirty
 		if rerankErr != nil {
-			slog.Debug("Re-ranking failed; using BM25", "error", rerankErr)
+			slog.Debug(
+				"Re-ranking failed; using BM25",
+				"provider", semanticProviderName(),
+				"error", rerankErr,
+			)
+			recordSemanticProviderFault(rerankErr)
 		}
 	}
 
@@ -769,7 +788,11 @@ func ensureScopedGitCorpusFallback(
 				activationErr := bindSemanticGeneration(cacheDir, indexDir, currentState, treeish)
 				releaseLock(pub)
 				if activationErr != nil {
-					slog.Debug("Semantic scoped index activation failed; keeping lexical search", "error", activationErr)
+					slog.Debug(
+						"Semantic scoped index activation failed; keeping lexical search",
+						"provider", semanticProviderName(),
+						"error", activationErr,
+					)
 				}
 				plan.scopedStateHash = currentState
 				return state, currentIndexState, nil
@@ -840,6 +863,8 @@ func ensureScopedGitCorpusFallback(
 			}
 			slog.Debug(
 				"Semantic scoped index build failed; keeping lexical search",
+				"provider",
+				semanticProviderName(),
 				"error",
 				semanticErr,
 			)
@@ -894,6 +919,8 @@ func ensureScopedGitCorpusFallback(
 		if activationErr != nil {
 			slog.Debug(
 				"Semantic scoped index activation failed; keeping lexical search",
+				"provider",
+				semanticProviderName(),
 				"error",
 				activationErr,
 			)
@@ -1137,4 +1164,14 @@ func searchIndexDirs(plan corpusPlan) []string {
 		return []string{plan.scopedIndexDir}
 	}
 	return []string{plan.indexDir}
+}
+
+// recordSemanticProviderFault notes a provider that produced unusable output.
+// A search on an already-built index is the common path, so without this a wrong
+// provider would drop every search to text ranking and never record itself. Any
+// other failure says nothing about the provider and is ignored.
+func recordSemanticProviderFault(err error) {
+	if errors.Is(err, errDegenerateSemanticVector) {
+		rejectLateOnAcceleratedProvider(err.Error())
+	}
 }

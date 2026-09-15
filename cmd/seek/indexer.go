@@ -461,7 +461,14 @@ func runIndexingWithCacheExecution(
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		slog.Debug("Semantic index build failed; keeping lexical search", "error", semanticErr)
+		slog.Debug(
+			"Semantic index build failed; keeping lexical search",
+			"provider", semanticProviderName(),
+			"error", semanticErr,
+		)
+		if errors.Is(semanticErr, errDegenerateSemanticVector) {
+			rejectLateOnAcceleratedProvider(semanticErr.Error())
+		}
 	}
 	// HEAD must still equal the captured value before publication. This check
 	// also covers an unborn snapshot that had no committed Builder work.
@@ -596,7 +603,11 @@ func runIndexingWithCacheExecution(
 			}
 			if activationErr != nil {
 				removeJoinedGeneration(cacheDir)
-				slog.Debug("Semantic index activation failed; keeping lexical search", "error", activationErr)
+				slog.Debug(
+					"Semantic index activation failed; keeping lexical search",
+					"provider", semanticProviderName(),
+					"error", activationErr,
+				)
 			}
 		}
 	} else {

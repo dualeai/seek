@@ -275,7 +275,14 @@ func ensureFolderCorpusFreshWithExecution(
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return corpusSearchable, ctxErr
 		}
-		slog.Debug("Semantic folder index build failed; keeping lexical search", "error", semanticErr)
+		slog.Debug(
+			"Semantic folder index build failed; keeping lexical search",
+			"provider", semanticProviderName(),
+			"error", semanticErr,
+		)
+		if errors.Is(semanticErr, errDegenerateSemanticVector) {
+			rejectLateOnAcceleratedProvider(semanticErr.Error())
+		}
 	}
 
 	postState, _, postStateErr := folderCorpusFingerprint(ctx, plan)
@@ -308,7 +315,11 @@ func ensureFolderCorpusFreshWithExecution(
 		}
 		if activationErr != nil {
 			semanticErr = activationErr
-			slog.Debug("Semantic folder index activation failed; keeping lexical search", "error", activationErr)
+			slog.Debug(
+				"Semantic folder index activation failed; keeping lexical search",
+				"provider", semanticProviderName(),
+				"error", activationErr,
+			)
 		}
 	}
 

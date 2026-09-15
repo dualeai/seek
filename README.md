@@ -230,6 +230,25 @@ Unless `--lexical-only` is set, Seek keeps both its text and meaning-based
 indexes up to date. This includes exact queries that use text ranking. Use
 `--lexical-only` to skip the meaning-based index and all model work.
 
+Seek selects the model run-time provider for the host. Set `SEEK_PROVIDER` to
+pin one when you report a problem, so the report names one provider: `cpu` runs
+the model on the CPU, `coreml-mlprogram-static` asks for Apple Core ML, and
+`auto` or an unset value keeps the automatic choice. A name this build cannot
+use stops a search with exit code 2; it does not stop `--lexical-only`, `seek gc`
+or other commands that never load the model. A pinned provider that fails to start
+falls back to text search, and `--verbose` gives the reason. `--verbose` also
+prints the provider Seek selected.
+
+The automatic choice compares Core ML with the CPU provider once for each model,
+run-time version and operating system build, then keeps the result beside the
+compiled model. That comparison runs the model twice, so it adds a
+noticeable pause to the first search under each of those combinations, and to the
+first search after a system update — about half a second on a recent Apple laptop,
+longer on slower hardware. Later searches read the stored result. This finds a provider that reports success but returns wrong
+numbers, such as
+[ONNX Runtime issue 32569](https://github.com/microsoft/onnxruntime/issues/32569)
+on macOS 15 ARM64.
+
 ### Shell completion
 
 Run `seek completion <shell> --help` to set up Bash, Zsh, fish, or PowerShell.
@@ -372,7 +391,7 @@ When multiple `seek` commands search the same repo at the same time:
 |------|---------|
 | 0 | Success (one or more matches) |
 | 1 | No accepted result: either search found no match or model-added results were too weak. This does not prove absence |
-| 2 | Error (usage error, indexing failed, invalid query) |
+| 2 | Error (usage error, invalid query or setting, indexing failed) |
 
 Uses the same exit-code pattern as `grep` and `ripgrep`, so `seek` works well
 in scripts.
