@@ -52,7 +52,7 @@ func TestMeanMaxSimPassesStrictBoundary(t *testing.T) {
 }
 
 func TestRerankAcceptanceCalibrationContract(t *testing.T) {
-	const wantCompatibility = "lateon-code-edge-proxy-no-symbol-centroids-v5-0c99bf27ea37f81efae985febf09d861"
+	const wantCompatibility = "lateon-code-edge-proxy-no-symbol-centroids-v5-76339ee2c2f5a452923bf85c0a72d6bb"
 	if hybridAcceptanceMinimumMeanMaxSim != 0.600 {
 		t.Fatalf("joined minimum=%g, want 0.600", hybridAcceptanceMinimumMeanMaxSim)
 	}

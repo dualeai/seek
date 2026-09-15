@@ -14,6 +14,12 @@ const (
 	// evidence and was not score-tested. A 128-file pool covered 72/72 labelled
 	// target files, compared with 70/72 at 20 files.
 	//
+	// The model asset was rebuilt on 2026-09-14 with shape inference re-run after
+	// the fixed dimensions are pinned, which cuts symbolic intermediate shapes
+	// from 330 to 171 and so gives Core ML larger partitions. Inference output is
+	// bit-identical to the previous asset over an 8-row probe, so this record
+	// still holds; only the model hash moved.
+	//
 	// MeanMaxSim is the raw LateOn score divided by active query-token count.
 	// Admission uses a strict greater-than test. These values are not relevance
 	// probabilities. Recalibrate after a change to scoring, normalization, model
