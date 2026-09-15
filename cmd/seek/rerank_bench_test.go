@@ -118,9 +118,36 @@ func BenchmarkCLIProcess(b *testing.B) {
 	b.Run("RerankEligibleFirstUse", func(b *testing.B) {
 		for b.Loop() {
 			b.StopTimer()
-			if err := os.RemoveAll(filepath.Join(semanticCache, "reranker")); err != nil {
+			// Remove the extracted run time, which is what "first use" measures.
+			// Keep reranker/coreml: it holds the compiled Core ML model and the
+			// provider verdict, and rebuilding both on every iteration would
+			// measure the Core ML compiler rather than Seek.
+			entries, err := os.ReadDir(filepath.Join(semanticCache, "reranker"))
+			if err != nil && !os.IsNotExist(err) {
 				b.Fatal(err)
 			}
+			for _, entry := range entries {
+				if entry.Name() == "coreml" {
+					continue
+				}
+				if err := os.RemoveAll(filepath.Join(semanticCache, "reranker", entry.Name())); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StartTimer()
+			mustRunSeekBenchmark(b, binary, semanticCache, fixture, eligibleArgs)
+		}
+	})
+	b.Run("RerankEligibleProviderCheck", func(b *testing.B) {
+		// RerankEligibleFirstUse deliberately keeps the compiled Core ML model,
+		// and the provider verdict lives in the same directory, so that case
+		// never runs the provider check. Remove the verdict alone to measure the
+		// check itself: a second session on the reference provider and one batch
+		// through each. Without this the only cost this feature adds has no
+		// benchmark at all.
+		for b.Loop() {
+			b.StopTimer()
+			removeProviderVerdicts(b, semanticCache)
 			b.StartTimer()
 			mustRunSeekBenchmark(b, binary, semanticCache, fixture, eligibleArgs)
 		}
@@ -469,4 +496,31 @@ func runSeekBenchmarkCommand(
 	cmd.Stderr = &output
 	err := cmd.Run()
 	return output.Bytes(), err
+}
+
+// removeProviderVerdicts deletes every recorded provider verdict under the cache,
+// keeping the compiled models beside them. The next run therefore repeats the
+// provider check without repeating the Core ML compile.
+func removeProviderVerdicts(b *testing.B, cacheDir string) {
+	b.Helper()
+	root := filepath.Join(cacheDir, "reranker", "coreml")
+	formats, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		b.Fatal(err)
+	}
+	for _, format := range formats {
+		keys, err := os.ReadDir(filepath.Join(root, format.Name()))
+		if err != nil {
+			b.Fatal(err)
+		}
+		for _, key := range keys {
+			verdict := filepath.Join(root, format.Name(), key.Name(), "provider-verdict")
+			if err := os.Remove(verdict); err != nil && !os.IsNotExist(err) {
+				b.Fatal(err)
+			}
+		}
+	}
 }
