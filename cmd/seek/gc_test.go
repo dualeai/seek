@@ -1439,3 +1439,181 @@ func TestRace_TrashDrainConcurrent(t *testing.T) {
 		t.Fatalf("trash should be empty, got %d entries", len(entries))
 	}
 }
+
+func TestSweepAgedProviderArtifacts(t *testing.T) {
+	cacheRoot := t.TempDir()
+	base := filepath.Join(cacheRoot, "reranker", "coreml", "mlprogram-static")
+	aged := filepath.Join(base, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	fresh := filepath.Join(base, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	for _, dir := range []string{aged, fresh} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "provider-verdict"), []byte("trusted\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	if err := os.Chtimes(aged, old, old); err != nil {
+		t.Fatal(err)
+	}
+	sweepAgedProviderArtifacts(t.Context(), nil, cacheRoot, time.Now().Add(-14*24*time.Hour))
+	if _, err := os.Stat(aged); !os.IsNotExist(err) {
+		t.Fatalf("aged compiled model survived: %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatalf("fresh compiled model was removed: %v", err)
+	}
+	// A model in daily use carries a fresh access marker and survives, even
+	// though nothing refreshes the directory's own modification time.
+	inUse := filepath.Join(base, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+	if err := os.MkdirAll(inUse, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inUse, providerArtifactUsedFile), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(inUse, old, old); err != nil {
+		t.Fatal(err)
+	}
+	sweepAgedProviderArtifacts(t.Context(), nil, cacheRoot, time.Now().Add(-14*24*time.Hour))
+	if _, err := os.Stat(inUse); err != nil {
+		t.Fatalf("a model in daily use was removed: %v", err)
+	}
+	// An aged marker does not save it.
+	if err := os.Chtimes(filepath.Join(inUse, providerArtifactUsedFile), old, old); err != nil {
+		t.Fatal(err)
+	}
+	sweepAgedProviderArtifacts(t.Context(), nil, cacheRoot, time.Now().Add(-14*24*time.Hour))
+	if _, err := os.Stat(inUse); !os.IsNotExist(err) {
+		t.Fatalf("an unused model with an aged marker survived: %v", err)
+	}
+
+	// A directory a previous sweep marked and did not finish is removed whatever
+	// its age, so a truncated removal cannot hide behind a refreshed timestamp.
+	leftover := filepath.Join(base, providerArtifactDiscardPrefix+"cccccccccccccccccccccccccccccccc")
+	if err := os.MkdirAll(leftover, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sweepAgedProviderArtifacts(t.Context(), nil, cacheRoot, time.Now().Add(-14*24*time.Hour))
+	if _, err := os.Stat(leftover); !os.IsNotExist(err) {
+		t.Fatalf("an unfinished removal survived: %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatalf("the fresh compiled model was removed: %v", err)
+	}
+
+	// A cancelled collection stops rather than half-removing more directories.
+	aged2 := filepath.Join(base, "dddddddddddddddddddddddddddddddd")
+	if err := os.MkdirAll(aged2, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(aged2, old, old); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	sweepAgedProviderArtifacts(cancelled, nil, cacheRoot, time.Now().Add(-14*24*time.Hour))
+	if _, err := os.Stat(aged2); err != nil {
+		t.Fatalf("a cancelled collection still removed a directory: %v", err)
+	}
+
+	// An absent tree is not an error.
+	sweepAgedProviderArtifacts(t.Context(), nil, t.TempDir(), time.Now())
+}
+
+func TestGCDryRunReportsProviderArtifacts(t *testing.T) {
+	cacheRoot := t.TempDir()
+	aged := plantProviderArtifact(t, cacheRoot, "ffffffffffffffffffffffffffffffff", 30*24*time.Hour)
+	fresh := plantProviderArtifact(t, cacheRoot, "11111111111111111111111111111111", 0)
+	var out bytes.Buffer
+	reportProviderArtifactPlan(t.Context(), &out, cacheRoot, time.Now().Add(-14*24*time.Hour))
+	plan := out.String()
+	if !strings.Contains(plan, aged) {
+		t.Fatalf("the plan omits a compiled model the sweep would remove:\n%s", plan)
+	}
+	if strings.Contains(plan, fresh) {
+		t.Fatalf("the plan lists a compiled model the sweep would keep:\n%s", plan)
+	}
+	// The plan must not remove anything.
+	if _, err := os.Stat(aged); err != nil {
+		t.Fatalf("the plan removed a compiled model: %v", err)
+	}
+	// A cache with nothing due prints nothing.
+	var empty bytes.Buffer
+	reportProviderArtifactPlan(t.Context(), &empty, t.TempDir(), time.Now())
+	if empty.Len() != 0 {
+		t.Fatalf("an empty plan printed %q", empty.String())
+	}
+}
+
+func TestRunGCCollectsCompiledProviderModels(t *testing.T) {
+	// The helper is tested directly elsewhere; this proves runGC actually calls
+	// it, so removing the call site cannot pass unnoticed.
+	cacheRoot := t.TempDir()
+	t.Setenv("SEEK_CACHE_DIR", cacheRoot)
+	aged := plantProviderArtifact(t, cacheRoot, "22222222222222222222222222222222", 30*24*time.Hour)
+	var out bytes.Buffer
+	runGC(t.Context(), gcOptions{
+		skipThrottle: true,
+		maxAge:       defaultGCMaxAge,
+		writer:       &out,
+	}, defaultGCInterval)
+	if _, err := os.Stat(aged); !os.IsNotExist(err) {
+		t.Fatalf("runGC did not collect an aged compiled model: %v", err)
+	}
+	if !strings.Contains(out.String(), "compiled model files removed: 1 (") {
+		t.Fatalf("the collection did not report the reclaim:\n%s", out.String())
+	}
+}
+
+func TestSweepSkipsAModelAnotherSearchJustUsed(t *testing.T) {
+	// Enumeration and removal are separate steps. A search that starts in
+	// between refreshes the marker, and the sweep must honour that.
+	cacheRoot := t.TempDir()
+	dir := plantProviderArtifact(t, cacheRoot, "33333333333333333333333333333333", 30*24*time.Hour)
+	// The directory is due by its own timestamp, but a live marker overrides it.
+	if err := os.WriteFile(filepath.Join(dir, providerArtifactUsedFile), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sweepAgedProviderArtifacts(t.Context(), nil, cacheRoot, time.Now().Add(-14*24*time.Hour))
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("the sweep removed a model a search had just used: %v", err)
+	}
+}
+
+func TestGCDryRunCommandListsCompiledProviderModels(t *testing.T) {
+	// reportProviderArtifactPlan is tested directly elsewhere; this proves the
+	// dry-run command calls it and removes nothing.
+	cacheRoot := t.TempDir()
+	t.Setenv("SEEK_CACHE_DIR", cacheRoot)
+	aged := plantProviderArtifact(t, cacheRoot, "44444444444444444444444444444444", 30*24*time.Hour)
+	stdout := captureStdoutGC(t, func() {
+		if err := runGCCommandCmd(t.Context(), gcCmdOptions{dryRun: true, sort: "name"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(stdout, aged) {
+		t.Fatalf("the dry run did not list a compiled model it would remove:\n%s", stdout)
+	}
+	if _, err := os.Stat(aged); err != nil {
+		t.Fatalf("the dry run removed a compiled model: %v", err)
+	}
+}
+
+// plantProviderArtifact creates a compiled model directory under cacheRoot and
+// backdates it, which five collector tests need. It returns the directory.
+func plantProviderArtifact(tb testing.TB, cacheRoot, key string, age time.Duration) string {
+	tb.Helper()
+	dir := filepath.Join(cacheRoot, "reranker", "coreml", "mlprogram-static", key)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		tb.Fatal(err)
+	}
+	if age > 0 {
+		stamp := time.Now().Add(-age)
+		if err := os.Chtimes(dir, stamp, stamp); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	return dir
+}

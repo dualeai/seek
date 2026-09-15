@@ -329,6 +329,12 @@ are:
 - macOS: `~/Library/Caches/seek/corpora/<id>/`
 - Linux: `${XDG_CACHE_HOME:-$HOME/.cache}/seek/corpora/<id>/`
 
+A Seek upgrade that changes the bundled model or its run time makes the stored
+meaning-based indexes unusable, so the first search after such an upgrade rebuilds
+them. It repeats only the meaning-based half of the first search, reading the
+files again and running the model over them; the text index stays valid and is
+not rebuilt. Text search works throughout.
+
 Git searches include committed files and local changes. Folder searches read
 regular files, skip `.git` directories, and do not skip dependency, build,
 cache, or vendor directories by name. Git ignore rules apply only in Git
@@ -356,8 +362,10 @@ use `XDG_CACHE_HOME` on Linux. Cleanup has no total-size limit.
 
 Environment settings:
 
+- `SEEK_CACHE_DIR` -- cache root (default: the user cache directory)
 - `SEEK_GC_MAX_AGE` -- maximum unused age (default `14d`)
 - `SEEK_GC_INTERVAL` -- delay between automatic checks (default `24h`)
+- `SEEK_PROVIDER` -- pin the model run-time provider; see "Descriptive search"
 
 Manual control:
 
@@ -370,9 +378,13 @@ seek gc --all                   # delete every search index not in use
 `--sort` orders the table by `name` (default), `age` (oldest first), or
 `size` (largest first).
 
-`seek gc` manages only `<seek-cache>/corpora/`. It does not remove rebuildable
-model files in `<seek-cache>/reranker/` or `<seek-cache>/semantic/usearch/`.
-Remove those directories only when no `seek` process is running.
+`seek gc` manages `<seek-cache>/corpora/`, and removes compiled model files under
+`<seek-cache>/reranker/coreml/` that no search has used within the same unused
+age. Seek compiles those again when it needs them, and checks the provider again,
+because the check result is stored beside the compiled model. It does not remove the
+extracted run time in `<seek-cache>/reranker/<version>/` or the search library in
+`<seek-cache>/semantic/usearch/`. Remove those directories by hand only when no
+`seek` process is running.
 
 ## Parallel use
 
