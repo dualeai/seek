@@ -100,7 +100,8 @@ type semanticUSearchShard struct {
 // semanticManifest binds the semantic artifacts to their exact formats.
 // VectorCodec identifies the fine-vector byte encoding. VectorStride is the
 // byte width of one semantic row, including all fine centroids, not one centroid
-// vector.
+// vector. Runtime is the bundled ONNX Runtime version that produced the vectors;
+// see semanticInferenceRuntime for why a run-time upgrade must not reuse them.
 type semanticManifest struct {
 	Format         uint32                 `json:"format"`
 	Source         string                 `json:"source"`
@@ -110,6 +111,7 @@ type semanticManifest struct {
 	VectorCodec    string                 `json:"vector_codec"`
 	VectorStride   uint32                 `json:"vector_stride"`
 	USearch        string                 `json:"usearch"`
+	Runtime        string                 `json:"runtime"`
 	Dimensions     uint32                 `json:"dimensions"`
 	Rows           uint64                 `json:"rows"`
 	RowsFile       semanticArtifact       `json:"rows_file"`
@@ -138,6 +140,30 @@ type semanticUSearchValidation struct {
 	err  error
 }
 
+// semanticInferenceRuntime reports the bundled ONNX Runtime version. It reads the
+// embedded runtime manifest, so it neither initializes the run time nor decodes
+// the model, and it is safe on lexical-only paths that never load either.
+//
+// The version belongs in the generation key because a run-time upgrade can change
+// the numbers the model produces: ONNX Runtime 1.29 changed reshape fusion and
+// constant folding, which changes how a graph is partitioned and therefore the
+// stored vectors. An index outlives the binary that wrote it, so without this a
+// new run time queries vectors an older one produced.
+//
+// The execution provider is deliberately absent. Resolving it needs the compiled
+// model cache directory, which needs the model bytes, and decoding those on a
+// lexical-only search would undo the work that keeps that path free of model
+// cost. Providers that pass the run-time comparison in
+// verifyLateOnAcceleratedProvider agree to far tighter limits than this key could
+// police.
+var semanticInferenceRuntime = sync.OnceValue(func() string {
+	bundle, err := lateOnRuntimeForPlatform()
+	if err != nil || bundle.version == "" {
+		return "unknown"
+	}
+	return bundle.version
+})
+
 func semanticGenerationKey(source string) string {
 	hash := sha256.New()
 	hash.Write([]byte("seek-semantic-generation-v1\x00"))
@@ -149,6 +175,7 @@ func semanticGenerationKey(source string) string {
 		semanticVectorCodec,
 		semanticUSearchLayout(),
 		semanticUSearchAssetKey(),
+		semanticInferenceRuntime(),
 		fmt.Sprint(semanticFormatVersion),
 	} {
 		writeSemanticHashField(hash, []byte(field))
@@ -218,6 +245,7 @@ func writeSemanticGenerationFromParts(
 		VectorCodec:    semanticVectorCodec,
 		VectorStride:   semanticFineVectorBytesPerUnit,
 		USearch:        usearchCompatibility,
+		Runtime:        semanticInferenceRuntime(),
 		Dimensions:     semanticEmbeddingDimensions,
 		Rows:           uint64(len(units)),
 		RowsFile:       rowsArtifact,
@@ -552,6 +580,7 @@ func validateSemanticManifest(manifest semanticManifest, source string) error {
 		manifest.VectorCodec != semanticVectorCodec ||
 		manifest.VectorStride != semanticFineVectorBytesPerUnit ||
 		manifest.USearch != usearchCompatibility ||
+		manifest.Runtime != semanticInferenceRuntime() ||
 		manifest.Dimensions != semanticEmbeddingDimensions ||
 		manifest.Rows > semanticMaxRows {
 		return fmt.Errorf("semantic generation is incompatible")

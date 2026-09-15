@@ -474,6 +474,9 @@ func TestSemanticManifestRejectsWrongVectorContract(t *testing.T) {
 		{name: "stride", change: func(value *semanticManifest) { value.VectorStride++ }},
 		{name: "bytes", change: func(value *semanticManifest) { value.VectorsFile.Bytes++ }},
 		{name: "representation", change: func(value *semanticManifest) { value.Representation = "anchored-spherical-f32-v1" }},
+		// A run-time upgrade can change the numbers the model produces, so
+		// vectors an older run time wrote must not be reused.
+		{name: "runtime", change: func(value *semanticManifest) { value.Runtime = "0.0.0-other" }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
