@@ -236,6 +236,39 @@ func touchProviderArtifactUse(directory string) {
 	_ = os.Chtimes(marker, now, now)
 }
 
+// These three complete the on-disk record format whose two shared spellings
+// semantic_encoder.go declares. They live here because this file holds the only
+// parser and the only writer. Do not move them beside those two: that file also
+// compiles where no accelerator exists, and there these three are unused. A
+// second accelerated target would need a file tagged for both targets, not the
+// shared encoder.
+
+// lateOnVerdictRecheck records real work that produced unusable output the
+// fixed probe row does not reproduce. The record reads "recheck <count>
+// <unix-seconds>", where the time is when the count last changed. One is
+// evidence, not proof: normalizeSemanticVector also rejects a vector whose norm
+// cancels exactly, which a healthy provider can produce. The next process
+// measures again rather than trusting one sample.
+//
+// The count must survive a passing probe. Without that, a provider that agrees
+// on the probe and fails on real work would alternate between the two records
+// for ever and never earn a demotion, so the continuous guards would report the
+// same fault on every build and nothing would change.
+//
+// Keep the spelling stable, the way the shared verdicts are kept: a machine that
+// upgrades Seek keeps the record its previous version wrote.
+const lateOnVerdictRecheck = "recheck"
+
+// lateOnVerdictFaultsBeforeRejection is how many separate batches must fail
+// before this host stops using the accelerated provider.
+const lateOnVerdictFaultsBeforeRejection = 2
+
+// lateOnProviderFaultWindow is how long one fault stays on the record. Two
+// faults inside it demote the provider; a lone fault outside it expires, so a
+// host that saw one benign cancellation returns to the cached-verdict path
+// instead of paying a second session and two full batches on every search.
+const lateOnProviderFaultWindow = 7 * 24 * time.Hour
+
 // lateOnProviderVerdictFile names the cached probe result. It sits in the Core
 // ML model cache directory, whose key already covers the model bytes, the ONNX
 // Runtime version, the provider options and the operating system build, so the

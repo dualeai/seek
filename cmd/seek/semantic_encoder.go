@@ -15,7 +15,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	ort "github.com/yalue/onnxruntime_go"
 )
@@ -24,39 +23,21 @@ import (
 // search paths read it for their fallback logs; they do not hold the encoder.
 var lateOnSelectedProvider atomic.Value
 
-// These are the on-disk provider-check verdicts. They live in the shared encoder
-// because it reads them to decide whether to build an accelerated session at
-// all; the accelerated targets write them. readLateOnProviderRecord is the only
-// parser and writeLateOnProviderVerdict the only writer; anything else on disk
-// counts as no verdict and makes the next process measure again.
+// These are the two verdict spellings the selection path below compares against.
+// They are shared because this file also compiles where no accelerator exists,
+// and there cachedLateOnProviderVerdict returns an empty string that matches
+// neither, so the comparisons stand and no verdict file is read or written.
 //
-// Keep the spellings stable: a machine that upgrades Seek keeps the verdict its
-// previous version recorded.
+// The rest of the record format — the recheck spelling, the fault count and the
+// fault window — stays with the accelerated target, which holds the only parser
+// and the only writer. Anything else on disk counts as no verdict and makes the
+// next process measure again.
+//
+// Keep these spellings stable: a machine that upgrades Seek keeps the verdict
+// its previous version recorded.
 const (
 	lateOnVerdictTrusted  = "trusted"
 	lateOnVerdictRejected = "rejected"
-	// lateOnVerdictRecheck records real work that produced unusable output the
-	// fixed probe row does not reproduce. The record reads "recheck <count>
-	// <unix-seconds>", where the time is when the count last changed. One is
-	// evidence, not proof: normalizeSemanticVector also rejects a vector whose
-	// norm cancels exactly, which a healthy provider can produce. The next
-	// process measures again rather than trusting one sample.
-	//
-	// The count must survive a passing probe. Without that, a provider that
-	// agrees on the probe and fails on real work would alternate between the two
-	// records for ever and never earn a demotion, so the continuous guards would
-	// report the same fault on every build and nothing would change.
-	lateOnVerdictRecheck = "recheck"
-
-	// lateOnVerdictFaultsBeforeRejection is how many separate batches must fail
-	// before this host stops using the accelerated provider.
-	lateOnVerdictFaultsBeforeRejection = 2
-
-	// lateOnProviderFaultWindow is how long one fault stays on the record. Two
-	// faults inside it demote the provider; a lone fault outside it expires, so a
-	// host that saw one benign cancellation returns to the cached-verdict path
-	// instead of paying a second session and two full batches on every search.
-	lateOnProviderFaultWindow = 7 * 24 * time.Hour
 )
 
 // lateOnCPUProviderName names the provider every supported target has. It is the
