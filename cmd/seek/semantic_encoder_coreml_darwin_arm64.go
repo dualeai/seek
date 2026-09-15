@@ -200,6 +200,12 @@ func lateOnRunProbe(
 	return copied, nil
 }
 
+// providerArtifactTouchInterval bounds how often a search rewrites the
+// providerArtifactUsedFile marker. It lives here, apart from the name it bounds,
+// because this file holds the only writer. provider_artifact.go compiles on
+// every target, and there the interval would be unused.
+const providerArtifactTouchInterval = 24 * time.Hour
+
 // touchProviderArtifactUse records that this compiled model is still wanted.
 // Nothing else writes into the directory after the compile and the single
 // verdict write, and neither MkdirAll nor Chmod moves a directory's modification
