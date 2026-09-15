@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"math"
 )
@@ -243,16 +244,22 @@ func normalizedLateOnSemanticTokens(
 	return append([]semanticVector(nil), workspace.tokens[:count]...), nil
 }
 
+// errDegenerateSemanticVector marks model output that carries no usable
+// direction. The run-time provider check samples one row once, so an
+// input-dependent provider fault can still reach the index build. Callers use
+// this to record a provider rejection instead of only failing the build.
+var errDegenerateSemanticVector = errors.New("model output is degenerate")
+
 func normalizeSemanticVector(vector *semanticVector) error {
 	var squaredNorm float64
 	for _, value := range vector {
 		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
-			return fmt.Errorf("vector has a non-finite value")
+			return fmt.Errorf("%w: vector has a non-finite value", errDegenerateSemanticVector)
 		}
 		squaredNorm += float64(value) * float64(value)
 	}
 	if squaredNorm == 0 || math.IsNaN(squaredNorm) || math.IsInf(squaredNorm, 0) {
-		return fmt.Errorf("vector has zero or invalid norm")
+		return fmt.Errorf("%w: vector has zero or invalid norm", errDegenerateSemanticVector)
 	}
 	scale64 := 1 / math.Sqrt(squaredNorm)
 	scale32 := float32(scale64)

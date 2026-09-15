@@ -936,3 +936,100 @@ func TestCLIProcessLateOnAcceptanceBoundary(t *testing.T) {
 		}
 	}
 }
+
+func TestLateOnMaxSimRejectsZeroDocumentVectors(t *testing.T) {
+	query := make([]float32, lateOnSequenceLength*semanticEmbeddingDimensions)
+	query[0] = 1
+	queryMask := make([]bool, lateOnSequenceLength)
+	queryMask[0] = true
+	documents := make([]float32, lateOnSequenceLength*semanticEmbeddingDimensions)
+	documentMask := make([]bool, lateOnSequenceLength)
+	documentMask[0] = true
+	documentMask[1] = true
+	if _, err := lateOnMaxSimPrepared(query, queryMask, documents, [][]bool{documentMask}); err == nil {
+		t.Fatal("all-zero document scored instead of failing")
+	}
+	documents[semanticEmbeddingDimensions] = 1
+	scores, err := lateOnMaxSimPrepared(query, queryMask, documents, [][]bool{documentMask})
+	if err != nil {
+		t.Fatalf("document with one usable token failed: %v", err)
+	}
+	if len(scores) != 1 {
+		t.Fatalf("scores = %v, want one score", scores)
+	}
+}
+
+func TestLateOnRowUsableTokenScansEveryMaskedToken(t *testing.T) {
+	documents := make([]float32, 2*lateOnSequenceLength*semanticEmbeddingDimensions)
+	mask := make([]bool, lateOnSequenceLength)
+	mask[0] = true
+	mask[1] = true
+	// Row 0: a non-finite first token must not end the scan, because a later
+	// token can still carry the row.
+	documents[0] = float32(math.NaN())
+	documents[semanticEmbeddingDimensions] = 1
+	if !lateOnRowHasUsableToken(documents, 0, mask) {
+		t.Fatal("a non-finite first token ended the scan")
+	}
+	// Row 1 is untouched, so it stays unusable. This also proves the row offset
+	// is applied, because row 0 is usable.
+	if lateOnRowHasUsableToken(documents, 1, mask) {
+		t.Fatal("an empty second row reported a usable token")
+	}
+	// A masked token outside the mask must not rescue the row.
+	documents[lateOnSequenceLength*semanticEmbeddingDimensions+5*semanticEmbeddingDimensions] = 1
+	if lateOnRowHasUsableToken(documents, 1, mask) {
+		t.Fatal("an unmasked token rescued the row")
+	}
+}
+
+func TestPrepareSemanticQueryReturnsUsableTokens(t *testing.T) {
+	// PrepareSemanticQuery guards its own output, because a degenerate query row
+	// gives every candidate a finite score of zero that no later guard can tell
+	// apart from a genuine miss. Assert the invariant on real model output, so a
+	// provider that starts returning zero rows fails here.
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	model, err := newLateOnSemanticModel(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := model.Close(); err != nil {
+			t.Errorf("close model: %v", err)
+		}
+	})
+	prepared, err := model.PrepareSemanticQuery(t.Context(), "rank search results before the output limit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !lateOnRowHasUsableToken(prepared.tokens, 0, prepared.scoreMask) {
+		t.Fatal("PrepareSemanticQuery returned a query row with no usable token")
+	}
+	// An empty query still produces the model prefix tokens, so it must also
+	// survive the guard rather than failing the search.
+	if _, err := model.PrepareSemanticQuery(t.Context(), ""); err != nil {
+		t.Fatalf("an empty query failed the guard: %v", err)
+	}
+}
+
+func TestDegenerateScoringErrorCarriesTheProviderSentinel(t *testing.T) {
+	// The search path must be able to tell a provider fault from any other
+	// scoring failure, or a wrong provider on an already-built index would drop
+	// every re-rank to BM25 and never record itself.
+	query := make([]float32, lateOnSequenceLength*semanticEmbeddingDimensions)
+	query[0] = 1
+	queryMask := make([]bool, lateOnSequenceLength)
+	queryMask[0] = true
+	documents := make([]float32, lateOnSequenceLength*semanticEmbeddingDimensions)
+	documentMask := make([]bool, lateOnSequenceLength)
+	documentMask[0] = true
+	_, err := lateOnMaxSimPrepared(query, queryMask, documents, [][]bool{documentMask})
+	if !errors.Is(err, errDegenerateSemanticVector) {
+		t.Fatalf("error = %v, want the degenerate-output sentinel", err)
+	}
+	// A shape failure is not a provider fault and must not be reported as one.
+	_, shapeErr := lateOnMaxSimPrepared(query[:10], queryMask, documents, [][]bool{documentMask})
+	if errors.Is(shapeErr, errDegenerateSemanticVector) {
+		t.Fatalf("a shape error claimed a provider fault: %v", shapeErr)
+	}
+}
