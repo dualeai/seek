@@ -625,6 +625,15 @@ func runIndexingWithCacheExecution(
 			}
 		}
 	} else {
+		// The working tree moved during the build, so the state and the
+		// uncommitted shards cannot be trusted. The committed vectors can:
+		// validateCommittedBuildHead already proved HEAD held, the generation is
+		// keyed by that commit, and it never reads the working tree. Publish it
+		// unbound so the next clean search binds it instead of embedding the
+		// same commit again. It stays unreachable until something binds it.
+		if semanticRequired && semanticBuilt {
+			keepDriftedSemanticGeneration(cacheDir, indexDir, semanticSource, semanticStaging)
+		}
 		deleteStateFiles(cacheDir)
 		slog.Warn("Index may be stale, will re-index on next search")
 	}
@@ -700,6 +709,15 @@ func publishedCommittedHead(cacheDir string, scan familyScan) string {
 		return head
 	}
 	return readHeadFile(cacheDir)
+}
+
+// keepDriftedSemanticGeneration publishes a finished committed generation that
+// a drifted build would otherwise discard. A failure here costs only the
+// rebuild it was trying to save, so it never fails the search.
+func keepDriftedSemanticGeneration(cacheDir, indexDir, source, stagingDir string) {
+	if err := publishUnboundSemanticGeneration(cacheDir, indexDir, source, stagingDir); err != nil {
+		slog.Debug("Could not keep the semantic generation after drift", "error", err)
+	}
 }
 
 // committedSnapshotReady reports whether scan has enough committed state for

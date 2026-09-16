@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -229,6 +230,39 @@ func publishAndBindSemanticGeneration(
 	return bindSemanticGeneration(cacheDir, indexDir, state, source)
 }
 
+// publishUnboundSemanticGeneration makes a finished generation reachable to a
+// later search without binding it to the current Zoekt family.
+//
+// A drifted build has valid committed vectors: the generation is keyed by the
+// commit, was built from a validated snapshot, and never reads the working
+// tree. Throwing it away means embedding the same commit again on the next
+// search. Publishing it without binding keeps it unreachable to this search's
+// joined descriptor while a later clean search can bind it for free.
+//
+// It prunes in the same call, under the publish lock the caller holds. Without
+// that, every drifted HEAD would leave one more generation behind, because
+// binding is the only other thing that prunes. It keeps two generations: the
+// one just published, and the one the live descriptor names, which a concurrent
+// reader may hold.
+func publishUnboundSemanticGeneration(
+	cacheDir string,
+	indexDir string,
+	source string,
+	stagingDir string,
+) error {
+	if err := publishSemanticGeneration(indexDir, stagingDir, source); err != nil {
+		return err
+	}
+	keep := map[string]struct{}{
+		filepath.Base(semanticGenerationDir(indexDir, source)): {},
+	}
+	if descriptor, err := readJoinedGeneration(cacheDir); err == nil && descriptor.SemanticKey != "" {
+		keep[semanticGenerationPrefix+descriptor.SemanticKey] = struct{}{}
+	}
+	removeSemanticGenerationsExcept(indexDir, keep)
+	return nil
+}
+
 func removeJoinedGeneration(cacheDir string) {
 	removeCacheFile(cacheDir, joinedGenerationFile)
 	removeCacheFile(cacheDir, joinedGenerationFile+".tmp")
@@ -237,17 +271,29 @@ func removeJoinedGeneration(cacheDir string) {
 // removeOtherSemanticGenerations removes rebuildable cache generations after
 // a new joined descriptor is active. The caller must hold the publish lock.
 func removeOtherSemanticGenerations(indexDir, source string) {
-	keep := filepath.Base(semanticGenerationDir(indexDir, source))
+	removeSemanticGenerationsExcept(indexDir, map[string]struct{}{
+		filepath.Base(semanticGenerationDir(indexDir, source)): {},
+	})
+}
+
+// removeSemanticGenerationsExcept removes every semantic generation directory
+// in indexDir whose name is not in keep. The caller must hold the publish lock.
+//
+// Both prune callers share this walk: binding keeps one generation, and an
+// unbound publish keeps two, the new one and the one the live descriptor names.
+func removeSemanticGenerationsExcept(indexDir string, keep map[string]struct{}) {
 	entries, err := os.ReadDir(indexDir)
 	if err != nil {
 		return
 	}
 	for _, entry := range entries {
-		if entry.Name() == keep ||
-			!entry.IsDir() ||
-			!bytes.HasPrefix([]byte(entry.Name()), []byte(semanticGenerationPrefix)) {
+		name := entry.Name()
+		if !entry.IsDir() || !strings.HasPrefix(name, semanticGenerationPrefix) {
 			continue
 		}
-		_ = os.RemoveAll(filepath.Join(indexDir, entry.Name()))
+		if _, ok := keep[name]; ok {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(indexDir, name))
 	}
 }
