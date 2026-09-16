@@ -26,7 +26,10 @@ const (
 	// stateTmpFile is used for atomic writes of the state file.
 	stateTmpFile = ".state.tmp"
 	// headFile stores the HEAD SHA of the last successful committed index.
-	// It skips committed indexing when HEAD has not changed.
+	// It is a fallback only: the shards record the commit they hold, and
+	// committedShardHead reads it. This file answers when that record cannot
+	// be read, so a damaged shard keeps the previous behaviour instead of
+	// rebuilding on every search.
 	headFile = ".head"
 	// emptyFile stores the state hash for a layer that is known to have
 	// no indexable shards. This prevents a missing/corrupt shard directory
@@ -377,10 +380,11 @@ func runIndexingWithCacheExecution(
 	}
 
 	hasDirty := len(state.Files) > 0
-	// Rebuild when HEAD changed or the committed family no longer matches its
-	// manifest. The .head file can remain after shard damage.
+	// Rebuild when the published shards hold another commit, or the committed
+	// family no longer matches its manifest. publishedCommittedHead asks the
+	// shards rather than the sidecar; committedShardHead documents why.
 	needCommitted := state.HeadSHA != "no-head" &&
-		(state.HeadSHA != readHeadFile(cacheDir) || !committedIntact)
+		(publishedCommittedHead(cacheDir, sc) != state.HeadSHA || !committedIntact)
 	clearCommitted := noHeadArtifacts
 	semanticPresent := semanticRequired && semanticGenerationPresent(indexDir, semanticSource)
 	needSemantic := semanticRequired && !semanticPresent
@@ -675,15 +679,38 @@ func buildCommittedGitStage(
 	}, nil
 }
 
+// publishedCommittedHead returns the commit the published committed family
+// holds, as the shards themselves record it. See committedShardHead for why the
+// shards and not the sidecar answer this.
+//
+// It falls back to the .head sidecar when no shard can answer, which covers a
+// corpus that has not published yet and a shard whose metadata cannot be read.
+func publishedCommittedHead(cacheDir string, scan familyScan) string {
+	if head, known := committedShardHead(scan); known {
+		return head
+	}
+	return readHeadFile(cacheDir)
+}
+
 // committedSnapshotReady reports whether scan has enough committed state for
 // the caller's separate cache-state and full-manifest checks. A valid manifest
 // can describe an empty committed family beside live dirty shards, so a
 // committed shard is not always required.
+//
+// When a committed shard is present, the answer comes from the commit that
+// shard records, not from the .head sidecar. See committedShardHead.
 func committedSnapshotReady(cacheDir, indexDir string, state repoState, scan familyScan) bool {
 	if state.HeadSHA == "no-head" {
 		return !scan.hasMember(familyCommitted)
 	}
 	if scan.hasCommittedShard() {
+		// This used to return true on presence alone, which said nothing about
+		// which commit the shards hold.
+		if shardHead, known := committedShardHead(scan); known {
+			return shardHead == state.HeadSHA
+		}
+		// Unknown, so keep the answer this corpus already gives. Reporting
+		// "stale" here would rebuild on every read of an unreadable shard.
 		return true
 	}
 	return readHeadFile(cacheDir) == state.HeadSHA && scan.matchesManifestFamily(indexDir, familyCommitted)
