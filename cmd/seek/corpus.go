@@ -102,6 +102,11 @@ type corpusPlan struct {
 	// corpus owns the boundary, so the walker should descend as plain
 	// folder. nil means discovery is disabled for this plan.
 	discover func(gitBoundary) bool
+	// skipVectors marks a plan the folder walker discovered during a search
+	// that was already under way. Its arrival makes the search span more than
+	// one corpus, which the joined route rejects, so this corpus can only pay
+	// for a vector generation that nothing reads.
+	skipVectors bool
 }
 
 // searchIndexDir is the directory a search of this plan actually reads. The

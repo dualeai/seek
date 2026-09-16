@@ -658,6 +658,9 @@ func ensureCombinedGitCorpusWithExecution(
 		ensureFSMonitor(ctx, paths)
 	}
 
+	if plan.skipVectors {
+		execution.prepareVectors = false
+	}
 	currentState := gitCorpusStateHash(paths, state)
 	semanticRequired := execution.vectorsWanted(state.HeadSHA)
 	joinedReady := !semanticRequired || joinedGenerationMatches(
