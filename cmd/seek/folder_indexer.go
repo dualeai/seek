@@ -49,7 +49,7 @@ type folderCandidate struct {
 // not sufficient because the manifest can record more family members.
 func folderFamilyUsable(indexDir string) bool {
 	sc, err := scanFamilyOptional(indexDir)
-	return err == nil && sc.hasShard() && sc.matchesManifest(indexDir)
+	return err == nil && sc.familyComplete(indexDir)
 }
 
 // ensureFolderCorpusFreshWithExecution makes the Zoekt family and, when
@@ -71,7 +71,7 @@ func ensureFolderCorpusFreshWithExecution(
 	if warmScanErr != nil {
 		return corpusSearchable, folderCorpusError(plan, warmScanErr)
 	}
-	hasShards := warmScan.hasShard() && warmScan.matchesManifest(plan.indexDir)
+	hasShards := warmScan.familyComplete(plan.indexDir)
 
 	var stateHash string
 	var selected []folderCandidate

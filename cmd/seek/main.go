@@ -651,9 +651,8 @@ func ensureCombinedGitCorpusWithExecution(
 	)
 	// Use one directory scan so all integrity checks describe the same state.
 	sc, scErr := scanFamilyOptional(plan.indexDir)
-	hasShards := scErr == nil && sc.hasShard() &&
-		committedSnapshotReady(plan.cacheDir, plan.indexDir, state, sc) &&
-		sc.matchesManifest(plan.indexDir)
+	hasShards := scErr == nil && sc.familyComplete(plan.indexDir) &&
+		committedSnapshotReady(plan.cacheDir, plan.indexDir, state, sc)
 	clearCommitted := state.HeadSHA == "no-head" && sc.hasMember(familyCommitted)
 	// A leftover .swapping marker means a prior publish was interrupted and the
 	// shards may be torn; force the build path so recoverIncompleteSwap runs even
@@ -949,7 +948,7 @@ func scopedFallbackCached(cacheDir, indexDir, currentState string) (corpusIndexS
 	// A presence check cannot detect a missing shard, a changed size, or a
 	// missing sidecar. Validate the fallback against its family manifest.
 	sc, err := scanFamilyOptional(indexDir)
-	if err == nil && sc.hasShard() && sc.matchesManifest(indexDir) {
+	if err == nil && sc.familyComplete(indexDir) {
 		return corpusSearchable, true
 	}
 	if readEmptyStateFile(cacheDir) == currentState {
