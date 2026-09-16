@@ -306,6 +306,14 @@ func familyShardFiles(dir string, fam shardFamily) ([]string, error) {
 	return sc.paths(fam), nil
 }
 
+// familyComplete reports whether the scan holds a published family that a
+// search can use: at least one shard, and exactly the set the last publish
+// recorded. Presence alone accepts one survivor of a torn family, so the two
+// checks always travel together.
+func (s familyScan) familyComplete(indexDir string) bool {
+	return s.hasShard() && s.matchesManifest(indexDir)
+}
+
 // familyManifestFile records the name and size of each published shard and
 // sidecar. It stays in indexDir so removing the index also removes its manifest.
 const familyManifestFile = ".family-v1"

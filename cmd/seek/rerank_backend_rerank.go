@@ -341,7 +341,10 @@ func (s *lateOnModel) PrepareSemanticQuery(
 	if err != nil {
 		return nil, err
 	}
-	encoded, encodeErr := encodeLateOnText(tokenizer, lateOnQueryPrefix+modelQuery)
+	encoded, truncated, encodeErr := encodeLateOnTextWithTruncation(
+		tokenizer,
+		lateOnQueryPrefix+modelQuery,
+	)
 	s.releaseTokenizer(tokenizer)
 	if encodeErr != nil {
 		return nil, encodeErr
@@ -359,10 +362,20 @@ func (s *lateOnModel) PrepareSemanticQuery(
 	if err != nil {
 		return nil, err
 	}
+	// The same provider fault that zeroes a document row can zero the query row.
+	// A zero query gives every candidate a finite score of 0, which no later
+	// guard can tell apart from a genuine miss.
+	if !lateOnRowHasUsableToken(embeddings, 0, mask[0]) {
+		return nil, fmt.Errorf(
+			"%w: LateOn query has no usable token vector",
+			errDegenerateSemanticVector,
+		)
+	}
 	return &semanticQueryEmbedding{
 		tokens:     embeddings,
 		scoreMask:  mask[0],
 		modelQuery: modelQuery,
+		truncated:  truncated,
 	}, nil
 }
 
@@ -755,6 +768,13 @@ func lateOnMaxSimPrepared(
 		if len(mask) != lateOnSequenceLength {
 			return nil, fmt.Errorf("invalid prepared LateOn mask size")
 		}
+		if !lateOnRowHasUsableToken(documents, document, mask) {
+			return nil, fmt.Errorf(
+				"%w: LateOn document %d has no usable token vector",
+				errDegenerateSemanticVector,
+				document,
+			)
+		}
 		var sum float32
 		for queryToken, keepQuery := range queryMask {
 			if !keepQuery {
@@ -786,6 +806,37 @@ func lateOnMaxSimPrepared(
 		scores[document] = sum
 	}
 	return scores, nil
+}
+
+// lateOnRowHasUsableToken reports whether a document row keeps one masked token
+// with a finite, non-zero vector. A provider fault can return a zero vector. That
+// vector contributes a dot product of zero, which keeps the score finite and
+// hides the fault, so the existing "no scoreable token" guard never sees it.
+func lateOnRowHasUsableToken(documents []float32, document int, mask []bool) bool {
+	for documentToken, keepDocument := range mask {
+		if !keepDocument {
+			continue
+		}
+		offset := (document*lateOnSequenceLength + documentToken) * semanticEmbeddingDimensions
+		var squaredNorm float64
+		finite := true
+		for dimension := range semanticEmbeddingDimensions {
+			value := float64(documents[offset+dimension])
+			if math.IsNaN(value) || math.IsInf(value, 0) {
+				// Keep looking. A later token can still carry the row, which is
+				// what the scoring loop below already relies on: a comparison
+				// against a non-finite value is false, so such a token never wins
+				// the maximum.
+				finite = false
+				break
+			}
+			squaredNorm += value * value
+		}
+		if finite && squaredNorm > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func encodeLateOnDocument(
@@ -922,11 +973,20 @@ func encodeLateOnText(
 	tokenizer *lateOnTokenizer,
 	text string,
 ) ([]int, error) {
+	encoded, _, err := encodeLateOnTextWithTruncation(tokenizer, text)
+	return encoded, err
+}
+
+func encodeLateOnTextWithTruncation(
+	tokenizer *lateOnTokenizer,
+	text string,
+) ([]int, bool, error) {
 	encoded, _, err := tokenizer.encode(text, true, false)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return truncateLateOnHead(encoded, lateOnSequenceLength), nil
+	truncated := len(encoded) > lateOnSequenceLength
+	return truncateLateOnHead(encoded, lateOnSequenceLength), truncated, nil
 }
 
 func truncateLateOnHead(encoded []int, limit int) []int {

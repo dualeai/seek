@@ -22,18 +22,21 @@ const (
 	gcStampFile = ".last-gc"
 	gcLockFile  = "gc.lock"
 	corporaDir  = "corpora"
+	rerankerDir = "reranker"
 	gcTrashDir  = ".trash"
 
 	// Per-corpus marker. mtime = "last access" — explicit, since atime is
 	// disabled (noatime/relatime) on most modern filesystems.
-	usedFile = ".used"
-
+	usedFile          = ".used"
 	defaultGCMaxAge   = 14 * 24 * time.Hour
 	defaultGCInterval = 24 * time.Hour
 	gcRunTimeout      = 5 * time.Second
 
 	envGCMaxAge   = "SEEK_GC_MAX_AGE"
 	envGCInterval = "SEEK_GC_INTERVAL"
+
+	gcLocalCacheHint = "Set SEEK_CACHE_DIR to a local directory. " +
+		"On Linux, you can instead unset SEEK_CACHE_DIR and set XDG_CACHE_HOME."
 )
 
 // TODO(gc-size-cap): GC is age-based and has no total cache-size limit. A
@@ -302,6 +305,10 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 		stats.summary(opts.writer, "evicted")
 	}
 
+	// Compiled accelerator models come last. Corpus eviction reclaims more and is
+	// the collection's main job, so it takes the time budget first.
+	sweepAgedProviderArtifacts(ctx, opts.writer, cacheRoot, time.Now().Add(-opts.maxAge))
+
 	// Stamp updated last and even on partial failures — prevents retry
 	// storms when persistent errors would otherwise re-run GC every
 	// invocation.
@@ -325,8 +332,7 @@ func warnNFSOnce(cacheRoot string) {
 	stampPath := filepath.Join(cacheRoot, gcStampFile)
 	if _, err := os.Stat(stampPath); errors.Is(err, fs.ErrNotExist) {
 		slog.Warn(
-			"seek cache on network filesystem; auto-GC disabled. "+
-				"Set XDG_CACHE_HOME to a local directory to enable.",
+			"seek cache on network filesystem; auto-GC disabled. "+gcLocalCacheHint,
 			"cache_root", cacheRoot,
 		)
 		touchStamp(cacheRoot)
@@ -389,6 +395,159 @@ func shouldRunGC(cacheRoot string, interval time.Duration) bool {
 // its temp dir's mtime stays fresh well within this bound even for a large cold
 // build.
 const buildTmpMaxAge = time.Hour
+
+// providerArtifactDiscardPrefix marks a compiled model that is being removed.
+// Removing one in place is not atomic, and a truncated removal would update the
+// directory's own modification time, which would hide it from the age test for
+// good while leaving a broken compiled model where the provider expects a whole
+// one. Renaming first makes the leftover self-identifying, so a later sweep
+// removes it whatever its age, the way drainTrash retries a partly evicted
+// corpus.
+const providerArtifactDiscardPrefix = ".discarding-"
+
+// sweepAgedProviderArtifacts removes compiled accelerator models that nothing has
+// rebuilt recently. Their cache key carries the operating system build, so every
+// system update strands the previous directory, and each one holds tens of
+// megabytes.
+//
+// Removing one that is still wanted costs a recompile AND a fresh provider
+// check, because the verdict file lives in the same directory. It therefore ages
+// on the access marker a search refreshes, not on the directory's own timestamp,
+// which nothing moves after the compile.
+//
+// It reports what it reclaimed to writer, so a live collection says the same
+// thing its plan did. A nil writer stays silent, which is the opportunistic path.
+//
+// Callers reach this only from runGC. The dry-run path returns before runGC, so
+// this never runs for a plan.
+func sweepAgedProviderArtifacts(
+	ctx context.Context,
+	writer io.Writer,
+	cacheRoot string,
+	before time.Time,
+) {
+	removed := 0
+	var reclaimed int64
+	for _, due := range agedProviderArtifacts(ctx, cacheRoot, before) {
+		if ctx.Err() != nil {
+			return
+		}
+		path := due.path()
+		if due.leftover {
+			// A previous sweep was cut short. Finish it whatever the age.
+			size := corpusDirSize(path)
+			if discardProviderArtifact(path, path) {
+				removed++
+				reclaimed += size
+			}
+			continue
+		}
+		// Re-read the access marker under the rename. Enumeration and removal are
+		// not one step, and a search that started in between is using this model.
+		if info, err := os.Stat(filepath.Join(path, providerArtifactUsedFile)); err == nil &&
+			!info.ModTime().Before(before) {
+			continue
+		}
+		// Measure before the rename; afterwards the directory is gone.
+		size := corpusDirSize(path)
+		discarded := filepath.Join(due.parent, providerArtifactDiscardPrefix+due.name)
+		if err := os.Rename(path, discarded); err != nil {
+			slog.Debug("gc cannot retire a compiled provider model", "path", path, "error", err)
+			continue
+		}
+		if discardProviderArtifact(discarded, path) {
+			removed++
+			reclaimed += size
+		}
+	}
+	if removed > 0 && writer != nil {
+		_, _ = fmt.Fprintf(
+			writer,
+			"compiled model files removed: %d (%s)\n",
+			removed,
+			humanBytes(reclaimed),
+		)
+	}
+}
+
+// dueProviderArtifact is one compiled model a collection would remove. It keeps
+// the parts the sweep needs, so the sweep does not rebuild them from a joined
+// path and cannot disagree with the enumeration about what a leftover is.
+type dueProviderArtifact struct {
+	parent   string
+	name     string
+	leftover bool
+}
+
+func (due dueProviderArtifact) path() string {
+	return filepath.Join(due.parent, due.name)
+}
+
+// agedProviderArtifacts lists the compiled models a collection would remove, so
+// the live sweep and `--dry-run` agree on what is due. An entry a previous sweep
+// left marked is always due, whatever its age.
+func agedProviderArtifacts(ctx context.Context, cacheRoot string, before time.Time) []dueProviderArtifact {
+	root := filepath.Join(cacheRoot, rerankerDir, "coreml")
+	formats, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	var due []dueProviderArtifact
+	for _, format := range formats {
+		if ctx.Err() != nil {
+			return due
+		}
+		if !format.IsDir() {
+			continue
+		}
+		formatPath := filepath.Join(root, format.Name())
+		keys, err := os.ReadDir(formatPath)
+		if err != nil {
+			continue
+		}
+		for _, key := range keys {
+			if ctx.Err() != nil {
+				return due
+			}
+			if !key.IsDir() {
+				continue
+			}
+			entry := dueProviderArtifact{
+				parent:   formatPath,
+				name:     key.Name(),
+				leftover: strings.HasPrefix(key.Name(), providerArtifactDiscardPrefix),
+			}
+			if entry.leftover || providerArtifactIsAged(entry.path(), key, before) {
+				due = append(due, entry)
+			}
+		}
+	}
+	return due
+}
+
+// providerArtifactIsAged reports whether a compiled model has gone unwanted for
+// long enough. It prefers the access marker, because nothing refreshes the
+// directory's own modification time after the compile, so a model in daily use
+// would otherwise age exactly like an abandoned one.
+func providerArtifactIsAged(path string, key os.DirEntry, before time.Time) bool {
+	if info, err := os.Stat(filepath.Join(path, providerArtifactUsedFile)); err == nil {
+		return info.ModTime().Before(before)
+	}
+	info, err := key.Info()
+	return err == nil && info.ModTime().Before(before)
+}
+
+// discardProviderArtifact removes a renamed compiled model and reports whether it
+// went. A failure leaves the marked directory for the next sweep, so it never
+// fails the collection.
+func discardProviderArtifact(discarded, original string) bool {
+	if err := os.RemoveAll(discarded); err != nil {
+		slog.Debug("gc cannot remove a compiled provider model", "path", original, "error", err)
+		return false
+	}
+	slog.Debug("gc removed a compiled provider model", "path", original)
+	return true
+}
 
 // sweepOrphanBuildDirs removes leftover .build-* temp index dirs (from a crashed
 // or killed builder) whose mtime is older than `before`. A still-running build's

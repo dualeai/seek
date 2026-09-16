@@ -1,3 +1,7 @@
+# Go installs command tools outside PATH on some hosts. Resolve that directory
+# only for recipes that use the installed tools.
+GO_BIN = $(shell go env GOBIN GOPATH | awk 'NR == 1 { gobin = $$0 } NR == 2 { split($$0, paths, ":"); print (gobin != "" ? gobin : paths[1] "/bin") }')
+
 version:
 	@bash ./cicd/version.sh -g . -c
 
@@ -40,8 +44,14 @@ TOKENIZER_LIBRARY := $(TOKENIZER_NATIVE_DIR)/libtokenizers.a
 
 $(TOKENIZER_LIBRARY): $(TOKENIZER_ARCHIVE)
 	mkdir -p "$(TOKENIZER_NATIVE_DIR)"
-	tar -xzf "$(TOKENIZER_ARCHIVE)" -C "$(TOKENIZER_NATIVE_DIR)" libtokenizers.a
-	touch "$(TOKENIZER_LIBRARY)"
+	@set -eu; \
+		temp_dir="$$(mktemp -d "$(TOKENIZER_NATIVE_DIR)/.extract.XXXXXX")"; \
+		trap 'rm -f "$$temp_dir/libtokenizers.a"; rmdir "$$temp_dir" 2>/dev/null || true' 0 HUP INT TERM; \
+		tar -xzf "$(TOKENIZER_ARCHIVE)" -C "$$temp_dir" libtokenizers.a; \
+		touch "$$temp_dir/libtokenizers.a"; \
+		mv -f "$$temp_dir/libtokenizers.a" "$(TOKENIZER_LIBRARY)"; \
+		rmdir "$$temp_dir"; \
+		trap - 0 HUP INT TERM
 
 tokenizer-native: $(TOKENIZER_LIBRARY)
 else
@@ -72,7 +82,7 @@ test:
 
 test-static: tokenizer-native
 	go vet ./...
-	golangci-lint run ./...
+	PATH="$(GO_BIN):$$PATH" golangci-lint run ./...
 
 # Plugin tests use the normal build target and exercise only seek's public CLI.
 # CI sets USE_PREBUILT=1 after it downloads the build job's executable.
@@ -90,7 +100,7 @@ BENCH_REPO_COUNT ?= 3
 SEMANTIC_BENCH_SAMPLES ?= 10
 
 test-unit: tokenizer-native test-plugin
-	gotestsum --junitfile $(JUNIT_XML) -- ./... -v -race -timeout 18m -covermode=atomic -coverprofile=$(COVERPROFILE)
+	PATH="$(GO_BIN):$$PATH" gotestsum --junitfile $(JUNIT_XML) -- ./... -v -race -timeout 18m -covermode=atomic -coverprofile=$(COVERPROFILE)
 
 # Local benchmark output is diagnostic. CodSpeed is the source for comparisons.
 test-bench: build
@@ -101,9 +111,11 @@ test-bench-repo: tokenizer-native
 	SEEK_BENCH_REPO="$(SEEK_BENCH_REPO)" go test ./cmd/seek/ -run='^$$' -bench=BenchmarkLargeRepo -benchmem -count=$(BENCH_REPO_COUNT) -timeout=600s
 
 # Run the retained production-binary cold-build gates on one pinned checkout.
-test-bench-semantic: build
+# The gate restores the native library from its tracked archive, then builds
+# its own binary.
+test-bench-semantic:
 	@if [ -z "$(SEEK_BENCH_REPO)" ]; then echo "Usage: make test-bench-semantic SEEK_BENCH_REPO=/path/to/pinned-kubernetes"; exit 1; fi
-	SEEK_BIN="$(abspath $(OUTPUT))" SEEK_BENCH_REPO="$(SEEK_BENCH_REPO)" SEEK_BENCH_HEAD="$(SEEK_BENCH_HEAD)" \
+	SEEK_BENCH_REPO="$(SEEK_BENCH_REPO)" SEEK_BENCH_HEAD="$(SEEK_BENCH_HEAD)" \
 		uv run --script ./cicd/bench-semantic.py --samples $(SEMANTIC_BENCH_SAMPLES)
 
 # Make a local diagnostic comparison with golang.org/x/perf/cmd/benchstat.
@@ -119,7 +131,7 @@ test-bench-compare:
 	go run golang.org/x/perf/cmd/benchstat@latest $(BASE) $(NEW)
 
 lint: tokenizer-native
-	golangci-lint run --fix ./...
+	PATH="$(GO_BIN):$$PATH" golangci-lint run --fix ./...
 
 release:
 	bash ./cicd/release.sh

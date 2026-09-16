@@ -128,11 +128,20 @@ func (p *corpusPool) planDiscoveredGitSubtree(paths gitPaths) ([]corpusPlan, err
 	return plans, nil
 }
 
+// enqueueDiscoveredSubtree accepts the corpora the folder walker found inside a
+// search that is already running.
+//
+// Each one is marked skipVectors: its arrival makes the search span more than
+// one corpus, which the joined route rejects, so a vector generation built for
+// it could never be read. The lexical index is still built.
 func (p *corpusPool) enqueueDiscoveredSubtree(plans []corpusPlan) bool {
 	if len(plans) == 0 {
 		return false
 	}
 	for _, plan := range plans {
+		// Discovered after the route decision, so no route can read its
+		// vectors. Build the lexical index only.
+		plan.skipVectors = true
 		p.Enqueue(plan)
 	}
 	// Fresh accepts and dedup hits both mean the boundary is owned by a pool

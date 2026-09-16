@@ -441,6 +441,7 @@ func buildSemanticGeneration(
 		encoded,
 		filepath.Join(dir, semanticVectorsFile),
 		coarseReady,
+		cancel,
 		collected,
 	)
 
@@ -544,6 +545,12 @@ func buildSemanticGeneration(
 	if err := ctx.Err(); err != nil {
 		return semanticManifest{}, err
 	}
+	if streamErr != nil && errors.Is(streamErr, context.Canceled) &&
+		output.err != nil && !errors.Is(output.err, context.Canceled) {
+		// A collector failure cancels the internal source. Keep that first fatal
+		// error instead of replacing it with the resulting source cancellation.
+		return semanticManifest{}, output.err
+	}
 	if streamErr != nil {
 		return semanticManifest{}, streamErr
 	}
@@ -555,9 +562,6 @@ func buildSemanticGeneration(
 	}
 	if output.err != nil {
 		return semanticManifest{}, output.err
-	}
-	if usearchOutput.err != nil {
-		return semanticManifest{}, usearchOutput.err
 	}
 	if uint64(len(output.units)) != nextRow {
 		return semanticManifest{}, fmt.Errorf(
@@ -856,23 +860,35 @@ func encodeSemanticBatches(
 	)
 }
 
+// collectSemanticBatches writes out-of-order model batches at their fixed row
+// offsets and restores row order in its output. It sends coarse vectors only
+// after the fine-vector write succeeds. On the first collector error, it keeps
+// that error, cancels shared build work, and drains encoded until the producer
+// closes it.
 func collectSemanticBatches(
 	encoded <-chan semanticEncodedBatch,
 	vectorsPath string,
 	coarseReady chan<- semanticCoarseBatch,
+	cancel context.CancelFunc,
 	done chan<- semanticBuildOutput,
 ) {
 	if coarseReady != nil {
 		defer close(coarseReady)
 	}
 	var output semanticBuildOutput
+	fail := func(err error) {
+		if err != nil && output.err == nil {
+			output.err = err
+			cancel()
+		}
+	}
 	batches := make(map[int]semanticCollectedBatch)
 	maxSequence := -1
 	totalRows := 0
 	maxBatches := (semanticMaxRows + semanticModelBatchRows - 1) / semanticModelBatchRows
 	vectorFile, err := os.OpenFile(vectorsPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		output.err = err
+		fail(err)
 	}
 	vectorBuffer := make([]byte, semanticModelBatchRows*semanticFineVectorBytesPerUnit)
 	for batch := range encoded {
@@ -884,33 +900,33 @@ func collectSemanticBatches(
 			continue
 		}
 		if batch.err != nil {
-			output.err = batch.err
+			fail(batch.err)
 			continue
 		}
 		if batch.sequence < 0 || batch.sequence >= maxBatches {
-			output.err = fmt.Errorf("semantic model batch %d exceeds limit", batch.sequence)
+			fail(fmt.Errorf("semantic model batch %d exceeds limit", batch.sequence))
 			continue
 		}
 		if _, exists := batches[batch.sequence]; exists {
-			output.err = fmt.Errorf("semantic model batch %d was repeated", batch.sequence)
+			fail(fmt.Errorf("semantic model batch %d was repeated", batch.sequence))
 			continue
 		}
 		if len(batch.units) == 0 || len(batch.units) != len(batch.embeddings) ||
 			len(batch.units) > semanticModelBatchRows {
-			output.err = fmt.Errorf("semantic model batch %d has mismatched rows", batch.sequence)
+			fail(fmt.Errorf("semantic model batch %d has mismatched rows", batch.sequence))
 			continue
 		}
 		start := batch.sequence * semanticModelBatchRows
 		for index, unit := range batch.units {
 			wantRow := start + index
 			if unit.row != uint64(wantRow) || wantRow >= semanticMaxRows {
-				output.err = fmt.Errorf(
+				fail(fmt.Errorf(
 					"semantic model batch %d row %d is %d, want %d",
 					batch.sequence,
 					index,
 					unit.row,
 					wantRow,
-				)
+				))
 				break
 			}
 		}
@@ -919,7 +935,7 @@ func collectSemanticBatches(
 		}
 		encodedVectors, err := encodeSemanticFineVectors(vectorBuffer, batch.embeddings, start)
 		if err != nil {
-			output.err = err
+			fail(err)
 			continue
 		}
 		offset := int64(start * semanticFineVectorBytesPerUnit)
@@ -928,7 +944,7 @@ func collectSemanticBatches(
 			if err == nil {
 				err = fmt.Errorf("semantic vector write was short")
 			}
-			output.err = err
+			fail(err)
 			continue
 		}
 		coarse := make([]semanticCoarseVectors, len(batch.embeddings))
@@ -946,7 +962,7 @@ func collectSemanticBatches(
 		if len(batches) != maxSequence+1 {
 			for sequence := range maxSequence + 1 {
 				if _, exists := batches[sequence]; !exists {
-					output.err = fmt.Errorf("semantic model batch %d did not complete", sequence)
+					fail(fmt.Errorf("semantic model batch %d did not complete", sequence))
 					break
 				}
 			}
@@ -957,12 +973,12 @@ func collectSemanticBatches(
 		for sequence := range maxSequence + 1 {
 			batch := batches[sequence]
 			if sequence < maxSequence && len(batch.units) != semanticModelBatchRows {
-				output.err = fmt.Errorf(
+				fail(fmt.Errorf(
 					"semantic model batch %d has %d rows, want %d",
 					sequence,
 					len(batch.units),
 					semanticModelBatchRows,
-				)
+				))
 				break
 			}
 			output.units = append(output.units, batch.units...)
@@ -972,15 +988,15 @@ func collectSemanticBatches(
 		if output.err == nil {
 			wantBytes, sizeOK := checkedSemanticVectorBytes(uint64(totalRows))
 			if !sizeOK {
-				output.err = fmt.Errorf("semantic vector size is invalid")
+				fail(fmt.Errorf("semantic vector size is invalid"))
 			} else if truncateErr := vectorFile.Truncate(int64(wantBytes)); truncateErr != nil {
-				output.err = truncateErr
+				fail(truncateErr)
 			} else {
 				output.vectorsArtifact = semanticSizedArtifact{Bytes: wantBytes}
 			}
 		}
 		if closeErr := vectorFile.Close(); output.err == nil && closeErr != nil {
-			output.err = closeErr
+			fail(closeErr)
 		}
 	}
 	done <- output

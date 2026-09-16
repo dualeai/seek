@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"math"
 	"path/filepath"
@@ -23,6 +25,78 @@ func TestGitCorpusFormatting_Empty(t *testing.T) {
 	result := formatGitCorpusResultsForTest(nil, nil, 0, 0)
 	if result != "" {
 		t.Errorf("expected empty string, got %q", result)
+	}
+}
+
+func TestWriteCorpusResultsWithContextMatchesStringFormatter(t *testing.T) {
+	results := []corpusSearchResult{
+		{
+			corpusID: "one",
+			kind:     corpusKindFolder,
+			file: zoekt.FileMatch{
+				FileName: "first.go",
+				Language: "Go",
+				Score:    2,
+				LineMatches: []zoekt.LineMatch{{
+					Line:       []byte("first match\n"),
+					LineNumber: 1,
+				}},
+			},
+		},
+		{
+			corpusID: "one",
+			kind:     corpusKindFolder,
+			file: zoekt.FileMatch{
+				FileName: "second.go",
+				Language: "Go",
+				Score:    1,
+				LineMatches: []zoekt.LineMatch{{
+					Line:       []byte("second match\n"),
+					LineNumber: 2,
+				}},
+			},
+		},
+	}
+	want := formatCorpusResultsWithContext(
+		results, nil, 1, 0, hideCorpusContext, plainPalette,
+	)
+	var output bytes.Buffer
+	wrote, err := writeCorpusResultsWithContext(
+		&output, results, nil, 1, 0, hideCorpusContext, plainPalette,
+	)
+	if err != nil || !wrote || output.String() != want {
+		t.Fatalf("streamed output=%q wrote=%t error=%v, want %q", output.String(), wrote, err, want)
+	}
+}
+
+type failingCorpusWriter struct {
+	err error
+}
+
+func (writer failingCorpusWriter) Write([]byte) (int, error) {
+	return 0, writer.err
+}
+
+func TestWriteCorpusResultsWithContextReturnsWriteError(t *testing.T) {
+	wantErr := fmt.Errorf("output stopped")
+	results := []corpusSearchResult{{
+		corpusID: "one",
+		file: zoekt.FileMatch{
+			FileName: "app.go",
+			Language: "Go",
+		},
+	}}
+	wrote, err := writeCorpusResultsWithContext(
+		failingCorpusWriter{err: wantErr},
+		results,
+		nil,
+		0,
+		0,
+		hideCorpusContext,
+		plainPalette,
+	)
+	if !wrote || !errors.Is(err, wantErr) {
+		t.Fatalf("wrote=%t error=%v, want true and %v", wrote, err, wantErr)
 	}
 }
 

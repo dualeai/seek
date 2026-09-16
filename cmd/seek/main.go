@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -60,9 +61,9 @@ func main() {
 	root.SetArgs(args)
 	err := root.ExecuteContext(ctx)
 
-	// Informational calls do not touch an index, so they must not wait for cache
-	// maintenance. Search and management calls still run opportunistic GC after
-	// their output is flushed.
+	// Help, completion, and explicit GC calls do not start automatic GC. A GC
+	// command already owns cache maintenance, and its dry-run form must remain
+	// read-only. Search calls run automatic GC after their output is flushed.
 	if shouldRunOpportunisticGC(args) {
 		fireOpportunisticGC(runOpportunisticGC, gcRunTimeout)
 	}
@@ -99,7 +100,8 @@ func shouldRunOpportunisticGC(args []string) bool {
 		if knownBool {
 			continue
 		}
-		if arg == "help" {
+		switch arg {
+		case "help", "completion", "gc", "garbage-collect":
 			return false
 		}
 		return true
@@ -167,6 +169,8 @@ func runSearchCommand(
 	if runConfig.policy.semanticEnabled() {
 		rerankPlan, rerankEligible = planRerankQuery(pattern, rawQ)
 	}
+	guaranteedTruncated := rerankEligible &&
+		rerankQueryGuaranteedTruncated(rerankPlan.modelQuery)
 
 	paths, err := resolveDefaultSearchRoot(ctx, pathOperands)
 	if err != nil {
@@ -176,7 +180,29 @@ func runSearchCommand(
 	if err != nil {
 		return err
 	}
-	execution := searchExecution{policy: runConfig.policy, resources: liveSearchResources()}
+	if guaranteedTruncated {
+		slog.Debug(
+			"Rejected model expansion",
+			"route", "all",
+			"reason", "query truncated",
+		)
+		rerankEligible = false
+		runConfig.newModel = nil
+	}
+	if rerankEligible && runConfig.newAcceptancePolicies != nil {
+		policies := runConfig.newAcceptancePolicies()
+		if runConfig.rerankAcceptance == nil {
+			runConfig.rerankAcceptance = policies.rerank
+		}
+		if runConfig.hybridAcceptance == nil {
+			runConfig.hybridAcceptance = policies.hybrid
+		}
+	}
+	execution := searchExecution{
+		policy:     runConfig.policy,
+		acceptance: runConfig.hybridAcceptance,
+		resources:  liveSearchResources(),
+	}
 	if runConfig.newModel != nil && runConfig.policy.semanticEnabled() {
 		execution.model = newSemanticModelFuture(runConfig.newModel)
 		if rerankEligible {
@@ -185,6 +211,24 @@ func runSearchCommand(
 		}
 		defer func() { _ = execution.model.Close() }()
 	}
+	// Decide once whether any route can read a committed vector generation.
+	// Every corpus reads this through searchExecution.vectorsWanted.
+	//
+	// Two conditions, both required. tryHybridSearch below runs only when
+	// rerankEligible, so a query shape the re-rank planner rejects — a symbol
+	// lookup, an exact phrase, a single word — can never reach a vector.
+	// hybridSearchEligible then rejects the corpus shapes the joined route
+	// cannot serve: a scope, more than one corpus, or an unsupported kind.
+	// Without both, a search builds and binds a generation that nothing reads.
+	//
+	// What this does not cover: neither input reads the working-tree state, so
+	// a dirty tree still prepares vectors and still discards the route at
+	// hybrid_search.go:95. Narrowing that needs the dirty state at the point
+	// the decision is made.
+	//
+	// hybridSearchEligible reads execution.model, so this must follow the block
+	// above that assigns it.
+	execution.prepareVectors = rerankEligible && hybridSearchEligible(plans, execution)
 
 	strictConfig := config
 	if rerankEligible {
@@ -226,7 +270,12 @@ func runSearchCommand(
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
-			slog.Debug("Joined search failed; using the lexical path", "error", hybridErr)
+			slog.Debug(
+				"Joined search failed; using the lexical path",
+				"provider", semanticProviderName(),
+				"error", hybridErr,
+			)
+			recordSemanticProviderFault(hybridErr)
 		}
 	}
 	if !hybridUsed {
@@ -235,7 +284,34 @@ func runSearchCommand(
 			return err
 		}
 	}
-	if rerankEligible && !hybridUsed {
+	rerankAfterLexical := rerankEligible && !hybridUsed
+	if rerankAfterLexical && execution.model != nil {
+		_, prepared, prepareErr := execution.model.prepareQuery(ctx, rerankPlan.modelQuery)
+		switch {
+		case prepareErr != nil:
+			allResults = applyRerankDisplayConfig(allResults, config)
+			slog.Debug(
+				"Re-ranking failed; using BM25",
+				"provider", semanticProviderName(),
+				"error", prepareErr,
+			)
+			recordSemanticProviderFault(prepareErr)
+			rerankAfterLexical = false
+		case prepared == nil:
+			allResults = applyRerankDisplayConfig(allResults, config)
+			slog.Debug(
+				"Re-ranking failed; using BM25",
+				"provider", semanticProviderName(),
+				"error", errRerankUnavailable,
+			)
+			rerankAfterLexical = false
+		case prepared.truncated:
+			allResults = applyRerankDisplayConfig(allResults, config)
+			logRerankExpansionRejection(runConfig.rerankAcceptance, "query truncated")
+			rerankAfterLexical = false
+		}
+	}
+	if rerankAfterLexical {
 		var score rerankScoreFunc
 		if execution.model != nil {
 			score = execution.model.scores
@@ -249,12 +325,18 @@ func runSearchCommand(
 			config,
 			rerankPlan,
 			score,
+			runConfig.rerankAcceptance,
 			search,
 		)
 		allResults = reranked
 		dirtyByCorpus = mergedDirty
 		if rerankErr != nil {
-			slog.Debug("Re-ranking failed; using BM25", "error", rerankErr)
+			slog.Debug(
+				"Re-ranking failed; using BM25",
+				"provider", semanticProviderName(),
+				"error", rerankErr,
+			)
+			recordSemanticProviderFault(rerankErr)
 		}
 	}
 
@@ -279,12 +361,25 @@ func runSearchCommand(
 	if useColor(os.Stdout) {
 		pal = ansiPalette
 	}
-	output := formatCorpusResultsWithContext(allResults, dirtyByCorpus, limit, maxMatches, displayMode, pal)
-	if output == "" {
+	output := bufio.NewWriter(os.Stdout)
+	wrote, err := writeCorpusResultsWithContext(
+		output,
+		allResults,
+		dirtyByCorpus,
+		limit,
+		maxMatches,
+		displayMode,
+		pal,
+	)
+	if err == nil {
+		err = output.Flush()
+	}
+	if err != nil {
+		return fmt.Errorf("write search results: %w", err)
+	}
+	if !wrote {
 		return errNoMatch
 	}
-
-	_, _ = os.Stdout.WriteString(output)
 	return nil
 }
 
@@ -563,9 +658,11 @@ func ensureCombinedGitCorpusWithExecution(
 		ensureFSMonitor(ctx, paths)
 	}
 
+	if plan.skipVectors {
+		execution.prepareVectors = false
+	}
 	currentState := gitCorpusStateHash(paths, state)
-	semanticRequired := execution.policy.semanticEnabled() &&
-		execution.model != nil && state.HeadSHA != "no-head"
+	semanticRequired := execution.vectorsWanted(state.HeadSHA)
 	joinedReady := !semanticRequired || joinedGenerationMatches(
 		plan.cacheDir,
 		plan.indexDir,
@@ -574,9 +671,8 @@ func ensureCombinedGitCorpusWithExecution(
 	)
 	// Use one directory scan so all integrity checks describe the same state.
 	sc, scErr := scanFamilyOptional(plan.indexDir)
-	hasShards := scErr == nil && sc.hasShard() &&
-		committedSnapshotReady(plan.cacheDir, plan.indexDir, state, sc) &&
-		sc.matchesManifest(plan.indexDir)
+	hasShards := scErr == nil && sc.familyComplete(plan.indexDir) &&
+		committedSnapshotReady(plan.cacheDir, plan.indexDir, state, sc)
 	clearCommitted := state.HeadSHA == "no-head" && sc.hasMember(familyCommitted)
 	// A leftover .swapping marker means a prior publish was interrupted and the
 	// shards may be torn; force the build path so recoverIncompleteSwap runs even
@@ -643,8 +739,9 @@ func ensureScopedGitCorpusFallback(
 	treeish := normalizeCommittedTreeish(state.HeadSHA)
 	scopedState := repoStateForDirtyScope(state, plan.dirtyScope)
 	currentState := scopedFallbackStateHash(paths, scopedState)
-	semanticRequired := execution.policy.semanticEnabled() &&
-		execution.model != nil && treeish != "no-head"
+	// A scoped fallback corpus can never use the vector route, so this is
+	// always false: hybridSearchEligible rejects any plan that carries a scope.
+	semanticRequired := execution.vectorsWanted(treeish)
 	semanticPresent := semanticRequired && semanticGenerationPresent(indexDir, treeish)
 
 	if readStateFile(cacheDir) == "" {
@@ -711,7 +808,11 @@ func ensureScopedGitCorpusFallback(
 				activationErr := bindSemanticGeneration(cacheDir, indexDir, currentState, treeish)
 				releaseLock(pub)
 				if activationErr != nil {
-					slog.Debug("Semantic scoped index activation failed; keeping lexical search", "error", activationErr)
+					slog.Debug(
+						"Semantic scoped index activation failed; keeping lexical search",
+						"provider", semanticProviderName(),
+						"error", activationErr,
+					)
 				}
 				plan.scopedStateHash = currentState
 				return state, currentIndexState, nil
@@ -782,6 +883,8 @@ func ensureScopedGitCorpusFallback(
 			}
 			slog.Debug(
 				"Semantic scoped index build failed; keeping lexical search",
+				"provider",
+				semanticProviderName(),
 				"error",
 				semanticErr,
 			)
@@ -836,6 +939,8 @@ func ensureScopedGitCorpusFallback(
 		if activationErr != nil {
 			slog.Debug(
 				"Semantic scoped index activation failed; keeping lexical search",
+				"provider",
+				semanticProviderName(),
 				"error",
 				activationErr,
 			)
@@ -864,7 +969,7 @@ func scopedFallbackCached(cacheDir, indexDir, currentState string) (corpusIndexS
 	// A presence check cannot detect a missing shard, a changed size, or a
 	// missing sidecar. Validate the fallback against its family manifest.
 	sc, err := scanFamilyOptional(indexDir)
-	if err == nil && sc.hasShard() && sc.matchesManifest(indexDir) {
+	if err == nil && sc.familyComplete(indexDir) {
 		return corpusSearchable, true
 	}
 	if readEmptyStateFile(cacheDir) == currentState {
@@ -1079,4 +1184,14 @@ func searchIndexDirs(plan corpusPlan) []string {
 		return []string{plan.scopedIndexDir}
 	}
 	return []string{plan.indexDir}
+}
+
+// recordSemanticProviderFault notes a provider that produced unusable output.
+// A search on an already-built index is the common path, so without this a wrong
+// provider would drop every search to text ranking and never record itself. Any
+// other failure says nothing about the provider and is ignored.
+func recordSemanticProviderFault(err error) {
+	if errors.Is(err, errDegenerateSemanticVector) {
+		rejectLateOnAcceleratedProvider(err.Error())
+	}
 }

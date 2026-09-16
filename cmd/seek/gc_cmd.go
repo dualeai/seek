@@ -37,19 +37,6 @@ func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 	if err != nil {
 		return fmt.Errorf("resolve cache root: %w", err)
 	}
-	if err := os.MkdirAll(cacheRoot, 0o755); err != nil {
-		return fmt.Errorf("create cache root: %w", err)
-	}
-
-	if isOnNFS(cacheRoot) {
-		slog.Warn(
-			"seek cache on network filesystem; gc disabled. "+
-				"Set XDG_CACHE_HOME to a local directory to enable.",
-			"cache_root", cacheRoot,
-		)
-		return nil
-	}
-
 	cfg := gcConfigFromEnv()
 	maxAge := cfg.maxAge
 	if opts.all {
@@ -57,13 +44,32 @@ func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 	}
 
 	corporaPath := filepath.Join(cacheRoot, corporaDir)
-	entries, err := enumerateCorpusDirs(corporaPath)
-	if err != nil {
-		return fmt.Errorf("enumerate corpora: %w", err)
+	if opts.dryRun {
+		// An absent cache is an empty plan. Do not create it only to report that
+		// it contains no corpora.
+		entries, err := enumerateCorpusDirs(corporaPath)
+		if err != nil {
+			return fmt.Errorf("enumerate corpora: %w", err)
+		}
+		if err := reportGCPlan(ctx, os.Stdout, cacheRoot, entries, time.Now().Add(-maxAge), sortKey); err != nil {
+			return err
+		}
+		reportProviderArtifactPlan(ctx, os.Stdout, cacheRoot, time.Now().Add(-maxAge))
+		return nil
 	}
 
-	if opts.dryRun {
-		return reportGCPlan(ctx, os.Stdout, cacheRoot, entries, time.Now().Add(-maxAge), sortKey)
+	if err := os.MkdirAll(cacheRoot, 0o755); err != nil {
+		return fmt.Errorf("create cache root: %w", err)
+	}
+	if isOnNFS(cacheRoot) {
+		slog.Warn(
+			"seek cache on network filesystem; gc disabled. "+gcLocalCacheHint,
+			"cache_root", cacheRoot,
+		)
+		return nil
+	}
+	if _, err := enumerateCorpusDirs(corporaPath); err != nil {
+		return fmt.Errorf("enumerate corpora: %w", err)
 	}
 
 	// Live eviction: reuse runGC for trash drain + lock + per-corpus
@@ -418,4 +424,32 @@ func corpusDirSize(path string) int64 {
 		return nil
 	})
 	return total
+}
+
+// reportProviderArtifactPlan lists the compiled model files a collection would
+// remove. Without it a plan under-reports the deletion, because those files live
+// outside the corpus table.
+func reportProviderArtifactPlan(ctx context.Context, w io.Writer, cacheRoot string, cutoff time.Time) {
+	due := agedProviderArtifacts(ctx, cacheRoot, cutoff)
+	if len(due) == 0 {
+		return
+	}
+	// Measure once per entry. corpusDirSize walks the whole subtree, and that walk
+	// dominates the cost of a plan, so the total and the rows must share it.
+	sizes := make([]int64, len(due))
+	var total int64
+	for i, entry := range due {
+		sizes[i] = corpusDirSize(entry.path())
+		total += sizes[i]
+	}
+	_, _ = fmt.Fprintf(
+		w,
+		"\ncompiled model files to remove: %d (%s)\n",
+		len(due),
+		humanBytes(total),
+	)
+	for i, entry := range due {
+		_, _ = fmt.Fprintf(w, "  %s  %s\n", humanBytes(sizes[i]), entry.path())
+	}
+	_, _ = fmt.Fprintf(w, "Seek compiles these again when it needs them.\n")
 }

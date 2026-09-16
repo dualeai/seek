@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"math"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -98,6 +98,8 @@ func (semanticBuildTestEmbedder) SemanticCallCPUs(context.Context) int { return 
 func (semanticBuildTestEmbedder) Close() error                         { return nil }
 
 func TestCollectSemanticBatchesRestoresSequence(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
 	firstUnits := make([]semanticUnit, semanticModelBatchRows)
 	firstEmbeddings := make([]semanticUnitEmbedding, semanticModelBatchRows)
 	firstVector := semanticVector{0: 1}
@@ -129,10 +131,13 @@ func TestCollectSemanticBatchesRestoresSequence(t *testing.T) {
 	done := make(chan semanticBuildOutput, 1)
 	coarseReady := make(chan semanticCoarseBatch, 2)
 	vectorsPath := filepath.Join(t.TempDir(), semanticVectorsFile)
-	collectSemanticBatches(encoded, vectorsPath, coarseReady, done)
+	collectSemanticBatches(encoded, vectorsPath, coarseReady, cancel, done)
 	output := <-done
 	if output.err != nil {
 		t.Fatal(output.err)
+	}
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("successful collection canceled its context: %v", err)
 	}
 	if got, want := []uint64{output.units[0].row, output.units[semanticModelBatchRows].row}, []uint64{0, semanticModelBatchRows}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("rows=%v, want %v", got, want)
@@ -162,9 +167,145 @@ func TestCollectSemanticBatchesRestoresSequence(t *testing.T) {
 		t.Fatal(err)
 	}
 	secondAt := semanticModelBatchRows * semanticFineVectorBytesPerUnit
-	if math.Float32frombits(binary.LittleEndian.Uint32(raw[:4])) != 1 ||
-		math.Float32frombits(binary.LittleEndian.Uint32(raw[secondAt+4:secondAt+8])) != 1 {
+	if int16(binary.LittleEndian.Uint16(raw[:2])) != semanticSNORM16Scale ||
+		int16(binary.LittleEndian.Uint16(raw[secondAt+2:secondAt+4])) != semanticSNORM16Scale {
 		t.Fatal("fine vectors are out of order")
+	}
+}
+
+func TestCollectSemanticBatchesRejectsInvalidInput(t *testing.T) {
+	validBatch := func(sequence, rows int) semanticEncodedBatch {
+		units := make([]semanticUnit, rows)
+		embeddings := make([]semanticUnitEmbedding, rows)
+		for index := range rows {
+			units[index].row = uint64(sequence*semanticModelBatchRows + index)
+			embeddings[index] = testSemanticUnitEmbedding(semanticVector{0: 1})
+		}
+		return semanticEncodedBatch{
+			sequence:   sequence,
+			units:      units,
+			embeddings: embeddings,
+		}
+	}
+	maxBatches := (semanticMaxRows + semanticModelBatchRows - 1) / semanticModelBatchRows
+	tests := []struct {
+		name      string
+		batches   []semanticEncodedBatch
+		wantError error
+		wantText  string
+	}{
+		{name: "negative sequence", batches: []semanticEncodedBatch{validBatch(-1, 1)}, wantText: "exceeds limit"},
+		{name: "sequence over limit", batches: []semanticEncodedBatch{validBatch(maxBatches, 1)}, wantText: "exceeds limit"},
+		{name: "repeated sequence", batches: []semanticEncodedBatch{validBatch(0, 1), validBatch(0, 1)}, wantText: "was repeated"},
+		{name: "empty batch", batches: []semanticEncodedBatch{{sequence: 0}}, wantText: "mismatched rows"},
+		{
+			name: "unit and embedding count differ",
+			batches: []semanticEncodedBatch{{
+				sequence: 0,
+				units:    []semanticUnit{{row: 0}},
+			}},
+			wantText: "mismatched rows",
+		},
+		{name: "wrong row", batches: []semanticEncodedBatch{func() semanticEncodedBatch {
+			batch := validBatch(0, 1)
+			batch.units[0].row = 1
+			return batch
+		}()}, wantText: "row 0 is 1, want 0"},
+		{name: "missing sequence", batches: []semanticEncodedBatch{validBatch(1, 1)}, wantText: "did not complete"},
+		{name: "short nonfinal batch", batches: []semanticEncodedBatch{validBatch(0, 1), validBatch(1, 1)}, wantText: "has 1 rows, want"},
+		{name: "oversize batch", batches: []semanticEncodedBatch{validBatch(0, semanticModelBatchRows+1)}, wantText: "mismatched rows"},
+		{name: "model error", batches: []semanticEncodedBatch{func() semanticEncodedBatch {
+			batch := validBatch(0, 1)
+			batch.err = context.Canceled
+			return batch
+		}()}, wantError: context.Canceled},
+		{name: "invalid embedding", batches: []semanticEncodedBatch{func() semanticEncodedBatch {
+			batch := validBatch(0, 1)
+			batch.embeddings[0] = testSemanticUnitEmbedding(semanticVector{0: 2})
+			return batch
+		}()}, wantText: "semantic row 0 centroid 0"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			encoded := make(chan semanticEncodedBatch, len(test.batches))
+			for _, batch := range test.batches {
+				encoded <- batch
+			}
+			close(encoded)
+			done := make(chan semanticBuildOutput, 1)
+			collectSemanticBatches(
+				encoded,
+				filepath.Join(t.TempDir(), semanticVectorsFile),
+				nil,
+				cancel,
+				done,
+			)
+			output := <-done
+			if output.err == nil {
+				t.Fatal("invalid semantic batch was accepted")
+			}
+			if test.wantError != nil && !errors.Is(output.err, test.wantError) {
+				t.Fatalf("error=%v, want %v", output.err, test.wantError)
+			}
+			if test.wantText != "" && !strings.Contains(output.err.Error(), test.wantText) {
+				t.Fatalf("error=%q, want text %q", output.err, test.wantText)
+			}
+			if output.vectorsArtifact.Bytes != 0 {
+				t.Fatalf("failed build reported %d vector bytes", output.vectorsArtifact.Bytes)
+			}
+			if !errors.Is(ctx.Err(), context.Canceled) {
+				t.Fatalf("failed collection context error=%v, want cancellation", ctx.Err())
+			}
+		})
+	}
+}
+
+func TestCollectSemanticBatchesAcceptsNoRows(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	encoded := make(chan semanticEncodedBatch)
+	close(encoded)
+	done := make(chan semanticBuildOutput, 1)
+	vectorsPath := filepath.Join(t.TempDir(), semanticVectorsFile)
+	collectSemanticBatches(encoded, vectorsPath, nil, cancel, done)
+	output := <-done
+	if output.err != nil {
+		t.Fatal(output.err)
+	}
+	if len(output.units) != 0 || output.vectorsArtifact.Bytes != 0 {
+		t.Fatalf("empty build returned %d rows and %d vector bytes", len(output.units), output.vectorsArtifact.Bytes)
+	}
+	info, err := os.Stat(vectorsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("empty vector file has %d bytes", info.Size())
+	}
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("empty collection canceled its context: %v", err)
+	}
+}
+
+func TestCollectSemanticBatchesCancelsAfterVectorCreationFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	vectorsPath := filepath.Join(t.TempDir(), semanticVectorsFile)
+	if err := os.WriteFile(vectorsPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	encoded := make(chan semanticEncodedBatch)
+	close(encoded)
+	done := make(chan semanticBuildOutput, 1)
+	collectSemanticBatches(encoded, vectorsPath, nil, cancel, done)
+	output := <-done
+	if !errors.Is(output.err, os.ErrExist) {
+		t.Fatalf("vector creation error=%v, want %v", output.err, os.ErrExist)
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("vector creation failure context error=%v, want cancellation", ctx.Err())
 	}
 }
 
@@ -515,6 +656,44 @@ func TestBuildSemanticGenerationReleasesSourceWeightOnModelFailure(t *testing.T)
 	)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("semantic build error=%v, want %v", err, wantErr)
+	}
+}
+
+func TestBuildSemanticGenerationKeepsCollectorErrorAfterInternalCancellation(t *testing.T) {
+	requireTools(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, semanticVectorsFile), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	embedder := semanticBuildTestEmbedder{embed: func(
+		context.Context,
+		[]semanticUnit,
+	) ([]semanticUnitEmbedding, error) {
+		return nil, errors.New("unexpected model call")
+	}}
+	_, err := buildSemanticGeneration(
+		t.Context(),
+		dir,
+		"source-collector-error",
+		embedder,
+		searchResources{},
+		func(ctx context.Context) (<-chan fileContent, func() error) {
+			documents := make(chan fileContent)
+			go func() {
+				<-ctx.Done()
+				close(documents)
+			}()
+			return documents, ctx.Err
+		},
+	)
+	if !errors.Is(err, os.ErrExist) {
+		t.Fatalf("semantic build error=%v, want existing vector file error", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("collector error was replaced by internal cancellation: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, semanticManifestFile)); !os.IsNotExist(statErr) {
+		t.Fatalf("failed build published a manifest: %v", statErr)
 	}
 }
 

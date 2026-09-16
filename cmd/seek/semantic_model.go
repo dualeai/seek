@@ -19,6 +19,7 @@ type semanticQueryEmbedding struct {
 	tokens     []float32
 	scoreMask  []bool
 	modelQuery string
+	truncated  bool
 }
 
 // semanticModel is the command-wide LateOn model used by indexing, retrieval,
@@ -171,16 +172,46 @@ func (future *semanticModelFuture) scores(
 	ctx context.Context,
 	query string,
 	documents []rerankDocument,
-) ([]float32, error) {
+) (rerankScoreBatch, error) {
 	model, prepared, err := future.prepareQuery(ctx, query)
 	if err != nil {
-		return nil, err
+		return rerankScoreBatch{}, err
 	}
-	return model.ScoresWithSemanticQuery(ctx, prepared, documents)
+	values, err := model.ScoresWithSemanticQuery(ctx, prepared, documents)
+	if err != nil {
+		return rerankScoreBatch{}, err
+	}
+	return newRerankScoreBatch(prepared, values)
 }
 
 type searchExecution struct {
-	policy    searchPolicy
-	model     *semanticModelFuture
-	resources searchResources
+	policy     searchPolicy
+	acceptance *rerankAcceptancePolicy
+	model      *semanticModelFuture
+	resources  searchResources
+	// prepareVectors reports whether any route in this search can read a
+	// committed vector generation. A model can still be wanted for re-ranking
+	// lexical candidates when this is false, so the two decisions are separate:
+	// building and binding vectors that the route will reject is pure cost.
+	prepareVectors bool
+}
+
+// vectorsWanted reports whether a corpus should build, validate and bind a
+// committed vector generation.
+//
+// Three conditions, all required. The policy must enable semantic search; a
+// model must exist; and a route must be able to read the result. That last
+// condition is prepareVectors, decided once per search: a query shape the
+// re-rank planner rejects, or a corpus shape the joined route rejects, can
+// never reach a vector, and building one for it is pure cost. The model itself
+// stays available for re-ranking lexical candidates in those cases.
+//
+// head is the commit the corpus indexes. A Git corpus with no commit has
+// nothing to key a generation by. Pass an empty head for a corpus kind that has
+// no commit at all, such as a folder, where the test does not apply.
+func (e searchExecution) vectorsWanted(head string) bool {
+	return e.policy.semanticEnabled() &&
+		e.model != nil &&
+		e.prepareVectors &&
+		head != "no-head"
 }

@@ -102,6 +102,67 @@ func TestLateOnSemanticCentroidsRejectInvalidRows(t *testing.T) {
 	}
 }
 
+func TestNormalizeSemanticVectorHandlesFiniteExtremeValues(t *testing.T) {
+	t.Run("smallest subnormal", func(t *testing.T) {
+		vector := semanticVector{0: math.SmallestNonzeroFloat32}
+		if err := normalizeSemanticVector(&vector); err != nil {
+			t.Fatal(err)
+		}
+		if vector[0] != 1 {
+			t.Fatalf("first component=%g, want 1", vector[0])
+		}
+		for dimension, value := range vector[1:] {
+			if value != 0 {
+				t.Fatalf("component %d=%g, want 0", dimension+1, value)
+			}
+		}
+	})
+
+	t.Run("largest finite", func(t *testing.T) {
+		vector := semanticVector{0: math.MaxFloat32, 1: math.MaxFloat32}
+		if err := normalizeSemanticVector(&vector); err != nil {
+			t.Fatal(err)
+		}
+		if vector[0] != vector[1] || vector[0] <= 0 ||
+			math.Abs(float64(vector[0])-1/math.Sqrt2) > 1e-6 {
+			t.Fatalf("first components=%v, want equal positive values near 1/sqrt(2)", vector[:2])
+		}
+		for dimension, value := range vector[2:] {
+			if value != 0 {
+				t.Fatalf("component %d=%g, want 0", dimension+2, value)
+			}
+		}
+	})
+}
+
+func TestNormalizeSemanticVectorRejectsInvalidInput(t *testing.T) {
+	for _, vector := range []semanticVector{
+		{},
+		{0: float32(math.NaN())},
+		{0: float32(math.Inf(-1))},
+		{0: float32(math.Inf(1))},
+	} {
+		if err := normalizeSemanticVector(&vector); err == nil {
+			t.Fatalf("invalid vector %v was accepted", vector[:1])
+		}
+	}
+}
+
+func TestNormalizeSemanticVectorPreservesOrdinaryFloat32Result(t *testing.T) {
+	vector := semanticVector{0: 0.3, 1: -0.4, 2: 0.5}
+	want := semanticVector{
+		0: math.Float32frombits(0x3ed93924),
+		1: math.Float32frombits(0xbf10d0c3),
+		2: math.Float32frombits(0x3f3504f3),
+	}
+	if err := normalizeSemanticVector(&vector); err != nil {
+		t.Fatal(err)
+	}
+	if vector != want {
+		t.Fatalf("normalized bytes changed: got %v, want %v", vector[:3], want[:3])
+	}
+}
+
 func BenchmarkLateOnSemanticUnitEmbedding(b *testing.B) {
 	mask := make([]bool, lateOnSequenceLength)
 	embeddings := make([]float32, lateOnSequenceLength*semanticEmbeddingDimensions)

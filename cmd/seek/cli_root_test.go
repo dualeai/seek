@@ -167,6 +167,42 @@ func TestRootCmd_RejectsNegativeLimit(t *testing.T) {
 	}
 }
 
+func TestDefaultSearchRunConfigBindsAcceptancePolicies(t *testing.T) {
+	config := defaultSearchRunConfig(defaultSearchPolicy())
+	if config.newModel == nil || config.newAcceptancePolicies == nil {
+		t.Fatalf("default run config is incomplete: %+v", config)
+	}
+	if config.rerankAcceptance != nil || config.hybridAcceptance != nil {
+		t.Fatalf("default run config resolved acceptance eagerly: %+v", config)
+	}
+	policies := config.newAcceptancePolicies()
+	if policies.rerank == nil || policies.hybrid == nil {
+		t.Fatalf("default acceptance policies are incomplete: %+v", policies)
+	}
+	if policies.rerank.route != "lexical-rerank" ||
+		policies.hybrid.route != "joined" {
+		t.Fatalf(
+			"acceptance routes=%q and %q",
+			policies.rerank.route,
+			policies.hybrid.route,
+		)
+	}
+	if policies.rerank.minimumMeanMaxSim != 0.575 ||
+		policies.hybrid.minimumMeanMaxSim != 0.600 {
+		t.Fatalf(
+			"acceptance minimums=%g and %g",
+			policies.rerank.minimumMeanMaxSim,
+			policies.hybrid.minimumMeanMaxSim,
+		)
+	}
+
+	lexical := defaultSearchRunConfig(lexicalOnlySearchPolicy())
+	if lexical.newModel != nil || lexical.rerankAcceptance != nil ||
+		lexical.hybridAcceptance != nil || lexical.newAcceptancePolicies != nil {
+		t.Fatalf("lexical-only run config started model policy: %+v", lexical)
+	}
+}
+
 func TestSelectSearchConfig(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -326,15 +362,52 @@ func TestShouldRunOpportunisticGC(t *testing.T) {
 		{name: "help command", args: []string{"help"}},
 		{name: "verbose help command", args: []string{"-v", "help", "gc"}},
 		{name: "numeric bool verbose help command", args: []string{"--verbose=0", "help"}},
+		{name: "gc command", args: []string{"gc"}},
+		{name: "gc dry run", args: []string{"gc", "--dry-run"}},
+		{name: "verbose gc alias", args: []string{"--verbose", "garbage-collect"}},
+		{name: "completion command", args: []string{"completion", "zsh"}},
 		{name: "version", args: []string{"--version"}},
 		{name: "short bool version", args: []string{"--version=t"}},
 		{name: "help path", args: []string{"needle", "help"}, want: true},
 		{name: "help query after separator", args: []string{"--", "--help"}, want: true},
+		{name: "gc query after separator", args: []string{"--", "gc"}, want: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := shouldRunOpportunisticGC(tc.args); got != tc.want {
 				t.Fatalf("shouldRunOpportunisticGC(%v)=%v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBadProviderPinOnlyStopsCommandsThatUseTheModel(t *testing.T) {
+	// A typo in SEEK_PROVIDER must be loud for a search that would use the
+	// model, and must not stop commands that never read the setting.
+	t.Setenv(lateOnProviderEnv, "gpu")
+	for _, test := range []struct {
+		name        string
+		lexicalOnly bool
+		subcommand  bool
+		wantErr     bool
+	}{
+		{name: "search", wantErr: true},
+		{name: "lexical only", lexicalOnly: true},
+		{name: "subcommand", subcommand: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := &cobra.Command{Use: "seek"}
+			cmd := root
+			if test.subcommand {
+				cmd = &cobra.Command{Use: "gc"}
+				root.AddCommand(cmd)
+			}
+			var err error
+			if !test.lexicalOnly && commandUsesSemanticModel(cmd) {
+				_, err = lateOnForcedProvider()
+			}
+			if (err != nil) != test.wantErr {
+				t.Fatalf("error = %v, want an error: %t", err, test.wantErr)
 			}
 		})
 	}

@@ -14,17 +14,11 @@ index also requires Universal Ctags on `PATH` or through `CTAGS_COMMAND`.
 Context rewrites require the public seek `-A` and `-C` flags. If those flags are
 not available, only context commands stay unchanged.
 
-The router implementation is wholly inside this plugin. `bin/router.sh` owns
-the hook JSON and `lib/router.awk` owns shell parsing and command adapters. Seek
-does not import, call, or expose the router. The plugin invokes only normal
-public seek commands.
+## Use and limits
 
-## Descriptive searches
-
-The skill recommends a plain description with two or more words. Seek uses
-local model re-ranking by default. One unscoped clean Git worktree, one stable
-plain file, or one stable plain folder also uses semantic retrieval. The router
-preserves mapped search patterns. Call `seek` directly:
+The router rewrites supported static shell searches and leaves other commands
+unchanged. It preserves the source pattern. Call `seek` directly when you want
+to search from a description:
 
 ```sh
 seek 'request authentication flow'
@@ -33,22 +27,24 @@ seek 'request authentication flow'
 See the [seek-search skill](skills/seek-search/SKILL.md#search-from-descriptions)
 for limits and fallback behavior.
 
-The router uses Seek's normal index policy and does not add `--lexical-only`.
-A routed exact search keeps strict BM25 order, but it still builds or updates
-both Zoekt and semantic data for a supported corpus. A first search of a large
-repo can take tens of seconds or longer and use all available compute, several
-GiB of memory, and significant cache space. Call `seek --lexical-only` directly
-when you want the Zoekt-only fast path, or set `SEEK_ROUTER=off` to run the
-original search command.
+Routed commands display at most 20 files and three matches per file. An `rg`
+context search displays one match per file. These ranked results are not
+exhaustive. Direct `seek -n 0` displays every file returned within Seek's search
+bounds, not every possible match.
 
-## Routing contract
+For a rename, a refactor, a count, or a complete reference list, bypass the
+hook:
 
-`bin/router.sh` accepts a hook payload on standard input. It has two results:
+```sh
+SEEK_ROUTER=off grep -rn 'PATTERN' .
+```
 
-| Result | Meaning |
-| --- | --- |
-| `allow` with `updatedInput` | Replace the shell command with seek. |
-| No output | Run the original shell command unchanged. |
+Set `SEEK_ROUTER=off` in the session environment to disable all routing. Routed
+searches use normal Seek defaults and can build both text and meaning-based
+indexes. Call `seek --lexical-only` directly when you want to skip the
+meaning-based index and model work.
+
+## Supported commands
 
 The router handles one static shell call, or one file-name search piped to
 `head` with a positive numeric limit (`-N`, `-n N`, `-nN`, `--lines N`, or
@@ -87,7 +83,7 @@ Each adapter has a separate contract:
 `-i` becomes `case:no`; other routed content searches use `case:yes`. The `fd`
 adapter uses a small ASCII smart-case rule: `A` to `Z` makes the search
 case-sensitive. Seek applies this regex to the full indexed path, returns files
-only, and uses the seek corpus rules. This is ranked navigation, not fd output,
+only, and uses Seek's path rules. This is ranked navigation, not fd output,
 Unicode-case, or regex-parser emulation.
 
 Routed regular expressions use Seek's Zoekt dialect. The router does not read a
@@ -95,9 +91,6 @@ ripgrep configuration file. Use the original command when those rules matter.
 
 When `rg` or `fd` has no path, the rewrite adds `.`. This keeps the search in
 the shell's current directory instead of widening it to the Git worktree root.
-
-The hook keeps every field in the original `tool_input` object and changes only
-`command`.
 
 ## Deliberate pass-through cases
 
@@ -116,40 +109,43 @@ router leaves these forms unchanged:
 Use seek directly for richer ranked searches. Use the original search tool
 when exact shell or regular-expression behavior matters.
 
-## Ranked result limits
-
-Routed commands use at most 20 files and three matches per file. An `rg`
-context search uses one match per file. A final `head` can lower the file cap
-for file-name results. These ranked results are not exhaustive.
-
-For a rename, refactor, count, or complete reference list, bypass the hook:
-
-```sh
-SEEK_ROUTER=off grep -rn 'PATTERN' .
-```
-
-Set `SEEK_ROUTER=off` in the session environment to disable all routing.
-
 ## Fail-open behavior
 
-The wrapper always exits with status 0. Invalid JSON, unsupported commands,
+The hook process always exits with status 0. Invalid JSON, unsupported commands,
 missing dependencies, and parser failures all produce no decision. The host
 then runs the original command.
 
 The hook rewrites a Bash call instead of denying it. The search runs in the
 agent shell, and the tool result is not a permission denial.
 
-## One hook entry
+## Maintainer reference
+
+### Hook entry
+
+The router implementation is inside this plugin. `bin/router.sh` owns the hook
+JSON, and `lib/router.awk` owns shell parsing and command adapters. The plugin
+invokes only public `seek` commands.
+
+`bin/router.sh` accepts a hook payload on standard input. It has two results:
+
+| Result | Meaning |
+| --- | --- |
+| `allow` with `updatedInput` | Replace the shell command with seek. |
+| No output | Run the original shell command unchanged. |
+
+The hook keeps every field in the original `tool_input` object and changes only
+`command`.
 
 The package uses one unconditional `Bash` matcher. Claude Code and Codex both
 load it. The wrapper has a 5-second timeout and exits quickly for commands
 outside its contract. The emitted Seek command runs after the hook and is not
 limited by this timeout.
 
-Codex asks the user to trust plugin hooks before it runs them. Both hosts set
-`CLAUDE_PLUGIN_ROOT`, so the shared hook command can locate the wrapper.
+Codex asks the user to trust plugin hooks before it runs them. It asks again if
+an update changes the hook definition. Both hosts set `CLAUDE_PLUGIN_ROOT`, so
+the shared hook command can locate the wrapper.
 
-## Layout
+### Layout
 
 ```text
 .claude-plugin/plugin.json   Claude Code manifest
@@ -172,7 +168,7 @@ does not add a root `plugin.json`.
 Codex discovers `hooks/hooks.json` through its
 [default plugin path](https://learn.chatgpt.com/docs/hooks).
 
-## Static test procedure
+### Static test procedure
 
 Run this command from the seek repository root:
 
@@ -194,7 +190,7 @@ repository that has no `.codex/hooks.json`. Open `/hooks`, confirm that
 `seek-router` appears under `PreToolUse`, trust it, and run a supported static
 search. The shell transcript shows the emitted `seek` command.
 
-## Tool scope
+### Tool scope
 
 The plugin does not replace built-in `Grep` or `Glob` tools. A hook can change
 arguments for one tool, but it cannot turn that call into a Bash call. Doing so

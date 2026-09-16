@@ -19,6 +19,7 @@ import argparse
 from pathlib import Path
 
 import onnx
+import onnx.shape_inference
 from onnx import TensorProto, helper
 from onnxconverter_common import float16
 
@@ -68,6 +69,18 @@ def make_model(source):
     set_dimension(dimensions[0], BATCH_ROWS)
     set_dimension(dimensions[1], SEQUENCE_TOKENS)
     set_dimension(dimensions[2], EMBEDDING_DIMENSIONS)
+    # The source graph keeps the shapes it was exported with. Pinning the model
+    # interface above does not update them, so symbolic dimensions survive inside
+    # the graph. The Core ML provider tests every node input, not the model
+    # interface, and rejects a node whose input shape is not static, so each
+    # symbolic shape splits the graph into smaller Core ML partitions.
+    #
+    # data_prop carries constant values through Shape, Gather and Concat chains.
+    # Without it, plain inference cannot resolve the attention and rotary shapes
+    # and leaves every one of them symbolic. Measured on the tracked model:
+    # 330 symbolic shapes without data_prop, 171 with it.
+    model.graph.ClearField("value_info")
+    model = onnx.shape_inference.infer_shapes(model, strict_mode=True, data_prop=True)
     model = float16.convert_float_to_float16(
         model,
         keep_io_types=True,

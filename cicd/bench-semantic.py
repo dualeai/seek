@@ -15,6 +15,7 @@ sample count.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -38,7 +39,7 @@ RUNS_HEADER = (
 
 BENCH_EPILOG = """environment:
   SEEK_BENCH_REPO                  required clean Git checkout
-  SEEK_BIN                         existing Seek binary; default builds one
+  SEEK_BIN                         report-only binary; gate mode builds from source
   SEEK_BENCH_HEAD                  expected commit
   SEEK_BENCH_MODEL_SAMPLES         fixed 100,000-row model sample count
   SEEK_BENCH_EXPECTED_FILES        expected indexed file count
@@ -56,6 +57,12 @@ scheduler columns in results/runs.tsv:
   final_limit       adaptive model-call limit at completion
   call_limit        current CPU-derived model-call ceiling
   input_empty_polls non-blocking checks with no prepared batch; count, not time
+
+The performance gate requires a clean Seek source tree. Its commit must match the
+tested binary's Go build record because the model benchmark runs from source. The
+script restores the native tokenizer library from its tracked archive before use.
+It verifies the source, binary, and native asset identities again before it writes
+the summary.
 """
 
 
@@ -94,6 +101,71 @@ def output(command: list[str], *, cwd: Path | None = None) -> str:
         detail = result.stderr.strip() or result.stdout.strip()
         stop(f"command failed: {' '.join(command)}{': ' + detail if detail else ''}")
     return result.stdout
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as source:
+            while block := source.read(1024 * 1024):
+                digest.update(block)
+    except OSError as error:
+        stop(f"cannot hash file {path}: {error}", 1)
+    return digest.hexdigest()
+
+
+def source_identity(path: Path) -> tuple[str, str]:
+    head = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        text=True,
+        capture_output=True,
+    )
+    if head.returncode != 0:
+        return "unavailable", "unavailable\n"
+    status = output(
+        ["git", "-C", str(path), "status", "--porcelain=v1", "--untracked-files=all"]
+    )
+    return head.stdout.strip(), status
+
+
+def binary_build_identity(path: Path) -> tuple[str, str]:
+    result = subprocess.run(
+        ["go", "version", "-m", str(path)],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return "unavailable", "unavailable"
+    settings: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        fields = line.strip().split("\t")
+        if len(fields) != 2 or fields[0] != "build":
+            continue
+        key, separator, value = fields[1].lstrip("-").partition("=")
+        if separator:
+            settings[key] = value
+    return settings.get("vcs.revision", "unavailable"), settings.get(
+        "vcs.modified", "unavailable"
+    )
+
+
+def restore_tokenizer_library(repo_root: Path) -> tuple[Path, str, Path, str]:
+    go_env = output(["go", "env", "GOOS", "GOARCH", "CGO_ENABLED"]).splitlines()
+    if len(go_env) != 3 or go_env[2] != "1":
+        stop("Seek benchmarks require CGO_ENABLED=1")
+    target = f"{go_env[0]}_{go_env[1]}"
+    asset_dir = repo_root / "cmd" / "seek" / f"rerank_tokenizer_assets_{target}"
+    native_dir = repo_root / "cmd" / "seek" / f"rerank_tokenizer_native_{target}"
+    archive = asset_dir / "libtokenizers.tar.gz"
+    library = native_dir / "libtokenizers.a"
+    if not archive.is_file():
+        stop(f"tracked tokenizer archive is missing for {target}: {archive}")
+    status = subprocess.run(
+        ["make", "-B", "tokenizer-native"], cwd=repo_root
+    ).returncode
+    if status != 0 or not library.is_file():
+        stop(f"native tokenizer restore failed for {target}", 1)
+    return archive, sha256_file(archive), library, sha256_file(library)
 
 
 def run_to_files(
@@ -401,13 +473,16 @@ def main() -> int:
     if not repo_text:
         stop("SEEK_BENCH_REPO is required")
     bench_repo = Path(repo_text).expanduser().resolve()
+    seek_text = os.environ.get("SEEK_BIN", "")
+    if gate and seek_text:
+        stop("SEEK_BIN is only valid with --report-only; gate mode builds from source")
     bench_head = os.environ.get("SEEK_BENCH_HEAD") or PROOF_HEAD
     if gate and (
         bench_head != PROOF_HEAD or expected_files != PROOF_FILES or expected_rows != PROOF_ROWS
     ):
         stop("the gate requires the pinned Kubernetes revision and fixed coverage counts")
 
-    for tool in ("du", "git", "go", "ps"):
+    for tool in ("du", "git", "go", "make", "ps"):
         require_tool(tool)
     ctags = shutil.which("universal-ctags") or shutil.which("ctags")
     if ctags is None or "Universal Ctags" not in output([ctags, "--version"]):
@@ -415,25 +490,59 @@ def main() -> int:
     validate_repo(bench_repo, bench_head)
 
     repo_root = Path(__file__).resolve().parent.parent
+    source_commit, source_status = source_identity(repo_root)
+    source_state = (
+        "unavailable"
+        if source_commit == "unavailable"
+        else "dirty" if source_status else "clean"
+    )
+    if gate and (source_commit == "unavailable" or source_status):
+        stop("the performance gate requires a clean Seek source tree")
+    supplied_seek_bin: Path | None = None
+    if seek_text:
+        supplied_seek_bin = Path(seek_text).expanduser().resolve()
+        if not supplied_seek_bin.is_file() or not os.access(
+            supplied_seek_bin, os.X_OK
+        ):
+            stop(f"SEEK_BIN is not an executable file: {supplied_seek_bin}")
+    (
+        tokenizer_archive,
+        tokenizer_archive_sha256,
+        tokenizer_library,
+        tokenizer_library_sha256,
+    ) = restore_tokenizer_library(repo_root)
     workdir = prepare_workdir(args.workdir)
     cache_dir = workdir / "cache"
     results_dir = workdir / "results"
+    go_cache_dir = workdir / "go-build-cache"
     cache_dir.mkdir()
     results_dir.mkdir()
+    go_cache_dir.mkdir()
+    source_env = os.environ | {"GOCACHE": str(go_cache_dir)}
 
-    seek_text = os.environ.get("SEEK_BIN", "")
-    if seek_text:
-        seek_bin = Path(seek_text).expanduser().resolve()
-        if not os.access(seek_bin, os.X_OK):
-            stop(f"SEEK_BIN is not executable: {seek_bin}")
+    if supplied_seek_bin is not None:
+        seek_bin = supplied_seek_bin
     else:
-        require_tool("make")
         seek_bin = workdir / "seek-proof-bin"
         status = subprocess.run(
-            ["make", "build", f"OUTPUT={seek_bin}"], cwd=repo_root
+            ["make", "build", f"OUTPUT={seek_bin}"],
+            cwd=repo_root,
+            env=source_env,
         ).returncode
         if status != 0:
             stop("Seek build failed", 1)
+    binary_sha256 = sha256_file(seek_bin)
+    binary_revision, binary_modified = binary_build_identity(seek_bin)
+    if gate and (
+        binary_revision != source_commit or binary_modified != "false"
+    ):
+        stop(
+            "the performance gate requires a binary built from the clean "
+            f"Seek source commit; binary revision={binary_revision} "
+            f"modified={binary_modified}, source commit={source_commit}"
+        )
+
+    (results_dir / "model-source-status.txt").write_text(source_status)
 
     bench_query = os.environ.get("SEEK_BENCH_QUERY", "request authentication flow")
     model_p50_limit = env_float("SEEK_BENCH_MODEL_P50_SECONDS", 30)
@@ -489,6 +598,7 @@ def main() -> int:
                 "-timeout=45m",
             ],
             cwd=repo_root,
+            env=source_env,
             stdout=log_file,
             stderr=subprocess.STDOUT,
         ).returncode
@@ -716,11 +826,41 @@ def main() -> int:
     median_gpu = statistics.median(all_gpu) if all_gpu else math.nan
     min_memory = min(all_memory, default=math.nan)
 
+    final_source_commit, final_source_status = source_identity(repo_root)
+    final_binary_sha256 = sha256_file(seek_bin)
+    final_tokenizer_archive_sha256 = sha256_file(tokenizer_archive)
+    final_tokenizer_library_sha256 = sha256_file(tokenizer_library)
+    validate_repo(bench_repo, bench_head)
+    if (final_source_commit, final_source_status) != (source_commit, source_status):
+        stop("Seek source changed during the benchmark; results are invalid", 1)
+    if final_binary_sha256 != binary_sha256:
+        stop("Seek binary changed during the benchmark; results are invalid", 1)
+    if final_tokenizer_archive_sha256 != tokenizer_archive_sha256:
+        stop(
+            "tracked tokenizer archive changed during the benchmark; results are invalid",
+            1,
+        )
+    if final_tokenizer_library_sha256 != tokenizer_library_sha256:
+        stop(
+            "native tokenizer library changed during the benchmark; results are invalid",
+            1,
+        )
+
     summary = f"""# Seek cold joined-index proof
 
+- Mode: {"performance gate" if gate else "report only; limits not enforced"}
 - Binary: {seek_bin}
-- Repository: {bench_repo}
-- Commit: {bench_head}
+- Binary SHA-256: {binary_sha256}
+- Binary source commit: {binary_revision}
+- Binary source modified: {binary_modified}
+- Model source: {repo_root}
+- Model source commit: {source_commit}
+- Model source state: {source_state}
+- Isolated Go build cache: {go_cache_dir}
+- Tokenizer archive SHA-256: {tokenizer_archive_sha256}
+- Native tokenizer library SHA-256: {tokenizer_library_sha256}
+- Benchmark repository: {bench_repo}
+- Benchmark repository commit: {bench_head}
 - Samples: {samples}
 - Fixed model samples: {model_samples}
 - Effective CPUs: {effective_cpus}

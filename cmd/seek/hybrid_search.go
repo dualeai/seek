@@ -15,9 +15,9 @@ import (
 )
 
 const (
-	// The proxy search reads more units than the final file limit because one
-	// file can own many units. File collapse removes that size advantage before
-	// the candidate union.
+	// The proxy search reads more units than the final scoring pool because one
+	// file can own many units. The search keeps the best unit for each file before
+	// it builds the candidate union.
 	hybridSemanticUnitLimit  = rerankCandidateLimit * 8
 	hybridBranchQuota        = rerankCandidateLimit / 2
 	hybridMissingLexicalRank = rerankCandidateLimit + 1
@@ -135,6 +135,22 @@ func tryHybridSearch(
 	) {
 		return nil, nil, false, fmt.Errorf("joined generation does not match the current Git state")
 	}
+	_, prepared, err := execution.model.prepareQuery(ctx, rerankPlan.modelQuery)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("prepare joined semantic query: %w", err)
+	}
+	if prepared == nil {
+		return nil, nil, false, fmt.Errorf("prepare joined semantic query: %w", errRerankUnavailable)
+	}
+	if prepared.truncated {
+		files, searchErr := runJoinedStrictSearch(ctx, plan, strictQ, config)
+		if searchErr != nil {
+			return nil, nil, false, searchErr
+		}
+		logRerankExpansionRejection(execution.acceptance, "query truncated")
+		touchPlanUsed(plan)
+		return wrapCorpusResults(plan, files), nil, true, nil
+	}
 	generation, err := openJoinedSemanticGeneration(
 		plan.cacheDir,
 		plan.indexDir,
@@ -163,13 +179,22 @@ func tryHybridSearch(
 	unlockFile(lock)
 	locked = false
 
+	semanticCandidates, err := selectSemanticFileCandidates(generation, semantic.hits)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("select semantic evidence: %w", err)
+	}
+	semanticCandidates = selectHybridSemanticCandidates(
+		plan,
+		strictFiles,
+		relaxedFiles,
+		semanticCandidates,
+	)
 	semanticFiles, err := materializeSemanticCandidates(
 		ctx,
 		plan,
 		*planPaths,
 		state.HeadSHA,
-		generation,
-		semantic.hits,
+		semanticCandidates,
 		max(configuredContextLines(config), searchContextLines),
 	)
 	if err != nil {
@@ -191,6 +216,7 @@ func tryHybridSearch(
 		relaxedFiles,
 		semanticFiles,
 		semantic,
+		execution.acceptance,
 	)
 	if err != nil {
 		return nil, nil, false, err
@@ -263,6 +289,22 @@ func tryHybridFolderSearch(
 	if !joinedGenerationMatches(plan.cacheDir, plan.indexDir, state, state) {
 		return nil, nil, false, fmt.Errorf("joined generation does not match the current folder state")
 	}
+	_, prepared, err := execution.model.prepareQuery(ctx, rerankPlan.modelQuery)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("prepare joined folder semantic query: %w", err)
+	}
+	if prepared == nil {
+		return nil, nil, false, fmt.Errorf("prepare joined folder semantic query: %w", errRerankUnavailable)
+	}
+	if prepared.truncated {
+		files, searchErr := runJoinedStrictSearch(ctx, plan, strictQ, config)
+		if searchErr != nil {
+			return nil, nil, false, searchErr
+		}
+		logRerankExpansionRejection(execution.acceptance, "query truncated")
+		touchPlanUsed(plan)
+		return wrapCorpusResults(plan, files), nil, true, nil
+	}
 	generation, err := openJoinedSemanticGeneration(plan.cacheDir, plan.indexDir, state)
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("open folder semantic generation: %w", err)
@@ -283,11 +325,20 @@ func tryHybridFolderSearch(
 
 	unlockFile(lock)
 	locked = false
+	semanticCandidates, err := selectSemanticFileCandidates(generation, semantic.hits)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("select folder semantic evidence: %w", err)
+	}
+	semanticCandidates = selectHybridSemanticCandidates(
+		plan,
+		strictFiles,
+		relaxedFiles,
+		semanticCandidates,
+	)
 	semanticFiles, err := materializeFolderSemanticCandidates(
 		ctx,
 		plan,
-		generation,
-		semantic.hits,
+		semanticCandidates,
 		max(configuredContextLines(config), searchContextLines),
 	)
 	if err != nil {
@@ -307,6 +358,7 @@ func tryHybridFolderSearch(
 		relaxedFiles,
 		semanticFiles,
 		semantic,
+		execution.acceptance,
 	)
 	if err != nil {
 		return nil, nil, false, err
@@ -388,6 +440,26 @@ func runHybridBranches(
 	return strictFiles, relaxedFiles, semantic, nil
 }
 
+func runJoinedStrictSearch(
+	ctx context.Context,
+	plan corpusPlan,
+	strictQ query.Q,
+	config searchConfig,
+) ([]zoekt.FileMatch, error) {
+	config.contextGitCorpus = plan.kind == corpusKindGit
+	files, err := executeParsedSearchScopedDirs(
+		ctx,
+		searchIndexDirs(plan),
+		strictQ,
+		plan.scope,
+		config,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("joined strict search: %w", err)
+	}
+	return files, nil
+}
+
 func finishHybridSearch(
 	ctx context.Context,
 	plan corpusPlan,
@@ -395,6 +467,7 @@ func finishHybridSearch(
 	relaxedFiles []zoekt.FileMatch,
 	semanticFiles []semanticFileCandidate,
 	semantic hybridSemanticResult,
+	acceptance *rerankAcceptancePolicy,
 ) ([]corpusSearchResult, error) {
 	strictResults := wrapCorpusResults(plan, strictFiles)
 	relaxedResults := wrapCorpusResults(plan, relaxedFiles)
@@ -415,9 +488,26 @@ func finishHybridSearch(
 	if err != nil {
 		return nil, fmt.Errorf("score joined candidates: %w", err)
 	}
-	return fuseRerankCandidates(candidates, scores, strictRanked, relaxedRanked)
+	batch, err := newRerankScoreBatch(semantic.query, scores)
+	if err != nil {
+		return nil, fmt.Errorf("score joined candidates: %w", err)
+	}
+	return fuseRerankCandidates(
+		candidates,
+		batch,
+		strictRanked,
+		relaxedRanked,
+		acceptance,
+	)
 }
 
+// hybridSearchEligible reports whether the joined route can run for this
+// search. It needs one corpus of a supported kind, with no scope, and a model.
+//
+// It also decides, together with the re-rank planner, whether a corpus prepares
+// a vector generation at all: searchExecution.prepareVectors is set from it in
+// runSearchCommand. A shape rejected here can never read a vector, so building
+// one for it is pure cost.
 func hybridSearchEligible(plans []corpusPlan, execution searchExecution) bool {
 	if len(plans) != 1 ||
 		(plans[0].kind != corpusKindGit && plans[0].kind != corpusKindFolder) ||
@@ -440,13 +530,11 @@ func materializeSemanticCandidates(
 	plan corpusPlan,
 	paths gitPaths,
 	head string,
-	generation *semanticGeneration,
-	hits []semanticHit,
+	candidates []semanticFileCandidate,
 	contextLines int,
 ) ([]semanticFileCandidate, error) {
-	candidates, err := selectSemanticFileCandidates(generation, hits)
-	if err != nil || len(candidates) == 0 {
-		return candidates, err
+	if len(candidates) == 0 {
+		return nil, nil
 	}
 
 	args := []string{"ls-tree", "-r", "-z", "--full-tree", "--no-abbrev", head, "--"}
@@ -454,7 +542,7 @@ func materializeSemanticCandidates(
 		args = append(args, candidate.unit.path)
 	}
 	entriesByPath := make(map[string]gitTreeEntry, len(candidates))
-	err = readNativeGitTreeRecords(ctx, paths.RepoDir, args, func(entries []gitTreeEntry) error {
+	err := readNativeGitTreeRecords(ctx, paths.RepoDir, args, func(entries []gitTreeEntry) error {
 		for _, entry := range entries {
 			if _, duplicate := entriesByPath[entry.path]; duplicate {
 				return fmt.Errorf("git returned duplicate path %q", entry.path)
@@ -521,13 +609,11 @@ func materializeSemanticCandidates(
 func materializeFolderSemanticCandidates(
 	ctx context.Context,
 	plan corpusPlan,
-	generation *semanticGeneration,
-	hits []semanticHit,
+	candidates []semanticFileCandidate,
 	contextLines int,
 ) ([]semanticFileCandidate, error) {
-	candidates, err := selectSemanticFileCandidates(generation, hits)
-	if err != nil || len(candidates) == 0 {
-		return candidates, err
+	if len(candidates) == 0 {
+		return nil, nil
 	}
 	for index := range candidates {
 		if err := ctx.Err(); err != nil {
@@ -629,6 +715,54 @@ func selectSemanticFileCandidates(
 		return nil, nil
 	}
 	return candidates, nil
+}
+
+// selectHybridSemanticCandidates keeps only semantic files that can enter the
+// final model batch. It uses file identities first, before source verification
+// reads full files and copies the selected source units.
+func selectHybridSemanticCandidates(
+	plan corpusPlan,
+	strictFiles []zoekt.FileMatch,
+	relaxedFiles []zoekt.FileMatch,
+	semantic []semanticFileCandidate,
+) []semanticFileCandidate {
+	if len(semantic) == 0 {
+		return nil
+	}
+	strictRanked := rankCorpusResultsBM25(wrapCorpusResults(plan, strictFiles), nil)
+	relaxedRanked := rankCorpusResultsBM25(wrapCorpusResults(plan, relaxedFiles), nil)
+	if len(relaxedRanked) > rerankCandidateLimit {
+		relaxedRanked = relaxedRanked[:rerankCandidateLimit]
+	}
+	identities := make([]semanticFileCandidate, len(semantic))
+	for index, candidate := range semantic {
+		identities[index] = semanticFileCandidate{
+			unit: candidate.unit,
+			result: corpusSearchResult{
+				corpusID: plan.id,
+				file:     zoekt.FileMatch{FileName: candidate.unit.path},
+			},
+		}
+	}
+	planned := buildHybridRerankCandidates(strictRanked, relaxedRanked, identities)
+	selected := make(map[corpusResultKey]struct{}, len(planned))
+	for _, candidate := range planned {
+		if !candidate.hasDocument {
+			continue
+		}
+		selected[corpusResultKey{
+			corpusID: candidate.result.corpusID,
+			fileName: candidate.result.file.FileName,
+		}] = struct{}{}
+	}
+	out := make([]semanticFileCandidate, 0, min(len(semantic), len(selected)))
+	for _, candidate := range semantic {
+		key := corpusResultKey{corpusID: plan.id, fileName: candidate.unit.path}
+		if _, ok := selected[key]; ok {
+			out = append(out, candidate)
+		}
+	}
+	return out
 }
 
 func semanticEvidenceFileMatch(

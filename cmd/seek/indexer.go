@@ -26,7 +26,10 @@ const (
 	// stateTmpFile is used for atomic writes of the state file.
 	stateTmpFile = ".state.tmp"
 	// headFile stores the HEAD SHA of the last successful committed index.
-	// It skips committed indexing when HEAD has not changed.
+	// It is a fallback only: the shards record the commit they hold, and
+	// committedShardHead reads it. This file answers when that record cannot
+	// be read, so a damaged shard keeps the previous behaviour instead of
+	// rebuilding on every search.
 	headFile = ".head"
 	// emptyFile stores the state hash for a layer that is known to have
 	// no indexable shards. This prevents a missing/corrupt shard directory
@@ -174,18 +177,26 @@ func deleteEmptyStateFiles(cacheDir string) {
 	_ = os.Remove(filepath.Join(cacheDir, emptyFile+".tmp"))
 }
 
-// deleteStateFiles removes all cached publication state and its tmp files.
-// Clearing .head alongside .state ensures that a failed or drifted
-// indexing cycle forces a full re-index (including committed) on the
-// next invocation, rather than relying on a potentially stale .head
-// to skip committed indexing.
+// deleteStateFiles removes the cached working-tree state and its tmp files, so
+// a failed or drifted indexing cycle re-checks the corpus on the next search.
+//
+// It keeps .git-committed-v1. That file describes the committed family still on
+// disk, which a failed build did not change, and dropping it forced the next
+// commit into a full rebuild. It still clears .head, which costs nothing now
+// that .head is only a fallback.
 func deleteStateFiles(cacheDir string) {
 	_ = os.Remove(filepath.Join(cacheDir, stateFile))
 	_ = os.Remove(filepath.Join(cacheDir, stateFile+".tmp"))
 	_ = os.Remove(filepath.Join(cacheDir, headFile))
 	_ = os.Remove(filepath.Join(cacheDir, headFile+".tmp"))
 	deleteEmptyStateFiles(cacheDir)
-	deleteCommittedGitState(cacheDir)
+	// .git-committed-v1 is kept. It records the delta base of the committed
+	// family that is still on disk, and a failed build does not change that
+	// family. Deleting it forced the next commit to rebuild in full.
+	//
+	// A stale record cannot produce a wrong answer: prepareNativeGitDelta
+	// compares it with the commit read from the shard itself
+	// (git_native_delta.go:124-127) and rejects a delta when the two disagree.
 }
 
 // indexParallelism returns the number of parallel indexing workers.
@@ -357,8 +368,10 @@ func runIndexingWithCacheExecution(
 	noHeadArtifacts := state.HeadSHA == "no-head" && sc.hasMember(familyCommitted)
 	committedPresent := committedSnapshotReady(cacheDir, indexDir, state, sc)
 	semanticSource := state.HeadSHA
-	semanticRequired := execution.policy.semanticEnabled() &&
-		execution.model != nil && state.HeadSHA != "no-head"
+	// Prepare vectors only when a route can read them. The model itself stays
+	// available for re-ranking lexical candidates. runSearchCommand documents
+	// which searches this covers.
+	semanticRequired := execution.vectorsWanted(state.HeadSHA)
 	joinedReady := !semanticRequired || joinedGenerationMatches(
 		cacheDir,
 		indexDir,
@@ -377,10 +390,11 @@ func runIndexingWithCacheExecution(
 	}
 
 	hasDirty := len(state.Files) > 0
-	// Rebuild when HEAD changed or the committed family no longer matches its
-	// manifest. The .head file can remain after shard damage.
+	// Rebuild when the published shards hold another commit, or the committed
+	// family no longer matches its manifest. publishedCommittedHead asks the
+	// shards rather than the sidecar; committedShardHead documents why.
 	needCommitted := state.HeadSHA != "no-head" &&
-		(state.HeadSHA != readHeadFile(cacheDir) || !committedIntact)
+		(publishedCommittedHead(cacheDir, sc) != state.HeadSHA || !committedIntact)
 	clearCommitted := noHeadArtifacts
 	semanticPresent := semanticRequired && semanticGenerationPresent(indexDir, semanticSource)
 	needSemantic := semanticRequired && !semanticPresent
@@ -461,7 +475,14 @@ func runIndexingWithCacheExecution(
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		slog.Debug("Semantic index build failed; keeping lexical search", "error", semanticErr)
+		slog.Debug(
+			"Semantic index build failed; keeping lexical search",
+			"provider", semanticProviderName(),
+			"error", semanticErr,
+		)
+		if errors.Is(semanticErr, errDegenerateSemanticVector) {
+			rejectLateOnAcceleratedProvider(semanticErr.Error())
+		}
 	}
 	// HEAD must still equal the captured value before publication. This check
 	// also covers an unborn snapshot that had no committed Builder work.
@@ -596,10 +617,23 @@ func runIndexingWithCacheExecution(
 			}
 			if activationErr != nil {
 				removeJoinedGeneration(cacheDir)
-				slog.Debug("Semantic index activation failed; keeping lexical search", "error", activationErr)
+				slog.Debug(
+					"Semantic index activation failed; keeping lexical search",
+					"provider", semanticProviderName(),
+					"error", activationErr,
+				)
 			}
 		}
 	} else {
+		// The working tree moved during the build, so the state and the
+		// uncommitted shards cannot be trusted. The committed vectors can:
+		// validateCommittedBuildHead already proved HEAD held, the generation is
+		// keyed by that commit, and it never reads the working tree. Publish it
+		// unbound so the next clean search binds it instead of embedding the
+		// same commit again. It stays unreachable until something binds it.
+		if semanticRequired && semanticBuilt {
+			keepDriftedSemanticGeneration(cacheDir, indexDir, semanticSource, semanticStaging)
+		}
 		deleteStateFiles(cacheDir)
 		slog.Warn("Index may be stale, will re-index on next search")
 	}
@@ -664,15 +698,47 @@ func buildCommittedGitStage(
 	}, nil
 }
 
+// publishedCommittedHead returns the commit the published committed family
+// holds, as the shards themselves record it. See committedShardHead for why the
+// shards and not the sidecar answer this.
+//
+// It falls back to the .head sidecar when no shard can answer, which covers a
+// corpus that has not published yet and a shard whose metadata cannot be read.
+func publishedCommittedHead(cacheDir string, scan familyScan) string {
+	if head, known := committedShardHead(scan); known {
+		return head
+	}
+	return readHeadFile(cacheDir)
+}
+
+// keepDriftedSemanticGeneration publishes a finished committed generation that
+// a drifted build would otherwise discard. A failure here costs only the
+// rebuild it was trying to save, so it never fails the search.
+func keepDriftedSemanticGeneration(cacheDir, indexDir, source, stagingDir string) {
+	if err := publishUnboundSemanticGeneration(cacheDir, indexDir, source, stagingDir); err != nil {
+		slog.Debug("Could not keep the semantic generation after drift", "error", err)
+	}
+}
+
 // committedSnapshotReady reports whether scan has enough committed state for
 // the caller's separate cache-state and full-manifest checks. A valid manifest
 // can describe an empty committed family beside live dirty shards, so a
 // committed shard is not always required.
+//
+// When a committed shard is present, the answer comes from the commit that
+// shard records, not from the .head sidecar. See committedShardHead.
 func committedSnapshotReady(cacheDir, indexDir string, state repoState, scan familyScan) bool {
 	if state.HeadSHA == "no-head" {
 		return !scan.hasMember(familyCommitted)
 	}
 	if scan.hasCommittedShard() {
+		// This used to return true on presence alone, which said nothing about
+		// which commit the shards hold.
+		if shardHead, known := committedShardHead(scan); known {
+			return shardHead == state.HeadSHA
+		}
+		// Unknown, so keep the answer this corpus already gives. Reporting
+		// "stale" here would rebuild on every read of an unreadable shard.
 		return true
 	}
 	return readHeadFile(cacheDir) == state.HeadSHA && scan.matchesManifestFamily(indexDir, familyCommitted)

@@ -37,9 +37,11 @@ func TestSemanticCPUParallelismProvidesCapacityForEffectiveCPU(t *testing.T) {
 }
 
 type countingSemanticScorer struct {
-	prepareCalls atomic.Int32
-	scoreCalls   atomic.Int32
-	closeCalls   atomic.Int32
+	prepareCalls   atomic.Int32
+	scoreCalls     atomic.Int32
+	closeCalls     atomic.Int32
+	scoreMask      []bool
+	queryTruncated bool
 }
 
 func (*countingSemanticScorer) PackSemanticUnits(
@@ -82,7 +84,15 @@ func (scorer *countingSemanticScorer) PrepareSemanticQuery(
 	query string,
 ) (*semanticQueryEmbedding, error) {
 	scorer.prepareCalls.Add(1)
-	return &semanticQueryEmbedding{modelQuery: query}, nil
+	scoreMask := append([]bool(nil), scorer.scoreMask...)
+	if len(scoreMask) == 0 {
+		scoreMask = []bool{true}
+	}
+	return &semanticQueryEmbedding{
+		modelQuery: query,
+		scoreMask:  scoreMask,
+		truncated:  scorer.queryTruncated,
+	}, nil
 }
 
 func (scorer *countingSemanticScorer) ScoresWithSemanticQuery(
@@ -102,7 +112,10 @@ func (scorer *countingSemanticScorer) Close() error {
 func (*countingSemanticScorer) SemanticCallCPUs(context.Context) int { return 1 }
 
 func TestSemanticModelFutureReusesOneQueryForRetrievalAndRerank(t *testing.T) {
-	scorer := &countingSemanticScorer{}
+	scorer := &countingSemanticScorer{
+		scoreMask:      []bool{true, false, true},
+		queryTruncated: true,
+	}
 	var factoryCalls atomic.Int32
 	future := newSemanticModelFuture(func(context.Context) (semanticModel, error) {
 		factoryCalls.Add(1)
@@ -127,12 +140,16 @@ func TestSemanticModelFutureReusesOneQueryForRetrievalAndRerank(t *testing.T) {
 	}
 	wait.Wait()
 
-	if _, err := future.scores(
+	batch, err := future.scores(
 		t.Context(),
 		"find request handler",
 		[]rerankDocument{{Text: "handler"}},
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if batch.activeQueryTokens != 2 || !batch.queryTruncated || len(batch.values) != 1 {
+		t.Fatalf("score metadata=%+v", batch)
 	}
 	if err := future.Close(); err != nil {
 		t.Fatal(err)

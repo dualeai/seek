@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -81,7 +83,6 @@ func TestLateOnTokenizerMatchesPyLate(t *testing.T) {
 	if got := mustEncodeLateOnText(t, tokenizer, probe); !reflect.DeepEqual(got, want) {
 		t.Fatalf("probe IDs = %v, want %v", got, want)
 	}
-
 	upper := mustEncodeLateOnText(t, tokenizer, "[Q] MyHTTPHandler")
 	lower := mustEncodeLateOnText(t, tokenizer, "[Q] myhttphandler")
 	if reflect.DeepEqual(upper, lower) {
@@ -100,6 +101,73 @@ func TestLateOnTokenizerMatchesPyLate(t *testing.T) {
 	)
 	if len(long) != lateOnSequenceLength || long[len(long)-1] != lateOnSEPTokenID {
 		t.Fatalf("truncated sequence has length %d and final ID %d", len(long), long[len(long)-1])
+	}
+}
+
+func TestLateOnPrepareSemanticQueryReportsTruncation(t *testing.T) {
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	scorer, err := newLateOnSemanticModel(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := scorer.Close(); err != nil {
+			t.Errorf("close scorer: %v", err)
+		}
+	})
+
+	for _, test := range []struct {
+		name      string
+		query     string
+		truncated bool
+	}{
+		{name: "short", query: "request authentication flow"},
+		{name: "long", query: strings.Repeat("identifier ", 300), truncated: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			prepared, err := scorer.PrepareSemanticQuery(t.Context(), test.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if prepared.modelQuery != test.query || prepared.truncated != test.truncated {
+				t.Fatalf(
+					"prepared query text match=%t truncated=%t, want %t",
+					prepared.modelQuery == test.query,
+					prepared.truncated,
+					test.truncated,
+				)
+			}
+			active := 0
+			for _, keep := range prepared.scoreMask {
+				if keep {
+					active++
+				}
+			}
+			if active == 0 {
+				t.Fatal("prepared query has no active score tokens")
+			}
+		})
+	}
+}
+
+func TestRerankCertainTermBoundAgreesWithTokenizer(t *testing.T) {
+	tokenizer, _ := openLateOnTestTokenizer(t)
+	query := strings.TrimSpace(strings.Repeat(
+		"identifier ",
+		rerankQueryMaximumUntruncatedTerms+1,
+	))
+	if !rerankQueryGuaranteedTruncated(query) {
+		t.Fatal("term preflight did not detect certain truncation")
+	}
+	_, truncated, err := encodeLateOnTextWithTruncation(
+		tokenizer,
+		lateOnQueryPrefix+query,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !truncated {
+		t.Fatal("tokenizer did not truncate a query above the certain term bound")
 	}
 }
 
@@ -506,7 +574,33 @@ func TestLateOnRuntimeExtractHelper(t *testing.T) {
 }
 
 func TestLateOnInferenceMatchesReferenceScores(t *testing.T) {
-	skipLateOnReferenceScoreKnownIssue(t)
+	// The automatic case gates CI: it exercises whatever the run-time provider
+	// check selected on this host, which is what users get.
+	t.Run("selected", func(t *testing.T) { lateOnReferenceScoreCheck(t, true) })
+	t.Run(lateOnCPUProviderName, func(t *testing.T) {
+		t.Setenv(lateOnProviderEnv, lateOnCPUProviderName)
+		lateOnReferenceScoreCheck(t, true)
+	})
+	if lateOnAcceleratedProviderName == lateOnCPUProviderName {
+		return
+	}
+	// Pinning the accelerated provider bypasses the run-time check, so this case
+	// records its scores without gating. On a host where that provider is wrong,
+	// the automatic case above still passes because the check demotes it, and the
+	// deltas recorded here say how wrong it is.
+	t.Run(lateOnAcceleratedProviderName, func(t *testing.T) {
+		t.Setenv(lateOnProviderEnv, lateOnAcceleratedProviderName)
+		lateOnReferenceScoreCheck(t, false)
+	})
+}
+
+// lateOnReferenceScoreCheck holds the scores this project calibrated its
+// acceptance thresholds against. Every provider must reproduce them.
+//
+// A provider that passes the run-time check in verifyLateOnAcceleratedProvider
+// but fails here means that check is too permissive. That is the signal to
+// tighten lateOnProbeAgreementLimit.
+func lateOnReferenceScoreCheck(t *testing.T, gate bool) {
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
 	scorer, err := newLateOnSemanticModel(context.Background())
 	if err != nil {
@@ -554,33 +648,25 @@ func TestLateOnInferenceMatchesReferenceScores(t *testing.T) {
 	if len(scores) != len(want) {
 		t.Fatalf("scores = %v, want %d scores", scores, len(want))
 	}
+	t.Logf("provider=%s scores=%v", semanticProviderName(), scores)
 	for i := range want {
 		if math.Abs(float64(scores[i]-want[i])) > 0.01 {
+			if !gate {
+				t.Logf("recorded only: scores = %v, want %v", scores, want)
+				return
+			}
 			t.Errorf("scores = %v, want %v", scores, want)
 			break
 		}
 	}
 	for i := range scores {
 		if i > 0 && scores[i-1] <= scores[i] {
+			if !gate {
+				t.Logf("recorded only: rank order = %v", scores)
+				return
+			}
 			t.Errorf("rank order = %v, want document order", scores)
 		}
-	}
-}
-
-func skipLateOnReferenceScoreKnownIssue(t *testing.T) {
-	t.Helper()
-	// ONNX Runtime CoreML returns incorrect FP16 scores on macOS 15 ARM64.
-	// TODO: Remove this skip after ONNX Runtime fixes
-	// https://github.com/microsoft/onnxruntime/issues/32569.
-	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
-		return
-	}
-	version, err := exec.Command("sw_vers", "-productVersion").Output()
-	if err != nil {
-		return
-	}
-	if strings.HasPrefix(strings.TrimSpace(string(version)), "15.") {
-		t.Skip("macOS 15 ARM64 Core ML score parity: https://github.com/microsoft/onnxruntime/issues/32569")
 	}
 }
 
@@ -751,7 +837,7 @@ func TestLateOnModelCanReopen(t *testing.T) {
 	}
 }
 
-func TestCLIProcessLateOnReranks(t *testing.T) {
+func TestCLIProcessLateOnStrictEvidenceContract(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
 	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
@@ -783,5 +869,379 @@ func TestCLIProcessLateOnReranks(t *testing.T) {
 		!strings.Contains(reranked.stdout, "## alpha.go") ||
 		!strings.Contains(reranked.stdout, "## beta.go") {
 		t.Fatalf("real backend did not publish the OR-only candidates: %+v", reranked)
+	}
+}
+
+func TestCLIProcessLateOnAcceptanceBoundary(t *testing.T) {
+	requireTools(t)
+	folder := t.TempDir()
+	writeFileAt(
+		t,
+		folder,
+		"auth.go",
+		"package sample\nfunc authenticateRequest(request Request) error { return validateToken(request.Token) }\n",
+	)
+	writeFileAt(
+		t,
+		folder,
+		"colors.go",
+		"package sample\nfunc terminalColorCode(name string) int { return ansiColors[name] }\n",
+	)
+	cache := t.TempDir()
+	const nonexistent = "zqxvplor blingwazzle nyoomphastic"
+
+	rejected := runCLIProcessWithCache(
+		t,
+		cache,
+		t.TempDir(),
+		[]string{nonexistent, folder},
+		nil,
+	)
+	if rejected.code != 1 || rejected.stdout != "" || rejected.stderr != "" {
+		t.Fatalf("nonexistent query=%+v, want silent no match", rejected)
+	}
+
+	verbose := runCLIProcessWithCache(
+		t,
+		cache,
+		t.TempDir(),
+		[]string{"--verbose", nonexistent, folder},
+		nil,
+	)
+	if verbose.code != 1 || verbose.stdout != "" {
+		t.Fatalf("verbose nonexistent query=%+v, want no match", verbose)
+	}
+	for _, want := range []string{`msg="Rejected model expansion"`, "route=joined"} {
+		if !strings.Contains(verbose.stderr, want) {
+			t.Fatalf("verbose rejection lacks %q:\n%s", want, verbose.stderr)
+		}
+	}
+	for _, want := range []string{`reason="score not above minimum"`, "minimum_mean_max_sim="} {
+		if !strings.Contains(verbose.stderr, want) {
+			t.Fatalf("score rejection lacks %q:\n%s", want, verbose.stderr)
+		}
+	}
+
+	const supportedQuery = "request authentication flow"
+	lexical := runCLIProcessWithCache(
+		t,
+		cache,
+		t.TempDir(),
+		[]string{"--lexical-only", supportedQuery, folder},
+		nil,
+	)
+	if lexical.code != 1 || lexical.stdout != "" || lexical.stderr != "" {
+		t.Fatalf("positive lexical control=%+v, want silent no match", lexical)
+	}
+
+	accepted := runCLIProcessWithCache(
+		t,
+		cache,
+		t.TempDir(),
+		[]string{"--verbose", supportedQuery, folder},
+		nil,
+	)
+	if accepted.code != 0 ||
+		!strings.Contains(accepted.stdout, "## auth.go") {
+		t.Fatalf("accepted query=%+v", accepted)
+	}
+	for _, want := range []string{
+		`msg="Accepted model expansion"`,
+		"route=joined",
+		`reason="score above minimum"`,
+	} {
+		if !strings.Contains(accepted.stderr, want) {
+			t.Fatalf("acceptance lacks %q:\n%s", want, accepted.stderr)
+		}
+	}
+}
+
+func TestLateOnMaxSimRejectsZeroDocumentVectors(t *testing.T) {
+	query := make([]float32, lateOnSequenceLength*semanticEmbeddingDimensions)
+	query[0] = 1
+	queryMask := make([]bool, lateOnSequenceLength)
+	queryMask[0] = true
+	documents := make([]float32, lateOnSequenceLength*semanticEmbeddingDimensions)
+	documentMask := make([]bool, lateOnSequenceLength)
+	documentMask[0] = true
+	documentMask[1] = true
+	if _, err := lateOnMaxSimPrepared(query, queryMask, documents, [][]bool{documentMask}); err == nil {
+		t.Fatal("all-zero document scored instead of failing")
+	}
+	documents[semanticEmbeddingDimensions] = 1
+	scores, err := lateOnMaxSimPrepared(query, queryMask, documents, [][]bool{documentMask})
+	if err != nil {
+		t.Fatalf("document with one usable token failed: %v", err)
+	}
+	if len(scores) != 1 {
+		t.Fatalf("scores = %v, want one score", scores)
+	}
+}
+
+func TestPrepareSemanticQueryReturnsUsableTokens(t *testing.T) {
+	// PrepareSemanticQuery guards its own output, because a degenerate query row
+	// gives every candidate a finite score of zero that no later guard can tell
+	// apart from a genuine miss. Assert the invariant on real model output, so a
+	// provider that starts returning zero rows fails here.
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	model, err := newLateOnSemanticModel(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := model.Close(); err != nil {
+			t.Errorf("close model: %v", err)
+		}
+	})
+	prepared, err := model.PrepareSemanticQuery(t.Context(), "rank search results before the output limit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !lateOnRowHasUsableToken(prepared.tokens, 0, prepared.scoreMask) {
+		t.Fatal("PrepareSemanticQuery returned a query row with no usable token")
+	}
+	// An empty query still produces the model prefix tokens, so it must also
+	// survive the guard rather than failing the search.
+	if _, err := model.PrepareSemanticQuery(t.Context(), ""); err != nil {
+		t.Fatalf("an empty query failed the guard: %v", err)
+	}
+}
+
+func TestLateOnRowUsableTokenScansEveryMaskedToken(t *testing.T) {
+	documents := make([]float32, 2*lateOnSequenceLength*semanticEmbeddingDimensions)
+	mask := make([]bool, lateOnSequenceLength)
+	mask[0] = true
+	mask[1] = true
+	// Row 0: a non-finite first token must not end the scan, because a later
+	// token can still carry the row.
+	documents[0] = float32(math.NaN())
+	documents[semanticEmbeddingDimensions] = 1
+	if !lateOnRowHasUsableToken(documents, 0, mask) {
+		t.Fatal("a non-finite first token ended the scan")
+	}
+	// Row 1 is untouched, so it stays unusable. This also proves the row offset
+	// is applied, because row 0 is usable.
+	if lateOnRowHasUsableToken(documents, 1, mask) {
+		t.Fatal("an empty second row reported a usable token")
+	}
+	// A masked token outside the mask must not rescue the row.
+	documents[lateOnSequenceLength*semanticEmbeddingDimensions+5*semanticEmbeddingDimensions] = 1
+	if lateOnRowHasUsableToken(documents, 1, mask) {
+		t.Fatal("an unmasked token rescued the row")
+	}
+}
+
+func TestLateOnForcedProviderParsesEnvironment(t *testing.T) {
+	t.Setenv(lateOnProviderEnv, "")
+	if forced, err := lateOnForcedProvider(); forced != "" || err != nil {
+		t.Fatalf("empty=%q err=%v, want automatic", forced, err)
+	}
+	t.Setenv(lateOnProviderEnv, "auto")
+	if forced, err := lateOnForcedProvider(); forced != "" || err != nil {
+		t.Fatalf("auto=%q err=%v, want automatic", forced, err)
+	}
+	t.Setenv(lateOnProviderEnv, " "+lateOnCPUProviderName+" ")
+	if forced, err := lateOnForcedProvider(); forced != lateOnCPUProviderName || err != nil {
+		t.Fatalf("cpu=%q err=%v", forced, err)
+	}
+	t.Setenv(lateOnProviderEnv, lateOnAcceleratedProviderName)
+	if forced, err := lateOnForcedProvider(); forced != lateOnAcceleratedProviderName || err != nil {
+		t.Fatalf("accelerated=%q err=%v", forced, err)
+	}
+	t.Setenv(lateOnProviderEnv, "CPU")
+	if forced, err := lateOnForcedProvider(); forced != lateOnCPUProviderName || err != nil {
+		t.Fatalf("mixed case=%q err=%v", forced, err)
+	}
+	t.Setenv(lateOnProviderEnv, "gpu")
+	err := func() error { _, err := lateOnForcedProvider(); return err }()
+	if err == nil {
+		t.Fatal("unknown provider did not fail")
+	}
+	// The message must name only the providers this build can select, and must
+	// not double-quote them.
+	message := err.Error()
+	if strings.Contains(message, `\"`) {
+		t.Fatalf("message escapes its own quotes: %s", message)
+	}
+	if !strings.Contains(message, strconv.Quote(lateOnCPUProviderName)) ||
+		!strings.Contains(message, strconv.Quote("auto")) {
+		t.Fatalf("message does not list the accepted values: %s", message)
+	}
+	if !lateOnProviderHasAccelerator && strings.Count(message, strconv.Quote(lateOnCPUProviderName)) != 1 {
+		t.Fatalf("message repeats one provider on a single-provider build: %s", message)
+	}
+}
+
+func TestLateOnProbeRowsCoverActiveTokens(t *testing.T) {
+	ids, attention := lateOnProbeRows()
+	if len(ids) != semanticModelBatchRows*lateOnSequenceLength || len(attention) != len(ids) {
+		t.Fatalf("ids=%d attention=%d, want %d", len(ids), len(attention), semanticModelBatchRows*lateOnSequenceLength)
+	}
+	// Stability is the property the probe depends on: both providers must be
+	// given the same input, and a cached verdict must describe the same input a
+	// later process will use.
+	again, againAttention := lateOnProbeRows()
+	if !reflect.DeepEqual(ids, again) || !reflect.DeepEqual(attention, againAttention) {
+		t.Fatal("the probe row is not stable between calls")
+	}
+	// Every attended token must be one the model can embed, and nothing beyond
+	// them may be attended, or the two providers would be compared over padding.
+	for row := range semanticModelBatchRows {
+		base := row * lateOnSequenceLength
+		for token := range lateOnSequenceLength {
+			attended := attention[base+token] == 1
+			if attended != (token < lateOnProbeActiveTokens) {
+				t.Fatalf("row %d attention[%d]=%d outside the active span", row, token, attention[base+token])
+			}
+			if !attended && ids[base+token] != lateOnPadTokenID {
+				t.Fatalf("row %d ids[%d]=%d is not padding", row, token, ids[base+token])
+			}
+			if attended && ids[base+token] == lateOnPadTokenID {
+				t.Fatalf("row %d ids[%d] is padding inside the active span", row, token)
+			}
+		}
+	}
+	// The batch must carry different content in each row. Identical rows would
+	// pay for a full batch of inference and sample one row of it.
+	distinct := map[string]bool{}
+	for row := range semanticModelBatchRows {
+		base := row * lateOnSequenceLength
+		distinct[fmt.Sprint(ids[base:base+lateOnProbeActiveTokens])] = true
+	}
+	if len(distinct) != semanticModelBatchRows {
+		t.Fatalf("the probe batch holds %d distinct rows, want %d", len(distinct), semanticModelBatchRows)
+	}
+}
+
+func TestLateOnOutputsAgreeSeparatesFaultFromNoise(t *testing.T) {
+	batch := semanticModelBatchRows * lateOnSequenceLength * semanticEmbeddingDimensions
+	reference := make([]float32, batch)
+	for row := range semanticModelBatchRows {
+		for token := range lateOnProbeActiveTokens {
+			offset := (row*lateOnSequenceLength + token) * semanticEmbeddingDimensions
+			for dimension := range semanticEmbeddingDimensions {
+				reference[offset+dimension] = float32(1 + (row+token+dimension)%7)
+			}
+		}
+	}
+	if agree, why := lateOnOutputsAgree(reference, reference); !agree {
+		t.Fatalf("identical outputs disagreed: %s", why)
+	}
+
+	// A uniform shrink keeps every cosine at 1 but depresses every score by the
+	// same factor, which is the shape of the macOS 15 fault. It must be rejected.
+	scaled := make([]float32, batch)
+	for index, value := range reference {
+		scaled[index] = value * 0.87
+	}
+	if agree, _ := lateOnOutputsAgree(scaled, reference); agree {
+		t.Fatal("a uniform 13 percent shrink agreed")
+	}
+
+	// A shrink inside the measured provider spread must still agree.
+	nudged := make([]float32, batch)
+	for index, value := range reference {
+		nudged[index] = value * 0.999
+	}
+	if agree, why := lateOnOutputsAgree(nudged, reference); !agree {
+		t.Fatalf("a 0.1 percent scale disagreed: %s", why)
+	}
+
+	// A zero token vector is the shape the macOS 15 fault takes.
+	// Put the fault in the last row, so a check that inspects only the first row
+	// fails this test.
+	lastRow := (semanticModelBatchRows - 1) * lateOnSequenceLength
+	zeroed := append([]float32(nil), reference...)
+	for dimension := range semanticEmbeddingDimensions {
+		zeroed[(lastRow+35)*semanticEmbeddingDimensions+dimension] = 0
+	}
+	if agree, _ := lateOnOutputsAgree(zeroed, reference); agree {
+		t.Fatal("a zero token vector agreed")
+	}
+
+	// A direction change past the limit must be rejected.
+	turned := append([]float32(nil), reference...)
+	turnedAt := (lastRow + 7) * semanticEmbeddingDimensions
+	turned[turnedAt] = -turned[turnedAt]
+	if agree, _ := lateOnOutputsAgree(turned, reference); agree {
+		t.Fatal("a turned token agreed")
+	}
+
+	// Noise well inside the measured provider spread must be accepted.
+	noisy := append([]float32(nil), reference...)
+	for index := range noisy {
+		noisy[index] *= 1 + float32(index%3)*1e-6
+	}
+	if agree, why := lateOnOutputsAgree(noisy, reference); !agree {
+		t.Fatalf("measured-scale noise disagreed: %s", why)
+	}
+
+	if agree, _ := lateOnOutputsAgree(reference[:10], reference); agree {
+		t.Fatal("a short output agreed")
+	}
+}
+
+func TestSemanticProviderNameReportsSelectionState(t *testing.T) {
+	// The fallback logs print this value, so it must never read "unset" while an
+	// encoder is being built: that is the moment provider selection itself can
+	// fail, and a record naming no provider is least useful there. Arrange each
+	// state the encoder stores and assert what a log would show.
+	previous := lateOnSelectedProvider.Load()
+	t.Cleanup(func() {
+		if previous != nil {
+			lateOnSelectedProvider.Store(previous)
+		}
+	})
+	lateOnSelectedProvider.Store("selecting:" + lateOnAcceleratedProviderName)
+	if got := semanticProviderName(); got != "selecting:"+lateOnAcceleratedProviderName {
+		t.Fatalf("provider name during selection = %q", got)
+	}
+	lateOnSelectedProvider.Store(lateOnCPUProviderName)
+	if got := semanticProviderName(); got != lateOnCPUProviderName {
+		t.Fatalf("provider name after selection = %q", got)
+	}
+
+	// A real construction must leave a settled provider, not an intent.
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	model, err := newLateOnSemanticModel(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := model.Close(); err != nil {
+			t.Errorf("close model: %v", err)
+		}
+	})
+	if _, err := model.PrepareSemanticQuery(t.Context(), "rank results before the output limit"); err != nil {
+		t.Fatal(err)
+	}
+	name := semanticProviderName()
+	if strings.HasPrefix(name, "selecting:") {
+		t.Fatalf("provider name is still an intent after a successful call: %s", name)
+	}
+	if name != lateOnCPUProviderName && name != lateOnAcceleratedProviderName {
+		t.Fatalf("provider name = %q, want a known provider", name)
+	}
+}
+
+func TestDegenerateScoringErrorCarriesTheProviderSentinel(t *testing.T) {
+	// The search path must be able to tell a provider fault from any other
+	// scoring failure, or a wrong provider on an already-built index would drop
+	// every re-rank to BM25 and never record itself.
+	query := make([]float32, lateOnSequenceLength*semanticEmbeddingDimensions)
+	query[0] = 1
+	queryMask := make([]bool, lateOnSequenceLength)
+	queryMask[0] = true
+	documents := make([]float32, lateOnSequenceLength*semanticEmbeddingDimensions)
+	documentMask := make([]bool, lateOnSequenceLength)
+	documentMask[0] = true
+	_, err := lateOnMaxSimPrepared(query, queryMask, documents, [][]bool{documentMask})
+	if !errors.Is(err, errDegenerateSemanticVector) {
+		t.Fatalf("error = %v, want the degenerate-output sentinel", err)
+	}
+	// A shape failure is not a provider fault and must not be reported as one.
+	_, shapeErr := lateOnMaxSimPrepared(query[:10], queryMask, documents, [][]bool{documentMask})
+	if errors.Is(shapeErr, errDegenerateSemanticVector) {
+		t.Fatalf("a shape error claimed a provider fault: %v", shapeErr)
 	}
 }

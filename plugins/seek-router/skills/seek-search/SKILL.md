@@ -1,6 +1,6 @@
 ---
 name: seek-search
-description: Search code with seek, a local relevance-ranked search with lexical retrieval, default code re-ranking, eligible semantic retrieval, and ctags symbols. Use it for ranked navigation of definitions, callers, configuration, and unfamiliar code. Use an exhaustive tool for renames, counts, and complete result lists.
+description: Search code with seek, a local ranked search for exact queries, descriptions, and symbol definitions. Use it to find definitions, callers, configuration, and unfamiliar code. Use an exhaustive tool for renames, counts, and complete result lists.
 ---
 
 # Search code with seek
@@ -14,29 +14,29 @@ seek [flags] '<query>' [path...]
 
 ## Query filters
 
-All filters go inside ONE quoted argument. Paths come after it.
+Put all filters in one quoted argument. Put paths after it.
 
 | Filter | Finds |
 | --- | --- |
 | `sym:Name` | definitions - functions, classes, methods (ctags) |
 | `content:REGEX` | a regex match in file content |
 | `file:path` | paths matching a regular expression |
-| `-file:path` | paths NOT matching a regular expression |
+| `-file:path` | paths that do not match a regular expression |
 | `lang:go` | one language |
 | `type:file` | filenames only, no content |
 
-The strict lexical branch matches bare words independently and combines them
-with AND. A final reranked result can lack one or both words.
+Before model ranking, a query with bare words requires every word. A final
+model-ranked result can lack one or more query words.
 
 ## Flags
 
 | Flag | Effect |
 | --- | --- |
-| `-n N` | display at most N files (0 = no display limit) |
-| `-m N` | display at most N matches per file (0 = no display limit) |
+| `-n N` | display at most N files (0 = all files returned within search bounds) |
+| `-m N` | display at most N matches per file (0 = all returned matches) |
 | `-A N` | N lines after each match (0-512) |
 | `-C N` | N lines before and after each match (0-512) |
-| `--lexical-only` | skip semantic indexing, search, and model re-ranking |
+| `--lexical-only` | skip meaning-based indexing, search, and model ranking |
 
 Flags go before the query. Do not combine `-A` and `-C`.
 
@@ -46,7 +46,7 @@ Flags go before the query. Do not combine `-A` and `-C`.
 seek 'sym:executeParsedSearchScoped'        # where is this defined
 seek 'sym:Index file:index -file:test'      # definitions, excluding tests
 seek 'content:func.*Test lang:go -file:bench'
-seek 'type:file config'                     # config-ish filenames
+seek 'type:file config'                     # configuration filenames
 seek 'TODO' ./cmd ./docs                    # limit to two subtrees
 seek -n 5 'retry backoff'                   # top 5 files only
 seek -n 5 -m 1 -A 20 'sym:executeParsedSearchScoped' ./cmd/seek
@@ -63,57 +63,38 @@ seek -n 5 -m 2 -C 1 'validate search query syntax'
 seek 'find request parser lang:go -file:_test\.go$'
 ```
 
-Seek collects up to 20 files from strict lexical, relaxed lexical, and semantic
-retrieval. The model scores each path with its best nearby code. Seek combines
-the lexical and model orders with weighted reciprocal rank fusion; lexical rank
-has twice the model weight. Results can have none of the query words.
+Plain queries with two or more words can use the bundled local model. One clean
+Git worktree, one file, or one folder can also add matches based on code meaning.
+Other searches can still use the model to rank text matches.
 
-Plain queries with two or more words use model re-ranking by default. One
-unscoped clean Git worktree, one stable plain file, or one stable plain folder
-also uses semantic retrieval. Scoped or dirty Git and multi-corpus searches can
-use model re-ranking when enough candidates exist, but not semantic retrieval.
-A description can contain `lang:`, `file:`, and `-file:` filters. Seek keeps
-these filters in strict, relaxed, and semantic retrieval and sends only the
-description to the model. For semantic retrieval, Seek builds an allowed-row
-bitmap and plans each shard separately. It skips shards with no allowed rows,
-uses normal USearch for full shards, scores bounded sparse partial shards
-exactly, and gives other partial shards to USearch with the bitmap predicate.
-The predicate admits only matching keys to the candidate set; other keys can
-still guide graph navigation. A filter that selects every row uses normal
-semantic retrieval. Native USearch routes remain approximate. An exact-only
-route scores every selected stored row. Eligibility follows Zoekt's parsed and
-simplified query tree, so equivalent spellings and aliases can use the same
-route. Exact identifiers, phrases, one-word queries, and trees that retain
-`sym:`, other filters, Boolean alternatives, or general negation use strict
-BM25 order.
+A description can include `lang:`, `file:`, and `-file:` filters. These filters
+stay active if Seek uses another search method. Exact identifiers, quoted
+phrases, one-word queries, other filters, Boolean alternatives, and general
+negation use text ranking.
 
-Unless `--lexical-only` is set, every supported search builds or updates both
-Zoekt and semantic data. This includes exact queries and commands rewritten by
-the router. A first search of a large repo can take tens of seconds or longer
-and use all available compute, several GiB of memory, and significant cache
-space. Use `--lexical-only` only when you want the Zoekt-only fast path with no
-model work.
+Seek considers at most 128 files for a description. Each text-search pass is
+limited to 10,000 matches and 60 seconds. These bounds are separate from `-n`.
+Meaning-based search is approximate. A result can contain none of the query
+words.
 
-Use normal seek for exact ranked navigation. For absence checks, renames,
-counts, and complete call-site lists, use the exhaustive command below.
+When no file contains every query word, Seek returns results that omit some
+query words only if the best model score is strong enough. Otherwise, it returns
+no output and exits with code 1. This does not prove absence. If the model fails,
+Seek returns results that contain every query word.
 
-The model runs locally and can use context that is not in the output. Display
-flags still apply. If semantic retrieval is unavailable, model re-ranking can
-still use lexical candidates. If the model fails, Seek returns the strict
-all-word BM25 results. An unfiltered search can use an exact vector scan for a
-bounded USearch graph failure. A larger failure returns to the lexical and
-model re-rank path. A filtered USearch error returns to the filtered lexical
-path and never removes the filter.
+Unless `--lexical-only` is set, Seek keeps its text and meaning-based indexes up
+to date. The first search of a large repository can take tens of seconds or
+longer and use several GiB of memory. Use `--lexical-only` to skip the
+meaning-based index and all model work.
 
 ## Paths
 
 With no path, seek searches the current Git worktree. You can mix directories
-and exact files from inside or outside it. Across roots, headers use absolute
-paths and a `[git]` or `[folder]` tag.
+and exact files from inside or outside it. Across multiple roots, headers use
+absolute paths and a `[git]` or `[folder]` tag.
 
-Path operands constrain the search results. They can also enable a scoped index
-when a whole Git repo exceeds an index limit. `file:` and `-file:` query filters
-apply to results after indexing and do not reduce index limits.
+Path operands limit results. `file:` and `-file:` filters apply after indexing,
+so they do not reduce index size limits.
 
 ## Pitfalls
 
@@ -125,9 +106,9 @@ apply to results after indexing and do not reduce index limits.
 
 ## When seek is the wrong tool
 
-By default, `-n` and `-m` add no display limits, but internal safety bounds
-still apply. The router uses `-n 20 -m 3`. For every occurrence, such as for a
-rename, refactor, or call-site count, use grep directly:
+By default, `-n 0` and `-m 0` display all results returned within Seek's search
+bounds. The router uses `-n 20 -m 3`. For every occurrence, such as for a rename,
+refactor, or call-site count, use grep directly:
 
 ```sh
 SEEK_ROUTER=off grep -rn 'PATTERN' .

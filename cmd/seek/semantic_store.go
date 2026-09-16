@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
-	"sort"
 	"sync"
 	"unsafe"
 
@@ -24,15 +23,17 @@ import (
 )
 
 const (
-	semanticFormatVersion = 4
+	semanticFormatVersion = 5
 	// Compatibility revisions are cache barriers for behavior that asset hashes
-	// and typed format settings cannot describe.
-	semanticRepresentationRevision = "anchored-spherical-f32-v1"
+	// and typed format settings cannot describe. anchored-spherical-v2 adds
+	// normalization for finite values whose scale cannot fit in float32.
+	// semanticVectorCodec identifies fine-vector encoding separately.
+	semanticRepresentationRevision = "anchored-spherical-v2"
 	semanticModelAlgorithmRevision = "lateon-code-edge-proxy-no-symbol-centroids-v5"
 	semanticGenerationPrefix       = "semantic-"
 	semanticManifestFile           = "manifest.json"
 	semanticRowsFile               = "rows.bin"
-	semanticVectorsFile            = "vectors.f32"
+	semanticVectorsFile            = "vectors.snorm16"
 	semanticUSearchFilePrefix      = "index-"
 	semanticUSearchFileSuffix      = ".usearch"
 	semanticRowsMagic              = "SEEKSROW"
@@ -41,8 +42,11 @@ const (
 	semanticManifestMaxBytes       = 64 << 10
 	semanticMetadataFieldMax       = 1 << 20
 	semanticMaxRows                = 10_000_000
-	semanticFineVectorBytesPerUnit = semanticFineCentroidsPerUnit * semanticEmbeddingDimensions * 4
 )
+
+// semanticNormalizedSquaredNormTolerance limits accepted float32 centroid and
+// query squared norms. The SNORM16 integer-norm tolerance is derived from it.
+const semanticNormalizedSquaredNormTolerance = 1e-3
 
 var semanticModelCompatibility = sync.OnceValue(func() string {
 	return semanticModelCompatibilityFor(lateOnCompressedModel, lateOnCompressedTokenizer)
@@ -79,9 +83,9 @@ type semanticArtifact struct {
 	SHA256 string `json:"sha256"`
 }
 
-// semanticSizedArtifact records the length needed to map rebuildable vector
-// data safely. It intentionally does not provide whole-file integrity. Reading
-// the full vector file to hash it would add an index-sized pass to every build.
+// semanticSizedArtifact records the exact length of rebuildable vector data.
+// It has no whole-file checksum, so open cannot detect all same-length content
+// changes. Hash validation would add an index-sized read.
 type semanticSizedArtifact struct {
 	Bytes uint64 `json:"bytes"`
 }
@@ -93,13 +97,21 @@ type semanticUSearchShard struct {
 	semanticArtifact
 }
 
+// semanticManifest binds the semantic artifacts to their exact formats.
+// VectorCodec identifies the fine-vector byte encoding. VectorStride is the
+// byte width of one semantic row, including all fine centroids, not one centroid
+// vector. Runtime is the bundled ONNX Runtime version that produced the vectors;
+// see semanticInferenceRuntime for why a run-time upgrade must not reuse them.
 type semanticManifest struct {
 	Format         uint32                 `json:"format"`
 	Source         string                 `json:"source"`
 	Model          string                 `json:"model"`
 	Extractor      string                 `json:"extractor"`
 	Representation string                 `json:"representation"`
+	VectorCodec    string                 `json:"vector_codec"`
+	VectorStride   uint32                 `json:"vector_stride"`
 	USearch        string                 `json:"usearch"`
+	Runtime        string                 `json:"runtime"`
 	Dimensions     uint32                 `json:"dimensions"`
 	Rows           uint64                 `json:"rows"`
 	RowsFile       semanticArtifact       `json:"rows_file"`
@@ -114,7 +126,7 @@ type semanticManifest struct {
 type semanticGeneration struct {
 	manifest          semanticManifest
 	rows              []semanticUnit
-	vectors           []semanticFineVectors
+	vectors           []semanticFineSNORM16Vectors
 	vectorMap         []byte
 	usearch           []string
 	usearchErr        error
@@ -128,6 +140,30 @@ type semanticUSearchValidation struct {
 	err  error
 }
 
+// semanticInferenceRuntime reports the bundled ONNX Runtime version. It reads the
+// embedded runtime manifest, so it neither initializes the run time nor decodes
+// the model, and it is safe on lexical-only paths that never load either.
+//
+// The version belongs in the generation key because a run-time upgrade can change
+// the numbers the model produces: ONNX Runtime 1.29 changed reshape fusion and
+// constant folding, which changes how a graph is partitioned and therefore the
+// stored vectors. An index outlives the binary that wrote it, so without this a
+// new run time queries vectors an older one produced.
+//
+// The execution provider is deliberately absent. Resolving it needs the compiled
+// model cache directory, which needs the model bytes, and decoding those on a
+// lexical-only search would undo the work that keeps that path free of model
+// cost. Providers that pass the run-time comparison in
+// verifyLateOnAcceleratedProvider agree to far tighter limits than this key could
+// police.
+var semanticInferenceRuntime = sync.OnceValue(func() string {
+	bundle, err := lateOnRuntimeForPlatform()
+	if err != nil || bundle.version == "" {
+		return "unknown"
+	}
+	return bundle.version
+})
+
 func semanticGenerationKey(source string) string {
 	hash := sha256.New()
 	hash.Write([]byte("seek-semantic-generation-v1\x00"))
@@ -136,8 +172,10 @@ func semanticGenerationKey(source string) string {
 		semanticModelCompatibility(),
 		semanticExtractorID,
 		semanticRepresentationCompatibility(),
+		semanticVectorCodec,
 		semanticUSearchLayout(),
 		semanticUSearchAssetKey(),
+		semanticInferenceRuntime(),
 		fmt.Sprint(semanticFormatVersion),
 	} {
 		writeSemanticHashField(hash, []byte(field))
@@ -204,7 +242,10 @@ func writeSemanticGenerationFromParts(
 		Model:          semanticModelCompatibility(),
 		Extractor:      semanticExtractorID,
 		Representation: semanticRepresentationCompatibility(),
+		VectorCodec:    semanticVectorCodec,
+		VectorStride:   semanticFineVectorBytesPerUnit,
 		USearch:        usearchCompatibility,
+		Runtime:        semanticInferenceRuntime(),
 		Dimensions:     semanticEmbeddingDimensions,
 		Rows:           uint64(len(units)),
 		RowsFile:       rowsArtifact,
@@ -263,31 +304,6 @@ func writeSemanticRows(path string, units []semanticUnit) (semanticArtifact, err
 		}
 		return buffered.Flush()
 	})
-}
-
-func encodeSemanticFineVectors(
-	buffer []byte,
-	embeddings []semanticUnitEmbedding,
-	startRow int,
-) ([]byte, error) {
-	wantBytes := len(embeddings) * semanticFineVectorBytesPerUnit
-	if startRow < 0 || len(buffer) < wantBytes {
-		return nil, fmt.Errorf("semantic vector buffer is too small")
-	}
-	encoded := buffer[:wantBytes]
-	at := 0
-	for row, embedding := range embeddings {
-		for centroid, vector := range embedding.fine {
-			if err := validateNormalizedSemanticVector(vector); err != nil {
-				return nil, fmt.Errorf("semantic row %d centroid %d: %w", startRow+row, centroid, err)
-			}
-			for _, value := range vector {
-				binary.LittleEndian.PutUint32(encoded[at:at+4], math.Float32bits(value))
-				at += 4
-			}
-		}
-	}
-	return encoded, nil
 }
 
 func writeSemanticArtifact(path string, write func(io.Writer) error) (semanticArtifact, error) {
@@ -561,7 +577,10 @@ func validateSemanticManifest(manifest semanticManifest, source string) error {
 		manifest.Model != semanticModelCompatibility() ||
 		manifest.Extractor != semanticExtractorID ||
 		manifest.Representation != semanticRepresentationCompatibility() ||
+		manifest.VectorCodec != semanticVectorCodec ||
+		manifest.VectorStride != semanticFineVectorBytesPerUnit ||
 		manifest.USearch != usearchCompatibility ||
+		manifest.Runtime != semanticInferenceRuntime() ||
 		manifest.Dimensions != semanticEmbeddingDimensions ||
 		manifest.Rows > semanticMaxRows {
 		return fmt.Errorf("semantic generation is incompatible")
@@ -635,7 +654,7 @@ func validateSemanticUSearchShardArtifacts(dir string, shards []semanticUSearchS
 }
 
 func checkedSemanticVectorBytes(rows uint64) (uint64, bool) {
-	const rowBytes = semanticFineCentroidsPerUnit * semanticEmbeddingDimensions * 4
+	const rowBytes = semanticFineVectorBytesPerUnit
 	if rows > math.MaxUint64/rowBytes {
 		return 0, false
 	}
@@ -808,7 +827,10 @@ func internSemanticRowLanguage(interned map[string]string, raw []byte) string {
 	return value
 }
 
-func mapSemanticVectors(file *os.File, count uint64) ([]semanticFineVectors, []byte, error) {
+// mapSemanticVectors checks the exact payload length and maps its bytes directly
+// as int16 rows. This view requires a little-endian target. It does not validate
+// component codes; exactSemanticRange validates each vector before scoring it.
+func mapSemanticVectors(file *os.File, count uint64) ([]semanticFineSNORM16Vectors, []byte, error) {
 	wantBytes, ok := checkedSemanticVectorBytes(count)
 	if !ok {
 		return nil, nil, fmt.Errorf("semantic vector length overflows")
@@ -830,7 +852,12 @@ func mapSemanticVectors(file *os.File, count uint64) ([]semanticFineVectors, []b
 	if err != nil {
 		return nil, nil, fmt.Errorf("map semantic vectors: %w", err)
 	}
-	vectors := unsafe.Slice((*semanticFineVectors)(unsafe.Pointer(&mapped[0])), int(count))
+	byteOrder := uint16(1)
+	if *(*byte)(unsafe.Pointer(&byteOrder)) != 1 {
+		_ = unix.Munmap(mapped)
+		return nil, nil, fmt.Errorf("semantic vector codec needs a little-endian target")
+	}
+	vectors := unsafe.Slice((*semanticFineSNORM16Vectors)(unsafe.Pointer(&mapped[0])), int(count))
 	return vectors, mapped, nil
 }
 
@@ -841,7 +868,7 @@ type semanticHit struct {
 
 func exactSemanticSearch(
 	ctx context.Context,
-	vectors []semanticFineVectors,
+	vectors []semanticFineSNORM16Vectors,
 	query *semanticQueryEmbedding,
 	limit int,
 ) ([]semanticHit, error) {
@@ -862,7 +889,7 @@ func exactSemanticSearch(
 // planning already produces this order, which keeps vector reads sequential.
 func exactSemanticSortedCandidates(
 	ctx context.Context,
-	vectors []semanticFineVectors,
+	vectors []semanticFineSNORM16Vectors,
 	query *semanticQueryEmbedding,
 	rows []uint64,
 	limit int,
@@ -877,11 +904,11 @@ func exactSemanticSortedCandidates(
 	return exactSemanticSortedRows(ctx, vectors, queryVectors, rows, limit)
 }
 
-// exactSemanticSortedRows scores checked query vectors against sorted unique
-// row IDs.
+// exactSemanticSortedRows scores an owned normalized query buffer against
+// sorted unique row IDs. Exact scoring validates and scales the query in place.
 func exactSemanticSortedRows(
 	ctx context.Context,
-	vectors []semanticFineVectors,
+	vectors []semanticFineSNORM16Vectors,
 	query []semanticVector,
 	rows []uint64,
 	limit int,
@@ -900,9 +927,11 @@ func exactSemanticSortedRows(
 	return exactSemanticRows(ctx, vectors, query, rows, limit)
 }
 
+// exactSemanticRows scores an owned normalized query buffer against the given
+// row IDs. Exact scoring validates and scales the query in place.
 func exactSemanticRows(
 	ctx context.Context,
-	vectors []semanticFineVectors,
+	vectors []semanticFineSNORM16Vectors,
 	query []semanticVector,
 	rows []uint64,
 	limit int,
@@ -910,16 +939,21 @@ func exactSemanticRows(
 	return exactSemanticRowSelection(ctx, vectors, query, rows, len(rows), limit)
 }
 
-// exactSemanticRowSelection uses implicit consecutive row IDs when rows is nil.
-// This keeps a full recovery scan from allocating one uint64 for every row.
+// exactSemanticRowSelection validates and scales its owned normalized query
+// buffer in place. It uses implicit consecutive row IDs when rows is nil. This
+// keeps a full recovery scan from allocating one uint64 for every row.
 func exactSemanticRowSelection(
 	ctx context.Context,
-	vectors []semanticFineVectors,
+	vectors []semanticFineSNORM16Vectors,
 	query []semanticVector,
 	rows []uint64,
 	rowCount int,
 	limit int,
 ) ([]semanticHit, error) {
+	scaledQuery, err := prepareSemanticSNORM16Query(query)
+	if err != nil {
+		return nil, err
+	}
 	// One row-token pair compares all fine centroids. Include query length in the
 	// worker count so long descriptive queries do not run large exact routes on
 	// one or two CPUs.
@@ -927,7 +961,7 @@ func exactSemanticRowSelection(
 	work := rowCount * max(1, len(query))
 	workers := min(runtime.GOMAXPROCS(0), max(1, work/rowTokenPairsPerWorker))
 	if workers == 1 {
-		hits, err := exactSemanticRange(ctx, vectors, query, rows, 0, rowCount, limit)
+		hits, err := exactSemanticRange(ctx, vectors, scaledQuery, rows, 0, rowCount, limit)
 		return hits, errors.Join(err, ctx.Err())
 	}
 	type result struct {
@@ -939,7 +973,7 @@ func exactSemanticRowSelection(
 		start := rowCount * worker / workers
 		end := rowCount * (worker + 1) / workers
 		go func() {
-			hits, err := exactSemanticRange(ctx, vectors, query, rows, start, end, limit)
+			hits, err := exactSemanticRange(ctx, vectors, scaledQuery, rows, start, end, limit)
 			results <- result{hits: hits, err: err}
 		}()
 	}
@@ -960,7 +994,7 @@ func exactSemanticRowSelection(
 	return merged, nil
 }
 
-func validateNormalizedSemanticVector(vector semanticVector) error {
+func validateNormalizedSemanticVector(vector *semanticVector) error {
 	var squaredNorm float64
 	for _, value := range vector {
 		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
@@ -968,7 +1002,7 @@ func validateNormalizedSemanticVector(vector semanticVector) error {
 		}
 		squaredNorm += float64(value * value)
 	}
-	if math.Abs(squaredNorm-1) > 1e-3 {
+	if math.Abs(squaredNorm-1) > semanticNormalizedSquaredNormTolerance {
 		return fmt.Errorf("has squared norm %.6f, want 1", squaredNorm)
 	}
 	return nil
@@ -976,15 +1010,18 @@ func validateNormalizedSemanticVector(vector semanticVector) error {
 
 func exactSemanticRange(
 	ctx context.Context,
-	vectors []semanticFineVectors,
-	query []semanticVector,
+	vectors []semanticFineSNORM16Vectors,
+	scaledQuery []semanticVector,
 	rows []uint64,
 	start int,
 	end int,
 	limit int,
 ) ([]semanticHit, error) {
+	if limit <= 0 || start >= end {
+		return nil, nil
+	}
 	hits := make([]semanticHit, 0, min(limit, end-start))
-	contextCheckRows := max(1, 4096/max(1, len(query)))
+	contextCheckRows := max(1, 4096/max(1, len(scaledQuery)))
 	nextContextCheck := 0
 	for index := start; index < end; index++ {
 		progress := index - start
@@ -998,16 +1035,20 @@ func exactSemanticRange(
 		if rows != nil {
 			row = rows[index]
 		}
-		for centroid, vector := range vectors[row] {
-			if err := validateNormalizedSemanticVector(vector); err != nil {
+		// Keep the mapped row in place. Ranging over its array value would copy
+		// 1,920 bytes once for validation and once for every query token.
+		rowVectors := &vectors[row]
+		for centroid := range rowVectors {
+			if err := validateSemanticSNORM16Vector(&rowVectors[centroid]); err != nil {
 				return nil, fmt.Errorf("semantic row %d centroid %d: %w", row, centroid, err)
 			}
 		}
 		var score float32
-		for _, queryVector := range query {
+		for queryIndex := range scaledQuery {
+			queryVector := &scaledQuery[queryIndex]
 			maximum := float32(math.Inf(-1))
-			for _, centroid := range vectors[row] {
-				maximum = max(maximum, semanticVectorDot(queryVector, centroid))
+			for centroid := range rowVectors {
+				maximum = max(maximum, semanticSNORM16VectorDot(queryVector, &rowVectors[centroid]))
 			}
 			if math.IsInf(float64(maximum), 0) || math.IsNaN(float64(maximum)) {
 				return nil, fmt.Errorf("semantic row %d produced an invalid score", row)
@@ -1015,20 +1056,60 @@ func exactSemanticRange(
 			score += maximum
 		}
 		hit := semanticHit{row: row, score: score}
-		position := sort.Search(len(hits), func(i int) bool {
-			return semanticHitLess(hit, hits[i])
-		})
-		if position >= limit {
-			continue
-		}
-		hits = append(hits, semanticHit{})
-		copy(hits[position+1:], hits[position:])
-		hits[position] = hit
-		if len(hits) > limit {
-			hits = hits[:limit]
-		}
+		hits = keepBestSemanticHit(hits, hit, limit)
 	}
+	sortSemanticHits(hits)
 	return hits, nil
+}
+
+// keepBestSemanticHit maintains a bounded worst-first heap. The root is the
+// least useful retained hit. Updating the retained set costs O(log limit)
+// instead of moving an ordered slice on every insertion.
+func keepBestSemanticHit(hits []semanticHit, hit semanticHit, limit int) []semanticHit {
+	if limit <= 0 {
+		return hits
+	}
+	if len(hits) < limit {
+		hits = append(hits, hit)
+		semanticHitHeapUp(hits, len(hits)-1)
+		return hits
+	}
+	if !semanticHitLess(hit, hits[0]) {
+		return hits
+	}
+	hits[0] = hit
+	semanticHitHeapDown(hits, 0)
+	return hits
+}
+
+func semanticHitHeapUp(hits []semanticHit, index int) {
+	for index > 0 {
+		parent := (index - 1) / 2
+		if !semanticHitWorse(hits[index], hits[parent]) {
+			return
+		}
+		hits[index], hits[parent] = hits[parent], hits[index]
+		index = parent
+	}
+}
+
+func semanticHitHeapDown(hits []semanticHit, index int) {
+	for {
+		left := index*2 + 1
+		if left >= len(hits) {
+			return
+		}
+		worst := left
+		right := left + 1
+		if right < len(hits) && semanticHitWorse(hits[right], hits[left]) {
+			worst = right
+		}
+		if !semanticHitWorse(hits[worst], hits[index]) {
+			return
+		}
+		hits[index], hits[worst] = hits[worst], hits[index]
+		index = worst
+	}
 }
 
 func sortSemanticHits(hits []semanticHit) {
@@ -1037,6 +1118,10 @@ func sortSemanticHits(hits []semanticHit) {
 
 func semanticHitLess(left, right semanticHit) bool {
 	return compareSemanticHits(left, right) < 0
+}
+
+func semanticHitWorse(left, right semanticHit) bool {
+	return compareSemanticHits(left, right) > 0
 }
 
 func compareSemanticHits(left, right semanticHit) int {
