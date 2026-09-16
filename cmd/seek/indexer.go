@@ -177,18 +177,26 @@ func deleteEmptyStateFiles(cacheDir string) {
 	_ = os.Remove(filepath.Join(cacheDir, emptyFile+".tmp"))
 }
 
-// deleteStateFiles removes all cached publication state and its tmp files.
-// Clearing .head alongside .state ensures that a failed or drifted
-// indexing cycle forces a full re-index (including committed) on the
-// next invocation, rather than relying on a potentially stale .head
-// to skip committed indexing.
+// deleteStateFiles removes the cached working-tree state and its tmp files, so
+// a failed or drifted indexing cycle re-checks the corpus on the next search.
+//
+// It keeps .git-committed-v1. That file describes the committed family still on
+// disk, which a failed build did not change, and dropping it forced the next
+// commit into a full rebuild. It still clears .head, which costs nothing now
+// that .head is only a fallback.
 func deleteStateFiles(cacheDir string) {
 	_ = os.Remove(filepath.Join(cacheDir, stateFile))
 	_ = os.Remove(filepath.Join(cacheDir, stateFile+".tmp"))
 	_ = os.Remove(filepath.Join(cacheDir, headFile))
 	_ = os.Remove(filepath.Join(cacheDir, headFile+".tmp"))
 	deleteEmptyStateFiles(cacheDir)
-	deleteCommittedGitState(cacheDir)
+	// .git-committed-v1 is kept. It records the delta base of the committed
+	// family that is still on disk, and a failed build does not change that
+	// family. Deleting it forced the next commit to rebuild in full.
+	//
+	// A stale record cannot produce a wrong answer: prepareNativeGitDelta
+	// compares it with the commit read from the shard itself
+	// (git_native_delta.go:124-127) and rejects a delta when the two disagree.
 }
 
 // indexParallelism returns the number of parallel indexing workers.

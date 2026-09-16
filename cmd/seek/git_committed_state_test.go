@@ -59,9 +59,18 @@ func TestCommittedGitStateEncodingAndDamage(t *testing.T) {
 	if err := writeCommittedGitState(cacheDir, want); err != nil {
 		t.Fatal(err)
 	}
+	// State cleanup keeps the committed record. It describes the delta base of
+	// the family that is still on disk, and a failed build does not change that
+	// family. A stale record is rejected by prepareNativeGitDelta, which
+	// compares it with the commit read from the shard itself.
 	deleteStateFiles(cacheDir)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("state cleanup removed the committed record: %v", err)
+	}
+	// Only the explicit remover drops it.
+	deleteCommittedGitState(cacheDir)
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("committed state remains after state cleanup: %v", err)
+		t.Fatalf("committed state remains after its own cleanup: %v", err)
 	}
 }
 
