@@ -199,9 +199,26 @@ func ensureFolderCorpusFreshWithExecution(
 		slog.Warn("Folder shard family does not match its manifest; rebuilding it in full",
 			"index_dir", plan.indexDir)
 	}
+	// The published family is the one this scan describes. Every failure below
+	// happens before the publish at the end of this function, so a failure
+	// cannot have changed it. Keeping .state in that case keeps the delta base:
+	// .state alone decides whether the next build can be a delta, so deleting
+	// it turns every interrupted build into a full rebuild of a family that is
+	// still correct on disk.
+	//
+	// This reuses the manifest result already in `intact` rather than calling
+	// familyComplete, which would read the manifest file a second time.
+	publishedFamilyUsable := sc.hasShard() && intact
+	// dropStateUnlessPublished clears the cached state only when no usable
+	// family survives. Every caller below sits before the publish.
+	dropStateUnlessPublished := func() {
+		if !publishedFamilyUsable {
+			deleteStateFiles(plan.cacheDir)
+		}
+	}
 	currentState := readStateFile(plan.cacheDir)
 	needLexical := currentState != stateHash || !sc.hasShard() || !intact
-	isDelta := needLexical && currentState != "" && sc.hasShard() && intact
+	isDelta := needLexical && currentState != "" && publishedFamilyUsable
 	semanticSource := stateHash
 	semanticPresent := semanticRequired && semanticGenerationPresent(plan.indexDir, semanticSource)
 	needSemantic := semanticRequired && !semanticPresent
@@ -231,7 +248,7 @@ func ensureFolderCorpusFreshWithExecution(
 	var lexicalErr, semanticErr error
 	if (needLexical || needSemantic) && selectedCount > 0 {
 		if err := checkCtagsCached(); err != nil {
-			deleteStateFiles(plan.cacheDir)
+			dropStateUnlessPublished()
 			return corpusSearchable, folderCorpusError(plan, err)
 		}
 	}
@@ -268,7 +285,7 @@ func ensureFolderCorpusFreshWithExecution(
 	}
 	runJoinedIndexBuilds(lexicalBuild, semanticBuild)
 	if lexicalErr != nil {
-		deleteStateFiles(plan.cacheDir)
+		dropStateUnlessPublished()
 		return corpusSearchable, folderCorpusError(plan, lexicalErr)
 	}
 	if semanticErr != nil {
@@ -287,11 +304,11 @@ func ensureFolderCorpusFreshWithExecution(
 
 	postState, _, postStateErr := folderCorpusFingerprint(ctx, plan)
 	if postStateErr != nil {
-		deleteStateFiles(plan.cacheDir)
+		dropStateUnlessPublished()
 		return corpusSearchable, folderCorpusError(plan, postStateErr)
 	}
 	if postState != stateHash {
-		deleteStateFiles(plan.cacheDir)
+		dropStateUnlessPublished()
 		return corpusSearchable, folderCorpusError(
 			plan,
 			fmt.Errorf("folder changed during index build"),
