@@ -61,8 +61,8 @@ func ensureFolderCorpusFreshWithExecution(
 	plan corpusPlan,
 	execution searchExecution,
 ) (corpusIndexState, error) {
-	semanticRequired := execution.policy.semanticEnabled() &&
-		execution.model != nil
+	// A folder corpus has no commit, so the head test does not apply.
+	semanticRequired := execution.vectorsWanted("")
 	cachedState := readStateFile(plan.cacheDir)
 	// One scan checks both shard presence and manifest agreement. Presence alone
 	// accepts any one surviving shard; the manifest detects missing or changed

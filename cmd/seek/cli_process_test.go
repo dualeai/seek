@@ -330,29 +330,107 @@ func TestCLIProcess_LexicalOnlySkipsSemanticCacheAndModel(t *testing.T) {
 			t.Errorf("lexical-only stderr contains %q: %s", marker, result.stderr)
 		}
 	}
-	var semanticPaths []string
+	semanticPaths := cachePathsMatching(t, cacheDir, func(name string) bool {
+		return name == joinedGenerationFile ||
+			strings.HasPrefix(name, semanticGenerationPrefix) ||
+			name == "semantic" || name == "reranker"
+	})
+	if len(semanticPaths) != 0 {
+		t.Fatalf("lexical-only command created semantic cache paths: %v", semanticPaths)
+	}
+}
+
+// TestCLIProcess_QueryShapeDecidesSemanticCache checks the user-visible rule
+// the README states: Seek builds meaning-based data only for a search that can
+// read it. An exact word cannot reach it, a description can.
+//
+// This sits at process level beside the --lexical-only test because it makes
+// the same kind of claim: a command either leaves semantic data in the cache or
+// it does not. The in-process tests cover why; this covers what a user sees.
+func TestCLIProcess_QueryShapeDecidesSemanticCache(t *testing.T) {
+	requireTools(t)
+	folder := t.TempDir()
+	writeFileAt(t, folder, "app.go", "package sample\n// alpha beta gamma describes the sample\n")
+
+	// wantCode guards this table against a vacuous pass: a case that expects no
+	// results and no vectors would also hold if the command crashed, so every
+	// case pins the documented exit code. 0 is a match, 1 is no match, and 2 is
+	// an error that must never appear here.
+	for _, testCase := range []struct {
+		name        string
+		query       string
+		wantCode    int
+		wantResults bool
+		wantVectors bool
+	}{
+		{name: "exact word", query: "alpha", wantCode: 0, wantResults: true, wantVectors: false},
+		{name: "symbol lookup", query: "sym:Missing", wantCode: 1, wantResults: false, wantVectors: false},
+		{name: "description", query: "describes the sample", wantCode: 0, wantResults: true, wantVectors: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			cacheDir := t.TempDir()
+			result := runCLIProcessWithCache(
+				t,
+				cacheDir,
+				t.TempDir(),
+				[]string{testCase.query, folder},
+				nil,
+			)
+			if result.code != testCase.wantCode {
+				t.Fatalf(
+					"exit code=%d, want %d: stdout=%q stderr=%q",
+					result.code,
+					testCase.wantCode,
+					result.stdout,
+					result.stderr,
+				)
+			}
+			if testCase.wantResults != strings.Contains(result.stdout, "## app.go") {
+				t.Fatalf(
+					"results=%t, want %t: stdout=%q stderr=%q",
+					!testCase.wantResults,
+					testCase.wantResults,
+					result.stdout,
+					result.stderr,
+				)
+			}
+			found := cachePathsMatching(t, cacheDir, func(name string) bool {
+				return strings.HasPrefix(name, semanticGenerationPrefix)
+			})
+			if testCase.wantVectors && len(found) == 0 {
+				t.Fatal("a search that can read meaning-based data built none")
+			}
+			if !testCase.wantVectors && len(found) != 0 {
+				t.Fatalf("a search that cannot read meaning-based data built %v", found)
+			}
+		})
+	}
+}
+
+// cachePathsMatching returns every path under cacheDir, relative to it, whose
+// base name the predicate accepts. Both semantic-cache assertions in this file
+// walk the same tree and differ only in which names count.
+func cachePathsMatching(tb testing.TB, cacheDir string, match func(name string) bool) []string {
+	tb.Helper()
+	var found []string
 	err := filepath.WalkDir(cacheDir, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		name := entry.Name()
-		if name == joinedGenerationFile ||
-			strings.HasPrefix(name, semanticGenerationPrefix) ||
-			name == "semantic" || name == "reranker" {
-			relative, err := filepath.Rel(cacheDir, path)
-			if err != nil {
-				return err
-			}
-			semanticPaths = append(semanticPaths, relative)
+		if !match(entry.Name()) {
+			return nil
 		}
+		relative, relErr := filepath.Rel(cacheDir, path)
+		if relErr != nil {
+			return relErr
+		}
+		found = append(found, relative)
 		return nil
 	})
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
-	if len(semanticPaths) != 0 {
-		t.Fatalf("lexical-only command created semantic cache paths: %v", semanticPaths)
-	}
+	return found
 }
 
 func runCLIProcess(t *testing.T, dir string, args, extraEnv []string) cliProcessResult {

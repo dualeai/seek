@@ -501,6 +501,13 @@ func finishHybridSearch(
 	)
 }
 
+// hybridSearchEligible reports whether the joined route can run for this
+// search. It needs one corpus of a supported kind, with no scope, and a model.
+//
+// It also decides, together with the re-rank planner, whether a corpus prepares
+// a vector generation at all: searchExecution.prepareVectors is set from it in
+// runSearchCommand. A shape rejected here can never read a vector, so building
+// one for it is pure cost.
 func hybridSearchEligible(plans []corpusPlan, execution searchExecution) bool {
 	if len(plans) != 1 ||
 		(plans[0].kind != corpusKindGit && plans[0].kind != corpusKindFolder) ||

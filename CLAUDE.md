@@ -91,9 +91,12 @@ Zoekt's parsed and simplified query tree, so equivalent spellings and aliases
 can use the same route. Exact identifiers, phrases, one-word queries, and trees
 that retain other filters, Boolean alternatives, or general negation use strict
 BM25 order.
-Unless `--lexical-only` is set, a supported search builds or updates both Zoekt
-and semantic data, including exact and router-generated queries. An eligible
-description uses Zoekt only when truncation is certain before model start. A
+Seek builds semantic data only for a search that can read it: one corpus, no
+scope, and a query the re-rank planner accepts. Exact terms, `sym:` lookups,
+phrases, one-word queries, and multi-corpus searches keep Zoekt up to date and
+build no semantic data. The first eligible search builds it. `--lexical-only`
+skips semantic and model work for every query. An eligible description uses
+Zoekt only when truncation is certain before model start. A
 first large-repo search can take tens of seconds or longer and use all
 available compute, several GiB of memory, and significant cache space. Use
 `--lexical-only` to skip all semantic index and model work. Use
@@ -130,9 +133,11 @@ Requires `universal-ctags` (`brew install universal-ctags` on macOS).
 When spawning sub-agents that don't inherit this config, pass:
 "Use `seek 'pattern' [path...]` for ranked code navigation. Keep query filters
 in one quoted string. Plain multi-word descriptions use model re-ranking by
-default. A supported default search maintains both Zoekt and semantic data; use
-`--lexical-only` to skip all semantic and model work. An unscoped clean Git
-worktree or one stable plain file or folder also uses semantic retrieval.
+default. Semantic data is built only for a search that can read it: one
+corpus, no scope, and a query the re-rank planner accepts; exact terms, `sym:`
+lookups, phrases and multi-corpus searches build none. Use `--lexical-only` to
+skip all semantic and model work. An unscoped clean Git worktree or one stable
+plain file or folder also uses semantic retrieval.
 Descriptions can include `lang:`, `file:`, and `-file:` filters. Eligible
 descriptions score at most 128 candidate files. Without a strict all-word
 result, the best normalized score must clear a support boundary; a

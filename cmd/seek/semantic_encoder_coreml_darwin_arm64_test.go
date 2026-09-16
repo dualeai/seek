@@ -321,7 +321,7 @@ func buildFolderWithFailingModel(t *testing.T, embedErr error) {
 	folder := t.TempDir()
 	writeFileAt(t, folder, "app.go", "package sample\n// semantic folder text\n")
 	plan := planFolderTestCorpus(t, folder)
-	future := newSemanticModelFuture(func(context.Context) (semanticModel, error) {
+	execution := testSemanticSearchExecution(t, func(context.Context) (semanticModel, error) {
 		return semanticBuildTestEmbedder{embed: func(
 			context.Context,
 			[]semanticUnit,
@@ -329,8 +329,6 @@ func buildFolderWithFailingModel(t *testing.T, embedErr error) {
 			return nil, embedErr
 		}}, nil
 	})
-	t.Cleanup(func() { _ = future.Close() })
-	execution := searchExecution{policy: defaultSearchPolicy(), model: future}
 	if _, err := ensureFolderCorpusFreshWithExecution(t.Context(), plan, execution); err != nil {
 		t.Fatalf("the build must keep lexical search, not fail: %v", err)
 	}

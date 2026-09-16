@@ -368,8 +368,10 @@ func runIndexingWithCacheExecution(
 	noHeadArtifacts := state.HeadSHA == "no-head" && sc.hasMember(familyCommitted)
 	committedPresent := committedSnapshotReady(cacheDir, indexDir, state, sc)
 	semanticSource := state.HeadSHA
-	semanticRequired := execution.policy.semanticEnabled() &&
-		execution.model != nil && state.HeadSHA != "no-head"
+	// Prepare vectors only when a route can read them. The model itself stays
+	// available for re-ranking lexical candidates. runSearchCommand documents
+	// which searches this covers.
+	semanticRequired := execution.vectorsWanted(state.HeadSHA)
 	joinedReady := !semanticRequired || joinedGenerationMatches(
 		cacheDir,
 		indexDir,

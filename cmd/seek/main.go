@@ -211,6 +211,24 @@ func runSearchCommand(
 		}
 		defer func() { _ = execution.model.Close() }()
 	}
+	// Decide once whether any route can read a committed vector generation.
+	// Every corpus reads this through searchExecution.vectorsWanted.
+	//
+	// Two conditions, both required. tryHybridSearch below runs only when
+	// rerankEligible, so a query shape the re-rank planner rejects — a symbol
+	// lookup, an exact phrase, a single word — can never reach a vector.
+	// hybridSearchEligible then rejects the corpus shapes the joined route
+	// cannot serve: a scope, more than one corpus, or an unsupported kind.
+	// Without both, a search builds and binds a generation that nothing reads.
+	//
+	// What this does not cover: neither input reads the working-tree state, so
+	// a dirty tree still prepares vectors and still discards the route at
+	// hybrid_search.go:95. Narrowing that needs the dirty state at the point
+	// the decision is made.
+	//
+	// hybridSearchEligible reads execution.model, so this must follow the block
+	// above that assigns it.
+	execution.prepareVectors = rerankEligible && hybridSearchEligible(plans, execution)
 
 	strictConfig := config
 	if rerankEligible {
@@ -641,8 +659,7 @@ func ensureCombinedGitCorpusWithExecution(
 	}
 
 	currentState := gitCorpusStateHash(paths, state)
-	semanticRequired := execution.policy.semanticEnabled() &&
-		execution.model != nil && state.HeadSHA != "no-head"
+	semanticRequired := execution.vectorsWanted(state.HeadSHA)
 	joinedReady := !semanticRequired || joinedGenerationMatches(
 		plan.cacheDir,
 		plan.indexDir,
@@ -719,8 +736,9 @@ func ensureScopedGitCorpusFallback(
 	treeish := normalizeCommittedTreeish(state.HeadSHA)
 	scopedState := repoStateForDirtyScope(state, plan.dirtyScope)
 	currentState := scopedFallbackStateHash(paths, scopedState)
-	semanticRequired := execution.policy.semanticEnabled() &&
-		execution.model != nil && treeish != "no-head"
+	// A scoped fallback corpus can never use the vector route, so this is
+	// always false: hybridSearchEligible rejects any plan that carries a scope.
+	semanticRequired := execution.vectorsWanted(treeish)
 	semanticPresent := semanticRequired && semanticGenerationPresent(indexDir, treeish)
 
 	if readStateFile(cacheDir) == "" {

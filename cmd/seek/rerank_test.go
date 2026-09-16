@@ -1270,7 +1270,9 @@ func TestRunRerankK01FallbackContracts(t *testing.T) {
 			return nil, errors.New("must not start")
 		},
 	})
-	wantIndexCalls := 1
+	// An exact phrase cannot reach a vector, so nothing builds one and the
+	// model factory stays unused. The output must not change.
+	wantIndexCalls := 0
 	if err != nil || protected != protectedBaseline || factoryCalls != wantIndexCalls {
 		t.Fatalf("protected path: error=%v calls=%d\nwant=%q\ngot=%q", err, factoryCalls, protectedBaseline, protected)
 	}
@@ -1398,7 +1400,11 @@ func TestRunRerankUnsupportedQueriesStayByteIdentical(t *testing.T) {
 					},
 				)
 			})
-			wantIndexCalls := 1
+			// A protected query cannot reach a vector, so the corpus no
+			// longer builds one for it and the model factory is never
+			// called. The output stays byte-identical, which is what this
+			// test protects.
+			wantIndexCalls := 0
 			if baseline != got || factoryCalls != wantIndexCalls ||
 				(baselineErr == nil) != (gotErr == nil) ||
 				(baselineErr != nil && baselineErr.Error() != gotErr.Error()) {

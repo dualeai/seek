@@ -436,9 +436,11 @@ func TestRunJoinedTruncatedQuerySkipsExpansionBranches(t *testing.T) {
 	setTestUserCache(t)
 	planFolderTestCorpus(t, folder)
 
+	// Seed with a re-rank eligible description so the generation exists before
+	// the truncated query runs. A one-word seed builds nothing now.
 	if _, err := runHybridTestSearch(
 		t,
-		"alpha",
+		"alpha beta sample",
 		[]string{folder},
 		defaultSearchPolicy(),
 		func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil },
@@ -581,9 +583,10 @@ func TestRunDefaultFilteredNativeFailureUsesFilteredLexicalRerank(t *testing.T) 
 	writeFileAt(t, folder, "blocked/leak.go", "package sample\n// alpha beta PATH_LEAK\n")
 	plan := planFolderTestCorpus(t, folder)
 
+	// A re-rank eligible seed; a one-word query no longer builds a generation.
 	if _, err := runHybridTestSearch(
 		t,
-		"seed",
+		"seed alpha beta",
 		[]string{folder},
 		defaultSearchPolicy(),
 		func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil },
@@ -724,7 +727,11 @@ func TestRunDefaultJoinedSearchReturnsOneSemanticOnlyFile(t *testing.T) {
 	}
 }
 
-func TestRunDefaultExactQueryStillBuildsJoinedIndex(t *testing.T) {
+// TestRunDefaultExactQuerySkipsJoinedIndex records the contract change: a
+// one-word or exact query is not re-rank eligible, so no route can read a
+// vector generation and the corpus must not build one. The lexical answer and
+// the warm-path behaviour must not change.
+func TestRunDefaultExactQuerySkipsJoinedIndex(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
 	writeFileAt(t, folder, "app.go", "package sample\n// alpha\n")
@@ -744,18 +751,20 @@ func TestRunDefaultExactQueryStillBuildsJoinedIndex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !joinedGenerationMatches(plan.cacheDir, plan.indexDir, state, state) {
-		t.Fatal("default exact query did not build the joined index")
+	if joinedGenerationMatches(plan.cacheDir, plan.indexDir, state, state) {
+		t.Fatal("an exact query built a joined index that no route can read")
 	}
-	assertIndexOnlyModelCalls(t, scorer)
+	if got := scorer.embedCalls.Load(); got != 0 {
+		t.Fatalf("an exact query embedded %d times", got)
+	}
 	firstEmbedCalls := scorer.embedCalls.Load()
 	warmOutput, err := runHybridTestSearch(t, "alpha", []string{folder}, defaultSearchPolicy(), newModel)
 	if err != nil || warmOutput != output {
 		t.Fatalf("warm exact search: error=%v output=%q, want %q", err, warmOutput, output)
 	}
-	if factoryCalls.Load() != 1 || scorer.embedCalls.Load() != firstEmbedCalls {
+	if factoryCalls.Load() != 0 || scorer.embedCalls.Load() != firstEmbedCalls {
 		t.Fatalf(
-			"warm model calls factory=%d embed=%d, want 1 and %d",
+			"warm model calls factory=%d embed=%d, want 0 and %d",
 			factoryCalls.Load(),
 			scorer.embedCalls.Load(),
 			firstEmbedCalls,
@@ -771,7 +780,9 @@ func TestRunDefaultRepairsDamagedSemanticGeneration(t *testing.T) {
 
 	run := func(scorer *hybridTestScorer) string {
 		t.Helper()
-		output, err := runHybridTestSearch(t, "alpha", []string{folder}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
+		// A multi-word description is re-rank eligible, so it builds the
+		// generation this test then damages and repairs.
+		output, err := runHybridTestSearch(t, "alpha sample package", []string{folder}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
 			return scorer, nil
 		})
 		if err != nil || !strings.Contains(output, "## app.go") {
@@ -820,7 +831,13 @@ func TestRunDefaultRepairsDamagedSemanticGeneration(t *testing.T) {
 	}
 }
 
-func TestRunDefaultOverCapScopedQueryBuildsJoinedIndex(t *testing.T) {
+// planOverCapScopedFixture builds the repository both over-cap scoped tests
+// use: one small in-scope file and one large out-of-scope file, with the index
+// byte limit lowered so the whole repository is over budget and only the scope
+// can be indexed. It returns the repository, its resolved paths, the single
+// scoped plan, and the scope directory.
+func planOverCapScopedFixture(t *testing.T) (string, gitPaths, corpusPlan, string) {
+	t.Helper()
 	requireTools(t)
 	repo := initGitRepo(t, "seed.go", "package seed\n")
 	inScope := "package small\n// OVERCAP_SEMANTIC_MARKER\n"
@@ -846,8 +863,19 @@ func TestRunDefaultOverCapScopedQueryBuildsJoinedIndex(t *testing.T) {
 	if err != nil || len(plans) != 1 {
 		t.Fatalf("plan scoped Git corpus: plans=%d error=%v", len(plans), err)
 	}
-	plan := plans[0]
 	t.Chdir(repo)
+	return repo, paths, plans[0], scope
+}
+
+// TestRunDefaultOverCapScopedQuerySkipsJoinedIndex records the contract change:
+// a scoped search can never read the vector route, because hybridSearchEligible
+// rejects any plan that carries a scope. Building and binding a generation for
+// it was pure cost, so the end-to-end search must now skip it.
+//
+// The fallback's own build and rebind path is covered separately, by
+// TestScopedGitCorpusFallback_BuildsAndRebindsWhenAskedForVectors.
+func TestRunDefaultOverCapScopedQuerySkipsJoinedIndex(t *testing.T) {
+	repo, paths, plan, scope := planOverCapScopedFixture(t)
 
 	scorer := &hybridTestScorer{}
 	output, err := runHybridTestSearch(t, "OVERCAP_SEMANTIC_MARKER", []string{scope}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
@@ -859,41 +887,94 @@ func TestRunDefaultOverCapScopedQueryBuildsJoinedIndex(t *testing.T) {
 	state := mustGitRepoStateIn(t, t.Context(), repo)
 	scopedState := repoStateForDirtyScope(state, plan.dirtyScope)
 	stateHash := scopedFallbackStateHash(paths, scopedState)
+	if joinedGenerationMatches(
+		plan.scopedCacheDir,
+		plan.scopedIndexDir,
+		stateHash,
+		state.HeadSHA,
+	) {
+		t.Fatal("scoped search built a joined generation that no route can read")
+	}
+	scorer.mu.Lock()
+	embeddedPaths := append([]string(nil), scorer.embeddedPaths...)
+	scorer.mu.Unlock()
+	if len(embeddedPaths) != 0 {
+		t.Fatalf("scoped search embedded %v for a route that rejects vectors", embeddedPaths)
+	}
+
+	// The scoped fallback's own semantic build and repair path is covered by
+	// TestScopedGitCorpusFallback_BuildsAndRebindsWhenAskedForVectors. It needs
+	// an execution that asks for vectors, which routing never produces for a
+	// scoped plan, so it does not belong in this end-to-end test.
+}
+
+// TestScopedGitCorpusFallback_BuildsAndRebindsWhenAskedForVectors covers the
+// scoped fallback's semantic build and descriptor repair by calling it
+// directly.
+//
+// Routing never asks a scoped corpus for vectors: hybridSearchEligible rejects
+// any plan that carries a scope, so searchExecution.prepareVectors is always
+// false here. This path is therefore defensive, and the test says so rather
+// than dressing a direct call up as an end-to-end search. If routing ever
+// admits scoped vectors, this is the test that already describes the contract.
+func TestScopedGitCorpusFallback_BuildsAndRebindsWhenAskedForVectors(t *testing.T) {
+	repo, paths, plan, _ := planOverCapScopedFixture(t)
+
+	state := mustGitRepoStateIn(t, t.Context(), repo)
+	scopedState := repoStateForDirtyScope(state, plan.dirtyScope)
+	stateHash := scopedFallbackStateHash(paths, scopedState)
+
+	buildScorer := &hybridTestScorer{}
+	buildExecution := testSemanticSearchExecution(t, func(context.Context) (semanticModel, error) {
+		return buildScorer, nil
+	})
+	buildPlan := plan
+	if _, builtState, err := ensureScopedGitCorpusFallback(
+		t.Context(),
+		&buildPlan,
+		paths,
+		state,
+		buildExecution,
+	); err != nil || builtState != corpusSearchable {
+		t.Fatalf("build scoped joined generation: state=%d error=%v", builtState, err)
+	}
 	if !joinedGenerationMatches(
 		plan.scopedCacheDir,
 		plan.scopedIndexDir,
 		stateHash,
 		state.HeadSHA,
 	) {
-		t.Fatal("default over-cap scoped build did not activate a joined generation")
+		t.Fatal("the scoped fallback did not build a joined generation when asked")
 	}
-	assertIndexOnlyModelCalls(t, scorer)
-	scorer.mu.Lock()
-	embeddedPaths := append([]string(nil), scorer.embeddedPaths...)
-	scorer.mu.Unlock()
-	if len(embeddedPaths) == 0 {
-		t.Fatal("scoped semantic build embedded no paths")
+	// The scoped build must embed only in-scope files. The end-to-end half no
+	// longer builds anything, so this is the only place that still checks it.
+	buildScorer.mu.Lock()
+	scopedPaths := append([]string(nil), buildScorer.embeddedPaths...)
+	buildScorer.mu.Unlock()
+	if len(scopedPaths) == 0 {
+		t.Fatal("the scoped semantic build embedded no paths")
 	}
-	for _, path := range embeddedPaths {
+	for _, path := range scopedPaths {
 		if path != "small/app.go" {
-			t.Fatalf("scoped semantic build embedded %q", path)
+			t.Fatalf("the scoped semantic build embedded %q, which is out of scope", path)
 		}
 	}
+	// Index-time work only: the build must not prepare or score a query.
+	assertIndexOnlyModelCalls(t, buildScorer)
 
 	removeJoinedGeneration(plan.scopedCacheDir)
 	var repairFactoryCalls atomic.Int32
-	repairFuture := newSemanticModelFuture(func(context.Context) (semanticModel, error) {
+	repairExecution := testSemanticSearchExecution(t, func(context.Context) (semanticModel, error) {
 		repairFactoryCalls.Add(1)
 		return &hybridTestScorer{}, nil
 	})
-	t.Cleanup(func() { _ = repairFuture.Close() })
 	repairPlan := plan
 	_, repairedState, err := ensureScopedGitCorpusFallback(
 		t.Context(),
 		&repairPlan,
 		paths,
 		state,
-		searchExecution{policy: defaultSearchPolicy(), model: repairFuture},
+		repairExecution,
 	)
 	if err != nil || repairedState != corpusSearchable {
 		t.Fatalf("repair scoped joined descriptor: state=%d error=%v", repairedState, err)
@@ -1075,10 +1156,7 @@ func TestRunLexicalOnlyBuildsNoSemanticDataAndStartsNoModel(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(plan.cacheDir, joinedGenerationFile)); !os.IsNotExist(err) {
 		t.Fatalf("lexical-only search created a joined descriptor: %v", err)
 	}
-	semanticDirs, err := filepath.Glob(filepath.Join(plan.indexDir, semanticGenerationPrefix+"*"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	semanticDirs := semanticGenerationDirs(t, plan.indexDir)
 	if len(semanticDirs) != 0 {
 		t.Fatalf("lexical-only search created semantic data: %v", semanticDirs)
 	}
@@ -1090,11 +1168,9 @@ func TestDefaultFolderBuildPublishesAndUpdatesJoinedGeneration(t *testing.T) {
 	writeFileAt(t, folder, "app.go", "package sample\n// first semantic folder text\n")
 	plan := planFolderTestCorpus(t, folder)
 	scorer := &hybridTestScorer{}
-	future := newSemanticModelFuture(func(context.Context) (semanticModel, error) {
+	execution := testSemanticSearchExecution(t, func(context.Context) (semanticModel, error) {
 		return scorer, nil
 	})
-	t.Cleanup(func() { _ = future.Close() })
-	execution := searchExecution{policy: defaultSearchPolicy(), model: future}
 
 	if state, err := ensureFolderCorpusFreshWithExecution(t.Context(), plan, execution); err != nil {
 		t.Fatal(err)
@@ -1123,10 +1199,7 @@ func TestDefaultFolderBuildPublishesAndUpdatesJoinedGeneration(t *testing.T) {
 	if !joinedGenerationMatches(plan.cacheDir, plan.indexDir, secondState, secondState) {
 		t.Fatal("updated folder build did not activate a joined generation")
 	}
-	semanticDirs, err := filepath.Glob(filepath.Join(plan.indexDir, semanticGenerationPrefix+"*"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	semanticDirs := semanticGenerationDirs(t, plan.indexDir)
 	if len(semanticDirs) != 1 {
 		t.Fatalf("semantic generation directories=%v, want one current directory", semanticDirs)
 	}
@@ -1145,7 +1218,7 @@ func TestLexicalOnlyFolderBuildStartsNoModelAndWritesNoSemanticData(t *testing.T
 		factoryCalls.Add(1)
 		return nil, fmt.Errorf("model must not start")
 	})
-	execution := searchExecution{policy: lexicalOnlySearchPolicy(), model: future}
+	execution := searchExecution{policy: lexicalOnlySearchPolicy(), model: future, prepareVectors: true}
 
 	if _, err := ensureFolderCorpusFreshWithExecution(t.Context(), plan, execution); err != nil {
 		t.Fatal(err)
@@ -1156,10 +1229,7 @@ func TestLexicalOnlyFolderBuildStartsNoModelAndWritesNoSemanticData(t *testing.T
 	if _, err := os.Lstat(filepath.Join(plan.cacheDir, joinedGenerationFile)); !os.IsNotExist(err) {
 		t.Fatalf("lexical-only folder build created a joined descriptor: %v", err)
 	}
-	semanticDirs, err := filepath.Glob(filepath.Join(plan.indexDir, semanticGenerationPrefix+"*"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	semanticDirs := semanticGenerationDirs(t, plan.indexDir)
 	if len(semanticDirs) != 0 {
 		t.Fatalf("lexical-only folder build created semantic data: %v", semanticDirs)
 	}

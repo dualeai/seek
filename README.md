@@ -226,9 +226,13 @@ If meaning-based search is unavailable, Seek can still use the model to rank tex
 matches. If the model fails, Seek returns results that contain every query
 word. Use `--verbose` to see why it used another search method.
 
-Unless `--lexical-only` is set, Seek keeps both its text and meaning-based
-indexes up to date. This includes exact queries that use text ranking. Use
-`--lexical-only` to skip the meaning-based index and all model work.
+Seek builds meaning-based data only for a search that can read it: one corpus,
+no path scope, and a query the ranker can expand. An exact word, a symbol
+lookup, a phrase, or a search over more than one corpus uses text ranking, so
+Seek keeps its text index up to date and builds no meaning-based data for it.
+The first search that can use meaning-based data builds it. Use
+`--lexical-only` to skip the meaning-based index and all model work for every
+query.
 
 Seek selects the model run-time provider for the host. Set `SEEK_PROVIDER` to
 pin one when you report a problem, so the report names one provider: `cpu` runs

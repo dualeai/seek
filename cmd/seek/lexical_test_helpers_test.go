@@ -2,12 +2,31 @@ package main
 
 import (
 	"context"
+	"testing"
 
 	"github.com/sourcegraph/zoekt/query"
 )
 
 func testLexicalSearchExecution() searchExecution {
 	return searchExecution{policy: lexicalOnlySearchPolicy()}
+}
+
+// testSemanticSearchExecution offers a model to a corpus build and asks for
+// vector preparation, closing the future when the test ends.
+//
+// prepareVectors is set here because routing decides it in production, from the
+// query and corpus shape, and a test that calls a corpus entry point directly
+// bypasses that decision. A test that drives a whole search must not use this:
+// it should let runSearchCommand decide.
+func testSemanticSearchExecution(tb testing.TB, factory semanticModelFactory) searchExecution {
+	tb.Helper()
+	future := newSemanticModelFuture(factory)
+	tb.Cleanup(func() { _ = future.Close() })
+	return searchExecution{
+		policy:         defaultSearchPolicy(),
+		model:          future,
+		prepareVectors: true,
+	}
 }
 
 func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexState, error) {
