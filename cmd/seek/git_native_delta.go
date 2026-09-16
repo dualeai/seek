@@ -114,10 +114,11 @@ func prepareNativeGitDelta(
 	if err != nil || !ok || existing == nil {
 		return nil, false, nil
 	}
-	if len(existing.Branches) != 1 || existing.Branches[0].Name != "HEAD" {
+	existingHead, ok := recordedHeadVersion(existing)
+	if !ok {
 		return nil, false, nil
 	}
-	baseOID, err := parseGitObjectID([]byte(existing.Branches[0].Version))
+	baseOID, err := parseGitObjectID([]byte(existingHead))
 	if err != nil || len(baseOID) != len(target.commitOID) || baseOID == target.commitOID {
 		return nil, false, nil
 	}
