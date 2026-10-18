@@ -221,10 +221,8 @@ func runSearchCommand(
 	// cannot serve: a scope, more than one corpus, or an unsupported kind.
 	// Without both, a search builds and binds a generation that nothing reads.
 	//
-	// What this does not cover: neither input reads the working-tree state, so
-	// a dirty tree still prepares vectors and still discards the route at
-	// hybrid_search.go:95. Narrowing that needs the dirty state at the point
-	// the decision is made.
+	// ensureCombinedGitCorpusWithExecution also excludes dirty Git state once
+	// it has the captured state used for index preparation.
 	//
 	// hybridSearchEligible reads execution.model, so this must follow the block
 	// above that assigns it.
@@ -243,13 +241,15 @@ func runSearchCommand(
 		searchQuery query.Q,
 		searchOptions searchConfig,
 	) ([]corpusSearchResult, dirtyFilesByCorpus, error) {
+		lexicalExecution := execution
+		lexicalExecution.prepareVectors = false
 		return searchCorporaWithExecution(
 			searchCtx,
 			searchPlans,
 			searchPaths,
 			searchQuery,
 			searchOptions,
-			execution,
+			lexicalExecution,
 		)
 	}
 	var allResults []corpusSearchResult
@@ -664,7 +664,7 @@ func ensureCombinedGitCorpusWithExecution(
 		ensureFSMonitor(ctx, paths)
 	}
 
-	if plan.skipVectors {
+	if plan.skipVectors || len(state.Files) != 0 {
 		execution.prepareVectors = false
 	}
 	currentState := gitCorpusStateHash(paths, state)

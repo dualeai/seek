@@ -20,6 +20,7 @@ import (
 )
 
 type hybridTestScorer struct {
+	packCalls      atomic.Int32
 	prepareCalls   atomic.Int32
 	embedCalls     atomic.Int32
 	scoreCalls     atomic.Int32
@@ -35,10 +36,11 @@ type hybridTestScorer struct {
 	embeddedPaths  []string
 }
 
-func (*hybridTestScorer) PackSemanticUnits(
+func (scorer *hybridTestScorer) PackSemanticUnits(
 	_ context.Context,
 	units []semanticUnit,
 ) ([]semanticUnit, error) {
+	scorer.packCalls.Add(1)
 	return units, nil
 }
 
@@ -1094,15 +1096,20 @@ func TestRunDefaultSemanticBuildFailureKeepsLexicalSearchAndCanRepair(t *testing
 	}
 	wantErr := errors.New("test semantic build failure")
 	logs := captureTestLogs(t, slog.LevelDebug)
+	scorer := &hybridTestScorer{embedErr: wantErr}
 
 	output, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
-		return &hybridTestScorer{
-			embedErr:   wantErr,
-			prepareErr: wantErr,
-		}, nil
+		return scorer, nil
 	})
-	if err != nil || output != lexicalOutput {
-		t.Fatalf("semantic build fallback: error=%v output=%q, want %q", err, output, lexicalOutput)
+	if err != nil || !strings.Contains(output, "## strict.go") || !strings.Contains(output, "## relaxed.go") {
+		t.Fatalf("semantic build fallback: error=%v output=%q; lexical control=%q", err, output, lexicalOutput)
+	}
+	// One failed build stops embedding; the query is still prepared and the
+	// lexical candidates are scored once, and the model is closed once.
+	if scorer.embedCalls.Load() != 1 || scorer.prepareCalls.Load() != 1 ||
+		scorer.scoreCalls.Load() != 1 || scorer.closeCalls.Load() != 1 {
+		t.Fatalf("fallback calls embed=%d prepare=%d score=%d close=%d",
+			scorer.embedCalls.Load(), scorer.prepareCalls.Load(), scorer.scoreCalls.Load(), scorer.closeCalls.Load())
 	}
 	if _, statErr := os.Lstat(filepath.Join(plan.cacheDir, joinedGenerationFile)); !os.IsNotExist(statErr) {
 		t.Fatalf("failed semantic build left a joined descriptor: %v", statErr)
@@ -1180,6 +1187,52 @@ func TestRunDefaultSemanticQueryFailureUsesLexicalOutput(t *testing.T) {
 	assertTestLogError(t, logs, "Joined search failed; using the lexical path", wantErr)
 	if scorer.embedCalls.Load() != 1 || scorer.prepareCalls.Load() != 1 || scorer.scoreCalls.Load() != 0 {
 		t.Fatalf("query failure calls embed=%d prepare=%d score=%d", scorer.embedCalls.Load(), scorer.prepareCalls.Load(), scorer.scoreCalls.Load())
+	}
+}
+
+func TestDirtyGitSearchSkipsVectorsAndRepairsWhenClean(t *testing.T) {
+	requireTools(t)
+	for _, seeded := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing-vectors=%t", seeded), func(t *testing.T) {
+			repo := initGitRepo(t, "app.go", "package sample\n// alpha beta\n")
+			writeFileAt(t, repo, "relaxed.go", "package sample\n// alpha\n")
+			gitRunIn(t, repo, "add", ".")
+			gitRunIn(t, repo, "commit", "-m", "second candidate")
+			setTestUserCache(t)
+			if seeded {
+				if _, err := runHybridTestSearch(t, "alpha beta", []string{repo}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
+					return &hybridTestScorer{}, nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeFileAt(t, repo, "app.go", "package sample\n// alpha beta DIRTY_MARKER\n")
+			dirty := &hybridTestScorer{}
+			out, err := runHybridTestSearch(t, "alpha beta", []string{repo}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
+				return dirty, nil
+			})
+			if err != nil || !strings.Contains(out, "DIRTY_MARKER") || !strings.Contains(out, "[uncommitted]") {
+				t.Fatalf("dirty output=%q error=%v", out, err)
+			}
+			if dirty.packCalls.Load() != 0 || dirty.embedCalls.Load() != 0 || dirty.scoreCalls.Load() != 1 {
+				t.Fatalf("dirty calls pack=%d embed=%d score=%d", dirty.packCalls.Load(), dirty.embedCalls.Load(), dirty.scoreCalls.Load())
+			}
+			gitRunIn(t, repo, "checkout", "--", "app.go")
+			clean := &hybridTestScorer{}
+			out, err = runHybridTestSearch(t, "alpha beta", []string{repo}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
+				return clean, nil
+			})
+			if err != nil || !strings.Contains(out, "## app.go") || strings.Contains(out, "DIRTY_MARKER") {
+				t.Fatalf("clean output=%q error=%v", out, err)
+			}
+			wantEmbeds := int32(1)
+			if seeded {
+				wantEmbeds = 0
+			}
+			if clean.embedCalls.Load() != wantEmbeds {
+				t.Fatalf("next clean embeds=%d, want %d", clean.embedCalls.Load(), wantEmbeds)
+			}
+		})
 	}
 }
 
