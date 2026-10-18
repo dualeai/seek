@@ -1428,9 +1428,9 @@ func twoDigitTestNumber(value int) string {
 func TestRunDefaultFolderJoinedSearchFindsGuardedFileByMeaning(t *testing.T) {
 	requireTools(t)
 	if testing.Short() {
-		t.Skip("indexes an 11 MiB file")
+		t.Skip("indexes a 3 MiB file")
 	}
-	swapShardFormatLimitForTest(t, 30<<20)
+	swapGuardLimitsForTest(t)
 	t.Chdir(t.TempDir())
 	folder := t.TempDir()
 	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
@@ -1444,7 +1444,7 @@ func TestRunDefaultFolderJoinedSearchFindsGuardedFileByMeaning(t *testing.T) {
 	// semantic match and the test does not depend on how a long file ranks.
 	var guarded strings.Builder
 	guarded.WriteString("package sample\n// " + needle + " SEMANTIC_TARGET dispatches a request to its handler\n")
-	for _, line := range strings.SplitAfter(string(randomWordText(5, 11<<20, "")), "\n") {
+	for _, line := range strings.SplitAfter(string(randomWordText(5, 5<<19, "")), "\n") {
 		if line != "" && line != "\n" {
 			guarded.WriteString("// SEMANTIC_TARGET " + line)
 		}

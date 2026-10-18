@@ -55,10 +55,12 @@ const (
 	// stateVersion is the prefix used in state hashing to invalidate previous
 	// state formats when the hash algorithm or input format changes.
 	stateVersion = "v6\x00"
-	// shardMax is the maximum corpus size (in bytes) per zoekt shard.
-	// Smaller shards let Zoekt build more shards concurrently.
-	shardMax = 10 * 1024 * 1024 // 10 MB
 )
+
+// shardMax is the maximum corpus size (in bytes) per zoekt shard.
+// Smaller shards let Zoekt build more shards concurrently. It is a variable so
+// tests can swap it; production callers treat it as read-only.
+var shardMax = 10 * 1024 * 1024 // 10 MB
 
 // largeDocumentParallelism bounds concurrent shard and ctags jobs for documents
 // that fill a shard of their own (isolatesShard): one per CPU, and at least 3,

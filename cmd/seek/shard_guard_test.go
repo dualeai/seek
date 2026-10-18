@@ -48,14 +48,35 @@ func guardShardReport(t *testing.T, dir string) (int, map[string][]string) {
 	return wrapped, contents
 }
 
+// The guard tests scale Zoekt's limits down, so they index a few MiB, not
+// tens of MiB. A document above guardShardMax that Zoekt keeps fills a shard
+// of its own, and a shard file above guardShardFormatLimit counts as wrapped.
+// A random-word shard takes about 2.8 MiB plus 3.9 bytes per content byte: the
+// 1.25 MiB fits.txt makes about 7.7 MiB and fits, and the 2.5 MiB wraps.txt
+// makes about 12.7 MiB and wraps.
+const (
+	// Below folderDeltaShardMax (1 MiB), so the default and folder delta
+	// builders keep different shard sizes.
+	guardShardMax         = 1 << 19  // 512 KiB
+	guardShardFormatLimit = 10 << 20 // 10 MiB
+)
+
+// swapGuardLimitsForTest sets shardMax and shardFormatLimit to the guard
+// test values for one test.
+func swapGuardLimitsForTest(tb testing.TB) {
+	tb.Helper()
+	swapShardMaxForTest(tb, guardShardMax)
+	swapShardFormatLimitForTest(tb, guardShardFormatLimit)
+}
+
 // guardDocs returns a document that Zoekt skips at Add (NUL bytes, so it does
-// not flush), one that fits, and one that wraps under a 60 MiB limit, in the
-// given order of names.
+// not flush), one that fits, and one that wraps under the guard limits, in the
+// given order of names. Each is above guardShardMax.
 func guardDocs(order ...string) []fileContent {
 	documents := map[string]fileContent{
-		"bin.dat":   {name: "bin.dat", content: make([]byte, 12<<20)},
-		"fits.txt":  {name: "fits.txt", content: randomWordText(3, 12<<20, "guard_fits_needle")},
-		"wraps.txt": {name: "wraps.txt", content: randomWordText(4, 20<<20, "guard_wraps_needle")},
+		"bin.dat":   {name: "bin.dat", content: make([]byte, 5<<18)},
+		"fits.txt":  {name: "fits.txt", content: randomWordText(3, 5<<18, "guard_fits_needle")},
+		"wraps.txt": {name: "wraps.txt", content: randomWordText(4, 5<<19, "guard_wraps_needle")},
 	}
 	docs := make([]fileContent, len(order))
 	for i, name := range order {
@@ -84,7 +105,7 @@ func expectGuardedShards(t *testing.T, dir string) {
 func TestGuardWrappedShards_SkippedDocumentDoesNotShiftMapping(t *testing.T) {
 	requireTools(t)
 	if testing.Short() {
-		t.Skip("indexes 44 MiB")
+		t.Skip("indexes 5 MiB per build")
 	}
 	orders := map[string][]string{
 		// A skipped document first must not shift the mapping.
@@ -111,7 +132,7 @@ func TestGuardWrappedShards_SkippedDocumentDoesNotShiftMapping(t *testing.T) {
 			return err
 		},
 	}
-	swapShardFormatLimitForTest(t, 60<<20)
+	swapGuardLimitsForTest(t)
 	for name, order := range orders {
 		for builderName, build := range builders {
 			t.Run(name+"/"+builderName, func(t *testing.T) {

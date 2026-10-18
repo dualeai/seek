@@ -27,6 +27,12 @@ func swapShardFormatLimitForTest(tb testing.TB, limit int64) {
 	swapForTest(tb, &shardFormatLimit, limit)
 }
 
+// swapShardMaxForTest sets shardMax, the Zoekt shard size target, for one test.
+func swapShardMaxForTest(tb testing.TB, limit int) {
+	tb.Helper()
+	swapForTest(tb, &shardMax, limit)
+}
+
 // swapDocumentContentLimitForTest sets documentContentLimit for one test.
 func swapDocumentContentLimitForTest(tb testing.TB, limit int64) {
 	tb.Helper()

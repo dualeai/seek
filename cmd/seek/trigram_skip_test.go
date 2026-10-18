@@ -164,21 +164,21 @@ func randomWordText(seed uint64, size int, needle string) []byte {
 	return []byte(content.String())
 }
 
-// TestRun_ShardGuardKeepsOversizedShardsNameOnly lowers the shard format limit
-// so a 20 MiB document "wraps" while a 12 MiB one fits. The wrapped document
-// must keep only its name, the exact-file warning must report it, and every
-// other document must stay searchable.
+// TestRun_ShardGuardKeepsOversizedShardsNameOnly lowers the shard limits
+// (swapGuardLimitsForTest) so a 2.5 MiB document "wraps" while a 1.25 MiB one
+// fits. The wrapped document must keep only its name, the exact-file warning
+// must report it, and every other document must stay searchable.
 func TestRun_ShardGuardKeepsOversizedShardsNameOnly(t *testing.T) {
 	requireTools(t)
 	if testing.Short() {
-		t.Skip("indexes 32 MiB of text")
+		t.Skip("indexes 3.75 MiB of text per build")
 	}
 	// The same fitting and wrapping documents as the builder-level guard tests.
 	const fitsNeedle, wrapsNeedle = "guard_fits_needle", "guard_wraps_needle"
 	docs := guardDocs("fits.txt", "wraps.txt")
 	fits, wraps := docs[0].content, docs[1].content
 	small := []byte("guard_small_needle_marker\n")
-	swapShardFormatLimitForTest(t, 60<<20)
+	swapGuardLimitsForTest(t)
 
 	check := func(t *testing.T, dir string, operands []string, wrapsPath string) {
 		t.Helper()
