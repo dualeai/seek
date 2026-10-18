@@ -13,15 +13,15 @@ func readWeight(size int64) int64 {
 }
 
 // readSemaphore bounds document weight in flight across reader entry points.
-// Budget is maxInFlightBytes (caps.go); each document takes readWeight of its
+// Budget is readBudgetBytes (caps.go); each document takes readWeight of its
 // size. Acquire on the reader side; the Release contract lives on
 // fileContent.weight (indexer.go).
-var readSemaphore = semaphore.NewWeighted(maxInFlightBytes)
+var readSemaphore = semaphore.NewWeighted(readBudgetBytes)
 
 // largeDocumentSemaphore bounds large shard and ctags jobs across all active
 // corpora. It limits concurrency only; every document still gets normal
 // content and symbol analysis.
-var largeDocumentSemaphore = semaphore.NewWeighted(largeDocumentParallelism)
+var largeDocumentSemaphore = semaphore.NewWeighted(int64(largeDocumentParallelism))
 
 // releaseFileContentWeights releases readSemaphore weight for every document
 // that carries non-zero weight. It is safe on nil, empty, and all-zero slices.

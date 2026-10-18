@@ -46,7 +46,7 @@ func waitUntilSemaphoreBelow(t *testing.T, sem *semaphore.Weighted, threshold in
 // Callers touching the shared readSemaphore MUST hold testReadSemMu for the
 // full before-action-after sequence.
 func availableWeight(sem *semaphore.Weighted) int64 {
-	lo, hi := int64(0), int64(maxInFlightBytes)
+	lo, hi := int64(0), readBudgetBytes
 	for lo < hi {
 		mid := (lo + hi + 1) / 2
 		if sem.TryAcquire(mid) {
@@ -102,12 +102,15 @@ func TestReader_OversizeCandidate_NoSemaphoreTouch(t *testing.T) {
 func TestReader_AboveBudgetCandidate_ClampsWeight(t *testing.T) {
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
+	// The budget grows with host memory and can pass the content limit; raise
+	// the limit so the candidate takes the weighted read path.
+	swapDocumentContentLimitForTest(t, readBudgetBytes+2)
 
 	before := availableWeight(readSemaphore)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	out := make(chan fileContent, 1)
-	c := folderCandidate{name: "huge", path: "/nonexistent/huge", size: maxInFlightBytes + 1}
+	c := folderCandidate{name: "huge", path: "/nonexistent/huge", size: readBudgetBytes + 1}
 	start := time.Now()
 	readOneFolderFileStreaming(ctx, c, out)
 	close(out)

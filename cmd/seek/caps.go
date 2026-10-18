@@ -36,36 +36,44 @@ const (
 	maxFolderIndexedBytes = maxCorpusIndexedBytes
 
 	// maxReadWeightBytes is the largest readSemaphore weight one document
-	// takes (readWeight). The read budget, maxInFlightBytes, is sized in these
-	// units, not by the document size limit.
+	// takes (readWeight). The smallest read budget, maxInFlightBytes, is sized
+	// in these units, not by the document size limit.
 	maxReadWeightBytes = 100 * 1024 * 1024 // 100 MiB
 
 	// corpusWorkerCap limits active corpus indexers. Each corpus indexer can
 	// also use the internal parallelism returned by indexParallelism.
 	corpusWorkerCap = 4
 
-	// maxInFlightBytes is the global semaphore capacity for accounted document
-	// content across all corpus readers and builders. Capacity grows by six
-	// maximum-weight documents per corpus slot; workers do not own separate
-	// quotas. Readers acquire weight, and consumers release it after the
-	// Builder.Finish that stops retaining the document. Other allocations are
-	// not covered, so this value does not bound process RSS.
+	// maxInFlightBytes is the smallest readSemaphore capacity: six
+	// maximum-weight documents per corpus slot. readBudgetBytes grows the
+	// capacity with the host's memory.
 	maxInFlightBytes = 6 * maxReadWeightBytes * corpusWorkerCap
 
-	// defaultIndexWindowBytes sets the document-weight rotation point in
-	// indexDocumentsWithRepository. A consumer rotates when its pending weight
-	// reaches or passes this point, so one document can take it past the point.
-	// The formula keeps headroom beyond N rotation points: N*window + 2*doc is
-	// within the semaphore budget. This is not an exact bound on pending weight
-	// or process memory. The compile-time checks below enforce these limits.
+	// defaultIndexWindowBytes is the rotation point for the smallest budget,
+	// maxInFlightBytes. The compile-time checks below prove the window rules
+	// with it; indexWindowBytes applies the same formula to the real budget.
 	defaultIndexWindowBytes = (maxInFlightBytes - 2*maxReadWeightBytes) / (2 * corpusWorkerCap)
 )
 
-// indexWindowBytes is the live rotation threshold for
+// readBudgetBytes is the global readSemaphore capacity for accounted document
+// content across all corpus readers and builders; workers do not own separate
+// quotas. Readers acquire weight, and consumers release it after the
+// Builder.Finish that stops retaining the document. Seek's objective is the
+// shortest time, so the budget grows with the host: a quarter of its physical
+// memory, and at least maxInFlightBytes. Zoekt needs several times the content
+// it builds, so the rest of memory is left for the builds. Other allocations
+// are not covered, so this value does not bound process RSS.
+var readBudgetBytes = max(int64(maxInFlightBytes), hostPhysicalMemory()/4)
+
+// indexWindowBytes is the live document-weight rotation point for
 // indexDocumentsWithRepository and the payload limit for native Git delta
-// admission. It is a variable so tests can shrink it through
-// swapIndexWindowBytesForTest; production callers treat it as read-only.
-var indexWindowBytes int64 = defaultIndexWindowBytes
+// admission. A consumer rotates when its pending weight reaches or passes this
+// point, so one document can take it past the point. The formula keeps headroom
+// beyond N rotation points: N*window + 2*doc is within readBudgetBytes. This is
+// not an exact bound on pending weight or process memory. It is a variable so
+// tests can shrink it through swapIndexWindowBytesForTest; production callers
+// treat it as read-only.
+var indexWindowBytes = (readBudgetBytes - 2*maxReadWeightBytes) / (2 * corpusWorkerCap)
 
 // documentContentLimit is the most content seek gives Zoekt for one document:
 // zoektShardFormatBytes, because one shard cannot hold more. Every reader sends

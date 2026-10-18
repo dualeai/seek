@@ -58,11 +58,15 @@ const (
 	// shardMax is the maximum corpus size (in bytes) per zoekt shard.
 	// Smaller shards let Zoekt build more shards concurrently.
 	shardMax = 10 * 1024 * 1024 // 10 MB
-	// largeDocumentParallelism bounds concurrent shard and ctags jobs when one
-	// document is larger than a normal shard. Seek does not reduce index quality
-	// for these files: it still indexes full content and runs symbol analysis.
-	largeDocumentParallelism = 3
 )
+
+// largeDocumentParallelism bounds concurrent shard and ctags jobs for documents
+// that fill a shard of their own (isolatesShard): one per CPU, and at least 3,
+// because seek's objective is the shortest time. Large windows also rotate on
+// their real content bytes, which bounds memory for documents above the
+// read-weight clamp. Seek does not reduce index quality for these files: it
+// still indexes full content and runs symbol analysis.
+var largeDocumentParallelism = max(3, runtime.GOMAXPROCS(0))
 
 // computeStateHash computes the xxHash64 of the given state string.
 // In production, the input is a repoStateFingerprint (raw git status output
@@ -945,7 +949,7 @@ func readOneDirtyFile(ctx context.Context, repoDir, f string, out chan<- fileCon
 // public Builder API accepts []byte documents, not io.Reader streams.
 // In-flight memory is bounded by two limits, whichever is tighter:
 //   - the worker count (each worker holds at most one fileContent),
-//   - readSemaphore's maxInFlightBytes byte budget (see caps.go).
+//   - readSemaphore's readBudgetBytes weight budget (see caps.go).
 //
 // Each yielded fileContent carries its reserved readSemaphore weight. The
 // consumer releases it after Builder.Finish returns. A caller must drain the

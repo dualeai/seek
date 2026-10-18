@@ -1418,7 +1418,7 @@ func appendFolderFingerprintBytes(h *xxhash.Digest, part []byte) {
 // each folder candidate. The output channel is unbuffered. In-flight
 // memory is bounded by two limits, whichever is tighter:
 //   - the worker count (each worker holds at most one fileContent),
-//   - readSemaphore's maxInFlightBytes byte budget (see caps.go).
+//   - readSemaphore's readBudgetBytes weight budget (see caps.go).
 //
 // Each yielded fileContent carries readWeight of the candidate's pre-read size
 // as its readSemaphore weight; a name-only document carries zero. The consumer

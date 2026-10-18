@@ -8,6 +8,9 @@ to find and rank code by meaning. No server or API key is needed.
 Seek caches indexes for fast repeat searches and safe concurrent use. Run it as
 a tool call or shell command.
 
+Seek is built for the shortest search time, not for low resource use. It uses
+all CPU cores and as much memory and cache space as a search needs.
+
 <!-- Status -->
 [![CI](https://github.com/dualeai/seek/actions/workflows/ci.yml/badge.svg)](https://github.com/dualeai/seek/actions/workflows/ci.yml)
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/dualeai/seek?utm_source=badge)
@@ -348,6 +351,10 @@ Seek has no file-size limit. Folder indexing stops at 1,000,000 files or
 10 GiB. Git applies limits of 10,000,000 files and 10 GiB separately to
 committed files and local changes. A scoped search can still index its selected
 paths when the complete repository exceeds a limit.
+
+To finish sooner, the text index reads file content in parallel up to a quarter
+of the host's physical memory at a time, and builds files that fill an index
+shard alone on all CPU cores at once.
 
 Text search covers the full content of every text file, however large it is and
 however many different character sequences it holds. The only limit for one
