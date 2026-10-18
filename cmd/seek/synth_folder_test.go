@@ -43,6 +43,11 @@ func planSynthCorpus(t *testing.T, root string) corpusPlan {
 	return plan
 }
 
+// synthFolderWords is the vocabulary of writeRandomFolder in long mode.
+var synthFolderWords = []string{
+	"alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+}
+
 // writeRandomFolder synthesises a temp directory containing files whose
 // cumulative Lstat sizes equal `total`. Each file holds `fileSize`
 // bytes (the last file is truncated to make the sum exact).
@@ -51,9 +56,14 @@ func planSynthCorpus(t *testing.T, root string) corpusPlan {
 //   - testing.Short() — uses writeSparseFile: a text prefix, then a
 //     SPARSE rest. The readSemaphore Acquire path keys off Lstat.Size, so
 //     sparse files drive the deadlock just as well as real bytes, but cost
-//     ~zero disk space and CPU. Use this for CI.
-//   - long mode — fills with deterministic pseudo-random printable ASCII
-//     seeded from t.Name() so reproductions are stable.
+//     ~zero disk space and CPU.
+//   - long mode, which CI runs — fills with words from synthFolderWords,
+//     picked by a generator seeded from t.Name() so reproductions are stable.
+//     Callers check read weight, window rotation, and cancellation. None of
+//     them searches the generated words; the beacon tests search a separate
+//     file. The small vocabulary has few distinct trigrams, so Zoekt indexes
+//     the full content at a low cost; random printable ASCII made the callers
+//     about 8 times slower under -race.
 //
 // Caller owns the returned path via t.TempDir(); no cleanup required.
 func writeRandomFolder(t *testing.T, total, fileSize int64) string {
@@ -82,13 +92,18 @@ func writeRandomFolder(t *testing.T, total, fileSize int64) string {
 		if testing.Short() {
 			writeSparseFile(t, p, sz)
 		} else {
-			// Random printable ASCII: high entropy, but no NUL byte, so the
-			// content is indexable text, not a binary file.
-			buf := make([]byte, sz)
-			for j := range buf {
-				buf[j] = byte('!' + rng.IntN('~'-'!'+1))
+			// Words and spaces have no NUL byte, so the content is indexable
+			// text, not a binary file.
+			buf := make([]byte, 0, sz+16)
+			for word := 0; int64(len(buf)) < sz; word++ {
+				buf = append(buf, synthFolderWords[rng.IntN(len(synthFolderWords))]...)
+				if word%10 == 9 {
+					buf = append(buf, '\n')
+				} else {
+					buf = append(buf, ' ')
+				}
 			}
-			if err := os.WriteFile(p, buf, 0o644); err != nil {
+			if err := os.WriteFile(p, buf[:sz], 0o644); err != nil {
 				t.Fatalf("writeRandomFolder: %v", err)
 			}
 		}
