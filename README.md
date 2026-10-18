@@ -366,6 +366,10 @@ match these names, not their content. Large files with much non-ASCII text, such
 as CJK prose, need much memory to index: 100 MiB of random CJK characters needs
 about 6.6 GiB.
 
+When a search of a file path operand finds no content match and the index holds
+no content for that file, Seek writes a warning with the reason to standard
+error. Searches of folders and repositories do not write this warning.
+
 The meaning-based index skips empty files, files with a NUL byte, and generated
 files with the standard `// Code generated ... DO NOT EDIT.` marker in the first
 4 KiB. Generated files can still appear in text results.

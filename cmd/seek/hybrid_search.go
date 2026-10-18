@@ -94,6 +94,7 @@ func tryHybridSearch(
 		plan.scopedStateHash != "" {
 		return nil, nil, false, nil
 	}
+	execution.prepared.record(plan)
 	if indexState == corpusKnownEmpty {
 		touchPlanUsed(plan)
 		return nil, nil, true, nil
@@ -249,6 +250,7 @@ func tryHybridFolderSearch(
 	if foundNestedGit.Load() {
 		return nil, nil, false, nil
 	}
+	execution.prepared.record(plan)
 	if indexState == corpusKnownEmpty {
 		touchPlanUsed(plan)
 		return nil, nil, true, nil

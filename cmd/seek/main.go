@@ -202,6 +202,7 @@ func runSearchCommand(
 		policy:     runConfig.policy,
 		acceptance: runConfig.hybridAcceptance,
 		resources:  liveSearchResources(),
+		prepared:   &preparedCorpora{},
 	}
 	if runConfig.newModel != nil && runConfig.policy.semanticEnabled() {
 		execution.model = newSemanticModelFuture(runConfig.newModel)
@@ -346,6 +347,7 @@ func runSearchCommand(
 		}
 	}
 
+	warnUnindexedFileOperands(ctx, plans, execution.prepared, pathOperands, allResults, dirtyByCorpus)
 	if len(allResults) == 0 {
 		return errNoMatch
 	}
@@ -506,6 +508,7 @@ func prepareAndSearchCorpusOnceWithExecution(
 		return nil, nil, fmt.Errorf("unsupported corpus kind: %s", plan.kind)
 	}
 
+	execution.prepared.record(plan)
 	if indexState == corpusKnownEmpty {
 		touchPlanUsed(plan)
 		return nil, dirtyFiles, nil

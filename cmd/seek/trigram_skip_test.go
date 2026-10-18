@@ -166,7 +166,8 @@ func randomWordText(seed uint64, size int, needle string) []byte {
 
 // TestRun_ShardGuardKeepsOversizedShardsNameOnly lowers the shard format limit
 // so a 20 MiB document "wraps" while a 12 MiB one fits. The wrapped document
-// must keep only its name, and every other document must stay searchable.
+// must keep only its name, the exact-file warning must report it, and every
+// other document must stay searchable.
 func TestRun_ShardGuardKeepsOversizedShardsNameOnly(t *testing.T) {
 	requireTools(t)
 	if testing.Short() {
@@ -183,9 +184,8 @@ func TestRun_ShardGuardKeepsOversizedShardsNameOnly(t *testing.T) {
 		t.Helper()
 		expectSearchMatch(t, dir, operands, fitsNeedle, "## fits.txt")
 		expectSearchMatch(t, dir, operands, "guard_small_needle_marker", "## small.txt")
-		if out, _ := searchFrom(t, dir, wrapsNeedle, []string{wrapsPath}); strings.Contains(out, "## wraps.txt") {
-			t.Fatalf("wrapped content stays searchable:\n%s", out)
-		}
+		got := runCapturingWarnings(t, dir, wrapsNeedle, []string{wrapsPath})
+		expectWarnings(t, got, wrapsPath)
 		// The name stays searchable.
 		out, err := searchFrom(t, dir, "file:wraps", operands)
 		if err != nil || !strings.Contains(out, "## wraps.txt") {
