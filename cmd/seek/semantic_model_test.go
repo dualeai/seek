@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 )
 
 func TestSemanticCPUParallelismProvidesCapacityForEffectiveCPU(t *testing.T) {
@@ -165,5 +167,90 @@ func TestSemanticModelFutureReusesOneQueryForRetrievalAndRerank(t *testing.T) {
 	}
 	if got := scorer.closeCalls.Load(); got != 1 {
 		t.Fatalf("model close calls=%d, want 1", got)
+	}
+}
+
+type waitingQueryScorer struct {
+	countingSemanticScorer
+	release <-chan struct{}
+	err     error
+}
+
+func (scorer *waitingQueryScorer) PrepareSemanticQuery(
+	ctx context.Context,
+	query string,
+) (*semanticQueryEmbedding, error) {
+	<-scorer.release
+	prepared, _ := scorer.countingSemanticScorer.PrepareSemanticQuery(ctx, query)
+	return prepared, scorer.err
+}
+
+func TestSemanticModelFutureCloseWaitsForStartedQuery(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		err    error
+		cancel bool
+	}{
+		{name: "success"},
+		{name: "query failure", err: errors.New("query failed")},
+		{name: "cancelled native work", cancel: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				release := make(chan struct{})
+				defer func() {
+					select {
+					case <-release:
+					default:
+						close(release)
+					}
+				}()
+				scorer := &waitingQueryScorer{release: release, err: test.err}
+				future := newSemanticModelFuture(func(context.Context) (semanticModel, error) {
+					return scorer, nil
+				})
+				// Close right after startQuery: it must already see the query as
+				// started and wait for it.
+				future.startQuery(ctx, "find request handler")
+				closed := make(chan error, 1)
+				go func() { closed <- future.Close() }()
+				synctest.Wait()
+				if test.cancel {
+					cancel()
+					synctest.Wait()
+				}
+				if scorer.closeCalls.Load() != 0 {
+					t.Fatal("model closed while the query still used it")
+				}
+				close(release)
+				synctest.Wait()
+				if err := <-closed; err != nil {
+					t.Fatal(err)
+				}
+				if scorer.prepareCalls.Load() != 1 || scorer.closeCalls.Load() != 1 {
+					t.Fatalf("calls prepare=%d close=%d", scorer.prepareCalls.Load(), scorer.closeCalls.Load())
+				}
+				// A later caller gets the stored query result.
+				if _, _, err := future.prepareQuery(t.Context(), "find request handler"); !errors.Is(err, test.err) {
+					t.Fatalf("query error=%v, want %v", err, test.err)
+				}
+			})
+		})
+	}
+}
+
+func TestSemanticModelFutureCloseAfterFactoryFailure(t *testing.T) {
+	want := errors.New("model setup failed")
+	future := newSemanticModelFuture(func(context.Context) (semanticModel, error) {
+		return nil, want
+	})
+	future.startQuery(t.Context(), "find request handler")
+	if _, _, err := future.prepareQuery(t.Context(), "find request handler"); !errors.Is(err, want) {
+		t.Fatalf("query error=%v, want %v", err, want)
+	}
+	if err := future.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

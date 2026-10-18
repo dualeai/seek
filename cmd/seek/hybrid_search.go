@@ -79,9 +79,7 @@ func tryHybridSearch(
 
 	// Start the only query encoding before index preparation. Both retrieval and
 	// final MaxSim wait on this same cached result.
-	go func() {
-		_, _, _ = execution.model.prepareQuery(ctx, rerankPlan.modelQuery)
-	}()
+	execution.model.startQuery(ctx, rerankPlan.modelQuery)
 
 	state, indexState, err := ensureGitCorpusFreshWithExecution(
 		ctx,
@@ -243,9 +241,7 @@ func tryHybridFolderSearch(
 			return true
 		}
 	}
-	go func() {
-		_, _, _ = execution.model.prepareQuery(ctx, rerankPlan.modelQuery)
-	}()
+	execution.model.startQuery(ctx, rerankPlan.modelQuery)
 	indexState, err := ensureFolderCorpusFreshWithExecution(ctx, plan, execution)
 	if err != nil {
 		return nil, nil, false, err

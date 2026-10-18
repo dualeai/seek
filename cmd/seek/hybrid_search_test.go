@@ -26,6 +26,7 @@ type hybridTestScorer struct {
 	closeCalls     atomic.Int32
 	embedErr       error
 	prepareErr     error
+	scoreErr       error
 	queryTruncated bool
 	vectorForUnit  func(semanticUnit) semanticVector
 	queryVector    *semanticVector
@@ -150,6 +151,9 @@ func (scorer *hybridTestScorer) ScoresWithSemanticQuery(
 	documents []rerankDocument,
 ) ([]float32, error) {
 	scorer.scoreCalls.Add(1)
+	if scorer.scoreErr != nil {
+		return nil, scorer.scoreErr
+	}
 	scorer.mu.Lock()
 	scorer.documents = append([]rerankDocument(nil), documents...)
 	scorer.mu.Unlock()
@@ -499,6 +503,70 @@ func TestRunDefaultFolderJoinedSearchAddsSemanticOnlyFile(t *testing.T) {
 	}
 	if !joinedGenerationMatches(plan.cacheDir, plan.indexDir, state, state) {
 		t.Fatal("default folder search did not keep a joined generation")
+	}
+}
+
+func TestHybridEarlyReturnOwnsQuery(t *testing.T) {
+	requireTools(t)
+	for _, kind := range []string{"git", "folder"} {
+		for _, setupError := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/error=%t", kind, setupError), func(t *testing.T) {
+				root := t.TempDir()
+				if kind == "git" {
+					root = initEmptyGitRepo(t)
+					gitRunIn(t, root, "commit", "--allow-empty", "-m", "empty corpus")
+				}
+				setTestUserCache(t)
+				paths, err := resolveDefaultSearchRoot(t.Context(), []string{root})
+				if err != nil {
+					t.Fatal(err)
+				}
+				plans, err := planCorpora(t.Context(), paths, []string{root})
+				if err != nil || len(plans) != 1 {
+					t.Fatalf("plans=%d error=%v", len(plans), err)
+				}
+				if setupError {
+					blocker := filepath.Join(t.TempDir(), "file")
+					if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					plans[0].cacheDir = filepath.Join(blocker, "cache")
+					plans[0].indexDir = filepath.Join(plans[0].cacheDir, "index")
+				}
+				rawQ, userQ, err := parseSearchQueryForms("alpha beta")
+				if err != nil {
+					t.Fatal(err)
+				}
+				rerankPlan, eligible := planRerankQuery("alpha beta", rawQ)
+				if !eligible {
+					t.Fatal("fixture query is not eligible")
+				}
+				release := make(chan struct{})
+				scorer := &waitingQueryScorer{release: release}
+				future := newSemanticModelFuture(func(context.Context) (semanticModel, error) {
+					return scorer, nil
+				})
+				defer func() {
+					close(release)
+					if err := future.Close(); err != nil {
+						t.Error(err)
+					}
+					if scorer.prepareCalls.Load() != 1 || scorer.closeCalls.Load() != 1 {
+						t.Errorf("calls prepare=%d close=%d", scorer.prepareCalls.Load(), scorer.closeCalls.Load())
+					}
+				}()
+				execution := searchExecution{
+					policy: defaultSearchPolicy(), model: future, prepareVectors: true,
+					resources: liveSearchResources(), acceptance: alwaysAcceptRerankPolicyForTest(),
+				}
+				_, _, used, err := tryHybridSearch(t.Context(), plans, paths, userQ, defaultSearchConfig(), rerankPlan, execution)
+				// The deferred check proves ownership: Close waits for the started
+				// query, which then runs once and closes the model once.
+				if (err != nil) != setupError || used == setupError {
+					t.Fatalf("used=%t error=%v, want setup error=%t", used, err, setupError)
+				}
+			})
+		}
 	}
 }
 
@@ -999,14 +1067,18 @@ func TestRunDefaultRerankFallbackLogsCause(t *testing.T) {
 	writeFileAt(t, folder, "relaxed.go", "package sample\n// alpha\n")
 	wantErr := errors.New("test score failure")
 	logs := captureTestLogs(t, slog.LevelDebug)
+	scorer := &hybridTestScorer{scoreErr: wantErr}
 
 	output, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
-		return &fixedRerankScorer{err: wantErr}, nil
+		return scorer, nil
 	})
 	if err != nil || !strings.Contains(output, "## strict.go") {
 		t.Fatalf("fallback search: error=%v output=%q", err, output)
 	}
 	assertTestLogError(t, logs, "Re-ranking failed; using BM25", wantErr)
+	if scorer.embedCalls.Load() != 1 || scorer.prepareCalls.Load() != 1 || scorer.scoreCalls.Load() != 2 {
+		t.Fatalf("fallback calls embed=%d prepare=%d score=%d", scorer.embedCalls.Load(), scorer.prepareCalls.Load(), scorer.scoreCalls.Load())
+	}
 }
 
 func TestRunDefaultSemanticBuildFailureKeepsLexicalSearchAndCanRepair(t *testing.T) {
@@ -1093,8 +1165,9 @@ func TestRunDefaultSemanticQueryFailureUsesLexicalOutput(t *testing.T) {
 
 	wantErr := errors.New("test semantic query failure")
 	logs := captureTestLogs(t, slog.LevelDebug)
+	scorer := &hybridTestScorer{prepareErr: wantErr}
 	output, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
-		return &hybridTestScorer{prepareErr: wantErr}, nil
+		return scorer, nil
 	})
 	if err != nil || output != lexicalOutput {
 		t.Fatalf(
@@ -1105,6 +1178,9 @@ func TestRunDefaultSemanticQueryFailureUsesLexicalOutput(t *testing.T) {
 		)
 	}
 	assertTestLogError(t, logs, "Joined search failed; using the lexical path", wantErr)
+	if scorer.embedCalls.Load() != 1 || scorer.prepareCalls.Load() != 1 || scorer.scoreCalls.Load() != 0 {
+		t.Fatalf("query failure calls embed=%d prepare=%d score=%d", scorer.embedCalls.Load(), scorer.prepareCalls.Load(), scorer.scoreCalls.Load())
+	}
 }
 
 func assertTestLogError(

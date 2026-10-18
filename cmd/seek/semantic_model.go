@@ -115,12 +115,11 @@ func (future *semanticModelFuture) model(ctx context.Context) (semanticModel, er
 	}
 }
 
-func (future *semanticModelFuture) prepareQuery(
-	ctx context.Context,
-	query string,
-) (semanticModel, *semanticQueryEmbedding, error) {
+// startQuery records ownership before returning so Close waits for query work
+// even when index preparation returns before the query goroutine starts.
+func (future *semanticModelFuture) startQuery(ctx context.Context, query string) {
 	if future == nil || query == "" {
-		return nil, nil, errRerankUnavailable
+		return
 	}
 	future.queryOnce.Do(func() {
 		future.queryText = query
@@ -140,6 +139,16 @@ func (future *semanticModelFuture) prepareQuery(
 			}
 		}()
 	})
+}
+
+func (future *semanticModelFuture) prepareQuery(
+	ctx context.Context,
+	query string,
+) (semanticModel, *semanticQueryEmbedding, error) {
+	if future == nil || query == "" {
+		return nil, nil, errRerankUnavailable
+	}
+	future.startQuery(ctx, query)
 	if future.queryText != query {
 		return nil, nil, errRerankUnavailable
 	}
