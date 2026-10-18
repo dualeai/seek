@@ -9,7 +9,7 @@ func TestLargeDocumentKeepsContentAndSymbolSearch(t *testing.T) {
 	requireTools(t)
 	content := []byte("package large\n\nfunc LargeFileSymbol() {}\n// LARGE_FILE_CONTENT_MARKER\n")
 	content = append(content, bytes.Repeat([]byte("// stable filler for the large source fixture\n"), shardMax/44+1)...)
-	if len(content) <= shardMax || len(content) > maxIndexedDocumentBytes {
+	if len(content) <= shardMax || !documentContentFits(int64(len(content))) {
 		t.Fatalf("fixture size=%d, want one supported document larger than shardMax=%d", len(content), shardMax)
 	}
 

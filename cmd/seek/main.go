@@ -1071,7 +1071,8 @@ func validateCommittedHead(ctx context.Context, paths gitPaths, expectedHead str
 func gitDirtyFilesHaveIndexableDocuments(repoDir string, files []string) bool {
 	for _, name := range files {
 		info, err := os.Lstat(filepath.Join(repoDir, name))
-		if err == nil && info.Mode().IsRegular() && info.Size() <= maxGitDirtyFileSize {
+		// A file too large for the index still gets a name-only document.
+		if err == nil && info.Mode().IsRegular() {
 			return true
 		}
 	}

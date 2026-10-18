@@ -41,7 +41,9 @@ func indexOptionsHash() string {
 func indexOptionsParts() []string {
 	return []string{
 		"ctags_must_succeed", "true",
-		"size_max", strconv.Itoa(maxIndexedDocumentBytes),
+		// TrigramMax always equals SizeMax (indexBuildOptions), so size_max
+		// covers both.
+		"size_max", strconv.FormatInt(documentContentLimit, 10),
 		"shard_max", strconv.Itoa(shardMax),
 		"document_naming", seekDocumentNamingVersion,
 		"zoekt_compatibility", zoektCompatibilityVersion,

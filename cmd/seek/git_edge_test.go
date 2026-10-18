@@ -813,15 +813,17 @@ func TestAcquireBuildLock_ContextCancellation(t *testing.T) {
 	}
 }
 
-// TestIntegration_VeryLargeUncommittedFile verifies that files exceeding
-// maxGitDirtyFileSize are skipped but other files are still indexed.
+// TestIntegration_VeryLargeUncommittedFile verifies that other files are still
+// indexed when an uncommitted file exceeds testDocumentContentLimit; that file
+// is indexed by name only.
 func TestIntegration_VeryLargeUncommittedFile(t *testing.T) {
+	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// normal_content_marker\n")
 
 	// Create a file just over the limit
-	large := make([]byte, maxGitDirtyFileSize+1)
+	large := make([]byte, testDocumentContentLimit+1)
 	for i := range large {
 		large[i] = 'x'
 	}
@@ -834,7 +836,7 @@ func TestIntegration_VeryLargeUncommittedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Should index the small file, skip the large one
+	// The small file keeps its content; the large one has only its name.
 	files, err := runSeekInRepo(t, dir, "small_file_marker")
 	if err != nil {
 		t.Fatalf("search failed: %v", err)

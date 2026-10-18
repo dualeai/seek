@@ -1420,3 +1420,51 @@ func TestLexicalOnlyFolderBuildStartsNoModelAndWritesNoSemanticData(t *testing.T
 func twoDigitTestNumber(value int) string {
 	return string([]byte{'0' + byte(value/10), '0' + byte(value%10)})
 }
+
+// TestRunDefaultFolderJoinedSearchFindsGuardedFileByMeaning forces the shard
+// guard on one large file. Its text index keeps only the name, but the
+// meaning-based index reads the file itself and has no shard format limit, so a
+// descriptive search must still show the file's semantic evidence.
+func TestRunDefaultFolderJoinedSearchFindsGuardedFileByMeaning(t *testing.T) {
+	requireTools(t)
+	if testing.Short() {
+		t.Skip("indexes an 11 MiB file")
+	}
+	swapShardFormatLimitForTest(t, 30<<20)
+	t.Chdir(t.TempDir())
+	folder := t.TempDir()
+	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
+	for index := range rerankCandidateLimit {
+		writeFileAt(t, folder, fmt.Sprintf("lex-%02d.go", index),
+			"package sample\n// alpha lexical candidate\n")
+	}
+	const needle = "guarded_semantic_needle_marker"
+	// Go comment lines keep the file valid source for ctags. Every line carries
+	// the text that the test scorer targets, so each of the file's units is a
+	// semantic match and the test does not depend on how a long file ranks.
+	var guarded strings.Builder
+	guarded.WriteString("package sample\n// " + needle + " SEMANTIC_TARGET dispatches a request to its handler\n")
+	for _, line := range strings.SplitAfter(string(randomWordText(5, 11<<20, "")), "\n") {
+		if line != "" && line != "\n" {
+			guarded.WriteString("// SEMANTIC_TARGET " + line)
+		}
+	}
+	writeFileAt(t, folder, "guarded.go", guarded.String())
+
+	scorer := &hybridTestScorer{}
+	output, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
+		return scorer, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output, "## guarded.go") || !strings.Contains(output, "SEMANTIC_TARGET") {
+		t.Fatalf("joined output omitted the guarded file's semantic evidence:\n%s", output)
+	}
+
+	// The text index holds only the name: the exact term has no match there.
+	lexical, err := runHybridTestSearch(t, needle, []string{folder}, lexicalOnlySearchPolicy(), nil)
+	if !errors.Is(err, errNoMatch) {
+		t.Fatalf("lexical search of the guarded file: err=%v, output:\n%s", err, lexical)
+	}
+}

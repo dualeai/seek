@@ -686,6 +686,9 @@ func extractSemanticDocuments(
 // semanticDocumentLanguage follows Zoekt's document checks before language
 // detection so lang: filters use the same whole-file value. The caller must
 // supply its worker-local DocChecker and the lexical build's index options.
+// One case differs: when guardWrappedShards makes a document name-only after
+// the lexical build, Zoekt stores a language from the name only, while the
+// semantic rows keep the language of the content.
 func semanticDocumentLanguage(
 	checker *index.DocChecker,
 	options index.Options,

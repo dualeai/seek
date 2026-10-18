@@ -455,7 +455,7 @@ func mustHoldTestReadSemMu() {
 
 // swapIndexWindowBytesForTest sets the windowed-indexer rotation
 // threshold for the duration of a test. Pair with swapReadSemaphoreForTest
-// so the invariant indexWindowBytes + maxIndexedDocumentBytes <=
+// so the invariant indexWindowBytes + maxReadWeightBytes <=
 // semaphore budget still holds in the test scope.
 //
 // Caller MUST hold testReadSemMu for the entire swap → action → restore
@@ -490,7 +490,7 @@ func setupPressureTest(t *testing.T, budget int64) func() {
 // TestFolderReader_FileGrew_NoLeak — when readFolderFile detects the
 // file grew past its cap mid-read, it returns an error. The
 // readOneFolderFileStreaming caller must release the semaphore weight
-// it Acquired against the pre-read size.
+// it Acquired for the pre-read size (readWeight).
 func TestFolderReader_FileGrew_NoLeak(t *testing.T) {
 	done := withReadSemLock(t)
 	defer done()

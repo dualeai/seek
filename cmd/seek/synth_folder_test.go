@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"hash/crc32"
 	"math/rand/v2"
@@ -47,12 +48,12 @@ func planSynthCorpus(t *testing.T, root string) corpusPlan {
 // bytes (the last file is truncated to make the sum exact).
 //
 // Mode:
-//   - testing.Short() — uses os.Truncate to create SPARSE files. The
-//     readSemaphore Acquire path keys off Lstat.Size, so sparse files
-//     drive the deadlock just as well as real bytes, but cost ~zero
-//     disk space and CPU. Use this for CI.
-//   - long mode — fills with deterministic pseudo-random bytes seeded
-//     from t.Name() so reproductions are stable.
+//   - testing.Short() — uses writeSparseFile: a text prefix, then a
+//     SPARSE rest. The readSemaphore Acquire path keys off Lstat.Size, so
+//     sparse files drive the deadlock just as well as real bytes, but cost
+//     ~zero disk space and CPU. Use this for CI.
+//   - long mode — fills with deterministic pseudo-random printable ASCII
+//     seeded from t.Name() so reproductions are stable.
 //
 // Caller owns the returned path via t.TempDir(); no cleanup required.
 func writeRandomFolder(t *testing.T, total, fileSize int64) string {
@@ -81,9 +82,11 @@ func writeRandomFolder(t *testing.T, total, fileSize int64) string {
 		if testing.Short() {
 			writeSparseFile(t, p, sz)
 		} else {
+			// Random printable ASCII: high entropy, but no NUL byte, so the
+			// content is indexable text, not a binary file.
 			buf := make([]byte, sz)
 			for j := range buf {
-				buf[j] = byte(rng.Uint32())
+				buf[j] = byte('!' + rng.IntN('~'-'!'+1))
 			}
 			if err := os.WriteFile(p, buf, 0o644); err != nil {
 				t.Fatalf("writeRandomFolder: %v", err)
@@ -94,18 +97,16 @@ func writeRandomFolder(t *testing.T, total, fileSize int64) string {
 	return root
 }
 
-// writeSparseFile creates path with size `size` bytes using os.Truncate.
-// The result reports `size` from Lstat but consumes essentially zero
-// disk space. Used by writeRandomFolder under -short and by property
-// tests that explore size boundaries without paying real I/O.
+// writeSparseFile creates path with size `size` bytes. It writes a text
+// prefix past the readers' binary probe, so readers read the file fully, and
+// uses os.Truncate for the rest, which consumes almost no disk space. Used by
+// writeRandomFolder under -short and by property tests that explore size
+// boundaries without paying real I/O.
 func writeSparseFile(t *testing.T, path string, size int64) {
 	t.Helper()
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
+	prefix := bytes.Repeat([]byte("x"), int(min(size, 2*binaryProbeBytes)))
+	if err := os.WriteFile(path, prefix, 0o644); err != nil {
 		t.Fatalf("writeSparseFile create %q: %v", path, err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("writeSparseFile close %q: %v", path, err)
 	}
 	if size == 0 {
 		return

@@ -50,7 +50,7 @@ func checkGitDirtyFileBudgetWithLimits(repoDir, indexDir string, files []string,
 	}
 	for _, name := range files {
 		info, err := os.Lstat(filepath.Join(repoDir, name))
-		if err != nil || !info.Mode().IsRegular() || info.Size() > maxGitDirtyFileSize {
+		if err != nil || !info.Mode().IsRegular() || !documentContentFits(info.Size()) {
 			continue
 		}
 		budget.indexedBytes += info.Size()

@@ -155,9 +155,12 @@ func TestCLIProcess_VerboseMissingGitKeepsHintAndDetail(t *testing.T) {
 
 func TestCLIProcess_FolderCapExplainsLimitAndRemedy(t *testing.T) {
 	folder := t.TempDir()
-	const fileCount = maxFolderIndexedBytes/maxIndexedDocumentBytes + 1
+	// The file size is only a unit for the folder byte cap. Any size that fits
+	// the index works; 100 MiB keeps the file count low.
+	const fileSize = 100 << 20
+	const fileCount = maxFolderIndexedBytes/fileSize + 1
 	for i := int64(0); i < fileCount; i++ {
-		writeSparseFile(t, filepath.Join(folder, fmt.Sprintf("f%03d.bin", i)), maxIndexedDocumentBytes)
+		writeSparseFile(t, filepath.Join(folder, fmt.Sprintf("f%03d.bin", i)), fileSize)
 	}
 
 	resolvedFolder, err := filepath.EvalSymlinks(folder)

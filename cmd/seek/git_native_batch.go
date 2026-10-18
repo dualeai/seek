@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os/exec"
 
 	"github.com/sourcegraph/zoekt/index"
@@ -83,17 +84,18 @@ func (b *nativeGitBatch) writeCommands(verb string, ids []gitObjectID) <-chan er
 	return done
 }
 
+// abort waits for the request writer. The batch is already failing, so a
+// writer error only goes to the debug log.
 func (b *nativeGitBatch) abort(writeDone <-chan error) {
-	if b.finished {
-		if writeDone != nil {
-			<-writeDone
-		}
+	if !b.finished {
+		abortNativeGitChild(b.execCmd, b.stdin)
+		b.finished = true
+	}
+	if writeDone == nil {
 		return
 	}
-	abortNativeGitChild(b.execCmd, b.stdin)
-	b.finished = true
-	if writeDone != nil {
-		<-writeDone
+	if err := <-writeDone; err != nil {
+		slog.Debug("Native Git batch writer failed during abort", "error", err)
 	}
 }
 
@@ -121,7 +123,7 @@ func (b *nativeGitBatch) check(entries []gitTreeEntry) ([]gitBlobInfo, error) {
 			b.abort(writeDone)
 			return nil, err
 		}
-		infos[i] = gitBlobInfo{entry: entry, size: size, oversize: size > maxIndexedDocumentBytes}
+		infos[i] = gitBlobInfo{entry: entry, size: size, oversize: !documentContentFits(size)}
 	}
 	if err := <-writeDone; err != nil {
 		b.abort(nil)
@@ -171,28 +173,38 @@ func (b *nativeGitBatch) read(infos []gitBlobInfo, consume func(fileContent) err
 			b.abort(writeDone)
 			return err
 		}
-		if err := readSemaphore.Acquire(b.ctx, info.size); err != nil {
+		weight := readWeight(info.size)
+		if err := readSemaphore.Acquire(b.ctx, weight); err != nil {
 			b.abort(writeDone)
 			return err
 		}
-		content := make([]byte, int(info.size))
-		if _, err := io.ReadFull(b.reader, content); err != nil {
-			readSemaphore.Release(info.size)
+		content, binary, consumed, err := readContent(b.reader, info.size)
+		if binary {
+			// The stream still carries the rest of the blob: drop it unread.
+			_, err = io.CopyN(io.Discard, b.reader, info.size-consumed)
+		}
+		if err != nil {
+			readSemaphore.Release(weight)
 			b.abort(writeDone)
 			return nativeGitReadError(b.ctx, fmt.Sprintf("read Git blob %s body", info.entry.oid), err)
 		}
 		delimiter, err := b.reader.ReadByte()
 		if err != nil || delimiter != '\n' {
-			readSemaphore.Release(info.size)
+			readSemaphore.Release(weight)
 			b.abort(writeDone)
 			if err == nil {
 				err = fmt.Errorf("got byte 0x%02x", delimiter)
 			}
 			return nativeGitReadError(b.ctx, fmt.Sprintf("read Git blob %s delimiter", info.entry.oid), err)
 		}
-		document := fileContent{name: info.entry.path, content: content, weight: info.size}
+		document := fileContent{name: info.entry.path, content: content, weight: weight}
+		if binary {
+			// Zoekt keeps only the name of a binary blob; nothing holds weight.
+			readSemaphore.Release(weight)
+			document = fileContent{name: info.entry.path, skipReason: index.SkipReasonBinary}
+		}
 		if err := consume(document); err != nil {
-			readSemaphore.Release(info.size)
+			readSemaphore.Release(document.weight)
 			b.abort(writeDone)
 			return err
 		}

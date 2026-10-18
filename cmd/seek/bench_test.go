@@ -2091,7 +2091,7 @@ func isBenchmarkSourceFile(d os.DirEntry) bool {
 		return false
 	}
 	info, err := d.Info()
-	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > maxGitDirtyFileSize {
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 || !documentContentFits(info.Size()) {
 		return false
 	}
 	switch strings.ToLower(filepath.Ext(d.Name())) {

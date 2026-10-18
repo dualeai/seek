@@ -211,9 +211,23 @@ func indexParallelism() int {
 func indexBuildOptions(indexDir string, parallelism int) index.Options {
 	// Keep the same content and ctags contract for every accepted document.
 	// Large-file controls can change only Builder scheduling and parallelism.
+	//
+	// TODO: Zoekt still replaces the content of two kinds of documents with a
+	// NOT-INDEXED marker, and index.Options has no switch for either: content
+	// with a NUL byte (index.SkipReasonBinary) and content shorter than three
+	// bytes (index.SkipReasonTooSmall). Seek accepts both limits for now.
+	// Removing them needs a Zoekt change. The readers find a NUL in the first
+	// binaryProbeBytes themselves and do not read the rest (readContent).
+	//
+	// TrigramMax at the content limit turns off Zoekt's distinct-trigram skip
+	// (default 20000). Zoekt counts only when len(content)-2 is above
+	// TrigramMax, so the count never decides whether content is searchable. The
+	// cost is index size and build memory for large files with many distinct
+	// non-ASCII trigrams.
 	return index.Options{
 		IndexDir:         indexDir,
-		SizeMax:          maxIndexedDocumentBytes,
+		SizeMax:          int(documentContentLimit),
+		TrigramMax:       int(documentContentLimit),
 		Parallelism:      parallelism,
 		CTagsMustSucceed: true,
 		ShardMax:         shardMax,
@@ -788,17 +802,20 @@ func fallbackGitRepositoryName(repoDir string) string {
 
 // fileContent carries one file's content from reader to consumer.
 //
-// weight is the byte count reserved from readSemaphore. A successful producer
-// call transfers ownership to the consumer. If a Builder accepts the content,
-// Zoekt can keep it until Finish returns. The consumer releases the weight on
-// an earlier error or after Finish:
+// weight is the readSemaphore weight reserved for the document: readWeight of
+// its size, or zero for a name-only document. A successful producer call
+// transfers ownership to the consumer. If a Builder accepts the content, Zoekt
+// can keep it until Finish returns, and guardWrappedShards can add it again.
+// The consumer releases the weight on an earlier error or after Finish and the
+// shard guard:
 //
-//   - indexDocumentsWithRepository releases each window after Finish.
+//   - indexDocumentsWithRepository releases each window after Finish and the
+//     shard guard.
 //   - indexDeltaDocumentsWithRepository releases the set before return and,
-//     after Builder creation, only after Finish.
+//     after Builder creation, only after Finish and the shard guard.
 //
 // Zero weight means that a synchronous folder-delta read did not use the
-// semaphore. Releasing zero has no effect.
+// semaphore, or that the document is name-only. Releasing zero has no effect.
 type fileContent struct {
 	name       string
 	content    []byte
@@ -808,8 +825,9 @@ type fileContent struct {
 }
 
 // readFilesToChannel reads files from the working tree using a bounded
-// worker pool and sends them to out. Skips files larger than
-// maxGitDirtyFileSize, symlinks, and directories. Individual file
+// worker pool and sends them to out. Files whose content does not fit the
+// index, or that start with binary content (readContent), are sent by name
+// only. Skips symlinks and directories. Individual file
 // failures are non-fatal (files may be deleted or modified between
 // git status and read). The channel is closed after all workers exit.
 //
@@ -850,7 +868,7 @@ func readFilesToChannel(ctx context.Context, repoDir string, files []string, par
 
 // readOneDirtyFile factors the per-file read so deferred Release of
 // readSemaphore weight runs on every exit path (including panics inside
-// io.ReadFull). The `released` sentinel transfers ownership to the
+// readContent). The `released` sentinel transfers ownership to the
 // consumer once the channel send succeeds.
 func readOneDirtyFile(ctx context.Context, repoDir, f string, out chan<- fileContent) {
 	srcPath := filepath.Join(repoDir, f)
@@ -869,11 +887,14 @@ func readOneDirtyFile(ctx context.Context, repoDir, f string, out chan<- fileCon
 	}
 
 	size := fi.Size()
-	if size > maxGitDirtyFileSize {
-		slog.Warn("Skipping large uncommitted file", "path", f, "size_mb", size/(1024*1024))
+	if !documentContentFits(size) {
+		// Send the name without content or weight: Zoekt stores its
+		// NOT-INDEXED marker, and the name stays searchable.
+		slog.Debug("Indexing large uncommitted file by name only", "path", f, "size_mb", size/(1024*1024))
+		sendNameOnly(ctx, out, f, index.SkipReasonTooLarge)
 		return
 	}
-	weight := size
+	weight := readWeight(size)
 	if err := readSemaphore.Acquire(ctx, weight); err != nil {
 		return // ctx cancelled or done; semaphore not Acquired.
 	}
@@ -885,20 +906,24 @@ func readOneDirtyFile(ctx context.Context, repoDir, f string, out chan<- fileCon
 	}()
 
 	// Read using the known size from Lstat to avoid the extra
-	// Fstat that os.ReadFile performs internally. A single
-	// Read is not guaranteed to fill the buffer, even for
-	// regular files, so use ReadFull and keep partial content
-	// only when the file shrank during the read.
+	// Fstat that os.ReadFile performs internally. readContent
+	// stops after its binary probe for a binary file, and keeps
+	// partial content only when the file shrank during the read.
 	fh, err := os.Open(srcPath)
 	if err != nil {
 		return
 	}
-	buf := make([]byte, size)
-	n, err := io.ReadFull(fh, buf)
+	buf, binary, _, err := readContent(fh, size)
 	_ = fh.Close()
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		return
 	}
+	if binary {
+		// No content to hold: the deferred release returns the weight.
+		sendNameOnly(ctx, out, f, index.SkipReasonBinary)
+		return
+	}
+	n := len(buf)
 	if n == 0 && size > 0 {
 		return
 	}
@@ -1150,11 +1175,12 @@ func indexDocuments(
 
 // indexDocumentsWithRepository consumes fileContent through rotating Builder
 // windows. It calls Finish when a normal window reaches indexWindowBytes.
-// Documents larger than shardMax use separate windows and a global concurrency
-// limit. This scheduling rule does not change content or symbol indexing. It
-// releases Builder-owned document weight after Finish and releases documents
-// that no Builder accepted as soon as their error path ends. See fileContent
-// for ownership.
+// Documents that fill a shard of their own (isolatesShard) use separate windows
+// and a global concurrency limit; guardWrappedShards checks their shards after
+// Finish. This scheduling rule does not change content or symbol indexing. It
+// releases Builder-owned document weight after Finish and the shard guard, and
+// releases documents that no Builder accepted as soon as their error path ends.
+// See fileContent for ownership.
 //
 // Window 0 uses IsDelta=false, so Finish prunes stale shards. Later windows use
 // IsDelta=true with no changed paths, so they skip deletion and tombstone work
@@ -1170,12 +1196,21 @@ func indexDocumentsWithRepository(
 	largeParallelism := min(max(parallelism, 1), largeDocumentParallelism)
 	var current *index.Builder
 	var pendingWeight int64
+	// pendingContent counts real content bytes; readWeight stops counting at
+	// maxReadWeightBytes, so large windows also rotate on it.
+	var pendingContent int64
 	var addErr error
 	indexedAny := false
 	openedWindows := 0
 	currentLarge := false
 	largeDocuments := 0
 	var largeReservations int64
+	// A large window gives each document its own shard; the guard checks them
+	// after Finish (guardWrappedShards).
+	var currentOpts index.Options
+	currentFirstShard := 0
+	var largeWindowDocs []index.Document
+	guardOpts := indexBuildOptions(indexDir, 1)
 
 	openWindow := func(isDelta, large bool) error {
 		if err := checkCtagsCached(); err != nil {
@@ -1188,12 +1223,18 @@ func indexDocumentsWithRepository(
 		opts := indexBuildOptions(indexDir, builderParallelism)
 		opts.RepositoryDescription = repository
 		opts.IsDelta = isDelta
+		firstShard := 0
+		if large {
+			firstShard = firstBuilderShard(opts)
+		}
 		b, err := index.NewBuilder(opts)
 		if err != nil {
 			return fmt.Errorf("create builder: %w", err)
 		}
 		current = b
 		currentLarge = large
+		currentOpts = opts
+		currentFirstShard = firstShard
 		largeDocuments = 0
 		openedWindows++
 		indexedAny = true
@@ -1210,6 +1251,14 @@ func indexDocumentsWithRepository(
 			return nil
 		}
 		err := current.Finish()
+		if err == nil && currentLarge {
+			// Run before the weight release: the guard can add the
+			// documents again.
+			err = guardWrappedShards(currentOpts, currentFirstShard, largeWindowDocs, nil)
+		}
+		clear(largeWindowDocs)
+		largeWindowDocs = largeWindowDocs[:0]
+		pendingContent = 0
 		if pendingWeight > 0 {
 			readSemaphore.Release(pendingWeight)
 			pendingWeight = 0
@@ -1251,7 +1300,15 @@ func indexDocumentsWithRepository(
 			continue
 		}
 
-		large := len(doc.content) > shardMax
+		document := index.Document{
+			Name:       doc.name,
+			Content:    doc.content,
+			Branches:   doc.branches,
+			SkipReason: doc.skipReason,
+		}
+		// Only a document that Zoekt keeps and flushes alone opens a large
+		// window, so each large window maps one document to one shard.
+		large := isolatesShard(document, guardOpts)
 		if current != nil && large != currentLarge {
 			if err := finishWindow(); err != nil {
 				if cancelProducer != nil {
@@ -1315,12 +1372,11 @@ func indexDocumentsWithRepository(
 		// doc.weight stays the window's responsibility either way and is Released
 		// by finishWindow.
 		pendingWeight += doc.weight
-		if err := current.Add(index.Document{
-			Name:       doc.name,
-			Content:    doc.content,
-			Branches:   doc.branches,
-			SkipReason: doc.skipReason,
-		}); err != nil {
+		pendingContent += int64(len(doc.content))
+		if currentLarge {
+			largeWindowDocs = append(largeWindowDocs, document)
+		}
+		if err := current.Add(document); err != nil {
 			addErr = fmt.Errorf("add document %s: %w", doc.name, err)
 			if cancelProducer != nil {
 				cancelProducer()
@@ -1331,7 +1387,8 @@ func indexDocumentsWithRepository(
 			largeDocuments++
 		}
 
-		if pendingWeight >= indexWindowBytes || (currentLarge && largeDocuments >= largeParallelism) {
+		if pendingWeight >= indexWindowBytes ||
+			(currentLarge && (largeDocuments >= largeParallelism || pendingContent >= indexWindowBytes)) {
 			if err := finishWindow(); err != nil {
 				if cancelProducer != nil {
 					cancelProducer()

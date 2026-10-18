@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -555,6 +556,7 @@ func TestCheckNativeGitBlobReplyFailures(t *testing.T) {
 }
 
 func TestCheckNativeGitBlobExactLimitAndOversize(t *testing.T) {
+	swapDocumentContentLimitForTest(t, 100<<20)
 	installFakeGit(t)
 	t.Setenv("FAKE_GIT_MODE", "batch_check_limits")
 	secondOID := strings.Repeat("a", 40)
@@ -574,13 +576,14 @@ func TestCheckNativeGitBlobExactLimitAndOversize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(infos) != 2 || infos[0].size != maxIndexedDocumentBytes || infos[0].oversize ||
-		infos[1].size != maxIndexedDocumentBytes+1 || !infos[1].oversize {
+	if len(infos) != 2 || infos[0].size != 104857600 || infos[0].oversize ||
+		infos[1].size != 104857601 || !infos[1].oversize {
 		t.Fatalf("blob limits=%+v", infos)
 	}
 }
 
 func TestScanNativeGitDeltaChangesCountsOversizeWithoutBytes(t *testing.T) {
+	swapDocumentContentLimitForTest(t, 100<<20)
 	installFakeGit(t)
 	t.Setenv("FAKE_GIT_MODE", "batch_check_oversize")
 	base := gitIndexBudget{candidates: 7, indexedBytes: 99}
@@ -640,16 +643,27 @@ func TestCheckNativeGitBlobCancellationKillsChild(t *testing.T) {
 func TestReadNativeGitBlobsReadsExactContent(t *testing.T) {
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
-	content := []byte("abc\nwith content\x00")
-	path := filepath.Join(repoDir, "blob")
-	if err := os.WriteFile(path, content, 0o644); err != nil {
-		t.Fatal(err)
+	// A binary blob larger than the probe comes first: the reader must drop the
+	// rest of it and still read the text blob after it exactly.
+	binary := append([]byte{0}, bytes.Repeat([]byte("b"), 3*binaryProbeBytes)...)
+	text := []byte("abc\nwith content\n")
+	var infos []gitBlobInfo
+	for _, blob := range []struct {
+		name    string
+		content []byte
+	}{{"binary", binary}, {"text", text}} {
+		if err := os.WriteFile(filepath.Join(repoDir, blob.name), blob.content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		oid := gitOutputIn(t, repoDir, "hash-object", "-w", blob.name)
+		entry := fakeTreeEntry(oid)
+		entry.path = blob.name
+		infos = append(infos, gitBlobInfo{entry: entry, size: int64(len(blob.content))})
 	}
-	oid := gitOutputIn(t, repoDir, "hash-object", "-w", "blob")
-	info := gitBlobInfo{entry: fakeTreeEntry(oid), size: int64(len(content))}
-	var got []byte
-	err := readNativeGitBlobs(t.Context(), repoDir, []gitBlobInfo{info}, func(document fileContent) error {
-		got = append([]byte(nil), document.content...)
+	var got []fileContent
+	err := readNativeGitBlobs(t.Context(), repoDir, infos, func(document fileContent) error {
+		document.content = append([]byte(nil), document.content...)
+		got = append(got, document)
 		if document.weight > 0 {
 			readSemaphore.Release(document.weight)
 		}
@@ -658,14 +672,21 @@ func TestReadNativeGitBlobsReadsExactContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != string(content) {
-		t.Fatalf("content=%q, want %q", got, content)
+	if len(got) != 2 {
+		t.Fatalf("documents = %d, want 2", len(got))
+	}
+	if got[0].skipReason != index.SkipReasonBinary || len(got[0].content) != 0 || got[0].weight != 0 {
+		t.Fatalf("binary blob = %+v, want a name-only binary document", got[0])
+	}
+	if string(got[1].content) != string(text) {
+		t.Fatalf("text content=%q, want %q", got[1].content, text)
 	}
 }
 
 func TestReadNativeGitBlobsDoesNotStartChildForOversize(t *testing.T) {
+	swapDocumentContentLimitForTest(t, 100<<20)
 	t.Setenv("PATH", t.TempDir())
-	info := gitBlobInfo{entry: fakeTreeEntry(nativeTestOID), size: maxIndexedDocumentBytes + 1, oversize: true}
+	info := gitBlobInfo{entry: fakeTreeEntry(nativeTestOID), size: documentContentLimit + 1, oversize: true}
 	called := false
 	err := readNativeGitBlobs(t.Context(), t.TempDir(), []gitBlobInfo{info}, func(document fileContent) error {
 		called = true

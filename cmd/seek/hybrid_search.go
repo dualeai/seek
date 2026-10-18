@@ -628,12 +628,15 @@ func materializeFolderSemanticCandidates(
 			path = plan.root
 		}
 		info, err := os.Lstat(path)
-		if err != nil || !info.Mode().IsRegular() || info.Size() > maxIndexedDocumentBytes {
+		if err != nil || !info.Mode().IsRegular() || !documentContentFits(info.Size()) {
 			return nil, fmt.Errorf("semantic folder source %q is unavailable", unit.path)
 		}
-		content, err := readFolderFile(folderCandidate{path: path, size: info.Size()})
+		content, binary, err := readFolderFile(folderCandidate{path: path, size: info.Size()})
 		if err != nil {
 			return nil, fmt.Errorf("read semantic folder source %q: %w", unit.path, err)
+		}
+		if binary {
+			return nil, fmt.Errorf("semantic folder source %q is now binary", unit.path)
 		}
 		unit, document, materializeErr := checkedSemanticCandidate(unit, content)
 		if materializeErr != nil {

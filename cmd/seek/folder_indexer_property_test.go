@@ -6,9 +6,12 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"testing/quick"
 	"time"
+
+	"github.com/sourcegraph/zoekt/index"
 )
 
 // TestEnsureFolderCorpusFresh_RandomDistribution — quick-check that
@@ -77,20 +80,20 @@ func TestEnsureFolderCorpusFresh_RandomDistribution(t *testing.T) {
 }
 
 // FuzzReadOneFolderFileStreaming_Sizes checks the per-file size boundary of
-// readOneFolderFileStreaming. For any size in [0, maxIndexedDocumentBytes+1],
+// readOneFolderFileStreaming. For any size in [0, testDocumentContentLimit+1],
 // the function must either
 // (a) send exactly one fileContent with weight=size and never leak,
-// or (b) skip silently without touching the semaphore.
+// or (b) send one name-only document without touching the semaphore.
 //
-// The test uses a sparse temporary file to limit fixture I/O. It keeps the
-// shared readSemaphore at the production budget, which accepts one file up to
-// maxIndexedDocumentBytes.
+// The test uses writeSparseFile to limit fixture I/O. It keeps the shared
+// readSemaphore at the production budget and swaps in a small content limit.
 func FuzzReadOneFolderFileStreaming_Sizes(f *testing.F) {
-	for _, s := range []int64{0, 1, 1024, 64 * 1024, int64(maxIndexedDocumentBytes) - 1, int64(maxIndexedDocumentBytes), int64(maxIndexedDocumentBytes) + 1} {
+	for _, s := range []int64{0, 1, 1024, 64 * 1024, testDocumentContentLimit - 1, testDocumentContentLimit, testDocumentContentLimit + 1} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, size int64) {
-		if size < 0 || size > int64(maxIndexedDocumentBytes)+1 {
+		swapDocumentContentLimitForTest(t, testDocumentContentLimit)
+		if size < 0 || size > testDocumentContentLimit+1 {
 			t.Skip()
 		}
 		testReadSemMu.Lock()
@@ -120,17 +123,27 @@ func FuzzReadOneFolderFileStreaming_Sizes(f *testing.F) {
 		readOneFolderFileStreaming(ctx, c, out)
 		close(out)
 		sent := 0
+		// Every fuzzed size is far below the 100 MiB read-weight clamp, so a
+		// document that keeps its content weighs its size.
+		oversize := size > testDocumentContentLimit
 		for fc := range out {
 			sent++
-			if fc.weight != size {
-				t.Fatalf("weight mismatch: got=%d want=%d", fc.weight, size)
+			wantWeight := size
+			if oversize {
+				wantWeight = 0
+			}
+			if fc.weight != wantWeight {
+				t.Fatalf("weight mismatch: got=%d want=%d", fc.weight, wantWeight)
+			}
+			if oversize && (fc.skipReason != index.SkipReasonTooLarge || fc.content != nil) {
+				t.Fatalf("oversize candidate = skip %v with %d content bytes, want name-only", fc.skipReason, len(fc.content))
 			}
 			readSemaphore.Release(fc.weight)
 		}
 		switch {
-		case size > int64(maxIndexedDocumentBytes):
-			if sent != 0 {
-				t.Fatalf("oversize candidate must be skipped, got sent=%d", sent)
+		case oversize:
+			if sent != 1 {
+				t.Fatalf("oversize candidate must send one name-only document, got sent=%d", sent)
 			}
 		default:
 			if sent != 1 {
@@ -143,34 +156,38 @@ func FuzzReadOneFolderFileStreaming_Sizes(f *testing.F) {
 	})
 }
 
-// TestEnsureFolderCorpusFresh_SingleFileAtPerDocCap — exact-boundary
-// case: one file at maxIndexedDocumentBytes, surrounded by near-empty
-// files. Verifies the per-doc cap is honoured under the production
-// semaphore (NOT swapped, since we need to fit a 100 MiB Acquire).
-func TestEnsureFolderCorpusFresh_SingleFileAtPerDocCap(t *testing.T) {
+// TestEnsureFolderCorpusFresh_SingleFileAroundReadWeightCap — boundary
+// cases: one file at maxReadWeightBytes and one byte above it, next to a
+// near-empty file. The production semaphore (NOT swapped) must admit the
+// first and clamp the second, with no hang and no leaked weight.
+func TestEnsureFolderCorpusFresh_SingleFileAroundReadWeightCap(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
 	}
 	if testing.Short() {
-		t.Skip("creates a 100 MiB sparse file")
+		t.Skip("creates 100 MiB sparse files")
 	}
-	testReadSemMu.Lock()
-	defer testReadSemMu.Unlock()
-	defer goroutineLeakGuard(t, 120*time.Second)()
+	for _, size := range []int64{maxReadWeightBytes, maxReadWeightBytes + 1} {
+		t.Run(strconv.FormatInt(size, 10), func(t *testing.T) {
+			testReadSemMu.Lock()
+			defer testReadSemMu.Unlock()
+			defer goroutineLeakGuard(t, 120*time.Second)()
 
-	root := t.TempDir()
-	writeSparseFile(t, filepath.Join(root, "huge.bin"), maxIndexedDocumentBytes)
-	writeSparseFile(t, filepath.Join(root, "tiny.bin"), 16)
+			root := t.TempDir()
+			writeSparseFile(t, filepath.Join(root, "huge.bin"), size)
+			writeSparseFile(t, filepath.Join(root, "tiny.bin"), 16)
 
-	plan := planSynthCorpus(t, root)
+			plan := planSynthCorpus(t, root)
 
-	before := availableWeight(readSemaphore)
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
-	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
-		t.Fatalf("ensureFolderCorpusFresh: %v", err)
-	}
-	if got := availableWeight(readSemaphore); got != before {
-		t.Fatalf("semaphore leak: before=%d after=%d", before, got)
+			before := availableWeight(readSemaphore)
+			ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+			defer cancel()
+			if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
+				t.Fatalf("ensureFolderCorpusFresh: %v", err)
+			}
+			if got := availableWeight(readSemaphore); got != before {
+				t.Fatalf("semaphore leak: before=%d after=%d", before, got)
+			}
+		})
 	}
 }
