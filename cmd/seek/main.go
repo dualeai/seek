@@ -45,6 +45,11 @@ func versionString() string {
 	return "seek (unknown)"
 }
 
+// TODO: github.com/rs/xid v1.6.0, which zoekt/index imports, runs ioreg at
+// package init on macOS. Every seek process pays about 20 ms before main.
+// Upstream issue https://github.com/rs/xid/issues/120; the fix
+// (https://github.com/rs/xid/pull/121) is on master but in no release yet.
+// Upgrade rs/xid when a release after v1.6.0 has it.
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
