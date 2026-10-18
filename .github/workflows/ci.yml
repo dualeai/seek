@@ -80,9 +80,14 @@ jobs:
           export PATH="$gobin:$PATH"
           go install golang.org/x/vuln/cmd/govulncheck@"${GOVULNCHECK_VERSION}"
           govulncheck -format sarif ./... > vuln.raw.sarif || true
-          # govulncheck emits duplicate items in rule tags; GitHub's SARIF
-          # validator rejects dups, so dedupe each tags array.
-          jq '(.runs[]?.tool.driver.rules[]?.properties.tags) |= (. // [] | unique)' \
+          # govulncheck emits duplicate items in rule tags and result stacks;
+          # GitHub's SARIF validator rejects dups, so dedupe both arrays.
+          # TODO: remove once these are fixed:
+          # https://github.com/golang/go/issues/75890 (tags)
+          # https://github.com/golang/go/issues/81953 (stacks)
+          # https://github.com/golang/go/issues/82319 (stacks)
+          jq '(.runs[]?.tool.driver.rules[]?.properties.tags) |= (. // [] | unique)
+            | (.runs[]?.results[]? | select(.stacks) | .stacks) |= unique' \
             vuln.raw.sarif > vuln.sarif
       - name: Upload SARIF to code scanning
         if: always()
