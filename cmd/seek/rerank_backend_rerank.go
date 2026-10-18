@@ -68,6 +68,9 @@ type lateOnRuntimeManifest struct {
 type lateOnModel struct {
 	tokenizers     chan *lateOnTokenizer
 	tokenizerCount int
+	tokenizerJSON  []byte
+	tokenizerOnce  sync.Once
+	tokenizerErr   error
 	punctuation    map[int]struct{}
 	encoderOnce    sync.Once
 	encoder        *lateOnStaticRowEncoder
@@ -147,29 +150,19 @@ func newLateOnSemanticModel(ctx context.Context) (semanticModel, error) {
 	if err != nil {
 		return nil, err
 	}
-	tokenizerCount := max(1, runtime.GOMAXPROCS(0))
-	tokenizerPool := make(chan *lateOnTokenizer, tokenizerCount)
+	tokenizerPool := make(chan *lateOnTokenizer, max(1, runtime.GOMAXPROCS(0)))
 	tokenizerPool <- tokenizer
-	for range tokenizerCount - 1 {
-		copyTokenizer, _, tokenizerErr := newLateOnTokenizer(tokenizerJSON)
-		if tokenizerErr != nil {
-			return nil, errors.Join(
-				tokenizerErr,
-				closeLateOnTokenizers(tokenizerPool, len(tokenizerPool)),
-			)
-		}
-		tokenizerPool <- copyTokenizer
-	}
 
 	if err := ensureLateOnEnvironment(runtimePath); err != nil {
 		return nil, errors.Join(
 			err,
-			closeLateOnTokenizers(tokenizerPool, tokenizerCount),
+			closeLateOnTokenizers(tokenizerPool, 1),
 		)
 	}
 	return &lateOnModel{
 		tokenizers:     tokenizerPool,
-		tokenizerCount: tokenizerCount,
+		tokenizerCount: 1,
+		tokenizerJSON:  tokenizerJSON,
 		punctuation:    punctuation,
 	}, nil
 }
@@ -213,6 +206,41 @@ func (s *lateOnModel) releaseTokenizer(tokenizer *lateOnTokenizer) {
 	if tokenizer != nil {
 		s.tokenizers <- tokenizer
 	}
+}
+
+// A cached search needs one tokenizer. Bulk packing fills the existing pool
+// before source workers use it, so index builds keep their tokenizer capacity.
+// The missing tokenizers are created in parallel: each takes tens of
+// milliseconds, and every source worker waits for the fill.
+func (s *lateOnModel) prepareBulkTokenizers(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.tokenizerOnce.Do(func() {
+		missing := cap(s.tokenizers) - s.tokenizerCount
+		created := make([]*lateOnTokenizer, missing)
+		errs := make([]error, missing)
+		var wait sync.WaitGroup
+		for i := range missing {
+			wait.Go(func() {
+				if errs[i] = ctx.Err(); errs[i] == nil {
+					created[i], _, errs[i] = newLateOnTokenizer(s.tokenizerJSON)
+				}
+			})
+		}
+		wait.Wait()
+		s.tokenizerJSON = nil
+		// Keep every tokenizer that was created; report the first failure.
+		for i, tokenizer := range created {
+			if tokenizer != nil {
+				s.tokenizers <- tokenizer
+				s.tokenizerCount++
+			} else if s.tokenizerErr == nil {
+				s.tokenizerErr = errs[i]
+			}
+		}
+	})
+	return s.tokenizerErr
 }
 
 func runLateOnSessionRows(
@@ -441,6 +469,7 @@ func (s *lateOnModel) Close() error {
 		s.tokenizers = nil
 		s.tokenizerCount = 0
 	}
+	s.tokenizerJSON = nil
 	// Keep the shared environment loaded for the process lifetime. Unloading the
 	// ONNX library after inference can race with its native thread cleanup.
 	return closeErr
@@ -596,6 +625,9 @@ func (s *lateOnModel) PackSemanticUnits(
 ) ([]semanticUnit, error) {
 	if len(units) == 0 {
 		return units, ctx.Err()
+	}
+	if err := s.prepareBulkTokenizers(ctx); err != nil {
+		return nil, err
 	}
 	tokenizer, err := s.takeTokenizer(ctx)
 	if err != nil {
