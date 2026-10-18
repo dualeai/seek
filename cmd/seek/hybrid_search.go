@@ -829,8 +829,9 @@ func semanticAfterContext(content []byte, start, lines int) []byte {
 
 // buildHybridRerankCandidates reserves up to half of the final candidate set
 // for each retrieval branch, removes duplicate corpus files, then alternates
-// remaining lexical and semantic candidates. For an overlap, it keeps the
-// lexical display result and rank but scores the checked semantic document.
+// remaining lexical and semantic candidates. An overlap reached during the
+// merge keeps lexical display data and scores the checked semantic document.
+// After the pool fills, unseen lexical overlaps supply only their known rank.
 func buildHybridRerankCandidates(
 	strictRanked []corpusSearchResult,
 	relaxedRanked []corpusSearchResult,
@@ -891,6 +892,15 @@ func buildHybridRerankCandidates(
 		if semanticAt < len(semantic) && len(candidates) < rerankCandidateLimit {
 			add(semanticCandidate(semantic[semanticAt]), true)
 			semanticAt++
+		}
+	}
+	// A full union can leave a protected semantic file's lexical rank unseen.
+	// Restore only that rank from the canonical list; keep its checked document,
+	// display evidence, flags, and position in the final pool.
+	for _, candidate := range lexical {
+		key := corpusResultKey{corpusID: candidate.result.corpusID, fileName: candidate.result.file.FileName}
+		if position, exists := positions[key]; exists && candidates[position].lexicalRank == hybridMissingLexicalRank {
+			candidates[position].lexicalRank = candidate.lexicalRank
 		}
 	}
 	return candidates

@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -234,6 +235,58 @@ func TestBuildHybridRerankCandidatesUsesCheckedUnitForLexicalFile(t *testing.T) 
 	}
 	if !shared.hasDocument || shared.document.Text != "checked source unit" || shared.lexicalRank != 1 {
 		t.Fatalf("semantic overlap did not replace score input: %+v", shared)
+	}
+}
+
+func TestBuildHybridRerankCandidatesRestoresOnlyCanonicalTailRank(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		position        int
+		strictOnly      bool
+		differentCorpus bool
+		wantRank        int
+	}{
+		{name: "known tail", position: 92, wantRank: 93},
+		{name: "displaced from canonical list", position: 127, strictOnly: true, wantRank: hybridMissingLexicalRank},
+		{name: "same name in another corpus", position: 92, differentCorpus: true, wantRank: hybridMissingLexicalRank},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			relaxed := make([]corpusSearchResult, rerankCandidateLimit)
+			for i := range relaxed {
+				relaxed[i] = rerankTestResult(fmt.Sprintf("lex-%03d.go", i), float64(1000-i))
+			}
+			var strict []corpusSearchResult
+			if test.strictOnly {
+				strict = []corpusSearchResult{rerankTestResult("strict-only.go", 1001)}
+			}
+			semantic := make([]semanticFileCandidate, hybridBranchQuota)
+			for i := range semantic {
+				semantic[i] = semanticFileCandidate{
+					result:   rerankTestResult(fmt.Sprintf("sem-%03d.go", i), 0.5),
+					document: rerankDocument{Text: fmt.Sprintf("checked semantic source %d", i)},
+				}
+			}
+			semantic[0].result.file.FileName = relaxed[test.position].file.FileName
+			if test.differentCorpus {
+				semantic[0].result.corpusID = "another-corpus"
+			}
+			got := buildHybridRerankCandidates(strict, relaxed, semantic)
+			if len(got) != rerankCandidateLimit {
+				t.Fatalf("candidate count=%d, want %d", len(got), rerankCandidateLimit)
+			}
+			want := rerankCandidate{
+				result: semantic[0].result, lexicalRank: test.wantRank,
+				document: semantic[0].document, hasDocument: true,
+			}
+			if !reflect.DeepEqual(got[hybridBranchQuota], want) {
+				t.Fatalf("tail candidate changed beyond rank: got=%+v want=%+v", got[hybridBranchQuota], want)
+			}
+			for i := 1; i < len(semantic); i++ {
+				if got[hybridBranchQuota+i].result.file.FileName != semantic[i].result.file.FileName {
+					t.Fatalf("semantic position %d changed", i)
+				}
+			}
+		})
 	}
 }
 
