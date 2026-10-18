@@ -182,7 +182,7 @@ func TestRealCaseWithin(t *testing.T) {
 		t.Fatal(err)
 	}
 	exact := filepath.Join(root, "Sub", "Real.txt")
-	if got := realCaseWithin(root, exact); got != exact {
+	if got := realCaseWithin(root, exact, dirListings{}); got != exact {
 		t.Fatalf("exact path must be preserved: got %q want %q", got, exact)
 	}
 	// Only meaningful where the FS resolves a different-case path.
@@ -190,7 +190,7 @@ func TestRealCaseWithin(t *testing.T) {
 	if _, err := os.Stat(wrong); err != nil {
 		t.Skip("case-sensitive filesystem; correction path not exercisable")
 	}
-	if got := realCaseWithin(root, wrong); got != exact {
+	if got := realCaseWithin(root, wrong, dirListings{}); got != exact {
 		t.Errorf("case correction: got %q want %q", got, exact)
 	}
 }

@@ -287,6 +287,7 @@ func collectExternalOperands(ctx context.Context, operands []string) (plannedExt
 	// by repository so visibility needs one Git check per root.
 	resolved := make([]resolvedOperand, 0, len(operands))
 	pathsByRepo := make(map[string][]string)
+	listings := make(dirListings)
 	for _, operand := range operands {
 		abs, err := filepath.Abs(operand)
 		if err != nil {
@@ -315,7 +316,7 @@ func collectExternalOperands(ctx context.Context, operands []string) (plannedExt
 			// insensitive filesystems os.Stat accepts a mistyped name, but
 			// the ls-tree pathspec / scope.contains / zoekt FileNameSet are
 			// exact, so the wrong-case name would silently match nothing.
-			ro.canonical = realCaseWithin(repoRoot, canonical)
+			ro.canonical = realCaseWithin(repoRoot, canonical, listings)
 			pathsByRepo[repoRoot] = append(pathsByRepo[repoRoot], ro.canonical)
 		}
 		resolved = append(resolved, ro)
@@ -914,24 +915,36 @@ func canonicalCorpusPath(path string) string {
 // file would be silently missed. Matching is by os.SameFile (device+inode),
 // robust to both case and NFC/NFD. Components are corrected top-down so a
 // wrong-case parent is fixed before its children are read. Best-effort: any
-// stat/read error leaves that component as typed.
-func realCaseWithin(root, path string) string {
+// stat/read error leaves that component as typed. listings holds the
+// directories already read, so many operands in one directory read it once.
+func realCaseWithin(root, path string, listings dirListings) string {
 	rel, ok := relWithin(root, path)
 	if !ok || rel == "." {
 		return path
 	}
 	cur := root
 	for _, comp := range strings.Split(rel, string(filepath.Separator)) {
-		cur = filepath.Join(cur, realCaseComponent(cur, comp))
+		cur = filepath.Join(cur, realCaseEntry(cur, comp, listings.read(cur)))
 	}
 	return cur
 }
 
-func realCaseComponent(parent, name string) string {
-	entries, err := os.ReadDir(parent)
-	if err != nil {
-		return name
+// dirListings caches directory listings for the case lookups of one command.
+// A read error is cached as an empty listing.
+type dirListings map[string][]os.DirEntry
+
+func (listings dirListings) read(dir string) []os.DirEntry {
+	entries, ok := listings[dir]
+	if !ok {
+		entries, _ = os.ReadDir(dir)
+		listings[dir] = entries
 	}
+	return entries
+}
+
+// realCaseEntry returns the on-disk name of parent/name, given entries, the
+// listing of parent.
+func realCaseEntry(parent, name string, entries []os.DirEntry) string {
 	// First check for an exact on-disk byte name.
 	for _, e := range entries {
 		if e.Name() == name {
