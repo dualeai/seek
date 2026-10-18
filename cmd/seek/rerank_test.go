@@ -1229,7 +1229,7 @@ func TestRunRerankK01FallbackContracts(t *testing.T) {
 		})
 	}
 
-	const expected = "## strict.go (Go)\n1 package strict\n2 // alpha beta"
+	const expected = "## strict.go (Go)\n1 package strict\n2 // alpha beta\n"
 	baseline, err := captureStdout(t, func() error {
 		return runWithSearchConfig(
 			context.Background(),

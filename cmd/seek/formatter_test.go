@@ -117,7 +117,7 @@ func TestGitCorpusFormatting_BasicFileMatch(t *testing.T) {
 	}
 
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
-	expected := "## src/main.go (Go)\n5 func main() {"
+	expected := "## src/main.go (Go)\n5 func main() {\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -140,7 +140,7 @@ func TestGitCorpusFormatting_UncommittedTag(t *testing.T) {
 	}
 
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
-	expected := "## lib/utils.py (Python) [uncommitted]\n10 def helper():"
+	expected := "## lib/utils.py (Python) [uncommitted]\n10 def helper():\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -232,7 +232,7 @@ func TestGitCorpusFormatting_SymbolKind(t *testing.T) {
 	}
 
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
-	expected := "## router.go (Go)\n15 [function] func CoreRouter() {"
+	expected := "## router.go (Go)\n15 [function] func CoreRouter() {\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -288,7 +288,7 @@ func TestGitCorpusFormatting_MultiFile(t *testing.T) {
 	}
 }
 
-func TestGitCorpusFormatting_NoTrailingNewline(t *testing.T) {
+func TestGitCorpusFormatting_EndsWithOneNewline(t *testing.T) {
 	files := []zoekt.FileMatch{
 		{
 			FileName:   "a.go",
@@ -302,8 +302,8 @@ func TestGitCorpusFormatting_NoTrailingNewline(t *testing.T) {
 	}
 
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
-	if len(result) > 0 && result[len(result)-1] == '\n' {
-		t.Error("output must not end with trailing newline")
+	if !strings.HasSuffix(result, "1 hello\n") || strings.HasSuffix(result, "\n\n") {
+		t.Errorf("output must end with exactly one newline, got %q", result)
 	}
 }
 
@@ -318,7 +318,7 @@ func TestGitCorpusFormatting_ZeroLineMatches(t *testing.T) {
 	}
 
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
-	expected := "## empty.go (Go)"
+	expected := "## empty.go (Go)\n"
 	if result != expected {
 		t.Errorf("expected %q, got %q", expected, result)
 	}
@@ -451,7 +451,7 @@ func TestGitCorpusFormatting_ContextLines_BeforeAndAfter(t *testing.T) {
 		"15 [function] func handleRequest(w http.ResponseWriter, r *http.Request) {",
 		`16     ctx := r.Context()`,
 		`17     log.Info("handling request")`,
-	}, "\n")
+	}, "\n") + "\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -475,7 +475,7 @@ func TestGitCorpusFormatting_ContextLines_NoContext(t *testing.T) {
 	}
 
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
-	expected := "## main.go (Go)\n5 func main() {"
+	expected := "## main.go (Go)\n5 func main() {\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -512,7 +512,7 @@ func TestGitCorpusFormatting_ContextLines_OverlappingContext(t *testing.T) {
 		"10 first match",
 		"11 line eleven",
 		"12 second match",
-	}, "\n")
+	}, "\n") + "\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -549,7 +549,7 @@ func TestGitCorpusFormatting_ContextLines_NonContiguousRegions(t *testing.T) {
 		"",
 		"49 before second",
 		"50 second match",
-	}, "\n")
+	}, "\n") + "\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -583,7 +583,7 @@ func TestGitCorpusFormatting_ContextLines_AdjacentMatches(t *testing.T) {
 		"## app.go (Go)",
 		"10 line one",
 		"11 line two match",
-	}, "\n")
+	}, "\n") + "\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -618,7 +618,7 @@ func TestGitCorpusFormatting_ContextLines_ThreeContextLines(t *testing.T) {
 		"21 ctx line 21",
 		"22 ctx line 22",
 		"23 ctx line 23",
-	}, "\n")
+	}, "\n") + "\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -647,7 +647,7 @@ func TestGitCorpusFormatting_ContextLines_MatchOnLine1(t *testing.T) {
 		"## main.go (Go)",
 		"1 package main",
 		"2 import \"fmt\"",
-	}, "\n")
+	}, "\n") + "\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -709,7 +709,7 @@ func TestGitCorpusFormatting_ContextLines_MatchOnLine2_PartialBefore(t *testing.
 		"## main.go (Go)",
 		"1 package main",
 		"2 import \"fmt\"",
-	}, "\n")
+	}, "\n") + "\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -752,7 +752,7 @@ func TestGitCorpusFormatting_ContextLines_ThreeConsecutiveMatches(t *testing.T) 
 		"12 match B",
 		"13 between BC",
 		"14 match C",
-	}, "\n")
+	}, "\n") + "\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -781,7 +781,7 @@ func TestGitCorpusFormatting_ContextLines_OnlyBefore(t *testing.T) {
 		"## app.go (Go)",
 		"99 penultimate",
 		"100 last line",
-	}, "\n")
+	}, "\n") + "\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -810,7 +810,7 @@ func TestGitCorpusFormatting_ContextLines_OnlyAfter(t *testing.T) {
 		"## app.go (Go)",
 		"1 first line",
 		"2 second line",
-	}, "\n")
+	}, "\n") + "\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -844,7 +844,7 @@ func TestGitCorpusFormatting_ContextLines_EmptyLinesInContext(t *testing.T) {
 		"5 func main() {",
 		"6 ",
 		"7     fmt.Println()",
-	}, "\n")
+	}, "\n") + "\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -870,7 +870,7 @@ func TestGitCorpusFormatting_ContextLines_EmptyByteSlice(t *testing.T) {
 	}
 
 	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
-	expected := "## app.go (Go)\n5 match"
+	expected := "## app.go (Go)\n5 match\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -900,7 +900,7 @@ func TestGitCorpusFormatting_ContextLines_BeforeNoTrailingNewline(t *testing.T) 
 		"1 line one",
 		"2 line two",
 		"3 match",
-	}, "\n")
+	}, "\n") + "\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
@@ -1710,7 +1710,7 @@ func TestGitCorpusFormatting_UnorderedOverlappingContext_NoDuplicateLines(t *tes
 		"11 line eleven",
 		"12 second match",
 		"13 line thirteen",
-	}, "\n")
+	}, "\n") + "\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
 	}
