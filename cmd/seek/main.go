@@ -289,6 +289,9 @@ func runSearchCommand(
 		_, prepared, prepareErr := execution.model.prepareQuery(ctx, rerankPlan.modelQuery)
 		switch {
 		case prepareErr != nil:
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			allResults = applyRerankDisplayConfig(allResults, config)
 			slog.Debug(
 				"Re-ranking failed; using BM25",
@@ -331,6 +334,9 @@ func runSearchCommand(
 		allResults = reranked
 		dirtyByCorpus = mergedDirty
 		if rerankErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			slog.Debug(
 				"Re-ranking failed; using BM25",
 				"provider", semanticProviderName(),
