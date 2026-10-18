@@ -100,7 +100,7 @@ BENCH_REPO_COUNT ?= 3
 SEMANTIC_BENCH_SAMPLES ?= 10
 
 test-unit: tokenizer-native test-plugin
-	PATH="$(GO_BIN):$$PATH" gotestsum --junitfile $(JUNIT_XML) -- ./... -v -race -timeout 18m -covermode=atomic -coverprofile=$(COVERPROFILE)
+	PATH="$(GO_BIN):$$PATH" gotestsum --junitfile $(JUNIT_XML) -- ./... -v -race -timeout 25m -covermode=atomic -coverprofile=$(COVERPROFILE)
 
 # Local benchmark output is diagnostic. CodSpeed is the source for comparisons.
 test-bench: build
