@@ -305,6 +305,16 @@ func executeParsedSearchScopedDirs(
 	if len(searchers) == 0 {
 		return nil, fmt.Errorf("%w: no loadable shards", errShardUnloadable)
 	}
+	return searchLoadedShards(ctx, searchers, q, config)
+}
+
+// searchLoadedShards closes each searcher after all search workers return.
+func searchLoadedShards(
+	ctx context.Context,
+	searchers []zoekt.Searcher,
+	q query.Q,
+	config searchConfig,
+) ([]zoekt.FileMatch, error) {
 	defer func() {
 		for _, s := range searchers {
 			s.Close()
@@ -314,6 +324,9 @@ func executeParsedSearchScopedDirs(
 	// Fast path: single shard avoids intermediate allFiles slice.
 	if len(searchers) == 1 {
 		result, err := searchers[0].Search(ctx, q, config.opts)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		if err != nil {
 			return nil, fmt.Errorf("search: %w", err)
 		}
@@ -354,6 +367,9 @@ func executeParsedSearchScopedDirs(
 		}(i, s)
 	}
 	wg.Wait()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	var allFiles []zoekt.FileMatch
 	for _, r := range results {
 		if r.err != nil {

@@ -1068,7 +1068,7 @@ func TestRun_ExternalGitRepoPathDoesNotBudgetIgnoredFiles(t *testing.T) {
 	}
 	trackedBytes := int64(len(appContent) + len(ignoreContent))
 	ignoredContent := strings.Repeat("x", int(trackedBytes)+1)
-	if int64(len(ignoredContent)) > maxGitDirtyFileSize {
+	if !documentContentFits(int64(len(ignoredContent))) {
 		t.Fatal("test ignored file must stay below the per-file limit")
 	}
 	if err := os.WriteFile(filepath.Join(ignoredDir, "artifact.bin"), []byte(ignoredContent), 0o644); err != nil {
@@ -3071,8 +3071,10 @@ func TestRun_ExternalFolderCapErrorDoesNotSearchStaleShards(t *testing.T) {
 		t.Fatalf("initial run: %v", err)
 	}
 
-	size := int64(maxIndexedDocumentBytes)
-	count := maxFolderIndexedBytes/maxIndexedDocumentBytes + 1
+	// The file size is only a unit for the folder byte cap. Any size that fits
+	// the index works; 100 MiB keeps the file count low.
+	const size = int64(100 << 20)
+	count := maxFolderIndexedBytes/size + 1
 	for i := range count {
 		path := filepath.Join(folder, fmt.Sprintf("large_%03d.bin", i))
 		if err := os.WriteFile(path, nil, 0o644); err != nil {

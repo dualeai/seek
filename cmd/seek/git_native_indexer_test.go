@@ -381,6 +381,7 @@ func TestNativeGitFullScopeUsesRootIgnoreAndExclusions(t *testing.T) {
 }
 
 func TestReadNativeGitIgnoreRejectsOversizeControlFile(t *testing.T) {
+	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
 	path := filepath.Join(repoDir, ".sourcegraph", "ignore")
@@ -390,7 +391,7 @@ func TestReadNativeGitIgnoreRejectsOversizeControlFile(t *testing.T) {
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Truncate(path, int64(maxIndexedDocumentBytes)+1); err != nil {
+	if err := os.Truncate(path, int64(testDocumentContentLimit)+1); err != nil {
 		t.Fatal(err)
 	}
 	gitRunIn(t, repoDir, "add", ".")

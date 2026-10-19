@@ -229,6 +229,7 @@ func TestNativeGitIndexer_AlternatesIsComplete(t *testing.T) {
 }
 
 func TestNativeGitIndexer_VisibleContract(t *testing.T) {
+	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
 
@@ -259,7 +260,7 @@ func TestNativeGitIndexer_VisibleContract(t *testing.T) {
 	if err := os.WriteFile(oversize, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Truncate(oversize, int64(maxIndexedDocumentBytes)+1); err != nil {
+	if err := os.Truncate(oversize, int64(testDocumentContentLimit)+1); err != nil {
 		t.Fatal(err)
 	}
 

@@ -60,126 +60,54 @@ const (
 	showCorpusContext
 )
 
-// corpusFormatWriter keeps one possible final newline until more output
-// arrives. Its finish method drops that byte, which preserves the
-// no-trailing-newline contract without collecting the complete output in memory.
+// corpusFormatWriter writes formatted results and keeps the first write
+// error, so the formatters can ignore errors until finish.
 type corpusFormatWriter struct {
-	w              io.Writer
-	err            error
-	pendingNewline bool
-}
-
-func (writer *corpusFormatWriter) flushPendingNewline() {
-	if writer.err != nil || !writer.pendingNewline {
-		return
-	}
-	writer.pendingNewline = false
-	if byteWriter, ok := writer.w.(io.ByteWriter); ok {
-		writer.err = byteWriter.WriteByte('\n')
-		return
-	}
-	data := [1]byte{'\n'}
-	written, err := writer.w.Write(data[:])
-	if err != nil {
-		writer.err = err
-	} else if written != len(data) {
-		writer.err = io.ErrShortWrite
-	}
+	w   io.Writer
+	err error
 }
 
 func (writer *corpusFormatWriter) Write(data []byte) (int, error) {
 	if writer.err != nil {
 		return 0, writer.err
 	}
-	accepted := len(data)
-	if accepted == 0 {
-		return 0, nil
-	}
-	writer.flushPendingNewline()
-	if writer.err != nil {
-		return 0, writer.err
-	}
-	if data[len(data)-1] == '\n' {
-		data = data[:len(data)-1]
-		writer.pendingNewline = true
-	}
-	if len(data) == 0 {
-		return accepted, nil
-	}
 	written, err := writer.w.Write(data)
-	if err != nil {
-		writer.err = err
-	} else if written != len(data) {
-		writer.err = io.ErrShortWrite
+	if err == nil && written != len(data) {
+		err = io.ErrShortWrite
 	}
-	if writer.err != nil {
-		return written, writer.err
-	}
-	return accepted, nil
+	writer.err = err
+	return written, err
 }
 
 func (writer *corpusFormatWriter) WriteString(text string) (int, error) {
 	if writer.err != nil {
 		return 0, writer.err
 	}
-	accepted := len(text)
-	if accepted == 0 {
-		return 0, nil
-	}
-	writer.flushPendingNewline()
-	if writer.err != nil {
-		return 0, writer.err
-	}
-	if text[len(text)-1] == '\n' {
-		text = text[:len(text)-1]
-		writer.pendingNewline = true
-	}
-	if len(text) == 0 {
-		return accepted, nil
-	}
 	written, err := io.WriteString(writer.w, text)
-	if err != nil {
-		writer.err = err
-	} else if written != len(text) {
-		writer.err = io.ErrShortWrite
+	if err == nil && written != len(text) {
+		err = io.ErrShortWrite
 	}
-	if writer.err != nil {
-		return written, writer.err
-	}
-	return accepted, nil
+	writer.err = err
+	return written, err
 }
 
 func (writer *corpusFormatWriter) WriteByte(value byte) error {
 	if writer.err != nil {
 		return writer.err
 	}
-	writer.flushPendingNewline()
-	if writer.err != nil {
-		return writer.err
-	}
-	if value == '\n' {
-		writer.pendingNewline = true
-		return nil
-	}
 	if byteWriter, ok := writer.w.(io.ByteWriter); ok {
 		writer.err = byteWriter.WriteByte(value)
 		return writer.err
 	}
 	data := [1]byte{value}
-	written, err := writer.w.Write(data[:])
-	if err != nil {
-		writer.err = err
-	} else if written != len(data) {
-		writer.err = io.ErrShortWrite
-	}
-	return writer.err
+	_, err := writer.Write(data[:])
+	return err
 }
 
 func (writer *corpusFormatWriter) WriteRune(value rune) (int, error) {
 	if value < unicode.MaxASCII {
 		return 1, writer.WriteByte(byte(value))
 	}
-	writer.flushPendingNewline()
 	if writer.err != nil {
 		return 0, writer.err
 	}
@@ -210,7 +138,6 @@ func (writer *corpusFormatWriter) writeRune(value rune) {
 }
 
 func (writer *corpusFormatWriter) finish() error {
-	writer.pendingNewline = false
 	return writer.err
 }
 

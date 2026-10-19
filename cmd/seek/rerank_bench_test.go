@@ -254,6 +254,13 @@ func BenchmarkSemanticModelPass100k(b *testing.B) {
 		}
 	})
 
+	// Real bulk work packs source units before embedding prepared rows.
+	if _, err := embedder.PackSemanticUnits(b.Context(), []semanticUnit{{
+		path: "benchmark.go", text: []byte("package benchmark\n"),
+	}}); err != nil {
+		b.Fatalf("prepare bulk tokenizers: %v", err)
+	}
+
 	const rowCount = 100_000
 	units := make([]semanticUnit, rowCount)
 	modelInputs := make([]int, rowCount*lateOnSequenceLength)

@@ -155,9 +155,12 @@ func TestCLIProcess_VerboseMissingGitKeepsHintAndDetail(t *testing.T) {
 
 func TestCLIProcess_FolderCapExplainsLimitAndRemedy(t *testing.T) {
 	folder := t.TempDir()
-	const fileCount = maxFolderIndexedBytes/maxIndexedDocumentBytes + 1
+	// The file size is only a unit for the folder byte cap. Any size that fits
+	// the index works; 100 MiB keeps the file count low.
+	const fileSize = 100 << 20
+	const fileCount = maxFolderIndexedBytes/fileSize + 1
 	for i := int64(0); i < fileCount; i++ {
-		writeSparseFile(t, filepath.Join(folder, fmt.Sprintf("f%03d.bin", i)), maxIndexedDocumentBytes)
+		writeSparseFile(t, filepath.Join(folder, fmt.Sprintf("f%03d.bin", i)), fileSize)
 	}
 
 	resolvedFolder, err := filepath.EvalSymlinks(folder)
@@ -464,4 +467,37 @@ func runCLIProcessWithCache(t *testing.T, cacheDir, dir string, args, extraEnv [
 	}
 	result.code = exitErr.ExitCode()
 	return result
+}
+
+// TestCLIProcess_ContentRulesOnStdoutAndStderr checks the user-facing contract
+// on the real process: content past Zoekt's default trigram cap matches and
+// stdout ends with one newline; a file whose content is not in the index gets
+// one warning on stderr with Zoekt's reason and exit status 1. The in-process
+// tests cover which operands get a warning.
+func TestCLIProcess_ContentRulesOnStdoutAndStderr(t *testing.T) {
+	requireTools(t)
+	const warning = "File content is not searchable"
+	folder := t.TempDir()
+	writeFileAt(t, folder, "nul.bin", "hello\x00tail\n")
+	high := string(highTrigramContent(t, "cli_high_trigram_marker"))
+	writeFileAt(t, folder, "high.txt", high)
+	nul := filepath.Join(folder, "nul.bin")
+
+	t.Run("high-trigram file matches", func(t *testing.T) {
+		result := runCLIProcess(t, t.TempDir(), []string{"--lexical-only", "cli_high_trigram_marker", filepath.Join(folder, "high.txt")}, nil)
+		if result.code != 0 || !strings.Contains(result.stdout, "cli_high_trigram_marker") {
+			t.Fatalf("code=%d stdout=%q stderr=%q", result.code, result.stdout, result.stderr)
+		}
+		if !strings.HasSuffix(result.stdout, "\n") || strings.HasSuffix(result.stdout, "\n\n") {
+			t.Fatalf("stdout must end with exactly one newline: %q", result.stdout)
+		}
+	})
+	t.Run("no match warns with the reason", func(t *testing.T) {
+		result := runCLIProcess(t, t.TempDir(), []string{"--lexical-only", "tail", nul}, nil)
+		if result.code != 1 || result.stdout != "" ||
+			strings.Count(result.stderr, warning) != 1 ||
+			!strings.Contains(result.stderr, "NOT-INDEXED: contains binary content") {
+			t.Fatalf("code=%d stdout=%q stderr=%q", result.code, result.stdout, result.stderr)
+		}
+	})
 }

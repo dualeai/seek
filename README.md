@@ -8,6 +8,9 @@ to find and rank code by meaning. No server or API key is needed.
 Seek caches indexes for fast repeat searches and safe concurrent use. Run it as
 a tool call or shell command.
 
+Seek is built for the shortest search time, not for low resource use. It uses
+all CPU cores and as much memory and cache space as a search needs.
+
 <!-- Status -->
 [![CI](https://github.com/dualeai/seek/actions/workflows/ci.yml/badge.svg)](https://github.com/dualeai/seek/actions/workflows/ci.yml)
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/dualeai/seek?utm_source=badge)
@@ -344,14 +347,32 @@ regular files, skip `.git` directories, and do not skip dependency, build,
 cache, or vendor directories by name. Git ignore rules apply only in Git
 repositories.
 
-Seek skips files larger than 100 MiB. Folder indexing stops at 1,000,000 files
-or 10 GiB. Git applies limits of 10,000,000 files and 10 GiB separately to
+Seek has no file-size limit. Folder indexing stops at 1,000,000 files or
+10 GiB. Git applies limits of 10,000,000 files and 10 GiB separately to
 committed files and local changes. A scoped search can still index its selected
 paths when the complete repository exceeds a limit.
 
+To finish sooner, the text index reads file content in parallel up to a quarter
+of the host's physical memory at a time, and builds files that fill an index
+shard alone on all CPU cores at once.
+
+Text search covers the full content of every text file, however large it is and
+however many different character sequences it holds. The only limit for one
+file is the index format: one Zoekt index shard holds at most 4 GiB. A file
+whose shard would be larger keeps only its name in the text index. Two more
+kinds of files keep only their name, because Zoekt has no option to index their
+content: files with a NUL byte, and files shorter than three bytes. A search can
+match these names, not their content. Large files with much non-ASCII text, such
+as CJK prose, need much memory to index: 100 MiB of random CJK characters needs
+about 6.6 GiB.
+
+When a search of a file path operand finds no content match and the index holds
+no content for that file, Seek writes a warning with the reason to standard
+error. Searches of folders and repositories do not write this warning.
+
 The meaning-based index skips empty files, files with a NUL byte, and generated
 files with the standard `// Code generated ... DO NOT EDIT.` marker in the first
-4 KiB. These files can still appear in text results.
+4 KiB. Generated files can still appear in text results.
 
 An upgrade can rebuild meaning-based data and can briefly need space for both
 the old and new copies. Do not alternate old and new Seek binaries with one

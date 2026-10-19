@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/sourcegraph/zoekt/index"
 )
 
 func TestComputeStateHash_Deterministic(t *testing.T) {
@@ -760,26 +762,36 @@ func TestValidateCommittedBuildHead_CommandStartFailurePropagates(t *testing.T) 
 
 // --- large file skip tests ---
 
-func TestStreamFiles_LargeFileSkipped(t *testing.T) {
+func TestStreamFiles_LargeFileNameOnly(t *testing.T) {
+	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	dir := t.TempDir()
 	// Create a file just over the limit
-	large := make([]byte, maxGitDirtyFileSize+1)
+	large := make([]byte, testDocumentContentLimit+1)
 	_ = os.WriteFile(filepath.Join(dir, "large.go"), large, 0o644)
 	_ = os.WriteFile(filepath.Join(dir, "small.go"), []byte("package small"), 0o644)
 
 	results := collectStreamFilesForTest(t.Context(), dir, []string{"large.go", "small.go"}, 2)
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result (large file skipped), got %d", len(results))
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results (large file by name only), got %d", len(results))
 	}
-	if results[0].name != "small.go" {
-		t.Errorf("expected small.go, got %s", results[0].name)
+	for _, result := range results {
+		if result.name != "large.go" {
+			continue
+		}
+		if result.skipReason != index.SkipReasonTooLarge || result.content != nil || result.weight != 0 {
+			t.Fatalf("large.go = skip %v, %d content bytes, weight %d; want name-only TooLarge",
+				result.skipReason, len(result.content), result.weight)
+		}
+		return
 	}
+	t.Fatal("expected a name-only document for large.go")
 }
 
 func TestStreamFiles_ExactlyMaxSize(t *testing.T) {
+	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	dir := t.TempDir()
 	// Exactly at the limit — should NOT be skipped (guard is >)
-	data := make([]byte, maxGitDirtyFileSize)
+	data := make([]byte, testDocumentContentLimit)
 	_ = os.WriteFile(filepath.Join(dir, "exact.go"), data, 0o644)
 
 	results := collectStreamFilesForTest(t.Context(), dir, []string{"exact.go"}, 1)
@@ -789,13 +801,14 @@ func TestStreamFiles_ExactlyMaxSize(t *testing.T) {
 }
 
 func TestStreamFiles_JustOverMaxSize(t *testing.T) {
+	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	dir := t.TempDir()
-	data := make([]byte, maxGitDirtyFileSize+1)
+	data := make([]byte, testDocumentContentLimit+1)
 	_ = os.WriteFile(filepath.Join(dir, "over.go"), data, 0o644)
 
 	results := collectStreamFilesForTest(t.Context(), dir, []string{"over.go"}, 1)
-	if len(results) != 0 {
-		t.Errorf("expected 0 results (just over max size should be skipped), got %d", len(results))
+	if len(results) != 1 || results[0].skipReason != index.SkipReasonTooLarge || results[0].content != nil {
+		t.Errorf("expected one name-only TooLarge document just over max size, got %+v", results)
 	}
 }
 
@@ -847,15 +860,8 @@ func TestComputeStateHash_VersionPrefix(t *testing.T) {
 
 func TestIndexBuildOptions_AlignsSharedIndexBudgets(t *testing.T) {
 	opts := indexBuildOptions(t.TempDir(), 3)
-	if opts.SizeMax != maxIndexedDocumentBytes {
-		t.Fatalf("SizeMax=%d, want %d", opts.SizeMax, maxIndexedDocumentBytes)
-	}
-	if maxGitDirtyFileSize != maxIndexedDocumentBytes {
-		t.Fatalf(
-			"git-dirty read limit must match Zoekt SizeMax: gitDirty=%d sizeMax=%d",
-			maxGitDirtyFileSize,
-			maxIndexedDocumentBytes,
-		)
+	if int64(opts.SizeMax) != documentContentLimit {
+		t.Fatalf("SizeMax=%d, want the reader content limit %d", opts.SizeMax, documentContentLimit)
 	}
 	if maxFolderIndexedBytes != maxCorpusIndexedBytes {
 		t.Fatalf("folder indexed bytes=%d, want shared corpus budget %d", maxFolderIndexedBytes, maxCorpusIndexedBytes)
@@ -960,12 +966,13 @@ func TestGitDirtyFileBudget_CapsIncludeCorpusContext(t *testing.T) {
 }
 
 func TestGitDirtyFileBudget_SkipsOversizeFilesForByteCap(t *testing.T) {
+	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	dir := t.TempDir()
 	large := filepath.Join(dir, "large.bin")
 	if err := os.WriteFile(large, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Truncate(large, maxGitDirtyFileSize+1); err != nil {
+	if err := os.Truncate(large, testDocumentContentLimit+1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1171,9 +1178,10 @@ func TestStreamFiles_PermissionDenied(t *testing.T) {
 	}
 }
 
-func TestStreamFiles_BinaryContent(t *testing.T) {
+func TestStreamFiles_BinaryContentNameOnly(t *testing.T) {
 	dir := t.TempDir()
-	// File with null bytes and binary content
+	// A NUL byte in the first bytes makes the file binary for Zoekt: the reader
+	// sends the name only and keeps no content.
 	binary := []byte{0x00, 0x01, 0xFF, 0xFE, 'h', 'e', 'l', 'l', 'o', 0x00}
 	_ = os.WriteFile(filepath.Join(dir, "bin.dat"), binary, 0o644)
 
@@ -1181,14 +1189,8 @@ func TestStreamFiles_BinaryContent(t *testing.T) {
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
-	if len(results[0].content) != len(binary) {
-		t.Errorf("expected %d bytes, got %d", len(binary), len(results[0].content))
-	}
-	for i, b := range binary {
-		if results[0].content[i] != b {
-			t.Errorf("byte %d: expected %x, got %x", i, b, results[0].content[i])
-			break
-		}
+	if results[0].skipReason != index.SkipReasonBinary || results[0].content != nil || results[0].weight != 0 {
+		t.Fatalf("bin.dat = %+v, want a name-only binary document", results[0])
 	}
 }
 
@@ -2293,22 +2295,26 @@ func TestStreamFiles_EmptyFileList(t *testing.T) {
 	}
 }
 
-func TestStreamFiles_AllFiltered(t *testing.T) {
+func TestStreamFiles_TooLargeByNameMissingFiltered(t *testing.T) {
+	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	dir := t.TempDir()
-	// All files are too large — should all be filtered
+	// A too-large file is sent by name only; a missing file is filtered.
 	name := "big.dat"
-	data := make([]byte, maxGitDirtyFileSize+1)
+	data := make([]byte, testDocumentContentLimit+1)
 	if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	// Also include a missing file
 	ch := streamFiles(t.Context(), dir, []string{name, "nonexistent.go"}, 4)
-	count := 0
-	for range ch {
-		count++
+	var names []string
+	for document := range ch {
+		if document.content != nil {
+			t.Errorf("%s has %d content bytes, want none", document.name, len(document.content))
+		}
+		names = append(names, document.name)
 	}
-	if count != 0 {
-		t.Errorf("expected 0 items when all filtered, got %d", count)
+	if len(names) != 1 || names[0] != name {
+		t.Errorf("expected only the name-only %s, got %v", name, names)
 	}
 }
 
@@ -2335,9 +2341,10 @@ func TestStreamFiles_ParallelismOne(t *testing.T) {
 }
 
 func TestStreamFiles_SingleFileExactlyMaxSize(t *testing.T) {
+	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	dir := t.TempDir()
-	// File exactly at maxGitDirtyFileSize — should be included
-	data := make([]byte, maxGitDirtyFileSize)
+	// File exactly at testDocumentContentLimit — should be included
+	data := make([]byte, testDocumentContentLimit)
 	for i := range data {
 		data[i] = 'x'
 	}
@@ -2349,8 +2356,8 @@ func TestStreamFiles_SingleFileExactlyMaxSize(t *testing.T) {
 	count := 0
 	for fc := range ch {
 		count++
-		if len(fc.content) != maxGitDirtyFileSize {
-			t.Errorf("expected content of size %d, got %d", maxGitDirtyFileSize, len(fc.content))
+		if len(fc.content) != testDocumentContentLimit {
+			t.Errorf("expected content of size %d, got %d", testDocumentContentLimit, len(fc.content))
 		}
 	}
 	if count != 1 {

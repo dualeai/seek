@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -833,6 +834,182 @@ func TestLateOnModelCanReopen(t *testing.T) {
 		}
 		if err := scorer.Close(); err != nil {
 			t.Fatal(err)
+		}
+	}
+}
+
+func TestLateOnTokenizerPoolExpandsOnlyForBulk(t *testing.T) {
+	previousCPUs := runtime.GOMAXPROCS(4)
+	t.Cleanup(func() { runtime.GOMAXPROCS(previousCPUs) })
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	scorer, err := newLateOnSemanticModel(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := scorer.(*lateOnModel)
+	t.Cleanup(func() {
+		if err := model.Close(); err != nil {
+			t.Errorf("close model: %v", err)
+		}
+	})
+	if model.tokenizerCount != 1 || len(model.tokenizers) != 1 || cap(model.tokenizers) != 4 {
+		t.Fatalf("initial pool count=%d available=%d capacity=%d", model.tokenizerCount, len(model.tokenizers), cap(model.tokenizers))
+	}
+
+	content := []byte("func Alpha() {}\nfunc Beta() {}\n")
+	units := extractSemanticUnits("sample.go", content, []*ctags.Entry{
+		{Name: "Alpha", Kind: "function", Language: "Go", Line: 1},
+		{Name: "Beta", Kind: "function", Language: "Go", Line: 2},
+	}, nil)
+	tokenizer, err := model.takeTokenizer(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, packErr := packLateOnSemanticUnits(t.Context(), tokenizer, units)
+	documents := []rerankDocument{{Text: "func 请求() { Alpha(); }", matchEnd: len("func 请求() { Alpha(); }")}}
+	wantIDs, wantAttention, wantMasks, tokenizeErr := tokenizeLateOnDocuments(tokenizer, model.punctuation, documents)
+	model.releaseTokenizer(tokenizer)
+	if packErr != nil || tokenizeErr != nil {
+		t.Fatalf("reference pack=%v tokenize=%v", packErr, tokenizeErr)
+	}
+	if _, err := model.PackSemanticUnits(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := model.PackSemanticUnits(cancelled, units); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled pack error=%v", err)
+	}
+	if model.tokenizerCount != 1 {
+		t.Fatalf("empty/cancelled work expanded pool to %d", model.tokenizerCount)
+	}
+
+	const workers = 8
+	packed := make([][]semanticUnit, workers)
+	packErrors := make([]error, workers)
+	var wait sync.WaitGroup
+	for i := range workers {
+		wait.Go(func() {
+			packed[i], packErrors[i] = model.PackSemanticUnits(t.Context(), units)
+		})
+	}
+	wait.Wait()
+	for i := range workers {
+		if packErrors[i] != nil || !reflect.DeepEqual(packed[i], want) {
+			t.Fatalf("worker %d pack=%+v error=%v, want %+v", i, packed[i], packErrors[i], want)
+		}
+	}
+	if model.tokenizerCount != 4 || len(model.tokenizers) != 4 || model.tokenizerJSON != nil {
+		t.Fatalf("bulk pool count=%d available=%d retained JSON=%t", model.tokenizerCount, len(model.tokenizers), model.tokenizerJSON != nil)
+	}
+	var owned []*lateOnTokenizer
+	for range model.tokenizerCount {
+		tokenizer, err := model.takeTokenizer(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids, attention, masks, tokenizeErr := tokenizeLateOnDocuments(tokenizer, model.punctuation, documents)
+		model.releaseTokenizer(tokenizer)
+		owned = append(owned, tokenizer)
+		if tokenizeErr != nil || !reflect.DeepEqual(ids, wantIDs) ||
+			!reflect.DeepEqual(attention, wantAttention) || !reflect.DeepEqual(masks, wantMasks) {
+			t.Fatalf("expanded tokenizer changed IDs, attention, or score masks: %v", tokenizeErr)
+		}
+	}
+	if err := model.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for i, tokenizer := range owned {
+		if tokenizer.native != nil {
+			t.Errorf("tokenizer %d remains open", i)
+		}
+	}
+}
+
+// cancelAfterErrChecks cancels its context on the first Err call after the
+// first `after` calls, so those checks pass. It is safe for concurrent use.
+type cancelAfterErrChecks struct {
+	context.Context
+	cancel context.CancelFunc
+	after  int32
+	calls  *atomic.Int32
+}
+
+func (c cancelAfterErrChecks) Err() error {
+	if c.calls.Add(1) > c.after {
+		c.cancel()
+	}
+	return c.Context.Err()
+}
+
+func TestLateOnTokenizerExpansionFailureKeepsOwnedTokenizer(t *testing.T) {
+	for _, failure := range []string{"invalid JSON", "cancel after one copy"} {
+		t.Run(failure, func(t *testing.T) {
+			testLateOnTokenizerExpansionFailure(t, failure)
+		})
+	}
+}
+
+func testLateOnTokenizerExpansionFailure(t *testing.T, failure string) {
+	t.Helper()
+	previousCPUs := runtime.GOMAXPROCS(3)
+	t.Cleanup(func() { runtime.GOMAXPROCS(previousCPUs) })
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	scorer, err := newLateOnSemanticModel(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := scorer.(*lateOnModel)
+	t.Cleanup(func() {
+		if err := model.Close(); err != nil {
+			t.Errorf("close model: %v", err)
+		}
+	})
+	ctx := t.Context()
+	wantCount := 1
+	if failure == "invalid JSON" {
+		model.tokenizerJSON = []byte("{")
+	} else {
+		cancelled, cancel := context.WithCancel(ctx)
+		defer cancel()
+		// The entry check and one of the two copies pass; the other copy sees
+		// the cancellation.
+		ctx = cancelAfterErrChecks{Context: cancelled, cancel: cancel, after: 2, calls: new(atomic.Int32)}
+		wantCount = 2
+	}
+	units := []semanticUnit{{path: "sample.go", text: []byte("package sample\n")}}
+	for range 2 {
+		if _, err := model.PackSemanticUnits(ctx, units); err == nil {
+			t.Fatal("expansion did not fail")
+		} else if failure != "invalid JSON" && !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled expansion error=%v", err)
+		}
+		if model.tokenizerCount != wantCount || len(model.tokenizers) != wantCount || model.tokenizerJSON != nil {
+			t.Fatalf("failed pool count=%d available=%d retained JSON=%t", model.tokenizerCount, len(model.tokenizers), model.tokenizerJSON != nil)
+		}
+	}
+	var owned []*lateOnTokenizer
+	for range wantCount {
+		tokenizer, err := model.takeTokenizer(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids, encodeErr := encodeLateOnText(tokenizer, lateOnQueryPrefix+"request authentication flow")
+		model.releaseTokenizer(tokenizer)
+		owned = append(owned, tokenizer)
+		if encodeErr != nil || len(ids) == 0 {
+			t.Fatalf("owned tokenizer is unusable after expansion failure: %v", encodeErr)
+		}
+	}
+	if err := model.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if model.tokenizers != nil || model.tokenizerCount != 0 {
+		t.Fatal("failed expansion did not clear its pool")
+	}
+	for _, tokenizer := range owned {
+		if tokenizer.native != nil {
+			t.Error("failed expansion did not close an owned tokenizer")
 		}
 	}
 }

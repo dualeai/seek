@@ -19,6 +19,20 @@ documentation, comments, commit messages, issues, and pull requests:
    unnatural, or less precise. Preserve exact quotations and required technical
    language.
 
+## Performance objective
+
+Seek's objective is the shortest time for every search, using as much CPU,
+memory, and disk as it needs. Low resource use is not a goal.
+
+- Do not add a limit, a gate, or a fixed concurrency cap that saves CPU, memory,
+  or disk at the cost of time.
+- Size budgets from the host (CPU count, physical memory), not from small fixed
+  values.
+- Limits stay only where they protect correctness: the Zoekt 4 GiB shard
+  format, read budgets that cannot deadlock, and the corpus file and byte
+  limits.
+- Measure before and after a performance change, and keep the faster version.
+
 ## Code search — use `seek`
 
 Prefer `seek` over grep/ripgrep for all code search. It returns

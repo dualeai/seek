@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"hash/crc32"
 	"math/rand/v2"
@@ -42,17 +43,27 @@ func planSynthCorpus(t *testing.T, root string) corpusPlan {
 	return plan
 }
 
+// synthFolderWords is the vocabulary of writeRandomFolder in long mode.
+var synthFolderWords = []string{
+	"alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+}
+
 // writeRandomFolder synthesises a temp directory containing files whose
 // cumulative Lstat sizes equal `total`. Each file holds `fileSize`
 // bytes (the last file is truncated to make the sum exact).
 //
 // Mode:
-//   - testing.Short() — uses os.Truncate to create SPARSE files. The
-//     readSemaphore Acquire path keys off Lstat.Size, so sparse files
-//     drive the deadlock just as well as real bytes, but cost ~zero
-//     disk space and CPU. Use this for CI.
-//   - long mode — fills with deterministic pseudo-random bytes seeded
-//     from t.Name() so reproductions are stable.
+//   - testing.Short() — uses writeSparseFile: a text prefix, then a
+//     SPARSE rest. The readSemaphore Acquire path keys off Lstat.Size, so
+//     sparse files drive the deadlock just as well as real bytes, but cost
+//     ~zero disk space and CPU.
+//   - long mode, which CI runs — fills with words from synthFolderWords,
+//     picked by a generator seeded from t.Name() so reproductions are stable.
+//     Callers check read weight, window rotation, and cancellation. None of
+//     them searches the generated words; the beacon tests search a separate
+//     file. The small vocabulary has few distinct trigrams, so Zoekt indexes
+//     the full content at a low cost; random printable ASCII made the callers
+//     about 8 times slower under -race.
 //
 // Caller owns the returned path via t.TempDir(); no cleanup required.
 func writeRandomFolder(t *testing.T, total, fileSize int64) string {
@@ -81,11 +92,18 @@ func writeRandomFolder(t *testing.T, total, fileSize int64) string {
 		if testing.Short() {
 			writeSparseFile(t, p, sz)
 		} else {
-			buf := make([]byte, sz)
-			for j := range buf {
-				buf[j] = byte(rng.Uint32())
+			// Words and spaces have no NUL byte, so the content is indexable
+			// text, not a binary file.
+			buf := make([]byte, 0, sz+16)
+			for word := 0; int64(len(buf)) < sz; word++ {
+				buf = append(buf, synthFolderWords[rng.IntN(len(synthFolderWords))]...)
+				if word%10 == 9 {
+					buf = append(buf, '\n')
+				} else {
+					buf = append(buf, ' ')
+				}
 			}
-			if err := os.WriteFile(p, buf, 0o644); err != nil {
+			if err := os.WriteFile(p, buf[:sz], 0o644); err != nil {
 				t.Fatalf("writeRandomFolder: %v", err)
 			}
 		}
@@ -94,18 +112,16 @@ func writeRandomFolder(t *testing.T, total, fileSize int64) string {
 	return root
 }
 
-// writeSparseFile creates path with size `size` bytes using os.Truncate.
-// The result reports `size` from Lstat but consumes essentially zero
-// disk space. Used by writeRandomFolder under -short and by property
-// tests that explore size boundaries without paying real I/O.
+// writeSparseFile creates path with size `size` bytes. It writes a text
+// prefix past the readers' binary probe, so readers read the file fully, and
+// uses os.Truncate for the rest, which consumes almost no disk space. Used by
+// writeRandomFolder under -short and by property tests that explore size
+// boundaries without paying real I/O.
 func writeSparseFile(t *testing.T, path string, size int64) {
 	t.Helper()
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
+	prefix := bytes.Repeat([]byte("x"), int(min(size, 2*binaryProbeBytes)))
+	if err := os.WriteFile(path, prefix, 0o644); err != nil {
 		t.Fatalf("writeSparseFile create %q: %v", path, err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("writeSparseFile close %q: %v", path, err)
 	}
 	if size == 0 {
 		return

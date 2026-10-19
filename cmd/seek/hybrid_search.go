@@ -79,9 +79,7 @@ func tryHybridSearch(
 
 	// Start the only query encoding before index preparation. Both retrieval and
 	// final MaxSim wait on this same cached result.
-	go func() {
-		_, _, _ = execution.model.prepareQuery(ctx, rerankPlan.modelQuery)
-	}()
+	execution.model.startQuery(ctx, rerankPlan.modelQuery)
 
 	state, indexState, err := ensureGitCorpusFreshWithExecution(
 		ctx,
@@ -96,6 +94,7 @@ func tryHybridSearch(
 		plan.scopedStateHash != "" {
 		return nil, nil, false, nil
 	}
+	execution.prepared.record(plan)
 	if indexState == corpusKnownEmpty {
 		touchPlanUsed(plan)
 		return nil, nil, true, nil
@@ -243,9 +242,7 @@ func tryHybridFolderSearch(
 			return true
 		}
 	}
-	go func() {
-		_, _, _ = execution.model.prepareQuery(ctx, rerankPlan.modelQuery)
-	}()
+	execution.model.startQuery(ctx, rerankPlan.modelQuery)
 	indexState, err := ensureFolderCorpusFreshWithExecution(ctx, plan, execution)
 	if err != nil {
 		return nil, nil, false, err
@@ -253,6 +250,7 @@ func tryHybridFolderSearch(
 	if foundNestedGit.Load() {
 		return nil, nil, false, nil
 	}
+	execution.prepared.record(plan)
 	if indexState == corpusKnownEmpty {
 		touchPlanUsed(plan)
 		return nil, nil, true, nil
@@ -632,12 +630,15 @@ func materializeFolderSemanticCandidates(
 			path = plan.root
 		}
 		info, err := os.Lstat(path)
-		if err != nil || !info.Mode().IsRegular() || info.Size() > maxIndexedDocumentBytes {
+		if err != nil || !info.Mode().IsRegular() || !documentContentFits(info.Size()) {
 			return nil, fmt.Errorf("semantic folder source %q is unavailable", unit.path)
 		}
-		content, err := readFolderFile(folderCandidate{path: path, size: info.Size()})
+		content, binary, err := readFolderFile(folderCandidate{path: path, size: info.Size()})
 		if err != nil {
 			return nil, fmt.Errorf("read semantic folder source %q: %w", unit.path, err)
+		}
+		if binary {
+			return nil, fmt.Errorf("semantic folder source %q is now binary", unit.path)
 		}
 		unit, document, materializeErr := checkedSemanticCandidate(unit, content)
 		if materializeErr != nil {
@@ -833,8 +834,9 @@ func semanticAfterContext(content []byte, start, lines int) []byte {
 
 // buildHybridRerankCandidates reserves up to half of the final candidate set
 // for each retrieval branch, removes duplicate corpus files, then alternates
-// remaining lexical and semantic candidates. For an overlap, it keeps the
-// lexical display result and rank but scores the checked semantic document.
+// remaining lexical and semantic candidates. An overlap reached during the
+// merge keeps lexical display data and scores the checked semantic document.
+// After the pool fills, unseen lexical overlaps supply only their known rank.
 func buildHybridRerankCandidates(
 	strictRanked []corpusSearchResult,
 	relaxedRanked []corpusSearchResult,
@@ -895,6 +897,15 @@ func buildHybridRerankCandidates(
 		if semanticAt < len(semantic) && len(candidates) < rerankCandidateLimit {
 			add(semanticCandidate(semantic[semanticAt]), true)
 			semanticAt++
+		}
+	}
+	// A full union can leave a protected semantic file's lexical rank unseen.
+	// Restore only that rank from the canonical list; keep its checked document,
+	// display evidence, flags, and position in the final pool.
+	for _, candidate := range lexical {
+		key := corpusResultKey{corpusID: candidate.result.corpusID, fileName: candidate.result.file.FileName}
+		if position, exists := positions[key]; exists && candidates[position].lexicalRank == hybridMissingLexicalRank {
+			candidates[position].lexicalRank = candidate.lexicalRank
 		}
 	}
 	return candidates

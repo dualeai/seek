@@ -37,7 +37,7 @@ func TestColor_PlainHasNoEscapes(t *testing.T) {
 	if strings.Contains(out, "\x1b") {
 		t.Fatalf("plain palette must not emit ANSI, got:\n%q", out)
 	}
-	if out != "## a.go (Go)\n2 the needle here" {
+	if out != "## a.go (Go)\n2 the needle here\n" {
 		t.Fatalf("unexpected plain output:\n%q", out)
 	}
 }

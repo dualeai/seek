@@ -45,6 +45,11 @@ func versionString() string {
 	return "seek (unknown)"
 }
 
+// TODO: github.com/rs/xid v1.6.0, which zoekt/index imports, runs ioreg at
+// package init on macOS. Every seek process pays about 20 ms before main.
+// Upstream issue https://github.com/rs/xid/issues/120; the fix
+// (https://github.com/rs/xid/pull/121) is on master but in no release yet.
+// Upgrade rs/xid when a release after v1.6.0 has it.
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
@@ -202,6 +207,7 @@ func runSearchCommand(
 		policy:     runConfig.policy,
 		acceptance: runConfig.hybridAcceptance,
 		resources:  liveSearchResources(),
+		prepared:   &preparedCorpora{},
 	}
 	if runConfig.newModel != nil && runConfig.policy.semanticEnabled() {
 		execution.model = newSemanticModelFuture(runConfig.newModel)
@@ -221,10 +227,8 @@ func runSearchCommand(
 	// cannot serve: a scope, more than one corpus, or an unsupported kind.
 	// Without both, a search builds and binds a generation that nothing reads.
 	//
-	// What this does not cover: neither input reads the working-tree state, so
-	// a dirty tree still prepares vectors and still discards the route at
-	// hybrid_search.go:95. Narrowing that needs the dirty state at the point
-	// the decision is made.
+	// ensureCombinedGitCorpusWithExecution also excludes dirty Git state once
+	// it has the captured state used for index preparation.
 	//
 	// hybridSearchEligible reads execution.model, so this must follow the block
 	// above that assigns it.
@@ -243,13 +247,15 @@ func runSearchCommand(
 		searchQuery query.Q,
 		searchOptions searchConfig,
 	) ([]corpusSearchResult, dirtyFilesByCorpus, error) {
+		lexicalExecution := execution
+		lexicalExecution.prepareVectors = false
 		return searchCorporaWithExecution(
 			searchCtx,
 			searchPlans,
 			searchPaths,
 			searchQuery,
 			searchOptions,
-			execution,
+			lexicalExecution,
 		)
 	}
 	var allResults []corpusSearchResult
@@ -289,6 +295,9 @@ func runSearchCommand(
 		_, prepared, prepareErr := execution.model.prepareQuery(ctx, rerankPlan.modelQuery)
 		switch {
 		case prepareErr != nil:
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			allResults = applyRerankDisplayConfig(allResults, config)
 			slog.Debug(
 				"Re-ranking failed; using BM25",
@@ -331,6 +340,9 @@ func runSearchCommand(
 		allResults = reranked
 		dirtyByCorpus = mergedDirty
 		if rerankErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			slog.Debug(
 				"Re-ranking failed; using BM25",
 				"provider", semanticProviderName(),
@@ -340,6 +352,7 @@ func runSearchCommand(
 		}
 	}
 
+	warnUnindexedFileOperands(ctx, plans, execution.prepared, pathOperands, allResults, dirtyByCorpus)
 	if len(allResults) == 0 {
 		return errNoMatch
 	}
@@ -500,6 +513,7 @@ func prepareAndSearchCorpusOnceWithExecution(
 		return nil, nil, fmt.Errorf("unsupported corpus kind: %s", plan.kind)
 	}
 
+	execution.prepared.record(plan)
 	if indexState == corpusKnownEmpty {
 		touchPlanUsed(plan)
 		return nil, dirtyFiles, nil
@@ -658,7 +672,7 @@ func ensureCombinedGitCorpusWithExecution(
 		ensureFSMonitor(ctx, paths)
 	}
 
-	if plan.skipVectors {
+	if plan.skipVectors || len(state.Files) != 0 {
 		execution.prepareVectors = false
 	}
 	currentState := gitCorpusStateHash(paths, state)
@@ -1065,7 +1079,8 @@ func validateCommittedHead(ctx context.Context, paths gitPaths, expectedHead str
 func gitDirtyFilesHaveIndexableDocuments(repoDir string, files []string) bool {
 	for _, name := range files {
 		info, err := os.Lstat(filepath.Join(repoDir, name))
-		if err == nil && info.Mode().IsRegular() && info.Size() <= maxGitDirtyFileSize {
+		// A file too large for the index still gets a name-only document.
+		if err == nil && info.Mode().IsRegular() {
 			return true
 		}
 	}

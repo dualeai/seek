@@ -231,7 +231,7 @@ func readNativeGitIgnoreEntry(batch *nativeGitBatch, entry *gitTreeEntry) (*igno
 	}
 	info := infos[0]
 	if info.oversize {
-		return nil, fmt.Errorf(".sourcegraph/ignore exceeds the %d-byte document limit", maxIndexedDocumentBytes)
+		return nil, fmt.Errorf(".sourcegraph/ignore exceeds the %d-byte document limit", documentContentLimit)
 	}
 	var matcher *ignore.Matcher
 	if err := batch.read([]gitBlobInfo{info}, func(document fileContent) error {

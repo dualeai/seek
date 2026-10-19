@@ -80,9 +80,14 @@ jobs:
           export PATH="$gobin:$PATH"
           go install golang.org/x/vuln/cmd/govulncheck@"${GOVULNCHECK_VERSION}"
           govulncheck -format sarif ./... > vuln.raw.sarif || true
-          # govulncheck emits duplicate items in rule tags; GitHub's SARIF
-          # validator rejects dups, so dedupe each tags array.
-          jq '(.runs[]?.tool.driver.rules[]?.properties.tags) |= (. // [] | unique)' \
+          # govulncheck emits duplicate items in rule tags and result stacks;
+          # GitHub's SARIF validator rejects dups, so dedupe both arrays.
+          # TODO: remove once these are fixed:
+          # https://github.com/golang/go/issues/75890 (tags)
+          # https://github.com/golang/go/issues/81953 (stacks)
+          # https://github.com/golang/go/issues/82319 (stacks)
+          jq '(.runs[]?.tool.driver.rules[]?.properties.tags) |= (. // [] | unique)
+            | (.runs[]?.results[]? | select(.stacks) | .stacks) |= unique' \
             vuln.raw.sarif > vuln.sarif
       - name: Upload SARIF to code scanning
         if: always()
@@ -98,7 +103,7 @@ jobs:
       fail-fast: false
       matrix: *native-matrix
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 40
     env:
       JUNIT_XML: junit-${{ matrix.name }}.xml
       COVERPROFILE: cover-${{ matrix.name }}.out
@@ -131,10 +136,11 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           go install gotest.tools/gotestsum@"${GOTESTSUM_VERSION}"
       - name: Run unit tests
-        # Step backstop sits above the Go test -timeout (18m, which fires first
-        # with a goroutine dump) and below the job timeout, so a hung test is
-        # bounded without GH hard-killing before Go can report.
-        timeout-minutes: 20
+        # Step backstop sits above the router plugin tests, the -race build, and
+        # the Go test -timeout (25m, which counts only the test run and fires with
+        # a goroutine dump), and below the job timeout. On macOS Intel the plugin
+        # tests took up to 2 min and the build up to 2 min.
+        timeout-minutes: 30
         run: make test-unit USE_PREBUILT=1 OUTPUT=seek
       - name: Coverage summary
         if: always()
@@ -167,7 +173,10 @@ jobs:
     needs: [build]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-26.04-arm
-    timeout-minutes: 20
+    # The benchmarks take at least 20 min here (BenchmarkSemanticModelPass100k
+    # alone takes 13 min), and CodSpeed runner v5.2.1 then took at least 16 min
+    # after the run.
+    timeout-minutes: 90
     permissions:
       actions: read
       contents: read
@@ -186,7 +195,7 @@ jobs:
       - name: Install benchmark dependency
         run: sudo apt-get install -y universal-ctags
       - name: Run benchmarks
-        uses: CodSpeedHQ/action@373d6868929f444bc08d901fd0eb0ad52a8875ea # v5.2.1
+        uses: CodSpeedHQ/action@821a40cd6c80e3cfe387caf55668287addd808da # v5.5.0
         with:
           mode: walltime
           go-runner-version: 1.3.0

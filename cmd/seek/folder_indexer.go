@@ -19,6 +19,7 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/sourcegraph/zoekt"
+	"github.com/sourcegraph/zoekt/index"
 	"github.com/sourcegraph/zoekt/query"
 	"golang.org/x/sys/unix"
 )
@@ -626,14 +627,13 @@ func (s *folderCorpusScanner) addFingerprintFile(dirFD int, name, rel string) er
 		return folderCapError("folder file cap exceeded", indexCapCandidateFiles, int64(s.candidateCount), maxFolderCandidateFiles)
 	}
 	appendFolderFileHash(s.stateHasher, rel, stat.mode, stat.size, stat.mtime, stat.dev, stat.ino)
-	if stat.size > maxIndexedDocumentBytes {
-		return nil
-	}
-	s.indexedBytes += stat.size
-	if s.indexedBytes > maxFolderIndexedBytes {
-		return folderCapError("folder indexed byte cap exceeded", indexCapIndexedBytes, s.indexedBytes, maxFolderIndexedBytes)
-	}
 	s.selectedCount++
+	if documentContentFits(stat.size) {
+		s.indexedBytes += stat.size
+		if s.indexedBytes > maxFolderIndexedBytes {
+			return folderCapError("folder indexed byte cap exceeded", indexCapIndexedBytes, s.indexedBytes, maxFolderIndexedBytes)
+		}
+	}
 	return nil
 }
 
@@ -802,12 +802,13 @@ func selectFolderCandidate(
 	indexedBytes *int64,
 	collectSelected bool,
 ) ([]folderCandidate, bool, error) {
-	if candidate.size > maxIndexedDocumentBytes {
-		return selected, false, nil
-	}
-	*indexedBytes += candidate.size
-	if *indexedBytes > maxFolderIndexedBytes {
-		return selected, false, folderCapError("folder indexed byte cap exceeded", indexCapIndexedBytes, *indexedBytes, maxFolderIndexedBytes)
+	// A file too large for the index is still selected, by name only: it adds
+	// no content bytes.
+	if documentContentFits(candidate.size) {
+		*indexedBytes += candidate.size
+		if *indexedBytes > maxFolderIndexedBytes {
+			return selected, false, folderCapError("folder indexed byte cap exceeded", indexCapIndexedBytes, *indexedBytes, maxFolderIndexedBytes)
+		}
 	}
 	if !collectSelected {
 		return selected, true, nil
@@ -1026,20 +1027,20 @@ func fingerprintRootEntry(
 		candidates: 1,
 		present:    true,
 	}
-	if info.Size() <= maxIndexedDocumentBytes {
+	piece.selected = 1
+	if documentContentFits(info.Size()) {
 		piece.indexedBytes = info.Size()
-		piece.selected = 1
-		if collectSelected {
-			piece.selectedCandidates = []folderCandidate{{
-				name:  name,
-				path:  path,
-				mode:  info.Mode(),
-				size:  info.Size(),
-				mtime: mtime,
-				dev:   dev,
-				ino:   ino,
-			}}
-		}
+	}
+	if collectSelected {
+		piece.selectedCandidates = []folderCandidate{{
+			name:  name,
+			path:  path,
+			mode:  info.Mode(),
+			size:  info.Size(),
+			mtime: mtime,
+			dev:   dev,
+			ino:   ino,
+		}}
 	}
 	return piece, nil
 }
@@ -1162,18 +1163,25 @@ func changedFolderDocuments(selected []folderCandidate, oldChecksums map[string]
 
 	for _, candidate := range selected {
 		seen[candidate.name] = struct{}{}
-		content, err := readFolderFile(candidate)
+		doc, err := readFolderDocument(candidate)
 		if err != nil {
 			if _, ok := oldChecksums[candidate.name]; ok {
 				changedPaths = append(changedPaths, candidate.name)
 			}
 			continue
 		}
-		checksum := crc64.Checksum(content, folderChecksumTable)
+		if doc.skipReason != index.SkipReasonNone {
+			// Zoekt checksums its marker, not the file, so this path cannot tell
+			// whether the name-only document changed. The manifest path can.
+			changedPaths = append(changedPaths, candidate.name)
+			changedDocs = append(changedDocs, doc)
+			continue
+		}
+		checksum := crc64.Checksum(doc.content, folderChecksumTable)
 		oldChecksum, ok := oldChecksums[candidate.name]
 		if !ok || oldChecksum != checksum {
 			changedPaths = append(changedPaths, candidate.name)
-			changedDocs = append(changedDocs, fileContent{name: candidate.name, content: content})
+			changedDocs = append(changedDocs, doc)
 		}
 	}
 
@@ -1265,13 +1273,16 @@ func changedFolderDocumentsFromManifest(selected []folderCandidate, manifest fol
 	var estContent int64
 
 	readCandidate := func(candidate folderCandidate) bool {
-		estContent += candidate.size
-		if estContent >= indexWindowBytes {
-			return false
+		// A name-only file reads no content, so it adds nothing to the payload.
+		if documentContentFits(candidate.size) {
+			estContent += candidate.size
+			if estContent >= indexWindowBytes {
+				return false
+			}
 		}
 		changedPaths = append(changedPaths, candidate.name)
-		if content, err := readFolderFile(candidate); err == nil {
-			changedDocs = append(changedDocs, fileContent{name: candidate.name, content: content})
+		if doc, err := readFolderDocument(candidate); err == nil {
+			changedDocs = append(changedDocs, doc)
 		}
 		return true
 	}
@@ -1407,11 +1418,12 @@ func appendFolderFingerprintBytes(h *xxhash.Digest, part []byte) {
 // each folder candidate. The output channel is unbuffered. In-flight
 // memory is bounded by two limits, whichever is tighter:
 //   - the worker count (each worker holds at most one fileContent),
-//   - readSemaphore's maxInFlightBytes byte budget (see caps.go).
+//   - readSemaphore's readBudgetBytes weight budget (see caps.go).
 //
-// Each yielded fileContent carries the candidate's pre-read size as its
-// readSemaphore weight. The consumer releases that weight after Builder.Finish
-// stops using the content. A caller must drain the channel or cancel ctx.
+// Each yielded fileContent carries readWeight of the candidate's pre-read size
+// as its readSemaphore weight; a name-only document carries zero. The consumer
+// releases that weight after Builder.Finish stops using the content. A caller
+// must drain the channel or cancel ctx.
 //
 // Synchronous folder-delta reads use readFolderFile directly and have zero
 // weight. readSemaphore does not limit those reads.
@@ -1455,15 +1467,16 @@ func streamFolderFiles(ctx context.Context, candidates []folderCandidate, parall
 
 // readOneFolderFileStreaming acquires readSemaphore weight for one candidate.
 // A successful send transfers release ownership to the consumer. On all other
-// paths, this function releases the weight.
+// paths, this function releases the weight. A candidate whose content does not
+// fit the index, or that starts with binary content (readContent), is sent by
+// name only, with no weight.
 func readOneFolderFileStreaming(ctx context.Context, candidate folderCandidate, out chan<- fileContent) {
 	size := candidate.size
-	if size > maxIndexedDocumentBytes {
-		// readFolderFile would have rejected this anyway; mirror the
-		// guard here to avoid acquiring weight we cannot honor.
+	if !documentContentFits(size) {
+		sendNameOnly(ctx, out, candidate.name, index.SkipReasonTooLarge)
 		return
 	}
-	weight := size
+	weight := readWeight(size)
 	if err := readSemaphore.Acquire(ctx, weight); err != nil {
 		return // ctx cancelled.
 	}
@@ -1474,8 +1487,13 @@ func readOneFolderFileStreaming(ctx context.Context, candidate folderCandidate, 
 		}
 	}()
 
-	content, err := readFolderFile(candidate)
+	content, binary, err := readFolderFile(candidate)
 	if err != nil {
+		return
+	}
+	if binary {
+		// No content to hold: the deferred release returns the weight.
+		sendNameOnly(ctx, out, candidate.name, index.SkipReasonBinary)
 		return
 	}
 	select {
@@ -1486,32 +1504,52 @@ func readOneFolderFileStreaming(ctx context.Context, candidate folderCandidate, 
 	}
 }
 
-func readFolderFile(candidate folderCandidate) ([]byte, error) {
-	if candidate.size > maxIndexedDocumentBytes {
-		return nil, fmt.Errorf("file exceeds max size")
+// readFolderDocument returns the document for one candidate, with no
+// readSemaphore weight: its content, or a name-only document when the file is
+// too large for the index or starts with binary content.
+func readFolderDocument(candidate folderCandidate) (fileContent, error) {
+	if !documentContentFits(candidate.size) {
+		return fileContent{name: candidate.name, skipReason: index.SkipReasonTooLarge}, nil
+	}
+	content, binary, err := readFolderFile(candidate)
+	if err != nil {
+		return fileContent{}, err
+	}
+	if binary {
+		return fileContent{name: candidate.name, skipReason: index.SkipReasonBinary}, nil
+	}
+	return fileContent{name: candidate.name, content: content}, nil
+}
+
+// readFolderFile reads one candidate. binary is true, with no content, when the
+// file starts with binary content (readContent); the rest is not read.
+func readFolderFile(candidate folderCandidate) (content []byte, binary bool, err error) {
+	if !documentContentFits(candidate.size) {
+		return nil, false, fmt.Errorf("file exceeds max size")
 	}
 	file, err := os.Open(candidate.path)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer func() { _ = file.Close() }()
 
-	content := make([]byte, candidate.size)
-	n, err := io.ReadFull(file, content)
+	content, binary, _, err = readContent(file, candidate.size)
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		return nil, err
+		return nil, false, err
 	}
-	content = content[:n]
+	if binary {
+		return nil, true, nil
+	}
 
 	var extra [1]byte
 	extraN, err := file.Read(extra[:])
 	if err != nil && err != io.EOF {
-		return nil, err
+		return nil, false, err
 	}
 	if extraN > 0 {
-		return nil, fmt.Errorf("file grew beyond max size")
+		return nil, false, fmt.Errorf("file grew beyond max size")
 	}
-	return content, nil
+	return content, false, nil
 }
 
 func folderRepoName(plan corpusPlan) string {

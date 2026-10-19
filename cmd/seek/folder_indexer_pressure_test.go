@@ -14,9 +14,9 @@ import (
 // Window rotation must Release per-window so reading proceeds; the
 // goroutineLeakGuard trips its watchdog if rotation regresses.
 //
-// Sparse files keep CI cheap: testing.Short() routes writeRandomFolder
-// through os.Truncate. Lstat.Size drives the Acquire weight, so
-// behaviour matches dense files.
+// testing.Short() routes writeRandomFolder through sparse files
+// (os.Truncate). Lstat.Size drives the Acquire weight, so behaviour
+// matches the dense small-vocabulary files that CI writes.
 func TestEnsureFolderCorpusFresh_BeyondInFlightBudget(t *testing.T) {
 	const testBudget int64 = 4 * 1024 * 1024  // 4 MiB
 	const fileSize int64 = 512 * 1024         // 512 KiB

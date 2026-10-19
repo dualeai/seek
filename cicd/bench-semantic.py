@@ -558,7 +558,7 @@ def main() -> int:
     print("priming bundled model and native runtimes", file=sys.stderr)
     seek_env = os.environ | {"SEEK_CACHE_DIR": str(cache_dir)}
     status = run_to_files(
-        [str(seek_bin), "--verbose", "-n", "1", "prime", str(prime_dir)],
+        [str(seek_bin), "--verbose", "-n", "1", "provider prime input", str(prime_dir)],
         results_dir / "prime.stdout",
         results_dir / "prime.stderr",
         env=seek_env,
