@@ -419,7 +419,7 @@ func TestReaderDoesNotWaitForAFullRebuild(t *testing.T) {
 func TestOpenNodeReadLock(t *testing.T) {
 	cacheDir := t.TempDir()
 	plan := node{corpusStore: corpusStore{cacheDir: cacheDir, indexDir: filepath.Join(cacheDir, "index")}}
-	read, readCtx, err := openNodeRead(t.Context(), plan)
+	read, readCtx, err := openNodeRead(t.Context(), plan, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -437,7 +437,7 @@ func TestOpenNodeReadLock(t *testing.T) {
 	// The lock is shared: a second read opens while the first one holds it.
 	secondCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	second, _, err := openNodeRead(secondCtx, plan)
+	second, _, err := openNodeRead(secondCtx, plan, nil)
 	if err != nil {
 		t.Fatalf("a second read during the first: %v", err)
 	}

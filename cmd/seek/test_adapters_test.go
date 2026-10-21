@@ -84,19 +84,15 @@ func executeParsedShardSearchForTest(
 	config searchConfig,
 ) ([]zoekt.FileMatch, error) {
 	plan := node{cacheDir: filepath.Dir(indexDir), indexDir: indexDir}
-	return searchPlannedCorpusParsed(ctx, plan, userQ, config)
+	return searchPlannedCorpusParsed(ctx, plan, nil, userQ, config)
 }
 
 // formatGitCorpusResultsForTest is a test adapter for the result format. It
-// puts files in testGitCorpusPlan, drops a committed result of a file in
-// dirtyFiles, hides the corpus context, and uses plainPalette.
-func formatGitCorpusResultsForTest(files []zoekt.FileMatch, dirtyFiles dirtyFileSet, limit, maxMatches int) string {
+// puts files in testGitCorpusPlan, hides the corpus context, and uses
+// plainPalette.
+func formatGitCorpusResultsForTest(files []zoekt.FileMatch, limit, maxMatches int) string {
 	results := wrapCorpusResults(testGitCorpusPlan, files)
-	dirtyByCorpus := dirtyFilesByCorpus{}
-	if dirtyFiles != nil {
-		dirtyByCorpus[testGitCorpusPlan.id] = dirtyFiles
-	}
-	return formatCorpusResultsWithContext(results, dirtyByCorpus, limit, maxMatches, hideCorpusContext, plainPalette)
+	return formatCorpusResultsWithContext(results, limit, maxMatches, hideCorpusContext, plainPalette)
 }
 
 // searchPlannedCorpusForTest is a test adapter for searchPlannedCorpusParsed.
@@ -106,7 +102,7 @@ func searchPlannedCorpusForTest(ctx context.Context, plan node, pattern string) 
 	if err != nil {
 		return nil, err
 	}
-	return searchPlannedCorpusParsed(ctx, plan, q, defaultSearchConfig())
+	return searchPlannedCorpusParsed(ctx, plan, nil, q, defaultSearchConfig())
 }
 
 // familyShardFilesForTest is a test adapter for familyShardFiles. Production
@@ -125,14 +121,13 @@ func familyShardFilesForTest(tb testing.TB, dir string, fam shardFamily) []strin
 // writeCorpusResultsWithContext. It returns the text that the command writes.
 func formatCorpusResultsWithContext(
 	results []corpusSearchResult,
-	dirtyByCorpus dirtyFilesByCorpus,
 	limit int,
 	maxMatches int,
 	displayMode corpusDisplayMode,
 	pal palette,
 ) string {
 	var sb strings.Builder
-	_, _ = writeCorpusResultsWithContext(&sb, results, dirtyByCorpus, limit, maxMatches, displayMode, pal)
+	_, _ = writeCorpusResultsWithContext(&sb, results, limit, maxMatches, displayMode, pal)
 	return sb.String()
 }
 

@@ -143,7 +143,7 @@ func TestCountedSkipReasonsMatchZoekt(t *testing.T) {
 	}
 	plan := node{cacheDir: t.TempDir(), indexDir: indexDir}
 	marker := &query.Substring{Pattern: zoektNotIndexedMarker, Content: true, CaseSensitive: true}
-	files, err := searchPlannedCorpusParsed(t.Context(), plan, marker, defaultSearchConfig())
+	files, err := searchPlannedCorpusParsed(t.Context(), plan, nil, marker, defaultSearchConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

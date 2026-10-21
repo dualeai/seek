@@ -12,24 +12,15 @@ import (
 	"github.com/sourcegraph/zoekt"
 )
 
-func testDirtyFileSet(paths ...string) dirtyFileSet {
-	files := make(dirtyFileSet, len(paths))
-	for _, path := range paths {
-		files[path] = struct{}{}
-	}
-	return files
-}
-
 // requireNoGitCorpusOutput puts files in testGitCorpusPlan, runs the
-// streamed formatter with dirtyFiles and limit, and requires no output and no
-// written result: runSearchCommand then returns errNoMatch (exit status 1).
-func requireNoGitCorpusOutput(t *testing.T, files []zoekt.FileMatch, dirtyFiles dirtyFileSet, limit int) {
+// streamed formatter with limit, and requires no output and no written result:
+// runSearchCommand then returns errNoMatch (exit status 1).
+func requireNoGitCorpusOutput(t *testing.T, files []zoekt.FileMatch, limit int) {
 	t.Helper()
 	var output bytes.Buffer
 	wrote, err := writeCorpusResultsWithContext(
 		&output,
 		wrapCorpusResults(testGitCorpusPlan, files),
-		dirtyFilesByCorpus{testGitCorpusPlan.id: dirtyFiles},
 		limit,
 		0,
 		hideCorpusContext,
@@ -41,7 +32,7 @@ func requireNoGitCorpusOutput(t *testing.T, files []zoekt.FileMatch, dirtyFiles 
 }
 
 func TestGitCorpusFormatting_Empty(t *testing.T) {
-	requireNoGitCorpusOutput(t, nil, nil, 0)
+	requireNoGitCorpusOutput(t, nil, 0)
 }
 
 func TestWriteCorpusResultsWithContextMatchesStringFormatter(t *testing.T) {
@@ -78,7 +69,7 @@ func TestWriteCorpusResultsWithContextMatchesStringFormatter(t *testing.T) {
 	const want = "## first.go (Go)\n1 first match\n\n… 1 more file (showing 1 of 2)\n"
 	var output bytes.Buffer
 	wrote, err := writeCorpusResultsWithContext(
-		&output, results, nil, 1, 0, hideCorpusContext, plainPalette,
+		&output, results, 1, 0, hideCorpusContext, plainPalette,
 	)
 	if err != nil || !wrote || output.String() != want {
 		t.Fatalf("streamed output=%q wrote=%t error=%v, want %q", output.String(), wrote, err, want)
@@ -86,7 +77,7 @@ func TestWriteCorpusResultsWithContextMatchesStringFormatter(t *testing.T) {
 	// The other formatter tests use the string formatter: it must give the
 	// same bytes as the streamed one.
 	if got := formatCorpusResultsWithContext(
-		results, nil, 1, 0, hideCorpusContext, plainPalette,
+		results, 1, 0, hideCorpusContext, plainPalette,
 	); got != want {
 		t.Fatalf("string output=%q, want %q", got, want)
 	}
@@ -112,7 +103,6 @@ func TestWriteCorpusResultsWithContextReturnsWriteError(t *testing.T) {
 	wrote, err := writeCorpusResultsWithContext(
 		failingCorpusWriter{err: wantErr},
 		results,
-		nil,
 		0,
 		0,
 		hideCorpusContext,
@@ -139,7 +129,7 @@ func TestGitCorpusFormatting_BasicFileMatch(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := "## src/main.go (Go)\n5 func main() {\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -162,44 +152,10 @@ func TestGitCorpusFormatting_UncommittedTag(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := "## lib/utils.py (Python) [uncommitted]\n10 def helper():\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
-	}
-}
-
-func TestGitCorpusFormatting_Deduplication_UncommittedWins(t *testing.T) {
-	files := []zoekt.FileMatch{
-		{
-			FileName:   "src/app.go",
-			Repository: "github.com/org/repo",
-			Language:   "Go",
-			Score:      10,
-			LineMatches: []zoekt.LineMatch{
-				{Line: []byte("old content from repo\n"), LineNumber: 1},
-			},
-		},
-		{
-			FileName:   "src/app.go",
-			Repository: repoUncommitted,
-			Language:   "Go",
-			Score:      5,
-			LineMatches: []zoekt.LineMatch{
-				{Line: []byte("new local changes\n"), LineNumber: 1},
-			},
-		},
-	}
-
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
-	if !strings.Contains(result, "[uncommitted]") {
-		t.Error("expected uncommitted version to win deduplication")
-	}
-	if strings.Contains(result, "old content from repo") {
-		t.Error("committed version should not appear when uncommitted exists")
-	}
-	if !strings.Contains(result, "new local changes") {
-		t.Error("uncommitted content should appear")
 	}
 }
 
@@ -225,7 +181,7 @@ func TestGitCorpusFormatting_ScoreSorting(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	highIdx := strings.Index(result, "high.go")
 	lowIdx := strings.Index(result, "low.go")
 	if highIdx > lowIdx {
@@ -254,7 +210,7 @@ func TestGitCorpusFormatting_SymbolKind(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := "## router.go (Go)\n15 [function] func CoreRouter() {\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -274,7 +230,7 @@ func TestGitCorpusFormatting_LanguageFallback(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	if !strings.Contains(result, "(unknown)") {
 		t.Error("expected language fallback to 'unknown'")
 	}
@@ -302,7 +258,7 @@ func TestGitCorpusFormatting_MultiFile(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	if !strings.Contains(result, "## a.go (Go)") {
 		t.Error("expected a.go header")
 	}
@@ -324,7 +280,7 @@ func TestGitCorpusFormatting_EndsWithOneNewline(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	if !strings.HasSuffix(result, "1 hello\n") || strings.HasSuffix(result, "\n\n") {
 		t.Errorf("output must end with exactly one newline, got %q", result)
 	}
@@ -340,7 +296,7 @@ func TestGitCorpusFormatting_ZeroLineMatches(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := "## empty.go (Go)\n"
 	if result != expected {
 		t.Errorf("expected %q, got %q", expected, result)
@@ -361,7 +317,7 @@ func TestGitCorpusFormatting_ManyFiles_SortedByScore(t *testing.T) {
 		}
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 
 	// Highest score (999) should appear before lowest (0)
 	highIdx := strings.Index(result, "file_0999.go")
@@ -398,7 +354,7 @@ func TestGitCorpusFormatting_UncommittedWinsRegardlessOfOrder(t *testing.T) {
 		{committed, uncommitted},
 		{uncommitted, committed},
 	} {
-		result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+		result := formatGitCorpusResultsForTest(files, 0, 0)
 		if !strings.Contains(result, "[uncommitted]") {
 			t.Fatalf("expected uncommitted tag, got:\n%s", result)
 		}
@@ -418,7 +374,7 @@ func TestGitCorpusFormatting_ScoreTiebreaking_Stable(t *testing.T) {
 		{FileName: "a.go", Repository: "repo", Language: "Go", Score: 10,
 			LineMatches: []zoekt.LineMatch{{Line: []byte("a\n"), LineNumber: 1}}},
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	aIdx := strings.Index(result, "a.go")
 	bIdx := strings.Index(result, "b.go")
 	if aIdx > bIdx {
@@ -433,7 +389,7 @@ func TestGitCorpusFormatting_TwoCommittedMatchesSameFileKeepsOneVisibleResult(t 
 		{FileName: "a.go", Repository: "repo", Score: 5,
 			LineMatches: []zoekt.LineMatch{{Line: []byte("second\n"), LineNumber: 2}}},
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	if strings.Count(result, "## a.go") != 1 {
 		t.Fatalf("expected one visible file header, got:\n%s", result)
 	}
@@ -466,7 +422,7 @@ func TestGitCorpusFormatting_ContextLines_BeforeAndAfter(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := strings.Join([]string{
 		"## server.go (Go)",
 		"13 ",
@@ -498,7 +454,7 @@ func TestGitCorpusFormatting_ContextLines_NoContext(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := "## main.go (Go)\n5 func main() {\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -530,7 +486,7 @@ func TestGitCorpusFormatting_ContextLines_OverlappingContext(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"10 first match",
@@ -565,7 +521,7 @@ func TestGitCorpusFormatting_ContextLines_NonContiguousRegions(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"5 first match",
@@ -602,7 +558,7 @@ func TestGitCorpusFormatting_ContextLines_AdjacentMatches(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"10 line one",
@@ -632,7 +588,7 @@ func TestGitCorpusFormatting_ContextLines_ThreeContextLines(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := strings.Join([]string{
 		"## main.go (Go)",
 		"17 ctx line 17",
@@ -666,7 +622,7 @@ func TestGitCorpusFormatting_ContextLines_MatchOnLine1(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := strings.Join([]string{
 		"## main.go (Go)",
 		"1 package main",
@@ -697,7 +653,7 @@ func TestGitCorpusFormatting_ContextLines_MatchOnLine1_ExcessBefore(t *testing.T
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	// Before lines should be silently dropped — no negative line numbers
 	if strings.Contains(result, "phantom") {
 		t.Errorf("expected excess Before lines to be dropped, got:\n%s", result)
@@ -728,7 +684,7 @@ func TestGitCorpusFormatting_ContextLines_MatchOnLine2_PartialBefore(t *testing.
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := strings.Join([]string{
 		"## main.go (Go)",
 		"1 package main",
@@ -768,7 +724,7 @@ func TestGitCorpusFormatting_ContextLines_ThreeConsecutiveMatches(t *testing.T) 
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"10 match A",
@@ -800,7 +756,7 @@ func TestGitCorpusFormatting_ContextLines_OnlyBefore(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"99 penultimate",
@@ -829,7 +785,7 @@ func TestGitCorpusFormatting_ContextLines_OnlyAfter(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"1 first line",
@@ -859,7 +815,7 @@ func TestGitCorpusFormatting_ContextLines_EmptyLinesInContext(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"2 import \"fmt\"",
@@ -893,7 +849,7 @@ func TestGitCorpusFormatting_ContextLines_EmptyByteSlice(t *testing.T) {
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := "## app.go (Go)\n5 match\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
@@ -918,7 +874,7 @@ func TestGitCorpusFormatting_ContextLines_BeforeNoTrailingNewline(t *testing.T) 
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"1 line one",
@@ -949,59 +905,9 @@ func TestGitCorpusFormatting_FileOnlyMatch_LineNumberZero(t *testing.T) {
 	}
 
 	// Should not panic
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	if !strings.Contains(result, "## path/to/file.go (Go)") {
 		t.Errorf("expected file header, got: %s", result)
-	}
-}
-
-func TestGitCorpusFormatting_StaleDirtyFileSuppressed(t *testing.T) {
-	// The formatter writes no result when the only match is a stale
-	// committed result for a dirty file.
-	files := []zoekt.FileMatch{
-		{
-			FileName:   "sqlite.py",
-			Repository: "repo",
-			Language:   "Python",
-			Score:      10,
-			LineMatches: []zoekt.LineMatch{
-				{Line: []byte("_MIGRATIONS = []\n"), LineNumber: 60},
-			},
-		},
-	}
-	requireNoGitCorpusOutput(t, files, testDirtyFileSet("sqlite.py"), 0)
-}
-
-func TestGitCorpusFormatting_AllSuppressedReturnsEmpty(t *testing.T) {
-	// When all results are suppressed, the formatter writes no result, so the
-	// caller returns errNoMatch (exit code 1).
-	files := []zoekt.FileMatch{
-		{FileName: "a.py", Repository: "repo", Language: "Python", Score: 10,
-			LineMatches: []zoekt.LineMatch{{Line: []byte("old\n"), LineNumber: 1}}},
-		{FileName: "b.py", Repository: "repo", Language: "Python", Score: 5,
-			LineMatches: []zoekt.LineMatch{{Line: []byte("stale\n"), LineNumber: 2}}},
-	}
-	requireNoGitCorpusOutput(t, files, testDirtyFileSet("a.py", "b.py"), 0)
-}
-
-func TestGitCorpusFormatting_PartialSuppression(t *testing.T) {
-	// Some results suppressed, some kept.
-	files := []zoekt.FileMatch{
-		{FileName: "stale.go", Repository: "repo", Language: "Go", Score: 10,
-			LineMatches: []zoekt.LineMatch{{Line: []byte("old\n"), LineNumber: 1}}},
-		{FileName: "valid.go", Repository: "repo", Language: "Go", Score: 5,
-			LineMatches: []zoekt.LineMatch{{Line: []byte("good\n"), LineNumber: 1}}},
-	}
-	dirtyFiles := testDirtyFileSet("stale.go")
-	result := formatGitCorpusResultsForTest(files, dirtyFiles, 0, 0)
-	if strings.Contains(result, "stale.go") {
-		t.Error("stale.go should be suppressed")
-	}
-	if !strings.Contains(result, "valid.go") {
-		t.Error("valid.go should be present")
-	}
-	if !strings.Contains(result, "good") {
-		t.Error("valid content should be present")
 	}
 }
 
@@ -1018,7 +924,7 @@ func TestGitCorpusFormatting_VeryLongFileName(t *testing.T) {
 			},
 		},
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	if !strings.Contains(result, longName) {
 		t.Error("expected long filename to appear in output without truncation")
 	}
@@ -1037,7 +943,7 @@ func TestGitCorpusFormatting_VeryLongLine(t *testing.T) {
 			},
 		},
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	if !strings.Contains(result, strings.Repeat("x", 10000)) {
 		t.Error("expected long line to appear without truncation")
 	}
@@ -1055,7 +961,7 @@ func TestGitCorpusFormatting_SpecialCharsInLine(t *testing.T) {
 			},
 		},
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	if !strings.Contains(result, "tab\there unicode: 日本語 emoji: 🎉") {
 		t.Errorf("expected special chars preserved, got: %s", result)
 	}
@@ -1079,7 +985,7 @@ func TestGitCorpusFormatting_LineNumber_MaxUint32(t *testing.T) {
 		},
 	}
 	// Should not panic
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	if !strings.Contains(result, "match") {
 		t.Error("expected match to appear in output")
 	}
@@ -1100,7 +1006,7 @@ func TestGitCorpusFormatting_LineNumbers_NoPaddingNoIndent(t *testing.T) {
 			},
 		},
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	// Dense gutter: line numbers are flush-left with a single space, never
 	// indented or right-aligned to a shared cross-file width.
 	if !strings.Contains(result, "\n5 near top") || !strings.Contains(result, "\n100 far down") {
@@ -1150,7 +1056,7 @@ func TestGitCorpusFormatting_Limit_TopN(t *testing.T) {
 			LineMatches: []zoekt.LineMatch{{Line: []byte("match\n"), LineNumber: 1}},
 		}
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 3, 0)
+	result := formatGitCorpusResultsForTest(files, 3, 0)
 	// Anchor on the "## " header so e.g. "file_09.go" can't alias "file_900.go".
 	for _, want := range []string{"## file_09.go", "## file_08.go", "## file_07.go"} {
 		if !strings.Contains(result, want) {
@@ -1182,7 +1088,7 @@ func TestGitCorpusFormatting_NonPositiveLimitsAreUnlimited(t *testing.T) {
 		{"maxMatches_negative", 0, -1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			result := formatGitCorpusResultsForTest(files, nil, tc.limit, tc.maxMatches)
+			result := formatGitCorpusResultsForTest(files, tc.limit, tc.maxMatches)
 			for i := range 5 {
 				if !strings.Contains(result, fmt.Sprintf("f%d.go", i)) {
 					t.Errorf("expected f%d.go in output", i)
@@ -1197,7 +1103,7 @@ func TestGitCorpusFormatting_Limit_ExceedsResults(t *testing.T) {
 		{FileName: "only.go", Repository: "repo", Language: "Go", Score: 1,
 			LineMatches: []zoekt.LineMatch{{Line: []byte("m\n"), LineNumber: 1}}},
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 100, 0)
+	result := formatGitCorpusResultsForTest(files, 100, 0)
 	if !strings.Contains(result, "only.go") {
 		t.Error("expected only.go in output")
 	}
@@ -1212,7 +1118,7 @@ func TestGitCorpusFormatting_Limit_EqualsResults(t *testing.T) {
 			LineMatches: []zoekt.LineMatch{{Line: []byte("m\n"), LineNumber: 1}},
 		}
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 3, 0)
+	result := formatGitCorpusResultsForTest(files, 3, 0)
 	for i := range 3 {
 		if !strings.Contains(result, fmt.Sprintf("f%d.go", i)) {
 			t.Errorf("expected f%d.go in output when limit == count", i)
@@ -1221,24 +1127,7 @@ func TestGitCorpusFormatting_Limit_EqualsResults(t *testing.T) {
 }
 
 func TestGitCorpusFormatting_Limit_EmptyInput(t *testing.T) {
-	requireNoGitCorpusOutput(t, nil, nil, 5)
-}
-
-func TestGitCorpusFormatting_Limit_DedupReducesBelowLimit(t *testing.T) {
-	files := dedupFixtureFiles(5, "f%d.go", "committed\n", "uncommitted\n")
-	result := formatGitCorpusResultsForTest(files, nil, 8, 0)
-	headers := extractFileHeaders(result)
-	if len(headers) != 5 {
-		t.Errorf("expected 5 file headers after dedup (limit=8), got %d", len(headers))
-	}
-}
-
-func TestGitCorpusFormatting_Limit_AllSuppressedByDirty(t *testing.T) {
-	files := []zoekt.FileMatch{
-		{FileName: "a.go", Repository: "repo", Language: "Go", Score: 10,
-			LineMatches: []zoekt.LineMatch{{Line: []byte("old\n"), LineNumber: 1}}},
-	}
-	requireNoGitCorpusOutput(t, files, testDirtyFileSet("a.go"), 5)
+	requireNoGitCorpusOutput(t, nil, 5)
 }
 
 func TestGitCorpusFormatting_Limit_TiedScores(t *testing.T) {
@@ -1250,7 +1139,7 @@ func TestGitCorpusFormatting_Limit_TiedScores(t *testing.T) {
 		{FileName: "c.go", Repository: "repo", Language: "Go", Score: 10,
 			LineMatches: []zoekt.LineMatch{{Line: []byte("c\n"), LineNumber: 1}}},
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 2, 0)
+	result := formatGitCorpusResultsForTest(files, 2, 0)
 	if !strings.Contains(result, "a.go") || !strings.Contains(result, "b.go") {
 		t.Errorf("expected a.go and b.go in output, got:\n%s", result)
 	}
@@ -1268,8 +1157,8 @@ func TestGitCorpusFormatting_Limit_PropertySameFilesAndOrder(t *testing.T) {
 			LineMatches: []zoekt.LineMatch{{Line: []byte("m\n"), LineNumber: 1}},
 		}
 	}
-	unlimited := formatGitCorpusResultsForTest(files, nil, 0, 0)
-	limited := formatGitCorpusResultsForTest(files, nil, 5, 0)
+	unlimited := formatGitCorpusResultsForTest(files, 0, 0)
+	limited := formatGitCorpusResultsForTest(files, 5, 0)
 	unlimitedHeaders := extractFileHeaders(unlimited)
 	limitedHeaders := extractFileHeaders(limited)
 	if len(limitedHeaders) != 5 {
@@ -1292,7 +1181,7 @@ func TestGitCorpusFormatting_Limit_WithUncommittedAndSymbols(t *testing.T) {
 		{FileName: "low.go", Repository: "repo", Language: "Go", Score: 1,
 			LineMatches: []zoekt.LineMatch{{Line: []byte("low\n"), LineNumber: 1}}},
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 2, 0)
+	result := formatGitCorpusResultsForTest(files, 2, 0)
 	if !strings.Contains(result, "[uncommitted]") {
 		t.Error("expected uncommitted tag")
 	}
@@ -1309,34 +1198,12 @@ func TestGitCorpusFormatting_Limit_FileOnlyMatch(t *testing.T) {
 		{FileName: "top.go", Repository: "repo", Language: "Go", Score: 100},
 		{FileName: "bot.go", Repository: "repo", Language: "Go", Score: 1},
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 1, 0)
+	result := formatGitCorpusResultsForTest(files, 1, 0)
 	if !strings.Contains(result, "top.go") {
 		t.Error("expected top.go")
 	}
 	if strings.Contains(result, "bot.go") {
 		t.Error("did not expect bot.go")
-	}
-}
-
-func TestGitCorpusFormatting_Limit_MixedDirtyClean(t *testing.T) {
-	files := []zoekt.FileMatch{
-		{FileName: "dirty.go", Repository: "repo", Language: "Go", Score: 100,
-			LineMatches: []zoekt.LineMatch{{Line: []byte("stale\n"), LineNumber: 1}}},
-		{FileName: "clean1.go", Repository: "repo", Language: "Go", Score: 50,
-			LineMatches: []zoekt.LineMatch{{Line: []byte("ok\n"), LineNumber: 1}}},
-		{FileName: "clean2.go", Repository: "repo", Language: "Go", Score: 25,
-			LineMatches: []zoekt.LineMatch{{Line: []byte("ok2\n"), LineNumber: 1}}},
-	}
-	dirtyFiles := testDirtyFileSet("dirty.go")
-	result := formatGitCorpusResultsForTest(files, dirtyFiles, 1, 0)
-	if !strings.Contains(result, "clean1.go") {
-		t.Error("expected clean1.go (highest after suppression)")
-	}
-	if strings.Contains(result, "clean2.go") {
-		t.Error("did not expect clean2.go with limit=1")
-	}
-	if strings.Contains(result, "dirty.go") {
-		t.Error("dirty.go should be suppressed")
 	}
 }
 
@@ -1350,7 +1217,7 @@ func TestGitCorpusFormatting_MaxMatches_Basic(t *testing.T) {
 	files := []zoekt.FileMatch{
 		{FileName: "f.go", Repository: "repo", Language: "Go", Score: 10, LineMatches: matches},
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 0, 3)
+	result := formatGitCorpusResultsForTest(files, 0, 3)
 	if !strings.Contains(result, "line0") {
 		t.Error("expected first match")
 	}
@@ -1369,7 +1236,7 @@ func TestGitCorpusFormatting_MaxMatches_ExceedsMatches(t *testing.T) {
 				{Line: []byte("only\n"), LineNumber: 1},
 			}},
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 0, 100)
+	result := formatGitCorpusResultsForTest(files, 0, 100)
 	if !strings.Contains(result, "only") {
 		t.Error("expected match when maxMatches > match count")
 	}
@@ -1384,7 +1251,7 @@ func TestGitCorpusFormatting_MaxMatches_One(t *testing.T) {
 				{Line: []byte("third\n"), LineNumber: 20},
 			}},
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 0, 1)
+	result := formatGitCorpusResultsForTest(files, 0, 1)
 	if !strings.Contains(result, "first") {
 		t.Error("expected first match")
 	}
@@ -1403,7 +1270,7 @@ func TestGitCorpusFormatting_MaxMatches_PreservesContext(t *testing.T) {
 				{Line: []byte("dropped\n"), LineNumber: 20},
 			}},
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 0, 1)
+	result := formatGitCorpusResultsForTest(files, 0, 1)
 	if !strings.Contains(result, "before_ctx") {
 		t.Error("expected before-context on kept match")
 	}
@@ -1429,7 +1296,7 @@ func TestGitCorpusFormatting_MaxMatches_MultipleFiles(t *testing.T) {
 				{Line: []byte("b2\n"), LineNumber: 10},
 			}},
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 0, 2)
+	result := formatGitCorpusResultsForTest(files, 0, 2)
 	if !strings.Contains(result, "a1") || !strings.Contains(result, "a2") {
 		t.Error("expected first 2 matches in a.go")
 	}
@@ -1445,7 +1312,7 @@ func TestGitCorpusFormatting_MaxMatches_FileOnlyMatch(t *testing.T) {
 	files := []zoekt.FileMatch{
 		{FileName: "f.go", Repository: "repo", Language: "Go", Score: 10},
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 0, 3)
+	result := formatGitCorpusResultsForTest(files, 0, 3)
 	if !strings.Contains(result, "f.go") {
 		t.Error("expected file header even with no matches")
 	}
@@ -1468,7 +1335,7 @@ func TestGitCorpusFormatting_LimitAndMaxMatches_Combined(t *testing.T) {
 			Score: float64(i), LineMatches: matches,
 		}
 	}
-	result := formatGitCorpusResultsForTest(files, nil, 3, 2)
+	result := formatGitCorpusResultsForTest(files, 3, 2)
 	headers := extractFileHeaders(result)
 	if len(headers) != 3 {
 		t.Fatalf("expected 3 file headers, got %d", len(headers))
@@ -1514,7 +1381,7 @@ func TestFormatCorpusResults_FileCorpusContextUsesExactRoot(t *testing.T) {
 	}})
 	results := append(fileResults, folderResults...)
 
-	out := formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext, plainPalette)
+	out := formatCorpusResultsWithContext(results, 0, 0, showCorpusContext, plainPalette)
 	if !strings.Contains(out, "## /tmp/exact.txt") {
 		t.Fatalf("expected exact file root header, got:\n%s", out)
 	}
@@ -1564,7 +1431,7 @@ func testFormatSamePathAcrossCorpora(
 		}
 	}
 
-	out := formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext, plainPalette)
+	out := formatCorpusResultsWithContext(results, 0, 0, showCorpusContext, plainPalette)
 	for _, header := range wantHeaders {
 		if !strings.Contains(out, "## "+header+" (") {
 			t.Fatalf("expected absolute path %s, got:\n%s", header, out)
@@ -1572,29 +1439,6 @@ func testFormatSamePathAcrossCorpora(
 	}
 	if strings.Count(out, "["+tag+"]") != len(roots) {
 		t.Fatalf("expected %s corpus tags, got:\n%s", tag, out)
-	}
-}
-
-func TestFormatCorpusResults_DirtySuppressionIsCorpusScoped(t *testing.T) {
-	results := []corpusSearchResult{
-		{
-			corpusID:    corpusID("external"),
-			kind:        corpusKindFolder,
-			displayRoot: "/tmp/external",
-			file: zoekt.FileMatch{FileName: "same.go", Language: "Go", Score: 1,
-				LineMatches: []zoekt.LineMatch{{Line: []byte("external\n"), LineNumber: 1}}},
-		},
-	}
-	dirtyByCorpus := dirtyFilesByCorpus{
-		"git": testDirtyFileSet("same.go"),
-	}
-
-	out := formatCorpusResultsWithContext(results, dirtyByCorpus, 0, 0, showCorpusContext, plainPalette)
-	if out == "" {
-		t.Fatal("external result should not be suppressed by Git dirty state")
-	}
-	if !strings.Contains(out, "external") {
-		t.Fatalf("expected external result, got:\n%s", out)
 	}
 }
 
@@ -1616,7 +1460,7 @@ func TestFormatCorpusResults_LimitAppliesAfterMerge(t *testing.T) {
 		},
 	}
 
-	out := formatCorpusResultsWithContext(results, nil, 1, 0, showCorpusContext, plainPalette)
+	out := formatCorpusResultsWithContext(results, 1, 0, showCorpusContext, plainPalette)
 	if !strings.Contains(out, "## /tmp/high/high.txt") || strings.Contains(out, "low.txt") {
 		t.Fatalf("expected limit after merged sort, got:\n%s", out)
 	}
@@ -1706,7 +1550,7 @@ func TestGitCorpusFormatting_UnorderedOverlappingContext_NoDuplicateLines(t *tes
 		},
 	}
 
-	result := formatGitCorpusResultsForTest(files, nil, 0, 0)
+	result := formatGitCorpusResultsForTest(files, 0, 0)
 	expected := strings.Join([]string{
 		"## app.go (Go)",
 		"10 first match",

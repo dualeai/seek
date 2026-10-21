@@ -203,12 +203,12 @@ func TestPlanRerankQueryAcceptsFileAndLanguageFilters(t *testing.T) {
 			}
 			var selected map[string]struct{}
 			err = openNode(t.Context(), plans[0], testLexicalSearchExecution(), func(node openedNode) error {
-				read, readCtx, err := openNodeRead(t.Context(), node.plan)
+				read, readCtx, err := openNodeRead(t.Context(), node.plan, node.dirty)
 				if err != nil {
 					return err
 				}
 				defer read.close()
-				selected, err = nodeRowSelection(readCtx, read, qp, node.dirty)
+				selected, err = nodeRowSelection(readCtx, read, qp)
 				return err
 			})
 			if err != nil {
@@ -588,14 +588,14 @@ func TestRankCorpusResultsForDisplayHonorsOverride(t *testing.T) {
 	low.rankOverride = 1
 	high := rerankTestResult("high.go", 10)
 	high.rankOverride = 2
-	ranked := rankCorpusResultsForDisplay([]corpusSearchResult{high, low}, nil)
+	ranked := rankCorpusResultsForDisplay([]corpusSearchResult{high, low})
 	if ranked[0].file.FileName != "low.go" {
 		t.Fatalf("override order=%q then %q", ranked[0].file.FileName, ranked[1].file.FileName)
 	}
 
 	low.rankOverride = 0
 	high.rankOverride = 0
-	ranked = rankCorpusResultsForDisplay([]corpusSearchResult{low, high}, nil)
+	ranked = rankCorpusResultsForDisplay([]corpusSearchResult{low, high})
 	if ranked[0].file.FileName != "high.go" {
 		t.Fatalf("BM25 order=%q then %q", ranked[0].file.FileName, ranked[1].file.FileName)
 	}

@@ -25,10 +25,13 @@ import (
 //   - close runs before openNode prepares the node again, and the marked
 //     context that openNodeRead returns does not leave the read.
 //   - The description read closes before it reads sources.
+//   - Every search sees only the current copy of each file (currentCopies).
 //
 // Only the goroutine that opened the read closes it.
 type nodeRead struct {
-	plan    node
+	plan node
+	// dirty holds the dirty files of the node's capture.
+	dirty   dirtyFileSet
 	lock    *os.File // nil after close
 	load    sync.Once
 	loaded  nodeShards
@@ -40,12 +43,16 @@ type nodeShards struct {
 	searchers []zoekt.Searcher
 	// paths are in the order of searchers; the BM25 rescore reads them.
 	paths []string
+	// current is the clause that keeps only current copies; nil keeps every
+	// document.
+	current query.Q
 }
 
-// openNodeRead takes the node's shared read lock. It returns the read and ctx
+// openNodeRead takes the node's shared read lock. dirty holds the dirty files
+// of the node's capture (nil for a folder node). It returns the read and ctx
 // marked by withReadLockHeld, so a build or publish wait inside the read fails
 // as a lock-order defect.
-func openNodeRead(ctx context.Context, plan node) (*nodeRead, context.Context, error) {
+func openNodeRead(ctx context.Context, plan node, dirty dirtyFileSet) (*nodeRead, context.Context, error) {
 	lock, err := os.OpenFile(filepath.Join(plan.cacheDir, lockFile), os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, ctx, fmt.Errorf("open search lock: %w", err)
@@ -54,7 +61,7 @@ func openNodeRead(ctx context.Context, plan node) (*nodeRead, context.Context, e
 		_ = lock.Close()
 		return nil, ctx, fmt.Errorf("acquire search lock: %w", err)
 	}
-	return &nodeRead{plan: plan, lock: lock}, withReadLockHeld(ctx), nil
+	return &nodeRead{plan: plan, dirty: dirty, lock: lock}, withReadLockHeld(ctx), nil
 }
 
 // shards loads the node's shards once per read. The load starts at the first
@@ -75,14 +82,21 @@ func (r *nodeRead) shards() (nodeShards, error) {
 			r.loadErr = err
 			return
 		}
-		r.loaded = nodeShards{searchers: searchers, paths: paths}
+		current, err := currentCopies(searchers, paths, r.dirty)
+		if err != nil {
+			closeShards(searchers)
+			r.loadErr = err
+			return
+		}
+		r.loaded = nodeShards{searchers: searchers, paths: paths, current: current}
 		nodeShardLoads.Add(1)
 		slog.Debug("Loaded the node's shards", "root", r.plan.displayRoot, "shards", len(searchers))
 	})
 	return r.loaded, r.loadErr
 }
 
-// search runs q on the node's shards within the node's scope.
+// search runs q on the node's shards within the node's scope, on the current
+// copy of each file.
 func (r *nodeRead) search(ctx context.Context, q query.Q, config searchConfig) ([]zoekt.FileMatch, error) {
 	if r.lock == nil {
 		return nil, fmt.Errorf("%w: a search of a closed node read", errInvariant)
@@ -90,6 +104,9 @@ func (r *nodeRead) search(ctx context.Context, q query.Q, config searchConfig) (
 	shards, err := r.shards()
 	if err != nil {
 		return nil, r.damage(fmt.Errorf("load index: %w", err))
+	}
+	if shards.current != nil {
+		q = query.NewAnd(q, shards.current)
 	}
 	files, err := searchShards(ctx, shards.searchers, shards.paths, q, r.plan.scope, config)
 	if err != nil {
@@ -134,4 +151,42 @@ func (r *nodeRead) close() {
 	r.loaded = nodeShards{}
 	releaseLock(r.lock)
 	r.lock = nil
+}
+
+// currentCopies gives the clause that keeps only the current copy of each
+// file of a Git node: the uncommitted copy wins. The clause hides the
+// committed copy of each dirty file and of each file in the uncommitted
+// shards. A stale or peer-built index can hold an uncommitted copy of a file
+// that is clean again; that copy is the current one. Zoekt reduces the
+// RepoSet per shard, so the clause adds no candidate and no BM25 term. The
+// result is nil when no file has a stale copy, as for a folder node.
+func currentCopies(searchers []zoekt.Searcher, paths []string, dirty dirtyFileSet) (query.Q, error) {
+	stale := make(map[string]struct{}, len(dirty))
+	for name := range dirty {
+		stale[name] = struct{}{}
+	}
+	opts := searchOpts
+	opts.NumContextLines = 0
+	all := &query.Type{Type: query.TypeFileName, Child: &query.Const{Value: true}}
+	for index, path := range paths {
+		if !isUncommittedShard(filepath.Base(path)) {
+			continue
+		}
+		// The listing is small: the uncommitted shards hold the dirty files
+		// only. Zoekt skips their tombstoned documents.
+		result, err := searchers[index].Search(context.Background(), all, &opts)
+		if err != nil {
+			return nil, fmt.Errorf("list uncommitted files: %w", err)
+		}
+		for _, file := range result.Files {
+			stale[file.FileName] = struct{}{}
+		}
+	}
+	if len(stale) == 0 {
+		return nil, nil
+	}
+	return &query.Not{Child: query.NewAnd(
+		&query.Not{Child: query.NewRepoSet(repoUncommitted)},
+		&query.FileNameSet{Set: stale},
+	)}, nil
 }

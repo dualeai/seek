@@ -1063,3 +1063,64 @@ func TestPeerBuildPrintsNoStaleTextOfAnEditedFile(t *testing.T) {
 		})
 	}
 }
+
+// TestPeerBuildUncommittedCopyWinsForARevertedFile edits a committed file,
+// builds, and reverts the edit while a peer holds the build lock. The node
+// serves its last complete index: its uncommitted shards still hold the edited
+// copy, and the capture lists the file as clean. The uncommitted copy wins on
+// both routes: the file prints once, as the uncommitted copy, and the
+// committed text does not print.
+func TestPeerBuildUncommittedCopyWinsForARevertedFile(t *testing.T) {
+	requireTools(t)
+	f := newGraphFixture(t)
+	const committed = "zqrevertwin committedtext alpha beta\n"
+	repo := f.GitRepo("repo", "a.txt", committed)
+	setTestUserCache(t)
+	newModel := func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil }
+	writeFixtureFile(t, filepath.Join(repo, "a.txt"), "zqrevertwin editedtext alpha beta\n")
+	if _, err := runHybridTestSearch(t, "zqrevertwin alpha", []string{repo}, defaultSearchPolicy(), newModel); err != nil {
+		t.Fatal(err)
+	}
+	plans, err := planCorpora(t.Context(), []string{repo})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%d err=%v", len(plans), err)
+	}
+	holder, err := os.OpenFile(filepath.Join(plans[0].cacheDir, buildLockFile), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { releaseLock(holder) })
+	if err := lockFileExclusive(holder); err != nil {
+		t.Fatal(err)
+	}
+	writeFixtureFile(t, filepath.Join(repo, "a.txt"), committed)
+	if out, err := exec.Command("git", "-C", repo, "status", "--porcelain").Output(); err != nil || len(out) != 0 {
+		t.Fatalf("the revert left the work tree dirty: %q err=%v", out, err)
+	}
+	for _, test := range []struct {
+		name, query string
+		newModel    semanticModelFactory
+	}{
+		{"strict", "zqrevertwin", nil},
+		{"description", "zqrevertwin alpha", newModel},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			out, err := runHybridTestSearch(t, test.query, []string{repo}, defaultSearchPolicy(), test.newModel)
+			if err != nil {
+				t.Fatalf("search: %v output:\n%s", err, out)
+			}
+			var headers []string
+			for line := range strings.Lines(out) {
+				if strings.HasPrefix(line, "## ") {
+					headers = append(headers, strings.TrimSpace(line))
+				}
+			}
+			if len(headers) != 1 || !strings.HasSuffix(headers[0], "a.txt (Text) [uncommitted]") {
+				t.Fatalf("headers=%q, want a.txt once, as the uncommitted copy; output:\n%s", headers, out)
+			}
+			if !strings.Contains(out, "editedtext") || strings.Contains(out, "committedtext") {
+				t.Fatalf("want the uncommitted text only; output:\n%s", out)
+			}
+		})
+	}
+}

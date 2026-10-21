@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -19,7 +18,15 @@ import (
 
 func zoektIndexedPaths(t testing.TB, indexDir string) []string {
 	t.Helper()
-	searchers, err := loadShards(indexDir)
+	// An empty repository writes no shard, so it indexes no path.
+	shards, err := familyShardNames(indexDir)
+	if err != nil {
+		t.Fatalf("list Zoekt shards: %v", err)
+	}
+	if len(shards) == 0 {
+		return nil
+	}
+	searchers, err := loadShardPaths(shards)
 	if err != nil {
 		t.Fatalf("load Zoekt shards: %v", err)
 	}
@@ -295,10 +302,6 @@ func TestNativeGitIndexer_VisibleContract(t *testing.T) {
 	}
 
 	head := gitOutputIn(t, repoDir, "rev-parse", "HEAD")
-	commitUnix, err := strconv.ParseInt(gitOutputIn(t, repoDir, "show", "-s", "--format=%ct", "HEAD"), 10, 64)
-	if err != nil {
-		t.Fatalf("parse commit time: %v", err)
-	}
 	repository := zoektRepositoryMetadata(t, indexDir)
 	if repository.Name != "native-golden" || repository.Source != repoDir {
 		t.Fatalf("repository identity name=%q source=%q", repository.Name, repository.Source)
@@ -314,9 +317,6 @@ func TestNativeGitIndexer_VisibleContract(t *testing.T) {
 	}
 	if len(repository.Branches) != 1 || repository.Branches[0].Name != "HEAD" || repository.Branches[0].Version != head {
 		t.Fatalf("repository branches=%v, want HEAD@%s", repository.Branches, head)
-	}
-	if repository.LatestCommitDate.Unix() != commitUnix {
-		t.Fatalf("latest commit=%s, want unix %d", repository.LatestCommitDate, commitUnix)
 	}
 	if repository.RawConfig["name"] != "native-golden" {
 		t.Fatalf("raw config=%v", repository.RawConfig)

@@ -80,7 +80,7 @@ func TestFolderDrift_NextBuildIndexesTheDrift(t *testing.T) {
 	if _, err := ensureFolderCorpusFreshWithExecution(ctx, plan, newExecution(&hybridTestScorer{})); err != nil {
 		t.Fatalf("warm build: %v", err)
 	}
-	files, err := searchPlannedCorpusParsed(ctx, plan, &query.Substring{Pattern: "arrived during the build"}, defaultSearchConfig())
+	files, err := searchPlannedCorpusParsed(ctx, plan, nil, &query.Substring{Pattern: "arrived during the build"}, defaultSearchConfig())
 	if err != nil || len(files) != 1 || files[0].FileName != "late.go" {
 		t.Fatalf("files=%v err=%v, want late.go indexed by the next build", files, err)
 	}

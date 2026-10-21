@@ -123,18 +123,9 @@ func prepareNativeGitDelta(
 	if !nativeGitDeltaStaticMetadataEqual(existing, &repository) {
 		return nil, false, nil
 	}
-	// Builder.Finish updates LatestCommitDate in existing shard sidecars, but it
-	// does not update their stored Rank. Rebuild when explicit commit-date
-	// ranking crosses a month so every shard keeps one rank.
-	if _, ok := repository.RawConfig["latestcommitdate"]; ok && existing.Rank != repository.Rank {
-		return nil, false, nil
-	}
 	baseOptions := opts
 	baseRepository := repository
 	baseRepository.Branches = existing.Branches
-	// Zoekt derives priority rank when it reads shard metadata. RawConfig
-	// equality above proves that this derived value matches.
-	baseRepository.Rank = existing.Rank
 	baseOptions.RepositoryDescription = baseRepository
 	if state, _ := baseOptions.IndexState(); state != index.IndexStateEqual {
 		return nil, false, nil
@@ -227,14 +218,16 @@ func scanNativeGitDeltaChanges(
 }
 
 // indexNativeGitDelta hard-links the verified committed seed into buildDir and
-// writes one delta there. buildDir is staging owned by the caller; this
-// function does not change or publish the live family.
+// writes one delta there, with up to parallelism shard jobs at the same time.
+// buildDir is staging owned by the caller; this function does not change or
+// publish the live family.
 func indexNativeGitDelta(
 	ctx context.Context,
 	repoDir string,
 	buildDir string,
 	seedPaths []string,
 	delta *nativeGitDelta,
+	parallelism int,
 ) error {
 	if err := seedFamilyFiles(buildDir, seedPaths); err != nil {
 		return err
@@ -249,6 +242,6 @@ func indexNativeGitDelta(
 		releaseFileContentWeights(documents)
 		return err
 	}
-	_, err = indexDeltaDocumentsWithRepository(buildDir, delta.repository, documents, 0, delta.changedPaths)
+	_, err = indexDeltaDocumentsWithRepository(buildDir, delta.repository, documents, parallelism, delta.changedPaths)
 	return err
 }

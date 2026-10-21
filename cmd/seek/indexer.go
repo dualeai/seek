@@ -855,6 +855,7 @@ func buildCommittedGitStage(
 				buildDir,
 				scan.paths(familyCommitted),
 				delta,
+				parallelism,
 			); err != nil {
 				return nil, nil, err
 			}
@@ -1325,7 +1326,7 @@ func indexUncommitted(
 		}
 		return nil
 	}
-	err := tryUncommittedDelta(ctx, repoDir, store, delta, preState, entries)
+	err := tryUncommittedDelta(ctx, repoDir, store, delta, preState, entries, parallelism)
 	if err == nil {
 		return nil
 	}
@@ -1340,7 +1341,7 @@ func indexUncommitted(
 	} else {
 		slog.Debug("Uncommitted delta indexing failed, falling back to full rebuild", "error", err)
 	}
-	// The delta fell back (a large payload, removals only): build in full
+	// The delta fell back (a large payload, a Builder error): build in full
 	// under the lock, as the prebuild does outside it.
 	stage, err := buildUncommittedStage(ctx, repoDir, store.indexDir, state, parallelism)
 	if err != nil {
@@ -1364,12 +1365,12 @@ type uncommittedDelta struct {
 // can take, or nil for a full rebuild. A delta needs a manifest of the cached
 // state, a family that matches .family-v1 (familyIntact), a contiguous family
 // of at most maxUncommittedDeltaShards shards (any count when only kept files
-// changed), and changed files to read that fit one index window. It writes
-// nothing, so a build can ask before the publish lock: the build lock keeps
-// other builds out, so the delta stays valid under the lock. A read repair can
-// still remove .family-v1 under the publish lock alone; familyIntact is then
-// stale, the build writes the manifest again, and the next damaged read
-// repairs once more.
+// changed), and files to read that fit one index window. A delta of removals
+// only reads no file. It writes nothing, so a build can ask before the publish
+// lock: the build lock keeps other builds out, so the delta stays valid under
+// the lock. A read repair can still remove .family-v1 under the publish lock
+// alone; familyIntact is then stale, the build writes the manifest again, and
+// the next damaged read repairs once more.
 func uncommittedDeltaPossible(ctx context.Context, repoDir string, store corpusStore, cachedState string, familyIntact bool, files []string) *uncommittedDelta {
 	cacheDir, indexDir := store.cacheDir, store.indexDir
 	manifest, ok := readUncommittedManifest(cacheDir, cachedState)
@@ -1401,12 +1402,10 @@ func uncommittedDeltaPossible(ctx context.Context, repoDir string, store corpusS
 		return delta // the locked part only refreshes the manifest
 	}
 	// The delta falls back to a full rebuild for these: build it before the
-	// lock instead. Zoekt rejects a delta of removals only.
+	// lock instead. A delta of removals only reads no file, and Zoekt writes
+	// only its tombstones.
 	if len(existing) > maxUncommittedDeltaShards && !onlyKept(changed, manifest) {
 		slog.Debug("Uncommitted delta shard limit reached, falling back to full rebuild", "shards", len(existing))
-		return nil
-	}
-	if len(toRead) == 0 {
 		return nil
 	}
 	var payload int64
@@ -1482,8 +1481,9 @@ func (stage *uncommittedStage) discard() {
 	discardBuildDir(stage.dir)
 }
 
-// tryUncommittedDelta writes delta into the live uncommitted family and
-// writes the manifest tagged with preState (the new .state value).
+// tryUncommittedDelta writes delta into the live uncommitted family, with up
+// to parallelism shard jobs at the same time, and writes the manifest tagged
+// with preState (the new .state value).
 func tryUncommittedDelta(
 	ctx context.Context,
 	repoDir string,
@@ -1491,6 +1491,7 @@ func tryUncommittedDelta(
 	delta *uncommittedDelta,
 	preState string,
 	entries []uncommittedManifestEntry,
+	parallelism int,
 ) error {
 	cacheDir, indexDir := store.cacheDir, store.indexDir
 	docs, noted, err := readUncommittedCandidates(ctx, repoDir, delta.toRead)
@@ -1511,16 +1512,10 @@ func tryUncommittedDelta(
 		writePendingUncommittedManifest(cacheDir, entries, noted)
 		return noted
 	}
-	if len(docs) == 0 {
-		// Pure tombstone cycle (all changes are removals). Zoekt's
-		// builder rejects empty delta builds with the same error
-		// shape as the folder side; surface that as a fallback signal.
-		// docs is empty here; no weights to release.
-		return fmt.Errorf("uncommitted delta contains only removals")
-	}
-	// indexDeltaDocuments releases all per-document readSemaphore weights;
-	// do not release them here.
-	if _, err := indexDeltaDocuments(indexDir, repoUncommitted, repoDir, docs, uncommittedDeltaShardMax, delta.changed); err != nil {
+	// With no document (removals only), Zoekt writes only the tombstones into
+	// the sidecars of the prior shards. indexDeltaDocuments releases all
+	// per-document readSemaphore weights; do not release them here.
+	if _, err := indexDeltaDocuments(indexDir, repoUncommitted, repoDir, docs, parallelism, delta.changed); err != nil {
 		return err
 	}
 	if noted != nil {

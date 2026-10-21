@@ -237,13 +237,6 @@ func benchmarkGitResults(files []zoekt.FileMatch) []corpusSearchResult {
 	}, files)
 }
 
-func benchmarkDirtyFilesByCorpus(dirtyFiles dirtyFileSet) dirtyFilesByCorpus {
-	if dirtyFiles == nil {
-		return nil
-	}
-	return dirtyFilesByCorpus{benchmarkFormatterCorpusID: dirtyFiles}
-}
-
 func BenchmarkCorpusFormatting_1File_1Match(b *testing.B) {
 	files := []zoekt.FileMatch{
 		{
@@ -256,7 +249,7 @@ func BenchmarkCorpusFormatting_1File_1Match(b *testing.B) {
 	results := benchmarkGitResults(files)
 	b.ReportAllocs()
 	for b.Loop() {
-		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
+		formatCorpusResultsWithContext(results, 0, 0, hideCorpusContext, plainPalette)
 	}
 }
 
@@ -273,7 +266,7 @@ func BenchmarkCorpusFormatting_LongLineWindowed(b *testing.B) {
 	results := benchmarkGitResults(files)
 	b.ReportAllocs()
 	for b.Loop() {
-		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
+		formatCorpusResultsWithContext(results, 0, 0, hideCorpusContext, plainPalette)
 	}
 }
 
@@ -288,7 +281,7 @@ func BenchmarkCorpusFormatting_SanitizedControlChars(b *testing.B) {
 	results := benchmarkGitResults(files)
 	b.ReportAllocs()
 	for b.Loop() {
-		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
+		formatCorpusResultsWithContext(results, 0, 0, hideCorpusContext, plainPalette)
 	}
 }
 
@@ -308,7 +301,7 @@ func BenchmarkCorpusFormatting_10Files_3Matches(b *testing.B) {
 	results := benchmarkGitResults(files)
 	b.ReportAllocs()
 	for b.Loop() {
-		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
+		formatCorpusResultsWithContext(results, 0, 0, hideCorpusContext, plainPalette)
 	}
 }
 
@@ -317,7 +310,7 @@ func BenchmarkCorpusFormatting_100Files_WithDedup(b *testing.B) {
 	results := benchmarkGitResults(files)
 	b.ReportAllocs()
 	for b.Loop() {
-		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
+		formatCorpusResultsWithContext(results, 0, 0, hideCorpusContext, plainPalette)
 	}
 }
 
@@ -342,7 +335,7 @@ func BenchmarkCorpusFormatting_WithSymbols(b *testing.B) {
 	results := benchmarkGitResults(files)
 	b.ReportAllocs()
 	for b.Loop() {
-		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
+		formatCorpusResultsWithContext(results, 0, 0, hideCorpusContext, plainPalette)
 	}
 }
 
@@ -385,7 +378,7 @@ func BenchmarkCorpusFormatting_FileLimit(b *testing.B) {
 		b.Run(name, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				formatCorpusResultsWithContext(results, nil, limit, 0, hideCorpusContext, plainPalette)
+				formatCorpusResultsWithContext(results, limit, 0, hideCorpusContext, plainPalette)
 			}
 		})
 	}
@@ -402,7 +395,7 @@ func BenchmarkCorpusFormatting_MatchLimit(b *testing.B) {
 		b.Run(name, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				formatCorpusResultsWithContext(results, nil, 0, maxMatches, hideCorpusContext, plainPalette)
+				formatCorpusResultsWithContext(results, 0, maxMatches, hideCorpusContext, plainPalette)
 			}
 		})
 	}
@@ -422,29 +415,9 @@ func BenchmarkCorpusFormatting_Combined(b *testing.B) {
 		b.Run(tc.name, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				formatCorpusResultsWithContext(results, nil, tc.limit, tc.maxMatches, hideCorpusContext, plainPalette)
+				formatCorpusResultsWithContext(results, tc.limit, tc.maxMatches, hideCorpusContext, plainPalette)
 			}
 		})
-	}
-}
-
-func BenchmarkDeduplicateCorpusResults_100(b *testing.B) {
-	results := make([]corpusSearchResult, 200)
-	for i := range 100 {
-		results[i] = corpusSearchResult{
-			corpusID: corpusID("repo"),
-			kind:     corpusKindGit,
-			file:     zoekt.FileMatch{FileName: fmt.Sprintf("f%d.go", i), Repository: "repo"},
-		}
-		results[100+i] = corpusSearchResult{
-			corpusID: corpusID("repo"),
-			kind:     corpusKindGit,
-			file:     zoekt.FileMatch{FileName: fmt.Sprintf("f%d.go", i), Repository: repoUncommitted},
-		}
-	}
-	b.ReportAllocs()
-	for b.Loop() {
-		deduplicateCorpusResults(results, nil)
 	}
 }
 
@@ -977,7 +950,7 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
-				if _, err := searchPlannedCorpusParsed(ctx, plan, userQ, defaultSearchConfig()); err != nil {
+				if _, err := searchPlannedCorpusParsed(ctx, plan, nil, userQ, defaultSearchConfig()); err != nil {
 					b.Fatalf("execute search with one dir: %v", err)
 				}
 			}
@@ -1187,7 +1160,7 @@ func BenchmarkMultiCorpus_WarmSearchAndFormat(b *testing.B) {
 			b.Fatalf("search corpus B: %v", err)
 		}
 		results := append(resultsA, resultsB...)
-		benchmarkStringSink = formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext, plainPalette)
+		benchmarkStringSink = formatCorpusResultsWithContext(results, 0, 0, showCorpusContext, plainPalette)
 	}
 }
 
@@ -1196,7 +1169,7 @@ func BenchmarkFormatCorpusResults_Dedupe(b *testing.B) {
 
 	b.ReportAllocs()
 	for b.Loop() {
-		benchmarkStringSink = formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext, plainPalette)
+		benchmarkStringSink = formatCorpusResultsWithContext(results, 0, 0, showCorpusContext, plainPalette)
 	}
 }
 
@@ -1209,7 +1182,6 @@ func BenchmarkWriteCorpusResults_Dedupe(b *testing.B) {
 		wrote, err := writeCorpusResultsWithContext(
 			output,
 			results,
-			nil,
 			0,
 			0,
 			showCorpusContext,
@@ -1486,7 +1458,7 @@ func BenchmarkFolderCorpus_DirtyReindexPhases_1File(b *testing.B) {
 			}
 			copyBenchmarkIndexFiles(b, templatePaths, indexDir)
 			b.StartTimer()
-			if _, err := indexDeltaDocuments(indexDir, repoName, plan.root, changedDocs, folderDeltaShardMax, changedPaths); err != nil {
+			if _, err := indexDeltaDocuments(indexDir, repoName, plan.root, changedDocs, indexParallelism(), changedPaths); err != nil {
 				b.Fatalf("index delta documents with base shard: %v", err)
 			}
 			b.StopTimer()
@@ -1531,7 +1503,7 @@ func BenchmarkFolderCorpus_OneFileZoektShardLowerBound(b *testing.B) {
 			b.Fatal("expected one-file shard to be indexed")
 		}
 		plan := node{cacheDir: baseDir, indexDir: indexDir}
-		results, err := searchPlannedCorpusParsed(ctx, plan, userQ, defaultSearchConfig())
+		results, err := searchPlannedCorpusParsed(ctx, plan, nil, userQ, defaultSearchConfig())
 		if err != nil {
 			b.Fatalf("search one-file shard: %v", err)
 		}
@@ -1654,7 +1626,7 @@ func BenchmarkCorpusFormatting_Palettes(b *testing.B) {
 		b.Run(pc.name, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				benchmarkStringSink = formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, pc.pal)
+				benchmarkStringSink = formatCorpusResultsWithContext(results, 0, 0, hideCorpusContext, pc.pal)
 			}
 			b.ReportMetric(float64(len(benchmarkStringSink)), "out_B")
 		})
@@ -1961,7 +1933,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 	b.Run("acquireSearchLock_uncontended", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			read, _, err := openNodeRead(ctx, plan)
+			read, _, err := openNodeRead(ctx, plan, nil)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -1993,30 +1965,10 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for b.Loop() {
-			formatCorpusResultsWithContext(corpusResults, nil, 0, 0, hideCorpusContext, plainPalette)
+			formatCorpusResultsWithContext(corpusResults, 0, 0, hideCorpusContext, plainPalette)
 		}
 	})
 
-	b.Run("formatCorpusResultsWithContext_dirtyFiles", func(b *testing.B) {
-		if err := os.WriteFile(target, append(original, []byte("\n// dirty_fmt\n")...), 0o644); err != nil {
-			b.Fatal(err)
-		}
-		dirtyState := mustGitRepoStateIn(b, ctx, repoDir)
-		results, err := searchPlannedCorpusForTest(ctx, plan, "func main")
-		if err != nil {
-			b.Fatal(err)
-		}
-		if len(results) == 0 {
-			b.Skip("no results to format")
-		}
-		corpusResults := benchmarkGitResults(results)
-		dirtyByCorpus := benchmarkDirtyFilesByCorpus(dirtyFileSetFromState(dirtyState))
-		b.ReportAllocs()
-		b.ResetTimer()
-		for b.Loop() {
-			formatCorpusResultsWithContext(corpusResults, dirtyByCorpus, 0, 0, hideCorpusContext, plainPalette)
-		}
-	})
 }
 
 // findSourceFile returns the absolute path of a source file suitable for editing.

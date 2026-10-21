@@ -57,7 +57,7 @@ func TestIndexDeltaDocuments_LargeBatchHoldsBudget(t *testing.T) {
 		changed[i] = name
 	}
 
-	if _, err := indexDeltaDocuments(indexDir, "delta_large_repo", source, docs, shardMax, changed); err != nil {
+	if _, err := indexDeltaDocuments(indexDir, "delta_large_repo", source, docs, indexParallelism(), changed); err != nil {
 		t.Fatalf("indexDeltaDocuments: %v", err)
 	}
 	if got := availableWeight(readSemaphore); got != testBudget {
@@ -138,7 +138,7 @@ func TestIndexDeltaDocuments_BlocksConcurrentReader(t *testing.T) {
 
 	deltaDone := make(chan error, 1)
 	go func() {
-		_, err := indexDeltaDocuments(indexDir, "delta_pressure_repo", source, docs, shardMax, changed)
+		_, err := indexDeltaDocuments(indexDir, "delta_pressure_repo", source, docs, indexParallelism(), changed)
 		deltaDone <- err
 	}()
 
@@ -208,7 +208,7 @@ func TestIndexDeltaDocuments_ReleasesOnNewBuilderError(t *testing.T) {
 	if err := os.WriteFile(bogusFile, []byte("not-a-dir"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, err := indexDeltaDocuments(bogusFile, "ctrl_delta_repo", t.TempDir(), docs, shardMax, []string{"ctrl1.go", "ctrl2.go"})
+	_, err := indexDeltaDocuments(bogusFile, "ctrl_delta_repo", t.TempDir(), docs, indexParallelism(), []string{"ctrl1.go", "ctrl2.go"})
 	if err == nil {
 		t.Fatal("expected NewBuilder failure with regular-file indexDir")
 	}

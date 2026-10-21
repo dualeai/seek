@@ -259,9 +259,6 @@ func runSearchCommand(
 	}
 	applyHeaders(allResults, execution.operands)
 
-	// Formatting writes nothing when all results were stale committed
-	// matches for dirty files — treat as no match (exit code 1).
-	//
 	// Show corpus context when the graph has more than one node. The graph
 	// expansion found every node before the search.
 	displayMode := hideCorpusContext
@@ -276,7 +273,6 @@ func runSearchCommand(
 	wrote, err := writeCorpusResultsWithContext(
 		output,
 		allResults,
-		dirtyByCorpus,
 		limit,
 		maxMatches,
 		displayMode,
@@ -512,15 +508,19 @@ func validateCommittedHead(ctx context.Context, paths gitPaths, expectedHead str
 	return nil
 }
 
+// searchPlannedCorpusParsed runs userQ on one node read of plan. dirty holds
+// the dirty files of the node's capture; the read searches only the current
+// copy of each file.
 func searchPlannedCorpusParsed(
 	ctx context.Context,
 	plan node,
+	dirty dirtyFileSet,
 	userQ query.Q,
 	config searchConfig,
 ) ([]zoekt.FileMatch, error) {
 	// Hold the shared publish lock while listing, opening, and searching shards.
 	// A publisher cannot replace the shard family during that work.
-	read, ctx, err := openNodeRead(ctx, plan)
+	read, ctx, err := openNodeRead(ctx, plan, dirty)
 	if err != nil {
 		return nil, err
 	}

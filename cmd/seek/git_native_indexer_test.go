@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/sourcegraph/zoekt"
 )
@@ -51,13 +50,6 @@ func TestCaptureGitSnapshotAndRepositoryMetadata(t *testing.T) {
 	if snapshot.commitOID.String() != head {
 		t.Fatalf("snapshot commit=%s, want %s", snapshot.commitOID, head)
 	}
-	wantUnix, err := strconv.ParseInt(gitOutputIn(t, repoDir, "show", "-s", "--format=%ct", head), 10, 64)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if snapshot.commitTime.Unix() != wantUnix {
-		t.Fatalf("snapshot time=%d, want %d", snapshot.commitTime.Unix(), wantUnix)
-	}
 
 	repository, err := nativeGitRepository(t.Context(), repoDir, snapshot)
 	if err != nil {
@@ -78,31 +70,8 @@ func TestCaptureGitSnapshotAndRepositoryMetadata(t *testing.T) {
 	if len(repository.Branches) != 1 || repository.Branches[0].Name != "HEAD" || repository.Branches[0].Version != head {
 		t.Fatalf("repository branches=%v", repository.Branches)
 	}
-	if repository.LatestCommitDate.Unix() != wantUnix || repository.RawConfig["name"] != "native-metadata" {
-		t.Fatalf("repository time/raw config=%s/%v", repository.LatestCommitDate, repository.RawConfig)
-	}
-}
-
-func TestCaptureGitSnapshotPreservesCommitTimezone(t *testing.T) {
-	requireTools(t)
-	repoDir := initEmptyGitRepoNoRemote(t)
-	if err := os.WriteFile(filepath.Join(repoDir, "main.go"), []byte("package main\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitRunIn(t, repoDir, "add", ".")
-	t.Setenv("GIT_AUTHOR_DATE", "2026-01-31T23:30:00-07:00")
-	t.Setenv("GIT_COMMITTER_DATE", "2026-01-31T23:30:00-07:00")
-	gitRunIn(t, repoDir, "commit", "-m", "offset")
-
-	snapshot := captureHeadForTest(t, repoDir)
-	want, err := time.Parse(time.RFC3339, gitOutputIn(t, repoDir, "show", "-s", "--format=%cI", "HEAD"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, gotOffset := snapshot.commitTime.Zone()
-	_, wantOffset := want.Zone()
-	if !snapshot.commitTime.Equal(want) || gotOffset != wantOffset {
-		t.Fatalf("commit time=%s offset=%d, want %s offset=%d", snapshot.commitTime, gotOffset, want, wantOffset)
+	if repository.RawConfig["name"] != "native-metadata" {
+		t.Fatalf("repository raw config=%v", repository.RawConfig)
 	}
 }
 
@@ -159,7 +128,7 @@ func TestNativeGitSHA256FullAndDelta(t *testing.T) {
 		t.Fatalf("prepare SHA-256 delta: eligible=%t error=%v", eligible, err)
 	}
 	deltaDir := t.TempDir()
-	if err := indexNativeGitDelta(t.Context(), paths.RepoDir, deltaDir, scan.paths(familyCommitted), delta); err != nil {
+	if err := indexNativeGitDelta(t.Context(), paths.RepoDir, deltaDir, scan.paths(familyCommitted), delta, indexParallelism()); err != nil {
 		t.Fatalf("build SHA-256 delta: %v", err)
 	}
 	fullDir := t.TempDir()
@@ -212,9 +181,7 @@ func TestNativeGitRepositoryNormalizesConfigKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	gitRunIn(t, repoDir, "add", ".")
-	t.Setenv("GIT_AUTHOR_DATE", "2026-01-15T12:00:00Z")
-	t.Setenv("GIT_COMMITTER_DATE", "2026-01-15T12:00:00Z")
-	gitRunIn(t, repoDir, "commit", "-m", "fixed date")
+	gitRunIn(t, repoDir, "commit", "-m", "config keys")
 	gitRunIn(t, repoDir, "config", "zoekt.name", "case-test")
 	gitRunIn(t, repoDir, "config", "zoekt.tenantID", "17")
 	gitRunIn(t, repoDir, "config", "zoekt.latestCommitDate", "1")
@@ -227,17 +194,15 @@ func TestNativeGitRepositoryNormalizesConfigKeys(t *testing.T) {
 		"tenantid":         "17",
 		"latestcommitdate": "1",
 	}
-	// Zoekt's month rank: (2026-1970)*12 + (January-1) = 672.
-	const wantRank = 672
-	if repository.TenantID != 17 || repository.Rank != wantRank || !maps.Equal(repository.RawConfig, want) {
-		t.Fatalf("tenant=%d rank=%d raw config=%v, want rank=%d config=%v", repository.TenantID, repository.Rank, repository.RawConfig, wantRank, want)
+	if repository.TenantID != 17 || !maps.Equal(repository.RawConfig, want) {
+		t.Fatalf("tenant=%d raw config=%v, want config=%v", repository.TenantID, repository.RawConfig, want)
 	}
 
 	paths, plan := planGitTestCorpus(t, repoDir)
 	reindexGit(t, t.Context(), paths, plan)
 	persisted := zoektRepositoryMetadata(t, plan.indexDir)
-	if persisted.Rank != wantRank || !maps.Equal(persisted.RawConfig, want) {
-		t.Fatalf("persisted rank=%d raw config=%v, want rank=%d config=%v", persisted.Rank, persisted.RawConfig, wantRank, want)
+	if !maps.Equal(persisted.RawConfig, want) {
+		t.Fatalf("persisted raw config=%v, want config=%v", persisted.RawConfig, want)
 	}
 }
 

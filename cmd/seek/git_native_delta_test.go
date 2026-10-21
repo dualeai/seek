@@ -272,7 +272,7 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 				seedBytes[path] = content
 			}
 			deltaDir := t.TempDir()
-			if err := indexNativeGitDelta(t.Context(), paths.RepoDir, deltaDir, scan.paths(familyCommitted), delta); err != nil {
+			if err := indexNativeGitDelta(t.Context(), paths.RepoDir, deltaDir, scan.paths(familyCommitted), delta, indexParallelism()); err != nil {
 				t.Fatalf("build delta: %v", err)
 			}
 			for path, want := range seedBytes {
@@ -502,48 +502,6 @@ func TestPrepareNativeGitDeltaAcceptsExplicitPriority(t *testing.T) {
 	_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan)
 	if err != nil || !eligible {
 		t.Fatalf("priority delta: eligible=%t error=%v", eligible, err)
-	}
-}
-
-func TestPrepareNativeGitDeltaCommitDateRank(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		targetDate string
-		eligible   bool
-	}{
-		{name: "same-month", targetDate: "2026-01-20T12:00:00Z", eligible: true},
-		{name: "next-month", targetDate: "2026-02-01T12:00:00Z", eligible: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			requireTools(t)
-			repoDir := initEmptyGitRepo(t)
-			if err := os.WriteFile(filepath.Join(repoDir, "base.go"), []byte("package base\n"), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			gitRunIn(t, repoDir, "add", ".")
-			t.Setenv("GIT_AUTHOR_DATE", "2026-01-01T12:00:00Z")
-			t.Setenv("GIT_COMMITTER_DATE", "2026-01-01T12:00:00Z")
-			gitRunIn(t, repoDir, "commit", "-m", "base")
-			gitRunIn(t, repoDir, "config", "zoekt.latestCommitDate", "")
-			paths, plan := planGitTestCorpus(t, repoDir)
-			reindexGit(t, t.Context(), paths, plan)
-
-			if err := os.WriteFile(filepath.Join(repoDir, "base.go"), []byte("package changed\n"), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			gitRunIn(t, repoDir, "add", "base.go")
-			t.Setenv("GIT_AUTHOR_DATE", tc.targetDate)
-			t.Setenv("GIT_COMMITTER_DATE", tc.targetDate)
-			gitRunIn(t, repoDir, "commit", "-m", "target")
-			scan, err := scanFamily(plan.indexDir)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan)
-			if err != nil || eligible != tc.eligible {
-				t.Fatalf("eligible=%t, want %t; error=%v", eligible, tc.eligible, err)
-			}
-		})
 	}
 }
 

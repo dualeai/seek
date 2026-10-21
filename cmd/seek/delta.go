@@ -7,6 +7,26 @@ import (
 	"github.com/sourcegraph/zoekt/index"
 )
 
+// deltaShardMin is the smallest shard target of a delta Builder. Each shard
+// starts its own ctags process and allocates its own postings, so a smaller
+// shard costs more time than it saves. Fewer shards also keep a family below
+// the delta shard caps for longer.
+const deltaShardMin = 1 << 20 // 1 MiB
+
+// deltaShardMax returns the shard target of a delta Builder: the payload of
+// files divided by parallelism, so that each Builder worker builds one shard.
+// The target is at least deltaShardMin and at most shardMax, the target of a
+// full build. Thus a shard with no isolated document stays far below the Zoekt
+// shard format (guardWrappedShards). Zoekt does not hash ShardMax, so a delta
+// stays compatible with its base.
+func deltaShardMax(files []fileContent, parallelism int) int {
+	payload := 0
+	for _, doc := range files {
+		payload += len(doc.name) + len(doc.content)
+	}
+	return min(shardMax, max(deltaShardMin, payload/max(parallelism, 1)))
+}
+
 // indexDeltaDocuments adapts a repository name and source to the shared delta
 // Builder sink.
 func indexDeltaDocuments(
@@ -14,15 +34,17 @@ func indexDeltaDocuments(
 	repoName string,
 	source string,
 	files []fileContent,
-	shardMaxBytes int,
+	parallelism int,
 	changedPaths []string,
 ) (bool, error) {
 	repository := zoekt.Repository{Name: repoName, Source: source}
-	return indexDeltaDocumentsWithRepository(indexDir, repository, files, shardMaxBytes, changedPaths)
+	return indexDeltaDocumentsWithRepository(indexDir, repository, files, parallelism, changedPaths)
 }
 
 // indexDeltaDocumentsWithRepository writes fresh content and tombstones for
-// changedPaths to one delta Builder. After it creates the Builder, it always
+// changedPaths to one delta Builder. The Builder builds up to parallelism
+// shards at the same time, as a full build does, with the shard target of
+// deltaShardMax. After it creates the Builder, it always
 // calls Finish, including after an Add error, so prior shards do not keep
 // partial tombstone updates. Zoekt makes each sidecar change visible with its
 // own temporary-file rename. After a successful Finish, guardWrappedShards can
@@ -37,18 +59,16 @@ func indexDeltaDocumentsWithRepository(
 	indexDir string,
 	repository zoekt.Repository,
 	files []fileContent,
-	shardMaxBytes int,
+	parallelism int,
 	changedPaths []string,
 ) (bool, error) {
 	if err := checkCtagsCached(); err != nil {
 		releaseFileContentWeights(files)
 		return false, err
 	}
-	opts := indexBuildOptions(indexDir, 1)
+	opts := indexBuildOptions(indexDir, max(parallelism, 1))
 	opts.RepositoryDescription = repository
-	if shardMaxBytes > 0 {
-		opts.ShardMax = shardMaxBytes
-	}
+	opts.ShardMax = deltaShardMax(files, parallelism)
 	opts.IsDelta = true
 
 	// Add the documents that fill a shard of their own first, so their shards

@@ -24,9 +24,6 @@ import (
 )
 
 const (
-	// Folder deltas are usually tiny. A smaller shard target reduces Zoekt's
-	// per-builder map sizing without changing the shard compatibility hash.
-	folderDeltaShardMax    = 1024 * 1024
 	maxFolderDeltaShards   = 64
 	folderManifestVersion  = 1
 	folderManifestFileName = ".folder-manifest-v1"
@@ -429,7 +426,7 @@ func indexFolderDocuments(
 	if tryDelta {
 		shardCount := repositoryShardCount(dir, repoName)
 		if shardCount > 0 && shardCount <= maxFolderDeltaShards {
-			indexedAny, err := indexFolderDocumentsDelta(ctx, plan, dir, repoName, selected, cachedState)
+			indexedAny, err := indexFolderDocumentsDelta(ctx, plan, dir, repoName, selected, parallelism, cachedState)
 			if err == nil {
 				return indexedAny, nil
 			}
@@ -460,6 +457,7 @@ func indexFolderDocumentsDelta(
 	dir string,
 	repoName string,
 	selected []folderCandidate,
+	parallelism int,
 	cachedState string,
 ) (bool, error) {
 	changedDocs, changedPaths, err := changedFolderDocumentsSinceCachedState(ctx, plan, dir, repoName, selected, cachedState)
@@ -469,14 +467,14 @@ func indexFolderDocumentsDelta(
 	if len(changedPaths) == 0 {
 		return len(selected) > 0, nil
 	}
-	if len(changedDocs) == 0 {
-		return false, fmt.Errorf("folder delta contains only removals")
-	}
+	// A delta of removals only adds no document: Zoekt then writes only the
+	// tombstones into the sidecars of the prior shards.
+	//
 	// On the manifest path, changedFolderDocumentsFromManifest stops before
 	// it reads the file that brings the changed size to the build's window,
 	// so the payload fits the single-builder bulk-Release contract of
 	// indexDeltaDocuments.
-	return indexDeltaDocuments(dir, repoName, plan.root, changedDocs, folderDeltaShardMax, changedPaths)
+	return indexDeltaDocuments(dir, repoName, plan.root, changedDocs, parallelism, changedPaths)
 }
 
 func changedFolderDocumentsSinceCachedState(

@@ -55,8 +55,8 @@ func guardShardReport(t *testing.T, dir string) (int, map[string][]string) {
 // 1.25 MiB fits.txt makes about 7.7 MiB and fits, and the 2.5 MiB wraps.txt
 // makes about 12.7 MiB and wraps.
 const (
-	// Below folderDeltaShardMax (1 MiB), so the default and folder delta
-	// builders keep different shard sizes.
+	// Below deltaShardMin (1 MiB), so a delta Builder uses it as its shard
+	// target too (deltaShardMax).
 	guardShardMax         = 1 << 19  // 512 KiB
 	guardShardFormatLimit = 10 << 20 // 10 MiB
 )
@@ -114,12 +114,12 @@ func TestGuardWrappedShards_SkippedDocumentDoesNotShiftMapping(t *testing.T) {
 		"fits after wraps": {"wraps.txt", "fits.txt", "bin.dat"},
 	}
 	builders := map[string]func(dir string, docs []fileContent) error{
-		"delta default shard size": func(dir string, docs []fileContent) error {
-			_, err := indexDeltaDocuments(dir, "guard", "", docs, 0, nil)
+		"delta with parallelism 1": func(dir string, docs []fileContent) error {
+			_, err := indexDeltaDocuments(dir, "guard", "", docs, 1, nil)
 			return err
 		},
-		"delta folder shard size": func(dir string, docs []fileContent) error {
-			_, err := indexDeltaDocuments(dir, "guard", "", docs, folderDeltaShardMax, nil)
+		"delta with parallelism 3": func(dir string, docs []fileContent) error {
+			_, err := indexDeltaDocuments(dir, "guard", "", docs, 3, nil)
 			return err
 		},
 		"windows with parallelism 3": func(dir string, docs []fileContent) error {

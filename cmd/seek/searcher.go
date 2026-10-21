@@ -56,7 +56,6 @@ type searchConfig struct {
 	afterOnly         bool
 	contextMatchLimit int
 	contextFileLimit  int
-	contextDirtyFiles dirtyFileSet
 }
 
 // querySyntaxError identifies a query that Zoekt could not parse. The original
@@ -196,6 +195,8 @@ func parseQueryHalves(pattern string) (raw, strict query.Q, halves map[query.Q]s
 // (index/matchtree.go regexpPattern and MustCompile): a regexp that Go's
 // parser rejects after Zoekt's simplification, such as a{1,501}, is a query
 // error, not a panic in the search.
+// TODO(https://github.com/sourcegraph/zoekt/issues/1188): drop this check
+// once Zoekt returns the compile error.
 func compileRegexpAtoms(q query.Q) error {
 	var err error
 	check := func(atom *query.Regexp) {
@@ -429,7 +430,8 @@ const bm25FilesPerWorker = 4
 // NOTE(zoekt): a query with a `query.Type` other than type:file panics inside
 // index.Searcher.Search (index/matchtree.go:1298, log.Panicf("type %T")).
 // Seek leaves the crash until Zoekt fixes it.
-// TODO: add the upstream Zoekt issue link once it is filed.
+// TODO(https://github.com/sourcegraph/zoekt/issues/1189): drop this note once
+// Zoekt returns an error for these types.
 func searchLoadedShards(
 	ctx context.Context,
 	searchers []zoekt.Searcher,
@@ -488,6 +490,8 @@ func searchLoadedShards(
 // roundScores rounds each score once, after the parts read the exact value:
 // Zoekt sums a score over a Go map, so equal true scores differ in their last
 // bits from run to run, and rounded ties sort by name.
+// TODO(https://github.com/sourcegraph/zoekt/issues/1187): drop the rounding
+// once Zoekt sums in a fixed order.
 func roundScores(files []zoekt.FileMatch) {
 	for index := range files {
 		files[index].Score = math.Round(files[index].Score*1e9) / 1e9
@@ -513,31 +517,18 @@ func cloneFileMatches(files []zoekt.FileMatch, config searchConfig) []zoekt.File
 }
 
 // displayedContextFiles returns the indexes of the best contextFileLimit files
-// of this corpus after deduplication and dirty-file suppression: the files that
-// can still show after the global file limit. Both steps are corpus-local, so
-// a global top N file is in its corpus's top N. A nil map means that all
-// context must be copied.
+// of this corpus: the files that can still show after the global file limit.
+// The node read returns one current copy per file, so a global top N file is
+// in its corpus's top N. A nil map means that all context must be copied.
 func displayedContextFiles(files []zoekt.FileMatch, config searchConfig) map[int]struct{} {
 	limit := config.contextFileLimit
 	if limit <= 0 || len(files) <= limit {
 		return nil
 	}
 
-	byPath := make(map[string]dedupEntry, len(files))
-	for i, file := range files {
-		// Only a Git node has the uncommitted repository; a folder
-		// repository is "folder_" + its ID.
-		isUncommitted := file.Repository == repoUncommitted
-		chooseDedupEntry(byPath, file.FileName, i, isUncommitted)
-	}
-
-	candidates := make([]int, 0, len(byPath))
-	for _, entry := range byPath {
-		file := files[entry.idx]
-		if !entry.uncommitted && config.contextDirtyFiles.contains(file.FileName) {
-			continue
-		}
-		candidates = append(candidates, entry.idx)
+	candidates := make([]int, len(files))
+	for i := range files {
+		candidates[i] = i
 	}
 	sort.Slice(candidates, func(i, j int) bool {
 		left := files[candidates[i]]

@@ -30,7 +30,7 @@ func TestLargeDocumentKeepsContentAndSymbolSearch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		matches, err := searchPlannedCorpusParsed(t.Context(), plan, q, defaultSearchConfig())
+		matches, err := searchPlannedCorpusParsed(t.Context(), plan, nil, q, defaultSearchConfig())
 		if err != nil {
 			t.Fatalf("search %q: %v", queryText, err)
 		}

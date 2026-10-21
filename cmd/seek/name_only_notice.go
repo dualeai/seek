@@ -89,13 +89,12 @@ func nameOnlyFilter(q query.Q) (query.Q, bool) {
 
 // countNameOnlyFiles counts the node's name-only files that pass the filter
 // subtree of q and that q does not already match, through read, which holds
-// the node's read lock. Only the current copy of a dirty file counts, and only
-// a complete marker document. A failed count loses only the notice.
+// the node's read lock and searches only the current copy of each file. Only
+// a complete marker document counts. A failed count loses only the notice.
 func countNameOnlyFiles(
 	ctx context.Context,
 	read *nodeRead,
 	q query.Q,
-	dirty dirtyFileSet,
 ) int64 {
 	if _, ok := ctx.Value(nameOnlyCountKey{}).(*atomic.Int64); !ok {
 		return 0
@@ -115,9 +114,6 @@ func countNameOnlyFiles(
 	}
 	var found int64
 	for _, file := range files {
-		if !currentCopy(file, dirty.contains(file.FileName)) {
-			continue
-		}
 		line, ok := onlyMarkerLine(file)
 		if ok && slices.Contains(countedSkipReasons, string(bytes.TrimPrefix(line, []byte(zoektNotIndexedMarker)))) {
 			found++

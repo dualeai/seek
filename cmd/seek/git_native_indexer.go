@@ -7,23 +7,21 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"math"
 	"os/exec"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/ignore"
 )
 
 type gitSnapshot struct {
-	commitOID  gitObjectID
-	commitTime time.Time
+	commitOID gitObjectID
 }
 
-// captureGitSnapshot verifies a full SHA-1 or SHA-256 commit ID and reads its
-// committer time. The "no-head" value returns ok=false without an error.
+// captureGitSnapshot verifies a full SHA-1 or SHA-256 commit ID: the commit
+// must exist in the repository. The "no-head" value returns ok=false without
+// an error.
 func captureGitSnapshot(ctx context.Context, repoDir, captured string) (gitSnapshot, bool, error) {
 	if captured == "no-head" {
 		return gitSnapshot{}, false, nil
@@ -33,28 +31,19 @@ func captureGitSnapshot(ctx context.Context, repoDir, captured string) (gitSnaps
 		return gitSnapshot{}, false, fmt.Errorf("captured Git commit: %w", err)
 	}
 
-	cmd := newGitCommand(ctx, repoDir, "show", "--no-patch", "--format=%H%x00%cI", captured+"^{commit}")
+	cmd := newGitCommand(ctx, repoDir, "show", "--no-patch", "--format=%H", captured+"^{commit}")
 	raw, err := gitOutput(ctx, cmd, "git show")
 	if err != nil {
 		return gitSnapshot{}, false, err
 	}
-	raw = bytes.TrimSuffix(raw, []byte{'\n'})
-	oidRaw, dateRaw, ok := bytes.Cut(raw, []byte{0})
-	if !ok || len(dateRaw) == 0 || bytes.IndexByte(dateRaw, 0) >= 0 {
-		return gitSnapshot{}, false, fmt.Errorf("malformed git show snapshot record")
-	}
-	got, err := parseGitObjectID(oidRaw)
+	got, err := parseGitObjectID(bytes.TrimSuffix(raw, []byte{'\n'}))
 	if err != nil {
 		return gitSnapshot{}, false, fmt.Errorf("git show commit: %w", err)
 	}
 	if got != want {
 		return gitSnapshot{}, false, fmt.Errorf("git show returned commit %s, want %s", got, want)
 	}
-	commitTime, err := time.Parse(time.RFC3339, string(dateRaw))
-	if err != nil {
-		return gitSnapshot{}, false, fmt.Errorf("parse Git commit time %q: %w", dateRaw, err)
-	}
-	return gitSnapshot{commitOID: got, commitTime: commitTime}, true, nil
+	return gitSnapshot{commitOID: got}, true, nil
 }
 
 // nativeGitConfig holds the local zoekt.* options. Git prints config names
@@ -93,13 +82,14 @@ func readNativeGitConfig(ctx context.Context, repoDir string) (nativeGitConfig, 
 
 // nativeGitRepository makes provider-neutral metadata for one captured commit.
 // Only explicit local zoekt.* settings can replace its opaque name or set its
-// web URL.
+// web URL. It sets no repository rank and no commit time: Zoekt reads them
+// only in its classic scorer, and every Seek search uses BM25
+// (searchOpts.UseBM25Scoring).
 func nativeGitRepository(ctx context.Context, repoDir string, snapshot gitSnapshot) (zoekt.Repository, error) {
 	repository := zoekt.Repository{
-		Name:             fallbackGitRepositoryName(repoDir),
-		Source:           repoDir,
-		Branches:         []zoekt.RepositoryBranch{{Name: "HEAD", Version: snapshot.commitOID.String()}},
-		LatestCommitDate: snapshot.commitTime,
+		Name:     fallbackGitRepositoryName(repoDir),
+		Source:   repoDir,
+		Branches: []zoekt.RepositoryBranch{{Name: "HEAD", Version: snapshot.commitOID.String()}},
 	}
 	config, err := readNativeGitConfig(ctx, repoDir)
 	if err != nil {
@@ -129,22 +119,9 @@ func applyNativeGitConfig(repository *zoekt.Repository, config nativeGitConfig) 
 	id, _ := strconv.ParseUint(config["repoid"], 10, 32)
 	repository.ID = uint32(id)
 	repository.TenantID, _ = strconv.Atoi(config["tenantid"])
-	if _, ok := config["latestcommitdate"]; ok {
-		repository.Rank = nativeGitCommitRank(repository.LatestCommitDate)
-	}
 	if len(config) > 0 {
 		repository.RawConfig = maps.Clone(config)
 	}
-}
-
-// nativeGitCommitRank returns Zoekt's month rank when local config enables
-// latestCommitDate ranking.
-func nativeGitCommitRank(commitTime time.Time) uint16 {
-	if commitTime.Before(time.Unix(0, 0)) {
-		return 0
-	}
-	months := int(commitTime.Year()-1970)*12 + int(commitTime.Month()-1)
-	return uint16(min(months, math.MaxUint16))
 }
 
 // reservedGitRepositoryName reports names that overlap the fixed shard prefix

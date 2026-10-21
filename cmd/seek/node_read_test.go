@@ -19,7 +19,7 @@ import (
 func TestNodeReadSharesOneLoad(t *testing.T) {
 	cacheDir := t.TempDir()
 	plan := node{corpusStore: corpusStore{cacheDir: cacheDir, indexDir: filepath.Join(cacheDir, "index")}}
-	read, readCtx, err := openNodeRead(t.Context(), plan)
+	read, readCtx, err := openNodeRead(t.Context(), plan, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestNodeReadLoadsShardsOnce(t *testing.T) {
 		t.Fatalf("plans=%d err=%v", len(plans), err)
 	}
 	before := nodeShardLoads.Load()
-	read, _, err := openNodeRead(t.Context(), plans[0])
+	read, _, err := openNodeRead(t.Context(), plans[0], nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestRemoveDamagedFamilyManifestKeepsANewPublish(t *testing.T) {
 	// seen is the damage of one read of plan.
 	seen := func(t *testing.T, plan node) error {
 		t.Helper()
-		read, _, err := openNodeRead(t.Context(), plan)
+		read, _, err := openNodeRead(t.Context(), plan, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

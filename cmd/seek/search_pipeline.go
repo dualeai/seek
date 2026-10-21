@@ -656,10 +656,9 @@ func strictNode(ctx context.Context, plan node, qp queryPlan, config searchConfi
 			touchPlanUsed(node.plan)
 			return nil
 		}
-		config.contextDirtyFiles = node.dirty
 		// One read lock and one shard load cover the file listing, the search
 		// and the count, so a publish cannot remove a shard between them.
-		read, ctx, err := openNodeRead(ctx, node.plan)
+		read, ctx, err := openNodeRead(ctx, node.plan, node.dirty)
 		if err != nil {
 			return err
 		}
@@ -670,7 +669,7 @@ func strictNode(ctx context.Context, plan node, qp queryPlan, config searchConfi
 		}
 		var counted sync.WaitGroup
 		counted.Go(func() {
-			nameOnly = countNameOnlyFiles(ctx, read, nodeQP.strict, node.dirty)
+			nameOnly = countNameOnlyFiles(ctx, read, nodeQP.strict)
 		})
 		strictConfig := config
 		strictConfig.bm25 = true
@@ -726,7 +725,7 @@ func retrieveNode(ctx context.Context, plan node, qp queryPlan, config searchCon
 // file for its display.
 func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config searchConfig, execution searchExecution, nameOnlyFiles *int64) (nodeHits, error) {
 	plan := node.plan
-	read, ctx, err := openNodeRead(ctx, plan)
+	read, ctx, err := openNodeRead(ctx, plan, node.dirty)
 	if err != nil {
 		return nil, err
 	}
@@ -793,7 +792,6 @@ func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config
 
 	modelConfig := rerankModelSearchConfig(config)
 	modelConfig.bm25 = true
-	modelConfig.contextDirtyFiles = node.dirty
 	var strictFiles []zoekt.FileMatch
 	var semanticHits []semanticHit
 	group, groupCtx := errgroup.WithContext(ctx)
@@ -803,12 +801,12 @@ func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config
 		return searchErr
 	})
 	group.Go(func() error {
-		*nameOnlyFiles = countNameOnlyFiles(groupCtx, read, qp.strict, node.dirty)
+		*nameOnlyFiles = countNameOnlyFiles(groupCtx, read, qp.strict)
 		return nil
 	})
 	// Both scans select their rows with one file-name query.
 	selection := sync.OnceValues(func() (map[string]struct{}, error) {
-		return nodeRowSelection(groupCtx, read, qp, node.dirty)
+		return nodeRowSelection(groupCtx, read, qp)
 	})
 	if generation != nil {
 		group.Go(func() error {
@@ -840,7 +838,7 @@ func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config
 	if err := group.Wait(); err != nil {
 		return nil, err
 	}
-	strict := deduplicateCorpusResults(wrapCorpusResults(plan, strictFiles), dirtyFilesByCorpus{plan.id: node.dirty})
+	strict := wrapCorpusResults(plan, strictFiles)
 	semanticFiles, err := semanticHitFiles(generation, semanticHits)
 	if err != nil {
 		return nil, err
@@ -873,10 +871,6 @@ func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config
 			return nil, err
 		}
 		for _, file := range relaxed {
-			if !currentCopy(file, node.dirty.contains(file.FileName)) {
-				// The committed copy of a dirty file holds old bytes.
-				continue
-			}
 			if best, ok := relaxedScores[file.FileName]; !ok || file.Score > best.score {
 				relaxedScores[file.FileName] = relaxedLexical{score: file.Score, parts: file.Debug}
 			}
@@ -938,7 +932,7 @@ func scanOverlay(ctx context.Context, qp queryPlan, overlay *semanticGeneration,
 
 // scanWithinRadius runs one scan with the command's query and the node's row
 // selection. The scan keeps the rows whose summed fine MaxSim reaches the
-// radius times the query's token count; each kept row then takes its fine
+// radius times the query's token count. Each kept row then takes its fine
 // MeanMaxSim as its score.
 func scanWithinRadius(
 	ctx context.Context,
@@ -973,10 +967,10 @@ func scanWithinRadius(
 }
 
 // nodeRowSelection gives the files that Zoekt selects on the node's own shards
-// for the query's filters and the node's scope; nil keeps every file. Only the
-// current copy of a dirty file counts (currentCopy), as in the text results: a
+// for the query's filters and the node's scope; nil keeps every file. The read
+// searches only the current copy of each file, as for the text results: a
 // committed copy that matches a filter does not select the work-tree copy.
-func nodeRowSelection(ctx context.Context, read *nodeRead, qp queryPlan, dirty dirtyFileSet) (map[string]struct{}, error) {
+func nodeRowSelection(ctx context.Context, read *nodeRead, qp queryPlan) (map[string]struct{}, error) {
 	if len(qp.model.filters) == 0 && read.plan.scope == nil {
 		return nil, nil
 	}
@@ -989,9 +983,7 @@ func nodeRowSelection(ctx context.Context, read *nodeRead, qp queryPlan, dirty d
 	}
 	selected := make(map[string]struct{}, len(files))
 	for _, file := range files {
-		if currentCopy(file, dirty.contains(file.FileName)) {
-			selected[file.FileName] = struct{}{}
-		}
+		selected[file.FileName] = struct{}{}
 	}
 	return selected, nil
 }

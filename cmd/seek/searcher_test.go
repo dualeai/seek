@@ -93,22 +93,22 @@ func TestCloneFileMatchesCopiesContextOnlyForPossibleDisplayedFiles(t *testing.T
 		}
 	}
 
+	// A node read gives one current copy per file.
 	input := []zoekt.FileMatch{
-		newFile("same.go", "repo", 100),
-		newFile("dirty.go", "repo", 90),
+		newFile("low.go", "repo", 1),
+		newFile("dirty.go", repoUncommitted, 90),
 		newFile("b.go", "repo", 50),
 		newFile("c.go", "repo", 40),
-		newFile("same.go", repoUncommitted, 1),
+		newFile("top.go", "repo", 100),
 	}
 	full := cloneFileMatches(input, defaultSearchConfig())
 	config := defaultSearchConfig()
 	config.contextFileLimit = 2
-	config.contextDirtyFiles = dirtyFileSet{"dirty.go": {}}
 	selected := cloneFileMatches(input, config)
 
 	for i, file := range selected {
 		gotContext := len(file.LineMatches[0].Before) > 0 && len(file.LineMatches[0].After) > 0
-		wantContext := i == 2 || i == 3
+		wantContext := i == 1 || i == 4
 		if gotContext != wantContext {
 			t.Fatalf("file %d %s context=%t, want %t", i, file.FileName, gotContext, wantContext)
 		}
@@ -118,15 +118,14 @@ func TestCloneFileMatchesCopiesContextOnlyForPossibleDisplayedFiles(t *testing.T
 	}
 
 	plan := node{id: corpusID("repo"), kind: corpusKindGit}
-	dirty := dirtyFilesByCorpus{plan.id: config.contextDirtyFiles}
-	want := formatCorpusResultsWithContext(wrapCorpusResults(plan, full), dirty, 2, 0, hideCorpusContext, plainPalette)
-	got := formatCorpusResultsWithContext(wrapCorpusResults(plan, selected), dirty, 2, 0, hideCorpusContext, plainPalette)
+	want := formatCorpusResultsWithContext(wrapCorpusResults(plan, full), 2, 0, hideCorpusContext, plainPalette)
+	got := formatCorpusResultsWithContext(wrapCorpusResults(plan, selected), 2, 0, hideCorpusContext, plainPalette)
 	if got != want {
 		t.Fatalf("selective context changed output:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
 
-	input[2].LineMatches[0].Before[0] = 'X'
-	if selected[2].LineMatches[0].Before[0] == 'X' {
+	input[4].LineMatches[0].Before[0] = 'X'
+	if selected[4].LineMatches[0].Before[0] == 'X' {
 		t.Fatal("selected file context aliases shard memory")
 	}
 }
@@ -176,8 +175,8 @@ func TestPerCorpusContextLimitPreservesGlobalTopFiles(t *testing.T) {
 		wrapCorpusResults(planA, cloneFileMatches(filesA, defaultSearchConfig())),
 		wrapCorpusResults(planB, cloneFileMatches(filesB, defaultSearchConfig()))...,
 	)
-	want := formatCorpusResultsWithContext(full, nil, 2, 0, showCorpusContext, plainPalette)
-	got := formatCorpusResultsWithContext(selective, nil, 2, 0, showCorpusContext, plainPalette)
+	want := formatCorpusResultsWithContext(full, 2, 0, showCorpusContext, plainPalette)
+	got := formatCorpusResultsWithContext(selective, 2, 0, showCorpusContext, plainPalette)
 	if got != want {
 		t.Fatalf("per-corpus context selection changed global output:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
@@ -229,7 +228,7 @@ func TestSearchPlannedCorpusParsed_ContextModes(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			files, err := searchPlannedCorpusParsed(t.Context(), plan, q, tc.config)
+			files, err := searchPlannedCorpusParsed(t.Context(), plan, nil, q, tc.config)
 			if err != nil {
 				t.Fatalf("search: %v", err)
 			}
@@ -306,14 +305,14 @@ func TestSearchPlannedCorpusParsed_ContextFileSelectionAfterShardMerge(t *testin
 
 			config := explicitSearchConfig(1, false)
 			config.contextFileLimit = 1
-			selected, err := searchPlannedCorpusParsed(t.Context(), plan, q, config)
+			selected, err := searchPlannedCorpusParsed(t.Context(), plan, nil, q, config)
 			if err != nil {
 				t.Fatalf("selective search: %v", err)
 			}
 
 			fullConfig := config
 			fullConfig.contextFileLimit = 0
-			full, err := searchPlannedCorpusParsed(t.Context(), plan, q, fullConfig)
+			full, err := searchPlannedCorpusParsed(t.Context(), plan, nil, q, fullConfig)
 			if err != nil {
 				t.Fatalf("full search: %v", err)
 			}
@@ -348,10 +347,10 @@ func TestSearchPlannedCorpusParsed_ContextFileSelectionAfterShardMerge(t *testin
 			}
 
 			want := formatCorpusResultsWithContext(
-				wrapCorpusResults(plan, full), nil, 1, 0, hideCorpusContext, plainPalette,
+				wrapCorpusResults(plan, full), 1, 0, hideCorpusContext, plainPalette,
 			)
 			got := formatCorpusResultsWithContext(
-				wrapCorpusResults(plan, selected), nil, 1, 0, hideCorpusContext, plainPalette,
+				wrapCorpusResults(plan, selected), 1, 0, hideCorpusContext, plainPalette,
 			)
 			if got != want {
 				t.Fatalf("selective context changed merged-shard output:\n--- got ---\n%s\n--- want ---\n%s", got, want)
@@ -394,7 +393,7 @@ func TestNodeRead_FailsClosedOnPartialCorruptShard(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan := node{cacheDir: t.TempDir(), indexDir: indexDir}
-	results, err := searchPlannedCorpusParsed(context.Background(), plan, q, defaultSearchConfig())
+	results, err := searchPlannedCorpusParsed(context.Background(), plan, nil, q, defaultSearchConfig())
 	if err == nil {
 		t.Fatal("expected corrupt shard to fail closed")
 	}

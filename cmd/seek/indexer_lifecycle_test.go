@@ -150,7 +150,7 @@ func TestIndexDeltaDocuments_ReleaseAccounting_Success(t *testing.T) {
 		makeFileContent(t, "delta_a.go", []byte("package a\nfunc A() {}\n")),
 		makeFileContent(t, "delta_b.go", []byte("package b\nfunc B() {}\n")),
 	}
-	if _, err := indexDeltaDocuments(indexDir, "delta_repo", source, docs, shardMax, []string{"delta_a.go", "delta_b.go"}); err != nil {
+	if _, err := indexDeltaDocuments(indexDir, "delta_repo", source, docs, indexParallelism(), []string{"delta_a.go", "delta_b.go"}); err != nil {
 		t.Fatalf("indexDeltaDocuments: %v", err)
 	}
 }
@@ -172,7 +172,7 @@ func TestIndexDeltaDocuments_BuilderInitFail_ReleasesWeight(t *testing.T) {
 	docs := []fileContent{
 		makeFileContent(t, "x.go", []byte("package x\n")),
 	}
-	_, err := indexDeltaDocuments(bogusFile, "delta_repo", t.TempDir(), docs, shardMax, []string{"x.go"})
+	_, err := indexDeltaDocuments(bogusFile, "delta_repo", t.TempDir(), docs, indexParallelism(), []string{"x.go"})
 	if err == nil {
 		t.Fatal("expected NewBuilder failure with regular-file indexDir; precondition lost")
 	}

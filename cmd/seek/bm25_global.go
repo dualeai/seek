@@ -29,8 +29,8 @@ import (
 // (index/score.go:356-370, k = 1.2, b = 0.75), so the strict order depends on
 // how the shards and the nodes split the files. Seek rescores every strict hit
 // with one average over all the shards that a command searches.
-// TODO(zoekt): ask upstream to let the caller supply the average file length,
-// so Seek can drop this rescore.
+// TODO(https://github.com/sourcegraph/zoekt/issues/1186): drop this rescore
+// once Zoekt lets the caller supply the average file length.
 //
 // The sources: Zoekt's score is exact in FileMatch.Score; the term
 // frequencies come from the matches Seek receives, with the file-name atoms run

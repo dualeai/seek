@@ -16,7 +16,7 @@ var ansiCodeRE = regexp.MustCompile("\x1b\\[[0-9;]*m")
 // hideCorpusContext (relative paths), the common shape for these unit tests.
 func fmtOneFile(fm zoekt.FileMatch, pal palette) string {
 	res := []corpusSearchResult{{corpusID: corpusID("c"), kind: corpusKindGit, file: fm}}
-	return formatCorpusResultsWithContext(res, nil, 0, 0, hideCorpusContext, pal)
+	return formatCorpusResultsWithContext(res, 0, 0, hideCorpusContext, pal)
 }
 
 func lineMatch(line string, lineNum uint32, frags ...zoekt.LineFragmentMatch) zoekt.LineMatch {
@@ -245,7 +245,7 @@ func TestNotices_FileLimit(t *testing.T) {
 		files = append(files, zoekt.FileMatch{FileName: name, Language: "Go", Score: 1,
 			LineMatches: []zoekt.LineMatch{lineMatch("x\n", 1)}})
 	}
-	out := formatGitCorpusResultsForTest(files, nil, 2, 0)
+	out := formatGitCorpusResultsForTest(files, 2, 0)
 	if !strings.Contains(out, "… 1 more file (showing 2 of 3)") {
 		t.Fatalf("expected file-limit notice, got:\n%q", out)
 	}
@@ -254,7 +254,7 @@ func TestNotices_FileLimit(t *testing.T) {
 func TestNotices_PerFileMatchLimit(t *testing.T) {
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("m1\n", 1), lineMatch("m2\n", 2), lineMatch("m3\n", 3)}}
-	out := formatGitCorpusResultsForTest([]zoekt.FileMatch{fm}, nil, 0, 2)
+	out := formatGitCorpusResultsForTest([]zoekt.FileMatch{fm}, 0, 2)
 	if !strings.Contains(out, "… 1 more match in this file") {
 		t.Fatalf("expected per-file match notice, got:\n%q", out)
 	}
@@ -263,7 +263,7 @@ func TestNotices_PerFileMatchLimit(t *testing.T) {
 func TestNotices_NoneWhenNothingDropped(t *testing.T) {
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("only\n", 1)}}
-	out := formatGitCorpusResultsForTest([]zoekt.FileMatch{fm}, nil, 5, 5)
+	out := formatGitCorpusResultsForTest([]zoekt.FileMatch{fm}, 5, 5)
 	if strings.Contains(out, "more files") || strings.Contains(out, "more matches") {
 		t.Fatalf("no notice expected when nothing dropped, got:\n%q", out)
 	}
@@ -302,7 +302,7 @@ func TestSanitize_DisplayRootControlBytesStripped(t *testing.T) {
 		file: zoekt.FileMatch{FileName: "f.txt", Language: "Text", Score: 1,
 			LineMatches: []zoekt.LineMatch{{Line: []byte("x\n"), LineNumber: 1}}},
 	}}
-	out := formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext, plainPalette)
+	out := formatCorpusResultsWithContext(results, 0, 0, showCorpusContext, plainPalette)
 	if strings.Contains(out, "\x1b") {
 		t.Fatalf("control byte in displayRoot leaked, got:\n%q", out)
 	}
@@ -449,7 +449,7 @@ func TestStripRune(t *testing.T) {
 
 func TestCorpusFormatting_Realistic(t *testing.T) {
 	results := benchmarkGitResults(benchmarkRealisticFiles(2))
-	plain := formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
+	plain := formatCorpusResultsWithContext(results, 0, 0, hideCorpusContext, plainPalette)
 	for _, pc := range []struct {
 		name string
 		pal  palette
@@ -458,7 +458,7 @@ func TestCorpusFormatting_Realistic(t *testing.T) {
 		{"ansi", ansiPalette},
 	} {
 		t.Run(pc.name, func(t *testing.T) {
-			out := formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, pc.pal)
+			out := formatCorpusResultsWithContext(results, 0, 0, hideCorpusContext, pc.pal)
 			if !utf8.ValidString(out) {
 				t.Fatalf("output is not valid UTF-8")
 			}

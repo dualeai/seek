@@ -76,24 +76,22 @@ func (writer corpusFormatWriter) writeRune(value rune)    { _, _ = writer.WriteR
 func writeCorpusResultsWithContext(
 	w io.Writer,
 	results []corpusSearchResult,
-	dirtyByCorpus dirtyFilesByCorpus,
 	limit int,
 	maxMatches int,
 	displayMode corpusDisplayMode,
 	pal palette,
 ) (bool, error) {
-	deduped, hiddenMatches, totalFiles := prepareCorpusResultsForDisplay(
+	ranked, hiddenMatches, totalFiles := prepareCorpusResultsForDisplay(
 		results,
-		dirtyByCorpus,
 		limit,
 		maxMatches,
 	)
-	if len(deduped) == 0 {
+	if len(ranked) == 0 {
 		return false, nil
 	}
 	// NewWriter returns w itself when w is a large enough bufio.Writer.
 	writer := corpusFormatWriter{bufio.NewWriter(w)}
-	renderCorpusResults(writer, deduped, hiddenMatches, totalFiles, displayMode, pal)
+	renderCorpusResults(writer, ranked, hiddenMatches, totalFiles, displayMode, pal)
 	return true, writer.Flush()
 }
 
@@ -126,31 +124,30 @@ func renderCorpusResults(
 
 func prepareCorpusResultsForDisplay(
 	results []corpusSearchResult,
-	dirtyByCorpus dirtyFilesByCorpus,
 	limit int,
 	maxMatches int,
 ) ([]corpusSearchResult, []int, int) {
 	if len(results) == 0 {
 		return nil, nil, 0
 	}
-	deduped := rankCorpusResultsForDisplay(results, dirtyByCorpus)
-	totalFiles := len(deduped)
-	if limit > 0 && len(deduped) > limit {
-		deduped = deduped[:limit]
+	ranked := rankCorpusResultsForDisplay(results)
+	totalFiles := len(ranked)
+	if limit > 0 && len(ranked) > limit {
+		ranked = ranked[:limit]
 	}
-	hiddenMatches := make([]int, len(deduped))
-	for index := range deduped {
-		deduped[index].file.LineMatches, hiddenMatches[index] =
-			normalizeLineMatches(deduped[index].file.LineMatches, maxMatches)
+	hiddenMatches := make([]int, len(ranked))
+	for index := range ranked {
+		ranked[index].file.LineMatches, hiddenMatches[index] =
+			normalizeLineMatches(ranked[index].file.LineMatches, maxMatches)
 	}
-	return deduped, hiddenMatches, totalFiles
+	return ranked, hiddenMatches, totalFiles
 }
 
-func rankCorpusResultsForDisplay(
-	results []corpusSearchResult,
-	dirtyByCorpus dirtyFilesByCorpus,
-) []corpusSearchResult {
-	ranked := deduplicateCorpusResults(results, dirtyByCorpus)
+// rankCorpusResultsForDisplay sorts a copy of results for display. Each node
+// read returns one current copy per file, so the results need no
+// deduplication.
+func rankCorpusResultsForDisplay(results []corpusSearchResult) []corpusSearchResult {
+	ranked := slices.Clone(results)
 	sort.SliceStable(ranked, func(i, j int) bool {
 		left := ranked[i]
 		right := ranked[j]
@@ -173,47 +170,6 @@ func lessCorpusResultBM25(left, right corpusSearchResult) bool {
 		return left.displayRoot < right.displayRoot
 	}
 	return left.corpusID < right.corpusID
-}
-
-func deduplicateCorpusResults(
-	results []corpusSearchResult,
-	dirtyByCorpus dirtyFilesByCorpus,
-) []corpusSearchResult {
-	byPath := make(map[corpusResultKey]dedupEntry, len(results))
-	for i, result := range results {
-		// Only a Git node has the uncommitted repository; a folder
-		// repository is "folder_" + its ID.
-		isUncommitted := result.file.Repository == repoUncommitted
-		key := corpusResultKey{corpusID: result.corpusID, fileName: result.file.FileName}
-		chooseDedupEntry(byPath, key, i, isUncommitted)
-	}
-	out := make([]corpusSearchResult, 0, len(byPath))
-	for _, entry := range byPath {
-		result := results[entry.idx]
-		dirtyFiles := dirtyByCorpus[result.corpusID]
-		if !entry.uncommitted && dirtyFiles.contains(result.file.FileName) {
-			continue
-		}
-		out = append(out, result)
-	}
-	return out
-}
-
-type corpusResultKey struct {
-	corpusID corpusID
-	fileName string
-}
-
-type dedupEntry struct {
-	idx         int
-	uncommitted bool
-}
-
-func chooseDedupEntry[K comparable](entries map[K]dedupEntry, key K, idx int, uncommitted bool) {
-	existing, ok := entries[key]
-	if !ok || (uncommitted && !existing.uncommitted) {
-		entries[key] = dedupEntry{idx: idx, uncommitted: uncommitted}
-	}
 }
 
 // normalizeLineMatches keeps the best maxMatches lines (every line when
@@ -250,6 +206,8 @@ func normalizeLineMatches(lms []zoekt.LineMatch, maxMatches int) ([]zoekt.LineMa
 
 // Zoekt can add equal term scores in different orders. Round scores to 12
 // decimal places before the line-number tie-break so parallel searches agree.
+// TODO(https://github.com/sourcegraph/zoekt/issues/1187): drop the rounding
+// once Zoekt sums in a fixed order.
 func stableLineMatchScore(score float64) float64 {
 	return math.Round(score * 1e12)
 }

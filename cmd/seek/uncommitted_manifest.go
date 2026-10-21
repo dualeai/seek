@@ -23,10 +23,6 @@ const (
 	// files alone passes the cap, by at most one shard per kept file, so a
 	// file that stays unreadable does not rebuild the family on each search.
 	maxUncommittedDeltaShards = 32
-	// uncommittedDeltaShardMax keeps each delta shard small so a long
-	// session of single-file saves does not balloon disk usage. Matches
-	// folder delta sizing.
-	uncommittedDeltaShardMax = 1024 * 1024
 )
 
 type uncommittedManifest struct {

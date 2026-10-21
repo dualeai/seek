@@ -12,9 +12,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/sourcegraph/zoekt"
-	"github.com/sourcegraph/zoekt/query"
 )
 
 // dirtyAndIndex rewrites the working-tree file at relPath with content and
@@ -425,11 +422,11 @@ func TestDeltaUncommitted_DeletedDirtyFileTombstoned(t *testing.T) {
 	}
 }
 
-// TestDeltaUncommitted_RemovalOnlyLeavesNoEmptyShard edits one dirty file, so
+// TestDeltaUncommitted_RemovalOnlyHidesTheRemovedFile edits one dirty file, so
 // a delta shard holds it alone, then removes that file with no other change.
-// The removed file must leave the results, the other dirty file must stay, and
-// each uncommitted shard must hold a live document.
-func TestDeltaUncommitted_RemovalOnlyLeavesNoEmptyShard(t *testing.T) {
+// The removed file must leave the results, and every other file must stay. The
+// next delta and a full rebuild must keep these results.
+func TestDeltaUncommitted_RemovalOnlyHidesTheRemovedFile(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// committed_base\n")
@@ -437,7 +434,7 @@ func TestDeltaUncommitted_RemovalOnlyLeavesNoEmptyShard(t *testing.T) {
 	paths, plan := planGitTestCorpus(t, dir)
 	reindexGit(t, ctx, paths, plan)
 
-	if err := os.WriteFile(filepath.Join(dir, "keep.go"), []byte("package main\n// keep_dirty_marker\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "keep.go"), []byte("package main\n// keep_first_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "gone.go"), []byte("package main\n// gone_first_marker\n"), 0o644); err != nil {
@@ -448,41 +445,50 @@ func TestDeltaUncommitted_RemovalOnlyLeavesNoEmptyShard(t *testing.T) {
 		t.Fatalf("uncommitted shards=%d, want a delta shard for the edit", shards)
 	}
 
+	matches := func(step string, absent, present []string) {
+		t.Helper()
+		for _, marker := range absent {
+			results, err := searchPlannedCorpusForTest(ctx, plan, marker)
+			if err != nil {
+				t.Fatalf("%s: search %s: %v", step, marker, err)
+			}
+			if len(results) != 0 {
+				t.Fatalf("%s: %s matches %d files, want none", step, marker, len(results))
+			}
+		}
+		for _, marker := range present {
+			results, err := searchPlannedCorpusForTest(ctx, plan, marker)
+			if err != nil {
+				t.Fatalf("%s: search %s: %v", step, marker, err)
+			}
+			if len(results) != 1 {
+				t.Fatalf("%s: %s matches %d files, want one", step, marker, len(results))
+			}
+		}
+	}
+
 	if err := os.Remove(filepath.Join(dir, "gone.go")); err != nil {
 		t.Fatal(err)
 	}
 	reindexGit(t, ctx, paths, plan)
+	matches("removal",
+		[]string{"gone_first_marker", "gone_second_marker"},
+		[]string{"keep_first_marker", "committed_base"})
 
-	for _, marker := range []string{"gone_first_marker", "gone_second_marker"} {
-		results, err := searchPlannedCorpusForTest(ctx, plan, marker)
-		if err != nil {
-			t.Fatalf("search %s: %v", marker, err)
-		}
-		if len(results) != 0 {
-			t.Fatalf("removed file still matches %s: %d files", marker, len(results))
-		}
+	dirtyAndIndex(t, ctx, paths, plan, "keep.go", "package main\n// keep_second_marker\n")
+	matches("next delta",
+		[]string{"gone_first_marker", "gone_second_marker", "keep_first_marker"},
+		[]string{"keep_second_marker", "committed_base"})
+
+	// With no manifest, the next build reads every dirty file again.
+	deleteUncommittedManifest(plan.cacheDir)
+	if err := os.WriteFile(filepath.Join(dir, "added.go"), []byte("package main\n// added_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if results, err := searchPlannedCorpusForTest(ctx, plan, "keep_dirty_marker"); err != nil || len(results) == 0 {
-		t.Fatalf("the other dirty file must stay findable: results=%d err=%v", len(results), err)
-	}
-	shards := repositoryShardFiles(plan.indexDir, repoUncommitted)
-	if len(shards) == 0 {
-		t.Fatal("no uncommitted shard holds the other dirty file")
-	}
-	for _, shard := range shards {
-		searcher, err := openShard(shard)
-		if err != nil {
-			t.Fatalf("open %s: %v", filepath.Base(shard), err)
-		}
-		result, err := searcher.Search(ctx, &query.Const{Value: true}, &zoekt.SearchOptions{})
-		searcher.Close()
-		if err != nil {
-			t.Fatalf("search %s: %v", filepath.Base(shard), err)
-		}
-		if len(result.Files) == 0 {
-			t.Errorf("uncommitted shard %s holds no live document", filepath.Base(shard))
-		}
-	}
+	reindexGit(t, ctx, paths, plan)
+	matches("full rebuild",
+		[]string{"gone_first_marker", "gone_second_marker", "keep_first_marker"},
+		[]string{"keep_second_marker", "added_marker", "committed_base"})
 }
 
 // TestDeltaUncommitted_OnlyAMissingFileIsGone stats a deleted file and a path
