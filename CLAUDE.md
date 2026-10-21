@@ -29,8 +29,8 @@ memory, and disk as it needs. Low resource use is not a goal.
 - Size budgets from the host (CPU count, physical memory), not from small fixed
   values.
 - Limits stay only where they protect correctness: the Zoekt 4 GiB shard
-  format, read budgets that cannot deadlock, and the corpus file and byte
-  limits.
+  format, read budgets that cannot deadlock, and the one cache budget
+  (`SEEK_CACHE_BUDGET`).
 - Measure before and after a performance change, and keep the faster version.
 
 ## Code search — use `seek`
@@ -45,7 +45,8 @@ Path operands accept directories or exact files, can be inside or outside the
 current Git worktree, and can be combined in a single invocation (e.g. mix a
 repo subtree with an external notes folder). Symlinked path operands are
 silently resolved to their targets; symlinks discovered during walks are still
-skipped. With no paths, seek searches the current Git worktree.
+skipped. With no paths, seek searches the current folder, the same as `.`;
+each Git repository in it is searched with its Git rules.
 
 ### Key filters (combine with spaces inside the quotes)
 
@@ -73,8 +74,8 @@ seek 'package' ./cmd/seek/searcher.go
 # Search a folder outside the Git worktree
 seek 'TODO' /tmp/notes
 
-# Mix in-repo and external paths (across roots, headers show the absolute
-# path and a [git]/[folder] tag so each match is directly openable)
+# Mix in-repo and external paths (across roots, each header shows the path
+# as typed and a [git]/[folder] tag, so each match is directly openable)
 seek 'sym:Index' ./cmd/seek /tmp/notes
 
 # Find indexing logic, excluding tests
@@ -95,34 +96,23 @@ Use a plain query when you know the behavior but not its identifier or file:
 seek 'validate search query syntax'
 ```
 
-Plain queries with two or more words use local model re-ranking by default.
-One unscoped clean Git worktree, one stable plain file, or one stable plain
-folder also uses semantic retrieval. Scoped or dirty Git and multi-corpus
-searches can still use model re-ranking when enough candidates exist, but not
-semantic retrieval. A description can contain `lang:`, `file:`, and `-file:`
-filters; Seek keeps them in lexical and semantic retrieval. Eligibility follows
-Zoekt's parsed and simplified query tree, so equivalent spellings and aliases
-can use the same route. Exact identifiers, phrases, one-word queries, and trees
-that retain other filters, Boolean alternatives, or general negation use strict
-BM25 order.
-Seek builds semantic data only for a search that can read it: one corpus, no
-scope, and a query the re-rank planner accepts. Exact terms, `sym:` lookups,
-phrases, one-word queries, and multi-corpus searches keep Zoekt up to date and
-build no semantic data. The first eligible search builds it. `--lexical-only`
-skips semantic and model work for every query. An eligible description uses
-Zoekt only when truncation is certain before model start. A
-first large-repo search can take tens of seconds or longer and use all
-available compute, several GiB of memory, and significant cache space. Use
-`--lexical-only` to skip all semantic index and model work. Use
+Plain queries with two or more description words use the local model: every
+searched folder and Git repository (clean or dirty, scoped or not) adds files
+by meaning, and the model ranks them with the text matches. Filters (`lang:`,
+`file:`, `-file:`, `sym:`, `content:`, path operands) apply to both. One-word
+queries, a lone quoted phrase, `or` between descriptions, and filter-only
+queries use strict BM25 order. The README "Support table" lists every query
+form. The first description search builds the meaning-based data of every
+searched folder and repository; on a large repo it can take tens of seconds or
+longer and use all available compute, several GiB of memory, and significant
+cache space. `--lexical-only` skips all semantic and model work. Use
 `SEEK_ROUTER=off grep` for absence checks, renames, counts, and complete
 call-site lists.
 
-An eligible description scores at most 128 candidate files before display
-limits. If it has no strict all-word result, the best normalized model score
-must clear the route's support boundary. Rejection returns no output and status
-1. This is not proof of absence. A non-truncated strict all-word result admits
-the complete model-expanded set without the score check. Semantic retrieval
-remains approximate and bounded.
+Every file within the semantic similarity radius is a candidate (no count
+bound). Files with every query word stay; a model-added file must pass the
+model's score threshold. No result returns no output and status 1. This is not
+proof of absence. Semantic retrieval is approximate.
 
 ### Pitfalls
 
@@ -146,18 +136,14 @@ Requires `universal-ctags` (`brew install universal-ctags` on macOS).
 
 When spawning sub-agents that don't inherit this config, pass:
 "Use `seek 'pattern' [path...]` for ranked code navigation. Keep query filters
-in one quoted string. Plain multi-word descriptions use model re-ranking by
-default. Semantic data is built only for a search that can read it: one
-corpus, no scope, and a query the re-rank planner accepts; exact terms, `sym:`
-lookups, phrases and multi-corpus searches build none. Use `--lexical-only` to
-skip all semantic and model work. An unscoped clean Git worktree or one stable
-plain file or folder also uses semantic retrieval.
-Descriptions can include `lang:`, `file:`, and `-file:` filters. Eligible
-descriptions score at most 128 candidate files. Without a strict all-word
-result, the best normalized score must clear a support boundary; a
-non-truncated strict result admits expansion without that score check. Use
-`SEEK_ROUTER=off grep` for absence checks, all occurrences, counts, renames, or
-complete call-site lists. A descriptive no-result is not proof of absence."
+in one quoted string. With no path, seek searches the current folder. Plain
+descriptions of two or more words use the local model on every searched
+folder and repository; filters apply to both text and meaning retrieval;
+one-word queries and a lone quoted phrase use text order. Use `--lexical-only`
+to skip all semantic and model work. A model-added file must pass a score
+threshold; files with every query word stay. Use `SEEK_ROUTER=off grep` for
+absence checks, all occurrences, counts, renames, or complete call-site lists.
+A descriptive no-result is not proof of absence."
 
 ## GitHub Actions
 

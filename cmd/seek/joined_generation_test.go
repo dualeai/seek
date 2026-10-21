@@ -80,7 +80,7 @@ func TestJoinedGenerationDescriptorBindsBothIndexParts(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantDigest := sha256.Sum256(family)
-	if descriptor.Format != 1 || descriptor.State != state ||
+	if descriptor.Format != joinedGenerationVersion || descriptor.State != state ||
 		descriptor.FamilySHA != hex.EncodeToString(wantDigest[:]) ||
 		descriptor.SemanticKey == "" {
 		t.Fatalf("joined descriptor=%+v", descriptor)
@@ -189,25 +189,26 @@ func TestReadJoinedGenerationRejectsInvalidJSON(t *testing.T) {
 	}{
 		{
 			name: "duplicate field",
-			content: `{"format":1,"format":1,"state":"s","family_sha256":"` +
+			content: `{"format":2,"format":2,"state":"s","family_sha256":"` +
 				digest + `","semantic_key":"k"}`,
 		},
 		{
 			name: "unknown field",
-			content: `{"format":1,"state":"s","family_sha256":"` + digest +
+			content: `{"format":2,"state":"s","family_sha256":"` + digest +
 				`","semantic_key":"k","extra":true}`,
 		},
 		{
 			name: "trailing value",
-			content: `{"format":1,"state":"s","family_sha256":"` + digest +
+			content: `{"format":2,"state":"s","family_sha256":"` + digest +
 				`","semantic_key":"k"}{}`,
 		},
 		{
 			name: "wrong format",
-			content: `{"format":2,"state":"s","family_sha256":"` + digest +
+			content: `{"format":1,"state":"s","family_sha256":"` + digest +
 				`","semantic_key":"k"}`,
 		},
-		{name: "incomplete", content: `{"format":1}`},
+		{name: "incomplete", content: `{"format":2}`},
+		{name: "no generation", content: `{"format":2,"state":"s","family_sha256":"` + digest + `"}`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -223,5 +224,87 @@ func TestReadJoinedGenerationRejectsInvalidJSON(t *testing.T) {
 				t.Fatal("invalid joined descriptor was accepted")
 			}
 		})
+	}
+}
+
+// TestJoinedGenerationBindsTheOverlay binds a base and an overlay: the match
+// needs both keys, and a node with no commit binds an overlay alone.
+func TestJoinedGenerationBindsTheOverlay(t *testing.T) {
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	indexDir := filepath.Join(root, "index")
+	for _, dir := range []string{cacheDir, indexDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(indexDir, familyManifestFile), []byte("seek_v17.00000.zoekt 481\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const state, base = "git-state-3", "head-3"
+	overlay := semanticOverlaySource(state)
+	units, embeddings := testSemanticRowsAndVectors(t)
+	for _, source := range []string{base, overlay} {
+		if _, err := writeTestSemanticGeneration(t.Context(), semanticGenerationDir(indexDir, source), source, units, embeddings); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writeJoinedGenerations(cacheDir, indexDir, state, base, overlay); err != nil {
+		t.Fatal(err)
+	}
+	if !joinedGenerationsMatch(cacheDir, indexDir, state, base, overlay) {
+		t.Fatal("base and overlay binding does not match")
+	}
+	if joinedGenerationsMatch(cacheDir, indexDir, state, base, "") || joinedGenerationMatches(cacheDir, indexDir, state, base) {
+		t.Fatal("a base-only read matched a binding with an overlay")
+	}
+	if joinedGenerationsMatch(cacheDir, indexDir, state, base, semanticOverlaySource("other-state")) {
+		t.Fatal("another state's overlay matched")
+	}
+	if err := writeJoinedGenerations(cacheDir, indexDir, state, "", overlay); err != nil {
+		t.Fatal(err)
+	}
+	if !joinedGenerationsMatch(cacheDir, indexDir, state, "", overlay) {
+		t.Fatal("an overlay-only binding does not match")
+	}
+}
+
+// TestOldOverlayWithAGraph reads an overlay generation that an older build
+// wrote with a USearch graph: the manifest check (the build gate) rejects it
+// as the open does, so the build replaces it before a search reads it, and
+// reuse still reads its rows.
+func TestOldOverlayWithAGraph(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "generation")
+	units, embeddings := testSemanticRowsAndVectors(t)
+	if _, err := writeTestSemanticGeneration(t.Context(), dir, "head-old", units, embeddings); err != nil {
+		t.Fatal(err)
+	}
+	overlay := semanticOverlaySource("state-old")
+	path := filepath.Join(dir, semanticManifestFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest map[string]any
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest["source"] = overlay
+	if data, err = json.Marshal(manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSemanticManifest(dir, overlay); err == nil {
+		t.Fatal("the manifest check accepted an overlay with a graph")
+	}
+	generation, err := openSemanticGenerationRows(dir, overlay)
+	if err != nil {
+		t.Fatalf("reuse cannot read the old overlay: %v", err)
+	}
+	defer func() { _ = generation.Close() }()
+	if len(generation.rows) != len(units) || len(generation.usearch) != 0 {
+		t.Fatalf("rows=%d usearch=%d, want %d rows and no shard", len(generation.rows), len(generation.usearch), len(units))
 	}
 }

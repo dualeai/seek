@@ -38,10 +38,6 @@ func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 		return fmt.Errorf("resolve cache root: %w", err)
 	}
 	cfg := gcConfigFromEnv()
-	maxAge := cfg.maxAge
-	if opts.all {
-		maxAge = 0
-	}
 
 	corporaPath := filepath.Join(cacheRoot, corporaDir)
 	if opts.dryRun {
@@ -51,10 +47,14 @@ func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 		if err != nil {
 			return fmt.Errorf("enumerate corpora: %w", err)
 		}
-		if err := reportGCPlan(ctx, os.Stdout, cacheRoot, entries, time.Now().Add(-maxAge), sortKey); err != nil {
+		evict, err := planCorpusEviction(cacheRoot, entries, opts.all, nil, false)
+		if err != nil {
+			return fmt.Errorf("compute the cache budget: %w", err)
+		}
+		if err := reportGCPlan(ctx, os.Stdout, cacheRoot, entries, evict, sortKey); err != nil {
 			return err
 		}
-		reportProviderArtifactPlan(ctx, os.Stdout, cacheRoot, time.Now().Add(-maxAge))
+		reportProviderArtifactPlan(ctx, os.Stdout, cacheRoot, time.Now().Add(-providerArtifactAge(opts.all)))
 		return nil
 	}
 
@@ -78,7 +78,7 @@ func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 	// writer is non-nil → runGC streams the per-corpus table to stdout
 	// (same shape as `--dry-run`, ACTION column shows real outcome).
 	runGC(ctx, gcOptions{
-		maxAge:       maxAge,
+		evictAll:     opts.all,
 		skipThrottle: opts.force || opts.all,
 		writer:       os.Stdout,
 		sortKey:      sortKey,
@@ -208,12 +208,12 @@ func printGCTableBanner(w io.Writer, cacheRoot string, n int) {
 	_, _ = fmt.Fprintln(w, gcTableHeader)
 }
 
-// predictGCAction is the dry-run counterpart to evictIfExpired: it reports
-// what the TTL decision would be (kept | evicted) without taking a lock or
+// predictGCAction is the dry-run counterpart to evictIfPlanned: it reports
+// what the eviction plan would do (kept | evicted) without taking a lock or
 // mutating anything. Sharing the gcRowResult vocabulary with the live path
 // keeps the two tables byte-aligned.
-func predictGCAction(e corpusDirEntry, cutoff time.Time) gcRowResult {
-	if e.usedAt.After(cutoff) {
+func predictGCAction(e corpusDirEntry, evict map[corpusID]bool) gcRowResult {
+	if !evict[e.name] {
 		return gcRowResult{action: actionKept}
 	}
 	return gcRowResult{action: actionEvicted}
@@ -251,14 +251,14 @@ func emitGCRow(w io.Writer, stats *gcTableStats, r gcRow, now time.Time, res gcR
 //
 // The summary counts the rows actually rendered — both branches stop early
 // on ctx cancellation, and the summary must describe what was measured.
-func reportGCPlan(ctx context.Context, w io.Writer, cacheRoot string, entries []corpusDirEntry, cutoff time.Time, sortKey gcSortKey) error {
+func reportGCPlan(ctx context.Context, w io.Writer, cacheRoot string, entries []corpusDirEntry, evict map[corpusID]bool, sortKey gcSortKey) error {
 	printGCTableBanner(w, cacheRoot, len(entries))
 	if len(entries) == 0 {
 		return nil
 	}
 	now := time.Now()
 	stats := &gcTableStats{}
-	emit := func(r gcRow) { emitGCRow(w, stats, r, now, predictGCAction(r.entry, cutoff)) }
+	emit := func(r gcRow) { emitGCRow(w, stats, r, now, predictGCAction(r.entry, evict)) }
 	if sortKey == sortByName {
 		// Default order streams each row right after its own measurement —
 		// incremental output on large caches, no frozen header.
@@ -414,6 +414,10 @@ func corpusDirSize(path string) int64 {
 			if strings.HasPrefix(d.Name(), buildDirPrefix) {
 				return fs.SkipDir
 			}
+			return nil
+		}
+		if d.Name() == corpusSizeFile {
+			// The ledger entry describes the corpus; it is not part of it.
 			return nil
 		}
 		info, err := d.Info()

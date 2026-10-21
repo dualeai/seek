@@ -12,15 +12,16 @@ func newGCCmd() *cobra.Command {
 		Use:     "gc",
 		Aliases: []string{"garbage-collect"},
 		Short:   "Delete unused search indexes and compiled model files",
-		Long: fmt.Sprintf(`Delete search indexes that have not been used for %s, and
-compiled model files no search has used in the same time. Seek rebuilds either
-when it needs them; a removed model file also makes Seek check its run-time
-provider again.
+		Long: fmt.Sprintf(`Delete the least recently used search indexes while the index cache is over
+its budget, and compiled model files no search has used for %s. Seek rebuilds
+either when it needs them; a removed model file also makes Seek check its
+run-time provider again. The budget is 10%% of the cache volume, or less to keep
+5%% of the volume free; set %s (for example 20G) to change it.
 
 Use --all to delete every index and compiled model file that is not in use. Use
 --dry-run to show what would be deleted, with sizes. Use --force to run cleanup
 even if it ran recently. Use --sort=size with --dry-run to find the largest
-indexes.`, humanDuration(defaultGCMaxAge)),
+indexes.`, humanDuration(providerArtifactMaxAge), envCacheBudget),
 		Args: func(_ *cobra.Command, args []string) error {
 			if len(args) > 0 {
 				return fmt.Errorf("seek gc takes no positional arguments (got %q)", args[0])

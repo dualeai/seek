@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -31,10 +30,11 @@ const (
 // classifyVisibility classifies every path against the single repo rooted at
 // repoRoot. paths must be canonical absolute paths; callers must group by
 // repo root and not mix roots in one call. Every input path appears in the
-// returned map. An error is returned only for a genuine subprocess failure:
-// git check-ignore exits 1 (nothing ignored) and 128 (outside repo /
-// submodule boundary) are normal signals, not errors. It owns no boundary
-// discovery (that is detectGitBoundary) and constructs no corpora.
+// returned map. git check-ignore exit 1 (nothing ignored) and an exit 128
+// that names a submodule boundary or a path outside the repository are normal
+// signals. Any other failure is an error: Seek never searches a repository
+// that Git cannot read as a folder. It owns no boundary discovery (that is
+// detectGitBoundary) and constructs no corpora.
 func classifyVisibility(ctx context.Context, repoRoot string, paths []string) (map[string]visibility, error) {
 	out := make(map[string]visibility, len(paths))
 	relOf := make(map[string]string, len(paths)) // slash-relative -> canonical abs
@@ -94,9 +94,10 @@ func decideVisibility(ignored bool) visibility {
 
 // checkGitIgnore runs `git check-ignore -z --stdin` in DEFAULT (index-aware)
 // mode over rels (repo-root-relative, slash form) and returns the set of
-// ignored rels. aborted is true when git exits 128 (a path crosses a
-// submodule boundary or is outside the repo); the batch output is then
-// unusable and the caller must fall back per path.
+// ignored rels. aborted is true when git exits 128 because a path crosses a
+// submodule boundary or leaves the repo; the batch output is then unusable
+// and the caller must fall back per path. Any other exit 128 (a corrupt
+// index, a dubious owner) is an error.
 //
 // DEFAULT mode is deliberate — never pass --no-index. A tracked file that
 // also matches a .gitignore pattern is reported NOT ignored (exit 1),
@@ -113,33 +114,24 @@ func checkGitIgnore(ctx context.Context, repoDir string, rels []string) (map[str
 	for i, rel := range rels {
 		dotted[i] = "./" + rel
 	}
-	// core.fsmonitor=false: the ignore decision depends only on .gitignore
-	// rules and index membership, never on working-tree mtimes, so skip the
-	// fsmonitor IPC tax (~9ms/call on an fsmonitor-managed repo). This is NOT
-	// --no-index — index membership is still consulted (tracked-but-ignored
-	// stays tracked).
-	cmd := gitCmd(ctx, "-c", "core.fsmonitor=false", "check-ignore", "-z", "--stdin")
-	cmd.Dir = repoDir
+	cmd := newGitCheckIgnoreCommand(ctx, repoDir, "-z", "--stdin")
 	cmd.Stdin = strings.NewReader(strings.Join(dotted, "\x00"))
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	out, err := gitOutput(ctx, cmd, "git check-ignore")
 	if err == nil {
 		return collectIgnoredRels(string(out)), false, nil
 	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 		switch exitErr.ExitCode() {
 		case 1: // no path was ignored
 			return map[string]bool{}, false, nil
-		case 128: // outside repo / submodule boundary — batch aborted
-			return nil, true, nil
+		case 128:
+			if message := err.Error(); strings.Contains(message, "is in submodule") ||
+				strings.Contains(message, "is outside repository") {
+				return nil, true, nil
+			}
 		}
 	}
-	if msg := strings.TrimSpace(stderr.String()); msg != "" {
-		return nil, false, fmt.Errorf("git check-ignore: %w: %s", err, msg)
-	}
-	return nil, false, fmt.Errorf("git check-ignore: %w", err)
+	return nil, false, err
 }
 
 // collectIgnoredRels splits NUL-terminated check-ignore output into a set of

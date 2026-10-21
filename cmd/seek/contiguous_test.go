@@ -10,87 +10,89 @@ import (
 // seeded. Zoekt derives the next shard number from the contiguous run it finds,
 // so a gapped seed can make a delta replace a later shard. Basename order does
 // not group each prefix's shards, so the comparison must use parsed prefixes
-// and shard numbers.
+// and shard numbers. Each case scans a directory of empty files with those
+// names, as the delta build does.
 func TestFamilyScanContiguous(t *testing.T) {
-	scan := func(names ...string) familyScan {
-		var sc familyScan
-		for _, n := range names {
-			m := familyMember{name: n, uncommitted: isUncommittedShard(n), shard: true}
-			m.prefix, m.num, m.numbered = parseShardName(n)
-			sc.members = append(sc.members, m)
-		}
-		return sc
-	}
-
 	tests := []struct {
-		name string
-		fam  shardFamily
-		scan familyScan
-		want bool
+		name  string
+		fam   shardFamily
+		names []string
+		want  bool
 	}{
-		{"empty", familyAll, scan(), true},
-		{"single shard zero", familyAll, scan("r_v16.00000.zoekt"), true},
-		{"run of three", familyAll, scan("r_v16.00000.zoekt", "r_v16.00001.zoekt", "r_v16.00002.zoekt"), true},
-		{"missing zero", familyAll, scan("r_v16.00001.zoekt", "r_v16.00002.zoekt"), false},
-		{"gap in the middle", familyAll, scan("r_v16.00000.zoekt", "r_v16.00002.zoekt"), false},
+		{"empty", familyAll, nil, true},
+		{"single shard zero", familyAll, []string{"r_v16.00000.zoekt"}, true},
+		{"run of three", familyAll, []string{"r_v16.00000.zoekt", "r_v16.00001.zoekt", "r_v16.00002.zoekt"}, true},
+		{"missing zero", familyAll, []string{"r_v16.00001.zoekt", "r_v16.00002.zoekt"}, false},
+		{"gap in the middle", familyAll, []string{"r_v16.00000.zoekt", "r_v16.00002.zoekt"}, false},
 		{
 			// The case the comment calls out: a second family whose whole name
 			// sorts between the first family's shard 0 and shard 1. Sorting by
 			// basename alone would interleave the two runs and mis-decide.
 			name: "two prefixes interleaved by basename",
 			fam:  familyAll,
-			scan: scan(
+			names: []string{
 				"a_v16.00000.zoekt",
 				"a_v16.00001.00000.zoekt",
 				"a_v16.00001.zoekt",
-			),
+			},
 			want: true,
 		},
 		{
 			name: "two prefixes, second one gapped",
 			fam:  familyAll,
-			scan: scan(
+			names: []string{
 				"a_v16.00000.zoekt",
 				"b_v16.00001.zoekt",
-			),
+			},
 			want: false,
-		},
-		{
-			// Members arrive in whatever order the caller built them; the
-			// comparator must order them, not the input.
-			name: "unsorted input still contiguous",
-			fam:  familyAll,
-			scan: scan("r_v16.00002.zoekt", "r_v16.00000.zoekt", "r_v16.00001.zoekt"),
-			want: true,
 		},
 		{
 			// familyCommitted must ignore the uncommitted family entirely: its
 			// own numbering says nothing about the committed run.
 			name: "committed view skips a gapped uncommitted family",
 			fam:  familyCommitted,
-			scan: scan(
+			names: []string{
 				"r_v16.00000.zoekt",
-				repoUncommitted+"_v16.00003.zoekt",
-			),
+				repoUncommitted + "_v16.00003.zoekt",
+			},
 			want: true,
 		},
 		{
 			name: "all view sees the gapped uncommitted family",
 			fam:  familyAll,
-			scan: scan(
+			names: []string{
 				"r_v16.00000.zoekt",
-				repoUncommitted+"_v16.00003.zoekt",
-			),
+				repoUncommitted + "_v16.00003.zoekt",
+			},
 			want: false,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.scan.contiguous(tc.fam); got != tc.want {
+			dir := t.TempDir()
+			for _, name := range tc.names {
+				if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			scan, err := scanFamily(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := scan.contiguous(tc.fam); got != tc.want {
 				t.Errorf("contiguous(%v) = %v, want %v", tc.fam, got, tc.want)
 			}
 		})
+	}
+
+	// An explicit shard list arrives in the caller's order; the comparator
+	// must order it, not the input.
+	if !pathsAreContiguous([]string{"r_v16.00002.zoekt", "r_v16.00000.zoekt", "r_v16.00001.zoekt"}) {
+		t.Error("an unsorted run of three is not contiguous")
+	}
+	if pathsAreContiguous([]string{"r_v16.00002.zoekt", "r_v16.00000.zoekt"}) {
+		t.Error("an unsorted run with a gap is contiguous")
 	}
 }
 

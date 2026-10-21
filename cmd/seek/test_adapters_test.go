@@ -43,16 +43,12 @@ func runGCCommand(ctx context.Context, args []string) error {
 	return cmd.ExecuteContext(ctx)
 }
 
-func planDiscoveredGitCorpus(boundary gitBoundary) (corpusPlan, error) {
-	return planDiscoveredGitPaths(boundary.toGitPaths())
-}
-
-func planFolderCorpus(root string, info os.FileInfo) (corpusPlan, error) {
-	return planFolderCorpusWithExclusions(root, info, nil)
-}
-
-func planCurrentGitCorpusWithOperands(paths gitPaths, operands []string) (corpusPlan, error) {
-	return planCurrentGitCorpusWithExclusions(paths, operands, nil)
+// planGitOperands expands the graph from one Git operand.
+func planGitOperands(ctx context.Context, paths gitPaths, operand string) ([]corpusPlan, error) {
+	return expandGraph(ctx, plannedExternalOperands{gitRoots: []externalGitRoot{{
+		paths:    paths,
+		operands: []string{operand},
+	}}})
 }
 
 func parseSearchQuery(pattern string) (query.Q, error) {

@@ -50,11 +50,7 @@ func appendFileAt(tb testing.TB, repo, name, content string) {
 
 func planForOperands(tb testing.TB, repo string, operands ...string) []corpusPlan {
 	tb.Helper()
-	paths, err := resolveGitPaths(context.Background(), repo)
-	if err != nil {
-		tb.Fatalf("resolve git paths: %v", err)
-	}
-	plans, err := planCorpora(context.Background(), &paths, operands)
+	plans, err := planCorpora(context.Background(), operands)
 	if err != nil {
 		tb.Fatalf("planCorpora: %v", err)
 	}
@@ -192,36 +188,6 @@ func TestRealCaseWithin(t *testing.T) {
 	}
 	if got := realCaseWithin(root, wrong, dirListings{}); got != exact {
 		t.Errorf("case correction: got %q want %q", got, exact)
-	}
-}
-
-// Golden guard for the dirty-scope key. The key hashes only slash-relative
-// names (no absolute paths), so a frozen hex literal is portable. It pins the
-// whole serialization — tag, part order, separator AND the hash encoding —
-// so any drift that would silently invalidate on-disk cache keys without a
-// deliberate version bump fails here. Regenerate the literal only when the
-// key formula is changed on purpose (and bump seekCacheLayoutVersion).
-func TestGitDirtyScopeKey_FormulaStable(t *testing.T) {
-	requireGit(t)
-	setTestUserCache(t)
-
-	repo := initGitRepo(t, "a.go", "package main\n")
-	writeTrackedFile(t, repo, "b.go", "package main\n")
-	paths, err := resolveGitPaths(context.Background(), repo)
-	if err != nil {
-		t.Fatalf("resolve git paths: %v", err)
-	}
-	plan, err := planCurrentGitCorpusWithOperands(paths, []string{
-		filepath.Join(repo, "a.go"), filepath.Join(repo, "b.go"),
-	})
-	if err != nil {
-		t.Fatalf("plan: %v", err)
-	}
-	// Frozen: hashParts("git_dirty_scope_v1", "include_dirs", "",
-	// "include_files", "a.go\x00b.go", "exclude_dirs", "", "exclude_files", "").
-	const want = "710eba413e54cee6e5183a58b23bb6b3"
-	if plan.dirtyScope == nil || plan.dirtyScope.key != want {
-		t.Fatalf("dirty-scope key drifted: got %v want %q", plan.dirtyScope, want)
 	}
 }
 

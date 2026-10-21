@@ -2,10 +2,9 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"regexp/syntax"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -15,28 +14,31 @@ import (
 )
 
 const (
-	// One final score call always runs the model's full static batch. Use every
-	// row so a separate presentation limit does not hide retrieval candidates.
-	rerankCandidateLimit     = semanticModelBatchRows
+	// The order of accepted files fuses the lexical and the model rank with
+	// weighted reciprocal-rank fusion: the lexical rank weighs twice the model
+	// rank.
 	rerankRRFConstant        = 60.0
 	rerankLexicalWeight      = 2.0
 	rerankPathComponentLimit = 4
 	// maxRerankDocumentBytes bounds work before the backend packs model tokens.
 	maxRerankDocumentBytes = 16 << 10
-	// A query has CLS, Q, and SEP tokens. Each whitespace-separated term that
-	// has an ASCII letter or digit adds at least one tokenizer token.
-	rerankQueryMaximumUntruncatedTerms = lateOnSequenceLength - 3
 )
 
-var (
-	errRerankUnavailable = errors.New("re-ranker unavailable")
-	errRerankNotUseful   = errors.New("not enough candidates to re-rank")
-)
+var errRerankUnavailable = errors.New("re-ranker unavailable")
 
+// rerankQueryPlan is the model part of a query plan: the text that the model
+// reads, the relaxed query that finds candidate files, and the filters.
 type rerankQueryPlan struct {
-	modelQuery     string
-	relaxedQ       query.Q
+	modelQuery string
+	relaxedQ   query.Q
+	// filters are the filter children of the description: Zoekt evaluates them
+	// on each node for the semantic row mask (nodeRowSelection).
+	filters        []query.Q
 	semanticFilter *semanticFilterPlan
+	// semanticUnfiltered marks a filter that compileSemanticFilterPlan cannot
+	// compile into semanticFilter. The search pipeline reads neither field:
+	// the per-node Zoekt mask applies every filter.
+	semanticUnfiltered bool
 }
 
 type rerankDocument struct {
@@ -49,152 +51,211 @@ type rerankDocument struct {
 	matchEnd int
 }
 
-type rerankScoreFunc func(context.Context, string, []rerankDocument) (rerankScoreBatch, error)
-
-type rerankAcceptancePolicies struct {
-	rerank *rerankAcceptancePolicy
-	hybrid *rerankAcceptancePolicy
-}
-
-type rerankAcceptancePolicyFactory func() rerankAcceptancePolicies
-
+// searchRunConfig is the search policy and the model factory of one command.
 type searchRunConfig struct {
-	policy                searchPolicy
-	rerankAcceptance      *rerankAcceptancePolicy
-	hybridAcceptance      *rerankAcceptancePolicy
-	newAcceptancePolicies rerankAcceptancePolicyFactory
-	newModel              semanticModelFactory
+	policy   searchPolicy
+	newModel semanticModelFactory
 }
 
-type rerankSearchFunc func(
-	context.Context,
-	[]corpusPlan,
-	*gitPaths,
-	query.Q,
-	searchConfig,
-) ([]corpusSearchResult, dirtyFilesByCorpus, error)
-
-type rerankCandidate struct {
-	result      corpusSearchResult
-	lexicalRank int
-	document    rerankDocument
-	// hasDocument is true when the semantic branch supplied the exact checked
-	// source unit that selected this file. Otherwise the lexical match supplies
-	// the final-score input.
-	hasDocument bool
-	// preservedStrictLeader is true when the strict leader was absent from
-	// the relaxed candidate set and was added as a separate candidate.
-	preservedStrictLeader bool
-}
-
-// planRerankQuery accepts a plain multi-word AND query, with an optional closed
-// set of file and language filters. Other syntax keeps the strict BM25 path.
-func planRerankQuery(pattern string, raw query.Q) (rerankQueryPlan, bool) {
-	if plan, ok := planPlainRerankQuery(pattern, raw); ok {
-		return plan, true
+// planRerankQuery plans the model routes from Zoekt's parsed tree, after
+// Zoekt's own simplification, so a route never depends on how the query was
+// spelled. Description atoms feed the model; filters stay with Zoekt;
+// modifiers change no route (querySupport). It needs two description atoms and
+// returns false for an or between descriptions and for a query that matches
+// nothing.
+func planRerankQuery(raw query.Q) (rerankQueryPlan, bool) {
+	tree := query.Simplify(raw)
+	// type:file is an output mode: plan its child.
+	if typed, ok := tree.(*query.Type); ok && typed.Type == query.TypeFileName {
+		tree = typed.Child
 	}
-	return planFilteredRerankQuery(raw)
-}
-
-func rerankQueryGuaranteedTruncated(modelQuery string) bool {
-	terms := 0
-	for _, field := range strings.Fields(modelQuery) {
-		for index := range len(field) {
-			char := field[index]
-			if (char >= 'a' && char <= 'z') ||
-				(char >= 'A' && char <= 'Z') ||
-				(char >= '0' && char <= '9') {
-				terms++
-				break
-			}
-		}
+	children := []query.Q{tree}
+	if and, ok := tree.(*query.And); ok {
+		children = and.Children
 	}
-	return terms > rerankQueryMaximumUntruncatedTerms
-}
-
-func rerankDescriptionTerm(node query.Q) (*query.Substring, bool) {
-	substring, ok := node.(*query.Substring)
-	if !ok || substring == nil || substring.FileName || substring.Content ||
-		substring.Pattern == "" || strings.IndexFunc(substring.Pattern, unicode.IsSpace) >= 0 {
-		return nil, false
-	}
-	term := *substring
-	term.FileName = false
-	term.Content = true
-	return &term, true
-}
-
-// planPlainRerankQuery keeps a query without filters out of the filter compiler.
-func planPlainRerankQuery(pattern string, raw query.Q) (rerankQueryPlan, bool) {
-	and, ok := raw.(*query.And)
-	if !ok || len(and.Children) < 2 {
-		return rerankQueryPlan{}, false
-	}
-	originalTerms := strings.Fields(pattern)
-	if len(originalTerms) != len(and.Children) {
-		return rerankQueryPlan{}, false
-	}
-
-	terms := make([]string, 0, len(and.Children))
-	children := make([]query.Q, 0, len(and.Children))
-	for i, child := range and.Children {
-		term, ok := rerankDescriptionTerm(child)
-		if !ok || originalTerms[i] != term.Pattern {
-			return rerankQueryPlan{}, false
-		}
-		terms = append(terms, term.Pattern)
-		children = append(children, term)
-	}
-
-	return rerankQueryPlan{
-		modelQuery: strings.Join(terms, " "),
-		relaxedQ:   query.Simplify(query.NewOr(children...)),
-	}, true
-}
-
-// planFilteredRerankQuery accepts a top-level AND with at least two description
-// terms and at least one supported typed filter. It returns false for every
-// unsupported node.
-func planFilteredRerankQuery(raw query.Q) (rerankQueryPlan, bool) {
-	and, ok := raw.(*query.And)
-	if !ok {
-		return rerankQueryPlan{}, false
-	}
-
-	terms := make([]string, 0, len(and.Children))
-	descriptions := make([]query.Q, 0, len(and.Children))
-	filters := make([]query.Q, 0, len(and.Children))
-	for _, child := range and.Children {
-		if term, ok := rerankDescriptionTerm(child); ok {
-			terms = append(terms, term.Pattern)
+	terms := make([]string, 0, len(children))
+	descriptions := make([]query.Q, 0, len(children))
+	filters := make([]query.Q, 0, len(children))
+	var punctuation []query.Q
+	for _, child := range children {
+		if term, text, ok := rerankDescriptionAtom(child); ok {
+			terms = append(terms, text)
 			descriptions = append(descriptions, term)
 			continue
 		}
+		if rerankPunctuationAtom(child) {
+			// A token such as "." or "^" gives the model nothing to read and
+			// changes no route: Zoekt keeps it in both lexical queries.
+			punctuation = append(punctuation, child)
+			continue
+		}
+		if !rerankFilter(child) {
+			return rerankQueryPlan{}, false
+		}
 		filters = append(filters, child)
 	}
-	if len(terms) < 2 || len(filters) == 0 {
+	if len(terms) < 2 {
 		return rerankQueryPlan{}, false
 	}
-	semanticFilter, err := compileSemanticFilterPlan(filters)
-	if err != nil {
-		return rerankQueryPlan{}, false
-	}
-	relaxedChildren := make([]query.Q, 0, len(filters)+1)
+	relaxedChildren := make([]query.Q, 0, len(filters)+len(punctuation)+1)
 	relaxedChildren = append(relaxedChildren, query.NewOr(descriptions...))
 	relaxedChildren = append(relaxedChildren, filters...)
-	return rerankQueryPlan{
-		modelQuery:     strings.Join(terms, " "),
-		relaxedQ:       query.Simplify(query.NewAnd(relaxedChildren...)),
-		semanticFilter: semanticFilter,
-	}, true
+	relaxedChildren = append(relaxedChildren, punctuation...)
+	plan := rerankQueryPlan{
+		modelQuery: strings.Join(terms, " "),
+		relaxedQ:   query.Simplify(query.NewAnd(relaxedChildren...)),
+		filters:    filters,
+	}
+	if len(filters) > 0 {
+		semanticFilter, err := compileSemanticFilterPlan(filters)
+		if err != nil {
+			// compileSemanticFilterPlan takes language and file-name filters
+			// only. Zoekt applies every filter, in lexical retrieval and in the
+			// per-node semantic row mask.
+			plan.semanticUnfiltered = true
+		}
+		plan.semanticFilter = semanticFilter
+	}
+	return plan, true
 }
 
-func rerankCandidateSearchConfig(config searchConfig) searchConfig {
-	out := rerankModelSearchConfig(config)
-	out.contextMatchLimit = 0
-	out.contextFileLimit = rerankCandidateLimit
-	out.resultFileLimit = rerankCandidateLimit
-	return out
+// semanticRetrievable reports whether compileSemanticFilterPlan compiled
+// every filter of the plan.
+func (plan rerankQueryPlan) semanticRetrievable() bool {
+	return !plan.semanticUnfiltered
+}
+
+// rerankDescriptionAtom returns a description atom as the content-only node
+// of relaxed retrieval, and the text that the model reads: any word, phrase,
+// or regular expression that is not a file or content filter.
+func rerankDescriptionAtom(node query.Q) (query.Q, string, bool) {
+	switch typed := node.(type) {
+	case *query.Substring:
+		if typed == nil || typed.FileName || typed.Content || !hasWordCharacter(typed.Pattern) {
+			return nil, "", false
+		}
+		term := *typed
+		term.Content = true
+		return &term, typed.Pattern, true
+	case *query.Regexp:
+		if typed == nil || typed.FileName || typed.Content || typed.Regexp == nil {
+			return nil, "", false
+		}
+		text := regexpModelText(typed.Regexp)
+		if !regexpHasLiteralWord(typed.Regexp) {
+			// A token such as "^", "\d+" or "[^a-z]" gives the model nothing to
+			// read: its letters, if any, are class names, not text.
+			return nil, "", false
+		}
+		term := *typed
+		term.Content = true
+		return &term, text, true
+	default:
+		return nil, "", false
+	}
+}
+
+// rerankPunctuationAtom reports a word or regular expression with no letter
+// and no digit outside a file or content filter.
+func rerankPunctuationAtom(node query.Q) bool {
+	switch typed := node.(type) {
+	case *query.Substring:
+		return typed != nil && !typed.FileName && !typed.Content && !hasWordCharacter(typed.Pattern)
+	case *query.Regexp:
+		return typed != nil && !typed.FileName && !typed.Content && typed.Regexp != nil &&
+			!regexpHasLiteralWord(typed.Regexp)
+	default:
+		return false
+	}
+}
+
+// regexpHasLiteralWord reports a regular expression with a literal letter or
+// digit: escapes and character classes do not count.
+func regexpHasLiteralWord(re *syntax.Regexp) bool {
+	if re.Op == syntax.OpLiteral {
+		return hasWordCharacter(string(re.Rune))
+	}
+	for _, sub := range re.Sub {
+		if regexpHasLiteralWord(sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasWordCharacter reports whether text holds a letter or a digit.
+func hasWordCharacter(text string) bool {
+	return strings.IndexFunc(text, func(r rune) bool {
+		return unicode.IsLetter(r) || unicode.IsDigit(r)
+	}) >= 0
+}
+
+// regexpModelText renders a parsed regular expression close to how it was
+// typed, for the model to read: Go's printer adds flag groups such as
+// (?-s:...) that no user wrote.
+func regexpModelText(re *syntax.Regexp) string {
+	switch re.Op {
+	case syntax.OpLiteral:
+		return string(re.Rune)
+	case syntax.OpAnyChar, syntax.OpAnyCharNotNL:
+		return "."
+	case syntax.OpBeginLine, syntax.OpBeginText:
+		return "^"
+	case syntax.OpEndLine, syntax.OpEndText:
+		return "$"
+	case syntax.OpEmptyMatch:
+		return ""
+	case syntax.OpCapture:
+		return "(" + regexpModelText(re.Sub[0]) + ")"
+	case syntax.OpStar:
+		return regexpModelText(re.Sub[0]) + "*"
+	case syntax.OpPlus:
+		return regexpModelText(re.Sub[0]) + "+"
+	case syntax.OpQuest:
+		return regexpModelText(re.Sub[0]) + "?"
+	case syntax.OpConcat, syntax.OpAlternate:
+		parts := make([]string, len(re.Sub))
+		for i, sub := range re.Sub {
+			parts[i] = regexpModelText(sub)
+		}
+		separator := ""
+		if re.Op == syntax.OpAlternate {
+			separator = "|"
+		}
+		return strings.Join(parts, separator)
+	default:
+		return re.String()
+	}
+}
+
+// rerankFilter reports a node that Zoekt applies as a filter of the
+// description atoms: a file, content, language, or symbol atom, a negation, a
+// repository or branch atom (which Seek passes to Zoekt unchanged), or an or
+// of filters. An or that holds a description is not a filter.
+func rerankFilter(node query.Q) bool {
+	switch typed := node.(type) {
+	case *query.Substring, *query.Regexp:
+		_, _, description := rerankDescriptionAtom(node)
+		return !description
+	case *query.Or:
+		for _, child := range typed.Children {
+			if !rerankFilter(child) {
+				return false
+			}
+		}
+		return true
+	case *query.And:
+		for _, child := range typed.Children {
+			if !rerankFilter(child) {
+				return false
+			}
+		}
+		return true
+	default:
+		// Not, Language, Symbol, Repo, Branch, RawConfig, Meta, Type, and the
+		// API-only nodes keep their Zoekt meaning.
+		return true
+	}
 }
 
 // rerankModelSearchConfig collects at least the standard symmetric context for
@@ -210,245 +271,12 @@ func rerankModelSearchConfig(config searchConfig) searchConfig {
 	}
 	out.opts = &opts
 	out.afterOnly = false
+	// The display limits apply after the rank: a node's Zoekt top -n is not the
+	// final top -n, so the model reads every strict file with its context.
+	out.contextFileLimit = 0
+	out.contextMatchLimit = 0
+	out.resultFileLimit = 0
 	return out
-}
-
-// tryRerankCorpora returns re-ranked results on success. On each failure, it
-// returns normal all-term results with the user's display context restored.
-func tryRerankCorpora(
-	ctx context.Context,
-	strictResults []corpusSearchResult,
-	strictDirty dirtyFilesByCorpus,
-	plans []corpusPlan,
-	paths *gitPaths,
-	config searchConfig,
-	plan rerankQueryPlan,
-	score rerankScoreFunc,
-	acceptance *rerankAcceptancePolicy,
-	search rerankSearchFunc,
-) ([]corpusSearchResult, dirtyFilesByCorpus, error) {
-	if score == nil {
-		return applyRerankDisplayConfig(strictResults, config), strictDirty, errRerankUnavailable
-	}
-	relaxedResults, relaxedDirty, err := search(
-		ctx,
-		plans,
-		paths,
-		plan.relaxedQ,
-		rerankCandidateSearchConfig(config),
-	)
-	if err != nil {
-		return applyRerankDisplayConfig(strictResults, config), strictDirty,
-			fmt.Errorf("collect re-rank candidates: %w", err)
-	}
-
-	reranked, mergedDirty, err := rerankCorpusResults(
-		ctx,
-		strictResults,
-		strictDirty,
-		relaxedResults,
-		relaxedDirty,
-		plan.modelQuery,
-		score,
-		acceptance,
-	)
-	if err != nil {
-		return applyRerankDisplayConfig(strictResults, config), strictDirty, err
-	}
-	return applyRerankDisplayConfig(reranked, config), mergedDirty, nil
-}
-
-// rerankCorpusResults scores at most one full static model batch from the normal
-// all-term leader and the relaxed any-term BM25 order. Weighted reciprocal rank
-// fusion gives lexical rank twice the model-rank weight. When expansion is
-// admitted, an injected strict leader cannot take first place and relaxed tails
-// remain available. Rejection returns strict BM25 results only.
-func rerankCorpusResults(
-	ctx context.Context,
-	strictResults []corpusSearchResult,
-	strictDirty dirtyFilesByCorpus,
-	relaxedResults []corpusSearchResult,
-	relaxedDirty dirtyFilesByCorpus,
-	modelQuery string,
-	score rerankScoreFunc,
-	acceptance *rerankAcceptancePolicy,
-) ([]corpusSearchResult, dirtyFilesByCorpus, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, nil, err
-	}
-
-	strictRanked := rankCorpusResultsBM25(strictResults, strictDirty)
-	relaxedRanked := rankCorpusResultsBM25(relaxedResults, relaxedDirty)
-	if len(relaxedRanked) > rerankCandidateLimit {
-		relaxedRanked = relaxedRanked[:rerankCandidateLimit]
-	}
-	candidates := buildRerankCandidates(strictRanked, relaxedRanked)
-	if len(candidates) < 2 {
-		return nil, nil, errRerankNotUseful
-	}
-	if score == nil {
-		return nil, nil, errRerankUnavailable
-	}
-
-	documents := rerankCandidateDocuments(candidates)
-
-	batch, err := score(ctx, modelQuery, documents)
-	if err != nil {
-		return nil, nil, err
-	}
-	out, err := fuseRerankCandidates(
-		candidates,
-		batch,
-		strictRanked,
-		relaxedRanked,
-		acceptance,
-	)
-	if err != nil {
-		return nil, nil, err
-	}
-	return out, mergeDirtyFilesByCorpus(strictDirty, relaxedDirty), nil
-}
-
-func rerankCandidateDocuments(candidates []rerankCandidate) []rerankDocument {
-	documents := make([]rerankDocument, len(candidates))
-	for index, candidate := range candidates {
-		if candidate.hasDocument {
-			documents[index] = candidate.document
-			continue
-		}
-		documents[index] = newRerankDocument(candidate.result)
-	}
-	return documents
-}
-
-func fuseRerankCandidates(
-	candidates []rerankCandidate,
-	batch rerankScoreBatch,
-	strictRanked []corpusSearchResult,
-	relaxedRanked []corpusSearchResult,
-	acceptance *rerankAcceptancePolicy,
-) ([]corpusSearchResult, error) {
-	candidates, batch, appendRelaxedTail, err := applyRerankAcceptance(
-		candidates,
-		batch,
-		strictRanked,
-		acceptance,
-	)
-	if err != nil {
-		return nil, err
-	}
-	scores := batch.values
-
-	semanticOrder := make([]int, len(scores))
-	for index := range semanticOrder {
-		semanticOrder[index] = index
-	}
-	sort.SliceStable(semanticOrder, func(i, j int) bool {
-		return scores[semanticOrder[i]] > scores[semanticOrder[j]]
-	})
-	semanticRanks := make([]int, len(scores))
-	for rank, index := range semanticOrder {
-		semanticRanks[index] = rank + 1
-	}
-	type fusedCandidate struct {
-		result                corpusSearchResult
-		score                 float64
-		preservedStrictLeader bool
-	}
-	fused := make([]fusedCandidate, len(candidates))
-	for index, candidate := range candidates {
-		fused[index] = fusedCandidate{
-			result:                candidate.result,
-			preservedStrictLeader: candidate.preservedStrictLeader,
-			score: rerankLexicalWeight/(rerankRRFConstant+float64(candidate.lexicalRank)) +
-				1/(rerankRRFConstant+float64(semanticRanks[index])),
-		}
-	}
-	sort.SliceStable(fused, func(i, j int) bool {
-		return fused[i].score > fused[j].score
-	})
-	// A strict-only leader adds all-term lexical evidence, but one such file must
-	// not replace the best result selected from both relaxed and semantic
-	// evidence. It can still rank second or rise naturally when it was already
-	// part of the relaxed candidate set.
-	if len(fused) > 1 && fused[0].preservedStrictLeader {
-		fused[0], fused[1] = fused[1], fused[0]
-	}
-
-	out := make([]corpusSearchResult, 0, len(fused)+len(strictRanked))
-	seen := make(map[corpusResultKey]struct{}, len(fused)+len(strictRanked))
-	add := func(result corpusSearchResult) {
-		key := corpusResultKey{corpusID: result.corpusID, fileName: result.file.FileName}
-		if _, ok := seen[key]; ok {
-			return
-		}
-		result.rankOverride = len(out) + 1
-		out = append(out, result)
-		seen[key] = struct{}{}
-	}
-	for _, candidate := range fused {
-		add(candidate.result)
-	}
-	// A strict-only leader can displace the last relaxed candidate from a full
-	// model set. Keep any such file in the final result set as an unscored tail.
-	if appendRelaxedTail {
-		for _, result := range relaxedRanked {
-			add(result)
-		}
-	}
-	for _, result := range strictRanked {
-		add(result)
-	}
-	return out, nil
-}
-
-// buildRerankCandidates adds strict BM25 rank one when present, then fills the
-// fixed model set in relaxed BM25 order with stable file deduplication.
-func buildRerankCandidates(
-	strictRanked []corpusSearchResult,
-	relaxedRanked []corpusSearchResult,
-) []rerankCandidate {
-	candidates := make([]rerankCandidate, 0, rerankCandidateLimit)
-	seen := make(map[corpusResultKey]struct{}, rerankCandidateLimit)
-	add := func(result corpusSearchResult, lexicalRank int, preservedStrictLeader bool) {
-		if len(candidates) >= rerankCandidateLimit {
-			return
-		}
-		key := corpusResultKey{corpusID: result.corpusID, fileName: result.file.FileName}
-		if _, ok := seen[key]; ok {
-			return
-		}
-		candidates = append(candidates, rerankCandidate{
-			result:                result,
-			lexicalRank:           lexicalRank,
-			preservedStrictLeader: preservedStrictLeader,
-		})
-		seen[key] = struct{}{}
-	}
-
-	if len(strictRanked) > 0 {
-		strictLeader := strictRanked[0]
-		preservedStrictLeader := true
-		strictLeaderKey := corpusResultKey{
-			corpusID: strictLeader.corpusID,
-			fileName: strictLeader.file.FileName,
-		}
-		// The relaxed result keeps context for every candidate match. Use it when
-		// it represents the same strict leader.
-		for _, result := range relaxedRanked {
-			key := corpusResultKey{corpusID: result.corpusID, fileName: result.file.FileName}
-			if key == strictLeaderKey {
-				strictLeader = result
-				preservedStrictLeader = false
-				break
-			}
-		}
-		add(strictLeader, 1, preservedStrictLeader)
-	}
-	for i, result := range relaxedRanked {
-		add(result, i+1, false)
-	}
-	return candidates
 }
 
 // newRerankDocument selects the highest-scoring match, with its line number as
@@ -696,29 +524,4 @@ func trimRerankContext(data []byte, limit int, before bool) []byte {
 		out = append(out, '\n')
 	}
 	return out
-}
-
-func mergeDirtyFilesByCorpus(left, right dirtyFilesByCorpus) dirtyFilesByCorpus {
-	if len(left) == 0 && len(right) == 0 {
-		return nil
-	}
-	merged := make(dirtyFilesByCorpus, len(left)+len(right))
-	for corpus, files := range left {
-		copied := make(dirtyFileSet, len(files))
-		for name := range files {
-			copied[name] = struct{}{}
-		}
-		merged[corpus] = copied
-	}
-	for corpus, files := range right {
-		current := merged[corpus]
-		if current == nil {
-			current = make(dirtyFileSet, len(files))
-			merged[corpus] = current
-		}
-		for name := range files {
-			current[name] = struct{}{}
-		}
-	}
-	return merged
 }

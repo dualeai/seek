@@ -20,8 +20,9 @@ import (
 //     "exceeds window threshold" error → indexFolderDocuments
 //     falls through to streamFolderFiles → indexDocuments full
 //     rebuild → searchable result.
-//  4. Assert: searches still hit the post-mutation content (full
-//     rebuild succeeded), and the semaphore returned to baseline.
+//  4. Assert: the base shard file is replaced (a delta keeps it and
+//     adds shards; a full rebuild writes a new one), searches still hit
+//     the post-mutation content, and the semaphore returned to baseline.
 //
 // Tests the guard at the layer it lives in: real folder corpus
 // pipeline, no mocked changedDocs. Drives the real
@@ -66,6 +67,7 @@ func TestIndexFolderDocumentsDelta_FallsBackOnOversizePayload(t *testing.T) {
 	if got := availableWeight(readSemaphore); got != testBudget {
 		t.Fatalf("semaphore leak after initial index: got=%d want=%d", got, testBudget)
 	}
+	baseBefore := firstShardInfo(t, plan.indexDir)
 
 	// Mutate every file with content size > window/fileCount each. Total
 	// = fileCount * 384 KiB = 3 MiB > 2 MiB window → guard trips.
@@ -89,6 +91,11 @@ func TestIndexFolderDocumentsDelta_FallsBackOnOversizePayload(t *testing.T) {
 	}
 	if got := availableWeight(readSemaphore); got != testBudget {
 		t.Fatalf("semaphore leak after fallback rebuild: got=%d want=%d", got, testBudget)
+	}
+	// A delta keeps the base shard file and adds shards; only a full
+	// rebuild replaces it.
+	if os.SameFile(baseBefore, firstShardInfo(t, plan.indexDir)) {
+		t.Fatal("the base shard was kept after an oversize change: a delta ran, not the full rebuild")
 	}
 
 	// Verify the post-mutation content is actually in the new shards.

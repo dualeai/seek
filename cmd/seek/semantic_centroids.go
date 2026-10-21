@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 )
 
 const (
@@ -50,7 +51,7 @@ func (set semanticCoarseSet) At(row int) (*semanticCoarseVectors, bool) {
 }
 
 func (set semanticCoarseSet) validate() error {
-	if set.rows < 0 || set.rows > semanticMaxRows {
+	if set.rows < 0 {
 		return fmt.Errorf("semantic coarse count %d is invalid", set.rows)
 	}
 	if set.rows == 0 {
@@ -289,16 +290,30 @@ func semanticVectorDot(left, right semanticVector) float32 {
 	return dot
 }
 
+// semanticQueryTokenVectors returns the normalized vector of each scoring
+// token of query, one 128-token window after another. A window with no scoring
+// token adds no vector.
 func semanticQueryTokenVectors(query *semanticQueryEmbedding) ([]semanticVector, error) {
 	if _, err := semanticQueryTokenCount(query); err != nil {
 		return nil, err
 	}
-	return normalizedLateOnSemanticTokens(query.tokens, query.scoreMask, 0)
+	var vectors []semanticVector
+	for window := range len(query.scoreMask) / lateOnSequenceLength {
+		mask := query.scoreMask[window*lateOnSequenceLength : (window+1)*lateOnSequenceLength]
+		if !slices.Contains(mask, true) {
+			continue
+		}
+		tokens, err := normalizedLateOnSemanticTokens(query.tokens, mask, window)
+		if err != nil {
+			return nil, err
+		}
+		vectors = append(vectors, tokens...)
+	}
+	return vectors, nil
 }
 
 func semanticQueryTokenCount(query *semanticQueryEmbedding) (int, error) {
-	if query == nil || len(query.tokens) != lateOnSequenceLength*semanticEmbeddingDimensions ||
-		len(query.scoreMask) != lateOnSequenceLength {
+	if !validSemanticQuery(query) {
 		return 0, fmt.Errorf("semantic query embedding is invalid")
 	}
 	count := 0

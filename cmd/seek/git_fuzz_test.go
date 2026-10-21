@@ -49,8 +49,7 @@ func FuzzExtractV2Path(f *testing.F) {
 
 // FuzzDetectGitBoundary feeds random bytes as the contents of a `.git`
 // worktree pointer file. detectGitBoundary must never panic and must never
-// OOM regardless of input. The fixture filesystem is reused across fuzz
-// inputs to amortize setup cost.
+// OOM regardless of input. Each input gets its own fixture directory.
 func FuzzDetectGitBoundary(f *testing.F) {
 	f.Add([]byte("gitdir: ./real-git\n"))
 	f.Add([]byte("gitdir: /absolute/path\n"))
@@ -82,6 +81,6 @@ func FuzzDetectGitBoundary(f *testing.F) {
 		if err := os.WriteFile(filepath.Join(worktree, ".git"), payload, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		_, _ = detectGitBoundary(worktree, root)
+		_, _ = detectGitBoundary(worktree)
 	})
 }

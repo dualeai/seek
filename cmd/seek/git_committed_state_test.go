@@ -15,10 +15,9 @@ func TestCommittedGitStateEncodingAndDamage(t *testing.T) {
 	want := committedGitState{
 		head:       gitObjectID(nativeTestOID),
 		baseHead:   gitObjectID(nativeTestOID),
-		budget:     gitIndexBudget{candidates: 123, indexedBytes: 456789},
 		baseShards: 153,
 	}
-	wantRaw := "v1\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\ncandidates 123\nindexed_bytes 456789\nbase_shards 153\n"
+	wantRaw := "v1\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\nbase_shards 153\n"
 
 	if err := writeCommittedGitState(cacheDir, want); err != nil {
 		t.Fatal(err)
@@ -43,10 +42,11 @@ func TestCommittedGitStateEncodingAndDamage(t *testing.T) {
 	for _, raw := range []string{
 		"",
 		"v2\nhead " + nativeTestOID + "\n",
-		"v1\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\ncandidates 1\nindexed_bytes 1\nbase_shards 1",
-		"v1\nhead bad\nbase_head " + nativeTestOID + "\ncandidates 1\nindexed_bytes 1\nbase_shards 1\n",
-		"v1\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\ncandidates -1\nindexed_bytes 1\nbase_shards 1\n",
-		"v1\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\ncandidates 1\nindexed_bytes 1\nbase_shards -1\n",
+		"v1\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\nbase_shards 1",
+		"v1\nhead bad\nbase_head " + nativeTestOID + "\nbase_shards 1\n",
+		"v1\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\nbase_shards -1\n",
+		// Work-total lines (candidates, indexed_bytes) make another format.
+		"v1\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\ncandidates 1\nindexed_bytes 1\nbase_shards 1\n",
 	} {
 		if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
 			t.Fatal(err)
@@ -135,7 +135,31 @@ func TestPrepareNativeGitDeltaAcceptsLargeFullBase(t *testing.T) {
 	}
 }
 
-func TestCommittedGitStateTracksOnlyChangedBlobTotals(t *testing.T) {
+func TestNativeGitDeltaShardLimitIsRelativeToFullBase(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		current int
+		base    int
+		want    bool
+	}{
+		{name: "large-full-base", current: 153, base: 153},
+		{name: "sixty-four-delta-shards", current: 217, base: 153},
+		{name: "sixty-five-delta-shards", current: 218, base: 153, want: true},
+		{name: "missing-base", current: 1, base: 0, want: true},
+		{name: "base-ahead-of-family", current: 10, base: 11, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := nativeGitDeltaShardLimitExceeded(tc.current, tc.base); got != tc.want {
+				t.Fatalf("limit exceeded=%t, want %t (current=%d base=%d)", got, tc.want, tc.current, tc.base)
+			}
+		})
+	}
+}
+
+// TestCommittedGitDeltaRunsNoRecursiveLsTree moves HEAD by one commit: the
+// committed delta runs no recursive ls-tree and keeps the base head and shard
+// count.
+func TestCommittedGitDeltaRunsNoRecursiveLsTree(t *testing.T) {
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
 	baseA := []byte("package a\n")
@@ -156,7 +180,7 @@ func TestCommittedGitStateTracksOnlyChangedBlobTotals(t *testing.T) {
 	reindexGit(t, context.Background(), paths, plan)
 	baseHead := gitObjectID(gitOutputIn(t, repoDir, "rev-parse", "HEAD"))
 	base, ok := readCommittedGitState(plan.cacheDir)
-	if !ok || base.head != baseHead || base.baseHead != baseHead || base.budget != (gitIndexBudget{candidates: 3, indexedBytes: int64(len(baseA) + len(baseB) + len(stable))}) {
+	if !ok || base.head != baseHead || base.baseHead != baseHead {
 		t.Fatalf("base state=%+v ok=%t", base, ok)
 	}
 
@@ -182,21 +206,13 @@ func TestCommittedGitStateTracksOnlyChangedBlobTotals(t *testing.T) {
 		t.Fatal(err)
 	}
 	shimDir := t.TempDir()
-	shim := `#!/bin/sh
-command_name=
-recursive=false
+	shim := "#!/bin/sh\n" + gitShimSubcommand + `recursive=false
 for arg do
-  case "$arg" in
-    -r) recursive=true ;;
-    -*) ;;
-    *)
-      if [ -z "$command_name" ]; then
-        command_name=$arg
-      fi
-      ;;
-  esac
+  if [ "$arg" = -r ]; then
+    recursive=true
+  fi
 done
-if [ "$command_name" = ls-tree ] && [ "$recursive" = true ]; then
+if [ "$subcommand" = ls-tree ] && [ "$recursive" = true ]; then
   echo unexpected-recursive-ls-tree >&2
   exit 43
 fi
@@ -218,35 +234,13 @@ exec "$SEEK_TEST_REAL_GIT" "$@"
 	reindexGit(t, context.Background(), paths, plan)
 	targetHead := gitObjectID(gitOutputIn(t, repoDir, "rev-parse", "HEAD"))
 	target, ok := readCommittedGitState(plan.cacheDir)
-	wantBudget := gitIndexBudget{candidates: 3, indexedBytes: int64(len(targetB) + len(targetC) + len(stable))}
-	if !ok || target.head != targetHead || target.baseHead != baseHead || target.baseShards != base.baseShards || target.budget != wantBudget {
-		t.Fatalf("target state=%+v ok=%t, want head=%s base_head=%s base_shards=%d budget=%+v", target, ok, targetHead, baseHead, base.baseShards, wantBudget)
+	if !ok || target.head != targetHead || target.baseHead != baseHead || target.baseShards != base.baseShards {
+		t.Fatalf("target state=%+v ok=%t, want head=%s base_head=%s base_shards=%d ", target, ok, targetHead, baseHead, base.baseShards)
 	}
 	for _, queryText := range []string{"DELTA_STABLE_MARKER", "DELTA_NEW_MARKER"} {
 		matches, err := executeUnscopedShardSearchForTest(t.Context(), plan.indexDir, queryText)
 		if err != nil || len(matches) != 1 {
 			t.Fatalf("search %q: matches=%v error=%v", queryText, matches, err)
 		}
-	}
-}
-
-func TestNativeGitDeltaShardLimitIsRelativeToFullBase(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		current int
-		base    int
-		want    bool
-	}{
-		{name: "large-full-base", current: 153, base: 153},
-		{name: "sixty-four-delta-shards", current: 217, base: 153},
-		{name: "sixty-five-delta-shards", current: 218, base: 153, want: true},
-		{name: "missing-base", current: 1, base: 0, want: true},
-		{name: "base-ahead-of-family", current: 10, base: 11, want: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := nativeGitDeltaShardLimitExceeded(tc.current, tc.base); got != tc.want {
-				t.Fatalf("limit exceeded=%t, want %t (current=%d base=%d)", got, tc.want, tc.current, tc.base)
-			}
-		})
 	}
 }

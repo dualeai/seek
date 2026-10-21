@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -110,45 +109,6 @@ func TestFolderCorpusState_OversizeNameOnlyFileChangesFingerprint(t *testing.T) 
 	}
 }
 
-func TestFolderCorpusState_IndexedByteCapFailsClosed(t *testing.T) {
-	root := t.TempDir()
-	// The file size is only a unit for the folder byte cap. Any size that fits
-	// the index works; 100 MiB keeps the file count low.
-	const size = int64(100 << 20)
-	count := maxFolderIndexedBytes/size + 1
-	for i := range count {
-		path := filepath.Join(root, fmt.Sprintf("file_%03d.bin", i))
-		if err := os.WriteFile(path, nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Truncate(path, size); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	info, err := os.Lstat(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan, err := planFolderCorpus(root, info)
-	if err != nil {
-		t.Fatalf("planFolderCorpus: %v", err)
-	}
-
-	_, _, err = folderCorpusState(context.Background(), plan)
-	if !errors.Is(err, errFolderCapExceeded) {
-		t.Fatalf("error=%v, want folder cap", err)
-	}
-	capErr, ok := errors.AsType[indexCapExceededError](err)
-	if !ok {
-		t.Fatalf("error=%v, want indexCapExceededError", err)
-	}
-	wantCurrent := int64(count) * size
-	if capErr.metric != indexCapIndexedBytes || capErr.current != wantCurrent || capErr.limit != maxFolderIndexedBytes {
-		t.Fatalf("cap error=%+v, want metric=%q current=%d limit=%d", capErr, indexCapIndexedBytes, wantCurrent, maxFolderIndexedBytes)
-	}
-}
-
 func TestStreamFolderFiles_OutputChannelUnbuffered(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "note.txt")
@@ -164,6 +124,7 @@ func TestStreamFolderFiles_OutputChannelUnbuffered(t *testing.T) {
 		context.Background(),
 		[]folderCandidate{newFolderCandidate("note.txt", path, info)},
 		4,
+		nil,
 	)
 	if cap(ch) != 0 {
 		t.Fatalf("streamFolderFiles output must be unbuffered, got cap=%d", cap(ch))
@@ -523,7 +484,7 @@ func TestFolderFamilyUsable(t *testing.T) {
 	}
 
 	// One survivor of a torn family: presence still says yes, the manifest says
-	// no. This is the case the restored check exists for.
+	// no. This is the case the manifest check exists for.
 	if err := os.Remove(filepath.Join(dir, shardB)); err != nil {
 		t.Fatal(err)
 	}

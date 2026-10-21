@@ -30,23 +30,16 @@ func nativeGitBlobMode(mode string) bool {
 }
 
 func nativeGitCommitExists(ctx context.Context, repoDir string, oid gitObjectID) (bool, error) {
-	cmd := nativeGitCmd(ctx, repoDir, "cat-file", "-e", oid.String()+"^{commit}")
-	var stderr boundedGitStderr
-	cmd.Stderr = &stderr
-	err := cmd.Run()
+	cmd := newGitCommand(ctx, repoDir, "cat-file", "-e", oid.String()+"^{commit}")
+	_, err := gitOutput(ctx, cmd, "git cat-file -e")
 	if err == nil {
 		return true, nil
 	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return false, ctxErr
-	}
-	if errors.Is(err, exec.ErrNotFound) {
-		return false, nativeGitCommandError(ctx, "git cat-file -e", err, &stderr)
-	}
-	if _, ok := err.(*exec.ExitError); ok {
+	// A nonzero exit means the commit is absent; other errors are failures.
+	if _, ok := errors.AsType[*exec.ExitError](err); ok {
 		return false, nil
 	}
-	return false, nativeGitCommandError(ctx, "git cat-file -e", err, &stderr)
+	return false, err
 }
 
 func nativeCommittedShardCount(scan familyScan) int {
@@ -80,8 +73,8 @@ func nativeGitDeltaStaticMetadataEqual(existing, target *zoekt.Repository) bool 
 // committed family. eligible=false with no error selects native full indexing;
 // an error stops the build. It selects full indexing for an incomplete or
 // incompatible base, too many shards or paths, changed ignore rules, a missing
-// base commit, or a delta payload that reaches the window limit. A corpus-limit
-// error stops the build. No other committed-data backend is a fallback.
+// base commit, or a delta payload that reaches the build's index window. No
+// other committed-data backend is a fallback.
 func prepareNativeGitDelta(
 	ctx context.Context,
 	repoDir string,
@@ -171,18 +164,15 @@ func prepareNativeGitDelta(
 		}
 	}
 
-	targetInfos, nextBudget, consistent, err := scanNativeGitDeltaChanges(ctx, repoDir, matcher, diff, committedState.budget)
+	targetInfos, err := scanNativeGitDeltaChanges(ctx, repoDir, matcher, diff)
 	if err != nil {
 		return nil, false, err
-	}
-	if !consistent {
-		return nil, false, nil
 	}
 	var payloadBytes int64
 	for _, info := range targetInfos {
 		if !info.oversize {
 			payloadBytes += info.size
-			if payloadBytes >= indexWindowBytes {
+			if payloadBytes >= indexWindow(ctx) {
 				return nil, false, nil
 			}
 		}
@@ -201,102 +191,53 @@ func prepareNativeGitDelta(
 		nextState: committedGitState{
 			head:       target.commitOID,
 			baseHead:   committedState.baseHead,
-			budget:     nextBudget,
 			baseShards: committedState.baseShards,
 		},
 	}, true, nil
 }
 
-// scanNativeGitDeltaChanges updates totals from the old and new objects named
-// by diff-tree. The saved full-scan totals account for every unchanged blob,
-// so delta admission never enumerates the unchanged target tree.
+// scanNativeGitDeltaChanges checks the new blobs named by diff-tree and returns
+// those that the ignore rules keep, so delta admission never enumerates the
+// unchanged target tree.
 func scanNativeGitDeltaChanges(
 	ctx context.Context,
 	repoDir string,
 	matcher *ignore.Matcher,
 	diff []gitDiffEntry,
-	base gitIndexBudget,
-) ([]gitBlobInfo, gitIndexBudget, bool, error) {
+) ([]gitBlobInfo, error) {
 	type requestRole struct {
 		diffIndex int
-		old       bool
 	}
-	entries := make([]gitTreeEntry, 0, 2*len(diff))
-	roles := make([]requestRole, 0, 2*len(diff))
+	entries := make([]gitTreeEntry, 0, len(diff))
+	roles := make([]requestRole, 0, len(diff))
 	for i, entry := range diff {
-		if nativeGitBlobMode(entry.oldMode) {
-			entries = append(entries, gitTreeEntry{mode: entry.oldMode, oid: entry.oldOID, path: entry.oldPath})
-			roles = append(roles, requestRole{diffIndex: i, old: true})
-		}
 		if nativeGitBlobMode(entry.newMode) {
 			entries = append(entries, gitTreeEntry{mode: entry.newMode, oid: entry.newOID, path: entry.newPath})
 			roles = append(roles, requestRole{diffIndex: i})
 		}
 	}
-	oldInfos := make([]gitBlobInfo, len(diff))
 	newInfos := make([]gitBlobInfo, len(diff))
-	oldPresent := make([]bool, len(diff))
 	newPresent := make([]bool, len(diff))
 	roleIndex := 0
 	if err := checkNativeGitBlobs(ctx, repoDir, entries, func(infos []gitBlobInfo) error {
 		for _, info := range infos {
 			role := roles[roleIndex]
 			roleIndex++
-			if role.old {
-				oldInfos[role.diffIndex] = info
-				oldPresent[role.diffIndex] = true
-			} else {
-				newInfos[role.diffIndex] = info
-				newPresent[role.diffIndex] = true
-			}
+			newInfos[role.diffIndex] = info
+			newPresent[role.diffIndex] = true
 		}
 		return nil
 	}); err != nil {
-		return nil, gitIndexBudget{}, false, err
+		return nil, err
 	}
 
-	budget := base
 	targetInfos := make([]gitBlobInfo, 0, len(diff))
 	for i, entry := range diff {
-		if oldPresent[i] {
-			oldInfo := oldInfos[i]
-			if budget.candidates == 0 || (!oldInfo.oversize && budget.indexedBytes < oldInfo.size) {
-				return nil, gitIndexBudget{}, false, nil
-			}
-			budget.candidates--
-			if !oldInfo.oversize {
-				budget.indexedBytes -= oldInfo.size
-			}
-		}
-		if !newPresent[i] {
-			continue
-		}
-		newInfo := newInfos[i]
-		budget.candidates++
-		if budget.candidates > gitCandidateFileLimit {
-			return nil, gitIndexBudget{}, false, gitCommittedCapError(
-				"git committed file cap exceeded",
-				indexCapCandidateFiles,
-				budget.candidates,
-				gitCandidateFileLimit,
-			)
-		}
-		if !newInfo.oversize {
-			budget.indexedBytes += newInfo.size
-			if budget.indexedBytes > gitCorpusIndexedByteLimit {
-				return nil, gitIndexBudget{}, false, gitCommittedCapError(
-					"git committed candidate blob byte cap exceeded",
-					indexCapIndexedBytes,
-					budget.indexedBytes,
-					gitCorpusIndexedByteLimit,
-				)
-			}
-		}
-		if !matcher.Match(entry.newPath) {
-			targetInfos = append(targetInfos, newInfo)
+		if newPresent[i] && !matcher.Match(entry.newPath) {
+			targetInfos = append(targetInfos, newInfos[i])
 		}
 	}
-	return targetInfos, budget, true, nil
+	return targetInfos, nil
 }
 
 // indexNativeGitDelta hard-links the verified committed seed into buildDir and

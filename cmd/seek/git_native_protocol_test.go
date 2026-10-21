@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sourcegraph/zoekt/ignore"
 	"github.com/sourcegraph/zoekt/index"
 )
 
@@ -57,6 +56,13 @@ func installFakeGit(t *testing.T) {
 	}
 	binDir := t.TempDir()
 	script := `#!/bin/sh
+# The filter-driver read (git config --get-regexp) finds no driver, as in a
+# repository with none: exit 1 and print nothing.
+for arg do
+  if [ "$arg" = config ]; then
+    exit 1
+  fi
+done
 read_object_command() {
   IFS=' ' read -r verb object
 }
@@ -333,6 +339,28 @@ func TestRequireNativeGitVersion(t *testing.T) {
 	})
 }
 
+func TestGitHonorsNoLazyFetch(t *testing.T) {
+	for version, want := range map[string]bool{
+		"git version 2.36.0":           false,
+		"git version 2.39.3":           false,
+		"git version 2.39.4":           true,
+		"git version 2.40.1":           false,
+		"git version 2.40.2":           true,
+		"git version 2.43.0":           false,
+		"git version 2.43.4":           true,
+		"git version 2.44.1":           true,
+		"git version 2.45.0":           true,
+		"git version 2.56.0":           true,
+		"git version 2.43.4.windows.1": true,
+		"git version 3.0.0":            true,
+		"git version garbage":          false,
+	} {
+		if got := gitHonorsNoLazyFetch([]byte(version + "\n")); got != want {
+			t.Errorf("%s: got %t, want %t", version, got, want)
+		}
+	}
+}
+
 func TestParseNativeGitTreeRecordModesAndBytePaths(t *testing.T) {
 	for _, test := range []struct {
 		mode   string
@@ -379,14 +407,15 @@ func TestSanitizedGitEnvSetsStableNonInteractiveValues(t *testing.T) {
 		"GIT_TERMINAL_PROMPT=1",
 		"GIT_DIR=/wrong",
 		"GIT_LITERAL_PATHSPECS=0",
+		"GIT_NO_LAZY_FETCH=0",
 	})
 	joined := strings.Join(env, "\n")
-	for _, want := range []string{"PATH=/bin", "LC_ALL=C", "LANG=C", "GIT_TERMINAL_PROMPT=0"} {
+	for _, want := range []string{"PATH=/bin", "LC_ALL=C", "LANG=C", "GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("environment %q lacks %q", joined, want)
 		}
 	}
-	for _, unwanted := range []string{"fr_FR", "GIT_DIR=", "GIT_LITERAL_PATHSPECS="} {
+	for _, unwanted := range []string{"fr_FR", "GIT_DIR=", "GIT_LITERAL_PATHSPECS=", "GIT_NO_LAZY_FETCH=0"} {
 		if strings.Contains(joined, unwanted) {
 			t.Fatalf("environment %q contains %q", joined, unwanted)
 		}
@@ -551,6 +580,12 @@ func TestCheckNativeGitBlobReplyFailures(t *testing.T) {
 			if err == nil {
 				t.Fatal("malformed cat-file info reply succeeded")
 			}
+			// A missing blob in a repository that is not a partial clone is
+			// damage: the error names the object and its path.
+			if mode == "batch_check_missing" && (!errors.Is(err, errGitBlobMissing) ||
+				!strings.Contains(err.Error(), nativeTestOID) || !strings.Contains(err.Error(), fakeTreeEntry(nativeTestOID).path)) {
+				t.Fatalf("error=%q, want errGitBlobMissing with the object ID and path", err)
+			}
 		})
 	}
 }
@@ -579,26 +614,6 @@ func TestCheckNativeGitBlobExactLimitAndOversize(t *testing.T) {
 	if len(infos) != 2 || infos[0].size != 104857600 || infos[0].oversize ||
 		infos[1].size != 104857601 || !infos[1].oversize {
 		t.Fatalf("blob limits=%+v", infos)
-	}
-}
-
-func TestScanNativeGitDeltaChangesCountsOversizeWithoutBytes(t *testing.T) {
-	swapDocumentContentLimitForTest(t, 100<<20)
-	installFakeGit(t)
-	t.Setenv("FAKE_GIT_MODE", "batch_check_oversize")
-	base := gitIndexBudget{candidates: 7, indexedBytes: 99}
-	diff := []gitDiffEntry{{
-		newMode: "100644",
-		newOID:  gitObjectID(nativeTestOID),
-		newPath: "oversize.bin",
-	}}
-	infos, got, consistent, err := scanNativeGitDeltaChanges(t.Context(), t.TempDir(), &ignore.Matcher{}, diff, base)
-	if err != nil || !consistent {
-		t.Fatalf("scan oversize delta: consistent=%t error=%v", consistent, err)
-	}
-	want := gitIndexBudget{candidates: 8, indexedBytes: 99}
-	if got != want || len(infos) != 1 || !infos[0].oversize || infos[0].entry.path != "oversize.bin" {
-		t.Fatalf("budget=%+v infos=%+v, want budget=%+v and one oversize file", got, infos, want)
 	}
 }
 

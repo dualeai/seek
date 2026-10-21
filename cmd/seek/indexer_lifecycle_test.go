@@ -251,7 +251,7 @@ func TestReader_ContextCancelled_NoLeak(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		readFilesToChannel(ctx, dir, files, 4, out)
+		readFilesToChannel(ctx, dir, files, 4, out, nil)
 	}()
 	// Drain whatever races through (a few may have Acquired before
 	// cancel propagated). Release those weights so the accounting
@@ -288,9 +288,13 @@ func TestReader_OpenFails_NoLeak(t *testing.T) {
 
 	out := make(chan fileContent, 1)
 	// readFilesToChannel closes out before returning.
-	readFilesToChannel(t.Context(), dir, []string{name}, 1, out)
+	readFilesToChannel(t.Context(), dir, []string{name}, 1, out, nil)
+	// The unreadable file stays searchable by name: one document with no
+	// content and no weight.
 	for fc := range out {
-		t.Fatalf("expected no fileContent for unreadable file, got %+v", fc)
+		if fc.name != name || len(fc.content) != 0 || fc.weight != 0 || fc.skipReason != seekNoBytesReason {
+			t.Fatalf("want a name-only document for the unreadable file, got %+v", fc)
+		}
 	}
 	// withReadSemLock's done() asserts the semaphore returned to baseline.
 }
@@ -314,7 +318,7 @@ func TestReader_SymlinkRejected_NoLeak(t *testing.T) {
 
 	out := make(chan fileContent, 1)
 	// readFilesToChannel closes out before returning.
-	readFilesToChannel(t.Context(), dir, []string{"link.go"}, 1, out)
+	readFilesToChannel(t.Context(), dir, []string{"link.go"}, 1, out, nil)
 	for fc := range out {
 		t.Fatalf("expected symlink to be skipped, got %+v", fc)
 	}
@@ -376,7 +380,7 @@ func TestReader_BackPressureQueuesAcquires(t *testing.T) {
 	}
 
 	out := make(chan fileContent)
-	go readFilesToChannel(t.Context(), dir, files, parallelism, out)
+	go readFilesToChannel(t.Context(), dir, files, parallelism, out, nil)
 
 	var indexed, concurrent, maxConcurrent int32
 	var wg sync.WaitGroup
@@ -425,7 +429,7 @@ func TestReader_BackPressureQueuesAcquires(t *testing.T) {
 // concurrently with this reassignment would be a data race. Tests
 // that use this helper are serialized by the lock by convention.
 //
-// Also shrinks indexWindowBytes proportionally so shardWindow rotation
+// Also shrinks indexWindowBytes proportionally so shard window rotation
 // in indexDocuments triggers at the new (smaller) budget. Without
 // this, rotation would not fire until defaultIndexWindowBytes of weight
 // accumulated and tests using small synthesised budgets would still
@@ -433,11 +437,17 @@ func TestReader_BackPressureQueuesAcquires(t *testing.T) {
 func swapReadSemaphoreForTest(budget int64) func() {
 	mustHoldTestReadSemMu()
 	old := readSemaphore
+	oldWindows, oldWindowBytes := buildWindows, buildWindowBytes
 	readSemaphore = semaphore.NewWeighted(budget)
+	// The build slots share the test budget too: a build takes two windows
+	// of it, so the slots limit the builds of a small budget.
+	buildWindowBytes = budget
+	buildWindows = semaphore.NewWeighted(budget)
 	restoreWindow := swapIndexWindowBytesForTest(budget / 2)
 	return func() {
 		restoreWindow()
 		readSemaphore = old
+		buildWindows, buildWindowBytes = oldWindows, oldWindowBytes
 	}
 }
 
@@ -520,10 +530,16 @@ func TestFolderReader_FileGrew_NoLeak(t *testing.T) {
 	}
 
 	out := make(chan fileContent, 1)
-	readOneFolderFileStreaming(t.Context(), c, out)
+	readOneFolderFileStreaming(t.Context(), c, out, nil)
 	close(out)
+	// The read fails, so the file stays searchable by name only, with no
+	// content and no read weight.
+	var docs []fileContent
 	for fc := range out {
-		t.Fatalf("expected file-grew rejection, got %+v", fc)
+		docs = append(docs, fc)
+	}
+	if len(docs) != 1 || docs[0].name != "grew.go" || len(docs[0].content) != 0 || docs[0].weight != 0 {
+		t.Fatalf("docs=%+v, want one name-only document with no weight", docs)
 	}
 }
 

@@ -17,12 +17,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
-
-	ctags "github.com/sourcegraph/go-ctags"
 )
 
 func openLateOnTestTokenizer(tb testing.TB) (*lateOnTokenizer, map[int]struct{}) {
@@ -105,7 +102,10 @@ func TestLateOnTokenizerMatchesPyLate(t *testing.T) {
 	}
 }
 
-func TestLateOnPrepareSemanticQueryReportsTruncation(t *testing.T) {
+// TestLateOnPrepareSemanticQueryUsesWindows prepares a short and a 300-term
+// query: the short one is one 128-token window, the long one keeps every token
+// in ceil(tokens/room) windows, with no truncation.
+func TestLateOnPrepareSemanticQueryUsesWindows(t *testing.T) {
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
 	scorer, err := newLateOnSemanticModel(t.Context())
 	if err != nil {
@@ -116,59 +116,55 @@ func TestLateOnPrepareSemanticQueryReportsTruncation(t *testing.T) {
 			t.Errorf("close scorer: %v", err)
 		}
 	})
-
-	for _, test := range []struct {
-		name      string
-		query     string
-		truncated bool
-	}{
-		{name: "short", query: "request authentication flow"},
-		{name: "long", query: strings.Repeat("identifier ", 300), truncated: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			prepared, err := scorer.PrepareSemanticQuery(t.Context(), test.query)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if prepared.modelQuery != test.query || prepared.truncated != test.truncated {
-				t.Fatalf(
-					"prepared query text match=%t truncated=%t, want %t",
-					prepared.modelQuery == test.query,
-					prepared.truncated,
-					test.truncated,
-				)
-			}
-			active := 0
-			for _, keep := range prepared.scoreMask {
-				if keep {
-					active++
-				}
-			}
-			if active == 0 {
-				t.Fatal("prepared query has no active score tokens")
-			}
-		})
-	}
-}
-
-func TestRerankCertainTermBoundAgreesWithTokenizer(t *testing.T) {
 	tokenizer, _ := openLateOnTestTokenizer(t)
-	query := strings.TrimSpace(strings.Repeat(
-		"identifier ",
-		rerankQueryMaximumUntruncatedTerms+1,
-	))
-	if !rerankQueryGuaranteedTruncated(query) {
-		t.Fatal("term preflight did not detect certain truncation")
-	}
-	_, truncated, err := encodeLateOnTextWithTruncation(
-		tokenizer,
-		lateOnQueryPrefix+query,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !truncated {
-		t.Fatal("tokenizer did not truncate a query above the certain term bound")
+	// A query starts with the class and the [Q] tokens and ends with the
+	// separator (TestLateOnTokenizerMatchesPyLate), so each window has room
+	// for 128 - 3 = 125 query tokens. The 300 words encode to 301 tokens (one
+	// per word and one for the final space): ceil(301/125) = 3 windows.
+	const head = 2
+	for _, tc := range []struct {
+		query   string
+		body    int
+		windows int
+	}{
+		{query: "request authentication flow", body: 3, windows: 1},
+		{query: strings.Repeat("identifier ", 300), body: 301, windows: 3},
+	} {
+		windows, err := lateOnQueryWindows(tokenizer, tc.query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, _, err := tokenizer.encode(lateOnQueryPrefix+tc.query, true, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(encoded[:head], []int{50281, 50368}) || len(encoded)-head-1 != tc.body {
+			t.Fatalf("query encodes to %d tokens with head %v, want %d query tokens", len(encoded), encoded[:head], tc.body)
+		}
+		if len(windows) != tc.windows {
+			t.Fatalf("%d query tokens: windows=%d, want %d", tc.body, len(windows), tc.windows)
+		}
+		// The windows repeat the head, end with the separator, fill the model
+		// input except the last, and give back the query tokens in order.
+		var kept []int
+		for index, window := range windows {
+			if len(window) > lateOnSequenceLength || !slices.Equal(window[:head], encoded[:head]) ||
+				window[len(window)-1] != lateOnSEPTokenID ||
+				(index < len(windows)-1 && len(window) != lateOnSequenceLength) {
+				t.Fatalf("window %d of %d has %d tokens: not a whole model input", index+1, len(windows), len(window))
+			}
+			kept = append(kept, window[head:len(window)-1]...)
+		}
+		if !slices.Equal(kept, encoded[head:len(encoded)-1]) {
+			t.Fatalf("windows keep %d of %d query tokens", len(kept), tc.body)
+		}
+		prepared, err := scorer.PrepareSemanticQuery(t.Context(), tc.query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(prepared.scoreMask) != tc.windows*lateOnSequenceLength || !validSemanticQuery(prepared) {
+			t.Fatalf("prepared mask=%d tokens=%d, want %d windows", len(prepared.scoreMask), len(prepared.tokens), tc.windows)
+		}
 	}
 }
 
@@ -305,74 +301,6 @@ func TestLateOnTokenizerSanitizesNativeStringInputs(t *testing.T) {
 	)
 	if err != nil || len(ids) == 0 {
 		t.Fatalf("sanitized document IDs=%v: %v", ids, err)
-	}
-}
-
-func TestPackLateOnSemanticUnitsJoinsOnlyCompleteRows(t *testing.T) {
-	tokenizer, _ := openLateOnTestTokenizer(t)
-	shortContent := []byte("func Alpha() {}\nfunc Beta() {}\n")
-	shortUnits := extractSemanticUnits("sample.go", shortContent, []*ctags.Entry{
-		{Name: "Alpha", Kind: "function", Language: "Go", Line: 1},
-		{Name: "Beta", Kind: "function", Language: "Go", Line: 2},
-	}, nil)
-	for index := range shortUnits {
-		shortUnits[index].fileLanguage = "Go"
-		shortUnits[index].id = makeSemanticUnitID(shortUnits[index])
-	}
-	packed, err := packLateOnSemanticUnits(t.Context(), tokenizer, shortUnits)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(packed) != 1 || packed[0].kind != semanticUnitPacked ||
-		packed[0].symbol != "function Alpha function Beta" {
-		t.Fatalf("packed units=%+v", packed)
-	}
-	if packed[0].fileLanguage != "Go" {
-		t.Fatalf("packed file language=%q, want Go", packed[0].fileLanguage)
-	}
-	if len(packed[0].modelInput) == 0 || len(packed[0].modelInput) > lateOnSequenceLength {
-		t.Fatalf("packed model input has %d tokens", len(packed[0].modelInput))
-	}
-	inputIDs, attention, _, err := tokenizeLateOnSemanticUnits(
-		nil,
-		map[int]struct{}{},
-		packed,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for index, id := range packed[0].modelInput {
-		if inputIDs[index] != int64(id) || attention[index] != 1 {
-			t.Fatalf("cached token %d was not reused", index)
-		}
-	}
-	if packed[0].start != 0 || packed[0].end != uint64(len(shortContent)) ||
-		!bytes.Equal(packed[0].text, shortContent) {
-		t.Fatalf("packed source span=%d:%d text=%q", packed[0].start, packed[0].end, packed[0].text)
-	}
-	repeated, err := packLateOnSemanticUnits(t.Context(), tokenizer, shortUnits)
-	if err != nil || !reflect.DeepEqual(repeated, packed) {
-		t.Fatalf("repeated pack differs: units=%+v err=%v", repeated, err)
-	}
-
-	line := strings.Repeat("identifier ", 200) + "\n"
-	longContent := []byte(line + line)
-	longUnits := extractSemanticUnits("large.go", longContent, []*ctags.Entry{
-		{Name: "First", Kind: "function", Language: "Go", Line: 1},
-		{Name: "Second", Kind: "function", Language: "Go", Line: 2},
-	}, nil)
-	notPacked, err := packLateOnSemanticUnits(t.Context(), tokenizer, longUnits)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(notPacked) != len(longUnits) {
-		t.Fatalf("long units=%d, want %d", len(notPacked), len(longUnits))
-	}
-
-	canceled, cancel := context.WithCancel(t.Context())
-	cancel()
-	if _, err := packLateOnSemanticUnits(canceled, tokenizer, shortUnits); !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled pack error=%v", err)
 	}
 }
 
@@ -802,7 +730,7 @@ func TestLateOnInferenceSupportsFullCandidateBatch(t *testing.T) {
 		}
 	})
 
-	documents := make([]rerankDocument, rerankCandidateLimit)
+	documents := make([]rerankDocument, semanticModelBatchRows)
 	for i := range documents {
 		documents[i] = rerankDocument{
 			Path:     "cmd/seek/searcher.go",
@@ -820,8 +748,8 @@ func TestLateOnInferenceSupportsFullCandidateBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(scores) != rerankCandidateLimit {
-		t.Fatalf("scores=%d, want %d", len(scores), rerankCandidateLimit)
+	if len(scores) != semanticModelBatchRows {
+		t.Fatalf("scores=%d, want %d", len(scores), semanticModelBatchRows)
 	}
 }
 
@@ -834,182 +762,6 @@ func TestLateOnModelCanReopen(t *testing.T) {
 		}
 		if err := scorer.Close(); err != nil {
 			t.Fatal(err)
-		}
-	}
-}
-
-func TestLateOnTokenizerPoolExpandsOnlyForBulk(t *testing.T) {
-	previousCPUs := runtime.GOMAXPROCS(4)
-	t.Cleanup(func() { runtime.GOMAXPROCS(previousCPUs) })
-	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
-	scorer, err := newLateOnSemanticModel(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	model := scorer.(*lateOnModel)
-	t.Cleanup(func() {
-		if err := model.Close(); err != nil {
-			t.Errorf("close model: %v", err)
-		}
-	})
-	if model.tokenizerCount != 1 || len(model.tokenizers) != 1 || cap(model.tokenizers) != 4 {
-		t.Fatalf("initial pool count=%d available=%d capacity=%d", model.tokenizerCount, len(model.tokenizers), cap(model.tokenizers))
-	}
-
-	content := []byte("func Alpha() {}\nfunc Beta() {}\n")
-	units := extractSemanticUnits("sample.go", content, []*ctags.Entry{
-		{Name: "Alpha", Kind: "function", Language: "Go", Line: 1},
-		{Name: "Beta", Kind: "function", Language: "Go", Line: 2},
-	}, nil)
-	tokenizer, err := model.takeTokenizer(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	want, packErr := packLateOnSemanticUnits(t.Context(), tokenizer, units)
-	documents := []rerankDocument{{Text: "func 请求() { Alpha(); }", matchEnd: len("func 请求() { Alpha(); }")}}
-	wantIDs, wantAttention, wantMasks, tokenizeErr := tokenizeLateOnDocuments(tokenizer, model.punctuation, documents)
-	model.releaseTokenizer(tokenizer)
-	if packErr != nil || tokenizeErr != nil {
-		t.Fatalf("reference pack=%v tokenize=%v", packErr, tokenizeErr)
-	}
-	if _, err := model.PackSemanticUnits(t.Context(), nil); err != nil {
-		t.Fatal(err)
-	}
-	cancelled, cancel := context.WithCancel(t.Context())
-	cancel()
-	if _, err := model.PackSemanticUnits(cancelled, units); !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancelled pack error=%v", err)
-	}
-	if model.tokenizerCount != 1 {
-		t.Fatalf("empty/cancelled work expanded pool to %d", model.tokenizerCount)
-	}
-
-	const workers = 8
-	packed := make([][]semanticUnit, workers)
-	packErrors := make([]error, workers)
-	var wait sync.WaitGroup
-	for i := range workers {
-		wait.Go(func() {
-			packed[i], packErrors[i] = model.PackSemanticUnits(t.Context(), units)
-		})
-	}
-	wait.Wait()
-	for i := range workers {
-		if packErrors[i] != nil || !reflect.DeepEqual(packed[i], want) {
-			t.Fatalf("worker %d pack=%+v error=%v, want %+v", i, packed[i], packErrors[i], want)
-		}
-	}
-	if model.tokenizerCount != 4 || len(model.tokenizers) != 4 || model.tokenizerJSON != nil {
-		t.Fatalf("bulk pool count=%d available=%d retained JSON=%t", model.tokenizerCount, len(model.tokenizers), model.tokenizerJSON != nil)
-	}
-	var owned []*lateOnTokenizer
-	for range model.tokenizerCount {
-		tokenizer, err := model.takeTokenizer(t.Context())
-		if err != nil {
-			t.Fatal(err)
-		}
-		ids, attention, masks, tokenizeErr := tokenizeLateOnDocuments(tokenizer, model.punctuation, documents)
-		model.releaseTokenizer(tokenizer)
-		owned = append(owned, tokenizer)
-		if tokenizeErr != nil || !reflect.DeepEqual(ids, wantIDs) ||
-			!reflect.DeepEqual(attention, wantAttention) || !reflect.DeepEqual(masks, wantMasks) {
-			t.Fatalf("expanded tokenizer changed IDs, attention, or score masks: %v", tokenizeErr)
-		}
-	}
-	if err := model.Close(); err != nil {
-		t.Fatal(err)
-	}
-	for i, tokenizer := range owned {
-		if tokenizer.native != nil {
-			t.Errorf("tokenizer %d remains open", i)
-		}
-	}
-}
-
-// cancelAfterErrChecks cancels its context on the first Err call after the
-// first `after` calls, so those checks pass. It is safe for concurrent use.
-type cancelAfterErrChecks struct {
-	context.Context
-	cancel context.CancelFunc
-	after  int32
-	calls  *atomic.Int32
-}
-
-func (c cancelAfterErrChecks) Err() error {
-	if c.calls.Add(1) > c.after {
-		c.cancel()
-	}
-	return c.Context.Err()
-}
-
-func TestLateOnTokenizerExpansionFailureKeepsOwnedTokenizer(t *testing.T) {
-	for _, failure := range []string{"invalid JSON", "cancel after one copy"} {
-		t.Run(failure, func(t *testing.T) {
-			testLateOnTokenizerExpansionFailure(t, failure)
-		})
-	}
-}
-
-func testLateOnTokenizerExpansionFailure(t *testing.T, failure string) {
-	t.Helper()
-	previousCPUs := runtime.GOMAXPROCS(3)
-	t.Cleanup(func() { runtime.GOMAXPROCS(previousCPUs) })
-	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
-	scorer, err := newLateOnSemanticModel(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	model := scorer.(*lateOnModel)
-	t.Cleanup(func() {
-		if err := model.Close(); err != nil {
-			t.Errorf("close model: %v", err)
-		}
-	})
-	ctx := t.Context()
-	wantCount := 1
-	if failure == "invalid JSON" {
-		model.tokenizerJSON = []byte("{")
-	} else {
-		cancelled, cancel := context.WithCancel(ctx)
-		defer cancel()
-		// The entry check and one of the two copies pass; the other copy sees
-		// the cancellation.
-		ctx = cancelAfterErrChecks{Context: cancelled, cancel: cancel, after: 2, calls: new(atomic.Int32)}
-		wantCount = 2
-	}
-	units := []semanticUnit{{path: "sample.go", text: []byte("package sample\n")}}
-	for range 2 {
-		if _, err := model.PackSemanticUnits(ctx, units); err == nil {
-			t.Fatal("expansion did not fail")
-		} else if failure != "invalid JSON" && !errors.Is(err, context.Canceled) {
-			t.Fatalf("cancelled expansion error=%v", err)
-		}
-		if model.tokenizerCount != wantCount || len(model.tokenizers) != wantCount || model.tokenizerJSON != nil {
-			t.Fatalf("failed pool count=%d available=%d retained JSON=%t", model.tokenizerCount, len(model.tokenizers), model.tokenizerJSON != nil)
-		}
-	}
-	var owned []*lateOnTokenizer
-	for range wantCount {
-		tokenizer, err := model.takeTokenizer(t.Context())
-		if err != nil {
-			t.Fatal(err)
-		}
-		ids, encodeErr := encodeLateOnText(tokenizer, lateOnQueryPrefix+"request authentication flow")
-		model.releaseTokenizer(tokenizer)
-		owned = append(owned, tokenizer)
-		if encodeErr != nil || len(ids) == 0 {
-			t.Fatalf("owned tokenizer is unusable after expansion failure: %v", encodeErr)
-		}
-	}
-	if err := model.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if model.tokenizers != nil || model.tokenizerCount != 0 {
-		t.Fatal("failed expansion did not clear its pool")
-	}
-	for _, tokenizer := range owned {
-		if tokenizer.native != nil {
-			t.Error("failed expansion did not close an owned tokenizer")
 		}
 	}
 }
@@ -1043,8 +795,8 @@ func TestCLIProcessLateOnStrictEvidenceContract(t *testing.T) {
 		t.Fatalf("reranked=%+v", reranked)
 	}
 	if reranked.stdout == lexical.stdout ||
-		!strings.Contains(reranked.stdout, "## alpha.go") ||
-		!strings.Contains(reranked.stdout, "## beta.go") {
+		!strings.Contains(reranked.stdout, "## "+filepath.Join(folder, "alpha.go")) ||
+		!strings.Contains(reranked.stdout, "## "+filepath.Join(folder, "beta.go")) {
 		t.Fatalf("real backend did not publish the OR-only candidates: %+v", reranked)
 	}
 }
@@ -1088,15 +840,10 @@ func TestCLIProcessLateOnAcceptanceBoundary(t *testing.T) {
 	if verbose.code != 1 || verbose.stdout != "" {
 		t.Fatalf("verbose nonexistent query=%+v, want no match", verbose)
 	}
-	for _, want := range []string{`msg="Rejected model expansion"`, "route=joined"} {
-		if !strings.Contains(verbose.stderr, want) {
-			t.Fatalf("verbose rejection lacks %q:\n%s", want, verbose.stderr)
-		}
-	}
-	for _, want := range []string{`reason="score not above minimum"`, "minimum_mean_max_sim="} {
-		if !strings.Contains(verbose.stderr, want) {
-			t.Fatalf("score rejection lacks %q:\n%s", want, verbose.stderr)
-		}
+	// Each model candidate passes or fails one fixed threshold on its own
+	// score, so a query that matches nothing accepts no candidate.
+	if strings.Contains(verbose.stderr, `msg="Accepted model candidates"`) && !strings.Contains(verbose.stderr, "accepted=0") {
+		t.Fatalf("verbose nonexistent query accepted a candidate:\n%s", verbose.stderr)
 	}
 
 	const supportedQuery = "request authentication flow"
@@ -1119,17 +866,11 @@ func TestCLIProcessLateOnAcceptanceBoundary(t *testing.T) {
 		nil,
 	)
 	if accepted.code != 0 ||
-		!strings.Contains(accepted.stdout, "## auth.go") {
+		!strings.Contains(accepted.stdout, "## "+filepath.Join(folder, "auth.go")) {
 		t.Fatalf("accepted query=%+v", accepted)
 	}
-	for _, want := range []string{
-		`msg="Accepted model expansion"`,
-		"route=joined",
-		`reason="score above minimum"`,
-	} {
-		if !strings.Contains(accepted.stderr, want) {
-			t.Fatalf("acceptance lacks %q:\n%s", want, accepted.stderr)
-		}
+	if !strings.Contains(accepted.stderr, `msg="Accepted model candidates"`) || strings.Contains(accepted.stderr, "accepted=0") {
+		t.Fatalf("acceptance lacks an accepted candidate:\n%s", accepted.stderr)
 	}
 }
 
@@ -1420,5 +1161,41 @@ func TestDegenerateScoringErrorCarriesTheProviderSentinel(t *testing.T) {
 	_, shapeErr := lateOnMaxSimPrepared(query[:10], queryMask, documents, [][]bool{documentMask})
 	if errors.Is(shapeErr, errDegenerateSemanticVector) {
 		t.Fatalf("a shape error claimed a provider fault: %v", shapeErr)
+	}
+}
+
+// TestScoresWithSemanticQueryBatchesAboveModelWidth scores 300 documents in
+// one call: the scorer runs ceil(300/128) encoder batches and returns one
+// score per document, equal to the scores of smaller calls.
+func TestScoresWithSemanticQueryBatchesAboveModelWidth(t *testing.T) {
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	scorer, err := newLateOnSemanticModel(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = scorer.Close() })
+	documents := make([]rerankDocument, 300)
+	for index := range documents {
+		text := fmt.Sprintf("func rank%d() { rankCorpusResults(%d) }", index, index)
+		documents[index] = rerankDocument{Path: fmt.Sprintf("pkg/f%03d.go", index), Language: "Go", Text: text, matchEnd: len(text)}
+	}
+	prepared, err := scorer.PrepareSemanticQuery(t.Context(), "find where search results are ranked")
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := scorer.ScoresWithSemanticQuery(t.Context(), prepared, documents)
+	if err != nil || len(all) != len(documents) {
+		t.Fatalf("scores=%d err=%v, want %d", len(all), err, len(documents))
+	}
+	for start := 0; start < len(documents); start += 100 {
+		part, err := scorer.ScoresWithSemanticQuery(t.Context(), prepared, documents[start:start+100])
+		if err != nil {
+			t.Fatal(err)
+		}
+		for offset, score := range part {
+			if diff := math.Abs(float64(score - all[start+offset])); diff > 1e-3 {
+				t.Fatalf("document %d scored %v in one call and %v alone", start+offset, all[start+offset], score)
+			}
+		}
 	}
 }

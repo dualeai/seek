@@ -39,15 +39,27 @@ func searchFrom(t *testing.T, dir, term string, operands []string) (string, erro
 	})
 }
 
-// expectSearchMatch runs one search from dir and requires the file header and
-// the matched term in the output.
+// hasHeaderLine reports whether out has the file header line header, with
+// or without the tags that follow it.
+func hasHeaderLine(out, header string) bool {
+	for line := range strings.SplitSeq(out, "\n") {
+		if line == header || strings.HasPrefix(line, header+" ") {
+			return true
+		}
+	}
+	return false
+}
+
+// expectSearchMatch runs one search from dir and requires the file header
+// and the matched term in the output. The caller writes the header out: the
+// typed operand, then the path below it.
 func expectSearchMatch(t *testing.T, dir string, operands []string, term, header string) {
 	t.Helper()
 	out, err := searchFrom(t, dir, term, operands)
 	if err != nil {
 		t.Fatalf("run %q: %v\noutput:\n%s", term, err, out)
 	}
-	if !strings.Contains(out, header) || !strings.Contains(out, term) {
+	if !hasHeaderLine(out, header) || !strings.Contains(out, term) {
 		t.Fatalf("expected %q with a %q line, got:\n%s", header, term, out)
 	}
 }
@@ -63,7 +75,7 @@ func TestRun_HighTrigramDocumentKeepsSearchableContent(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(folder, "big.txt"), content, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		expectSearchMatch(t, t.TempDir(), []string{folder}, highTrigramNeedle, "## big.txt")
+		expectSearchMatch(t, t.TempDir(), []string{folder}, highTrigramNeedle, "## "+folder+"/big.txt")
 	})
 
 	t.Run("exact file", func(t *testing.T) {
@@ -73,7 +85,7 @@ func TestRun_HighTrigramDocumentKeepsSearchableContent(t *testing.T) {
 		if err := os.WriteFile(file, content, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		expectSearchMatch(t, t.TempDir(), []string{file}, highTrigramNeedle, "## big.txt")
+		expectSearchMatch(t, t.TempDir(), []string{file}, highTrigramNeedle, "## "+file)
 	})
 
 	t.Run("git committed", func(t *testing.T) {
@@ -110,11 +122,11 @@ func TestRun_HighTrigramDocumentKeepsSearchableContentAfterDelta(t *testing.T) {
 			t.Fatal(err)
 		}
 		cwd := t.TempDir()
-		expectSearchMatch(t, cwd, []string{folder}, seed, "## big.txt")
+		expectSearchMatch(t, cwd, []string{folder}, seed, "## "+file)
 		if err := os.WriteFile(file, content, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		expectSearchMatch(t, cwd, []string{folder}, highTrigramNeedle, "## big.txt")
+		expectSearchMatch(t, cwd, []string{folder}, highTrigramNeedle, "## "+file)
 	})
 
 	t.Run("git uncommitted delta", func(t *testing.T) {
@@ -180,15 +192,18 @@ func TestRun_ShardGuardKeepsOversizedShardsNameOnly(t *testing.T) {
 	small := []byte("guard_small_needle_marker\n")
 	swapGuardLimitsForTest(t)
 
-	check := func(t *testing.T, dir string, operands []string, wrapsPath string) {
+	// headerDir is the text that each header prints before the file name: the
+	// folder operand and a slash, or nothing for a search from the repository
+	// root.
+	check := func(t *testing.T, dir string, operands []string, headerDir, wrapsPath string) {
 		t.Helper()
-		expectSearchMatch(t, dir, operands, fitsNeedle, "## fits.txt")
-		expectSearchMatch(t, dir, operands, "guard_small_needle_marker", "## small.txt")
+		expectSearchMatch(t, dir, operands, fitsNeedle, "## "+headerDir+"fits.txt")
+		expectSearchMatch(t, dir, operands, "guard_small_needle_marker", "## "+headerDir+"small.txt")
 		got := runCapturingWarnings(t, dir, wrapsNeedle, []string{wrapsPath})
 		expectWarnings(t, got, wrapsPath)
 		// The name stays searchable.
 		out, err := searchFrom(t, dir, "file:wraps", operands)
-		if err != nil || !strings.Contains(out, "## wraps.txt") {
+		if err != nil || !hasHeaderLine(out, "## "+headerDir+"wraps.txt") {
 			t.Fatalf("file-name search: err=%v, output:\n%s", err, out)
 		}
 	}
@@ -199,7 +214,7 @@ func TestRun_ShardGuardKeepsOversizedShardsNameOnly(t *testing.T) {
 		writeFileAt(t, folder, "fits.txt", string(fits))
 		writeFileAt(t, folder, "wraps.txt", string(wraps))
 		writeFileAt(t, folder, "small.txt", string(small))
-		check(t, t.TempDir(), []string{folder}, filepath.Join(folder, "wraps.txt"))
+		check(t, t.TempDir(), []string{folder}, folder+"/", filepath.Join(folder, "wraps.txt"))
 	})
 
 	t.Run("folder delta", func(t *testing.T) {
@@ -208,9 +223,9 @@ func TestRun_ShardGuardKeepsOversizedShardsNameOnly(t *testing.T) {
 		writeFileAt(t, folder, "fits.txt", string(fits))
 		writeFileAt(t, folder, "small.txt", string(small))
 		cwd := t.TempDir()
-		expectSearchMatch(t, cwd, []string{folder}, fitsNeedle, "## fits.txt")
+		expectSearchMatch(t, cwd, []string{folder}, fitsNeedle, "## "+folder+"/fits.txt")
 		writeFileAt(t, folder, "wraps.txt", string(wraps))
-		check(t, cwd, []string{folder}, filepath.Join(folder, "wraps.txt"))
+		check(t, cwd, []string{folder}, folder+"/", filepath.Join(folder, "wraps.txt"))
 	})
 
 	t.Run("git committed", func(t *testing.T) {
@@ -220,7 +235,7 @@ func TestRun_ShardGuardKeepsOversizedShardsNameOnly(t *testing.T) {
 		writeFileAt(t, repo, "wraps.txt", string(wraps))
 		gitRunIn(t, repo, "add", ".")
 		gitRunIn(t, repo, "commit", "-m", "large documents")
-		check(t, repo, nil, filepath.Join(repo, "wraps.txt"))
+		check(t, repo, nil, "", filepath.Join(repo, "wraps.txt"))
 	})
 
 	t.Run("git committed delta", func(t *testing.T) {
@@ -231,7 +246,7 @@ func TestRun_ShardGuardKeepsOversizedShardsNameOnly(t *testing.T) {
 		writeFileAt(t, repo, "wraps.txt", string(wraps))
 		gitRunIn(t, repo, "add", ".")
 		gitRunIn(t, repo, "commit", "-m", "large documents")
-		check(t, repo, nil, filepath.Join(repo, "wraps.txt"))
+		check(t, repo, nil, "", filepath.Join(repo, "wraps.txt"))
 	})
 
 	t.Run("git uncommitted", func(t *testing.T) {
@@ -239,6 +254,6 @@ func TestRun_ShardGuardKeepsOversizedShardsNameOnly(t *testing.T) {
 		repo := initGitRepoNoRemote(t, "small.txt", string(small))
 		writeFileAt(t, repo, "fits.txt", string(fits))
 		writeFileAt(t, repo, "wraps.txt", string(wraps))
-		check(t, repo, nil, filepath.Join(repo, "wraps.txt"))
+		check(t, repo, nil, "", filepath.Join(repo, "wraps.txt"))
 	})
 }

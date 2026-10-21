@@ -4,11 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"flag"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -124,55 +122,22 @@ func TestCLIProcessErrorsAndExitCodes(t *testing.T) {
 	}
 }
 
-func TestCLIProcess_MissingGitDoesNotReturnNoMatch(t *testing.T) {
+// TestCLIProcess_MissingGitSkipsTheNode runs with no Git on PATH: the Git
+// node fails and the search skips it, as it does any failed node. One warning
+// names the root and gives the hint; no folder content shows; the exit is 1.
+func TestCLIProcess_MissingGitSkipsTheNode(t *testing.T) {
 	repo := initGitRepo(t, "note.txt", "missing_git_process_marker\n")
 	result := runCLIProcess(t, repo, []string{"missing_git_process_marker"}, []string{
 		"PATH=" + t.TempDir(),
 	})
-	want := "seek: Git is required but was not found\n" +
-		"hint: install Git and ensure git is on PATH\n"
-	if result.stdout != "" || result.stderr != want || result.code != 2 {
-		t.Fatalf("stdout=%q stderr=%q code=%d, want empty stdout, stderr=%q, code=2", result.stdout, result.stderr, result.code, want)
+	if result.stdout != "" || result.code != 1 || strings.Count(result.stderr, "\n") != 1 {
+		t.Fatalf("stdout=%q stderr=%q code=%d, want one warning and code 1", result.stdout, result.stderr, result.code)
 	}
-}
-
-func TestCLIProcess_VerboseMissingGitKeepsHintAndDetail(t *testing.T) {
-	repo := initGitRepo(t, "note.txt", "missing_git_verbose_process_marker\n")
-	result := runCLIProcess(t, repo, []string{"--verbose", "missing_git_verbose_process_marker"}, []string{
-		"PATH=" + t.TempDir(),
-	})
-	wantPrefix := "seek: Git is required but was not found\n" +
-		"hint: install Git and ensure git is on PATH\n"
-	if result.stdout != "" || result.code != 2 || !strings.HasPrefix(result.stderr, wantPrefix) {
-		t.Fatalf("stdout=%q stderr=%q code=%d, want empty stdout, stderr prefix=%q, code=2", result.stdout, result.stderr, result.code, wantPrefix)
-	}
-	for _, want := range []string{"level=ERROR", `msg="Command failed"`, `error="git corpus root=`} {
+	// No path is the same as ".", so the warning names the resolved root.
+	for _, want := range []string{"level=WARN", "root=" + canonicalCorpusPath(repo), "Git is required but was not found", "install Git and ensure git is on PATH"} {
 		if !strings.Contains(result.stderr, want) {
-			t.Fatalf("stderr=%q, want structured detail %q", result.stderr, want)
+			t.Fatalf("stderr=%q, want %q", result.stderr, want)
 		}
-	}
-}
-
-func TestCLIProcess_FolderCapExplainsLimitAndRemedy(t *testing.T) {
-	folder := t.TempDir()
-	// The file size is only a unit for the folder byte cap. Any size that fits
-	// the index works; 100 MiB keeps the file count low.
-	const fileSize = 100 << 20
-	const fileCount = maxFolderIndexedBytes/fileSize + 1
-	for i := int64(0); i < fileCount; i++ {
-		writeSparseFile(t, filepath.Join(folder, fmt.Sprintf("f%03d.bin", i)), fileSize)
-	}
-
-	resolvedFolder, err := filepath.EvalSymlinks(folder)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result := runCLIProcess(t, t.TempDir(), []string{"needle", folder}, nil)
-	want := "seek: cannot index " + strconv.Quote(filepath.Clean(resolvedFolder)) +
-		": the total size of indexable files exceeds the 10 GiB folder limit\n" +
-		"hint: pass smaller paths after the query; file: and -file: filters apply after indexing\n"
-	if result.stdout != "" || result.stderr != want || result.code != 2 {
-		t.Fatalf("stdout=%q stderr=%q code=%d, want empty stdout, stderr=%q, code=2", result.stdout, result.stderr, result.code, want)
 	}
 }
 
@@ -275,7 +240,7 @@ func TestCLIProcess_GCRemainsSubcommand(t *testing.T) {
 		t.Run(command, func(t *testing.T) {
 			result := runCLIProcess(t, t.TempDir(), []string{command, "--help"}, nil)
 			if result.code != 0 || result.stderr != "" ||
-				!strings.Contains(result.stdout, "Delete search indexes that have not been used") ||
+				!strings.Contains(result.stdout, "Delete the least recently used search indexes") ||
 				!strings.Contains(result.stdout, "run cleanup even if it ran recently") ||
 				strings.Contains(result.stdout, ".last-gc") ||
 				!strings.Contains(result.stdout, "--dry-run") {
@@ -315,7 +280,7 @@ func TestCLIProcess_LexicalOnlySkipsSemanticCacheAndModel(t *testing.T) {
 		[]string{"--verbose", "--lexical-only", "alpha beta", folder},
 		nil,
 	)
-	if result.code != 0 || !strings.Contains(result.stdout, "## app.go") {
+	if result.code != 0 || !strings.Contains(result.stdout, "## "+filepath.Join(folder, "app.go")) {
 		t.Fatalf(
 			"lexical-only stdout=%q stderr=%q code=%d",
 			result.stdout,
@@ -388,7 +353,7 @@ func TestCLIProcess_QueryShapeDecidesSemanticCache(t *testing.T) {
 					result.stderr,
 				)
 			}
-			if testCase.wantResults != strings.Contains(result.stdout, "## app.go") {
+			if testCase.wantResults != strings.Contains(result.stdout, "## "+filepath.Join(folder, "app.go")) {
 				t.Fatalf(
 					"results=%t, want %t: stdout=%q stderr=%q",
 					!testCase.wantResults,

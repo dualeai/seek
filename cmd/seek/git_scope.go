@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 
 	"github.com/sourcegraph/zoekt/query"
@@ -13,33 +12,12 @@ import (
 
 // This file builds the scope that restricts a Git corpus search to selected
 // paths. gitScopeSpec holds the parsed paths and builds the committed query.
-// gitDirtyScope separately supplies Git pathspecs and filters to the native
-// committed full reader and the dirty reader. The remaining helpers collapse
-// and deduplicate the selection.
-
-type gitDirtyScope struct {
-	includeDirs  []string
-	includeFiles []string
-	excludeDirs  []string
-	excludeFiles []string
-	key          string
-}
+// The remaining helpers collapse and deduplicate the selection.
 
 type gitScopeSpec struct {
 	dirs         []string
 	files        []string
 	rootIncluded bool
-}
-
-func combineGitScope(includeScope, excludeScope query.Q) query.Q {
-	if excludeScope == nil {
-		return includeScope
-	}
-	notExcluded := &query.Not{Child: excludeScope}
-	if includeScope == nil {
-		return notExcluded
-	}
-	return query.Simplify(query.NewAnd(includeScope, notExcluded))
 }
 
 // maxRegexpFileOperands bounds how many individual file operands are expanded
@@ -88,34 +66,6 @@ func buildCurrentGitScope(root string, operands []string) (query.Q, error) {
 	}
 }
 
-func buildGitDirtyScope(root string, operands, excludes []string) (*gitDirtyScope, error) {
-	include, err := buildGitScopeSpec(root, operands)
-	if err != nil || include.rootIncluded {
-		return nil, err
-	}
-	if len(include.dirs) == 0 && len(include.files) == 0 {
-		return nil, nil
-	}
-	exclude, err := buildGitScopeSpec(root, excludes)
-	if err != nil {
-		return nil, err
-	}
-	scope := &gitDirtyScope{
-		includeDirs:  include.dirs,
-		includeFiles: include.files,
-		excludeDirs:  exclude.dirs,
-		excludeFiles: exclude.files,
-	}
-	scope.key = hashParts(
-		"git_dirty_scope_v1",
-		"include_dirs", strings.Join(scope.includeDirs, "\x00"),
-		"include_files", strings.Join(scope.includeFiles, "\x00"),
-		"exclude_dirs", strings.Join(scope.excludeDirs, "\x00"),
-		"exclude_files", strings.Join(scope.excludeFiles, "\x00"),
-	)
-	return scope, nil
-}
-
 func buildGitScopeSpec(root string, operands []string) (gitScopeSpec, error) {
 	root = canonicalCorpusPath(root)
 	fileSet := make(map[string]struct{})
@@ -150,26 +100,6 @@ func buildGitScopeSpec(root string, operands []string) (gitScopeSpec, error) {
 	dirs := collapseDirectoryScopes(sortedKeys(dirSet))
 	files := dropFilesCoveredByDirs(sortedKeys(fileSet), dirs)
 	return gitScopeSpec{dirs: dirs, files: files}, nil
-}
-
-func (s *gitDirtyScope) contains(name string) bool {
-	name = filepath.ToSlash(name)
-	if coveredByAnyDir(name, s.excludeDirs) || containsString(s.excludeFiles, name) {
-		return false
-	}
-	return coveredByAnyDir(name, s.includeDirs) || containsString(s.includeFiles, name)
-}
-
-func gitLiteralPathspec(name string) string {
-	if name == "." {
-		return "."
-	}
-	return ":(top,literal)" + name
-}
-
-func containsString(values []string, value string) bool {
-	i := sort.SearchStrings(values, value)
-	return i < len(values) && values[i] == value
 }
 
 func collapseDirectoryScopes(dirs []string) []string {

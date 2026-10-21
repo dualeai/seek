@@ -316,21 +316,27 @@ func TestRepoStateFingerprint_AllFilesDeleted(t *testing.T) {
 }
 
 // TestStateFile_CorruptContent verifies that a corrupted state file
-// (non-hex content) is treated as a cache miss (different from any valid hash).
+// (non-hex content) is treated as a cache miss: the next freshness check
+// builds again and writes the valid state back.
 func TestStateFile_CorruptContent(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, stateFile), []byte("CORRUPT!@#$%"), 0o644); err != nil {
+	requireTools(t)
+	dir := initGitRepo(t, "app.go", "package main\n// corrupt_state_marker\n")
+	paths, plan := planGitTestCorpus(t, dir)
+	if _, _, err := ensureGitCorpusFresh(t.Context(), plan, paths); err != nil {
 		t.Fatal(err)
 	}
-	cached := readStateFile(dir)
-	// Corrupt content is read as-is (trimmed); it simply won't match any valid hash
-	if cached == "" {
-		t.Error("expected non-empty read of corrupt state file")
+	valid := readStateFile(plan.cacheDir)
+	if valid == "" {
+		t.Fatal("the first build wrote no state")
 	}
-	// Verify it doesn't match a real hash
-	realHash := computeStateHash("anything")
-	if cached == realHash {
-		t.Error("corrupt state file should not match a valid hash")
+	if err := os.WriteFile(filepath.Join(plan.cacheDir, stateFile), []byte("CORRUPT!@#$%"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ensureGitCorpusFresh(t.Context(), plan, paths); err != nil {
+		t.Fatal(err)
+	}
+	if got := readStateFile(plan.cacheDir); got != valid {
+		t.Fatalf("state after a corrupt record=%q, want the rebuilt state %q", got, valid)
 	}
 }
 
@@ -573,11 +579,20 @@ func TestIntegration_MergeConflictState(t *testing.T) {
 	cmd := exec.Command("git", "merge", "conflict-branch")
 	cmd.Dir = dir
 	_ = cmd.Run() // ignore error, conflict is expected
+	// Real Git output is the oracle: app.go is an unmerged ("u") entry.
+	if status := gitOutputIn(t, dir, "status", "--porcelain=v2", "-z"); !strings.HasPrefix(status, "u UU ") {
+		t.Fatalf("merge left no unmerged entry: %q", status)
+	}
 
-	// Seek should still work during merge conflict — should not crash
-	_, err := runSeekInRepo(t, dir, "conflict")
+	// The work-tree app.go holds both sides between conflict markers. Only
+	// the work-tree copy holds the branch side: HEAD holds the default
+	// branch side.
+	files, err := runSeekInRepo(t, dir, "conflict_branch_marker")
 	if err != nil {
 		t.Fatalf("search during merge conflict should not error: %v", err)
+	}
+	if len(files) != 1 || files[0] != "app.go" {
+		t.Fatalf("files=%q, want the unmerged work-tree app.go", files)
 	}
 }
 

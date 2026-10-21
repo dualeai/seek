@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -417,6 +419,25 @@ func TestDeltaUncommitted_DeletedDirtyFileTombstoned(t *testing.T) {
 	}
 	if r, _ := searchPlannedCorpusForTest(ctx, plan, "second_dirty_marker_v2"); len(r) == 0 {
 		t.Fatal("edited dirty file content should be findable")
+	}
+}
+
+// TestDeltaUncommitted_OnlyAMissingFileIsGone stats a deleted file and a path
+// too long for Lstat: only the deleted file is gone, and the delta reads the
+// other one. A gone file gets no manifest entry, so when it comes back the
+// delta tombstones nothing.
+func TestDeltaUncommitted_OnlyAMissingFileIsGone(t *testing.T) {
+	long := strings.Repeat("z/", 600) + "x.txt"
+	candidates := statUncommittedCandidates(t.TempDir(), []string{"deleted.txt", long})
+	if len(candidates) != 2 || !candidates[0].gone || candidates[1].gone {
+		t.Fatalf("candidates=%+v, want deleted.txt gone and the long path not", candidates)
+	}
+	if entries := uncommittedManifestEntries(candidates); len(entries) != 1 || entries[0].Name != long {
+		t.Fatalf("entries=%+v, want the long path only", entries)
+	}
+	toRead, changed := diffUncommittedAgainstManifest(candidates, uncommittedManifest{})
+	if len(toRead) != 1 || toRead[0].name != long || !slices.Equal(changed, []string{long}) {
+		t.Fatalf("toRead=%+v changed=%v, want the long path only", toRead, changed)
 	}
 }
 

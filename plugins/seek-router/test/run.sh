@@ -122,8 +122,13 @@ else
 	record_failure "session bypass" "exit $code, output [$out]"
 fi
 
-mkdir -p "$WORK/empty"
-out=$(printf '%s' "$payload" | PATH="$WORK/empty" /bin/sh "$ROUTER" 2>/dev/null)
+# Keep every other tool that the router uses, so only the seek check can stop
+# the rewrite.
+mkdir -p "$WORK/no-seek"
+for tool in awk cat dirname jq; do
+	ln -s "$(command -v "$tool")" "$WORK/no-seek/$tool"
+done
+out=$(printf '%s' "$payload" | PATH="$WORK/no-seek" /bin/sh "$ROUTER" 2>/dev/null)
 code=$?
 if [ "$code" -eq 0 ] && [ -z "$out" ]; then
 	record_pass

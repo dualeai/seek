@@ -13,13 +13,20 @@ const (
 	semanticEmbeddingDimensions = 48
 )
 
-// semanticQueryEmbedding keeps retrieval and final scoring data from one query
-// model call. Token vectors drive both USearch and LateOn MaxSim.
+// semanticQueryEmbedding holds the token vectors of one query model call: one
+// or more 128-token query windows, row after row, so a long query keeps every
+// token. The token vectors drive both USearch and LateOn MaxSim.
 type semanticQueryEmbedding struct {
 	tokens     []float32
 	scoreMask  []bool
 	modelQuery string
-	truncated  bool
+}
+
+// validSemanticQuery reports a query with whole windows and a vector per mask
+// slot.
+func validSemanticQuery(query *semanticQueryEmbedding) bool {
+	return query != nil && len(query.scoreMask) > 0 && len(query.scoreMask)%lateOnSequenceLength == 0 &&
+		len(query.tokens) == len(query.scoreMask)*semanticEmbeddingDimensions
 }
 
 // semanticModel is the command-wide LateOn model used by indexing, retrieval,
@@ -27,7 +34,6 @@ type semanticQueryEmbedding struct {
 // the command is active. The production implementation owns one shared
 // inference session. Zoekt and USearch stay outside this boundary.
 type semanticModel interface {
-	PackSemanticUnits(context.Context, []semanticUnit) ([]semanticUnit, error)
 	EmbedSemanticUnits(context.Context, []semanticUnit) ([]semanticUnitEmbedding, error)
 	PrepareSemanticQuery(context.Context, string) (*semanticQueryEmbedding, error)
 	ScoresWithSemanticQuery(context.Context, *semanticQueryEmbedding, []rerankDocument) ([]float32, error)
@@ -177,54 +183,33 @@ func (future *semanticModelFuture) Close() error {
 	return future.result.model.Close()
 }
 
-func (future *semanticModelFuture) scores(
-	ctx context.Context,
-	query string,
-	documents []rerankDocument,
-) (rerankScoreBatch, error) {
-	model, prepared, err := future.prepareQuery(ctx, query)
-	if err != nil {
-		return rerankScoreBatch{}, err
-	}
-	values, err := model.ScoresWithSemanticQuery(ctx, prepared, documents)
-	if err != nil {
-		return rerankScoreBatch{}, err
-	}
-	return newRerankScoreBatch(prepared, values)
-}
-
 type searchExecution struct {
-	policy     searchPolicy
-	acceptance *rerankAcceptancePolicy
-	model      *semanticModelFuture
-	resources  searchResources
-	// prepareVectors reports whether any route in this search can read a
-	// committed vector generation. A model can still be wanted for re-ranking
-	// lexical candidates when this is false, so the two decisions are separate:
-	// building and binding vectors that the route will reject is pure cost.
-	prepareVectors bool
-	// prepared records each corpus plan after its index preparation, so a later
-	// step of the same command can search the index again without a second
-	// freshness check. Nil records nothing.
-	prepared *preparedCorpora
+	policy    searchPolicy
+	model     *semanticModelFuture
+	resources searchResources
+	// vectors reports that the command's model stages read vectors: every
+	// node builds and binds its generation before its read. A Git node with
+	// no commit has no base to build; the overlay adds its files.
+	vectors bool
+	// opened holds the command's node preparations (openNode). Nil prepares
+	// on every call.
+	opened *openedNodes
+	// operands give the display paths that headers and file: filters read.
+	// With nil, file: filters read node-relative paths and headers show
+	// absolute paths.
+	operands displayOperands
 }
 
-// vectorsWanted reports whether a corpus should build, validate and bind a
-// committed vector generation.
-//
-// Three conditions, all required. The policy must enable semantic search; a
-// model must exist; and a route must be able to read the result. That last
-// condition is prepareVectors, decided once per search: a query shape the
-// re-rank planner rejects, or a corpus shape the joined route rejects, can
-// never reach a vector, and building one for it is pure cost. The model itself
-// stays available for re-ranking lexical candidates in those cases.
-//
-// head is the commit the corpus indexes. A Git corpus with no commit has
-// nothing to key a generation by. Pass an empty head for a corpus kind that has
-// no commit at all, such as a folder, where the test does not apply.
-func (e searchExecution) vectorsWanted(head string) bool {
-	return e.policy.semanticEnabled() &&
-		e.model != nil &&
-		e.prepareVectors &&
-		head != "no-head"
+// buildsVectors reports whether a node with the commit head builds and binds a
+// vector generation: the model stages run, the policy allows semantic search,
+// a model exists, and the node has a commit (an empty folder head counts).
+func (e searchExecution) buildsVectors(head string) bool {
+	return e.vectors && e.policy.semanticEnabled() && e.model != nil && head != "no-head"
+}
+
+// buildsOverlay reports whether a Git node with dirty files builds and binds
+// the overlay of their work-tree bytes: every file of the node is then in
+// vector retrieval, committed or not, with or without a commit.
+func (e searchExecution) buildsOverlay(dirty bool) bool {
+	return e.vectors && e.policy.semanticEnabled() && e.model != nil && dirty
 }

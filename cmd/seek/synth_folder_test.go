@@ -27,19 +27,20 @@ func planSynthCorpus(t *testing.T, root string) corpusPlan {
 	if err != nil {
 		t.Fatalf("planSynthCorpus planFolderCorpus: %v", err)
 	}
-	plan.cacheDir = t.TempDir()
-	plan.indexDir = t.TempDir()
 	// Invariants: catch a regression where folder planning loses
 	// the root, collides cache and index dirs, or returns blanks.
+	// Check the production plan before the t.TempDir overrides below.
 	if plan.root == "" {
 		t.Fatal("planSynthCorpus: production returned empty plan.root")
 	}
 	if plan.cacheDir == "" || plan.indexDir == "" {
-		t.Fatal("planSynthCorpus: empty cacheDir or indexDir after t.TempDir overrides")
+		t.Fatal("planSynthCorpus: production returned empty cacheDir or indexDir")
 	}
 	if plan.cacheDir == plan.indexDir {
 		t.Fatalf("planSynthCorpus: cacheDir collides with indexDir: %q", plan.cacheDir)
 	}
+	plan.cacheDir = t.TempDir()
+	plan.indexDir = t.TempDir()
 	return plan
 }
 

@@ -190,14 +190,15 @@ type semanticFilterMask struct {
 // that Seek scores directly without planning individual shard routes.
 const semanticFilteredExactRows = 256
 
-// buildSemanticFilterMask evaluates each adjacent group of rows for one file
-// once. It writes bitmap ranges and shard counts during that same pass.
+// buildSemanticFilterMask evaluates matches once for each adjacent group of
+// rows of one file. It writes bitmap ranges and shard counts during that same
+// pass, for the bitmap filter of USearch's filtered search.
 func buildSemanticFilterMask(
 	ctx context.Context,
 	generation *semanticGeneration,
-	filter *semanticFilterPlan,
+	matches func(path, fileLanguage string) bool,
 ) (semanticFilterMask, error) {
-	if generation == nil || filter == nil {
+	if generation == nil || matches == nil {
 		return semanticFilterMask{}, fmt.Errorf("semantic filter input is missing")
 	}
 	rowCount := uint64(len(generation.rows))
@@ -248,7 +249,7 @@ func buildSemanticFilterMask(
 			}
 			end++
 		}
-		matchedFile := filter.matches(first.path, first.fileLanguage)
+		matchedFile := matches(first.path, first.fileLanguage)
 		if matchedFile {
 			seenMatch = true
 			startRow, endRow := uint64(at), uint64(end)

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -41,10 +40,9 @@ func TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable(t *testing.T) {
 	}
 }
 
-// TestFolderCorpusStateParallel_HighFanout_NoStallNoDrop checks that the
-// parallel dispatcher returns every file when there are more entries than
-// workers.
-func TestFolderCorpusStateParallel_HighFanout_NoStallNoDrop(t *testing.T) {
+// TestFolderCorpusState_HighFanout_NoStallNoDrop checks that the parallel
+// walk returns every file when there are more directories than workers.
+func TestFolderCorpusState_HighFanout_NoStallNoDrop(t *testing.T) {
 	root := t.TempDir()
 	const N = 200
 	for i := 0; i < N; i++ {
@@ -57,21 +55,21 @@ func TestFolderCorpusStateParallel_HighFanout_NoStallNoDrop(t *testing.T) {
 		}
 	}
 	plan := planFolderTestCorpus(t, root)
-	state, selected, err := folderCorpusStateParallel(t.Context(), plan)
+	state, selected, err := folderCorpusState(t.Context(), plan)
 	if err != nil {
-		t.Fatalf("folderCorpusStateParallel: %v", err)
+		t.Fatalf("folderCorpusState: %v", err)
 	}
 	if state == "" {
 		t.Fatal("expected non-empty stateHash")
 	}
 	if got := len(selected); got != N {
-		t.Fatalf("selected count = %d, want %d (parallel dispatcher dropped entries)", got, N)
+		t.Fatalf("selected count = %d, want %d (the parallel walk dropped entries)", got, N)
 	}
 }
 
-// TestFolderCorpusStateParallel_IdempotentSelectedAndStateHash checks that two
+// TestFolderCorpusState_IdempotentSelectedAndStateHash checks that two
 // scans of an unchanged tree return the same state and selected file count.
-func TestFolderCorpusStateParallel_IdempotentSelectedAndStateHash(t *testing.T) {
+func TestFolderCorpusState_IdempotentSelectedAndStateHash(t *testing.T) {
 	root := t.TempDir()
 	for i := 0; i < 50; i++ {
 		if err := os.WriteFile(filepath.Join(root, "f"+strconv.Itoa(i)+".txt"), []byte("payload"), 0o644); err != nil {
@@ -80,11 +78,11 @@ func TestFolderCorpusStateParallel_IdempotentSelectedAndStateHash(t *testing.T) 
 	}
 	plan := planFolderTestCorpus(t, root)
 	ctx := t.Context()
-	hash1, sel1, err := folderCorpusStateParallel(ctx, plan)
+	hash1, sel1, err := folderCorpusState(ctx, plan)
 	if err != nil {
 		t.Fatalf("first call: %v", err)
 	}
-	hash2, sel2, err := folderCorpusStateParallel(ctx, plan)
+	hash2, sel2, err := folderCorpusState(ctx, plan)
 	if err != nil {
 		t.Fatalf("second call: %v", err)
 	}
@@ -93,95 +91,6 @@ func TestFolderCorpusStateParallel_IdempotentSelectedAndStateHash(t *testing.T) 
 	}
 	if len(sel1) != len(sel2) {
 		t.Fatalf("selected count drift: %d vs %d", len(sel1), len(sel2))
-	}
-}
-
-type fakeDirEntry struct {
-	name        string
-	isDir       bool
-	typ         os.FileMode
-	infoCalls   int
-	failOnInfo  bool
-	regInfoFile string
-}
-
-func (f *fakeDirEntry) Name() string      { return f.name }
-func (f *fakeDirEntry) IsDir() bool       { return f.isDir }
-func (f *fakeDirEntry) Type() os.FileMode { return f.typ }
-func (f *fakeDirEntry) Info() (os.FileInfo, error) {
-	f.infoCalls++
-	if f.failOnInfo {
-		return nil, errors.New("Info() must not be called for non-regular entries")
-	}
-	return os.Lstat(f.regInfoFile)
-}
-
-// Check each non-zero type bit from io/fs.FileMode. Modifier bits must also
-// return before Info because production checks Type() != 0.
-// ModeDir is omitted because fingerprintRootEntry checks IsDir first.
-func TestFingerprintRootEntry_NonRegular_SkipsEntryInfo(t *testing.T) {
-	plan := planFolderTestCorpus(t, t.TempDir())
-
-	cases := []struct {
-		name string
-		typ  os.FileMode
-	}{
-		{"symlink", os.ModeSymlink},
-		{"named-pipe", os.ModeNamedPipe},
-		{"socket", os.ModeSocket},
-		{"device", os.ModeDevice},
-		{"char-device", os.ModeDevice | os.ModeCharDevice},
-		{"irregular", os.ModeIrregular},
-		{"setuid-marker", os.ModeSetuid},
-		{"setgid-marker", os.ModeSetgid},
-		{"sticky-marker", os.ModeSticky},
-		{"temporary-marker", os.ModeTemporary},
-		{"append-marker", os.ModeAppend},
-		{"exclusive-marker", os.ModeExclusive},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			entry := &fakeDirEntry{
-				name:       "x",
-				typ:        tc.typ,
-				failOnInfo: true,
-			}
-			piece, err := fingerprintRootEntry(t.Context(), plan, entry, false, false)
-			if err != nil {
-				t.Fatalf("unexpected err: %v", err)
-			}
-			if piece.present {
-				t.Fatalf("expected piece.present=false for non-regular type %v", tc.typ)
-			}
-			if entry.infoCalls != 0 {
-				t.Fatalf("entry.Info() called %d times for non-regular; want 0", entry.infoCalls)
-			}
-		})
-	}
-}
-
-// TestFingerprintRootEntry_RegularFile_CallsInfo checks that a regular entry
-// loads its file information.
-func TestFingerprintRootEntry_RegularFile_CallsInfo(t *testing.T) {
-	plan := planFolderTestCorpus(t, t.TempDir())
-	regFile := filepath.Join(t.TempDir(), "real.txt")
-	if err := os.WriteFile(regFile, []byte("payload"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	entry := &fakeDirEntry{
-		name:        "real.txt",
-		typ:         0, // regular
-		regInfoFile: regFile,
-	}
-	piece, err := fingerprintRootEntry(t.Context(), plan, entry, false, false)
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	if !piece.present {
-		t.Fatalf("expected piece.present=true for regular file")
-	}
-	if entry.infoCalls != 1 {
-		t.Fatalf("entry.Info() called %d times for regular; want 1", entry.infoCalls)
 	}
 }
 
@@ -201,48 +110,19 @@ func TestWalkDirectory_GitContentNotInStateHash(t *testing.T) {
 	}
 	plan := planFolderTestCorpus(t, root)
 
-	preHash, _, err := folderCorpusStateParallel(t.Context(), plan)
+	preHash, _, err := folderCorpusState(t.Context(), plan)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(gitDir, "sentinel"), []byte("v2-mutated"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	postHash, _, err := folderCorpusStateParallel(t.Context(), plan)
+	postHash, _, err := folderCorpusState(t.Context(), plan)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if preHash != postHash {
 		t.Fatalf(".git sentinel mutation leaked into stateHash:\n  pre  = %q\n  post = %q", preHash, postHash)
-	}
-}
-
-// TestWalkDirectory_GitPresenceAffectsBoundaryMarker checks that adding .git
-// changes the boundary marker even though its content is excluded.
-func TestWalkDirectory_GitPresenceAffectsBoundaryMarker(t *testing.T) {
-	noGit := t.TempDir()
-	if err := os.WriteFile(filepath.Join(noGit, "a.txt"), []byte("payload"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	withGit := t.TempDir()
-	if err := os.WriteFile(filepath.Join(withGit, "a.txt"), []byte("payload"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(withGit, ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	hashNoGit, _, err := folderCorpusStateParallel(t.Context(), planFolderTestCorpus(t, noGit))
-	if err != nil {
-		t.Fatal(err)
-	}
-	hashWithGit, _, err := folderCorpusStateParallel(t.Context(), planFolderTestCorpus(t, withGit))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if hashNoGit == hashWithGit {
-		t.Fatalf("boundary marker did not contribute: same hash for trees with/without .git (%q)", hashNoGit)
 	}
 }
 

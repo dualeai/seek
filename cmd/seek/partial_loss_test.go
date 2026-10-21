@@ -803,8 +803,9 @@ func plSoleCorpusIndexDir(t *testing.T, cacheRoot string) string {
 	return populated[0]
 }
 
-// TestPartialLoss_RouterContractOnRealProcess checks the process-level result:
-// exit 1, empty stderr, no match, and the same result on the next run.
+// TestPartialLoss_RouterContractOnRealProcess checks the process-level result
+// after a shard loss: exit 0, the restored match on stdout, no repair notice
+// on stdout, and the same result on the next run.
 //
 // runCLIProcessWithCache starts the test binary as the CLI with an isolated
 // SEEK_CACHE_DIR. This lets the test check the exit code and output streams.

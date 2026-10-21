@@ -13,10 +13,11 @@ import (
 )
 
 const (
-	// semanticUnitMaxBytes bounds copied source while keeping enough code for
-	// the 128-token model input. It is a format value, not a worker setting.
+	// semanticUnitMaxBytes bounds the source span of one unit; the window
+	// split then cuts each unit into 128-token model inputs. It is a format
+	// value, not a worker setting.
 	semanticUnitMaxBytes = 16 << 10
-	semanticExtractorID  = "ctags-gaps-v4-source-skips"
+	semanticExtractorID  = "ctags-gaps-v6-windows"
 )
 
 type semanticUnitKind uint8
@@ -25,7 +26,6 @@ const (
 	semanticUnitGap semanticUnitKind = iota + 1
 	semanticUnitSymbol
 	semanticUnitFallback
-	semanticUnitPacked
 )
 
 type semanticParserResult uint8
@@ -55,9 +55,16 @@ type semanticUnit struct {
 	fileLanguage string
 	symbol       string
 	text         []byte
-	// modelInput is transient. The exact packer supplies the token IDs that the
-	// encoder consumes, then the collector clears them before storage.
+	// key identifies the row's model input (makeSemanticRowKey): a build
+	// copies the vectors of a key that a live generation or the unit store
+	// holds.
+	key semanticRowKey
+	// modelInput is transient. The window split supplies the token IDs that
+	// the encoder consumes, then the collector clears them before storage.
 	modelInput []int
+	// reuse is transient: the live generation row whose vectors this row
+	// copies, or nil when the model embeds it.
+	reuse *semanticReuseRef
 }
 
 type semanticTagParser interface {
@@ -72,9 +79,9 @@ type semanticAnchor struct {
 }
 
 // extractSemanticUnits covers each eligible non-empty source byte once. It
-// excludes binary and generated files. Valid ctags starts create symbol units.
-// Prefixes and parser gaps create gap units. A parser failure or a file without
-// valid symbols creates fallback units.
+// excludes binary files and keeps generated files. Valid ctags starts create
+// symbol units. Prefixes and parser gaps create gap units. A parser failure or
+// a file without valid symbols creates fallback units.
 func extractSemanticUnits(
 	path string,
 	content []byte,
@@ -96,7 +103,20 @@ func extractEligibleSemanticUnits(
 	parseErr error,
 	fileLanguage string,
 ) []semanticUnit {
-	contentID := semanticContentID(sha256.Sum256(content))
+	return extractSemanticUnitsWithID(
+		path, content, semanticContentID(sha256.Sum256(content)), entries, parseErr, fileLanguage,
+	)
+}
+
+// extractSemanticUnitsWithID extracts content whose SHA-256 the caller has.
+func extractSemanticUnitsWithID(
+	path string,
+	content []byte,
+	contentID semanticContentID,
+	entries []*ctags.Entry,
+	parseErr error,
+	fileLanguage string,
+) []semanticUnit {
 	var idBuffer []byte
 	parserResult := semanticParserCTags
 	switch {
@@ -164,7 +184,7 @@ func extractEligibleSemanticUnits(
 }
 
 func semanticContentIsEligible(content []byte) bool {
-	return len(content) > 0 && !semanticContentIsBinary(content) && !semanticContentIsGenerated(content)
+	return len(content) > 0 && !semanticContentIsBinary(content)
 }
 
 // semanticContentIsBinary matches the standard source-index boundary for the
@@ -172,30 +192,6 @@ func semanticContentIsEligible(content []byte) bool {
 // sending binary payloads through ctags, tokenization, and the model.
 func semanticContentIsBinary(content []byte) bool {
 	return bytes.IndexByte(content, 0) >= 0
-}
-
-// semanticContentIsGenerated recognizes the source marker defined by the Go
-// generated-code convention in the first 4 KiB. Zoekt keeps these files on its
-// complete lexical path. The semantic branch omits them because generated
-// symbols add duplicate model work and often reduce descriptive-search
-// precision.
-func semanticContentIsGenerated(content []byte) bool {
-	header := content[:min(len(content), 4096)]
-	for len(header) > 0 {
-		line := header
-		if end := bytes.IndexByte(header, '\n'); end >= 0 {
-			line = header[:end]
-			header = header[end+1:]
-		} else {
-			header = nil
-		}
-		line = bytes.TrimSuffix(line, []byte{'\r'})
-		if bytes.HasPrefix(line, []byte("// Code generated ")) &&
-			bytes.HasSuffix(line, []byte(" DO NOT EDIT.")) {
-			return true
-		}
-	}
-	return false
 }
 
 func semanticSymbolMetadata(entry *ctags.Entry) string {

@@ -18,10 +18,7 @@ func TestExplicitSearchConfigCopiesDefaults(t *testing.T) {
 	if config.opts.NumContextLines != 360 || !config.afterOnly {
 		t.Fatalf("unexpected context config: %+v", config)
 	}
-	if config.opts.TotalMaxMatchCount != 10000 || config.opts.ShardMaxMatchCount != 10000 {
-		t.Fatalf("context changed match budgets: %+v", config.opts)
-	}
-	if searchOpts.NumContextLines != searchContextLines || searchOpts.TotalMaxMatchCount != 10000 || searchOpts.ShardMaxMatchCount != 10000 {
+	if searchOpts.NumContextLines != searchContextLines {
 		t.Fatalf("explicitSearchConfig changed the package defaults: %+v", searchOpts)
 	}
 }

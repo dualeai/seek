@@ -167,39 +167,37 @@ func TestRootCmd_RejectsNegativeLimit(t *testing.T) {
 	}
 }
 
+// TestDefaultSearchRunConfigBindsAcceptancePolicies checks the default run
+// config: the model factory with semantic search, none without, and the one
+// per-file acceptance value.
 func TestDefaultSearchRunConfigBindsAcceptancePolicies(t *testing.T) {
-	config := defaultSearchRunConfig(defaultSearchPolicy())
-	if config.newModel == nil || config.newAcceptancePolicies == nil {
-		t.Fatalf("default run config is incomplete: %+v", config)
+	if config := defaultSearchRunConfig(defaultSearchPolicy()); config.newModel == nil {
+		t.Fatalf("default run config has no model: %+v", config)
 	}
-	if config.rerankAcceptance != nil || config.hybridAcceptance != nil {
-		t.Fatalf("default run config resolved acceptance eagerly: %+v", config)
+	if lexical := defaultSearchRunConfig(lexicalOnlySearchPolicy()); lexical.newModel != nil {
+		t.Fatalf("lexical-only run config started a model: %+v", lexical)
 	}
-	policies := config.newAcceptancePolicies()
-	if policies.rerank == nil || policies.hybrid == nil {
-		t.Fatalf("default acceptance policies are incomplete: %+v", policies)
+	if pipelineTauFile != 0.6 {
+		t.Fatalf("tau_file=%g, want 0.6", pipelineTauFile)
 	}
-	if policies.rerank.route != "lexical-rerank" ||
-		policies.hybrid.route != "joined" {
-		t.Fatalf(
-			"acceptance routes=%q and %q",
-			policies.rerank.route,
-			policies.hybrid.route,
-		)
-	}
-	if policies.rerank.minimumMeanMaxSim != 0.575 ||
-		policies.hybrid.minimumMeanMaxSim != 0.600 {
-		t.Fatalf(
-			"acceptance minimums=%g and %g",
-			policies.rerank.minimumMeanMaxSim,
-			policies.hybrid.minimumMeanMaxSim,
-		)
-	}
+}
 
-	lexical := defaultSearchRunConfig(lexicalOnlySearchPolicy())
-	if lexical.newModel != nil || lexical.rerankAcceptance != nil ||
-		lexical.hybridAcceptance != nil || lexical.newAcceptancePolicies != nil {
-		t.Fatalf("lexical-only run config started model policy: %+v", lexical)
+// TestContextLinesHaveNoUpperBound checks that -C and -A accept 1000 lines.
+func TestContextLinesHaveNoUpperBound(t *testing.T) {
+	for _, args := range [][]string{{"-C", "1000"}, {"-A", "1000"}} {
+		flags := &cliFlags{search: defaultSearchConfig()}
+		cmd := &cobra.Command{}
+		cmd.Flags().IntVarP(&flags.afterContext, "after-context", "A", 0, "")
+		cmd.Flags().IntVarP(&flags.context, "context", "C", 0, "")
+		if err := cmd.Flags().Parse(args); err != nil {
+			t.Fatalf("parse %v: %v", args, err)
+		}
+		if err := selectSearchConfig(cmd, flags); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		if flags.search.opts.NumContextLines != 1000 {
+			t.Fatalf("%v: context lines=%d, want 1000", args, flags.search.opts.NumContextLines)
+		}
 	}
 }
 
@@ -215,8 +213,9 @@ func TestSelectSearchConfig(t *testing.T) {
 		{name: "after", args: []string{"-A", "360"}, wantLines: 360, wantAfter: true},
 		{name: "context", args: []string{"--context=12"}, wantLines: 12},
 		{name: "zero context", args: []string{"-C", "0"}, wantLines: 0},
-		{name: "too much context", args: []string{"-C", "513"}, wantErr: "between 0 and 512"},
-		{name: "negative after", args: []string{"-A=-1"}, wantErr: "between 0 and 512"},
+		{name: "large context", args: []string{"-C", "513"}, wantLines: 513},
+		{name: "negative after", args: []string{"-A=-1"}, wantErr: "must be 0 or more"},
+		{name: "negative context", args: []string{"--context=-1"}, wantErr: "must be 0 or more"},
 		{name: "mixed modes", args: []string{"-A", "2", "-C", "3"}, wantErr: "cannot be used together"},
 	}
 
@@ -385,29 +384,22 @@ func TestBadProviderPinOnlyStopsCommandsThatUseTheModel(t *testing.T) {
 	// A typo in SEEK_PROVIDER must be loud for a search that would use the
 	// model, and must not stop commands that never read the setting.
 	t.Setenv(lateOnProviderEnv, "gpu")
+	// Each command also has a bad argument that fails after the provider
+	// check, so the error tells which check stopped it first.
 	for _, test := range []struct {
-		name        string
-		lexicalOnly bool
-		subcommand  bool
-		wantErr     bool
+		name string
+		args []string
+		want string
 	}{
-		{name: "search", wantErr: true},
-		{name: "lexical only", lexicalOnly: true},
-		{name: "subcommand", subcommand: true},
+		{name: "search", args: []string{"-n", "-5", "needle"}, want: lateOnProviderEnv + ` is "gpu"`},
+		{name: "lexical only", args: []string{"--lexical-only", "-n", "-5", "needle"}, want: "--limit must be"},
+		{name: "subcommand", args: []string{"gc", "--sort=bogus"}, want: "--sort must be"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			root := &cobra.Command{Use: "seek"}
-			cmd := root
-			if test.subcommand {
-				cmd = &cobra.Command{Use: "gc"}
-				root.AddCommand(cmd)
-			}
-			var err error
-			if !test.lexicalOnly && commandUsesSemanticModel(cmd) {
-				_, err = lateOnForcedProvider()
-			}
-			if (err != nil) != test.wantErr {
-				t.Fatalf("error = %v, want an error: %t", err, test.wantErr)
+			root := newQuietRootCmd()
+			root.SetArgs(test.args)
+			if err := root.Execute(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
 			}
 		})
 	}

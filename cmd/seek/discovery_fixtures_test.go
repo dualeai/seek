@@ -1,37 +1,10 @@
 package main
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
-
-	"golang.org/x/sync/errgroup"
 )
-
-// newTestPool constructs a corpusPool ready for direct Enqueue /
-// discoverNestedGit testing. Caller supplies the worker (production
-// callers use prepareAndSearchCorpus via a closure; tests typically
-// pass a no-op or assertion-emitting body). bufferSize sizes the
-// resultsCh. Direct pool tests should size it for the plans they enqueue;
-// production runCorpusPool drains concurrently while workers run.
-func newTestPool(t *testing.T, worker corpusWorkerFunc, bufferSize int) (*corpusPool, *errgroup.Group) {
-	t.Helper()
-	g, gctx := errgroup.WithContext(t.Context())
-	pool := &corpusPool{
-		g:           g,
-		gctx:        gctx,
-		resultsCh:   make(chan corpusPoolResult, bufferSize),
-		worker:      worker,
-		workerSlots: make(chan struct{}, corpusWorkerCap),
-	}
-	return pool, g
-}
-
-// noopPoolWorker lets tests exercise enqueue and deduplication without indexing.
-func noopPoolWorker(_ context.Context, _ corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
-	return nil, nil, nil
-}
 
 // writeGitTriadAt creates the structural minimum a git repo needs to
 // satisfy hasGitTriad: HEAD (regular file) + objects/ (dir) + refs/
@@ -56,10 +29,23 @@ func writeGitTriadAt(t testing.TB, gitDir string) {
 	}
 }
 
+// writeSubmoduleGitDir creates a submodule Git directory whose core.worktree
+// names worktree, the way Git writes it in a superproject.
+func writeSubmoduleGitDir(t testing.TB, gitDir, worktree string) {
+	t.Helper()
+	writeGitTriadAt(t, gitDir)
+	rel, err := filepath.Rel(gitDir, worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "config"), []byte("[core]\n\tworktree = "+rel+"\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+}
+
 // writeMinimalGitRepo creates a working-tree directory containing a
 // valid `.git/` triad. Equivalent to writeGitTriadAt(t, filepath.Join(
-// repoDir, ".git")) but takes the working-tree root, which is what
-// callers asserting walker discovery typically have on hand.
+// repoDir, ".git")) but takes the working-tree root.
 func writeMinimalGitRepo(t *testing.T, repoDir string) {
 	t.Helper()
 	writeGitTriadAt(t, filepath.Join(repoDir, ".git"))

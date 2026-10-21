@@ -1,11 +1,11 @@
 package main
 
 import (
-	"errors"
 	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -163,7 +163,7 @@ func TestNativeGitSHA256FullAndDelta(t *testing.T) {
 		t.Fatalf("build SHA-256 delta: %v", err)
 	}
 	fullDir := t.TempDir()
-	if err := indexNativeGitFull(t.Context(), paths.RepoDir, fullDir, target, nil, 1); err != nil {
+	if err := indexNativeGitFull(t.Context(), paths.RepoDir, fullDir, target, 1, nil); err != nil {
 		t.Fatalf("build SHA-256 full: %v", err)
 	}
 	if got, want := nativeVisibleDocuments(t, deltaDir), nativeVisibleDocuments(t, fullDir); !slices.Equal(got, want) {
@@ -174,13 +174,21 @@ func TestNativeGitSHA256FullAndDelta(t *testing.T) {
 
 func TestNativeGitRepositoryIgnoresOriginHosting(t *testing.T) {
 	requireTools(t)
-	repoDir := initEmptyGitRepo(t)
+	repoDir := initEmptyGitRepoNoRemote(t)
 	if err := os.WriteFile(filepath.Join(repoDir, "main.go"), []byte("package main\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitRunIn(t, repoDir, "add", ".")
 	gitRunIn(t, repoDir, "commit", "-m", "origin")
 	snapshot := captureHeadForTest(t, repoDir)
+	// The oracle is the metadata of the same commit with no origin.
+	want, err := nativeGitRepository(t.Context(), repoDir, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want.URL != "" || want.CommitURLTemplate != "" || want.FileURLTemplate != "" || want.Rank != 0 || want.RawConfig != nil {
+		t.Fatalf("metadata with no origin and no zoekt config=%+v, want no URL, templates, rank, or raw config", want)
+	}
 	for _, origin := range []string{
 		"git@github.com:sourcegraph/zoekt.git",
 		"https://gitlab.example/group/repo.git",
@@ -191,16 +199,22 @@ func TestNativeGitRepositoryIgnoresOriginHosting(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if repository.Name != fallbackGitRepositoryName(repoDir) || repository.URL != "" ||
-			repository.CommitURLTemplate != "" || repository.FileURLTemplate != "" || repository.Rank != 0 {
-			t.Fatalf("origin %q changed provider-neutral metadata: %+v", origin, repository)
+		if !reflect.DeepEqual(repository, want) {
+			t.Fatalf("origin %q changed provider-neutral metadata:\ngot  %+v\nwant %+v", origin, repository, want)
 		}
 	}
 }
 
 func TestNativeGitRepositoryNormalizesConfigKeys(t *testing.T) {
 	requireTools(t)
-	repoDir := initGitRepo(t, "main.go", "package main\n")
+	repoDir := initEmptyGitRepo(t)
+	if err := os.WriteFile(filepath.Join(repoDir, "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repoDir, "add", ".")
+	t.Setenv("GIT_AUTHOR_DATE", "2026-01-15T12:00:00Z")
+	t.Setenv("GIT_COMMITTER_DATE", "2026-01-15T12:00:00Z")
+	gitRunIn(t, repoDir, "commit", "-m", "fixed date")
 	gitRunIn(t, repoDir, "config", "zoekt.name", "case-test")
 	gitRunIn(t, repoDir, "config", "zoekt.tenantID", "17")
 	gitRunIn(t, repoDir, "config", "zoekt.latestCommitDate", "1")
@@ -213,7 +227,8 @@ func TestNativeGitRepositoryNormalizesConfigKeys(t *testing.T) {
 		"tenantid":         "17",
 		"latestcommitdate": "1",
 	}
-	wantRank := nativeGitCommitRank(repository.LatestCommitDate)
+	// Zoekt's month rank: (2026-1970)*12 + (January-1) = 672.
+	const wantRank = 672
 	if repository.TenantID != 17 || repository.Rank != wantRank || !maps.Equal(repository.RawConfig, want) {
 		t.Fatalf("tenant=%d rank=%d raw config=%v, want rank=%d config=%v", repository.TenantID, repository.Rank, repository.RawConfig, wantRank, want)
 	}
@@ -234,13 +249,19 @@ func TestNativeGitRepositoryConfigDoesNotRequireOrigin(t *testing.T) {
 	}
 	gitRunIn(t, repoDir, "add", ".")
 	gitRunIn(t, repoDir, "commit", "-m", "no origin")
-	gitRunIn(t, repoDir, "config", "zoekt.repoid", "42")
-	repository, err := nativeGitRepository(t.Context(), repoDir, captureHeadForTest(t, repoDir))
+	snapshot := captureHeadForTest(t, repoDir)
+	// The name with no zoekt config is the oracle: zoekt.repoid sets no name.
+	unconfigured, err := nativeGitRepository(t.Context(), repoDir, snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if repository.Name != fallbackGitRepositoryName(repoDir) || repository.ID != 42 || repository.RawConfig["repoid"] != "42" {
-		t.Fatalf("no-origin repository=%+v", repository)
+	gitRunIn(t, repoDir, "config", "zoekt.repoid", "42")
+	repository, err := nativeGitRepository(t.Context(), repoDir, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repository.Name == "" || repository.Name != unconfigured.Name || repository.ID != 42 || repository.RawConfig["repoid"] != "42" {
+		t.Fatalf("no-origin repository=%+v, want name %q", repository, unconfigured.Name)
 	}
 }
 
@@ -290,7 +311,7 @@ func TestNativeGitFullRotatesBuilderWindows(t *testing.T) {
 	}()
 
 	indexDir := t.TempDir()
-	if err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, nil, 1); err != nil {
+	if err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, 1, nil); err != nil {
 		t.Fatalf("native full: %v", err)
 	}
 	shards, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
@@ -317,7 +338,7 @@ func TestReadNativeGitTreeEmptyAndRepeatedBlob(t *testing.T) {
 	gitRunIn(t, repoDir, "commit", "--allow-empty", "-m", "empty")
 	empty := captureHeadForTest(t, repoDir)
 	count := 0
-	if err := readNativeGitTree(t.Context(), repoDir, empty, nil, func(entries []gitTreeEntry) error {
+	if err := readNativeGitTree(t.Context(), repoDir, empty, func(entries []gitTreeEntry) error {
 		count += len(entries)
 		return nil
 	}); err != nil || count != 0 {
@@ -338,7 +359,7 @@ func TestReadNativeGitTreeEmptyAndRepeatedBlob(t *testing.T) {
 	gitRunIn(t, repoDir, "commit", "-m", "repeated blob")
 	snapshot := captureHeadForTest(t, repoDir)
 	var entries []gitTreeEntry
-	if err := readNativeGitTree(t.Context(), repoDir, snapshot, nil, func(chunk []gitTreeEntry) error {
+	if err := readNativeGitTree(t.Context(), repoDir, snapshot, func(chunk []gitTreeEntry) error {
 		entries = append(entries, chunk...)
 		return nil
 	}); err != nil {
@@ -349,14 +370,13 @@ func TestReadNativeGitTreeEmptyAndRepeatedBlob(t *testing.T) {
 	}
 }
 
-func TestNativeGitFullScopeUsesRootIgnoreAndExclusions(t *testing.T) {
+func TestNativeGitFullUsesRootIgnore(t *testing.T) {
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
 	for name, content := range map[string]string{
 		".sourcegraph/ignore": "scope/ignored.go\n",
 		"scope/keep.go":       "package keep\n// SCOPE_KEEP\n",
 		"scope/ignored.go":    "package ignored\n// SCOPE_IGNORED\n",
-		"scope/excluded.go":   "package excluded\n// SCOPE_EXCLUDED\n",
 		"other/out.go":        "package out\n// SCOPE_OUT\n",
 	} {
 		path := filepath.Join(repoDir, name)
@@ -370,13 +390,12 @@ func TestNativeGitFullScopeUsesRootIgnoreAndExclusions(t *testing.T) {
 	gitRunIn(t, repoDir, "add", ".")
 	gitRunIn(t, repoDir, "commit", "-m", "scope")
 	snapshot := captureHeadForTest(t, repoDir)
-	scope := &gitDirtyScope{includeDirs: []string{"scope"}, excludeFiles: []string{"scope/excluded.go"}}
 	indexDir := t.TempDir()
-	if err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, scope, 1); err != nil {
-		t.Fatalf("scoped native full: %v", err)
+	if err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, 1, nil); err != nil {
+		t.Fatalf("native full: %v", err)
 	}
-	if got, want := zoektIndexedPaths(t, indexDir), []string{"scope/keep.go"}; !slices.Equal(got, want) {
-		t.Fatalf("scoped paths=%v, want %v", got, want)
+	if got, want := zoektIndexedPaths(t, indexDir), []string{".sourcegraph/ignore", "other/out.go", "scope/keep.go"}; !slices.Equal(got, want) {
+		t.Fatalf("paths=%v, want %v", got, want)
 	}
 }
 
@@ -402,59 +421,5 @@ func TestReadNativeGitIgnoreRejectsOversizeControlFile(t *testing.T) {
 	}()
 	if err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("error=%v", err)
-	}
-}
-
-func TestNativeGitBudgetCountsIgnoredBlobs(t *testing.T) {
-	requireTools(t)
-	repoDir := initEmptyGitRepo(t)
-	if err := os.MkdirAll(filepath.Join(repoDir, ".sourcegraph"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repoDir, ".sourcegraph", "ignore"), []byte("ignored.go\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repoDir, "ignored.go"), []byte("package ignored\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitRunIn(t, repoDir, "add", ".")
-	gitRunIn(t, repoDir, "commit", "-m", "ignored budget")
-
-	oldFiles := gitCandidateFileLimit
-	gitCandidateFileLimit = 1
-	t.Cleanup(func() { gitCandidateFileLimit = oldFiles })
-	err := indexNativeGitFull(t.Context(), repoDir, t.TempDir(), captureHeadForTest(t, repoDir), nil, 1)
-	if !errors.Is(err, errGitCommittedCapExceeded) {
-		t.Fatalf("error=%v, want committed candidate cap", err)
-	}
-}
-
-func TestNativeGitBudgetCountsIgnoredBlobBytes(t *testing.T) {
-	requireTools(t)
-	repoDir := initEmptyGitRepo(t)
-	if err := os.MkdirAll(filepath.Join(repoDir, ".sourcegraph"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	ignoreContent := []byte("ignored.go\n")
-	ignoredContent := []byte("package ignored\n")
-	if err := os.WriteFile(filepath.Join(repoDir, ".sourcegraph", "ignore"), ignoreContent, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repoDir, "ignored.go"), ignoredContent, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitRunIn(t, repoDir, "add", ".")
-	gitRunIn(t, repoDir, "commit", "-m", "ignored byte budget")
-
-	oldBytes := gitCorpusIndexedByteLimit
-	gitCorpusIndexedByteLimit = int64(len(ignoreContent) + len(ignoredContent) - 1)
-	t.Cleanup(func() { gitCorpusIndexedByteLimit = oldBytes })
-	err := indexNativeGitFull(t.Context(), repoDir, t.TempDir(), captureHeadForTest(t, repoDir), nil, 1)
-	if !errors.Is(err, errGitCommittedCapExceeded) {
-		t.Fatalf("error=%v, want committed byte cap", err)
-	}
-	capErr, ok := errors.AsType[indexCapExceededError](err)
-	if !ok || capErr.metric != indexCapIndexedBytes {
-		t.Fatalf("error=%v, want indexed-byte cap", err)
 	}
 }

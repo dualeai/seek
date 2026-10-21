@@ -11,38 +11,25 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
-
-	"github.com/sourcegraph/zoekt"
 )
 
 type hybridTestScorer struct {
-	packCalls      atomic.Int32
-	prepareCalls   atomic.Int32
-	embedCalls     atomic.Int32
-	scoreCalls     atomic.Int32
-	closeCalls     atomic.Int32
-	embedErr       error
-	prepareErr     error
-	scoreErr       error
-	queryTruncated bool
-	vectorForUnit  func(semanticUnit) semanticVector
-	queryVector    *semanticVector
-	mu             sync.Mutex
-	documents      []rerankDocument
-	embeddedPaths  []string
-}
-
-func (scorer *hybridTestScorer) PackSemanticUnits(
-	_ context.Context,
-	units []semanticUnit,
-) ([]semanticUnit, error) {
-	scorer.packCalls.Add(1)
-	return units, nil
+	prepareCalls  atomic.Int32
+	embedCalls    atomic.Int32
+	scoreCalls    atomic.Int32
+	closeCalls    atomic.Int32
+	embedErr      error
+	prepareErr    error
+	scoreErr      error
+	vectorForUnit func(semanticUnit) semanticVector
+	queryVector   *semanticVector
+	mu            sync.Mutex
+	documents     []rerankDocument
+	embeddedPaths []string
 }
 
 func runHybridTestSearch(
@@ -54,12 +41,6 @@ func runHybridTestSearch(
 ) (string, error) {
 	t.Helper()
 	runConfig := searchRunConfig{policy: policy, newModel: newModel}
-	if policy.semanticEnabled() {
-		// These tests isolate joined retrieval and index behavior. Process tests
-		// cover the calibrated production policies.
-		runConfig.rerankAcceptance = alwaysAcceptRerankPolicyForTest()
-		runConfig.hybridAcceptance = alwaysAcceptRerankPolicyForTest()
-	}
 	return captureStdout(t, func() error {
 		return runSearchCommand(
 			t.Context(),
@@ -79,19 +60,6 @@ func (scorer *hybridTestScorer) Scores(
 	documents []rerankDocument,
 ) ([]float32, error) {
 	return scoreWithTestSemanticEmbedder(ctx, scorer, query, documents)
-}
-
-func assertIndexOnlyModelCalls(t *testing.T, scorer *hybridTestScorer) {
-	t.Helper()
-	if scorer.embedCalls.Load() == 0 || scorer.prepareCalls.Load() != 0 ||
-		scorer.scoreCalls.Load() != 0 {
-		t.Fatalf(
-			"model calls embed=%d prepare=%d score=%d",
-			scorer.embedCalls.Load(),
-			scorer.prepareCalls.Load(),
-			scorer.scoreCalls.Load(),
-		)
-	}
 }
 
 func (scorer *hybridTestScorer) EmbedSemanticUnits(
@@ -137,7 +105,6 @@ func (scorer *hybridTestScorer) PrepareSemanticQuery(
 		tokens:     make([]float32, lateOnSequenceLength*semanticEmbeddingDimensions),
 		scoreMask:  make([]bool, lateOnSequenceLength),
 		modelQuery: query,
-		truncated:  scorer.queryTruncated,
 	}
 	if scorer.queryVector == nil {
 		prepared.tokens[0] = 1
@@ -176,120 +143,6 @@ func (scorer *hybridTestScorer) Close() error {
 
 func (*hybridTestScorer) SemanticCallCPUs(context.Context) int { return 1 }
 
-func TestBuildHybridRerankCandidatesProtectsBothBranches(t *testing.T) {
-	strict := []corpusSearchResult{rerankTestResult("lex-00.go", 100)}
-	relaxed := make([]corpusSearchResult, rerankCandidateLimit)
-	semantic := make([]semanticFileCandidate, rerankCandidateLimit)
-	for index := range rerankCandidateLimit {
-		relaxed[index] = rerankTestResult(
-			"lex-"+twoDigitTestNumber(index)+".go",
-			float64(rerankCandidateLimit-index),
-		)
-		semantic[index] = semanticFileCandidate{
-			result:   rerankTestResult("sem-"+twoDigitTestNumber(index)+".go", 0),
-			document: rerankDocument{Text: "semantic " + twoDigitTestNumber(index)},
-		}
-	}
-
-	candidates := buildHybridRerankCandidates(strict, relaxed, semantic)
-	if len(candidates) != rerankCandidateLimit {
-		t.Fatalf("candidate count=%d, want %d", len(candidates), rerankCandidateLimit)
-	}
-	lexicalCount, semanticCount := 0, 0
-	for _, candidate := range candidates {
-		switch {
-		case strings.HasPrefix(candidate.result.file.FileName, "lex-"):
-			lexicalCount++
-		case strings.HasPrefix(candidate.result.file.FileName, "sem-"):
-			semanticCount++
-			if !candidate.hasDocument || candidate.lexicalRank != hybridMissingLexicalRank {
-				t.Fatalf("semantic-only candidate=%+v", candidate)
-			}
-		}
-	}
-	if lexicalCount != hybridBranchQuota || semanticCount != hybridBranchQuota {
-		t.Fatalf("branch counts lexical=%d semantic=%d, want %d each",
-			lexicalCount, semanticCount, hybridBranchQuota)
-	}
-}
-
-func TestBuildHybridRerankCandidatesUsesCheckedUnitForLexicalFile(t *testing.T) {
-	lexical := rerankTestResult("shared.go", 10)
-	semanticResult := rerankTestResult("shared.go", 0)
-	semanticResult.file.LineMatches[0].Line = []byte("semantic evidence\n")
-	candidates := buildHybridRerankCandidates(
-		nil,
-		[]corpusSearchResult{lexical, rerankTestResult("other.go", 9)},
-		[]semanticFileCandidate{{
-			result:   semanticResult,
-			document: rerankDocument{Text: "checked source unit"},
-		}},
-	)
-	if len(candidates) != 2 {
-		t.Fatalf("candidate count=%d, want 2", len(candidates))
-	}
-	shared := candidates[0]
-	if shared.result.file.Score != lexical.file.Score ||
-		string(shared.result.file.LineMatches[0].Line) != string(lexical.file.LineMatches[0].Line) {
-		t.Fatalf("semantic overlap replaced lexical display: %+v", shared.result.file)
-	}
-	if !shared.hasDocument || shared.document.Text != "checked source unit" || shared.lexicalRank != 1 {
-		t.Fatalf("semantic overlap did not replace score input: %+v", shared)
-	}
-}
-
-func TestBuildHybridRerankCandidatesRestoresOnlyCanonicalTailRank(t *testing.T) {
-	for _, test := range []struct {
-		name            string
-		position        int
-		strictOnly      bool
-		differentCorpus bool
-		wantRank        int
-	}{
-		{name: "known tail", position: 92, wantRank: 93},
-		{name: "displaced from canonical list", position: 127, strictOnly: true, wantRank: hybridMissingLexicalRank},
-		{name: "same name in another corpus", position: 92, differentCorpus: true, wantRank: hybridMissingLexicalRank},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			relaxed := make([]corpusSearchResult, rerankCandidateLimit)
-			for i := range relaxed {
-				relaxed[i] = rerankTestResult(fmt.Sprintf("lex-%03d.go", i), float64(1000-i))
-			}
-			var strict []corpusSearchResult
-			if test.strictOnly {
-				strict = []corpusSearchResult{rerankTestResult("strict-only.go", 1001)}
-			}
-			semantic := make([]semanticFileCandidate, hybridBranchQuota)
-			for i := range semantic {
-				semantic[i] = semanticFileCandidate{
-					result:   rerankTestResult(fmt.Sprintf("sem-%03d.go", i), 0.5),
-					document: rerankDocument{Text: fmt.Sprintf("checked semantic source %d", i)},
-				}
-			}
-			semantic[0].result.file.FileName = relaxed[test.position].file.FileName
-			if test.differentCorpus {
-				semantic[0].result.corpusID = "another-corpus"
-			}
-			got := buildHybridRerankCandidates(strict, relaxed, semantic)
-			if len(got) != rerankCandidateLimit {
-				t.Fatalf("candidate count=%d, want %d", len(got), rerankCandidateLimit)
-			}
-			want := rerankCandidate{
-				result: semantic[0].result, lexicalRank: test.wantRank,
-				document: semantic[0].document, hasDocument: true,
-			}
-			if !reflect.DeepEqual(got[hybridBranchQuota], want) {
-				t.Fatalf("tail candidate changed beyond rank: got=%+v want=%+v", got[hybridBranchQuota], want)
-			}
-			for i := 1; i < len(semantic); i++ {
-				if got[hybridBranchQuota+i].result.file.FileName != semantic[i].result.file.FileName {
-					t.Fatalf("semantic position %d changed", i)
-				}
-			}
-		})
-	}
-}
-
 func TestMaterializeSemanticCandidatesChecksCommittedBytes(t *testing.T) {
 	requireTools(t)
 	const content = "package sample\n\nfunc ServeRequest() {\n\t// checked semantic evidence\n}\n"
@@ -303,7 +156,7 @@ func TestMaterializeSemanticCandidatesChecksCommittedBytes(t *testing.T) {
 	units[0].row = 0
 	units[0].text = nil
 	generation := &semanticGeneration{rows: units}
-	selected, err := selectSemanticFileCandidates(
+	selected, err := semanticHitFiles(
 		generation,
 		[]semanticHit{{row: 0, score: 0.75}},
 	)
@@ -335,7 +188,7 @@ func TestMaterializeSemanticCandidatesChecksCommittedBytes(t *testing.T) {
 
 	broken := &semanticGeneration{rows: append([]semanticUnit(nil), generation.rows...)}
 	broken.rows[0].contentID = semanticContentID(sha256.Sum256([]byte("different")))
-	brokenSelected, err := selectSemanticFileCandidates(
+	brokenSelected, err := semanticHitFiles(
 		broken,
 		[]semanticHit{{row: 0, score: 1}},
 	)
@@ -349,46 +202,11 @@ func TestMaterializeSemanticCandidatesChecksCommittedBytes(t *testing.T) {
 	}
 }
 
-func TestSelectHybridSemanticCandidatesSkipsUnusedFiles(t *testing.T) {
-	plan := corpusPlan{id: "test", kind: corpusKindFolder}
-	strict := []zoekt.FileMatch{{FileName: "lex-000.go", Score: 200}}
-	relaxed := make([]zoekt.FileMatch, rerankCandidateLimit)
-	semantic := make([]semanticFileCandidate, rerankCandidateLimit)
-	for index := range rerankCandidateLimit {
-		relaxed[index] = zoekt.FileMatch{
-			FileName: fmt.Sprintf("lex-%03d.go", index),
-			Score:    float64(rerankCandidateLimit - index),
-		}
-		semantic[index].unit.path = fmt.Sprintf("sem-%03d.go", index)
-	}
-
-	selected := selectHybridSemanticCandidates(plan, strict, relaxed, semantic)
-	if len(selected) != hybridBranchQuota {
-		t.Fatalf("selected semantic files=%d, want %d", len(selected), hybridBranchQuota)
-	}
-	for index, candidate := range selected {
-		want := fmt.Sprintf("sem-%03d.go", index)
-		if candidate.unit.path != want {
-			t.Fatalf("selected semantic file %d=%q, want %q", index, candidate.unit.path, want)
-		}
-	}
-
-	for index := range semantic {
-		semantic[index].unit.path = relaxed[index].FileName
-	}
-	selected = selectHybridSemanticCandidates(plan, strict, relaxed, semantic)
-	// The last lexical file fills the batch before its semantic duplicate is
-	// visited, so that file uses lexical evidence and needs no source read.
-	if len(selected) != rerankCandidateLimit-1 {
-		t.Fatalf("overlapping semantic files=%d, want %d", len(selected), rerankCandidateLimit-1)
-	}
-}
-
 func TestRunDefaultJoinedSearchAddsSemanticOnlyFile(t *testing.T) {
 	requireTools(t)
 	repo := initEmptyGitRepo(t)
 	writeFileAt(t, repo, "strict.go", "package sample\n// alpha beta\n")
-	for index := range rerankCandidateLimit {
+	for index := range semanticModelBatchRows {
 		writeFileAt(t, repo, fmt.Sprintf("lex-%02d.go", index),
 			"package sample\n// alpha lexical candidate\n")
 	}
@@ -452,88 +270,12 @@ func TestRunDefaultJoinedSearchAddsSemanticOnlyFile(t *testing.T) {
 	}
 }
 
-func TestRunJoinedAcceptanceRejectionDoesNotUseLexicalFallback(t *testing.T) {
-	requireTools(t)
-	t.Chdir(t.TempDir())
-	folder := t.TempDir()
-	writeFileAt(t, folder, "alpha.go", "package sample\n// alpha only\n")
-	writeFileAt(t, folder, "beta.go", "package sample\n// beta only\n")
-	setTestUserCache(t)
-
-	scorer := &hybridTestScorer{}
-	output, err := captureStdout(t, func() error {
-		return runSearchCommand(
-			t.Context(),
-			"alpha beta",
-			[]string{folder},
-			0,
-			0,
-			defaultSearchConfig(),
-			searchRunConfig{
-				policy:           defaultSearchPolicy(),
-				hybridAcceptance: newRerankAcceptancePolicy(0.6),
-				newModel: func(context.Context) (semanticModel, error) {
-					return scorer, nil
-				},
-			},
-		)
-	})
-	if !errors.Is(err, errNoMatch) || output != "" {
-		t.Fatalf("joined rejection output=%q error=%v, want no match", output, err)
-	}
-	if scorer.scoreCalls.Load() != 1 {
-		t.Fatalf("joined score calls=%d, want 1", scorer.scoreCalls.Load())
-	}
-}
-
-func TestRunJoinedTruncatedQuerySkipsExpansionBranches(t *testing.T) {
-	requireTools(t)
-	t.Chdir(t.TempDir())
-	folder := t.TempDir()
-	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
-	writeFileAt(t, folder, "relaxed.go", "package sample\n// alpha only\n")
-	setTestUserCache(t)
-	planFolderTestCorpus(t, folder)
-
-	// Seed with a re-rank eligible description so the generation exists before
-	// the truncated query runs. A one-word seed builds nothing now.
-	if _, err := runHybridTestSearch(
-		t,
-		"alpha beta sample",
-		[]string{folder},
-		defaultSearchPolicy(),
-		func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil },
-	); err != nil {
-		t.Fatal(err)
-	}
-	scorer := &hybridTestScorer{queryTruncated: true}
-	output, err := runHybridTestSearch(
-		t,
-		"alpha beta",
-		[]string{folder},
-		defaultSearchPolicy(),
-		func(context.Context) (semanticModel, error) { return scorer, nil },
-	)
-	if err != nil || !strings.Contains(output, "strict.go") || strings.Contains(output, "relaxed.go") {
-		t.Fatalf("truncated joined output=%q error=%v", output, err)
-	}
-	if scorer.prepareCalls.Load() != 1 || scorer.scoreCalls.Load() != 0 ||
-		scorer.embedCalls.Load() != 0 {
-		t.Fatalf(
-			"model calls: prepare=%d score=%d embed=%d, want 1, 0, 0",
-			scorer.prepareCalls.Load(),
-			scorer.scoreCalls.Load(),
-			scorer.embedCalls.Load(),
-		)
-	}
-}
-
 func TestRunDefaultFolderJoinedSearchAddsSemanticOnlyFile(t *testing.T) {
 	requireTools(t)
 	t.Chdir(t.TempDir())
 	folder := t.TempDir()
 	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
-	for index := range rerankCandidateLimit {
+	for index := range semanticModelBatchRows {
 		writeFileAt(t, folder, fmt.Sprintf("lex-%02d.go", index),
 			"package sample\n// alpha lexical candidate\n")
 	}
@@ -548,7 +290,7 @@ func TestRunDefaultFolderJoinedSearchAddsSemanticOnlyFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output, "## semantic.go") ||
+	if !strings.Contains(output, "## "+filepath.Join(folder, "semantic.go")) ||
 		!strings.Contains(output, "SEMANTIC_TARGET") {
 		t.Fatalf("joined folder output omitted the semantic-only file:\n%s", output)
 	}
@@ -561,77 +303,13 @@ func TestRunDefaultFolderJoinedSearchAddsSemanticOnlyFile(t *testing.T) {
 	}
 }
 
-func TestHybridEarlyReturnOwnsQuery(t *testing.T) {
-	requireTools(t)
-	for _, kind := range []string{"git", "folder"} {
-		for _, setupError := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/error=%t", kind, setupError), func(t *testing.T) {
-				root := t.TempDir()
-				if kind == "git" {
-					root = initEmptyGitRepo(t)
-					gitRunIn(t, root, "commit", "--allow-empty", "-m", "empty corpus")
-				}
-				setTestUserCache(t)
-				paths, err := resolveDefaultSearchRoot(t.Context(), []string{root})
-				if err != nil {
-					t.Fatal(err)
-				}
-				plans, err := planCorpora(t.Context(), paths, []string{root})
-				if err != nil || len(plans) != 1 {
-					t.Fatalf("plans=%d error=%v", len(plans), err)
-				}
-				if setupError {
-					blocker := filepath.Join(t.TempDir(), "file")
-					if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
-						t.Fatal(err)
-					}
-					plans[0].cacheDir = filepath.Join(blocker, "cache")
-					plans[0].indexDir = filepath.Join(plans[0].cacheDir, "index")
-				}
-				rawQ, userQ, err := parseSearchQueryForms("alpha beta")
-				if err != nil {
-					t.Fatal(err)
-				}
-				rerankPlan, eligible := planRerankQuery("alpha beta", rawQ)
-				if !eligible {
-					t.Fatal("fixture query is not eligible")
-				}
-				release := make(chan struct{})
-				scorer := &waitingQueryScorer{release: release}
-				future := newSemanticModelFuture(func(context.Context) (semanticModel, error) {
-					return scorer, nil
-				})
-				defer func() {
-					close(release)
-					if err := future.Close(); err != nil {
-						t.Error(err)
-					}
-					if scorer.prepareCalls.Load() != 1 || scorer.closeCalls.Load() != 1 {
-						t.Errorf("calls prepare=%d close=%d", scorer.prepareCalls.Load(), scorer.closeCalls.Load())
-					}
-				}()
-				execution := searchExecution{
-					policy: defaultSearchPolicy(), model: future, prepareVectors: true,
-					resources: liveSearchResources(), acceptance: alwaysAcceptRerankPolicyForTest(),
-				}
-				_, _, used, err := tryHybridSearch(t.Context(), plans, paths, userQ, defaultSearchConfig(), rerankPlan, execution)
-				// The deferred check proves ownership: Close waits for the started
-				// query, which then runs once and closes the model once.
-				if (err != nil) != setupError || used == setupError {
-					t.Fatalf("used=%t error=%v, want setup error=%t", used, err, setupError)
-				}
-			})
-		}
-	}
-}
-
 func TestRunDefaultJoinedSearchAppliesSemanticFilters(t *testing.T) {
 	requireTools(t)
 	t.Chdir(t.TempDir())
 	folder := t.TempDir()
 	writeFileAt(t, folder, "allowed/strict.go", "package sample\n// alpha beta\n")
 	writeFileAt(t, folder, "allowed/semantic.go",
-		"package sample\n// SEMANTIC_ALLOWED dispatches a request\n")
+		"package sample\n// SEMANTIC_TARGET SEMANTIC_ALLOWED dispatches a request\n")
 	writeFileAt(t, folder, "allowed/semantic_test.go",
 		"package sample\n// FILTERED_TEST_TARGET\n")
 	writeFileAt(t, folder, "allowed/semantic.py", "# FILTERED_LANGUAGE_TARGET\n")
@@ -654,7 +332,7 @@ func TestRunDefaultJoinedSearchAppliesSemanticFilters(t *testing.T) {
 	}
 	output, err := runHybridTestSearch(
 		t,
-		`alpha beta lang:go file:^allowed/ -file:_test\.go$`,
+		`alpha beta lang:go file:allowed/ -file:_test\.go$`,
 		[]string{folder},
 		defaultSearchPolicy(),
 		func(context.Context) (semanticModel, error) { return scorer, nil },
@@ -662,7 +340,7 @@ func TestRunDefaultJoinedSearchAppliesSemanticFilters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output, "## allowed/semantic.go") ||
+	if !strings.Contains(output, "## "+filepath.Join(folder, "allowed/semantic.go")) ||
 		!strings.Contains(output, "SEMANTIC_ALLOWED") {
 		t.Fatalf("filtered joined output omitted the allowed semantic file:\n%s", output)
 	}
@@ -688,7 +366,7 @@ func TestRunDefaultJoinedSearchAppliesSemanticFilters(t *testing.T) {
 	}
 }
 
-func TestRunDefaultFilteredNativeFailureUsesFilteredLexicalRerank(t *testing.T) {
+func TestRunDefaultFilteredNativeFailureRecoversExactly(t *testing.T) {
 	requireTools(t)
 	t.Chdir(t.TempDir())
 	folder := t.TempDir()
@@ -704,9 +382,14 @@ func TestRunDefaultFilteredNativeFailureUsesFilteredLexicalRerank(t *testing.T) 
 	writeFileAt(t, folder, "allowed/leak_test.go", "package sample\n// alpha beta TEST_LEAK\n")
 	writeFileAt(t, folder, "allowed/leak.py", "# alpha beta LANGUAGE_LEAK\n")
 	writeFileAt(t, folder, "blocked/leak.go", "package sample\n// alpha beta PATH_LEAK\n")
+	// Two files with no query word that only vectors find: only the exact
+	// recovery over the allowed rows can add the allowed one, and it must not
+	// add the blocked one.
+	writeFileAt(t, folder, "allowed/meaning.go", "package sample\n// SEMANTIC_TARGET dispatches a request\n")
+	writeFileAt(t, folder, "blocked/meaning.go", "package sample\n// SEMANTIC_TARGET SEMANTIC_PATH_LEAK\n")
 	plan := planFolderTestCorpus(t, folder)
 
-	// A re-rank eligible seed; a one-word query no longer builds a generation.
+	// A re-rank eligible seed builds the generation; a one-word query does not.
 	if _, err := runHybridTestSearch(
 		t,
 		"seed alpha beta",
@@ -726,16 +409,16 @@ func TestRunDefaultFilteredNativeFailureUsesFilteredLexicalRerank(t *testing.T) 
 		t.Fatal(err)
 	}
 	raw, _, err := parseSearchQueryForms(
-		`alpha beta lang:go file:^allowed/ -file:_test\.go$`,
+		`alpha beta lang:go file:allowed/ -file:_test\.go$`,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rerankPlan, ok := planRerankQuery("", raw)
+	rerankPlan, ok := planRerankQuery(raw)
 	if !ok || rerankPlan.semanticFilter == nil {
 		t.Fatal("filtered fallback query is not eligible")
 	}
-	mask, err := buildSemanticFilterMask(t.Context(), generation, rerankPlan.semanticFilter)
+	mask, err := buildSemanticFilterMask(t.Context(), generation, rerankPlan.semanticFilter.matches)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -752,7 +435,7 @@ func TestRunDefaultFilteredNativeFailureUsesFilteredLexicalRerank(t *testing.T) 
 	}
 	// Damage the graph, then refresh its manifest digest. This bypasses the
 	// open-time artifact check so the query reaches the native search error and
-	// filtered lexical fallback.
+	// the exact-vector recovery.
 	shardPath := filepath.Join(semanticDir, manifest.USearchFiles[0].Name)
 	shard, err := os.OpenFile(shardPath, os.O_WRONLY, 0)
 	if err != nil {
@@ -787,7 +470,7 @@ func TestRunDefaultFilteredNativeFailureUsesFilteredLexicalRerank(t *testing.T) 
 	logs := captureTestLogs(t, slog.LevelDebug)
 	output, err := runHybridTestSearch(
 		t,
-		`alpha beta lang:go file:^allowed/ -file:_test\.go$`,
+		`alpha beta lang:go file:allowed/ -file:_test\.go$`,
 		[]string{folder},
 		defaultSearchPolicy(),
 		func(context.Context) (semanticModel, error) { return scorer, nil },
@@ -795,10 +478,13 @@ func TestRunDefaultFilteredNativeFailureUsesFilteredLexicalRerank(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output, "## allowed/strict.go") {
+	if !strings.Contains(output, "## "+filepath.Join(folder, "allowed/strict.go")) {
 		t.Fatalf("filtered fallback omitted its strict result:\n%s", output)
 	}
-	for _, leak := range []string{"leak_test.go", "leak.py", "blocked/leak.go", "TEST_LEAK", "LANGUAGE_LEAK", "PATH_LEAK"} {
+	if !strings.Contains(output, "## "+filepath.Join(folder, "allowed/meaning.go")) {
+		t.Fatalf("exact recovery omitted the allowed semantic-only file:\n%s", output)
+	}
+	for _, leak := range []string{"leak_test.go", "leak.py", "blocked/leak.go", "blocked/meaning.go", "TEST_LEAK", "LANGUAGE_LEAK", "PATH_LEAK"} {
 		if strings.Contains(output, leak) {
 			t.Fatalf("filtered fallback contains %q:\n%s", leak, output)
 		}
@@ -815,15 +501,17 @@ func TestRunDefaultFilteredNativeFailureUsesFilteredLexicalRerank(t *testing.T) 
 		}
 	}
 	scorer.mu.Unlock()
-	foundFallbackLog := false
+	// The --verbose record proves that the damaged graph failed, so the
+	// semantic-only file above came from the exact recovery.
+	foundRecoveryLog := false
 	for _, record := range logs.Records() {
-		if record.Message == "Joined search failed; using the lexical path" {
-			foundFallbackLog = true
+		if record.Message == "Filtered USearch search failed; using exact vectors" {
+			foundRecoveryLog = true
 			break
 		}
 	}
-	if !foundFallbackLog {
-		t.Fatal("filtered native failure did not enter the lexical fallback")
+	if !foundRecoveryLog {
+		t.Fatal("filtered native failure did not recover with exact vectors")
 	}
 }
 
@@ -841,7 +529,7 @@ func TestRunDefaultJoinedSearchReturnsOneSemanticOnlyFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output, "## semantic.go") ||
+	if !strings.Contains(output, "## "+filepath.Join(folder, "semantic.go")) ||
 		!strings.Contains(output, "SEMANTIC_TARGET") {
 		t.Fatalf("single semantic-only result was omitted:\n%s", output)
 	}
@@ -850,10 +538,9 @@ func TestRunDefaultJoinedSearchReturnsOneSemanticOnlyFile(t *testing.T) {
 	}
 }
 
-// TestRunDefaultExactQuerySkipsJoinedIndex records the contract change: a
-// one-word or exact query is not re-rank eligible, so no route can read a
-// vector generation and the corpus must not build one. The lexical answer and
-// the warm-path behaviour must not change.
+// TestRunDefaultExactQuerySkipsJoinedIndex checks that a one-word or exact
+// query, which is not re-rank eligible, builds no vector generation and starts
+// no model, and that a warm search gives the same lexical answer.
 func TestRunDefaultExactQuerySkipsJoinedIndex(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
@@ -867,7 +554,7 @@ func TestRunDefaultExactQuerySkipsJoinedIndex(t *testing.T) {
 		return scorer, nil
 	}
 	output, err := runHybridTestSearch(t, "alpha", []string{folder}, defaultSearchPolicy(), newModel)
-	if err != nil || !strings.Contains(output, "## app.go") {
+	if err != nil || !strings.Contains(output, "## "+filepath.Join(folder, "app.go")) {
 		t.Fatalf("exact search: error=%v output=%q", err, output)
 	}
 	state, _, err := folderCorpusFingerprint(t.Context(), plan)
@@ -908,7 +595,7 @@ func TestRunDefaultRepairsDamagedSemanticGeneration(t *testing.T) {
 		output, err := runHybridTestSearch(t, "alpha sample package", []string{folder}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
 			return scorer, nil
 		})
-		if err != nil || !strings.Contains(output, "## app.go") {
+		if err != nil || !strings.Contains(output, "## "+filepath.Join(folder, "app.go")) {
 			t.Fatalf("exact search: error=%v output=%q", err, output)
 		}
 		return output
@@ -954,167 +641,6 @@ func TestRunDefaultRepairsDamagedSemanticGeneration(t *testing.T) {
 	}
 }
 
-// planOverCapScopedFixture builds the repository both over-cap scoped tests
-// use: one small in-scope file and one large out-of-scope file, with the index
-// byte limit lowered so the whole repository is over budget and only the scope
-// can be indexed. It returns the repository, its resolved paths, the single
-// scoped plan, and the scope directory.
-func planOverCapScopedFixture(t *testing.T) (string, gitPaths, corpusPlan, string) {
-	t.Helper()
-	requireTools(t)
-	repo := initGitRepo(t, "seed.go", "package seed\n")
-	inScope := "package small\n// OVERCAP_SEMANTIC_MARKER\n"
-	writeTrackedFile(t, repo, filepath.Join("small", "app.go"), inScope)
-	writeTrackedFile(
-		t,
-		repo,
-		filepath.Join("big", "huge.go"),
-		"package big\n"+strings.Repeat("x", len(inScope)*8),
-	)
-
-	oldLimit := gitCorpusIndexedByteLimit
-	gitCorpusIndexedByteLimit = int64(len(inScope) + 8)
-	t.Cleanup(func() { gitCorpusIndexedByteLimit = oldLimit })
-
-	setTestUserCache(t)
-	paths, err := resolveGitPaths(t.Context(), repo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	scope := filepath.Join(repo, "small")
-	plans, err := planGitOperands(t.Context(), paths, scope)
-	if err != nil || len(plans) != 1 {
-		t.Fatalf("plan scoped Git corpus: plans=%d error=%v", len(plans), err)
-	}
-	t.Chdir(repo)
-	return repo, paths, plans[0], scope
-}
-
-// TestRunDefaultOverCapScopedQuerySkipsJoinedIndex records the contract change:
-// a scoped search can never read the vector route, because hybridSearchEligible
-// rejects any plan that carries a scope. Building and binding a generation for
-// it was pure cost, so the end-to-end search must now skip it.
-//
-// The fallback's own build and rebind path is covered separately, by
-// TestScopedGitCorpusFallback_BuildsAndRebindsWhenAskedForVectors.
-func TestRunDefaultOverCapScopedQuerySkipsJoinedIndex(t *testing.T) {
-	repo, paths, plan, scope := planOverCapScopedFixture(t)
-
-	scorer := &hybridTestScorer{}
-	output, err := runHybridTestSearch(t, "OVERCAP_SEMANTIC_MARKER", []string{scope}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
-		return scorer, nil
-	})
-	if err != nil || !strings.Contains(output, "## small/app.go") {
-		t.Fatalf("over-cap scoped search: error=%v output=%q", err, output)
-	}
-	state := mustGitRepoStateIn(t, t.Context(), repo)
-	scopedState := repoStateForDirtyScope(state, plan.dirtyScope)
-	stateHash := scopedFallbackStateHash(paths, scopedState)
-	if joinedGenerationMatches(
-		plan.scopedCacheDir,
-		plan.scopedIndexDir,
-		stateHash,
-		state.HeadSHA,
-	) {
-		t.Fatal("scoped search built a joined generation that no route can read")
-	}
-	scorer.mu.Lock()
-	embeddedPaths := append([]string(nil), scorer.embeddedPaths...)
-	scorer.mu.Unlock()
-	if len(embeddedPaths) != 0 {
-		t.Fatalf("scoped search embedded %v for a route that rejects vectors", embeddedPaths)
-	}
-
-	// The scoped fallback's own semantic build and repair path is covered by
-	// TestScopedGitCorpusFallback_BuildsAndRebindsWhenAskedForVectors. It needs
-	// an execution that asks for vectors, which routing never produces for a
-	// scoped plan, so it does not belong in this end-to-end test.
-}
-
-// TestScopedGitCorpusFallback_BuildsAndRebindsWhenAskedForVectors covers the
-// scoped fallback's semantic build and descriptor repair by calling it
-// directly.
-//
-// Routing never asks a scoped corpus for vectors: hybridSearchEligible rejects
-// any plan that carries a scope, so searchExecution.prepareVectors is always
-// false here. This path is therefore defensive, and the test says so rather
-// than dressing a direct call up as an end-to-end search. If routing ever
-// admits scoped vectors, this is the test that already describes the contract.
-func TestScopedGitCorpusFallback_BuildsAndRebindsWhenAskedForVectors(t *testing.T) {
-	repo, paths, plan, _ := planOverCapScopedFixture(t)
-
-	state := mustGitRepoStateIn(t, t.Context(), repo)
-	scopedState := repoStateForDirtyScope(state, plan.dirtyScope)
-	stateHash := scopedFallbackStateHash(paths, scopedState)
-
-	buildScorer := &hybridTestScorer{}
-	buildExecution := testSemanticSearchExecution(t, func(context.Context) (semanticModel, error) {
-		return buildScorer, nil
-	})
-	buildPlan := plan
-	if _, builtState, err := ensureScopedGitCorpusFallback(
-		t.Context(),
-		&buildPlan,
-		paths,
-		state,
-		buildExecution,
-	); err != nil || builtState != corpusSearchable {
-		t.Fatalf("build scoped joined generation: state=%d error=%v", builtState, err)
-	}
-	if !joinedGenerationMatches(
-		plan.scopedCacheDir,
-		plan.scopedIndexDir,
-		stateHash,
-		state.HeadSHA,
-	) {
-		t.Fatal("the scoped fallback did not build a joined generation when asked")
-	}
-	// The scoped build must embed only in-scope files. The end-to-end half no
-	// longer builds anything, so this is the only place that still checks it.
-	buildScorer.mu.Lock()
-	scopedPaths := append([]string(nil), buildScorer.embeddedPaths...)
-	buildScorer.mu.Unlock()
-	if len(scopedPaths) == 0 {
-		t.Fatal("the scoped semantic build embedded no paths")
-	}
-	for _, path := range scopedPaths {
-		if path != "small/app.go" {
-			t.Fatalf("the scoped semantic build embedded %q, which is out of scope", path)
-		}
-	}
-	// Index-time work only: the build must not prepare or score a query.
-	assertIndexOnlyModelCalls(t, buildScorer)
-
-	removeJoinedGeneration(plan.scopedCacheDir)
-	var repairFactoryCalls atomic.Int32
-	repairExecution := testSemanticSearchExecution(t, func(context.Context) (semanticModel, error) {
-		repairFactoryCalls.Add(1)
-		return &hybridTestScorer{}, nil
-	})
-	repairPlan := plan
-	_, repairedState, err := ensureScopedGitCorpusFallback(
-		t.Context(),
-		&repairPlan,
-		paths,
-		state,
-		repairExecution,
-	)
-	if err != nil || repairedState != corpusSearchable {
-		t.Fatalf("repair scoped joined descriptor: state=%d error=%v", repairedState, err)
-	}
-	if repairFactoryCalls.Load() != 0 {
-		t.Fatalf("descriptor repair started the model %d times", repairFactoryCalls.Load())
-	}
-	if !joinedGenerationMatches(
-		plan.scopedCacheDir,
-		plan.scopedIndexDir,
-		stateHash,
-		state.HeadSHA,
-	) {
-		t.Fatal("scoped repair did not bind the existing semantic generation")
-	}
-}
-
 func TestRunDefaultRerankFallbackLogsCause(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
@@ -1127,11 +653,11 @@ func TestRunDefaultRerankFallbackLogsCause(t *testing.T) {
 	output, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
 		return scorer, nil
 	})
-	if err != nil || !strings.Contains(output, "## strict.go") {
+	if err != nil || !strings.Contains(output, "## "+filepath.Join(folder, "strict.go")) {
 		t.Fatalf("fallback search: error=%v output=%q", err, output)
 	}
-	assertTestLogError(t, logs, "Re-ranking failed; using BM25", wantErr)
-	if scorer.embedCalls.Load() != 1 || scorer.prepareCalls.Load() != 1 || scorer.scoreCalls.Load() != 2 {
+	assertTestLogError(t, logs, "Model stages failed; using strict order", wantErr)
+	if scorer.embedCalls.Load() != 1 || scorer.prepareCalls.Load() != 1 || scorer.scoreCalls.Load() != 1 {
 		t.Fatalf("fallback calls embed=%d prepare=%d score=%d", scorer.embedCalls.Load(), scorer.prepareCalls.Load(), scorer.scoreCalls.Load())
 	}
 }
@@ -1154,11 +680,12 @@ func TestRunDefaultSemanticBuildFailureKeepsLexicalSearchAndCanRepair(t *testing
 	output, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
 		return scorer, nil
 	})
-	if err != nil || !strings.Contains(output, "## strict.go") || !strings.Contains(output, "## relaxed.go") {
+	// The node gives its strict hits; a relaxed match alone is no candidate.
+	if err != nil || !strings.Contains(output, "## "+filepath.Join(folder, "strict.go")) || strings.Contains(output, "## "+filepath.Join(folder, "relaxed.go")) {
 		t.Fatalf("semantic build fallback: error=%v output=%q; lexical control=%q", err, output, lexicalOutput)
 	}
 	// One failed build stops embedding; the query is still prepared and the
-	// lexical candidates are scored once, and the model is closed once.
+	// strict candidates are scored once, and the model is closed once.
 	if scorer.embedCalls.Load() != 1 || scorer.prepareCalls.Load() != 1 ||
 		scorer.scoreCalls.Load() != 1 || scorer.closeCalls.Load() != 1 {
 		t.Fatalf("fallback calls embed=%d prepare=%d score=%d close=%d",
@@ -1181,7 +708,7 @@ func TestRunDefaultSemanticBuildFailureKeepsLexicalSearchAndCanRepair(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(repairOutput, "## semantic.go") ||
+	if !strings.Contains(repairOutput, "## "+filepath.Join(folder, "semantic.go")) ||
 		!strings.Contains(repairOutput, "SEMANTIC_TARGET") {
 		t.Fatalf("repaired joined search omitted semantic result:\n%s", repairOutput)
 	}
@@ -1237,20 +764,25 @@ func TestRunDefaultSemanticQueryFailureUsesLexicalOutput(t *testing.T) {
 			lexicalOutput,
 		)
 	}
-	assertTestLogError(t, logs, "Joined search failed; using the lexical path", wantErr)
+	assertTestLogError(t, logs, "Model stages failed; using strict order", wantErr)
 	if scorer.embedCalls.Load() != 1 || scorer.prepareCalls.Load() != 1 || scorer.scoreCalls.Load() != 0 {
 		t.Fatalf("query failure calls embed=%d prepare=%d score=%d", scorer.embedCalls.Load(), scorer.prepareCalls.Load(), scorer.scoreCalls.Load())
 	}
 }
 
-func TestDirtyGitSearchSkipsVectorsAndRepairsWhenClean(t *testing.T) {
+// TestDirtyGitSearchUsesCommittedVectors searches a dirty work tree: the node
+// builds or reuses the generation of its commit, semantic retrieval finds a
+// clean file through it, the dirty file shows its uncommitted bytes, and the
+// next clean search embeds nothing new. The dirty bytes reach vectors through
+// the overlay.
+func TestDirtyGitSearchUsesCommittedVectors(t *testing.T) {
 	requireTools(t)
 	for _, seeded := range []bool{false, true} {
 		t.Run(fmt.Sprintf("existing-vectors=%t", seeded), func(t *testing.T) {
 			repo := initGitRepo(t, "app.go", "package sample\n// alpha beta\n")
-			writeFileAt(t, repo, "relaxed.go", "package sample\n// alpha\n")
+			writeFileAt(t, repo, "target.go", "package sample\n// SEMANTIC_TARGET dispatches the request\n")
 			gitRunIn(t, repo, "add", ".")
-			gitRunIn(t, repo, "commit", "-m", "second candidate")
+			gitRunIn(t, repo, "commit", "-m", "semantic target")
 			setTestUserCache(t)
 			if seeded {
 				if _, err := runHybridTestSearch(t, "alpha beta", []string{repo}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
@@ -1264,26 +796,29 @@ func TestDirtyGitSearchSkipsVectorsAndRepairsWhenClean(t *testing.T) {
 			out, err := runHybridTestSearch(t, "alpha beta", []string{repo}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
 				return dirty, nil
 			})
-			if err != nil || !strings.Contains(out, "DIRTY_MARKER") || !strings.Contains(out, "[uncommitted]") {
-				t.Fatalf("dirty output=%q error=%v", out, err)
+			if err != nil || !strings.Contains(out, "DIRTY_MARKER") || !strings.Contains(out, "[uncommitted]") ||
+				!strings.Contains(out, "## "+filepath.Join(repo, "target.go")) {
+				t.Fatalf("dirty output=%q error=%v, want the dirty file and the semantic target", out, err)
 			}
-			if dirty.packCalls.Load() != 0 || dirty.embedCalls.Load() != 0 || dirty.scoreCalls.Load() != 1 {
-				t.Fatalf("dirty calls pack=%d embed=%d score=%d", dirty.packCalls.Load(), dirty.embedCalls.Load(), dirty.scoreCalls.Load())
+			// The overlay embeds the dirty file; the committed base
+			// embeds once, before or here.
+			wantEmbeds := int32(2)
+			if seeded {
+				wantEmbeds = 1
+			}
+			if dirty.embedCalls.Load() != wantEmbeds || dirty.scoreCalls.Load() != 1 {
+				t.Fatalf("dirty calls embed=%d score=%d, want %d and 1", dirty.embedCalls.Load(), dirty.scoreCalls.Load(), wantEmbeds)
 			}
 			gitRunIn(t, repo, "checkout", "--", "app.go")
 			clean := &hybridTestScorer{}
 			out, err = runHybridTestSearch(t, "alpha beta", []string{repo}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
 				return clean, nil
 			})
-			if err != nil || !strings.Contains(out, "## app.go") || strings.Contains(out, "DIRTY_MARKER") {
+			if err != nil || !strings.Contains(out, "## "+filepath.Join(repo, "app.go")) || strings.Contains(out, "DIRTY_MARKER") {
 				t.Fatalf("clean output=%q error=%v", out, err)
 			}
-			wantEmbeds := int32(1)
-			if seeded {
-				wantEmbeds = 0
-			}
-			if clean.embedCalls.Load() != wantEmbeds {
-				t.Fatalf("next clean embeds=%d, want %d", clean.embedCalls.Load(), wantEmbeds)
+			if clean.embedCalls.Load() != 0 {
+				t.Fatalf("next clean embeds=%d, want 0", clean.embedCalls.Load())
 			}
 		})
 	}
@@ -1400,7 +935,7 @@ func TestLexicalOnlyFolderBuildStartsNoModelAndWritesNoSemanticData(t *testing.T
 		factoryCalls.Add(1)
 		return nil, fmt.Errorf("model must not start")
 	})
-	execution := searchExecution{policy: lexicalOnlySearchPolicy(), model: future, prepareVectors: true}
+	execution := searchExecution{policy: lexicalOnlySearchPolicy(), model: future, vectors: true}
 
 	if _, err := ensureFolderCorpusFreshWithExecution(t.Context(), plan, execution); err != nil {
 		t.Fatal(err)
@@ -1417,10 +952,6 @@ func TestLexicalOnlyFolderBuildStartsNoModelAndWritesNoSemanticData(t *testing.T
 	}
 }
 
-func twoDigitTestNumber(value int) string {
-	return string([]byte{'0' + byte(value/10), '0' + byte(value%10)})
-}
-
 // TestRunDefaultFolderJoinedSearchFindsGuardedFileByMeaning forces the shard
 // guard on one large file. Its text index keeps only the name, but the
 // meaning-based index reads the file itself and has no shard format limit, so a
@@ -1434,7 +965,7 @@ func TestRunDefaultFolderJoinedSearchFindsGuardedFileByMeaning(t *testing.T) {
 	t.Chdir(t.TempDir())
 	folder := t.TempDir()
 	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
-	for index := range rerankCandidateLimit {
+	for index := range semanticModelBatchRows {
 		writeFileAt(t, folder, fmt.Sprintf("lex-%02d.go", index),
 			"package sample\n// alpha lexical candidate\n")
 	}
@@ -1458,7 +989,7 @@ func TestRunDefaultFolderJoinedSearchFindsGuardedFileByMeaning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output, "## guarded.go") || !strings.Contains(output, "SEMANTIC_TARGET") {
+	if !strings.Contains(output, "## "+filepath.Join(folder, "guarded.go")) || !strings.Contains(output, "SEMANTIC_TARGET") {
 		t.Fatalf("joined output omitted the guarded file's semantic evidence:\n%s", output)
 	}
 
@@ -1466,5 +997,32 @@ func TestRunDefaultFolderJoinedSearchFindsGuardedFileByMeaning(t *testing.T) {
 	lexical, err := runHybridTestSearch(t, needle, []string{folder}, lexicalOnlySearchPolicy(), nil)
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("lexical search of the guarded file: err=%v, output:\n%s", err, lexical)
+	}
+}
+
+// TestEditDuringSearchShowsInTheNextSearch edits a tracked file after the
+// graph expansion captured the repository, while a warm descriptive search
+// runs (the model factory runs after planning). The search reads one capture
+// per node (one git status per node per command), so it shows the captured
+// content; the next search captures the edit and shows it.
+func TestEditDuringSearchShowsInTheNextSearch(t *testing.T) {
+	requireTools(t)
+	repo := initGitRepo(t, "a.go", "package sample\n// alpha beta original line\n")
+	setTestUserCache(t)
+	t.Chdir(repo)
+	newModel := func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil }
+	if _, err := runHybridTestSearch(t, "alpha beta", nil, defaultSearchPolicy(), newModel); err != nil {
+		t.Fatalf("warm-up search: %v", err)
+	}
+	output, err := runHybridTestSearch(t, "alpha beta", nil, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
+		writeFileAt(t, repo, "a.go", "package sample\n// alpha beta ZQEDITEDDURINGSEARCH\n")
+		return &hybridTestScorer{}, nil
+	})
+	if err != nil || !strings.Contains(output, "original line") || strings.Contains(output, "ZQEDITEDDURINGSEARCH") {
+		t.Fatalf("the search did not show its capture: err=%v\n%s", err, output)
+	}
+	output, err = runHybridTestSearch(t, "alpha beta", nil, defaultSearchPolicy(), newModel)
+	if err != nil || !strings.Contains(output, "ZQEDITEDDURINGSEARCH") {
+		t.Fatalf("the next search does not show the edit: err=%v\n%s", err, output)
 	}
 }

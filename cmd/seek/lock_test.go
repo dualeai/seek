@@ -2,10 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 func TestLockFileExclusive_Basic(t *testing.T) {
@@ -164,47 +171,10 @@ func TestAcquireReadLock_SharedConcurrent(t *testing.T) {
 	}
 }
 
-func TestAcquireReadLock_WedgedSwapUsesRemainingShards(t *testing.T) {
-	old := readLockTimeout
-	readLockTimeout = 150 * time.Millisecond
-	defer func() { readLockTimeout = old }()
-
-	dir := t.TempDir()
-	lockPath := filepath.Join(dir, lockFile)
-	indexDir := filepath.Join(dir, "index")
-	if err := os.MkdirAll(indexDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// Shards are present, so the unlocked fallback is allowed.
-	if err := os.WriteFile(filepath.Join(indexDir, "x_v16.00000.zoekt"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// Hold EX (a wedged swap) on a separate fd.
-	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := lockFileExclusive(holder); err != nil {
-		t.Fatalf("hold EX: %v", err)
-	}
-	defer releaseLock(holder)
-
-	reader, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = reader.Close() }()
-	// The exclusive lock is wedged. After the wait, use remaining shards.
-	if err := acquireReadLock(context.Background(), indexDir, reader); err != nil {
-		t.Fatalf("wedged-swap remaining-shard fallback should return nil, got %v", err)
-	}
-}
-
-func TestAcquireStrictReadLock_WedgedSwapRejectsUnlockedRead(t *testing.T) {
-	old := readLockTimeout
-	readLockTimeout = 50 * time.Millisecond
-	defer func() { readLockTimeout = old }()
-
+// TestAcquireReadLock_WaitsForPublishUntilCancel holds the publish lock as a
+// wedged publish would: the read waits until its context ends, with no
+// unlocked read of the remaining shards.
+func TestAcquireReadLock_WaitsForPublishUntilCancel(t *testing.T) {
 	dir := t.TempDir()
 	lockPath := filepath.Join(dir, lockFile)
 	indexDir := filepath.Join(dir, "index")
@@ -221,19 +191,128 @@ func TestAcquireStrictReadLock_WedgedSwapRejectsUnlockedRead(t *testing.T) {
 	if err := lockFileExclusive(holder); err != nil {
 		t.Fatalf("hold exclusive lock: %v", err)
 	}
-	defer releaseLock(holder)
-
 	reader, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = reader.Close() }()
-	if err := acquireStrictReadLock(context.Background(), indexDir, reader); err == nil {
-		t.Fatal("strict read must not use shards without the generation lock")
+	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
+	defer cancel()
+	if err := acquireReadLock(ctx, indexDir, reader); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("read under a wedged publish: %v, want the context's end", err)
+	}
+	// Once the publish ends, the same wait gets the lock, however long the
+	// publish took: a wait deadline would fail here.
+	done := make(chan error, 1)
+	go func() { done <- acquireReadLock(t.Context(), indexDir, reader) }()
+	time.Sleep(lockWaitProof)
+	releaseLock(holder)
+	if err := <-done; err != nil {
+		t.Fatalf("read after the publish: %v", err)
+	}
+	unlockFile(reader)
+}
+
+// lockWaitProof is how long the lock tests hold a lock that another wait
+// needs, so that a lock wait with a deadline fails them.
+const lockWaitProof = 3 * time.Second
+
+// TestLockOrderNoReadLockWhileWaitingForPublish proves that a build or
+// publish lock wait under a read lock fails as a Seek defect, so any route
+// that takes that order fails the suite.
+func TestLockOrderNoReadLockWhileWaitingForPublish(t *testing.T) {
+	dir := t.TempDir()
+	indexDir := filepath.Join(dir, "index")
+	if err := os.MkdirAll(indexDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, lockFile), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	held := withReadLockHeld(t.Context())
+	if _, err := acquirePublishLock(held, dir); !errors.Is(err, errLockOrder) || !errors.Is(err, errInvariant) {
+		t.Fatalf("publish wait under a read lock: %v", err)
+	}
+	if _, _, err := acquireBuildLock(held, dir, indexDir); !errors.Is(err, errLockOrder) {
+		t.Fatalf("build wait under a read lock: %v", err)
+	}
+	if f, err := acquirePublishLock(t.Context(), dir); err != nil {
+		t.Fatalf("publish lock with no read lock: %v", err)
+	} else {
+		releaseLock(f)
 	}
 }
 
-// TestAcquireBuildLock_TouchesUsedAtStart covers FIX B: a build bumps the
+// TestTwoColdSearchesSameNode runs two searches of one cold node at the same
+// time: one builds, the other waits for that build with no deadline, and both
+// answer.
+func TestTwoColdSearchesSameNode(t *testing.T) {
+	requireTools(t)
+	folder := t.TempDir()
+	for index := range 50 {
+		writeFileAt(t, folder, fmt.Sprintf("f%02d.txt", index), fmt.Sprintf("zqtwocold %d\n", index))
+	}
+	setTestUserCache(t)
+	// run writes to os.Stdout, which one swap covers for both searches.
+	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout := os.Stdout
+	os.Stdout = devnull
+	defer func() {
+		os.Stdout = stdout
+		_ = devnull.Close()
+	}()
+	var group errgroup.Group
+	for range 2 {
+		group.Go(func() error {
+			return run(context.Background(), "zqtwocold", []string{folder})
+		})
+	}
+	if err := group.Wait(); err != nil {
+		t.Fatalf("a search failed: %v", err)
+	}
+}
+
+// TestColdSearchWaitsForAnotherProcessBuild holds the build lock of a cold
+// node for lockWaitProof while a search process reads the node: the process
+// waits on the lock with no deadline, then builds and answers. In one process,
+// the buildWindows semaphore orders two builds before the build lock does, so
+// the test uses a second process.
+func TestColdSearchWaitsForAnotherProcessBuild(t *testing.T) {
+	requireTools(t)
+	folder := t.TempDir()
+	writeFileAt(t, folder, "a.txt", "zqprocesswait\n")
+	cacheDir := t.TempDir()
+	t.Setenv("SEEK_CACHE_DIR", cacheDir)
+	plans, err := planCorpora(context.Background(), []string{folder})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%d err=%v", len(plans), err)
+	}
+	if err := os.MkdirAll(plans[0].cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := os.OpenFile(filepath.Join(plans[0].cacheDir, buildLockFile), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockFileExclusive(holder); err != nil {
+		t.Fatalf("hold the build lock: %v", err)
+	}
+	done := make(chan cliProcessResult, 1)
+	go func() {
+		done <- runCLIProcessWithCache(t, cacheDir, folder, []string{"--lexical-only", "zqprocesswait"}, nil)
+	}()
+	time.Sleep(lockWaitProof)
+	releaseLock(holder)
+	result := <-done
+	if result.code != 0 || !strings.Contains(result.stdout, "a.txt") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", result.code, result.stdout, result.stderr)
+	}
+}
+
+// TestAcquireBuildLock_TouchesUsedAtStart proves that a build bumps the
 // corpus .used at start so a concurrent gc cannot evict it in the window between
 // the build releasing the lock and the search re-opening the corpus.
 func TestAcquireBuildLock_TouchesUsedAtStart(t *testing.T) {
@@ -254,5 +333,81 @@ func TestAcquireBuildLock_TouchesUsedAtStart(t *testing.T) {
 	}
 	if d := time.Since(info.ModTime()); d > 30*time.Second {
 		t.Fatalf(".used should be fresh after build-start touch, age=%v", d)
+	}
+}
+
+// TestPollLockRetriesOnlyAHeldLock retries EAGAIN and EINTR until the lock is
+// free, and returns any other flock error at once with the lock path.
+func TestPollLockRetriesOnlyAHeldLock(t *testing.T) {
+	for _, held := range []error{syscall.EWOULDBLOCK, syscall.EAGAIN, syscall.EINTR} {
+		calls := 0
+		err := pollLock(t.Context(), "/cache/.lock", func() error {
+			if calls++; calls == 1 {
+				return held
+			}
+			return nil
+		}, time.Millisecond, time.Millisecond)
+		if err != nil || calls != 2 {
+			t.Fatalf("%v: err=%v calls=%d, want a retry then success", held, err, calls)
+		}
+	}
+	for _, lasting := range []error{syscall.ENOLCK, syscall.EIO} {
+		calls := 0
+		err := pollLock(t.Context(), "/cache/.lock", func() error {
+			calls++
+			return lasting
+		}, time.Millisecond, time.Millisecond)
+		if !errors.Is(err, lasting) || calls != 1 || !strings.Contains(err.Error(), "/cache/.lock") {
+			t.Fatalf("%v: err=%v calls=%d, want one call and the lock path", lasting, err, calls)
+		}
+	}
+}
+
+// TestReaderDoesNotWaitForAFullRebuild holds a full uncommitted rebuild for
+// lockWaitProof on one file read, in this process: the family builds before
+// the publish lock, so a search in another process reads the live index at
+// once.
+func TestReaderDoesNotWaitForAFullRebuild(t *testing.T) {
+	requireTools(t)
+	f := newGraphFixture(t)
+	repo := f.GitRepo("repo", "a.txt", "committed\n")
+	for _, name := range []string{"a.txt", "b.txt"} {
+		writeFixtureFile(t, filepath.Join(repo, name), "zqreader "+name+"\n")
+	}
+	cacheDir := t.TempDir()
+	t.Setenv("SEEK_CACHE_DIR", cacheDir)
+	if _, err := captureStdout(t, func() error { return run(context.Background(), "zqreader", []string{repo}) }); err != nil {
+		t.Fatal(err)
+	}
+	plans, err := planCorpora(context.Background(), []string{repo})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(plans[0].cacheDir, stateFile)); err != nil {
+		t.Fatal(err)
+	}
+	realOpen := dirtyOpenFile
+	t.Cleanup(func() { dirtyOpenFile = realOpen })
+	var slow sync.Once
+	dirtyOpenFile = func(path string) (*os.File, error) {
+		if filepath.Base(path) == "b.txt" {
+			slow.Do(func() { time.Sleep(lockWaitProof) })
+		}
+		return realOpen(path)
+	}
+	built := make(chan error, 1)
+	go func() {
+		_, err := captureStdout(t, func() error { return run(context.Background(), "zqreader", []string{repo}) })
+		built <- err
+	}()
+	time.Sleep(500 * time.Millisecond)
+	started := time.Now()
+	result := runCLIProcessWithCache(t, cacheDir, repo, []string{"--lexical-only", "zqreader"}, nil)
+	elapsed := time.Since(started)
+	if err := <-built; err != nil {
+		t.Fatal(err)
+	}
+	if result.code != 0 || !strings.Contains(result.stdout, "b.txt") || elapsed > lockWaitProof-time.Second {
+		t.Fatalf("reader: code=%d after %v, want the live index at once:\n%s%s", result.code, elapsed, result.stdout, result.stderr)
 	}
 }

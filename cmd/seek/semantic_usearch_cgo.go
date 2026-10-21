@@ -53,8 +53,6 @@ typedef struct seek_usearch_hit_t {
     float score;
 } seek_usearch_hit_t;
 
-#define SEEK_USEARCH_MAX_RESULTS 256
-
 _Static_assert(sizeof(seek_usearch_hit_t) == 16, "unexpected batch hit size");
 _Static_assert(offsetof(seek_usearch_hit_t, key) == 0, "unexpected batch key offset");
 _Static_assert(offsetof(seek_usearch_hit_t, score) == 8, "unexpected batch score offset");
@@ -175,16 +173,12 @@ static void seek_usearch_search_many(
     size_t query_count,
     size_t dimensions,
     size_t count,
+    uint64_t* keys,
+    float* distances,
     seek_usearch_hit_t* hits,
     size_t* found,
     seek_usearch_error_t* error
 ) {
-    if (count > SEEK_USEARCH_MAX_RESULTS) {
-        *error = "USearch batch result limit is too large";
-        return;
-    }
-    uint64_t keys[SEEK_USEARCH_MAX_RESULTS];
-    float distances[SEEK_USEARCH_MAX_RESULTS];
     for (size_t query = 0; query != query_count; ++query) {
         found[query] = seek_usearch_search_ptr(
             index,
@@ -213,17 +207,13 @@ static void seek_usearch_filtered_search_many(
     size_t bytes,
     uint64_t rows,
     uint8_t centroid_shift,
+    uint64_t* keys,
+    float* distances,
     seek_usearch_hit_t* hits,
     size_t* found,
     seek_usearch_error_t* error
 ) {
-    if (count > SEEK_USEARCH_MAX_RESULTS) {
-        *error = "USearch batch result limit is too large";
-        return;
-    }
     seek_bitmap_filter_state_t state = {bits, bytes, rows, centroid_shift};
-    uint64_t keys[SEEK_USEARCH_MAX_RESULTS];
-    float distances[SEEK_USEARCH_MAX_RESULTS];
     for (size_t query = 0; query != query_count; ++query) {
         found[query] = seek_usearch_filtered_search_ptr(
             index,
@@ -258,7 +248,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
+	"sort"
 	"sync"
 	"unsafe"
 )
@@ -276,9 +266,10 @@ const (
 	// independent shards up to the effective CPU allowance.
 	semanticUSearchThreads       = 1
 	semanticUSearchUnitsPerShard = 4_096
-	// Each native shard call requests at most this many approximate vector keys
-	// per query token. The merger applies the same global per-token cap before
-	// unit collapse and exact scoring.
+	// Each native shard call first requests this many approximate vector keys
+	// per query token. A token whose last key still reaches
+	// semanticUSearchDeepenSimilarity searches again with twice as many keys,
+	// until the shard has no more: no count cuts the candidates.
 	semanticUSearchVectorsPerQuery = 256
 	semanticUSearchLayoutRevision  = 2
 )
@@ -431,6 +422,10 @@ func buildSemanticUSearchStream(
 				}
 				artifact, err := inspectSemanticArtifact(path)
 				cpu.release()
+				var info os.FileInfo
+				if err == nil {
+					info, err = os.Lstat(path)
+				}
 				if err != nil {
 					fail(err)
 					continue
@@ -440,6 +435,7 @@ func buildSemanticUSearchStream(
 					Start:            uint64(start),
 					Rows:             uint64(job.embeddings.Len()),
 					semanticArtifact: artifact,
+					Check:            semanticRowsCheckOf(info),
 				}
 				shardsMu.Lock()
 				shardsByNumber[job.shard] = shard
@@ -448,7 +444,6 @@ func buildSemanticUSearchStream(
 		}()
 	}
 
-	maxBatches := (semanticMaxRows + semanticModelBatchRows - 1) / semanticModelBatchRows
 	pending := make(map[int][]semanticCoarseVectors)
 	seen := make(map[int]struct{})
 	nextSequence := 0
@@ -505,8 +500,8 @@ func buildSemanticUSearchStream(
 		if ctx.Err() != nil {
 			continue
 		}
-		if batch.sequence < 0 || batch.sequence >= maxBatches {
-			fail(fmt.Errorf("semantic coarse batch %d exceeds limit", batch.sequence))
+		if batch.sequence < 0 {
+			fail(fmt.Errorf("semantic coarse batch %d is invalid", batch.sequence))
 			continue
 		}
 		if _, exists := seen[batch.sequence]; exists {
@@ -650,9 +645,10 @@ func searchSemanticUSearchFilteredCandidates(
 	return result.rows, err
 }
 
-// semanticUSearchQueryShard defines one shard search. limit is the maximum
-// number of vector keys returned for each query token, not a semantic row
-// count. filtered is true only when the shard must use the bitmap predicate.
+// semanticUSearchQueryShard defines one shard search. limit is the number of
+// vector keys that the first request asks for each query token, not a
+// semantic row count; a token can search again with more. filtered is true
+// only when the shard must use the bitmap predicate.
 type semanticUSearchQueryShard struct {
 	index    int
 	limit    int
@@ -677,9 +673,9 @@ type semanticUSearchCandidateSet struct {
 }
 
 const (
-	// Direct filtered scoring and native-error recovery share a work limit equal
-	// to one full shard at the model's maximum query length. Counting one extra
-	// token covers stored-vector validation, whose cost does not fall with query
+	// Direct filtered scoring in a shard plan has a work limit equal to one
+	// full shard at one 128-token query window. Counting one extra token
+	// covers stored-vector validation, whose cost does not fall with query
 	// length.
 	semanticExactWorkLimit            = semanticUSearchUnitsPerShard * (lateOnSequenceLength + 1)
 	semanticFilteredExactShardDivisor = 4
@@ -720,7 +716,7 @@ func planSemanticUSearchShards(
 	if generation == nil || len(generation.manifest.USearchFiles) == 0 {
 		return semanticUSearchQueryPlan{}, fmt.Errorf("USearch semantic generation is unavailable")
 	}
-	if queryTokens <= 0 || queryTokens > lateOnSequenceLength {
+	if queryTokens <= 0 {
 		return semanticUSearchQueryPlan{}, fmt.Errorf("semantic query token count is invalid")
 	}
 	shards := generation.manifest.USearchFiles
@@ -784,9 +780,9 @@ func planSemanticUSearchShards(
 
 // searchSemanticUSearchCandidatesWithMask executes the shard plan. A nil mask
 // sends every shard to unfiltered native search. A partial mask uses the route
-// table in planSemanticUSearchShards. The merger keeps the best 256 returned
-// vector keys across all shards for each query token before key-to-row collapse,
-// then joins the sorted exact rows and returns one sorted unique row set.
+// table in planSemanticUSearchShards. The merger takes the row of every vector
+// key that a shard returns, joins the exact rows, and returns one sorted
+// unique row set.
 func searchSemanticUSearchCandidatesWithMask(
 	ctx context.Context,
 	generation *semanticGeneration,
@@ -872,8 +868,18 @@ func executeSemanticUSearchPlan(
 		wait.Wait()
 		close(results)
 	}()
-	merged := make([][]semanticHit, len(queryVectors))
-	mergeBuffers := make([][]semanticHit, len(queryVectors))
+	// Only the row set reaches the exact scores, so each shard's keys go to a
+	// bitmap of the generation's rows: a merge in score order costs time
+	// quadratic in the shard count.
+	rows := generation.manifest.Rows
+	seen := make([]uint64, (rows+63)/64)
+	mark := func(row uint64) error {
+		if row >= rows {
+			return fmt.Errorf("USearch returned unit row %d outside generation", row)
+		}
+		seen[row/64] |= 1 << (row % 64)
+		return nil
+	}
 	var firstErr error
 	for result := range results {
 		if result.err != nil {
@@ -882,19 +888,19 @@ func executeSemanticUSearchPlan(
 			}
 			continue
 		}
-		for token, hits := range result.hits {
-			if len(merged[token]) == 0 {
-				// The worker no longer uses this slice after the receive.
-				merged[token] = hits
-				continue
+		if firstErr != nil {
+			continue
+		}
+	marking:
+		for _, hits := range result.hits {
+			for _, hit := range hits {
+				row, _ := semanticUSearchUnitAndCentroid(hit.row)
+				if err := mark(row); err != nil {
+					firstErr = err
+					cancel()
+					break marking
+				}
 			}
-			mergeBuffers[token] = mergeSemanticHits(
-				mergeBuffers[token][:0],
-				merged[token],
-				hits,
-				semanticUSearchVectorsPerQuery,
-			)
-			merged[token], mergeBuffers[token] = mergeBuffers[token], merged[token]
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -903,67 +909,36 @@ func executeSemanticUSearchPlan(
 	if firstErr != nil {
 		return semanticUSearchCandidateSet{}, firstErr
 	}
-	rowCapacity := len(plan.exactRows)
-	for _, hits := range merged {
-		rowCapacity += len(hits)
-	}
-	ordered := make([]uint64, 0, rowCapacity)
-	ordered = append(ordered, plan.exactRows...)
-	for _, hits := range merged {
-		for _, hit := range hits {
-			row, _ := semanticUSearchUnitAndCentroid(hit.row)
-			if row >= generation.manifest.Rows {
-				return semanticUSearchCandidateSet{}, fmt.Errorf(
-					"USearch returned unit row %d outside generation", row,
-				)
-			}
-			ordered = append(ordered, row)
+	for _, row := range plan.exactRows {
+		if err := mark(row); err != nil {
+			return semanticUSearchCandidateSet{}, err
 		}
 	}
-	slices.Sort(ordered)
-	ordered = slices.Compact(ordered)
+	count := 0
+	for _, word := range seen {
+		count += mathbits.OnesCount64(word)
+	}
+	ordered := make([]uint64, 0, count)
+	for index, word := range seen {
+		for word != 0 {
+			ordered = append(ordered, uint64(index)*64+uint64(mathbits.TrailingZeros64(word)))
+			word &= word - 1
+		}
+	}
 	return semanticUSearchCandidateSet{
 		rows: ordered, query: queryVectors, usedUSearch: true,
 	}, nil
 }
 
-// mergeSemanticHits merges two ordered hit lists and retains their best limit
-// entries. dst must not share its backing array with left or right.
-func mergeSemanticHits(dst, left, right []semanticHit, limit int) []semanticHit {
-	want := min(limit, len(left)+len(right))
-	if want <= 0 {
-		return dst[:0]
-	}
-	if cap(dst) < want {
-		dst = make([]semanticHit, 0, want)
-	}
-	dst = dst[:0]
-	for len(dst) < want && len(left) > 0 && len(right) > 0 {
-		if semanticHitLess(left[0], right[0]) {
-			dst = append(dst, left[0])
-			left = left[1:]
-		} else {
-			dst = append(dst, right[0])
-			right = right[1:]
-		}
-	}
-	for len(dst) < want && len(left) > 0 {
-		dst = append(dst, left[0])
-		left = left[1:]
-	}
-	for len(dst) < want && len(right) > 0 {
-		dst = append(dst, right[0])
-		right = right[1:]
-	}
-	return dst
-}
-
 // searchSemanticUSearchShardTokens views one graph shard and sends all query
-// tokens through one synchronous C batch. The batch loops over normal USearch
-// calls and cannot stop in its middle. A filtered batch requires a partial
-// global-row bitmap. In this function, semanticHit.row holds a USearch vector
-// key; the caller later converts it to a semantic row. This boundary rejects
-// keys outside the shard, filtered-out rows, duplicate keys, and non-finite
+// tokens through one synchronous C batch of up to limit keys each. The batch
+// loops over normal USearch calls and cannot stop in its middle. A token whose
+// last key still reaches semanticUSearchDeepenSimilarity searches again alone
+// with twice the keys, until the shard has no more; each token keeps only the
+// keys within that bound. A filtered batch requires a partial global-row
+// bitmap. In this function, semanticHit.row holds a USearch vector key; the
+// caller later converts it to a semantic row. This boundary rejects keys
+// outside the shard, filtered-out rows, duplicate keys, and non-finite
 // distances.
 func searchSemanticUSearchShardTokens(
 	ctx context.Context,
@@ -999,14 +974,11 @@ func searchSemanticUSearchShardTokens(
 	if want <= 0 {
 		return nil, fmt.Errorf("USearch shard is empty")
 	}
-	resultSlots := len(queries) * want
 	if unsafe.Sizeof(semanticHit{}) != unsafe.Sizeof(C.seek_usearch_hit_t{}) ||
 		unsafe.Offsetof(semanticHit{}.row) != 0 ||
 		unsafe.Offsetof(semanticHit{}.score) != 8 {
 		return nil, fmt.Errorf("USearch batch hit layout is incompatible")
 	}
-	nativeHits := make([]C.seek_usearch_hit_t, resultSlots)
-	found := make([]C.size_t, len(queries))
 	startKey := semanticUSearchVectorKey(shard.Start, 0)
 	endKey := semanticUSearchVectorKey(shard.Start+shard.Rows, 0)
 	seenKeys := make([]byte, (vectorCount+7)/8)
@@ -1021,42 +993,52 @@ func searchSemanticUSearchShardTokens(
 			return nil, err
 		}
 	}
-	if err := callSemanticUSearch(func(cErr *C.seek_usearch_error_t) {
-		if filtered {
-			C.seek_usearch_filtered_search_many(
+	// search runs USearch for the tokens of queries with count keys each.
+	search := func(queries []semanticVector, count int) ([]C.seek_usearch_hit_t, []C.size_t, error) {
+		nativeHits := make([]C.seek_usearch_hit_t, len(queries)*count)
+		found := make([]C.size_t, len(queries))
+		keys := make([]C.uint64_t, count)
+		distances := make([]C.float, count)
+		err := callSemanticUSearch(func(cErr *C.seek_usearch_error_t) {
+			if filtered {
+				C.seek_usearch_filtered_search_many(
+					index,
+					(*C.float)(unsafe.Pointer(&queries[0][0])),
+					C.size_t(len(queries)),
+					C.size_t(semanticEmbeddingDimensions),
+					C.size_t(count),
+					(*C.uint8_t)(unsafe.Pointer(&mask.bits[0])),
+					C.size_t(len(mask.bits)),
+					C.uint64_t(mask.rows),
+					C.uint8_t(centroidShift),
+					&keys[0], &distances[0],
+					(*C.seek_usearch_hit_t)(unsafe.Pointer(&nativeHits[0])),
+					(*C.size_t)(unsafe.Pointer(&found[0])),
+					cErr,
+				)
+				return
+			}
+			C.seek_usearch_search_many(
 				index,
 				(*C.float)(unsafe.Pointer(&queries[0][0])),
 				C.size_t(len(queries)),
 				C.size_t(semanticEmbeddingDimensions),
-				C.size_t(want),
-				(*C.uint8_t)(unsafe.Pointer(&mask.bits[0])),
-				C.size_t(len(mask.bits)),
-				C.uint64_t(mask.rows),
-				C.uint8_t(centroidShift),
+				C.size_t(count),
+				&keys[0], &distances[0],
 				(*C.seek_usearch_hit_t)(unsafe.Pointer(&nativeHits[0])),
 				(*C.size_t)(unsafe.Pointer(&found[0])),
 				cErr,
 			)
-			return
+		})
+		runtime.KeepAlive(queries)
+		if mask != nil {
+			runtime.KeepAlive(mask.bits)
 		}
-		C.seek_usearch_search_many(
-			index,
-			(*C.float)(unsafe.Pointer(&queries[0][0])),
-			C.size_t(len(queries)),
-			C.size_t(semanticEmbeddingDimensions),
-			C.size_t(want),
-			(*C.seek_usearch_hit_t)(unsafe.Pointer(&nativeHits[0])),
-			(*C.size_t)(unsafe.Pointer(&found[0])),
-			cErr,
-		)
-	}); err != nil {
-		return nil, err
+		return nativeHits, found, err
 	}
-	runtime.KeepAlive(queries)
-	runtime.KeepAlive(nativeHits)
-	runtime.KeepAlive(found)
-	if mask != nil {
-		runtime.KeepAlive(mask.bits)
+	nativeHits, found, err := search(queries, want)
+	if err != nil {
+		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -1066,11 +1048,23 @@ func searchSemanticUSearchShardTokens(
 		if count > want {
 			return nil, fmt.Errorf("USearch returned too many vectors")
 		}
-		resultStart := token * want
-		hits := unsafe.Slice(
-			(*semanticHit)(unsafe.Pointer(&nativeHits[resultStart])),
-			count,
-		)
+		tokenHits, tokenCount, tokenWant := nativeHits[token*want:], count, want
+		queryNorm2 := semanticUSearchInt8SquaredNorm(&queries[token])
+		// A token whose last key still reaches the bound searches again with
+		// twice the keys, until the shard has no more.
+		for tokenCount == tokenWant && tokenWant < vectorCount &&
+			semanticUSearchSimilarity(float32(tokenHits[tokenCount-1].score), queryNorm2) >= semanticUSearchDeepenSimilarity {
+			tokenWant = min(2*tokenWant, vectorCount)
+			deeper, deeperFound, err := search(queries[token:token+1], tokenWant)
+			if err != nil {
+				return nil, err
+			}
+			tokenHits, tokenCount = deeper, int(deeperFound[0])
+			if tokenCount > tokenWant {
+				return nil, fmt.Errorf("USearch returned too many vectors")
+			}
+		}
+		hits := unsafe.Slice((*semanticHit)(unsafe.Pointer(&tokenHits[0])), tokenCount)
 		clear(seenKeys)
 		for hit := range hits {
 			key := hits[hit].row
@@ -1094,9 +1088,44 @@ func searchSemanticUSearchShardTokens(
 			hits[hit] = semanticHit{row: key, score: score}
 		}
 		sortSemanticHits(hits)
-		allHits[token] = hits
+		// Only keys within the bound are candidates: the candidate set
+		// follows the similarity, not the shard count.
+		cut := sort.Search(len(hits), func(at int) bool {
+			return semanticUSearchSimilarity(hits[at].score, queryNorm2) < semanticUSearchDeepenSimilarity
+		})
+		allHits[token] = hits[:cut]
 	}
 	return allHits, nil
+}
+
+// semanticUSearchSimilarity turns a score of the int8 inner-product index
+// (minus the distance: the int8 dot product minus one) into a cosine
+// estimate. USearch casts each unit vector to int8 by scaling it by 127 and
+// truncating toward zero, so a cast vector is shorter than 127: the dot of two
+// cast vectors over the query's own cast squared norm estimates their cosine
+// with a mean bias under 0.001; a division by 127^2 gives an estimate 4.5 %
+// low.
+func semanticUSearchSimilarity(score, queryNorm2 float32) float32 {
+	return (score + 1) / queryNorm2
+}
+
+// semanticUSearchInt8SquaredNorm is the squared norm of vector after the
+// USearch int8 cast.
+func semanticUSearchInt8SquaredNorm(vector *semanticVector) float32 {
+	var norm float64
+	for _, value := range vector {
+		norm += float64(value) * float64(value)
+	}
+	norm = math.Sqrt(norm)
+	if norm == 0 {
+		return 1
+	}
+	var sum float64
+	for _, value := range vector {
+		cast := max(-127, min(127, math.Trunc(float64(value)/norm*127)))
+		sum += cast * cast
+	}
+	return float32(max(sum, 1))
 }
 
 func semanticUSearchVectorKey(row uint64, centroid int) uint64 {
@@ -1169,12 +1198,29 @@ func semanticUSearchFiltered(
 	limit int,
 ) ([]semanticHit, error) {
 	if filter == nil {
-		return semanticUSearchExactFallback(ctx, generation, query, limit)
+		return semanticUSearchMasked(ctx, generation, query, nil, limit)
 	}
-	mask, err := buildSemanticFilterMask(ctx, generation, filter)
+	mask, err := buildSemanticFilterMask(ctx, generation, filter.matches)
 	if err != nil {
 		return nil, err
 	}
+	return semanticUSearchMasked(ctx, generation, query, &mask, limit)
+}
+
+// semanticUSearchMasked searches the rows that mask allows (nil: every row):
+// USearch or a direct exact scan finds the candidates, and the exact fine
+// scores rank them, at most limit.
+func semanticUSearchMasked(
+	ctx context.Context,
+	generation *semanticGeneration,
+	query *semanticQueryEmbedding,
+	mask *semanticFilterMask,
+	limit int,
+) ([]semanticHit, error) {
+	if mask == nil {
+		return semanticUSearchExactFallback(ctx, generation, query, limit)
+	}
+	var err error
 	switch mask.mode {
 	case semanticFilterNone:
 		return nil, nil
@@ -1194,9 +1240,14 @@ func semanticUSearchFiltered(
 		slog.Debug("Searched semantic index", "backend", "filtered-exact", "rows", len(rows))
 	} else {
 		var candidates semanticUSearchCandidateSet
-		candidates, err = searchSemanticUSearchCandidatesWithMask(ctx, generation, query, &mask)
+		candidates, err = searchSemanticUSearchCandidatesWithMask(ctx, generation, query, mask)
 		if err != nil {
-			return nil, err
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			// Recovery is exact over the allowed rows.
+			slog.Debug("Filtered USearch search failed; using exact vectors", "error", err)
+			return exactSemanticSortedCandidates(ctx, generation.vectors, query, mask.selectedRows(), limit)
 		}
 		rows = candidates.rows
 		backend := "filtered-shard-exact"
@@ -1213,10 +1264,8 @@ func semanticUSearchFiltered(
 
 // semanticUSearchExactFallback uses a full exact scan for a small generation.
 // For a larger generation it gets approximate USearch candidates and then
-// exact-scores their mapped vectors. A non-cancellation native error uses exact
-// recovery only while the row-token work stays within the shared exact-work
-// budget. Larger failures return an error so the caller can use its normal
-// lexical/model fallback without starting a long full scan.
+// exact-scores their mapped vectors. A native error other than cancellation
+// falls back to a full exact scan.
 func semanticUSearchExactFallback(
 	ctx context.Context,
 	generation *semanticGeneration,
@@ -1240,19 +1289,8 @@ func semanticUSearchExactFallback(
 	if generation == nil {
 		return nil, err
 	}
-	queryTokens, queryErr := semanticQueryTokenCount(query)
-	if queryErr != nil {
-		return nil, queryErr
-	}
-	exactWork := semanticExactWork(uint64(len(generation.vectors)), queryTokens)
-	if exactWork > uint64(semanticExactWorkLimit) {
-		return nil, fmt.Errorf(
-			"USearch semantic search failed and exact recovery work %d exceeds limit %d: %w",
-			exactWork,
-			semanticExactWorkLimit,
-			err,
-		)
-	}
+	// Recovery is always exact, with no work limit: a node keeps its
+	// semantic hits when its graph fails.
 	slog.Debug("USearch semantic search failed; using exact vectors", "error", err)
 	return exactSemanticSearch(ctx, generation.vectors, query, limit)
 }

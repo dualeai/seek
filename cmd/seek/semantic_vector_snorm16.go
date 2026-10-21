@@ -28,6 +28,23 @@ const (
 )
 
 type semanticSNORM16Vector [semanticEmbeddingDimensions]int16
+
+// semanticCoarseSNORM16Vectors is one row's stored coarse centroids. The
+// USearch shards are built from their decoded values, so a row that a build
+// copies gives the same shard input as a row that the model embeds.
+type semanticCoarseSNORM16Vectors [semanticCoarseCentroidsPerUnit]semanticSNORM16Vector
+
+const semanticCoarseVectorBytesPerUnit = semanticCoarseCentroidsPerUnit * semanticEmbeddingDimensions * 2
+
+// decodeSemanticSNORM16Vector returns the float value of a stored vector.
+func decodeSemanticSNORM16Vector(stored semanticSNORM16Vector) semanticVector {
+	var vector semanticVector
+	for dimension, code := range stored {
+		vector[dimension] = float32(code) / float32(semanticSNORM16Scale)
+	}
+	return vector
+}
+
 type semanticFineSNORM16Vectors [semanticFineCentroidsPerUnit]semanticSNORM16Vector
 
 func encodeSemanticFineVectors(

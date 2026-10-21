@@ -28,23 +28,19 @@ const (
 	// Per-corpus marker. mtime = "last access" — explicit, since atime is
 	// disabled (noatime/relatime) on most modern filesystems.
 	usedFile          = ".used"
-	defaultGCMaxAge   = 14 * 24 * time.Hour
 	defaultGCInterval = 24 * time.Hour
 	gcRunTimeout      = 5 * time.Second
+	// providerArtifactMaxAge collects compiled accelerator models that no
+	// search used for this long. The cache budget does not cover them.
+	providerArtifactMaxAge = 14 * 24 * time.Hour
 
-	envGCMaxAge   = "SEEK_GC_MAX_AGE"
 	envGCInterval = "SEEK_GC_INTERVAL"
 
 	gcLocalCacheHint = "Set SEEK_CACHE_DIR to a local directory. " +
 		"On Linux, you can instead unset SEEK_CACHE_DIR and set XDG_CACHE_HOME."
 )
 
-// TODO(gc-size-cap): GC is age-based and has no total cache-size limit. A
-// future limit must apply to all corpus types and must not evict an active
-// corpus.
-
 type gcConfig struct {
-	maxAge   time.Duration
 	interval time.Duration
 }
 
@@ -61,7 +57,7 @@ type corpusDirEntry struct {
 type gcAction uint8
 
 const (
-	actionKept    gcAction = iota // .used within TTL, or TOCTOU re-bump under lock
+	actionKept    gcAction = iota // not planned for eviction, or TOCTOU re-bump under lock
 	actionEvicted                 // rename to .trash + RemoveAll succeeded
 	actionLocked                  // corpus .lock held by active indexer/searcher
 	actionGone                    // corpus dir vanished mid-flight
@@ -117,8 +113,9 @@ func shortErr(err error) string {
 
 // gcOptions tunes a single runGC invocation.
 //   - skipThrottle bypasses the .last-gc mtime gate (manual `seek gc --force`).
-//   - maxAge is the per-corpus TTL — entries with .used older than now-maxAge
-//     are evicted. `seek gc --all` collapses this to 0.
+//   - evictAll evicts every corpus that no search holds (`seek gc --all`).
+//     Otherwise GC evicts the least recently used corpora only while the
+//     cache is over its budget; age alone never evicts a corpus.
 //   - writer, when non-nil, makes runGC stream a per-corpus table to it
 //     (manual path). Nil = silent (opportunistic path after every run).
 //   - sortKey orders the streamed table (`seek gc --sort`). Only consulted
@@ -126,7 +123,7 @@ func shortErr(err error) string {
 //     order, so the opportunistic path is unaffected.
 type gcOptions struct {
 	skipThrottle bool
-	maxAge       time.Duration
+	evictAll     bool
 	writer       io.Writer
 	sortKey      gcSortKey
 }
@@ -160,7 +157,7 @@ func runOpportunisticGC(ctx context.Context) {
 		}
 	}()
 	cfg := gcConfigFromEnv()
-	runGC(ctx, gcOptions{maxAge: cfg.maxAge, skipThrottle: false}, cfg.interval)
+	runGC(ctx, gcOptions{}, cfg.interval)
 }
 
 // runGC is the shared GC body. Two callers:
@@ -175,12 +172,16 @@ func runOpportunisticGC(ctx context.Context) {
 //  3. acquire global gc.lock (other gc → skip, surfaced when streaming)
 //  4. drain any leftover trash (idempotent crash recovery)
 //  5. enumerate + sort corpora by hash (deterministic sweep order)
-//  6. streaming with --sort=age|size: sweep, measure all rows, sort, then
+//  6. plan the eviction (planCorpusEviction): every corpus with --all, else
+//     the least recently used corpora while the cache is over its budget
+//  7. streaming with --sort=age|size: sweep, measure all rows, sort, then
 //     evict + render in table order (cancel semantics: see the sorted-
 //     branch comment). Default name order and the silent path: one
 //     interleaved sweep → measure (streaming only) → evict pass per
 //     entry, rows streaming incrementally.
-//  7. stamp .last-gc to throttle the next opportunistic run
+//  8. evict the unit-store segments of the planned corpora, then sweep aged
+//     compiled accelerator models
+//  9. stamp .last-gc to throttle the next opportunistic run
 func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 	cacheRoot, err := seekUserCacheRoot()
 	if err != nil {
@@ -250,7 +251,10 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 	}
 
 	now := time.Now()
-	cutoff := now.Add(-opts.maxAge)
+	evict, err := planCorpusEviction(cacheRoot, entries, opts.evictAll, nil, true)
+	if err != nil {
+		slog.Warn("gc cannot compute the cache budget", "error", err)
+	}
 	streaming := opts.writer != nil
 	if streaming {
 		printGCTableBanner(opts.writer, cacheRoot, len(entries))
@@ -279,7 +283,7 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 			if ctx.Err() != nil {
 				break
 			}
-			emitGCRow(opts.writer, stats, r, now, evictIfExpired(r.entry, trashPath, cutoff))
+			emitGCRow(opts.writer, stats, r, now, evictIfPlanned(r.entry, trashPath, evict))
 		}
 	} else {
 		// Default name order and the silent opportunistic path: one
@@ -293,11 +297,14 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 			sweepCorpusOrphans(e, now)
 			if streaming {
 				r := measureGCRow(e)
-				emitGCRow(opts.writer, stats, r, now, evictIfExpired(e, trashPath, cutoff))
+				emitGCRow(opts.writer, stats, r, now, evictIfPlanned(e, trashPath, evict))
 			} else {
-				evictIfExpired(e, trashPath, cutoff)
+				evictIfPlanned(e, trashPath, evict)
 			}
 		}
+	}
+	if ctx.Err() == nil {
+		evictPlannedUnits(cacheRoot, evict)
 	}
 	if streaming && stats.rendered > 0 {
 		// Rendered count (not len(entries)) — Ctrl-C / ctx cancel may break
@@ -307,7 +314,7 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 
 	// Compiled accelerator models come last. Corpus eviction reclaims more and is
 	// the collection's main job, so it takes the time budget first.
-	sweepAgedProviderArtifacts(ctx, opts.writer, cacheRoot, time.Now().Add(-opts.maxAge))
+	sweepAgedProviderArtifacts(ctx, opts.writer, cacheRoot, time.Now().Add(-providerArtifactAge(opts.evictAll)))
 
 	// Stamp updated last and even on partial failures — prevents retry
 	// storms when persistent errors would otherwise re-run GC every
@@ -341,15 +348,17 @@ func warnNFSOnce(cacheRoot string) {
 	slog.Debug("gc skipped: cache on network filesystem", "cache_root", cacheRoot)
 }
 
-func gcConfigFromEnv() gcConfig {
-	cfg := gcConfig{maxAge: defaultGCMaxAge, interval: defaultGCInterval}
-	if v := os.Getenv(envGCMaxAge); v != "" {
-		if d, err := parseGCDuration(v); err == nil && d > 0 {
-			cfg.maxAge = d
-		} else {
-			slog.Debug("invalid SEEK_GC_MAX_AGE, using default", "value", v)
-		}
+// providerArtifactAge is the age after which GC collects a compiled model:
+// zero with --all.
+func providerArtifactAge(all bool) time.Duration {
+	if all {
+		return 0
 	}
+	return providerArtifactMaxAge
+}
+
+func gcConfigFromEnv() gcConfig {
+	cfg := gcConfig{interval: defaultGCInterval}
 	if v := os.Getenv(envGCInterval); v != "" {
 		if d, err := parseGCDuration(v); err == nil && d >= 0 {
 			cfg.interval = d
@@ -688,21 +697,13 @@ func sweepCorpusOrphans(e corpusDirEntry, now time.Time) {
 	}
 }
 
-// evictIfExpired applies the TTL decision for one corpus: kept when .used
-// is within the cutoff, otherwise evictCorpus, with partial and failed
-// outcomes logged. Shared by the streaming and silent runGC loops.
-func evictIfExpired(e corpusDirEntry, trashDir string, cutoff time.Time) gcRowResult {
-	if e.usedAt.After(cutoff) {
+// evictIfPlanned applies the eviction plan to one corpus. Shared by the
+// streaming and silent runGC loops.
+func evictIfPlanned(e corpusDirEntry, trashDir string, evict map[corpusID]bool) gcRowResult {
+	if !evict[e.name] {
 		return gcRowResult{action: actionKept}
 	}
-	res := evictCorpus(e, trashDir, cutoff)
-	switch res.action {
-	case actionFailed:
-		slog.Warn("gc eviction failed", "corpus", e.name, "error", res.err)
-	case actionTrashed:
-		slog.Warn("gc partial eviction", "corpus", e.name, "error", res.err)
-	}
-	return res
+	return evictPlanned(e, trashDir)
 }
 
 // evictCorpus performs a two-phase delete under a non-blocking per-corpus

@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"path/filepath"
 	"strconv"
 )
 
@@ -58,8 +59,8 @@ func gitCorpusFingerprint(paths gitPaths, state repoState) string {
 		"document_naming", seekDocumentNamingVersion,
 		"zoekt_compatibility", zoektCompatibilityVersion,
 		"index_options", indexOptionsHash(),
-		"worktree", canonicalCorpusPath(paths.RepoDir),
-		"common_dir", canonicalCorpusPath(paths.CommonDir),
+		"worktree", pathIdentityOrClean(paths.RepoDir),
+		"common_dir", pathIdentityOrClean(paths.CommonDir),
 		"repo_state", repoStateFingerprint(paths.RepoDir, state),
 	)
 }
@@ -89,4 +90,14 @@ func stringsJoinNUL(parts ...string) string {
 		buf = append(buf, part...)
 	}
 	return string(buf)
+}
+
+// pathIdentityOrClean returns the file identity (dev:ino) of path, so a state
+// hash does not depend on how the path was typed. When stat fails, it returns
+// the clean path.
+func pathIdentityOrClean(path string) string {
+	if id, err := filesystemIdentity(path); err == nil {
+		return id
+	}
+	return filepath.Clean(path)
 }

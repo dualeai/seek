@@ -237,13 +237,11 @@ func TestExtractV2Path(t *testing.T) {
 }
 
 func TestIndexParallelism_Bounds(t *testing.T) {
-	p := indexParallelism()
-	want := runtime.GOMAXPROCS(0)
-	if want < 1 {
-		want = 1
-	}
-	if p != want {
-		t.Errorf("parallelism=%d, want current Go CPU limit %d", p, want)
+	// Set the Go CPU limit to a known value: the index uses all of it.
+	previous := runtime.GOMAXPROCS(3)
+	t.Cleanup(func() { runtime.GOMAXPROCS(previous) })
+	if p := indexParallelism(); p != 3 {
+		t.Errorf("parallelism=%d, want the Go CPU limit 3", p)
 	}
 }
 
@@ -858,16 +856,14 @@ func TestComputeStateHash_VersionPrefix(t *testing.T) {
 	}
 }
 
-func TestIndexBuildOptions_AlignsSharedIndexBudgets(t *testing.T) {
+// TestIndexBuildOptions_SizeMaxIsTheContentLimit checks that the Builder takes
+// the live content limit. TestRun_ContentLimitChangeRebuildsIndex checks that a
+// limit change rebuilds a cached index.
+func TestIndexBuildOptions_SizeMaxIsTheContentLimit(t *testing.T) {
+	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	opts := indexBuildOptions(t.TempDir(), 3)
-	if int64(opts.SizeMax) != documentContentLimit {
-		t.Fatalf("SizeMax=%d, want the reader content limit %d", opts.SizeMax, documentContentLimit)
-	}
-	if maxFolderIndexedBytes != maxCorpusIndexedBytes {
-		t.Fatalf("folder indexed bytes=%d, want shared corpus budget %d", maxFolderIndexedBytes, maxCorpusIndexedBytes)
-	}
-	if !strings.Contains(strings.Join(indexOptionsParts(), "\x00"), "size_max") {
-		t.Fatal("index options must include size_max")
+	if opts.SizeMax != 1<<20 {
+		t.Fatalf("SizeMax=%d, want the swapped reader content limit 1 MiB", opts.SizeMax)
 	}
 }
 
@@ -875,116 +871,6 @@ func requireGit(tb testing.TB) {
 	tb.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		tb.Skip("requires git on PATH")
-	}
-}
-
-func TestIndexScopedCommittedUsesCapturedTreeish(t *testing.T) {
-	requireTools(t)
-
-	dir := initEmptyGitRepo(t)
-	platform := filepath.Join(dir, "platform")
-	if err := os.MkdirAll(platform, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(platform, "app.go"), []byte("package platform\n// captured_treeish_old_marker\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitRun(t, dir, "add", ".")
-	gitRun(t, dir, "commit", "-m", "add old scoped file")
-	capturedHead := gitOutputIn(t, dir, "rev-parse", "HEAD")
-
-	if err := os.WriteFile(filepath.Join(platform, "app.go"), []byte("package platform\n// captured_treeish_live_head_marker\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitRun(t, dir, "add", ".")
-	gitRun(t, dir, "commit", "-m", "replace scoped file")
-
-	scope, err := buildGitDirtyScope(dir, []string{platform}, nil)
-	if err != nil {
-		t.Fatalf("build scope: %v", err)
-	}
-	indexDir := filepath.Join(t.TempDir(), "index")
-	snapshot, ok, err := captureGitSnapshot(context.Background(), dir, capturedHead)
-	if err != nil || !ok {
-		t.Fatalf("capture treeish: ok=%t error=%v", ok, err)
-	}
-	err = indexNativeGitFull(context.Background(), dir, indexDir, snapshot, scope, indexParallelism())
-	if err != nil {
-		t.Fatalf("index captured treeish: %v", err)
-	}
-
-	oldMatches, err := executeUnscopedShardSearchForTest(context.Background(), indexDir, "captured_treeish_old_marker")
-	if err != nil {
-		t.Fatalf("search old marker: %v", err)
-	}
-	if len(oldMatches) != 1 || oldMatches[0].FileName != "platform/app.go" {
-		t.Fatalf("expected captured treeish content, got %#v", oldMatches)
-	}
-	liveMatches, err := executeUnscopedShardSearchForTest(context.Background(), indexDir, "captured_treeish_live_head_marker")
-	if err != nil {
-		t.Fatalf("search live marker: %v", err)
-	}
-	if len(liveMatches) != 0 {
-		t.Fatalf("live HEAD content should not be indexed for captured treeish, got %#v", liveMatches)
-	}
-}
-
-func TestGitDirtyFileBudget_CapsIncludeCorpusContext(t *testing.T) {
-	dir := t.TempDir()
-	const content = "package a\n"
-	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	tests := []struct {
-		name     string
-		maxFiles int64
-		maxBytes int64
-		metric   indexCapMetric
-		current  int64
-	}{
-		{name: "candidate files", maxFiles: 0, maxBytes: maxCorpusIndexedBytes, metric: indexCapCandidateFiles, current: 1},
-		{name: "indexed bytes", maxFiles: maxGitCandidateFiles, maxBytes: 0, metric: indexCapIndexedBytes, current: int64(len(content))},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			indexDir := filepath.Join(t.TempDir(), "index")
-			err := checkGitDirtyFileBudgetWithLimits(dir, indexDir, []string{"a.go"}, tc.maxFiles, tc.maxBytes)
-			if !errors.Is(err, errGitCapExceeded) {
-				t.Fatalf("error=%v, want Git cap error", err)
-			}
-			contextErr, ok := errors.AsType[*gitCorpusContextError](err)
-			if !ok || contextErr.root != dir || contextErr.indexDir != indexDir {
-				t.Fatalf("context error=%+v, want root=%q index=%q", contextErr, dir, indexDir)
-			}
-			capErr, ok := errors.AsType[indexCapExceededError](err)
-			if !ok || capErr.metric != tc.metric || capErr.current != tc.current || capErr.limit != 0 {
-				t.Fatalf("cap error=%+v, want metric=%q current=%d limit=0", capErr, tc.metric, tc.current)
-			}
-		})
-	}
-}
-
-func TestGitDirtyFileBudget_SkipsOversizeFilesForByteCap(t *testing.T) {
-	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
-	dir := t.TempDir()
-	large := filepath.Join(dir, "large.bin")
-	if err := os.WriteFile(large, nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Truncate(large, testDocumentContentLimit+1); err != nil {
-		t.Fatal(err)
-	}
-
-	err := checkGitDirtyFileBudgetWithLimits(
-		dir,
-		filepath.Join(t.TempDir(), "index"),
-		[]string{"large.bin"},
-		maxGitCandidateFiles,
-		0,
-	)
-	if err != nil {
-		t.Fatalf("oversize dirty file should not consume indexed byte budget: %v", err)
 	}
 }
 
@@ -1116,9 +1002,15 @@ func TestCleanUncommittedShards_PreservesCommittedShards(t *testing.T) {
 func TestCleanUncommittedShards_ReadOnlyFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "uncommitted_v16.00000.zoekt")
-	_ = os.WriteFile(path, []byte{}, 0o444)
-	// Should not panic even if removal fails
+	if err := os.WriteFile(path, []byte{}, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	// The mode of a file does not prevent its removal from a writable
+	// directory.
 	cleanUncommittedShards(dir)
+	if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("read-only uncommitted shard remains: stat error=%v", err)
+	}
 }
 
 func TestShardsExist_OnlyTmpFiles(t *testing.T) {
@@ -1169,12 +1061,24 @@ func TestStreamFiles_PermissionDenied(t *testing.T) {
 
 	_ = os.WriteFile(filepath.Join(dir, "ok.go"), []byte("ok"), 0o644)
 
+	// The unreadable file stays searchable by name.
 	results := collectStreamFilesForTest(t.Context(), dir, []string{"secret.go", "ok.go"}, 2)
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result (permission denied skipped), got %d", len(results))
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
 	}
-	if results[0].name != "ok.go" {
-		t.Errorf("expected ok.go, got %s", results[0].name)
+	for _, result := range results {
+		switch result.name {
+		case "ok.go":
+			if string(result.content) != "ok" {
+				t.Errorf("ok.go content=%q", result.content)
+			}
+		case "secret.go":
+			if len(result.content) != 0 || result.skipReason != seekNoBytesReason {
+				t.Errorf("secret.go is not name-only: %+v", result)
+			}
+		default:
+			t.Errorf("unexpected result %s", result.name)
+		}
 	}
 }
 
@@ -1198,12 +1102,17 @@ func TestStreamFiles_DuplicateNames(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "dup.go"), []byte("content"), 0o644)
 
-	// Same file passed twice
+	// Same file passed twice. The callers remove duplicates
+	// (TestParseGitStatusV2_Deduplication), so the reader can send the file
+	// once or twice; each copy must hold the full content.
 	results := collectStreamFilesForTest(t.Context(), dir, []string{"dup.go", "dup.go"}, 2)
-	// collectStreamFilesForTest doesn't deduplicate — both are read.
-	// This is fine because deduplication happens at the formatter level.
-	if len(results) != 2 {
-		t.Errorf("expected 2 results (no dedup at read level), got %d", len(results))
+	if len(results) == 0 || len(results) > 2 {
+		t.Fatalf("got %d results, want dup.go once or twice", len(results))
+	}
+	for _, result := range results {
+		if result.name != "dup.go" || string(result.content) != "content" {
+			t.Errorf("result=%q content=%q, want dup.go with its full content", result.name, result.content)
+		}
 	}
 }
 
@@ -1258,7 +1167,7 @@ func TestStateCaching_BothSucceed_StateStable(t *testing.T) {
 }
 
 // TestStateCaching_BothSucceed_DirtyFileChangedAfterStateCapture verifies that
-// post-verification detects changed metadata for a previously dirty file.
+// the next search sees changed metadata of a previously dirty file.
 func TestStateCaching_BothSucceed_DirtyFileChangedAfterStateCapture(t *testing.T) {
 	requireTools(t)
 
@@ -1285,15 +1194,14 @@ func TestStateCaching_BothSucceed_DirtyFileChangedAfterStateCapture(t *testing.T
 	}
 
 	// Run indexing with the pre-mutation state.
-	// Post-verification re-stats state.Files and detects the drift.
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
-	// State file should NOT be written (drift detected via re-stat)
-	cached := readStateFile(plan.cacheDir)
-	if cached != "" {
-		t.Errorf("expected no state file after dirty-file drift, got %q", cached)
+	// The build publishes its capture: a search shows the tree as captured at
+	// its start, and the next capture sees the edit.
+	if cached := readStateFile(plan.cacheDir); cached != stateHash {
+		t.Errorf("the build did not publish its capture: got %q, want %q", cached, stateHash)
 	}
 
 	files, err := runSeekInPlannedGitCorpus(ctx, "second_edit_during_indexing", paths, plan)
@@ -1313,8 +1221,8 @@ func TestStateCaching_BothSucceed_DirtyFileChangedAfterStateCapture(t *testing.T
 }
 
 // TestStateCaching_BothSucceed_CleanFileChangesAfterStateCapture verifies that
-// the final full-state check finds a new dirty path that was absent from the
-// captured file list.
+// the next search finds a new dirty path that was absent from the captured
+// file list.
 func TestStateCaching_BothSucceed_CleanFileChangesAfterStateCapture(t *testing.T) {
 	testStateCachingNewDirtyPathAfterCapture(t, func(dir string) string {
 		const marker = "mutated"
@@ -1329,8 +1237,8 @@ func TestStateCaching_BothSucceed_CleanFileChangesAfterStateCapture(t *testing.T
 	})
 }
 
-// TestStateCaching_DirtyFileDeletedAfterStateCapture verifies that
-// post-verification detects deletion of a captured dirty file.
+// TestStateCaching_DirtyFileDeletedAfterStateCapture verifies that the next
+// search sees the deletion of a captured dirty file.
 func TestStateCaching_DirtyFileDeletedAfterStateCapture(t *testing.T) {
 	requireTools(t)
 
@@ -1359,10 +1267,9 @@ func TestStateCaching_DirtyFileDeletedAfterStateCapture(t *testing.T) {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
-	// Drift should be detected when the previously dirty file disappears.
-	cached := readStateFile(plan.cacheDir)
-	if cached != "" {
-		t.Errorf("expected no state file after captured file deletion, got %q", cached)
+	// The build publishes its capture; the next capture sees the deletion.
+	if cached := readStateFile(plan.cacheDir); cached != stateHash {
+		t.Errorf("the build did not publish its capture: got %q, want %q", cached, stateHash)
 	}
 
 	files, err := runSeekInPlannedGitCorpus(ctx, "dirty_deleted_marker", paths, plan)
@@ -1406,10 +1313,9 @@ func TestStateCaching_DirtyFileAtomicReplaceAfterStateCapture(t *testing.T) {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
-	// Drift should be detected (inode changed via rename)
-	cached := readStateFile(plan.cacheDir)
-	if cached != "" {
-		t.Errorf("expected no state file after atomic replace, got %q", cached)
+	// The build publishes its capture; the next capture sees the new inode.
+	if cached := readStateFile(plan.cacheDir); cached != stateHash {
+		t.Errorf("the build did not publish its capture: got %q, want %q", cached, stateHash)
 	}
 
 	files, err := runSeekInPlannedGitCorpus(ctx, "atomic_replaced", paths, plan)
@@ -1566,8 +1472,8 @@ func TestStateCaching_StaleAValidationKeepsPublishedBState(t *testing.T) {
 	}
 }
 
-// TestStateCaching_NewUntrackedFileAfterStateCapture verifies that the final
-// full-state check finds a new path absent from the captured file list.
+// TestStateCaching_NewUntrackedFileAfterStateCapture verifies that the next
+// search finds a new path absent from the captured file list.
 func TestStateCaching_NewUntrackedFileAfterStateCapture(t *testing.T) {
 	testStateCachingNewDirtyPathAfterCapture(t, func(dir string) string {
 		const marker = "brand_new"
@@ -1603,9 +1509,9 @@ func testStateCachingNewDirtyPathAfterCapture(
 		t.Fatalf("indexing failed: %v", err)
 	}
 
-	cached := readStateFile(plan.cacheDir)
-	if cached != "" {
-		t.Fatalf("expected no state file after a new dirty path, got %q", cached)
+	// The build publishes its capture; the next capture sees the new path.
+	if cached := readStateFile(plan.cacheDir); cached != stateHash {
+		t.Fatalf("the build did not publish its capture: got %q, want %q", cached, stateHash)
 	}
 	files, err := runSeekInPlannedGitCorpus(ctx, marker, paths, plan)
 	if err != nil {
@@ -1738,6 +1644,9 @@ func TestStateCaching_DoubleCheck_SkipsRedundantIndex(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// content\n")
+	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// double_check_published\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
@@ -1745,26 +1654,25 @@ func TestStateCaching_DoubleCheck_SkipsRedundantIndex(t *testing.T) {
 	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 
-	// First index
+	// A peer builds and publishes this state.
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("first indexing failed: %v", err)
 	}
 
-	// Pre-populate state file with the SAME hash we're about to pass
-	// This simulates another process having just indexed
-	if err := writeStateFile(plan.cacheDir, stateHash); err != nil {
+	// The dirty file changes after this caller captured the same state. A
+	// rebuild would read the new content; the skip keeps the published index.
+	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// double_check_rebuilt\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-
-	// Second index with same state should be a no-op (double-check hit)
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("second indexing failed: %v", err)
 	}
 
-	// State file should still contain the same hash
-	cached := readStateFile(plan.cacheDir)
-	if cached != stateHash {
-		t.Errorf("state file changed after double-check skip: %q -> %q", stateHash, cached)
+	if results, err := executeUnscopedShardSearchForTest(ctx, plan.indexDir, "double_check_rebuilt"); err != nil || len(results) != 0 {
+		t.Fatalf("same-state call rebuilt the index: results=%d error=%v", len(results), err)
+	}
+	if results, err := executeUnscopedShardSearchForTest(ctx, plan.indexDir, "double_check_published"); err != nil || len(results) == 0 {
+		t.Fatalf("same-state call lost the published index: results=%d error=%v", len(results), err)
 	}
 }
 
@@ -1838,8 +1746,9 @@ func TestStateCaching_StaleFallback_DoesNotWriteState(t *testing.T) {
 // repoStateFingerprint — inode detection tests
 // ---------------------------------------------------------------------------
 
-// TestRepoStateFingerprint_InodeChange_AtomicWrite verifies that when a file
-// is replaced by rename, the inode field changes even if mtime and size match.
+// TestRepoStateFingerprint_InodeChange_AtomicWrite verifies that a file
+// replaced by rename changes the fingerprint when its content, size, and mtime
+// match. Only the inode and the ctime differ.
 func TestRepoStateFingerprint_InodeChange_AtomicWrite(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "file.go")
@@ -1847,6 +1756,11 @@ func TestRepoStateFingerprint_InodeChange_AtomicWrite(t *testing.T) {
 	if err := os.WriteFile(path, content, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	mtime := time.Unix(1_700_000_000, 0)
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	oldInode := getInode(t, path)
 
 	state := repoState{
 		RawOutput: "# branch.oid abc\x00",
@@ -1855,24 +1769,23 @@ func TestRepoStateFingerprint_InodeChange_AtomicWrite(t *testing.T) {
 	fp1 := repoStateFingerprint(dir, state)
 
 	// Simulate atomic write: write to a new tmp file, then rename over original.
-	// This creates a new inode while preserving the content.
+	// The tmp file exists beside the original, so it has a different inode.
 	tmpPath := filepath.Join(dir, "file.go.tmp")
 	if err := os.WriteFile(tmpPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(tmpPath, mtime, mtime); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		t.Fatal(err)
 	}
+	if getInode(t, path) == oldInode {
+		t.Fatal("precondition: the rename kept the inode")
+	}
 
-	fp2 := repoStateFingerprint(dir, state)
-
-	// Fingerprints must differ — the inode changed even though content is identical.
-	// Note: on some filesystems, inode recycling could theoretically reuse the same
-	// inode, so we log rather than hard-fail if they match.
-	if fp1 == fp2 {
-		// Verify inode actually changed — if it didn't, the filesystem recycled it
-		fi1Ino := getInode(t, path)
-		t.Logf("fp1 == fp2; inode after rename: %d (may indicate inode recycling on this filesystem)", fi1Ino)
+	if fp2 := repoStateFingerprint(dir, state); fp1 == fp2 {
+		t.Fatal("fingerprint did not change after an atomic replace with the same content, size, and mtime")
 	}
 }
 
@@ -2056,12 +1969,18 @@ func TestRepoStateFingerprint_SameSizeEditWithNewMtime(t *testing.T) {
 }
 
 // TestRepoStateFingerprint_SymlinkInFingerprint verifies that Lstat records
-// symlink metadata instead of target metadata.
+// symlink metadata instead of target metadata: a change to the target keeps
+// the fingerprint, and a new link changes it.
 func TestRepoStateFingerprint_SymlinkInFingerprint(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target.go")
-	_ = os.WriteFile(target, []byte("x"), 0o644)
-	_ = os.Symlink(target, filepath.Join(dir, "link.go"))
+	link := filepath.Join(dir, "link.go")
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
 
 	state := repoState{
 		RawOutput: "raw",
@@ -2069,21 +1988,31 @@ func TestRepoStateFingerprint_SymlinkInFingerprint(t *testing.T) {
 	}
 	fp := repoStateFingerprint(dir, state)
 
-	// The symlink should be fingerprinted (Lstat sees it as a symlink).
-	// The fingerprint should contain the symlink's own metadata, not the target's.
-	if !strings.Contains(fp, "\x00link.go\x00") {
-		t.Error("expected link.go in fingerprint")
+	// New size and mtime for the target only.
+	if err := os.WriteFile(target, []byte("target grew\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Unix(1_700_000_000, 0)
+	if err := os.Chtimes(target, later, later); err != nil {
+		t.Fatal(err)
+	}
+	if got := repoStateFingerprint(dir, state); got != fp {
+		t.Fatal("fingerprint changed with the symlink target; want the metadata of the link itself")
 	}
 
-	// Verify symlink has a different inode than target
-	linkFi, _ := os.Lstat(filepath.Join(dir, "link.go"))
-	targetFi, _ := os.Lstat(target)
-	if linkStat, ok := linkFi.Sys().(*syscall.Stat_t); ok {
-		if targetStat, ok := targetFi.Sys().(*syscall.Stat_t); ok {
-			if linkStat.Ino == targetStat.Ino {
-				t.Error("expected symlink and target to have different inodes")
-			}
-		}
+	// A new link to another target is a change of the listed path.
+	other := filepath.Join(dir, "other-target.go")
+	if err := os.WriteFile(other, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(other, link); err != nil {
+		t.Fatal(err)
+	}
+	if got := repoStateFingerprint(dir, state); got == fp {
+		t.Fatal("fingerprint did not change after the link was replaced")
 	}
 }
 
@@ -2169,30 +2098,40 @@ func TestComputeStateHash_NulBytesInInput(t *testing.T) {
 // Integration: inode-aware drift detection end-to-end
 // ---------------------------------------------------------------------------
 
-// TestIntegration_AtomicWriteDetected verifies that when a file is replaced
-// via atomic write (the vim/emacs pattern), seek detects the change and
-// re-indexes even if the content, size, and potentially mtime match.
+// TestIntegration_AtomicWriteDetected verifies that when a dirty file is
+// replaced via atomic write (the vim/emacs pattern), seek detects the change
+// and re-indexes. The size and mtime stay the same, and git status does not
+// change: only the file identity tells the change.
 func TestIntegration_AtomicWriteDetected(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// atomic_original\n")
+	appPath := filepath.Join(dir, "app.go")
+	mtime := time.Unix(1_700_000_000, 0)
 
-	// First search to build index
-	files, err := runSeekInRepo(t, dir, "atomic_original")
+	// Make the file dirty, then search to build the index.
+	if err := os.WriteFile(appPath, []byte("package main\n// atomic_first_v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(appPath, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	files, err := runSeekInRepo(t, dir, "atomic_first_v1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(files) == 0 {
-		t.Fatal("expected match for original content")
+		t.Fatal("expected match for the first dirty content")
 	}
 
-	// Edit via uncommitted change
-	appPath := filepath.Join(dir, "app.go")
+	// Simulate atomic write: write to tmp, rename over original. The new
+	// content has the same size, and the tmp file gets the same mtime.
 	newContent := []byte("package main\n// atomic_replaced\n")
-
-	// Simulate atomic write: write to tmp, rename over original
 	tmpPath := appPath + ".tmp"
 	if err := os.WriteFile(tmpPath, newContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(tmpPath, mtime, mtime); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Rename(tmpPath, appPath); err != nil {

@@ -262,15 +262,44 @@ func TestRejectedModelStopsRefreshingItsAccessMarker(t *testing.T) {
 }
 
 func TestSearchFallbacksRecordAProviderFault(t *testing.T) {
-	// Every search-path fallback must report a provider fault, not only the
-	// re-rank one. A wrong provider on an already-built index otherwise drops
-	// every search to text ranking and never records itself.
-	for _, name := range []string{"joined search", "query preparation", "re-ranking"} {
-		t.Run(name, func(t *testing.T) {
+	// A wrong provider on an already-built index makes the search fall back to
+	// strict order. The fallback must record one provider fault, or the
+	// provider never earns a demotion. The query model and the re-rank model
+	// each fail with degenerate output on the second search; the first search
+	// builds the vectors with a working model.
+	for _, test := range []struct {
+		name string
+		fail func(*hybridTestScorer, error)
+	}{
+		{name: "query preparation", fail: func(scorer *hybridTestScorer, err error) { scorer.prepareErr = err }},
+		{name: "re-ranking", fail: func(scorer *hybridTestScorer, err error) { scorer.scoreErr = err }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requireTools(t)
+			setTestUserCache(t)
+			folder := t.TempDir()
+			writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
 			path := pinAcceleratedProviderForTest(t)
-			recordSemanticProviderFault(fmt.Errorf("%s: %w", name, errDegenerateSemanticVector))
-			if readLateOnProviderRecord(path).faults != 1 {
-				t.Fatalf("%s did not record a provider fault", name)
+			search := func(scorer *hybridTestScorer) {
+				t.Helper()
+				output, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(),
+					func(context.Context) (semanticModel, error) { return scorer, nil })
+				if err != nil || !strings.Contains(output, "strict.go") {
+					t.Fatalf("output=%q err=%v, want the strict file", output, err)
+				}
+			}
+			search(&hybridTestScorer{})
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("the build with a working model recorded a provider fault: %v", err)
+			}
+			failing := &hybridTestScorer{}
+			test.fail(failing, fmt.Errorf("%s: %w", test.name, errDegenerateSemanticVector))
+			search(failing)
+			if failing.embedCalls.Load() != 0 {
+				t.Fatalf("the second search embedded %d batches, want the built index", failing.embedCalls.Load())
+			}
+			if record := readLateOnProviderRecord(path); record.faults != 1 {
+				t.Fatalf("provider record=%+v, want one fault from the %s fallback", record, test.name)
 			}
 		})
 	}

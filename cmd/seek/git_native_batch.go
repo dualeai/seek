@@ -3,13 +3,20 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os/exec"
+	"sync"
 
 	"github.com/sourcegraph/zoekt/index"
 )
+
+// missingBlobWarned holds the repositories whose missing-blob warning this
+// command already wrote. The lexical and semantic builds read the same tree,
+// so one command warns once per repository.
+var missingBlobWarned sync.Map
 
 // nativeGitBatch is one ordered, buffered Git object session. Each request
 // group ends with an explicit flush. A full scan reuses one instance for its
@@ -24,10 +31,12 @@ type nativeGitBatch struct {
 	stderr   boundedGitStderr
 	ids      []gitObjectID
 	finished bool
+	repoDir  string
+	missing  int
 }
 
 func startNativeGitBatch(ctx context.Context, repoDir string) (*nativeGitBatch, error) {
-	cmd := nativeGitCmd(ctx, repoDir, "cat-file", "--batch-command", "--buffer")
+	cmd := newGitCommand(ctx, repoDir, "cat-file", "--batch-command", "--buffer")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("open git cat-file --batch-command stdin: %w", err)
@@ -43,11 +52,12 @@ func startNativeGitBatch(ctx context.Context, repoDir string) (*nativeGitBatch, 
 		stdin:   stdin,
 		writer:  bufio.NewWriterSize(stdin, 64*1024),
 		reader:  bufio.NewReaderSize(stdout, 64*1024),
+		repoDir: repoDir,
 	}
 	cmd.Stderr = &batch.stderr
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
-		return nil, nativeGitCommandError(ctx, "start git cat-file --batch-command", err, &batch.stderr)
+		return nil, gitCommandError(ctx, "start git cat-file --batch-command", err, &batch.stderr)
 	}
 	return batch, nil
 }
@@ -99,6 +109,9 @@ func (b *nativeGitBatch) abort(writeDone <-chan error) {
 	}
 }
 
+// check reads the size of the blob of each entry. In a partial clone, a
+// missing blob gives a name-only info and counts toward the warning that close
+// writes; in any other repository, a missing blob fails the batch.
 func (b *nativeGitBatch) check(entries []gitTreeEntry) ([]gitBlobInfo, error) {
 	if len(entries) == 0 {
 		return nil, nil
@@ -119,9 +132,14 @@ func (b *nativeGitBatch) check(entries []gitTreeEntry) ([]gitBlobInfo, error) {
 			return nil, fmt.Errorf("read git cat-file info reply %d: %w", i, err)
 		}
 		size, err := parseNativeGitBatchHeader(header, entry.oid, nil)
+		if errors.Is(err, errGitBlobMissing) && repoIsPartialClone(b.ctx, b.repoDir) {
+			b.missing++
+			infos[i] = gitBlobInfo{entry: entry, missing: true}
+			continue
+		}
 		if err != nil {
 			b.abort(writeDone)
-			return nil, err
+			return nil, fmt.Errorf("git blob %s for %q: %w", entry.oid, entry.path, err)
 		}
 		infos[i] = gitBlobInfo{entry: entry, size: size, oversize: !documentContentFits(size)}
 	}
@@ -135,16 +153,18 @@ func (b *nativeGitBatch) check(entries []gitTreeEntry) ([]gitBlobInfo, error) {
 	return infos, nil
 }
 
+// read passes one document per info to consume, in order: the content, or the
+// name only for a missing, oversize, or binary blob.
 func (b *nativeGitBatch) read(infos []gitBlobInfo, consume func(fileContent) error) error {
 	b.ids = b.ids[:0]
 	for i := range infos {
-		if !infos[i].oversize {
+		if !infos[i].nameOnly() {
 			b.ids = append(b.ids, infos[i].entry.oid)
 		}
 	}
 	if len(b.ids) == 0 {
 		for _, info := range infos {
-			if err := consume(fileContent{name: info.entry.path, skipReason: index.SkipReasonTooLarge}); err != nil {
+			if err := consume(info.nameOnlyDocument()); err != nil {
 				return err
 			}
 		}
@@ -153,8 +173,8 @@ func (b *nativeGitBatch) read(infos []gitBlobInfo, consume func(fileContent) err
 	writeDone := b.writeCommands("contents", b.ids)
 	replyIndex := 0
 	for _, info := range infos {
-		if info.oversize {
-			if err := consume(fileContent{name: info.entry.path, skipReason: index.SkipReasonTooLarge}); err != nil {
+		if info.nameOnly() {
+			if err := consume(info.nameOnlyDocument()); err != nil {
 				b.abort(writeDone)
 				return err
 			}
@@ -219,11 +239,19 @@ func (b *nativeGitBatch) read(infos []gitBlobInfo, consume func(fileContent) err
 	return nil
 }
 
+// close ends the session. It writes the missing-blob warning once per
+// repository and command.
 func (b *nativeGitBatch) close() error {
 	if b == nil || b.finished {
 		return nil
 	}
 	b.finished = true
+	if b.missing > 0 {
+		if _, warned := missingBlobWarned.LoadOrStore(b.repoDir, struct{}{}); !warned {
+			slog.Warn("Git objects are missing locally; their files are searchable by name only",
+				"repo", b.repoDir, "files", b.missing)
+		}
+	}
 	closeErr := b.stdin.Close()
 	eofErr := readExactEOF(b.reader)
 	waitErr := waitNativeGitChild(b.ctx, b.execCmd, "git cat-file --batch-command", &b.stderr)

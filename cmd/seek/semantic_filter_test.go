@@ -80,7 +80,7 @@ func TestBuildSemanticFilterMask(t *testing.T) {
 		},
 		rows: rows,
 	}
-	mask, err := buildSemanticFilterMask(t.Context(), generation, semanticFilterForTest(t, "file:^keep/"))
+	mask, err := buildSemanticFilterMask(t.Context(), generation, semanticFilterForTest(t, "file:^keep/").matches)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,11 +100,11 @@ func TestBuildSemanticFilterMask(t *testing.T) {
 		t.Fatalf("bitmap bytes=%d, want 1", len(mask.bits))
 	}
 
-	all, err := buildSemanticFilterMask(t.Context(), generation, semanticFilterForTest(t, "file:go"))
+	all, err := buildSemanticFilterMask(t.Context(), generation, semanticFilterForTest(t, "file:go").matches)
 	if err != nil || all.mode != semanticFilterAll || len(all.bits) != 0 || len(all.shardAllowed) != 0 {
 		t.Fatalf("all mask=%+v error=%v", all, err)
 	}
-	none, err := buildSemanticFilterMask(t.Context(), generation, semanticFilterForTest(t, "file:^missing/"))
+	none, err := buildSemanticFilterMask(t.Context(), generation, semanticFilterForTest(t, "file:^missing/").matches)
 	if err != nil || none.mode != semanticFilterNone || len(none.bits) != 0 || len(none.shardAllowed) != 0 {
 		t.Fatalf("none mask=%+v error=%v", none, err)
 	}
@@ -117,7 +117,7 @@ func TestBuildSemanticFilterMaskHonorsCancellation(t *testing.T) {
 		manifest: semanticManifest{Rows: 1},
 		rows:     []semanticUnit{{row: 0, path: "main.go", fileLanguage: "Go"}},
 	}
-	_, err := buildSemanticFilterMask(ctx, generation, semanticFilterForTest(t, "lang:go"))
+	_, err := buildSemanticFilterMask(ctx, generation, semanticFilterForTest(t, "lang:go").matches)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error=%v, want cancellation", err)
 	}
@@ -132,7 +132,7 @@ func TestBuildSemanticFilterMaskRejectsInvalidGroupedRow(t *testing.T) {
 		},
 	}
 	_, err := buildSemanticFilterMask(
-		t.Context(), generation, semanticFilterForTest(t, "lang:go"),
+		t.Context(), generation, semanticFilterForTest(t, "lang:go").matches,
 	)
 	if err == nil {
 		t.Fatal("invalid row identity was accepted")
@@ -158,7 +158,7 @@ func TestSemanticFilterMaskCrossesByteAndShardBoundary(t *testing.T) {
 		},
 		rows: rows,
 	}
-	mask, err := buildSemanticFilterMask(t.Context(), generation, semanticFilterForTest(t, "file:^keep"))
+	mask, err := buildSemanticFilterMask(t.Context(), generation, semanticFilterForTest(t, "file:^keep").matches)
 	if err != nil {
 		t.Fatal(err)
 	}

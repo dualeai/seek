@@ -6,7 +6,6 @@ BEGIN {
 	regex_meta = "\\.+*?()|[]{}^$"
 	file_limit = 20
 	match_limit = 3
-	max_context = 512
 }
 
 {
@@ -25,8 +24,7 @@ END {
 
 	limit = file_limit
 	if (head_limit && head_limit < limit) limit = head_limit
-	context_kind = route_context_flag == "" ? "none" : substr(route_context_flag, 2, 1)
-	print context_kind "|" render_seek(limit)
+	print render_seek(limit)
 }
 
 function push_token() {
@@ -275,11 +273,8 @@ function route_rg(first, last,    i, j, arg, flag, value, pattern_at, path_at, p
 	if (!pattern_set || route_pattern == "") return 0
 	if (fixed) route_pattern = regexp_quote(route_pattern)
 
-	if (!path_at || path_at > last) {
-		route_paths[++route_npaths] = "."
-	} else if (!copy_paths(path_at, last) || has_dash_path()) {
-		return 0
-	}
+	# A pathless form sends no path: Seek searches the current directory.
+	if (path_at && path_at <= last && (!copy_paths(path_at, last) || has_dash_path())) return 0
 	if (route_context_flag != "" && ((!path_at || path_at > last) || files_only)) return 0
 
 	route_insensitive = insensitive
@@ -288,12 +283,15 @@ function route_rg(first, last,    i, j, arg, flag, value, pattern_at, path_at, p
 	return 1
 }
 
-function set_rg_context(flag, value,    number) {
+function set_rg_context(flag, value) {
 	if (route_context_flag != "" || !decimal_digits(value)) return 0
-	number = value + 0
-	if (number < 0 || number > max_context) return 0
+	# Keep the decimal text: an awk number rounds above 2^53. Seek reads an
+	# int64, so a larger value stays with rg.
+	sub(/^0+/, "", value)
+	if (value == "") value = "0"
+	if (length(value) > 19 || (length(value) == 19 && value > "9223372036854775807")) return 0
 	route_context_flag = flag
-	route_context_lines = number
+	route_context_lines = value
 	return 1
 }
 
@@ -319,12 +317,9 @@ function route_git_grep(first, last,    i, j, arg, flag, pattern_at, insensitive
 	if (!fixed && !portable_regex_literal(route_pattern)) return 0
 	if (fixed) route_pattern = regexp_quote(route_pattern)
 
-	if (pattern_at == last) {
-		route_paths[++route_npaths] = "."
-	} else {
+	if (pattern_at < last) {
 		if (args[pattern_at + 1] != "--") return 0
-		if (pattern_at + 1 == last) route_paths[++route_npaths] = "."
-		else if (!copy_paths(pattern_at + 2, last) || !literal_git_paths()) return 0
+		if (pattern_at + 1 < last && (!copy_paths(pattern_at + 2, last) || !literal_git_paths())) return 0
 	}
 	route_insensitive = insensitive
 	route_files_only = files_only
@@ -339,11 +334,15 @@ function route_fd(first, last,    i) {
 	}
 	if (i > last || args[i] == "" || substr(args[i], 1, 1) == "-") return 0
 	route_pattern = args[i++]
-	if (i > last) route_paths[++route_npaths] = "."
-	else if (!copy_paths(i, last) || has_dash_path()) return 0
+	# fd matches its pattern on the file name, and the header holds the path as
+	# typed. A literal name with no "/" maps to a match inside the last path
+	# component; any other pattern stays with fd.
+	if (index(route_pattern, "/") || !portable_regex_literal(route_pattern)) return 0
+	if (i <= last && (!copy_paths(i, last) || has_dash_path())) return 0
+	route_insensitive = !has_upper(route_pattern)
+	route_pattern = "(^|/)[^/]*" route_pattern "[^/]*$"
 	route_query_kind = "file"
 	route_files_only = 1
-	route_insensitive = !has_upper(route_pattern)
 	return 1
 }
 

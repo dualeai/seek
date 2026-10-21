@@ -11,14 +11,6 @@ import (
 
 const semanticSNORM16MaximumDecodeError = 2.980141289299354e-8
 
-func decodeSemanticSNORM16Vector(vector semanticSNORM16Vector) semanticVector {
-	var decoded semanticVector
-	for dimension, code := range vector {
-		decoded[dimension] = float32(code) / float32(semanticSNORM16Scale)
-	}
-	return decoded
-}
-
 func testSemanticSNORM16GoldenEmbedding() semanticUnitEmbedding {
 	var embedding semanticUnitEmbedding
 	embedding.fine[0] = semanticVector{0: -0.5, 1: 0.5, 2: float32(math.Sqrt(0.5))}

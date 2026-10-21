@@ -204,25 +204,18 @@ func BenchmarkExtractV2Path(b *testing.B) {
 	}
 }
 
-func BenchmarkFastResolveGitPaths(b *testing.B) {
-	dir := b.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, ".git", "info"), 0o755); err != nil {
+// BenchmarkFindGitBoundaryUp measures a walk from a folder three levels deep
+// up to its repository's Git boundary, with one detectGitBoundary probe per
+// level, as operandRepo does for each operand.
+func BenchmarkFindGitBoundaryUp(b *testing.B) {
+	dir := initGitRepo(b, "dummy.go", "package dummy\n")
+	sub := filepath.Join(dir, "a", "b", "c")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
 		b.Fatal(err)
 	}
-
-	// Change to the temp dir so fastResolveGitPaths can find .git
-	origDir, err := os.Getwd()
-	if err != nil {
-		b.Fatal(err)
-	}
-	if err := os.Chdir(dir); err != nil {
-		b.Fatal(err)
-	}
-	b.Cleanup(func() { _ = os.Chdir(origDir) })
-
 	b.ReportAllocs()
 	for b.Loop() {
-		fastResolveGitPaths()
+		findGitBoundaryUp(sub)
 	}
 }
 
@@ -597,7 +590,7 @@ func BenchmarkGitPathScoped_WarmSearch(b *testing.B) {
 
 	ctx := context.Background()
 	paths, _ := planGitTestCorpus(b, dir)
-	scopedPlan, err := planCurrentGitCorpusWithOperands(paths, []string{filepath.Join(dir, "a")})
+	scopedPlan, err := planGitCorpus(paths, []string{filepath.Join(dir, "a")})
 	if err != nil {
 		b.Fatalf("plan scoped corpus: %v", err)
 	}
@@ -631,9 +624,8 @@ func BenchmarkGitPathScoped_PlanCorpora(b *testing.B) {
 	gitRunIn(b, dir, "commit", "-m", "add scoped planning files")
 
 	ctx := context.Background()
-	paths, _ := planGitTestCorpus(b, dir)
 	operands := []string{scope}
-	if plans, err := planCorpora(ctx, &paths, operands); err != nil {
+	if plans, err := planCorpora(ctx, operands); err != nil {
 		b.Fatalf("plan setup: %v", err)
 	} else if len(plans) != 1 {
 		b.Fatalf("plans=%d, want 1", len(plans))
@@ -642,7 +634,7 @@ func BenchmarkGitPathScoped_PlanCorpora(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		plans, err := planCorpora(ctx, &paths, operands)
+		plans, err := planCorpora(ctx, operands)
 		if err != nil {
 			b.Fatalf("plan scoped corpus: %v", err)
 		}
@@ -659,7 +651,7 @@ func BenchmarkGitPathScoped_ColdIndexWithTrackedSibling(b *testing.B) {
 	dir, scope := writeScopedGitBenchmarkRepo(b)
 	ctx := context.Background()
 	paths, _ := planGitTestCorpus(b, dir)
-	scopedPlan, err := planCurrentGitCorpusWithOperands(paths, []string{scope})
+	scopedPlan, err := planGitCorpus(paths, []string{scope})
 	if err != nil {
 		b.Fatalf("plan scoped corpus: %v", err)
 	}
@@ -696,7 +688,7 @@ func BenchmarkGitPathScoped_DirtyReindexWithTrackedSibling(b *testing.B) {
 	dir, scope := writeScopedGitBenchmarkRepo(b)
 	ctx := context.Background()
 	paths, _ := planGitTestCorpus(b, dir)
-	scopedPlan, err := planCurrentGitCorpusWithOperands(paths, []string{scope})
+	scopedPlan, err := planGitCorpus(paths, []string{scope})
 	if err != nil {
 		b.Fatalf("plan scoped corpus: %v", err)
 	}
@@ -744,7 +736,7 @@ func BenchmarkGitPathScoped_OutOfScopeCommitReusesCommittedLayer(b *testing.B) {
 	dir, scope := writeScopedGitBenchmarkRepo(b)
 	ctx := context.Background()
 	paths, _ := planGitTestCorpus(b, dir)
-	scopedPlan, err := planCurrentGitCorpusWithOperands(paths, []string{scope})
+	scopedPlan, err := planGitCorpus(paths, []string{scope})
 	if err != nil {
 		b.Fatalf("plan scoped corpus: %v", err)
 	}
@@ -869,7 +861,7 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(b, dir)
 
-	if _, _, err := ensureGitCorpusFresh(ctx, &plan, paths); err != nil {
+	if _, _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
 		b.Fatalf("initial indexing: %v", err)
 	}
 
@@ -907,17 +899,10 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 		}
 	})
 
-	b.Run("planCurrentGitCorpus", func(b *testing.B) {
+	b.Run("planGitCorpus", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			_, _ = planCurrentGitCorpus(paths)
-		}
-	})
-
-	b.Run("ensureUntrackedCache", func(b *testing.B) {
-		b.ReportAllocs()
-		for b.Loop() {
-			ensureUntrackedCache(ctx, paths)
+			_, _ = planGitCorpus(paths, nil)
 		}
 	})
 
@@ -950,7 +935,7 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 			// Reuse the captured state (paths only). statUncommittedCandidates
 			// re-stats each file during indexUncommitted, so the delta path
 			// still sees fresh mtime/size/ino for every iteration.
-			if err := indexUncommitted(ctx, dir, plan.indexDir, plan.cacheDir, state, cachedState, preState, indexParallelism()); err != nil {
+			if err := indexUncommitted(ctx, dir, plan.indexDir, plan.cacheDir, state, cachedState, preState, indexParallelism(), nil, nil); err != nil {
 				b.Fatalf("index uncommitted: %v", err)
 			}
 		}
@@ -1318,7 +1303,7 @@ func BenchmarkChangedFolderDocumentsFromManifest_1000Files_1Changed(b *testing.B
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		changedDocs, changedPaths, _ := changedFolderDocumentsFromManifest(selected, manifest)
+		changedDocs, changedPaths, _ := changedFolderDocumentsFromManifest(selected, manifest, indexWindowBytes)
 		if len(changedDocs) != 1 || len(changedPaths) != 1 {
 			b.Fatalf("changed docs=%d paths=%d, want 1 each", len(changedDocs), len(changedPaths))
 		}
@@ -1458,7 +1443,7 @@ func BenchmarkFolderCorpus_DirtyReindexPhases_1File(b *testing.B) {
 	if err != nil {
 		b.Fatalf("folder state: %v", err)
 	}
-	changedDocs, changedPaths, _ := changedFolderDocumentsFromManifest(selected, manifest)
+	changedDocs, changedPaths, _ := changedFolderDocumentsFromManifest(selected, manifest, indexWindowBytes)
 	if len(changedDocs) != 1 || len(changedPaths) != 1 {
 		b.Fatalf("changed docs=%d paths=%d, want 1 each", len(changedDocs), len(changedPaths))
 	}
@@ -1493,7 +1478,7 @@ func BenchmarkFolderCorpus_DirtyReindexPhases_1File(b *testing.B) {
 	b.Run("changedDocumentsFromManifest", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			docs, paths, _ := changedFolderDocumentsFromManifest(selected, manifest)
+			docs, paths, _ := changedFolderDocumentsFromManifest(selected, manifest, indexWindowBytes)
 			if len(docs) != 1 || len(paths) != 1 {
 				b.Fatalf("changed docs=%d paths=%d, want 1 each", len(docs), len(paths))
 			}
@@ -1713,7 +1698,7 @@ func setupLargeRepoBench(b *testing.B) (repoDir string, paths gitPaths, plan cor
 	paths, plan = planGitTestCorpus(b, repoDir)
 
 	ctx := context.Background()
-	if _, _, err := ensureGitCorpusFresh(ctx, &plan, paths); err != nil {
+	if _, _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
 		b.Fatalf("initial indexing failed: %v", err)
 	}
 	return repoDir, paths, plan
@@ -1725,7 +1710,7 @@ func setupScratchLargeRepoBench(b *testing.B) (repoDir string, paths gitPaths, p
 	paths, plan = planGitTestCorpus(b, repoDir)
 
 	ctx := context.Background()
-	if _, _, err := ensureGitCorpusFresh(ctx, &plan, paths); err != nil {
+	if _, _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
 		b.Fatalf("initial indexing failed: %v", err)
 	}
 	return repoDir, paths, plan
@@ -1873,17 +1858,10 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		}
 	})
 
-	b.Run("planCurrentGitCorpus", func(b *testing.B) {
+	b.Run("planGitCorpus", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			_, _ = planCurrentGitCorpus(paths)
-		}
-	})
-
-	b.Run("ensureUntrackedCache", func(b *testing.B) {
-		b.ReportAllocs()
-		for b.Loop() {
-			ensureUntrackedCache(ctx, paths)
+			_, _ = planGitCorpus(paths, nil)
 		}
 	})
 
@@ -1917,7 +1895,7 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 			}
 			loopState := mustGitRepoStateIn(b, ctx, repoDir)
 			preState := gitCorpusStateHash(paths, loopState)
-			if err := indexUncommitted(ctx, repoDir, plan.indexDir, plan.cacheDir, loopState, cachedState, preState, indexParallelism()); err != nil {
+			if err := indexUncommitted(ctx, repoDir, plan.indexDir, plan.cacheDir, loopState, cachedState, preState, indexParallelism(), nil, nil); err != nil {
 				b.Fatalf("index uncommitted: %v", err)
 			}
 		}
@@ -2410,13 +2388,16 @@ func BenchmarkGC_RunGC_NoEvictions_N100(b *testing.B) {
 		}
 		b.StartTimer()
 
-		runGC(ctx, gcOptions{maxAge: defaultGCMaxAge, skipThrottle: true}, defaultGCInterval)
+		runGC(ctx, gcOptions{skipThrottle: true}, defaultGCInterval)
 	}
 }
 
 func BenchmarkGC_RunGC_FullEvict_N100(b *testing.B) {
 	resetNFSCheck(b)
 	root := cacheRootForTest(b)
+	// A 1-byte budget puts every corpus over the budget, so each pass evicts
+	// all 100.
+	b.Setenv(envCacheBudget, "1")
 	stale := time.Now().Add(-30 * 24 * time.Hour)
 	ctx := context.Background()
 
@@ -2430,7 +2411,7 @@ func BenchmarkGC_RunGC_FullEvict_N100(b *testing.B) {
 		}
 		b.StartTimer()
 
-		runGC(ctx, gcOptions{maxAge: defaultGCMaxAge, skipThrottle: true}, defaultGCInterval)
+		runGC(ctx, gcOptions{skipThrottle: true}, defaultGCInterval)
 	}
 }
 
@@ -2447,15 +2428,14 @@ func BenchmarkGC_RunGC_StreamingSorted_N100(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		b.StopTimer()
-		// Recreate the 100 stale corpora each iter — runGC's prior pass
-		// just evicted them.
+		// Seed the 100 corpora again each iteration. The 1P test budget
+		// keeps them all, so the pass evicts nothing.
 		for i := 0; i < 100; i++ {
 			seedCorpus(b, root, fakeCorpusHash(i), stale)
 		}
 		b.StartTimer()
 
 		runGC(ctx, gcOptions{
-			maxAge:       defaultGCMaxAge,
 			skipThrottle: true,
 			writer:       io.Discard,
 			sortKey:      sortBySize,
@@ -2510,12 +2490,15 @@ func BenchmarkGC_DryRun_Render_N20(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	cutoff := time.Now().Add(-defaultGCMaxAge)
+	evict, err := planCorpusEviction(root, entries, false, nil, true)
+	if err != nil {
+		b.Fatal(err)
+	}
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		if err := reportGCPlan(ctx, io.Discard, root, entries, cutoff, sortByName); err != nil {
+		if err := reportGCPlan(ctx, io.Discard, root, entries, evict, sortByName); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -2617,7 +2600,7 @@ func BenchmarkDetectGitBoundary_NotBoundary(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, status := detectGitBoundary(root, root)
+		_, status := detectGitBoundary(root)
 		if status != notBoundary {
 			b.Fatalf("status=%v", status)
 		}
@@ -2632,7 +2615,7 @@ func BenchmarkDetectGitBoundary_DirForm(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, status := detectGitBoundary(root, root)
+		_, status := detectGitBoundary(root)
 		if status != boundaryConfirmed {
 			b.Fatalf("status=%v", status)
 		}
@@ -2663,7 +2646,7 @@ func BenchmarkDetectGitBoundary_WorktreeFile(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, status := detectGitBoundary(worktree, root)
+		_, status := detectGitBoundary(worktree)
 		if status != boundaryConfirmed {
 			b.Fatalf("status=%v", status)
 		}
@@ -2687,7 +2670,7 @@ func BenchmarkDetectGitBoundary_LinkedWorktreeBackref(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, status := detectGitBoundary(worktree, root)
+		_, status := detectGitBoundary(worktree)
 		if status != boundaryConfirmed {
 			b.Fatalf("status=%v", status)
 		}

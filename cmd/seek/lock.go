@@ -26,27 +26,66 @@ var errCorpusEvicted = errors.New("corpus evicted during build")
 //     published. It opens an existing file so an evicted corpus returns
 //     errCorpusEvicted.
 //   - acquireReadLock: shared lock on cacheDir/.lock, held while the reader
-//     lists, opens, and searches shards. It waits for a bounded time. If the
-//     wait expires and shards remain, it permits an unlocked read of them.
+//     lists, opens, and searches shards.
+//
+// Every wait lasts until the lock is free or the user cancels: a search waits
+// for another process's build of the same node. This lock order keeps every
+// wait finite: a goroutine that holds a read lock never waits for a build or
+// a publish lock (withReadLockHeld marks its context, and such a wait fails as
+// a Seek defect). The pipeline prepares a node, which builds and publishes,
+// before its read takes the read lock, and a retry prepares again only after
+// the read returned it (openNode). So each read lock is released after a
+// search of bounded time, and each build wait ends when the build before it
+// publishes or fails, in this process and across processes. flock keeps no
+// queue: a publish waits while readers overlap. That delays a new index only:
+// a search of a node that has shards reads them and never waits for its build.
+
+type readLockHeldKey struct{}
+
+// withReadLockHeld marks a context whose goroutine holds a read lock.
+func withReadLockHeld(ctx context.Context) context.Context {
+	return context.WithValue(ctx, readLockHeldKey{}, true)
+}
+
+// errLockOrder reports a build or publish wait under a read lock: the one
+// order that could wait forever.
+var errLockOrder = fmt.Errorf("%w: build or publish lock wait while a read lock is held", errInvariant)
+
+// checkLockOrder returns errLockOrder when ctx is marked by withReadLockHeld.
+func checkLockOrder(ctx context.Context) error {
+	if held, _ := ctx.Value(readLockHeldKey{}).(bool); held {
+		return errLockOrder
+	}
+	return nil
+}
 
 // acquireBuildLock holds an exclusive cacheDir/.build.lock for the complete
 // build. If another builder holds it and any shard exists, it returns
 // (nil, false, nil), and the caller uses the current shards. A corpus with no
 // shards waits for the lock so its first build is not skipped.
 func acquireBuildLock(ctx context.Context, cacheDir, indexDir string) (*os.File, bool, error) {
+	if err := checkLockOrder(ctx); err != nil {
+		return nil, false, err
+	}
 	lockPath := filepath.Join(cacheDir, buildLockFile)
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, false, fmt.Errorf("open build lock file: %w", err)
 	}
 	if err := lockFileExclusive(f); err != nil {
+		if !lockHeld(err) {
+			// Only a held lock means another builder.
+			_ = f.Close()
+			return nil, false, fmt.Errorf("lock %s: %w", lockPath, err)
+		}
 		if shardsExist(indexDir) {
 			_ = f.Close()
 			return nil, false, nil
 		}
-		if perr := pollLock(ctx, func() error { return lockFileExclusive(f) }, 100*time.Millisecond, 2*time.Second, lockPollTimeout); perr != nil {
+		slog.Debug("Waiting for another build of the node", "cache_dir", cacheDir)
+		if perr := pollLock(ctx, lockPath, func() error { return lockFileExclusive(f) }, 100*time.Millisecond, 2*time.Second); perr != nil {
 			_ = f.Close()
-			return nil, false, fmt.Errorf("build lock held >%v: %w", lockPollTimeout, perr)
+			return nil, false, perr
 		}
 	}
 	// Ensure the publish lock file exists so acquirePublishLock (which opens it
@@ -64,8 +103,9 @@ func acquireBuildLock(ctx context.Context, cacheDir, indexDir string) (*os.File,
 }
 
 // tryBuildLock attempts a NON-blocking LOCK_EX on cacheDir/.build.lock. Returns
-// (fd, true, nil) when acquired, (nil, false, nil) when a builder holds it. Used
-// by gc to skip a corpus whose build is in progress.
+// (fd, true, nil) when acquired, and (nil, false, nil) when the lock is not
+// taken: a builder holds it, or flock fails. Used by gc to skip a corpus whose
+// build is in progress.
 func tryBuildLock(cacheDir string) (*os.File, bool, error) {
 	lockPath := filepath.Join(cacheDir, buildLockFile)
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
@@ -83,6 +123,9 @@ func tryBuildLock(cacheDir string) (*os.File, bool, error) {
 // O_RDWR without O_CREATE: a missing lock file means the corpus was evicted, so
 // it returns errCorpusEvicted rather than resurrecting a phantom corpus.
 func acquirePublishLock(ctx context.Context, cacheDir string) (*os.File, error) {
+	if err := checkLockOrder(ctx); err != nil {
+		return nil, err
+	}
 	lockPath := filepath.Join(cacheDir, lockFile)
 	f, err := os.OpenFile(lockPath, os.O_RDWR, 0o644)
 	if err != nil {
@@ -94,59 +137,25 @@ func acquirePublishLock(ctx context.Context, cacheDir string) (*os.File, error) 
 	if err := lockFileExclusive(f); err == nil {
 		return f, nil
 	}
-	if err := pollLock(ctx, func() error { return lockFileExclusive(f) }, 20*time.Millisecond, 500*time.Millisecond, lockPollTimeout); err != nil {
+	slog.Debug("Waiting for the readers of the node", "cache_dir", cacheDir)
+	if err := pollLock(ctx, lockPath, func() error { return lockFileExclusive(f) }, 20*time.Millisecond, 500*time.Millisecond); err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("publish lock held >%v: %w", lockPollTimeout, err)
+		return nil, err
 	}
 	return f, nil
 }
 
 // acquireReadLock takes the shared lock on the open cacheDir/.lock file. The
-// caller holds it while it lists, opens, and searches shards. If the bounded
-// wait expires and shards remain, the caller can read them without the lock.
+// caller holds it while it lists, opens, and searches shards, and marks its
+// context with withReadLockHeld. A publish in progress makes it wait until the
+// publish ends or the user cancels; the wait writes one debug line.
 func acquireReadLock(ctx context.Context, indexDir string, f *os.File) error {
-	return acquireReadLockWithFallback(ctx, indexDir, f, true)
-}
-
-// acquireStrictReadLock takes the shared publish lock or returns an error. A
-// joined query cannot use the unlocked stale-shard fallback because its Zoekt
-// and semantic data must name the same generation.
-func acquireStrictReadLock(ctx context.Context, indexDir string, f *os.File) error {
-	return acquireReadLockWithFallback(ctx, indexDir, f, false)
-}
-
-func acquireReadLockWithFallback(
-	ctx context.Context,
-	indexDir string,
-	f *os.File,
-	allowUnlocked bool,
-) error {
 	if err := lockFileSharedNB(f); err == nil {
 		return nil
 	}
-	// A publish swap is ms-scale; poll briefly for it to finish.
-	if err := pollLock(ctx, func() error { return lockFileSharedNB(f) }, 20*time.Millisecond, 500*time.Millisecond, readLockTimeout); err != nil {
-		// Wedged swap: use the shards that remain rather than hang. This is the
-		// sole unlocked read path and fires only when the publish lock stays held
-		// past the timeout.
-		if allowUnlocked && shardsExist(indexDir) {
-			slog.Warn("Publish lock contended past timeout; searching remaining shards without the lock", "index_dir", indexDir)
-			return nil
-		}
-		return fmt.Errorf("timeout waiting for indexer to finish (%v)", readLockTimeout)
-	}
-	return nil
+	slog.Debug("Waiting for a publish of the node", "index_dir", indexDir)
+	return pollLock(ctx, f.Name(), func() error { return lockFileSharedNB(f) }, 20*time.Millisecond, 500*time.Millisecond)
 }
-
-// readLockTimeout bounds how long a search waits for a publish swap before it
-// can read remaining shards without the lock. The swap is usually ms-scale.
-// This is a variable so tests can shorten the wait.
-var readLockTimeout = 10 * time.Second
-
-// lockPollTimeout bounds how long the build/publish lock acquisitions poll for a
-// held lock before giving up. Named so the value and the ">Ns" error messages
-// stay in sync.
-const lockPollTimeout = 60 * time.Second
 
 // lockFileExclusive attempts a non-blocking exclusive lock on f.
 func lockFileExclusive(f *os.File) error {
@@ -158,35 +167,39 @@ func lockFileSharedNB(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB)
 }
 
+// lockHeld reports a flock error that means another holder, or a signal: the
+// only errors that a wait retries. Any other error (ENOLCK on a mount with no
+// lock support, EIO) returns with the lock path.
+func lockHeld(err error) bool {
+	return errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EINTR)
+}
+
 // unlockFile releases the lock on f.
 func unlockFile(f *os.File) {
 	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }
 
 // pollLock retries lockFn with exponential backoff and jitter until it
-// succeeds or the timeout expires. Jitter (up to 50% of backoff) prevents
-// thundering herd when multiple processes poll the same lock.
-func pollLock(ctx context.Context, lockFn func() error, initialBackoff, maxBackoff, timeout time.Duration) error {
-	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
+// succeeds or ctx ends. Jitter (up to 50% of backoff) keeps processes that poll
+// the same lock from retrying at the same time. Only a held lock is retried:
+// any other flock error never clears, so it returns at once.
+func pollLock(ctx context.Context, path string, lockFn func() error, initialBackoff, maxBackoff time.Duration) error {
 	backoff := initialBackoff
 	for {
-		if err := lockFn(); err == nil {
+		err := lockFn()
+		if err == nil {
 			return nil
+		}
+		if !lockHeld(err) {
+			return fmt.Errorf("lock %s: %w", path, err)
 		}
 
 		jitter := time.Duration(rand.Int64N(int64(backoff) / 2))
 		timer := time.NewTimer(backoff + jitter)
 		select {
-		case <-timeoutCtx.Done():
+		case <-ctx.Done():
 			timer.Stop()
-			// Distinguish parent-context cancellation (e.g. Ctrl-C) from the
-			// poll deadline so callers can errors.Is(err, context.Canceled).
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return fmt.Errorf("lock poll timeout (%v)", timeout)
+			return ctx.Err()
 		case <-timer.C:
 		}
 

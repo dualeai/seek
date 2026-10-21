@@ -4,38 +4,59 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 )
 
+// TestSemanticUSearchCompatibilityUsesLoadedRuntime checks the identity that a
+// manifest stores: it names the version that the loaded runtime reports,
+// which must be the version that cicd/rerank-assets-upgrade.sh pins, and the
+// storage layout. The asset key, the directory of the extracted runtime,
+// follows the runtime bytes.
 func TestSemanticUSearchCompatibilityUsesLoadedRuntime(t *testing.T) {
 	compatibility, err := semanticUSearchCompatibility()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if compatibility == "" {
-		t.Fatal("USearch compatibility identity is empty")
+	script, err := os.ReadFile(filepath.Join("..", "..", "cicd", "rerank-assets-upgrade.sh"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if semanticUSearchRuntimeVer == "" {
-		t.Fatal("loaded USearch runtime did not report a version")
+	pinned := regexp.MustCompile(`(?m)^usearch_version=([0-9][0-9.]*)$`).FindSubmatch(script)
+	if pinned == nil {
+		t.Fatal("cicd/rerank-assets-upgrade.sh pins no USearch version")
 	}
-	wantCompatibility := "usearch-" + semanticUSearchRuntimeVer + "-" + semanticUSearchLayout()
-	if compatibility != wantCompatibility {
-		t.Fatalf("USearch compatibility=%q, want %q", compatibility, wantCompatibility)
+	// The layout settings of semantic_usearch_cgo.go: inner product (2), int8
+	// (4), connectivity 16, expansions 128 and 64, one thread, four centroids,
+	// 4,096 units per shard, revision 2. A change to one of them must change
+	// the identity, so that no generation reuses an incompatible graph.
+	want := "usearch-" + string(pinned[1]) + "-metric2-quant4-m16-add128-search64-threads1-c4-units4096-v2"
+	if compatibility != want {
+		t.Fatalf("USearch compatibility=%q, want %q", compatibility, want)
 	}
-	digest := sha256.Sum256(semanticUSearchCompressedRuntime)
-	wantAssetKey := hex.EncodeToString(digest[:16])
-	if got := semanticUSearchAssetKey(); got != wantAssetKey {
-		t.Fatalf("USearch asset key=%q, want %q", got, wantAssetKey)
+
+	key := semanticUSearchAssetKey()
+	if len(key) != 32 || strings.Trim(key, "0123456789abcdef") != "" {
+		t.Fatalf("USearch asset key=%q, want 32 lowercase hex digits", key)
+	}
+	original := semanticUSearchCompressedRuntime
+	t.Cleanup(func() { semanticUSearchCompressedRuntime = original })
+	semanticUSearchCompressedRuntime = append([]byte(nil), original...)
+	if got := semanticUSearchAssetKey(); got != key {
+		t.Fatalf("the same runtime bytes gave asset key %q, then %q", key, got)
+	}
+	semanticUSearchCompressedRuntime[len(semanticUSearchCompressedRuntime)-1] ^= 0xff
+	if got := semanticUSearchAssetKey(); got == key {
+		t.Fatalf("other runtime bytes kept asset key %q", key)
 	}
 }
 
@@ -309,8 +330,15 @@ func TestSearchGenerationDefersUnusedGraphValidation(t *testing.T) {
 	}
 }
 
-func TestSemanticUSearchExactFallbackRejectsExcessWork(t *testing.T) {
+// TestSemanticUSearchExactFallbackRecoversAnySize fails the graph of a
+// generation whose exact work at 128 query tokens is above
+// semanticExactWorkLimit: recovery is still exact, with no work limit.
+func TestSemanticUSearchExactFallbackRecoversAnySize(t *testing.T) {
 	rowCount := semanticUSearchUnitsPerShard + 1
+	vectors := make([]semanticFineSNORM16Vectors, rowCount)
+	for row := range vectors {
+		vectors[row] = testSemanticStoredFineVectors(semanticVector{0: 1})
+	}
 	generation := &semanticGeneration{
 		manifest: semanticManifest{
 			Rows: uint64(rowCount),
@@ -318,7 +346,7 @@ func TestSemanticUSearchExactFallbackRejectsExcessWork(t *testing.T) {
 				Name: "unavailable.usearch", Rows: uint64(rowCount),
 			}},
 		},
-		vectors:    make([]semanticFineSNORM16Vectors, rowCount),
+		vectors:    vectors,
 		usearch:    []string{"unavailable.usearch"},
 		usearchErr: errors.New("damaged graph"),
 	}
@@ -328,9 +356,9 @@ func TestSemanticUSearchExactFallbackRejectsExcessWork(t *testing.T) {
 		query.tokens[start] = 1
 		query.scoreMask[token] = true
 	}
-	_, err := semanticUSearchExactFallback(t.Context(), generation, query, 1)
-	if err == nil || !strings.Contains(err.Error(), "exact recovery work") {
-		t.Fatalf("fallback error=%v", err)
+	hits, err := semanticUSearchExactFallback(t.Context(), generation, query, 1)
+	if err != nil || len(hits) != 1 {
+		t.Fatalf("fallback hits=%v error=%v, want one exact hit", hits, err)
 	}
 }
 
@@ -461,20 +489,6 @@ func TestPlanSemanticUSearchShardsHonorsCancellation(t *testing.T) {
 	}
 }
 
-func TestMergeSemanticHitsKeepsBoundedTotalOrder(t *testing.T) {
-	left := []semanticHit{{row: 1, score: 9}, {row: 9, score: 7}}
-	right := []semanticHit{{row: 0, score: 9}, {row: 3, score: 8}, {row: 5, score: 1}}
-	buffer := make([]semanticHit, 0, 3)
-	got := mergeSemanticHits(buffer, left, right, 3)
-	want := []semanticHit{{row: 0, score: 9}, {row: 1, score: 9}, {row: 3, score: 8}}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("merged hits=%+v, want %+v", got, want)
-	}
-	if len(got) != 3 || cap(got) != cap(buffer) {
-		t.Fatalf("merged length/capacity=%d/%d, buffer capacity=%d", len(got), cap(got), cap(buffer))
-	}
-}
-
 func TestSemanticUSearchVectorKeyFormatExamples(t *testing.T) {
 	tests := []struct {
 		row      uint64
@@ -557,16 +571,18 @@ func TestSemanticFilteredRouteBoundaryAndNativeFailure(t *testing.T) {
 		t.Fatalf("exact boundary hits=%+v", hits)
 	}
 
-	_, err = semanticUSearchFiltered(
+	// The native route fails: recovery scores the allowed rows.
+	hits, err = semanticUSearchFiltered(
 		t.Context(),
 		generation,
 		testSemanticQuery(vector),
 		semanticFilterForTest(t, "-file:^drop/"),
 		1,
 	)
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("native route error=%v, want %v", err, wantErr)
+	if err != nil || len(hits) != 1 || hits[0].row == semanticFilteredExactRows+1 {
+		t.Fatalf("native route recovery hits=%+v error=%v, want one allowed exact hit", hits, err)
 	}
+	_ = wantErr
 
 	hits, err = semanticUSearchFiltered(
 		t.Context(),
@@ -636,8 +652,7 @@ func TestRunDefaultJoinedSearchUsesUSearchAboveExactThreshold(t *testing.T) {
 			0,
 			defaultSearchConfig(),
 			searchRunConfig{
-				policy:           defaultSearchPolicy(),
-				hybridAcceptance: alwaysAcceptRerankPolicyForTest(),
+				policy: defaultSearchPolicy(),
 				newModel: func(context.Context) (semanticModel, error) {
 					return scorer, nil
 				},
@@ -692,7 +707,7 @@ func TestRunDefaultJoinedSearchUsesUSearchAboveExactThreshold(t *testing.T) {
 	if !found {
 		t.Fatalf("native USearch omitted target row %d from %d candidates", targetRow, len(rows))
 	}
-	if !strings.Contains(output, "## 00-target.go") ||
+	if !strings.Contains(output, "## "+filepath.Join(folder, "00-target.go")) ||
 		!strings.Contains(output, "SEMANTIC_TARGET") {
 		t.Fatalf("joined search omitted the native candidate:\n%s", output)
 	}
@@ -757,7 +772,7 @@ func BenchmarkSemanticFilteredRetrieval(b *testing.B) {
 			name:    "production-limit-medium-25-percent-32-tokens",
 			percent: 25,
 			tokens:  32,
-			limit:   hybridSemanticUnitLimit,
+			limit:   1024,
 		},
 	} {
 		limit := test.limit
@@ -795,7 +810,7 @@ func BenchmarkSemanticFilteredRetrieval(b *testing.B) {
 			copy(prepared.tokens[start:start+semanticEmbeddingDimensions], embeddings[target].fine[0][:])
 			prepared.scoreMask[token] = true
 		}
-		benchmarkMask, err := buildSemanticFilterMask(b.Context(), generation, filter)
+		benchmarkMask, err := buildSemanticFilterMask(b.Context(), generation, filter.matches)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -848,7 +863,7 @@ func BenchmarkSemanticFilteredRetrieval(b *testing.B) {
 				name:      "forced-exact",
 				exactRows: len(allowedRows),
 				run: func(ctx context.Context) ([]semanticHit, error) {
-					mask, err := buildSemanticFilterMask(ctx, generation, filter)
+					mask, err := buildSemanticFilterMask(ctx, generation, filter.matches)
 					if err != nil {
 						return nil, err
 					}
@@ -902,7 +917,7 @@ func benchmarkForcedNativeSemanticFilter(
 	filter *semanticFilterPlan,
 	limit int,
 ) ([]semanticHit, error) {
-	mask, err := buildSemanticFilterMask(ctx, generation, filter)
+	mask, err := buildSemanticFilterMask(ctx, generation, filter.matches)
 	if err != nil {
 		return nil, err
 	}
@@ -942,9 +957,6 @@ func BenchmarkPlanSemanticUSearchShardsScale(b *testing.B) {
 			rows := uint64(0)
 			for shard := range shards {
 				shardRows := uint64(semanticUSearchUnitsPerShard)
-				if remaining := uint64(semanticMaxRows) - rows; shardRows > remaining {
-					shardRows = remaining
-				}
 				shards[shard] = semanticUSearchShard{Start: rows, Rows: shardRows}
 				rows += shardRows
 			}
@@ -994,4 +1006,79 @@ func semanticUSearchTestVector(row int) semanticVector {
 		vector[column] *= scale
 	}
 	return vector
+}
+
+// TestSemanticUSearchSimilarityIsCosine builds one shard of keys near a
+// random query and reads every key: the score over the query's int8 squared
+// norm estimates the f32 cosine with no scale bias, so a bound in cosine
+// units means what it says.
+func TestSemanticUSearchSimilarityIsCosine(t *testing.T) {
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	if err := ensureSemanticUSearchRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	random := rand.New(rand.NewPCG(7, 8))
+	near := func(query *semanticVector, alpha float64) semanticVector {
+		var vector semanticVector
+		for d := range vector {
+			value := random.NormFloat64()
+			if query != nil {
+				value += alpha * float64(query[d]) * math.Sqrt(semanticEmbeddingDimensions)
+			}
+			vector[d] = float32(value)
+		}
+		if err := normalizeSemanticVector(&vector); err != nil {
+			t.Fatal(err)
+		}
+		return vector
+	}
+	query := near(nil, 0)
+	const rows = 1024
+	coarse := make([][semanticCoarseCentroidsPerUnit]semanticVector, rows)
+	var batches [][]semanticCoarseVectors
+	for start := 0; start < rows; start += semanticModelBatchRows {
+		batch := make([]semanticCoarseVectors, min(semanticModelBatchRows, rows-start))
+		for offset := range batch {
+			for centroid := range semanticCoarseCentroidsPerUnit {
+				coarse[start+offset][centroid] = near(&query, random.Float64()*3)
+				batch[offset][centroid] = coarse[start+offset][centroid]
+			}
+		}
+		batches = append(batches, batch)
+	}
+	path := filepath.Join(t.TempDir(), semanticUSearchShardName(0))
+	if err := buildSemanticUSearchShard(t.Context(), path, 0, semanticCoarseSet{batches: batches, rows: rows}); err != nil {
+		t.Fatal(err)
+	}
+	shard := semanticUSearchShard{Name: semanticUSearchShardName(0), Start: 0, Rows: rows}
+	saved := semanticUSearchDeepenSimilarity
+	semanticUSearchDeepenSimilarity = -10
+	all, err := searchSemanticUSearchShardTokens(t.Context(), path, shard, []semanticVector{query}, rows*semanticCoarseCentroidsPerUnit, nil, false)
+	semanticUSearchDeepenSimilarity = saved
+	if err != nil {
+		t.Fatal(err)
+	}
+	norm2 := semanticUSearchInt8SquaredNorm(&query)
+	var count int
+	var bias, worst float64
+	for _, hit := range all[0] {
+		row, centroid := semanticUSearchUnitAndCentroid(hit.row)
+		var cosine float64
+		for d := range query {
+			cosine += float64(query[d]) * float64(coarse[row][centroid][d])
+		}
+		if cosine < 0.5 {
+			continue
+		}
+		diff := float64(semanticUSearchSimilarity(hit.score, norm2)) - cosine
+		count++
+		bias += diff
+		worst = max(worst, math.Abs(diff))
+	}
+	if count < 500 {
+		t.Fatalf("only %d keys with a cosine of at least 0.5", count)
+	}
+	if bias /= float64(count); math.Abs(bias) > 0.005 || worst > 0.03 {
+		t.Fatalf("estimate - cosine over %d keys: mean %+.4f, max %.4f; want |mean| <= 0.005, max <= 0.03", count, bias, worst)
+	}
 }

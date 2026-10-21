@@ -67,8 +67,16 @@ func TestReader_OversizeCandidate_NoSemaphoreTouch(t *testing.T) {
 	defer testReadSemMu.Unlock()
 
 	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
-	before := availableWeight(readSemaphore)
-	ctx := t.Context()
+	// Hold the whole read budget, as busy readers would: a reader that
+	// acquires any weight waits until its context ends and sends nothing.
+	const budget = 1 << 20
+	defer swapReadSemaphoreForTest(budget)()
+	if !readSemaphore.TryAcquire(budget) {
+		t.Fatal("cannot hold the test read budget")
+	}
+	defer readSemaphore.Release(budget)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
 	out := make(chan fileContent, 1)
 
 	// Larger than the swapped content limit: the reader must send it by name
@@ -78,7 +86,7 @@ func TestReader_OversizeCandidate_NoSemaphoreTouch(t *testing.T) {
 		path: "/nonexistent/huge",
 		size: maxInFlightBytes + 1,
 	}
-	readOneFolderFileStreaming(ctx, c, out)
+	readOneFolderFileStreaming(ctx, c, out, nil)
 	close(out)
 	sent := 0
 	for document := range out {
@@ -87,11 +95,8 @@ func TestReader_OversizeCandidate_NoSemaphoreTouch(t *testing.T) {
 			t.Fatalf("oversize candidate = %+v, want a name-only TooLarge document", document)
 		}
 	}
-	if sent != 1 {
-		t.Fatalf("expected one name-only document for the oversize candidate, got %d", sent)
-	}
-	if got := availableWeight(readSemaphore); got != before {
-		t.Fatalf("semaphore was touched: before=%d after=%d", before, got)
+	if sent != 1 || ctx.Err() != nil {
+		t.Fatalf("sent %d documents (context error %v), want one name-only document with no wait for read weight", sent, ctx.Err())
 	}
 }
 
@@ -112,7 +117,7 @@ func TestReader_AboveBudgetCandidate_ClampsWeight(t *testing.T) {
 	out := make(chan fileContent, 1)
 	c := folderCandidate{name: "huge", path: "/nonexistent/huge", size: readBudgetBytes + 1}
 	start := time.Now()
-	readOneFolderFileStreaming(ctx, c, out)
+	readOneFolderFileStreaming(ctx, c, out, nil)
 	close(out)
 	if ctx.Err() != nil {
 		t.Fatalf("reader waited %v for a weight above the budget", time.Since(start))
@@ -142,7 +147,7 @@ func TestReader_BinaryPrefixSendsNameOnly(t *testing.T) {
 	}
 	before := availableWeight(readSemaphore)
 	out := make(chan fileContent, 1)
-	readOneFolderFileStreaming(t.Context(), folderCandidate{name: "model.bin", path: path, size: 64 << 20}, out)
+	readOneFolderFileStreaming(t.Context(), folderCandidate{name: "model.bin", path: path, size: 64 << 20}, out, nil)
 	close(out)
 	var got []fileContent
 	for document := range out {

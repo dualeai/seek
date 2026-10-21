@@ -17,13 +17,15 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
 const (
-	semanticFormatVersion = 5
+	semanticFormatVersion = 6
 	// Compatibility revisions are cache barriers for behavior that asset hashes
 	// and typed format settings cannot describe. anchored-spherical-v2 adds
 	// normalization for finite values whose scale cannot fit in float32.
@@ -34,14 +36,21 @@ const (
 	semanticManifestFile           = "manifest.json"
 	semanticRowsFile               = "rows.bin"
 	semanticVectorsFile            = "vectors.snorm16"
+	semanticCoarseFile             = "coarse.snorm16"
 	semanticUSearchFilePrefix      = "index-"
 	semanticUSearchFileSuffix      = ".usearch"
 	semanticRowsMagic              = "SEEKSROW"
 	semanticRowsHeaderBytes        = len(semanticRowsMagic) + 8
-	semanticRowFixedBytes          = 3*8 + 2*sha256.Size + 4 + 2 + 2 + 2 + 2
-	semanticManifestMaxBytes       = 64 << 10
+	semanticRowFixedBytes          = 3*8 + 3*sha256.Size + 4 + 4 + 2 + 4 + 2
 	semanticMetadataFieldMax       = 1 << 20
-	semanticMaxRows                = 10_000_000
+)
+
+// semanticRowsHashedBytes counts the rows.bin bytes that a full check read,
+// and semanticShardsHashed the USearch shards that one hashed; tests read them
+// to see that a search trusts a checked file.
+var (
+	semanticRowsHashedBytes atomic.Int64
+	semanticShardsHashed    atomic.Int64
 )
 
 // semanticNormalizedSquaredNormTolerance limits accepted float32 centroid and
@@ -95,6 +104,18 @@ type semanticUSearchShard struct {
 	Start uint64 `json:"start"`
 	Rows  uint64 `json:"rows"`
 	semanticArtifact
+	// Check is the shard file as the full check at build saw it.
+	Check semanticRowsCheck `json:"check"`
+}
+
+// semanticRowsCheck records a file as the full check at build saw it: a later
+// open that finds the same length, device, inode, mtime, and ctime trusts the
+// file; any other value runs the full check again.
+type semanticRowsCheck struct {
+	Device  uint64 `json:"device"`
+	Inode   uint64 `json:"inode"`
+	MtimeNs int64  `json:"mtime_ns"`
+	CtimeNs int64  `json:"ctime_ns"`
 }
 
 // semanticManifest binds the semantic artifacts to their exact formats.
@@ -115,19 +136,24 @@ type semanticManifest struct {
 	Dimensions     uint32                 `json:"dimensions"`
 	Rows           uint64                 `json:"rows"`
 	RowsFile       semanticArtifact       `json:"rows_file"`
+	RowsCheck      semanticRowsCheck      `json:"rows_check"`
 	VectorsFile    semanticSizedArtifact  `json:"vectors_file"`
+	CoarseFile     semanticSizedArtifact  `json:"coarse_file"`
 	USearchFiles   []semanticUSearchShard `json:"usearch_files"`
 }
 
-// semanticGeneration owns one open semantic generation. vectors aliases the
-// memory in vectorMap and must not be used after Close. A search-opened
-// generation validates each graph before its first native use. A fully opened
-// generation records aggregate graph validation in usearchErr.
+// semanticGeneration owns one open semantic generation. vectors and coarse
+// alias the memory in vectorMap and coarseMap and must not be used after
+// Close. A search-opened generation validates each graph before its first
+// native use. A fully opened generation records aggregate graph validation in
+// usearchErr.
 type semanticGeneration struct {
 	manifest          semanticManifest
 	rows              []semanticUnit
 	vectors           []semanticFineSNORM16Vectors
 	vectorMap         []byte
+	coarse            []semanticCoarseSNORM16Vectors
+	coarseMap         []byte
 	usearch           []string
 	usearchErr        error
 	usearchValidation []semanticUSearchValidation
@@ -203,11 +229,9 @@ func writeSemanticGenerationFromParts(
 	source string,
 	units []semanticUnit,
 	vectorsArtifact semanticSizedArtifact,
+	coarseArtifact semanticSizedArtifact,
 	usearchShards []semanticUSearchShard,
 ) (semanticManifest, error) {
-	if len(units) > semanticMaxRows {
-		return semanticManifest{}, fmt.Errorf("semantic row count %d exceeds limit %d", len(units), semanticMaxRows)
-	}
 	if source == "" {
 		return semanticManifest{}, fmt.Errorf("semantic generation identity is missing")
 	}
@@ -221,6 +245,9 @@ func writeSemanticGenerationFromParts(
 	if vectorsArtifact.Bytes != wantVectorBytes {
 		return semanticManifest{}, fmt.Errorf("semantic vector artifact has %d bytes, want %d", vectorsArtifact.Bytes, wantVectorBytes)
 	}
+	if wantCoarse, ok := checkedSemanticCoarseBytes(uint64(len(units))); !ok || coarseArtifact.Bytes != wantCoarse {
+		return semanticManifest{}, fmt.Errorf("semantic coarse artifact has %d bytes, want %d", coarseArtifact.Bytes, wantCoarse)
+	}
 	usearchCompatibility, err := semanticUSearchCompatibility()
 	if err != nil {
 		return semanticManifest{}, err
@@ -228,10 +255,14 @@ func writeSemanticGenerationFromParts(
 	if err := prepareSemanticGenerationDirectory(dir); err != nil {
 		return semanticManifest{}, err
 	}
-	if err := validateSemanticUSearchShards(dir, uint64(len(units)), usearchShards); err != nil {
+	if err := validateSemanticUSearchShards(dir, uint64(len(units)), usearchShards, semanticSourceHasGraph(source)); err != nil {
 		return semanticManifest{}, err
 	}
 	rowsArtifact, err := writeSemanticRows(filepath.Join(dir, semanticRowsFile), units)
+	if err != nil {
+		return semanticManifest{}, fmt.Errorf("write semantic generation: %w", err)
+	}
+	rowsInfo, err := os.Lstat(filepath.Join(dir, semanticRowsFile))
 	if err != nil {
 		return semanticManifest{}, fmt.Errorf("write semantic generation: %w", err)
 	}
@@ -249,7 +280,9 @@ func writeSemanticGenerationFromParts(
 		Dimensions:     semanticEmbeddingDimensions,
 		Rows:           uint64(len(units)),
 		RowsFile:       rowsArtifact,
+		RowsCheck:      semanticRowsCheckOf(rowsInfo),
 		VectorsFile:    vectorsArtifact,
+		CoarseFile:     coarseArtifact,
 		USearchFiles:   usearchShards,
 	}
 	if err := writeSemanticManifest(filepath.Join(dir, semanticManifestFile), manifest); err != nil {
@@ -259,8 +292,9 @@ func writeSemanticGenerationFromParts(
 }
 
 // The stored row layout starts with magic and a little-endian uint64 row count.
-// Each row then stores row, start, and end as uint64 values; two SHA-256 values;
-// path length as uint32; language, file-language, and symbol lengths as uint16;
+// Each row then stores row, start, and end as uint64 values; three SHA-256
+// values (unit ID, content ID, window key); path and language lengths as
+// uint32; the file-language length as uint16; the symbol length as uint32;
 // and kind and parser result as bytes. The path, language, file-language, and
 // symbol bytes follow in that order with no padding. Keep readSemanticRowsFrom
 // and checkedSemanticRowsMinimumBytes in sync with this layout.
@@ -277,22 +311,23 @@ func writeSemanticRows(path string, units []semanticUnit) (semanticArtifact, err
 		for index, unit := range units {
 			if unit.row != uint64(index) || unit.end <= unit.start ||
 				len(unit.path) > semanticMetadataFieldMax ||
-				len(unit.language) > math.MaxUint16 ||
+				len(unit.language) > math.MaxUint32 ||
 				len(unit.fileLanguage) > math.MaxUint16 ||
-				len(unit.symbol) > math.MaxUint16 {
+				len(unit.symbol) > math.MaxUint32 {
 				return fmt.Errorf("invalid semantic row %d", index)
 			}
 			binary.LittleEndian.PutUint64(fixed[0:8], unit.row)
 			binary.LittleEndian.PutUint64(fixed[8:16], unit.start)
 			binary.LittleEndian.PutUint64(fixed[16:24], unit.end)
-			copy(fixed[24:24+sha256.Size], unit.id[:])
-			copy(fixed[24+sha256.Size:24+2*sha256.Size], unit.contentID[:])
-			binary.LittleEndian.PutUint32(fixed[88:92], uint32(len(unit.path)))
-			binary.LittleEndian.PutUint16(fixed[92:94], uint16(len(unit.language)))
-			binary.LittleEndian.PutUint16(fixed[94:96], uint16(len(unit.fileLanguage)))
-			binary.LittleEndian.PutUint16(fixed[96:98], uint16(len(unit.symbol)))
-			fixed[98] = byte(unit.kind)
-			fixed[99] = byte(unit.parserResult)
+			copy(fixed[24:56], unit.id[:])
+			copy(fixed[56:88], unit.contentID[:])
+			copy(fixed[88:120], unit.key[:])
+			binary.LittleEndian.PutUint32(fixed[120:124], uint32(len(unit.path)))
+			binary.LittleEndian.PutUint32(fixed[124:128], uint32(len(unit.language)))
+			binary.LittleEndian.PutUint16(fixed[128:130], uint16(len(unit.fileLanguage)))
+			binary.LittleEndian.PutUint32(fixed[130:134], uint32(len(unit.symbol)))
+			fixed[134] = byte(unit.kind)
+			fixed[135] = byte(unit.parserResult)
 			if _, err := buffered.Write(fixed[:]); err != nil {
 				return err
 			}
@@ -330,9 +365,6 @@ func writeSemanticManifest(path string, manifest semanticManifest) error {
 		return err
 	}
 	content = append(content, '\n')
-	if len(content) > semanticManifestMaxBytes {
-		return fmt.Errorf("semantic manifest is too large")
-	}
 	artifact, err := writeSemanticArtifact(path, func(writer io.Writer) error {
 		_, err := writer.Write(content)
 		return err
@@ -367,32 +399,45 @@ func inspectSemanticArtifact(path string) (semanticArtifact, error) {
 // openSemanticGenerationForSearch so an exact-only plan does not hash unused
 // graph shards.
 func openSemanticGeneration(dir, source string) (*semanticGeneration, error) {
-	return openSemanticGenerationWithOptions(dir, source, true)
+	return openSemanticGenerationWithOptions(dir, source, true, false)
 }
 
+// openSemanticGenerationForSearch trusts a rows.bin whose length, device,
+// inode, mtime, and ctime match the recorded check; it hashes no graph shard
+// until a native plan needs it.
 func openSemanticGenerationForSearch(dir, source string) (*semanticGeneration, error) {
-	return openSemanticGenerationWithOptions(dir, source, false)
+	return openSemanticGenerationWithOptions(dir, source, false, false)
+}
+
+// openSemanticGenerationRows opens a generation for its rows and vectors
+// only (reuse, the unit store): it reads no USearch shard, so a generation
+// that an older build made with another graph rule still gives its rows.
+func openSemanticGenerationRows(dir, source string) (*semanticGeneration, error) {
+	return openSemanticGenerationWithOptions(dir, source, false, true)
 }
 
 func openSemanticGenerationWithOptions(
 	dir string,
 	source string,
-	validateGraphs bool,
+	full bool,
+	rowsOnly bool,
 ) (*semanticGeneration, error) {
-	manifest, err := readSemanticManifest(dir, source)
+	manifest, err := readSemanticManifestChecked(dir, source, !rowsOnly)
 	if err != nil {
 		return nil, err
+	}
+	if rowsOnly {
+		manifest.USearchFiles = nil
 	}
 	rows, err := readCheckedSemanticRows(
 		filepath.Join(dir, semanticRowsFile),
 		manifest.RowsFile,
+		manifest.RowsCheck,
 		manifest.Rows,
+		full,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("validate %s: %w", semanticRowsFile, err)
-	}
-	if err := validateSemanticUSearchShardMetadata(manifest.Rows, manifest.USearchFiles); err != nil {
-		return nil, err
 	}
 	vectorsFile, err := openRegularSemanticFile(filepath.Join(dir, semanticVectorsFile))
 	if err != nil {
@@ -403,6 +448,11 @@ func openSemanticGenerationWithOptions(
 	if err != nil {
 		return nil, err
 	}
+	coarse, coarseMap, err := mapSemanticCoarse(filepath.Join(dir, semanticCoarseFile), manifest.Rows)
+	if err != nil {
+		_ = unix.Munmap(vectorMap)
+		return nil, fmt.Errorf("validate %s: %w", semanticCoarseFile, err)
+	}
 	usearchPaths := make([]string, len(manifest.USearchFiles))
 	for index, shard := range manifest.USearchFiles {
 		usearchPaths[index] = filepath.Join(dir, shard.Name)
@@ -412,9 +462,11 @@ func openSemanticGenerationWithOptions(
 		rows:      rows,
 		vectors:   vectors,
 		vectorMap: vectorMap,
+		coarse:    coarse,
+		coarseMap: coarseMap,
 		usearch:   usearchPaths,
 	}
-	if validateGraphs {
+	if full {
 		generation.usearchErr = validateSemanticUSearchShardArtifacts(dir, manifest.USearchFiles)
 	} else {
 		generation.usearchValidation = make([]semanticUSearchValidation, len(manifest.USearchFiles))
@@ -439,6 +491,13 @@ func (generation *semanticGeneration) validateUSearchShard(index int) error {
 	validation := &generation.usearchValidation[index]
 	validation.once.Do(func() {
 		shard := generation.manifest.USearchFiles[index]
+		// A shard that the check at build saw is trusted, as rows.bin is;
+		// any other file is hashed in full.
+		if info, err := os.Lstat(generation.usearch[index]); err == nil && info.Mode().IsRegular() &&
+			uint64(info.Size()) == shard.Bytes && semanticRowsCheckOf(info) == shard.Check {
+			return
+		}
+		semanticShardsHashed.Add(1)
 		validation.err = validateSemanticArtifact(generation.usearch[index], shard.semanticArtifact)
 		if validation.err != nil && generation.onUSearchDamage != nil {
 			generation.usearchDamageOnce.Do(generation.onUSearchDamage)
@@ -450,19 +509,24 @@ func (generation *semanticGeneration) validateUSearchShard(index int) error {
 	return nil
 }
 
+// readSemanticManifest reads and checks the manifest of dir, its USearch
+// shard list included: the build gate and the open apply one rule.
 func readSemanticManifest(dir, source string) (semanticManifest, error) {
+	return readSemanticManifestChecked(dir, source, true)
+}
+
+// readSemanticManifestChecked reads and checks the manifest of dir; graph also
+// checks its USearch shard list.
+func readSemanticManifestChecked(dir, source string, graph bool) (semanticManifest, error) {
 	manifestPath := filepath.Join(dir, semanticManifestFile)
 	file, err := openRegularSemanticFile(manifestPath)
 	if err != nil {
 		return semanticManifest{}, err
 	}
-	content, readErr := io.ReadAll(io.LimitReader(file, semanticManifestMaxBytes+1))
+	content, readErr := io.ReadAll(file)
 	closeErr := file.Close()
 	if err := errors.Join(readErr, closeErr); err != nil {
 		return semanticManifest{}, err
-	}
-	if len(content) > semanticManifestMaxBytes {
-		return semanticManifest{}, fmt.Errorf("semantic manifest is too large")
 	}
 	manifest, err := decodeSemanticManifest(content)
 	if err != nil {
@@ -471,10 +535,32 @@ func readSemanticManifest(dir, source string) (semanticManifest, error) {
 	if err := validateSemanticManifest(manifest, source); err != nil {
 		return semanticManifest{}, err
 	}
+	if graph {
+		if err := validateSemanticUSearchShardMetadata(manifest.Rows, manifest.USearchFiles, semanticSourceHasGraph(manifest.Source)); err != nil {
+			return semanticManifest{}, err
+		}
+	}
 	return manifest, nil
 }
 
-// Close unmaps vector data and invalidates generation.vectors.
+// readSemanticManifestUnchecked decodes the manifest of dir without checking
+// its source, so a build can name the source of another generation; the open
+// that follows checks the manifest in full.
+func readSemanticManifestUnchecked(dir string) (semanticManifest, error) {
+	file, err := openRegularSemanticFile(filepath.Join(dir, semanticManifestFile))
+	if err != nil {
+		return semanticManifest{}, err
+	}
+	content, readErr := io.ReadAll(file)
+	closeErr := file.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return semanticManifest{}, err
+	}
+	return decodeSemanticManifest(content)
+}
+
+// Close unmaps vector data and invalidates generation.vectors and
+// generation.coarse.
 func (generation *semanticGeneration) Close() error {
 	if generation == nil || len(generation.vectorMap) == 0 {
 		return nil
@@ -482,6 +568,11 @@ func (generation *semanticGeneration) Close() error {
 	err := unix.Munmap(generation.vectorMap)
 	generation.vectorMap = nil
 	generation.vectors = nil
+	if len(generation.coarseMap) > 0 {
+		err = errors.Join(err, unix.Munmap(generation.coarseMap))
+	}
+	generation.coarseMap = nil
+	generation.coarse = nil
 	return err
 }
 
@@ -581,13 +672,14 @@ func validateSemanticManifest(manifest semanticManifest, source string) error {
 		manifest.VectorStride != semanticFineVectorBytesPerUnit ||
 		manifest.USearch != usearchCompatibility ||
 		manifest.Runtime != semanticInferenceRuntime() ||
-		manifest.Dimensions != semanticEmbeddingDimensions ||
-		manifest.Rows > semanticMaxRows {
+		manifest.Dimensions != semanticEmbeddingDimensions {
 		return fmt.Errorf("semantic generation is incompatible")
 	}
 	wantVectorBytes, ok := checkedSemanticVectorBytes(manifest.Rows)
+	wantCoarseBytes, coarseOK := checkedSemanticCoarseBytes(manifest.Rows)
 	minimumRowsBytes, rowsOK := checkedSemanticRowsMinimumBytes(manifest.Rows)
 	if !ok || manifest.VectorsFile.Bytes != wantVectorBytes ||
+		!coarseOK || manifest.CoarseFile.Bytes != wantCoarseBytes ||
 		!rowsOK || manifest.RowsFile.Bytes < minimumRowsBytes {
 		return fmt.Errorf("semantic generation has invalid lengths")
 	}
@@ -610,21 +702,23 @@ func semanticUSearchShardName(index int) string {
 	return fmt.Sprintf("%s%05d%s", semanticUSearchFilePrefix, index, semanticUSearchFileSuffix)
 }
 
-func validateSemanticUSearchShards(dir string, rows uint64, shards []semanticUSearchShard) error {
-	if err := validateSemanticUSearchShardMetadata(rows, shards); err != nil {
+func validateSemanticUSearchShards(dir string, rows uint64, shards []semanticUSearchShard, graph bool) error {
+	if err := validateSemanticUSearchShardMetadata(rows, shards, graph); err != nil {
 		return err
 	}
 	return validateSemanticUSearchShardArtifacts(dir, shards)
 }
 
-func validateSemanticUSearchShardMetadata(rows uint64, shards []semanticUSearchShard) error {
-	if rows == 0 {
+// validateSemanticUSearchShardMetadata checks that the shards cover every
+// row, or that a generation with no graph has none.
+func validateSemanticUSearchShardMetadata(rows uint64, shards []semanticUSearchShard, graph bool) error {
+	if rows == 0 || !graph {
 		if len(shards) != 0 {
-			return fmt.Errorf("empty semantic generation has USearch shards")
+			return fmt.Errorf("semantic generation with no graph has USearch shards")
 		}
 		return nil
 	}
-	if len(shards) == 0 || len(shards) > semanticMaxRows {
+	if len(shards) == 0 {
 		return fmt.Errorf("semantic generation has an invalid USearch shard count")
 	}
 	next := uint64(0)
@@ -651,6 +745,38 @@ func validateSemanticUSearchShardArtifacts(dir string, shards []semanticUSearchS
 		}
 	}
 	return nil
+}
+
+func checkedSemanticCoarseBytes(rows uint64) (uint64, bool) {
+	const rowBytes = semanticCoarseVectorBytesPerUnit
+	if rows > math.MaxUint64/rowBytes {
+		return 0, false
+	}
+	return rows * rowBytes, true
+}
+
+// mapSemanticCoarse maps the coarse vectors of every row, as
+// mapSemanticVectors maps the fine ones.
+func mapSemanticCoarse(path string, count uint64) ([]semanticCoarseSNORM16Vectors, []byte, error) {
+	file, err := openRegularSemanticFile(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = file.Close() }()
+	wantBytes, ok := checkedSemanticCoarseBytes(count)
+	info, err := file.Stat()
+	if !ok || err != nil || uint64(info.Size()) != wantBytes {
+		return nil, nil, fmt.Errorf("semantic coarse file length mismatch")
+	}
+	if count == 0 {
+		return nil, nil, nil
+	}
+	mapped, err := unix.Mmap(int(file.Fd()), 0, int(wantBytes), unix.PROT_READ, unix.MAP_PRIVATE)
+	if err != nil {
+		return nil, nil, fmt.Errorf("map semantic coarse vectors: %w", err)
+	}
+	coarse := unsafe.Slice((*semanticCoarseSNORM16Vectors)(unsafe.Pointer(&mapped[0])), int(count))
+	return coarse, mapped, nil
 }
 
 func checkedSemanticVectorBytes(rows uint64) (uint64, bool) {
@@ -700,10 +826,15 @@ func validateSemanticArtifact(path string, want semanticArtifact) error {
 	return nil
 }
 
+// readCheckedSemanticRows reads rows.bin. full, or a file whose device,
+// inode, mtime, or ctime differs from the recorded check, hashes it against
+// the manifest; a file that the check saw is trusted.
 func readCheckedSemanticRows(
 	path string,
 	want semanticArtifact,
+	check semanticRowsCheck,
 	count uint64,
+	full bool,
 ) ([]semanticUnit, error) {
 	file, err := openRegularSemanticFile(path)
 	if err != nil {
@@ -714,11 +845,45 @@ func readCheckedSemanticRows(
 	if err != nil || uint64(info.Size()) != want.Bytes {
 		return nil, fmt.Errorf("semantic artifact length mismatch")
 	}
-	rows, err := readVerifiedSemanticRows(file, want.SHA256, count)
-	if err != nil {
-		return nil, err
+	if !full && semanticRowsCheckOf(info) == check {
+		return readSemanticRowsFrom(file, count, false)
 	}
-	return rows, nil
+	rows, err := readVerifiedSemanticRows(file, want.SHA256, count)
+	if err == nil && !full {
+		// The full check passed: record the file as it is now, so later
+		// searches trust it again.
+		refreshSemanticRowsCheck(filepath.Dir(path), semanticRowsCheckOf(info))
+	}
+	return rows, err
+}
+
+// refreshSemanticRowsCheck rewrites a generation's manifest with a new rows
+// check: a temporary file renamed over the manifest, so a reader sees the old
+// or the new one. A failure keeps the old check: the next open checks again.
+func refreshSemanticRowsCheck(dir string, check semanticRowsCheck) {
+	manifest, err := readSemanticManifestUnchecked(dir)
+	if err != nil {
+		return
+	}
+	manifest.RowsCheck = check
+	temp := filepath.Join(dir, fmt.Sprintf(".%s.%d", semanticManifestFile, os.Getpid()))
+	_ = os.Remove(temp)
+	if err := writeSemanticManifest(temp, manifest); err != nil {
+		_ = os.Remove(temp)
+		return
+	}
+	if err := os.Rename(temp, filepath.Join(dir, semanticManifestFile)); err != nil {
+		_ = os.Remove(temp)
+	}
+}
+
+func semanticRowsCheckOf(info os.FileInfo) semanticRowsCheck {
+	device, inode, mtime := fileInfoIdentity(info)
+	check := semanticRowsCheck{Device: device, Inode: inode, MtimeNs: mtime}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		check.CtimeNs = statCtimeNano(*st)
+	}
+	return check
 }
 
 func readVerifiedSemanticRows(
@@ -727,7 +892,9 @@ func readVerifiedSemanticRows(
 	count uint64,
 ) ([]semanticUnit, error) {
 	hash := sha256.New()
-	rows, err := readSemanticRowsFrom(io.TeeReader(reader, hash), count)
+	counted := &semanticCountingReader{reader: io.TeeReader(reader, hash)}
+	rows, err := readSemanticRowsFrom(counted, count, true)
+	semanticRowsHashedBytes.Add(counted.bytes)
 	if err != nil {
 		return nil, err
 	}
@@ -737,7 +904,21 @@ func readVerifiedSemanticRows(
 	return rows, nil
 }
 
-func readSemanticRowsFrom(reader io.Reader, count uint64) ([]semanticUnit, error) {
+type semanticCountingReader struct {
+	reader io.Reader
+	bytes  int64
+}
+
+func (r *semanticCountingReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	r.bytes += int64(n)
+	return n, err
+}
+
+// readSemanticRowsFrom parses rows. verifyIDs recomputes each unit ID: the
+// full check does it; a file that the recorded check saw is trusted, so its
+// open hashes nothing.
+func readSemanticRowsFrom(reader io.Reader, count uint64, verifyIDs bool) ([]semanticUnit, error) {
 	buffered := bufio.NewReaderSize(reader, 256<<10)
 	var header [semanticRowsHeaderBytes]byte
 	if _, err := io.ReadFull(buffered, header[:]); err != nil ||
@@ -762,20 +943,19 @@ func readSemanticRowsFrom(reader io.Reader, count uint64) ([]semanticUnit, error
 		unit.row = binary.LittleEndian.Uint64(fixed[0:8])
 		unit.start = binary.LittleEndian.Uint64(fixed[8:16])
 		unit.end = binary.LittleEndian.Uint64(fixed[16:24])
-		copy(unit.id[:], fixed[24:24+sha256.Size])
-		copy(unit.contentID[:], fixed[24+sha256.Size:24+2*sha256.Size])
-		pathBytes := binary.LittleEndian.Uint32(fixed[88:92])
-		languageBytes := binary.LittleEndian.Uint16(fixed[92:94])
-		fileLanguageBytes := binary.LittleEndian.Uint16(fixed[94:96])
-		symbolBytes := binary.LittleEndian.Uint16(fixed[96:98])
-		if pathBytes > semanticMetadataFieldMax {
-			return nil, fmt.Errorf("semantic row path is too large")
+		copy(unit.id[:], fixed[24:56])
+		copy(unit.contentID[:], fixed[56:88])
+		copy(unit.key[:], fixed[88:120])
+		pathBytes := binary.LittleEndian.Uint32(fixed[120:124])
+		languageBytes := binary.LittleEndian.Uint32(fixed[124:128])
+		fileLanguageBytes := binary.LittleEndian.Uint16(fixed[128:130])
+		symbolBytes := binary.LittleEndian.Uint32(fixed[130:134])
+		if pathBytes > semanticMetadataFieldMax || languageBytes > semanticMetadataFieldMax ||
+			symbolBytes > semanticMetadataFieldMax {
+			return nil, fmt.Errorf("semantic row field is too large")
 		}
 		fieldsBytes := uint64(pathBytes) + uint64(languageBytes) +
 			uint64(fileLanguageBytes) + uint64(symbolBytes)
-		if fieldsBytes > 2*semanticMetadataFieldMax {
-			return nil, fmt.Errorf("semantic row fields are too large")
-		}
 		if cap(fields) < int(fieldsBytes) {
 			fields = make([]byte, int(fieldsBytes))
 		} else {
@@ -797,14 +977,16 @@ func readSemanticRowsFrom(reader io.Reader, count uint64) ([]semanticUnit, error
 		unit.language = internSemanticRowLanguage(internedLanguages, fields[languageAt:fileLanguageAt])
 		unit.fileLanguage = internSemanticRowLanguage(internedLanguages, fields[fileLanguageAt:symbolAt])
 		unit.symbol = string(fields[symbolAt:])
-		unit.kind = semanticUnitKind(fixed[98])
-		unit.parserResult = semanticParserResult(fixed[99])
-		var wantID semanticUnitID
-		wantID, idBuffer = makeSemanticUnitIDBuffered(*unit, idBuffer)
+		unit.kind = semanticUnitKind(fixed[134])
+		unit.parserResult = semanticParserResult(fixed[135])
+		wantID := unit.id
+		if verifyIDs {
+			wantID, idBuffer = makeSemanticUnitIDBuffered(*unit, idBuffer)
+		}
 		if unit.row != uint64(index) || unit.path == "" || unit.end <= unit.start ||
 			unit.end-unit.start > semanticUnitMaxBytes ||
 			unit.id != wantID ||
-			unit.kind < semanticUnitGap || unit.kind > semanticUnitPacked ||
+			unit.kind < semanticUnitGap || unit.kind > semanticUnitFallback ||
 			unit.parserResult < semanticParserCTags || unit.parserResult > semanticParserInvalidUTF8 {
 			return nil, fmt.Errorf("semantic row %d is invalid", index)
 		}

@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -161,13 +160,11 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 		modifiedContent = "package changed\n// DELTA_MODIFIED\n"
 	)
 	mutations := []struct {
-		name       string
-		wantBudget gitIndexBudget
-		mutate     func(*testing.T, string)
+		name   string
+		mutate func(*testing.T, string)
 	}{
 		{
-			name:       "add",
-			wantBudget: gitIndexBudget{candidates: 3, indexedBytes: int64(len(keepContent) + len(baseContent) + len(addedContent))},
+			name: "add",
 			mutate: func(t *testing.T, repoDir string) {
 				t.Helper()
 				if err := os.WriteFile(filepath.Join(repoDir, "added.go"), []byte(addedContent), 0o644); err != nil {
@@ -176,8 +173,7 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 			},
 		},
 		{
-			name:       "delete",
-			wantBudget: gitIndexBudget{candidates: 1, indexedBytes: int64(len(keepContent))},
+			name: "delete",
 			mutate: func(t *testing.T, repoDir string) {
 				t.Helper()
 				if err := os.Remove(filepath.Join(repoDir, "change.go")); err != nil {
@@ -186,8 +182,7 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 			},
 		},
 		{
-			name:       "modify",
-			wantBudget: gitIndexBudget{candidates: 2, indexedBytes: int64(len(keepContent) + len(modifiedContent))},
+			name: "modify",
 			mutate: func(t *testing.T, repoDir string) {
 				t.Helper()
 				if err := os.WriteFile(filepath.Join(repoDir, "change.go"), []byte(modifiedContent), 0o644); err != nil {
@@ -196,8 +191,7 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 			},
 		},
 		{
-			name:       "type-change",
-			wantBudget: gitIndexBudget{candidates: 2, indexedBytes: int64(len(keepContent) + len("keep.go"))},
+			name: "type-change",
 			mutate: func(t *testing.T, repoDir string) {
 				t.Helper()
 				if err := os.Remove(filepath.Join(repoDir, "change.go")); err != nil {
@@ -209,8 +203,7 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 			},
 		},
 		{
-			name:       "mode-only",
-			wantBudget: gitIndexBudget{candidates: 2, indexedBytes: int64(len(keepContent) + len(baseContent))},
+			name: "mode-only",
 			mutate: func(t *testing.T, repoDir string) {
 				t.Helper()
 				if err := os.Chmod(filepath.Join(repoDir, "change.go"), 0o755); err != nil {
@@ -219,16 +212,14 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 			},
 		},
 		{
-			name:       "rename",
-			wantBudget: gitIndexBudget{candidates: 2, indexedBytes: int64(len(keepContent) + len(baseContent))},
+			name: "rename",
 			mutate: func(t *testing.T, repoDir string) {
 				t.Helper()
 				gitRunIn(t, repoDir, "mv", "change.go", "renamed.go")
 			},
 		},
 		{
-			name:       "empty-diff",
-			wantBudget: gitIndexBudget{candidates: 2, indexedBytes: int64(len(keepContent) + len(baseContent))},
+			name: "empty-diff",
 			mutate: func(t *testing.T, repoDir string) {
 				t.Helper()
 			},
@@ -268,8 +259,8 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 			if err != nil || !eligible {
 				t.Fatalf("prepare delta: eligible=%t error=%v", eligible, err)
 			}
-			if delta.nextState.budget != test.wantBudget {
-				t.Fatalf("delta budget=%+v, want %+v", delta.nextState.budget, test.wantBudget)
+			if delta.nextState.head != target.commitOID {
+				t.Fatalf("delta head=%s, want %s", delta.nextState.head, target.commitOID)
 			}
 
 			seedBytes := make(map[string][]byte)
@@ -292,7 +283,7 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 			}
 
 			fullDir := t.TempDir()
-			if err := indexNativeGitFull(t.Context(), paths.RepoDir, fullDir, target, nil, 1); err != nil {
+			if err := indexNativeGitFull(t.Context(), paths.RepoDir, fullDir, target, 1, nil); err != nil {
 				t.Fatalf("build clean full: %v", err)
 			}
 			if got, want := nativeVisibleDocuments(t, deltaDir), nativeVisibleDocuments(t, fullDir); !slices.Equal(got, want) {
@@ -488,47 +479,6 @@ func TestPrepareNativeGitDeltaRejectsCommittedStateDamage(t *testing.T) {
 			_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.cacheDir, plan.indexDir, target, scan)
 			if err != nil || eligible {
 				t.Fatalf("damaged state: eligible=%t error=%v", eligible, err)
-			}
-		})
-	}
-}
-
-func TestPrepareNativeGitDeltaChecksUpdatedCorpusTotals(t *testing.T) {
-	for _, metric := range []indexCapMetric{indexCapCandidateFiles, indexCapIndexedBytes} {
-		t.Run(string(metric), func(t *testing.T) {
-			repoDir, paths, plan := prepareNativeDeltaFixture(t)
-			baseState, ok := readCommittedGitState(plan.cacheDir)
-			if !ok {
-				t.Fatal("read committed state")
-			}
-			if err := os.WriteFile(filepath.Join(repoDir, "added.go"), []byte("package added\n"), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			gitRunIn(t, repoDir, "add", "added.go")
-			gitRunIn(t, repoDir, "commit", "-m", "cross saved total")
-
-			oldFiles, oldBytes := gitCandidateFileLimit, gitCorpusIndexedByteLimit
-			if metric == indexCapCandidateFiles {
-				gitCandidateFileLimit = baseState.budget.candidates
-			} else {
-				gitCorpusIndexedByteLimit = baseState.budget.indexedBytes
-			}
-			t.Cleanup(func() {
-				gitCandidateFileLimit = oldFiles
-				gitCorpusIndexedByteLimit = oldBytes
-			})
-
-			scan, err := scanFamily(plan.indexDir)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.cacheDir, plan.indexDir, captureHeadForTest(t, repoDir), scan)
-			if eligible || !errors.Is(err, errGitCommittedCapExceeded) {
-				t.Fatalf("eligible=%t error=%v, want committed %s cap error", eligible, err, metric)
-			}
-			capErr, ok := errors.AsType[indexCapExceededError](err)
-			if !ok || capErr.metric != metric {
-				t.Fatalf("cap error=%+v, want metric %s", capErr, metric)
 			}
 		})
 	}

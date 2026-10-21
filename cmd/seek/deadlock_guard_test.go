@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// defaultLeakTimeout is the watchdog budget used by light-weight pool
+// defaultLeakTimeout is the watchdog budget used by light-weight node
 // tests (no real indexing, no real corpus pressure). Tests that
 // exercise indexing, semaphore pressure, or large fixtures pass an
 // explicit longer duration directly.

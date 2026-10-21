@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,13 +23,19 @@ func fakeCorpusHash(id int) string {
 	return fmt.Sprintf("%0*x", corpusHashHexLen, id)
 }
 
-// seedCorpus creates corpora/<hash>/ with a .used marker mtime'd to usedAt.
-// Returns the cache-dir path.
+// seededCorpusBytes is the ledger size of a seeded corpus.
+const seededCorpusBytes = 1 << 20
+
+// seedCorpus creates corpora/<hash>/ with a .used marker mtime'd to usedAt
+// and a ledger entry of seededCorpusBytes. Returns the cache-dir path.
 func seedCorpus(tb testing.TB, cacheRoot, hash string, usedAt time.Time) string {
 	tb.Helper()
 	dir := filepath.Join(cacheRoot, corporaDir, hash)
 	if err := os.MkdirAll(filepath.Join(dir, "index"), 0o755); err != nil {
 		tb.Fatalf("mkdir corpus: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, corpusSizeFile), []byte(strconv.Itoa(seededCorpusBytes)), 0o644); err != nil {
+		tb.Fatalf("write size: %v", err)
 	}
 	usedPath := filepath.Join(dir, usedFile)
 	if err := os.WriteFile(usedPath, nil, 0o644); err != nil {
@@ -56,7 +63,6 @@ func cacheRootForTest(tb testing.TB) string {
 
 func clearGCEnvForTest(tb testing.TB) {
 	tb.Helper()
-	tb.Setenv(envGCMaxAge, "")
 	tb.Setenv(envGCInterval, "")
 }
 
@@ -134,6 +140,9 @@ func runGCCapture(tb testing.TB, args ...string) string {
 
 func TestGC_ThrottleGate_SkipsWhenStampFresh(t *testing.T) {
 	root := cacheRootForTest(t)
+	// Over the budget, so the GC would evict the corpus unless the guard
+	// under test holds it.
+	t.Setenv(envCacheBudget, "1")
 	dir := seedCorpus(t, root, fakeCorpusHash(1), time.Now().Add(-30*24*time.Hour))
 
 	// Fresh stamp (now) — should block GC.
@@ -141,7 +150,7 @@ func TestGC_ThrottleGate_SkipsWhenStampFresh(t *testing.T) {
 		t.Fatalf("write stamp: %v", err)
 	}
 
-	runGC(context.Background(), gcOptions{maxAge: defaultGCMaxAge}, defaultGCInterval)
+	runGC(context.Background(), gcOptions{}, defaultGCInterval)
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("stale corpus removed despite fresh stamp: %v", err)
@@ -150,9 +159,11 @@ func TestGC_ThrottleGate_SkipsWhenStampFresh(t *testing.T) {
 
 func TestGC_ThrottleGate_RunsWhenStampMissing(t *testing.T) {
 	root := cacheRootForTest(t)
+	// Over the budget, so GC evicts every corpus that no search holds.
+	t.Setenv(envCacheBudget, "1")
 	dir := seedCorpus(t, root, fakeCorpusHash(2), time.Now().Add(-30*24*time.Hour))
 
-	runGC(context.Background(), gcOptions{maxAge: defaultGCMaxAge}, defaultGCInterval)
+	runGC(context.Background(), gcOptions{}, defaultGCInterval)
 
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("stale corpus should be evicted: err=%v", err)
@@ -164,6 +175,8 @@ func TestGC_ThrottleGate_RunsWhenStampMissing(t *testing.T) {
 
 func TestGC_ThrottleGate_RunsWhenStampOld(t *testing.T) {
 	root := cacheRootForTest(t)
+	// Over the budget, so GC evicts every corpus that no search holds.
+	t.Setenv(envCacheBudget, "1")
 	dir := seedCorpus(t, root, fakeCorpusHash(3), time.Now().Add(-30*24*time.Hour))
 
 	stamp := filepath.Join(root, gcStampFile)
@@ -175,7 +188,7 @@ func TestGC_ThrottleGate_RunsWhenStampOld(t *testing.T) {
 		t.Fatalf("chtimes stamp: %v", err)
 	}
 
-	runGC(context.Background(), gcOptions{maxAge: defaultGCMaxAge}, defaultGCInterval)
+	runGC(context.Background(), gcOptions{}, defaultGCInterval)
 
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("stale corpus should be evicted with old stamp: err=%v", err)
@@ -184,6 +197,9 @@ func TestGC_ThrottleGate_RunsWhenStampOld(t *testing.T) {
 
 func TestGC_GlobalLockContention_SkipsWhenHeld(t *testing.T) {
 	root := cacheRootForTest(t)
+	// Over the budget, so the GC would evict the corpus unless the guard
+	// under test holds it.
+	t.Setenv(envCacheBudget, "1")
 	dir := seedCorpus(t, root, fakeCorpusHash(4), time.Now().Add(-30*24*time.Hour))
 
 	// Externally hold gc.lock.
@@ -196,32 +212,43 @@ func TestGC_GlobalLockContention_SkipsWhenHeld(t *testing.T) {
 		t.Fatalf("hold gc.lock: %v", err)
 	}
 
-	runGC(context.Background(), gcOptions{maxAge: defaultGCMaxAge}, defaultGCInterval)
+	runGC(context.Background(), gcOptions{}, defaultGCInterval)
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("stale corpus should survive when gc.lock contended: %v", err)
 	}
 }
 
-func TestGC_EvictsCorpusBeyondTTL(t *testing.T) {
+// TestGC_EvictsLRUOverBudget puts the cache over its budget: GC evicts the
+// least recently used corpus and keeps the newer one.
+func TestGC_EvictsLRUOverBudget(t *testing.T) {
 	root := cacheRootForTest(t)
-	dir := seedCorpus(t, root, fakeCorpusHash(5), time.Now().Add(-15*24*time.Hour))
+	t.Setenv(envCacheBudget, strconv.Itoa(seededCorpusBytes*3/2))
+	// Both are only days old, so the eviction comes from the budget, not
+	// from age.
+	old := seedCorpus(t, root, fakeCorpusHash(5), time.Now().Add(-2*24*time.Hour))
+	recent := seedCorpus(t, root, fakeCorpusHash(6), time.Now().Add(-1*time.Hour))
 
-	runGC(context.Background(), gcOptions{maxAge: defaultGCMaxAge}, defaultGCInterval)
+	runGC(context.Background(), gcOptions{}, defaultGCInterval)
 
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Fatalf("stale corpus should be evicted: err=%v", err)
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf("least recently used corpus should be evicted: err=%v", err)
+	}
+	if _, err := os.Stat(recent); err != nil {
+		t.Fatalf("recent corpus should be kept: %v", err)
 	}
 }
 
-func TestGC_KeepsCorpusWithinTTL(t *testing.T) {
+// TestGC_KeepsOldCorpusWithinBudget checks that age alone never evicts a
+// corpus; only the budget does.
+func TestGC_KeepsOldCorpusWithinBudget(t *testing.T) {
 	root := cacheRootForTest(t)
-	dir := seedCorpus(t, root, fakeCorpusHash(6), time.Now().Add(-1*24*time.Hour))
+	dir := seedCorpus(t, root, fakeCorpusHash(6), time.Now().Add(-90*24*time.Hour))
 
-	runGC(context.Background(), gcOptions{maxAge: defaultGCMaxAge}, defaultGCInterval)
+	runGC(context.Background(), gcOptions{}, defaultGCInterval)
 
 	if _, err := os.Stat(dir); err != nil {
-		t.Fatalf("recently-used corpus should be kept: %v", err)
+		t.Fatalf("an old corpus within the budget should be kept: %v", err)
 	}
 }
 
@@ -236,7 +263,7 @@ func TestGC_CrashRecovery_DrainsTrash(t *testing.T) {
 		t.Fatalf("seed trash marker: %v", err)
 	}
 
-	runGC(context.Background(), gcOptions{maxAge: defaultGCMaxAge}, defaultGCInterval)
+	runGC(context.Background(), gcOptions{}, defaultGCInterval)
 
 	if _, err := os.Stat(trashEntry); !os.IsNotExist(err) {
 		t.Fatalf("trash should be drained: err=%v", err)
@@ -278,9 +305,14 @@ func TestGC_TouchUsed_UpdatesMtime(t *testing.T) {
 
 func TestGC_BackwardCompat_NoUsedFile_UsesDirMtime(t *testing.T) {
 	root := cacheRootForTest(t)
+	// Over the budget, so GC evicts every corpus that no search holds.
+	t.Setenv(envCacheBudget, "1")
 	dir := filepath.Join(root, corporaDir, fakeCorpusHash(8))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir corpus: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "shard"), make([]byte, 64), 0o644); err != nil {
+		t.Fatalf("write shard: %v", err)
 	}
 	// No .used marker. Set dir mtime to 15d ago.
 	old := time.Now().Add(-15 * 24 * time.Hour)
@@ -288,7 +320,13 @@ func TestGC_BackwardCompat_NoUsedFile_UsesDirMtime(t *testing.T) {
 		t.Fatalf("chtimes dir: %v", err)
 	}
 
-	runGC(context.Background(), gcOptions{maxAge: defaultGCMaxAge}, defaultGCInterval)
+	// The AGE cell of the plan shows the dir mtime: 15 days.
+	rows := gcTableRows(runGCCapture(t, "--dry-run"))
+	if len(rows) != 1 || strings.Fields(rows[0])[2] != "15d" {
+		t.Fatalf("plan rows = %q, want one row with AGE 15d (dir mtime)", rows)
+	}
+
+	runGC(context.Background(), gcOptions{}, defaultGCInterval)
 
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("corpus without .used should fall back to dir mtime and evict: err=%v", err)
@@ -297,6 +335,9 @@ func TestGC_BackwardCompat_NoUsedFile_UsesDirMtime(t *testing.T) {
 
 func TestGC_PerCorpusActive_SkipsLockedCorpus(t *testing.T) {
 	root := cacheRootForTest(t)
+	// Over the budget, so the GC would evict the corpus unless the guard
+	// under test holds it.
+	t.Setenv(envCacheBudget, "1")
 	dir := seedCorpus(t, root, fakeCorpusHash(9), time.Now().Add(-30*24*time.Hour))
 
 	// Externally hold the corpus .lock LOCK_EX.
@@ -310,7 +351,7 @@ func TestGC_PerCorpusActive_SkipsLockedCorpus(t *testing.T) {
 		t.Fatalf("hold corpus lock: %v", err)
 	}
 
-	runGC(context.Background(), gcOptions{maxAge: defaultGCMaxAge}, defaultGCInterval)
+	runGC(context.Background(), gcOptions{}, defaultGCInterval)
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("locked corpus should not be evicted: %v", err)
@@ -340,30 +381,12 @@ func TestGC_TOCTOU_RefreshedUsedUnderLock_SkipsEvict(t *testing.T) {
 	if err := os.MkdirAll(trashDir, 0o755); err != nil {
 		t.Fatalf("mkdir trash: %v", err)
 	}
-	res := evictCorpus(entry, trashDir, time.Now().Add(-defaultGCMaxAge))
+	res := evictCorpus(entry, trashDir, entry.usedAt)
 	if res.action != actionKept {
 		t.Fatalf("expected actionKept after .used refresh under lock, got %s err=%v", res.String(), res.err)
 	}
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("corpus should remain after TOCTOU skip: %v", err)
-	}
-}
-
-func TestGC_EnvMaxAgeOverride(t *testing.T) {
-	root := cacheRootForTest(t)
-	t.Setenv(envGCMaxAge, "1h")
-
-	stale := seedCorpus(t, root, fakeCorpusHash(11), time.Now().Add(-2*time.Hour))
-	fresh := seedCorpus(t, root, fakeCorpusHash(12), time.Now().Add(-30*time.Minute))
-
-	cfg := gcConfigFromEnv()
-	runGC(context.Background(), gcOptions{maxAge: cfg.maxAge}, cfg.interval)
-
-	if _, err := os.Stat(stale); !os.IsNotExist(err) {
-		t.Fatalf("2h corpus should evict under 1h TTL: err=%v", err)
-	}
-	if _, err := os.Stat(fresh); err != nil {
-		t.Fatalf("30m corpus should remain under 1h TTL: %v", err)
 	}
 }
 
@@ -433,13 +456,18 @@ func TestGC_TouchUsed_NFSGate_SkipsWhenCached(t *testing.T) {
 
 func TestGCCmd_DryRun_NoEvictions(t *testing.T) {
 	root := cacheRootForTest(t)
-	dir := seedCorpus(t, root, fakeCorpusHash(16), time.Now().Add(-30*24*time.Hour))
+	// Over the budget, so the plan evicts the corpus and a live run would
+	// remove it.
+	t.Setenv(envCacheBudget, "1")
+	hash := fakeCorpusHash(16)
+	dir := seedCorpus(t, root, hash, time.Now().Add(-30*24*time.Hour))
 
 	out := runGCCapture(t, "--dry-run")
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("dry-run should not evict: %v", err)
 	}
+	requireRow(t, out, hash, "evicted")
 	// Dry-run summary verb is "evictable" (the live path says "evicted").
 	if !strings.Contains(out, "evictable (") {
 		t.Fatalf("dry-run summary should say 'evictable'; got: %q", out)
@@ -464,6 +492,8 @@ func TestGCCmd_DryRun_DoesNotCreateMissingCacheRoot(t *testing.T) {
 
 func TestGCCmd_Force_BypassesThrottle(t *testing.T) {
 	root := cacheRootForTest(t)
+	// Over the budget, so GC evicts every corpus that no search holds.
+	t.Setenv(envCacheBudget, "1")
 	hash := fakeCorpusHash(17)
 	dir := seedCorpus(t, root, hash, time.Now().Add(-30*24*time.Hour))
 	if err := os.WriteFile(filepath.Join(root, gcStampFile), nil, 0o644); err != nil {
@@ -518,6 +548,8 @@ func TestGCCmd_All_BypassesThrottle(t *testing.T) {
 // pre-fix silent behavior where users saw nothing.
 func TestGCCmd_Force_PrintsLiveTable(t *testing.T) {
 	root := cacheRootForTest(t)
+	// Over the budget, so GC evicts every corpus that no search holds.
+	t.Setenv(envCacheBudget, "1")
 	hash := fakeCorpusHash(40)
 	seedCorpus(t, root, hash, time.Now().Add(-30*24*time.Hour))
 
@@ -540,6 +572,8 @@ func TestGCCmd_Force_PrintsLiveTable(t *testing.T) {
 // ACTION=locked rather than being silently skipped.
 func TestGCCmd_LiveTable_ShowsLockedAction(t *testing.T) {
 	root := cacheRootForTest(t)
+	// Over the budget, so GC evicts every corpus that no search holds.
+	t.Setenv(envCacheBudget, "1")
 	hash := fakeCorpusHash(41)
 	dir := seedCorpus(t, root, hash, time.Now().Add(-30*24*time.Hour))
 
@@ -626,6 +660,8 @@ func TestGCCmd_LockContention_PrintsSkipMessage(t *testing.T) {
 // summary used `len(entries)` instead of processedCount).
 func TestGCCmd_CtxCanceled_SummaryUsesProcessedCount(t *testing.T) {
 	root := cacheRootForTest(t)
+	// Over the budget, so an uncanceled run evicts every corpus.
+	t.Setenv(envCacheBudget, "1")
 	dirs := make([]string, 5)
 	for i := 0; i < 5; i++ {
 		dirs[i] = seedCorpus(t, root, fakeCorpusHash(70+i), time.Now().Add(-30*24*time.Hour))
@@ -688,27 +724,6 @@ func TestGC_ParseGCDuration(t *testing.T) {
 	}
 }
 
-func TestGC_EnvMaxAge_DaysSuffix(t *testing.T) {
-	root := cacheRootForTest(t)
-	t.Setenv(envGCMaxAge, "7d")
-
-	stale := seedCorpus(t, root, fakeCorpusHash(21), time.Now().Add(-8*24*time.Hour))
-	fresh := seedCorpus(t, root, fakeCorpusHash(22), time.Now().Add(-3*24*time.Hour))
-
-	cfg := gcConfigFromEnv()
-	if cfg.maxAge != 7*24*time.Hour {
-		t.Fatalf("cfg.maxAge = %v, want 7d", cfg.maxAge)
-	}
-	runGC(context.Background(), gcOptions{maxAge: cfg.maxAge}, cfg.interval)
-
-	if _, err := os.Stat(stale); !os.IsNotExist(err) {
-		t.Fatalf("8d corpus must evict under 7d TTL: err=%v", err)
-	}
-	if _, err := os.Stat(fresh); err != nil {
-		t.Fatalf("3d corpus must survive under 7d TTL: %v", err)
-	}
-}
-
 func TestGCCmd_UnknownFlag_Errors(t *testing.T) {
 	cacheRootForTest(t)
 	if err := runGCCommand(context.Background(), []string{"--whoops"}); err == nil {
@@ -741,6 +756,8 @@ func TestGC_IsCorpusHashName(t *testing.T) {
 // while others skip cleanly.
 func TestRace_ConcurrentGCInvocations(t *testing.T) {
 	root := cacheRootForTest(t)
+	// Over the budget, so GC evicts every corpus that no search holds.
+	t.Setenv(envCacheBudget, "1")
 	const N = 20
 	for i := 0; i < N; i++ {
 		seedCorpus(t, root, fakeCorpusHash(100+i), time.Now().Add(-30*24*time.Hour))
@@ -751,7 +768,7 @@ func TestRace_ConcurrentGCInvocations(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runGC(context.Background(), gcOptions{maxAge: defaultGCMaxAge, skipThrottle: true}, defaultGCInterval)
+			runGC(context.Background(), gcOptions{skipThrottle: true}, defaultGCInterval)
 		}()
 	}
 	wg.Wait()
@@ -767,9 +784,12 @@ func TestRace_ConcurrentGCInvocations(t *testing.T) {
 }
 
 // TestRace_GCDuringIndexing — corpus .lock held by simulated indexer →
-// eviction must skip even when stale.
+// eviction must skip even over the budget.
 func TestRace_GCDuringIndexing(t *testing.T) {
 	root := cacheRootForTest(t)
+	// Over the budget, so the GC would evict the corpus unless the guard
+	// under test holds it.
+	t.Setenv(envCacheBudget, "1")
 	hash := fakeCorpusHash(200)
 	dir := seedCorpus(t, root, hash, time.Now().Add(-30*24*time.Hour))
 
@@ -788,7 +808,7 @@ func TestRace_GCDuringIndexing(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runGC(context.Background(), gcOptions{maxAge: defaultGCMaxAge, skipThrottle: true}, defaultGCInterval)
+		runGC(context.Background(), gcOptions{skipThrottle: true}, defaultGCInterval)
 	}()
 	wg.Wait()
 
@@ -1062,6 +1082,9 @@ func TestGC_FireOpportunisticGC_PassesContextWithDeadline(t *testing.T) {
 func TestGC_RunGC_CtxCanceledBreaksLoop(t *testing.T) {
 	resetNFSCheck(t)
 	root := cacheRootForTest(t)
+	// Over the budget, so the GC would evict the corpus unless the guard
+	// under test holds it.
+	t.Setenv(envCacheBudget, "1")
 	stale := time.Now().Add(-30 * 24 * time.Hour)
 	for i := 0; i < 50; i++ {
 		seedCorpus(t, root, fakeCorpusHash(i), stale)
@@ -1071,12 +1094,13 @@ func TestGC_RunGC_CtxCanceledBreaksLoop(t *testing.T) {
 	cancel() // pre-canceled
 
 	start := time.Now()
-	runGC(ctx, gcOptions{maxAge: defaultGCMaxAge, skipThrottle: true}, defaultGCInterval)
+	runGC(ctx, gcOptions{skipThrottle: true}, defaultGCInterval)
 	elapsed := time.Since(start)
 
 	// Pre-canceled ctx → loop's first ctx.Err() check trips immediately.
-	// 50 evictions would take >10ms; clean break is <5ms in practice.
-	if elapsed > 50*time.Millisecond {
+	// The bound leaves room for a loaded host; the count below is
+	// the real check.
+	if elapsed > time.Second {
 		t.Fatalf("canceled ctx did not short-circuit loop: took %v", elapsed)
 	}
 
@@ -1106,7 +1130,7 @@ func TestGC_FireOpportunisticGC_Composition(t *testing.T) {
 	// eviction; this mirrors how the manual `seek gc --force` path is
 	// driven through the same composition.
 	t.Setenv(envGCInterval, "0s")
-	t.Setenv(envGCMaxAge, "14d")
+	t.Setenv(envCacheBudget, "1")
 
 	start := time.Now()
 	fireOpportunisticGC(runOpportunisticGC, 5*time.Second)
@@ -1192,7 +1216,7 @@ func TestGC_FireOpportunisticGC_RunFnReadsCtxMidExecution(t *testing.T) {
 	}
 }
 
-// TestGC_RunGC_CtxCanceledDuringEnumerate is a stricter variant of the
+// TestGC_RunGC_CtxCanceledEmptyCorpora is a stricter variant of the
 // loop-break test: cancel happens BEFORE runGC is called, no corpora are
 // seeded — confirms the loop is benign for zero entries plus a canceled
 // context (no double-decrement, no panic on len(entries)==0).
@@ -1203,7 +1227,7 @@ func TestGC_RunGC_CtxCanceledEmptyCorpora(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	// Must complete without panic; nothing to evict.
-	runGC(ctx, gcOptions{maxAge: defaultGCMaxAge, skipThrottle: true}, defaultGCInterval)
+	runGC(ctx, gcOptions{skipThrottle: true}, defaultGCInterval)
 }
 
 // TestGC_RunGC_CtxCancelMidLoop — context canceled WHILE the eviction
@@ -1213,6 +1237,8 @@ func TestGC_RunGC_CtxCanceledEmptyCorpora(t *testing.T) {
 func TestGC_RunGC_CtxCancelMidLoop(t *testing.T) {
 	resetNFSCheck(t)
 	root := cacheRootForTest(t)
+	// Over the budget, so GC evicts every corpus that no search holds.
+	t.Setenv(envCacheBudget, "1")
 	stale := time.Now().Add(-30 * 24 * time.Hour)
 	const seeded = 100
 	for i := 0; i < seeded; i++ {
@@ -1231,7 +1257,7 @@ func TestGC_RunGC_CtxCancelMidLoop(t *testing.T) {
 	// long before the ~100 filesystem renames a full sweep would take.
 	done := make(chan struct{})
 	go func() {
-		runGC(ctx, gcOptions{maxAge: defaultGCMaxAge, skipThrottle: true}, defaultGCInterval)
+		runGC(ctx, gcOptions{skipThrottle: true}, defaultGCInterval)
 		close(done)
 	}()
 poll:
@@ -1252,8 +1278,8 @@ poll:
 	if err != nil {
 		t.Fatalf("enumerate: %v", err)
 	}
-	// All seeded corpora are stale, so an uncancelled run evicts everything;
-	// cancelling on the first eviction must spare the remainder.
+	// All seeded corpora are over the budget, so an uncancelled run evicts
+	// everything; cancelling on the first eviction must spare the remainder.
 	if len(entries) == 0 {
 		t.Fatalf("mid-loop cancel should leave some corpora intact; all evicted")
 	}
@@ -1355,9 +1381,10 @@ func TestGC_Integration_RunFlowEvictsStale(t *testing.T) {
 	t.Chdir(repoDir)
 	ensureTestUserCache(t)
 
-	// Force GC to run on every invocation, evict anything older than 1h.
+	// Force GC to run on every invocation; the budget holds the real corpus
+	// but not the 1 MiB fake one.
 	t.Setenv(envGCInterval, "0s")
-	t.Setenv(envGCMaxAge, "1h")
+	t.Setenv(envCacheBudget, "512K")
 
 	// Seed a stale fake corpus alongside the real one. Its hash shape
 	// matches what newCorpusID produces.
@@ -1377,9 +1404,9 @@ func TestGC_Integration_RunFlowEvictsStale(t *testing.T) {
 	}
 
 	// Real corpus' .used must exist (proof that touchUsed wiring fired).
-	plan, err := planCurrentGitCorpus(mustResolveGitPaths(t, repoDir))
+	plan, err := planGitCorpus(mustResolveGitPaths(t, repoDir), nil)
 	if err != nil {
-		t.Fatalf("planCurrentGitCorpus: %v", err)
+		t.Fatalf("planGitCorpus: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(plan.cacheDir, usedFile)); err != nil {
 		t.Fatalf("real corpus .used missing after run(): %v", err)
@@ -1426,7 +1453,7 @@ func TestRace_TrashDrainConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runGC(context.Background(), gcOptions{maxAge: defaultGCMaxAge, skipThrottle: true}, defaultGCInterval)
+			runGC(context.Background(), gcOptions{skipThrottle: true}, defaultGCInterval)
 		}()
 	}
 	wg.Wait()
@@ -1556,7 +1583,6 @@ func TestRunGCCollectsCompiledProviderModels(t *testing.T) {
 	var out bytes.Buffer
 	runGC(t.Context(), gcOptions{
 		skipThrottle: true,
-		maxAge:       defaultGCMaxAge,
 		writer:       &out,
 	}, defaultGCInterval)
 	if _, err := os.Stat(aged); !os.IsNotExist(err) {

@@ -1,6 +1,6 @@
 # seek
 
-Ranked local search for AI coding agents. `seek` searches the current Git repo
+Ranked local search for AI coding agents. `seek` searches the current folder
 or the paths you pass, then returns relevant matches with definitions and
 context. Plain descriptions with two or more words can use a bundled local model
 to find and rank code by meaning. No server or API key is needed.
@@ -39,7 +39,11 @@ sudo apt-get install universal-ctags  # Linux
 ```
 
 Git 2.36 or later is required for Git-backed searches and `git worktree`
-setups.
+setups. Seek never fetches from a remote: in a partial clone, files whose
+content is not on disk are searchable by name only, and the first search after
+their content arrives indexes it. A partial clone needs Git
+2.45 or later, or a 2024 maintenance release that blocks lazy fetches (2.39.4,
+2.40.2, 2.41.1, 2.42.2, 2.43.4, or 2.44.1).
 
 The executable includes the search model and its runtime. Release archives
 support macOS 15 or newer and glibc-based Linux on amd64 and arm64. Alpine and
@@ -50,7 +54,7 @@ other musl systems are not supported.
 ```bash
 cd your-project
 
-seek 'handleRequest'                 # current repo
+seek 'handleRequest'                 # current folder, the same as .
 seek 'sym:handleRequest'             # definition, not calls
 seek 'handleRequest' ./src ./cmd     # selected paths
 seek 'TODO' ../notes                 # folder outside Git
@@ -60,7 +64,7 @@ seek --lexical-only 'handleRequest'  # text search only; skip all model work
 ```
 
 The first search builds local indexes. On a large repository, it can take tens
-of seconds or longer, use several GiB of memory, and create about 1 GiB of cache
+of seconds or longer, use several GiB of memory, and create several GiB of cache
 data. Use `--lexical-only` for a faster text-only search with no model work.
 
 A search returns output like this:
@@ -85,18 +89,20 @@ A search returns output like this:
 Results are grouped by file and sorted by relevance. By default, each match
 includes up to 3 lines before and after it. Tags like `[func]` and `[class]`
 mark definitions. Terminal output uses color; piped output is plain text, so
-agents and CI get clean results. Across multiple folders or repos, file headers
-use absolute paths so each match is easy to open.
+agents and CI get clean results. A file header is the path as you typed it plus
+the path below it, the rule of ripgrep and `git grep`: with no path or `.`, the
+path below the current folder. Across several folders or repos, each header
+also has a `[git]` or `[folder]` tag.
 
 Set `NO_COLOR` to a non-empty value to disable color. Set `CLICOLOR_FORCE` to
 force color through a pipe. `NO_COLOR` takes precedence when both are set.
 
 ## Ranked, not exhaustive
 
-Seek ranks results, but it does not guarantee every match. A descriptive search
-considers at most 128 files. Each text-search pass is limited to 10,000 matches
-and 60 seconds. With `-n 0`, Seek displays every file returned within these
-bounds. With `-m 0`, it displays every returned match in each file. For every
+Seek ranks results, but it does not guarantee every match. Meaning-based
+retrieval is approximate. Text search counts every match. With `-n 0`, Seek
+displays every returned file. With `-m 0`, it displays every returned match in
+each file. For every
 occurrence, a count, a rename, or an absence check, use an exhaustive tool:
 
 ```sh
@@ -113,7 +119,8 @@ seek [flags] '<query>' [path...]
 
 The query comes first. Paths after the query choose where to search.
 
-- No paths: search the current Git repo.
+- No paths: search the current folder, the same as `.`. Inside a Git repo, the
+  search covers that folder and the folders below it.
 - Folders inside Git repos: use Git ignore and include local changes.
 - Exact files: search only that file, not sibling files, even when the file is
   inside a Git repo.
@@ -121,7 +128,8 @@ The query comes first. Paths after the query choose where to search.
 - Visible nested Git worktrees inside selected folders are searched once with
   their own Git rules.
 - Files or folders ignored by Git stay ignored when you search that repo or a
-  folder inside it. Passing an exact ignored file or folder still searches it.
+  folder inside it. Passing an exact ignored file or folder still searches it,
+  and so does a search from inside an ignored folder.
 
 Flags must come before the query:
 
@@ -133,10 +141,14 @@ Paths must exist. Symlinks passed on the command line are resolved to their
 targets. Broken symlinks and invalid paths exit with code 2. Symlinks found
 while walking folders are skipped.
 
-Paths limit the search results. Selected paths can also use a smaller index when
-a complete Git repository exceeds an index limit. Query filters such as
-`file:api` and `-file:test` apply after indexing, so they do not reduce index
-limits.
+Paths limit the search results. A selected path inside a Git repository uses
+the index of the whole repository. Query filters such as `file:api` and
+`-file:test` match the header path, which starts with the path you typed:
+`seek 'file:^src/' proj` finds nothing, and `seek 'file:^proj/src/' proj` finds
+`proj/src/x.go`. They apply after indexing, so they do not change what Seek
+indexes. A `file:` filter adds rank only where it also matches the file's path
+inside its repository or folder. A plain word also matches that path, so from
+`staging/src/k8s.io/api` the word `staging` matches every file.
 
 ## Query Syntax
 
@@ -172,8 +184,61 @@ limits.
 | `seek '(foo or bar) lang:go'` | Group expressions with parentheses |
 | `seek 'handleError file:api -file:test'` | Combine content and path filters |
 
-Seek also supports the [query syntax](https://github.com/sourcegraph/zoekt/blob/df97bab6f7bb/doc/query_syntax.md)
+Seek also supports the [query syntax](https://github.com/sourcegraph/zoekt/blob/0e68f41329d9/doc/query_syntax.md)
 of its pinned Zoekt search engine. Results are ranked by relevance.
+
+### Support table
+
+Each row is one query form: its role in a descriptive search and what Seek
+does with it. A description atom is text that the model reads; a filter
+applies in lexical and semantic retrieval; a modifier changes neither. A Zoekt
+pass-through is an atom that Seek sends to Zoekt with no meaning of its own.
+The test `TestQuerySupportReadmeMatchesTable` keeps this table equal to the one
+in the code.
+
+| ID | Form | Role | What Seek does | Example |
+|----|------|------|----------------|---------|
+| T01 | bare word | description | Matches the file name or the content. | `parse` |
+| T02 | bare regular expression token | description | The model reads the token text; the lexical half keeps the regular expression. | `parsed?` |
+| T03 | regex: | description | The same atom as a bare token. | `regex:request` |
+| T04 | quoted phrase | description | The model reads the phrase; the lexical half keeps Zoekt's meaning, a regular expression of the quoted text. | `"request line"` |
+| T05 | quoted word | description | The same atom as the bare word. | `"request"` |
+| T06 | content: (c:) | filter | Content only, applied by Zoekt. | `content:method` |
+| T07 | -content: (-c:) | filter | Content without the term, applied by Zoekt. | `-content:malformed` |
+| T08 | file: (f:) | filter | Path filter; the semantic mask applies it too. | `file:server` |
+| T09 | -file: (-f:) | filter | Negated path filter; the semantic mask applies it too. | `-file:_test.go` |
+| T10 | lang: | filter | Language filter; the semantic mask applies it too. | `lang:go` |
+| T11 | lang: with an unknown language | filter | Zoekt pass-through: matches nothing. | `lang:nosuchlanguage` |
+| T12 | -lang: | filter | Files in other languages, applied by Zoekt. | `-lang:go` |
+| T13 | sym: | filter | Files with a matching ctags symbol, applied by Zoekt. | `sym:ParseRequest` |
+| T14 | -sym: | filter | Files without the symbol, applied by Zoekt. | `-sym:ParseRequest` |
+| T15 | case:yes, case:no, case:auto | modifier | Parse directive: sets the case sensitivity of the atoms and leaves the tree. A negated -case: makes Zoekt's per-shard searcher panic (an upstream bug). | `case:yes` |
+| T16 | smart case (a capital letter) | description | A description word that matches its case. | `Parse` |
+| T17 | type:file, type:filename (t:file, t:filename) | modifier | Output mode: the search prints file names only. With a negated -type:, Zoekt fails the search of each node; Seek warns and skips the node. | `type:file` |
+| T18 | type:filematch (t:filematch) | filter | Zoekt pass-through; Zoekt's per-shard searcher panics on it (an upstream bug). | `type:filematch` |
+| T19 | type:repo (t:repo) | filter | Zoekt pass-through; Zoekt's per-shard searcher panics on it (an upstream bug). | `type:repo` |
+| T20 | repo: (r:) | filter | Zoekt pass-through on Seek's internal repository names. | `repo:nomatch` |
+| T21 | -repo: (-r:) | filter | Zoekt pass-through. | `-repo:nomatch` |
+| T22 | branch: (b:) | filter | Zoekt pass-through: committed Git files carry the branch HEAD. | `branch:HEAD` |
+| T23 | archived:, fork:, public: | filter | Zoekt pass-through on repository flags. | `archived:no` |
+| T24 | meta.<field>: | filter | Zoekt pass-through: Seek sets no repository metadata. | `meta.owner:x` |
+| T25 | or between filters | filter | Either filter. An or binds the whole query unless it is in parentheses; an or between descriptions keeps strict ranking. | `(file:server or file:tools)` |
+| T26 | and, not, OR | description | Plain words, not operators: only a lowercase or is an operator. | `and` |
+| T27 | -word | filter | Files without the term, applied by Zoekt. | `-malformed` |
+| T28 | parentheses | modifier | Grouping; Zoekt flattens it. | `(alpha beta)` |
+| T29 | -( ... ) | filter | Files that match none of the group, applied by Zoekt. | `-(file:test or lang:python)` |
+| T30 | backslash escape | description | A literal character in a word. | `foo\.bar` |
+| T31 | C++, X[], X(), a::b() programming names | description | When Zoekt rejects the query, Seek quotes each programming name and parses the query again; filters keep their meaning, and the model reads the name. | `C++` |
+| T32 | unknown prefix (l:go, ext:go) | description | Not a Zoekt prefix: a plain word. | `l:go` |
+| T33 | API-only nodes (FileNameSet) | filter | Seek's path-operand scope; the parser makes no such node. |  |
+| T34 | one description atom | description | Strict ranking: the model routes need two or more description atoms. |  |
+| T35 | two or more identifiers | description | Description atoms like any words. |  |
+| T36 | no description atom | filter | Strict ranking: filters alone give the model nothing to read. |  |
+| T37 | more than 125 terms | modifier | A long query keeps every token in 128-token query windows. |  |
+| T38 | --lexical-only | modifier | No model work for any query. |  |
+| T39 | path-operand scope | filter | The scope is one more filter subtree: Zoekt keeps the files in scope, and the mask keeps their rows for semantic retrieval. |  |
+| T40 | two or more nodes | modifier | Each node runs the same pipeline with its own mask; the results do not depend on the node count. |  |
+| T41 | a token with no letter or digit | modifier | Zoekt keeps it in both lexical queries; the model reads nothing from it and the route does not change. | `.` |
 
 ### Flags
 
@@ -187,9 +252,9 @@ of its pinned Zoekt search engine. Results are ranked by relevance.
 | `seek -v 'query'` | Show debug logs and detailed errors (`--verbose`) |
 | `seek --lexical-only 'query'` | Skip meaning-based indexing, search, and model ranking |
 
-`-n 0` and `-m 0` display all results returned within the search bounds above.
-They do not make search exhaustive. `-A` and `-C` accept values from 0 to 512
-and cannot be used together.
+`-n 0` and `-m 0` display all returned results. They do not make a descriptive
+search exhaustive. `-A` and `-C` accept any value of 0 or more and cannot be
+used together.
 
 Flags combine with filters and paths. For example,
 `seek -n 3 'sym:handleRequest file:api' ./src` returns up to 3 files under
@@ -206,36 +271,31 @@ seek -n 5 -m 2 -C 1 'validate search query syntax'
 seek 'find request parser lang:go -file:_test\.go$'
 ```
 
-A plain query with two or more words can use model ranking. It can include
-`lang:`, `file:`, and `-file:` filters. Other filters, Boolean expressions,
-quoted phrases, exact identifiers, and one-word queries use text-match order.
+A plain query with two or more description words uses the model. Every
+searched folder and repository, clean or with local changes, scoped or not,
+adds files whose code has a similar meaning, and the model ranks them with the
+text matches. Filters (`lang:`, `file:`, `-file:`, `sym:`, `content:`, and the
+path operands) apply to both. A one-word query, a lone quoted phrase, an `or`
+between descriptions, and a query of filters alone use text-match order. The
+[Support table](#support-table) lists each query form.
 
-When you search one clean Git worktree, one file, or one folder, Seek can also
-find code with a similar meaning. A selected Git subpath, a Git worktree with
-local changes, or multiple sources can still use the model to rank text matches.
-Seek keeps `lang:`, `file:`, and `-file:` filters active if it uses another
-search method.
+Every file that has a unit within the similarity radius of the description is
+a candidate; there is no count bound, and `-n` limits only the display.
+Meaning-based search is approximate, so `-n 0` cannot make it exhaustive. A
+long description keeps every word, in 128-token windows.
 
-Seek considers at most 128 files for a description. This bound is separate from
-the `-n` display limit. Meaning-based search is approximate, so `-n 0` cannot
-make it exhaustive.
+Files that contain every query word stay. A file that only the model adds must
+pass the model's score threshold. With no result, Seek prints nothing and exits
+with code 1. This does not prove that the code is absent. If the model fails,
+Seek returns the text matches; use `--verbose` to see why.
 
-When no file contains every query word, Seek returns results that omit some
-query words only if the best model score is strong enough. Otherwise, it prints
-nothing and exits with code 1. This does not prove that the code is absent. A
-description that is too long for the model uses text results only.
-
-If meaning-based search is unavailable, Seek can still use the model to rank text
-matches. If the model fails, Seek returns results that contain every query
-word. Use `--verbose` to see why it used another search method.
-
-Seek builds meaning-based data only for a search that can read it: one corpus,
-no path scope, and a query the ranker can expand. An exact word, a symbol
-lookup, a phrase, or a search over more than one corpus uses text ranking, so
-Seek keeps its text index up to date and builds no meaning-based data for it.
-The first search that can use meaning-based data builds it. Use
-`--lexical-only` to skip the meaning-based index and all model work for every
-query.
+The first description search builds the meaning-based data of every searched
+folder and repository before it answers, so a first search and a repeat search
+give the same results. In a Git repository, files with local changes or
+untracked files go to a small overlay that holds their current bytes; the
+unchanged part of the repository is never embedded again. An exact word, a
+symbol lookup, or a phrase builds no meaning-based data. Use `--lexical-only` to
+skip the meaning-based index and all model work for every query.
 
 Seek selects the model run-time provider for the host. Set `SEEK_PROVIDER` to
 pin one when you report a problem, so the report names one provider: `cpu` runs
@@ -313,7 +373,7 @@ search. seek adds the parts agents usually need when they search repeatedly:
 | | ripgrep | seek |
 |---|---|---|
 | **Search method** | Scans files for each command | Builds, then reuses a local index |
-| **Default directory scope** | Current directory | Current Git worktree; outside Git, pass a path |
+| **Default directory scope** | Current directory | Current folder, the same as `.`, with each Git repository in it searched by Git's rules |
 | **Default order** | Unspecified; `--sort path` gives stable path order | Relevance for exact queries; local model ranking for eligible descriptions |
 | **Plain descriptions** | Literal (`-F`) or regular expression | Uses the bundled model and can find code with a similar meaning |
 | **Symbols** | No symbol index | `sym:` finds definitions and tags symbols |
@@ -347,10 +407,9 @@ regular files, skip `.git` directories, and do not skip dependency, build,
 cache, or vendor directories by name. Git ignore rules apply only in Git
 repositories.
 
-Seek has no file-size limit. Folder indexing stops at 1,000,000 files or
-10 GiB. Git applies limits of 10,000,000 files and 10 GiB separately to
-committed files and local changes. A scoped search can still index its selected
-paths when the complete repository exceeds a limit.
+Seek has no file-count limit and no byte limit for a search. The only limit on
+the index cache is its budget (see "Cache maintenance"); the only limit on the
+text of one file is the index format (below).
 
 To finish sooner, the text index reads file content in parallel up to a quarter
 of the host's physical memory at a time, and builds files that fill an index
@@ -361,8 +420,14 @@ however many different character sequences it holds. The only limit for one
 file is the index format: one Zoekt index shard holds at most 4 GiB. A file
 whose shard would be larger keeps only its name in the text index. Two more
 kinds of files keep only their name, because Zoekt has no option to index their
-content: files with a NUL byte, and files shorter than three bytes. A search can
-match these names, not their content. Large files with much non-ASCII text, such
+content: files with a NUL byte, and files shorter than three bytes. Files whose
+bytes Seek does not have keep only their name too: cloud-only files that are not
+on disk, blobs that a partial clone lacks, and files that cannot be read. A
+search can match these names, not their content. When a search could have
+matched such files by content, it prints one line after the results that counts
+them (Zoekt's own files of under three bytes are not counted). Zoekt stores a
+short `NOT-INDEXED:` marker as their text, so a search for its words lists
+them. Large files with much non-ASCII text, such
 as CJK prose, need much memory to index: 100 MiB of random CJK characters needs
 about 6.6 GiB.
 
@@ -370,9 +435,8 @@ When a search of a file path operand finds no content match and the index holds
 no content for that file, Seek writes a warning with the reason to standard
 error. Searches of folders and repositories do not write this warning.
 
-The meaning-based index skips empty files, files with a NUL byte, and generated
-files with the standard `// Code generated ... DO NOT EDIT.` marker in the first
-4 KiB. Generated files can still appear in text results.
+The meaning-based index skips empty files and files with a NUL byte. Generated
+files are in both indexes.
 
 An upgrade can rebuild meaning-based data and can briefly need space for both
 the old and new copies. Do not alternate old and new Seek binaries with one
@@ -380,15 +444,23 @@ cache. Use `--lexical-only` when you do not want this rebuild.
 
 ## Cache maintenance
 
-Seek automatically removes search-index caches that have not been used for 14
-days. It checks at most once per 24 hours. Automatic cleanup is disabled on a
-network filesystem. Set `SEEK_CACHE_DIR` to a local directory to enable it, or
-use `XDG_CACHE_HOME` on Linux. Cleanup has no total-size limit.
+The search-index cache has one byte budget: 10% of the cache volume, or less so
+that 5% of the volume stays free. Before any index build, Seek estimates the
+cache that the search needs. If it does not fit, the search stops with exit
+code 2 and names the planned size and the budget. After a search, Seek removes
+the least recently used indexes that the search did not use until the cache
+fits. Age alone never removes an index. Compiled model files that no search
+used for 14 days are removed too; the check runs at most once per 24 hours.
+Automatic cleanup is disabled on a network filesystem. Set `SEEK_CACHE_DIR` to a
+local directory to enable it, or use `XDG_CACHE_HOME` on Linux. The cache
+directory must support `flock(2)` locks: a lock error other than a held lock
+stops the search of that index with an error that names the lock file.
 
 Environment settings:
 
 - `SEEK_CACHE_DIR` -- cache root (default: the user cache directory)
-- `SEEK_GC_MAX_AGE` -- maximum unused age (default `14d`)
+- `SEEK_CACHE_BUDGET` -- index cache budget, for example `20G` (default: see
+  above)
 - `SEEK_GC_INTERVAL` -- delay between automatic checks (default `24h`)
 - `SEEK_PROVIDER` -- pin the model run-time provider; see "Descriptive search"
 
@@ -404,8 +476,7 @@ seek gc --all                   # delete every search index not in use
 `size` (largest first).
 
 `seek gc` manages `<seek-cache>/corpora/`, and removes compiled model files under
-`<seek-cache>/reranker/coreml/` that no search has used within the same unused
-age. Seek compiles those again when it needs them, and checks the provider again,
+`<seek-cache>/reranker/coreml/` that no search has used for 14 days. Seek compiles those again when it needs them, and checks the provider again,
 because the check result is stored beside the compiled model. It does not remove the
 extracted run time in `<seek-cache>/reranker/<version>/` or the search library in
 `<seek-cache>/semantic/usearch/`. Remove those directories by hand only when no
@@ -418,9 +489,9 @@ When multiple `seek` commands search the same repo at the same time:
 | Scenario | Behavior |
 |----------|----------|
 | Index is fresh | All commands search at the same time |
-| Update active | One command builds while others search the current index. Searches wait up to 10 seconds while the new index replaces the old one, then warn and use the available index |
-| An update fails and an old index exists | Seek warns and uses the old index. File and byte limit errors still stop the search |
-| No index yet | First command builds it; others wait up to 60s |
+| Update active | One command builds while others search the current index. A search waits while the new index replaces the old one, with no deadline; Ctrl-C ends the wait |
+| An update fails and an old index exists | Seek warns and uses the old index. A search that does not fit the cache budget stops before any build |
+| No index yet | First command builds it; the others wait for that build |
 
 ## Exit codes
 
@@ -434,6 +505,12 @@ Uses the same exit-code pattern as `grep` and `ripgrep`, so `seek` works well
 in scripts.
 
 ## Security
+
+A search does not trust a repository's own Git configuration or attributes: it
+runs no filter, diff, or credential command that a repository sets. It writes
+no repository configuration and starts no daemon. It uses no network, also in a
+partial clone. Git's own index refresh, which updates `.git/index` stat data,
+stays.
 
 - [Security Policy](SECURITY.md) -- vulnerability reporting and response
   timeline

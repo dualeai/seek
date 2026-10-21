@@ -143,7 +143,8 @@ func cleanEmptyShards(ctx context.Context, indexDir, repoName string) {
 }
 
 // shardHasNoLiveDocuments returns true when shard contains no live documents
-// for repoName. It uses query.Const{true} with a one-document result cap.
+// for repoName. It uses query.Const{true} with a one-match cap
+// (ShardMaxMatchCount 1): one match is one document.
 func shardHasNoLiveDocuments(ctx context.Context, shard, repoName string) (bool, error) {
 	searcher, err := openShard(shard)
 	if err != nil {
@@ -151,12 +152,7 @@ func shardHasNoLiveDocuments(ctx context.Context, shard, repoName string) (bool,
 	}
 	defer searcher.Close()
 
-	opts := zoekt.SearchOptions{
-		TotalMaxMatchCount: 1,
-		ShardMaxMatchCount: 1,
-		MaxDocDisplayCount: 1,
-		MaxWallTime:        searchTimeout,
-	}
+	opts := zoekt.SearchOptions{ShardMaxMatchCount: 1}
 	result, err := searcher.Search(ctx, &query.Const{Value: true}, &opts)
 	if err != nil {
 		return false, err

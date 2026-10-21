@@ -80,7 +80,7 @@ func requireCompleteNativeIndex(t *testing.T, repoDir string, want []string) {
 	t.Helper()
 	indexDir := t.TempDir()
 	snapshot := captureHeadForTest(t, repoDir)
-	if err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, nil, 1); err != nil {
+	if err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, 1, nil); err != nil {
 		t.Fatalf("native committed index: %v", err)
 	}
 	got := zoektIndexedPaths(t, indexDir)
@@ -278,7 +278,7 @@ func TestNativeGitIndexer_VisibleContract(t *testing.T) {
 
 	indexDir := t.TempDir()
 	snapshot := captureHeadForTest(t, repoDir)
-	if err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, nil, 1); err != nil {
+	if err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, 1, nil); err != nil {
 		t.Fatalf("native committed index: %v", err)
 	}
 	wantPaths := []string{

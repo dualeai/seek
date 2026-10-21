@@ -257,7 +257,9 @@ func TestFix_ConcurrentSearchDuringReindex_Stress(t *testing.T) {
 // every cycle). A stable committed marker must be found on EVERY concurrent
 // search — proving the publish EX lock excludes readers from the non-atomic
 // swap window. The existing TestFix_* only edit the working tree (HEAD fixed),
-// so they never exercise this path.
+// so they never exercise this path. Each swap stays open for 20 ms and the
+// searches run until the last build ends, so a search that does not wait for
+// the publish lock meets the torn family.
 func TestFix_ConcurrentSearchDuringCommittedSwap(t *testing.T) {
 	requireTools(t)
 	dir := initGitRepo(t, "stable.go", "package main\n// always_committed_marker\n")
@@ -272,10 +274,18 @@ func TestFix_ConcurrentSearchDuringCommittedSwap(t *testing.T) {
 	var missed, searchErr atomic.Int64
 	var wg sync.WaitGroup
 	start := make(chan struct{})
+	built := make(chan struct{})
+	var swaps atomic.Int32
+	afterDeleteBeforeRenameHook = func() {
+		swaps.Add(1)
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Cleanup(func() { afterDeleteBeforeRenameHook = nil })
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer close(built)
 		<-start
 		for i := 0; i < 20; i++ {
 			writeTrackedFile(t, dir, fmt.Sprintf("c_%d.go", i), fmt.Sprintf("package main\n// commit_%d\n", i))
@@ -293,7 +303,14 @@ func TestFix_ConcurrentSearchDuringCommittedSwap(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			for i := 0; i < 10; i++ {
+			for {
+				// Search until the last build ends. The pause leaves moments
+				// with no reader, so a swap can take the publish lock.
+				select {
+				case <-built:
+					return
+				case <-time.After(100 * time.Millisecond):
+				}
 				res, err := searchPlannedCorpusForTest(ctx, plan, "always_committed_marker")
 				if err != nil {
 					searchErr.Add(1)
@@ -308,6 +325,9 @@ func TestFix_ConcurrentSearchDuringCommittedSwap(t *testing.T) {
 	close(start)
 	wg.Wait()
 
+	if swaps.Load() == 0 {
+		t.Fatal("no build swapped the committed family, so the test proves nothing")
+	}
 	if missed.Load() > 0 {
 		t.Errorf("committed shard gap during swap: %d misses (reader saw no committed shards mid-swap)", missed.Load())
 	}
@@ -320,6 +340,9 @@ func TestFix_ConcurrentSearchDuringCommittedSwap(t *testing.T) {
 // while a temp-swap build runs outside the publish lock.
 func TestGC_SkipsCorpusWithBuildInProgress(t *testing.T) {
 	root := cacheRootForTest(t)
+	// Over the budget, so the GC would evict the corpus unless the guard
+	// under test holds it.
+	t.Setenv(envCacheBudget, "1")
 	dir := seedCorpus(t, root, fakeCorpusHash(91), time.Now().Add(-30*24*time.Hour))
 
 	// Simulate an in-flight builder holding the build lock.
@@ -332,7 +355,7 @@ func TestGC_SkipsCorpusWithBuildInProgress(t *testing.T) {
 		t.Fatalf("hold build lock: %v", err)
 	}
 
-	runGC(context.Background(), gcOptions{maxAge: defaultGCMaxAge}, defaultGCInterval)
+	runGC(context.Background(), gcOptions{}, defaultGCInterval)
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("corpus with build in progress must survive gc, got %v", err)

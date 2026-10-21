@@ -28,30 +28,8 @@ command=$(
 		' 2>/dev/null
 ) || exit 0
 
-route=$(printf '%s' "$command" | LC_ALL=C awk -f "$ROUTER_AWK" 2>/dev/null) || exit 0
-[ -n "$route" ] || exit 0
-context_kind=${route%%|*}
-new_command=${route#*|}
-[ "$new_command" != "$route" ] && [ -n "$new_command" ] || exit 0
-
-# Context flags are a public seek feature. An older seek must keep the original
-# rg command instead of receiving a flag it does not know.
-case $context_kind in
-A | C)
-	help=$(seek --help 2>/dev/null) || exit 0
-	;;
-esac
-
-case $context_kind in
-A)
-	case $help in *"--after-context"*) ;; *) exit 0 ;; esac
-	;;
-C)
-	case $help in *"--context"*) ;; *) exit 0 ;; esac
-	;;
-none) ;;
-*) exit 0 ;;
-esac
+new_command=$(printf '%s' "$command" | LC_ALL=C awk -f "$ROUTER_AWK" 2>/dev/null) || exit 0
+[ -n "$new_command" ] || exit 0
 
 output=$(
 	printf '%s' "$payload" |

@@ -136,7 +136,7 @@ func TestSearchLoadedShardsRejectsCancelledPartialResult(t *testing.T) {
 		cancel()
 		return &zoekt.SearchResult{Files: []zoekt.FileMatch{{FileName: "partial.go"}}}, nil
 	}}
-	files, err := searchLoadedShards(ctx, []zoekt.Searcher{shard}, &query.Const{Value: true}, defaultSearchConfig())
+	files, err := searchLoadedShards(ctx, []zoekt.Searcher{shard}, &query.Const{Value: true}, defaultSearchConfig(), nil)
 	if !errors.Is(err, context.Canceled) || len(files) != 0 {
 		t.Errorf("cancelled shard: files=%v error=%v, want no files and cancellation", files, err)
 	}
@@ -167,7 +167,7 @@ func TestSearchLoadedShardsJoinsWorkersBeforeCancellation(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		files, err := searchLoadedShards(ctx, []zoekt.Searcher{first, second}, &query.Const{Value: true}, defaultSearchConfig())
+		files, err := searchLoadedShards(ctx, []zoekt.Searcher{first, second}, &query.Const{Value: true}, defaultSearchConfig(), nil)
 		done <- result{files: files, err: err}
 	}()
 	select {

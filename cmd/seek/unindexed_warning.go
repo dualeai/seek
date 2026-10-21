@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sync"
 
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/query"
@@ -23,11 +22,12 @@ const zoektNotIndexedMarker = "NOT-INDEXED: "
 // warnUnindexedFileOperands warns for each file named as an exact path operand
 // that has no content match and no searchable content. Zoekt decides which
 // documents it skips and stores that decision in the index; seek only reads it
-// back, so seek keeps no skip rules of its own and a new Zoekt skip reason
-// needs no change here.
+// back, so a new Zoekt skip reason needs no change here. The documents that
+// seek keeps by name carry seekNoBytesReason, which the warning words in
+// seek's own terms.
 //
-// The check searches the index that this command prepared for each plan, as
-// prepared records it. A successful search prepares every plan.
+// The check searches the index that this command opened for each plan (the
+// opened-node memo). A successful search opens every plan.
 //
 // NOTE: folder and Git scopes get no such warning. Repositories with many
 // binary files (images, archives) would print it on every search. Review this
@@ -35,7 +35,7 @@ const zoektNotIndexedMarker = "NOT-INDEXED: "
 func warnUnindexedFileOperands(
 	ctx context.Context,
 	plans []corpusPlan,
-	prepared *preparedCorpora,
+	opened *openedNodes,
 	operands []string,
 	results []corpusSearchResult,
 	dirtyByCorpus dirtyFilesByCorpus,
@@ -55,8 +55,8 @@ func warnUnindexedFileOperands(
 				continue
 			}
 			// A Git or folder corpus indexes the on-disk name, which can differ
-			// in case from the typed one. A single-file corpus indexes the
-			// typed name, so it needs no lookup. Look it up only now: on a large
+			// in case from the typed one. A single-file corpus matches by file
+			// identity, so it needs no lookup. Look it up only now: on a large
 			// directory the lookup costs a full directory read.
 			if plan.rootType != rootTypeFile {
 				if onDisk := realCaseWithin(filepath.Dir(file), file, listings); onDisk != file {
@@ -74,7 +74,7 @@ func warnUnindexedFileOperands(
 		if len(names) == 0 {
 			continue
 		}
-		if searched, ok := prepared.lookup(plan.id); ok {
+		if searched, ok := opened.plan(plan.id); ok {
 			checks = append(checks, markerCheck{plan: searched, dirty: dirty, names: names, paths: pending})
 		}
 	}
@@ -122,34 +122,12 @@ func (check markerCheck) reasons(ctx context.Context, markerQuery query.Q) []str
 	reasons := make([]string, len(check.names))
 	for i, name := range check.names {
 		reasons[i], _ = unindexedReason(found, name, check.dirty.contains(name), check.paths[i])
+		if reasons[i] == zoektNotIndexedMarker+"contains too many trigrams" {
+			// Seek's no-bytes reason (seekNoBytesReason), in its own words.
+			reasons[i] = zoektNotIndexedMarker + "its content is not on disk or cannot be read"
+		}
 	}
 	return reasons
-}
-
-// preparedCorpora records corpus plans after their index preparation in one
-// command. It is safe for concurrent use by the corpus workers.
-type preparedCorpora struct {
-	mu    sync.Mutex
-	plans map[corpusID]corpusPlan
-}
-
-func (corpora *preparedCorpora) record(plan corpusPlan) {
-	if corpora == nil {
-		return
-	}
-	corpora.mu.Lock()
-	defer corpora.mu.Unlock()
-	if corpora.plans == nil {
-		corpora.plans = make(map[corpusID]corpusPlan)
-	}
-	corpora.plans[plan.id] = plan
-}
-
-func (corpora *preparedCorpora) lookup(id corpusID) (corpusPlan, bool) {
-	corpora.mu.Lock()
-	defer corpora.mu.Unlock()
-	plan, ok := corpora.plans[id]
-	return plan, ok
 }
 
 // regularFileOperands returns the canonical paths of the operands that are
@@ -206,14 +184,15 @@ func hasContentMatch(file zoekt.FileMatch) bool {
 // corpusFileName returns the corpus-relative name of path when plan indexes it.
 func corpusFileName(plan corpusPlan, path string) (string, bool) {
 	if plan.rootType == rootTypeFile {
-		return filepath.Base(path), plan.root == path
+		// The root has the on-disk letter case; the typed path can differ.
+		return filepath.Base(plan.root), plan.root == path || sameFile(plan.root, path)
 	}
 	rel, ok := relWithin(plan.root, path)
 	if !ok {
 		return "", false
 	}
-	for _, excluded := range plan.excludeRoots {
-		if pathWithin(excluded, path) {
+	for skipped := range folderSkipDirs(plan) {
+		if pathWithin(skipped, path) {
 			return "", false
 		}
 	}

@@ -11,8 +11,6 @@ See [Agent Integration](../../README.md#agent-integration) for installation.
 
 The router requires `seek`, `jq`, and a POSIX `awk`. Building or updating a seek
 index also requires Universal Ctags on `PATH` or through `CTAGS_COMMAND`.
-Context rewrites require the public seek `-A` and `-C` flags. If those flags are
-not available, only context commands stay unchanged.
 
 ## Use and limits
 
@@ -29,8 +27,8 @@ for limits and fallback behavior.
 
 Routed commands display at most 20 files and three matches per file. An `rg`
 context search displays one match per file. These ranked results are not
-exhaustive. Direct `seek -n 0` displays every file returned within Seek's search
-bounds, not every possible match.
+exhaustive. Direct `seek -n 0` displays every returned file, not every possible
+match.
 
 For a rename, a refactor, a count, or a complete reference list, bypass the
 hook:
@@ -40,9 +38,8 @@ SEEK_ROUTER=off grep -rn 'PATTERN' .
 ```
 
 Set `SEEK_ROUTER=off` in the session environment to disable all routing. Routed
-searches use normal Seek defaults and can build both text and meaning-based
-indexes. Call `seek --lexical-only` directly when you want to skip the
-meaning-based index and model work.
+searches use normal Seek defaults. A routed query has no description words, so
+Seek ranks it by text match and builds no meaning-based index for it.
 
 ## Supported commands
 
@@ -69,12 +66,12 @@ Each adapter has a separate contract:
   atom grammar.
 - `rg`: one pattern, optional literal paths, short search flags, and their
   direct long forms. `-e` selects one pattern in spaced or attached form.
-  After-context and symmetric context need an explicit path and accept 0 to 512
-  lines.
+  After-context and symmetric context need an explicit path.
 - `git grep`: one plain pattern and optional bundled `n`, `l`, `F`, or `i` flags.
   Literal paths can follow `--`. Tree objects and path magic stay unchanged.
-- `fd`: `fd PATTERN [ROOT...]`, with optional leading `-t f`. It becomes a
-  ranked indexed-path search limited to files.
+- `fd`: `fd NAME [ROOT...]`, with optional leading `-t f`, where `NAME` is a
+  literal name with no `/` and no regex operator. It becomes a ranked search
+  of the files whose name holds `NAME`. A regex pattern stays with fd.
 - `find`: `find ROOT... -type f -name PATTERN` in either predicate order, with
   optional final `-print`.
   The name pattern can contain `*`, but no other glob operator. `*` does not
@@ -82,15 +79,14 @@ Each adapter has a separate contract:
 
 `-i` becomes `case:no`; other routed content searches use `case:yes`. The `fd`
 adapter uses a small ASCII smart-case rule: `A` to `Z` makes the search
-case-sensitive. Seek applies this regex to the full indexed path, returns files
-only, and uses Seek's path rules. This is ranked navigation, not fd output,
-Unicode-case, or regex-parser emulation.
+case-sensitive. Seek returns files only and uses its path rules. This is ranked
+navigation, not fd output or Unicode-case emulation.
 
 Routed regular expressions use Seek's Zoekt dialect. The router does not read a
 ripgrep configuration file. Use the original command when those rules matter.
 
-When `rg` or `fd` has no path, the rewrite adds `.`. This keeps the search in
-the shell's current directory instead of widening it to the Git worktree root.
+When `rg`, `git grep`, or `fd` has no path, the rewrite sends none: Seek
+searches the current directory, as the original command does.
 
 ## Deliberate pass-through cases
 

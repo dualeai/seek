@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -57,15 +56,22 @@ func TestWriteCorpusResultsWithContextMatchesStringFormatter(t *testing.T) {
 			},
 		},
 	}
-	want := formatCorpusResultsWithContext(
-		results, nil, 1, 0, hideCorpusContext, plainPalette,
-	)
+	// Written by hand from the output format: the header and the match line of
+	// the file that limit 1 keeps, a blank line, then the notice for the other.
+	const want = "## first.go (Go)\n1 first match\n\n… 1 more files (showing 1 of 2)\n"
 	var output bytes.Buffer
 	wrote, err := writeCorpusResultsWithContext(
 		&output, results, nil, 1, 0, hideCorpusContext, plainPalette,
 	)
 	if err != nil || !wrote || output.String() != want {
 		t.Fatalf("streamed output=%q wrote=%t error=%v, want %q", output.String(), wrote, err, want)
+	}
+	// The other formatter tests use the string formatter: it must give the
+	// same bytes as the streamed one.
+	if got := formatCorpusResultsWithContext(
+		results, nil, 1, 0, hideCorpusContext, plainPalette,
+	); got != want {
+		t.Fatalf("string output=%q, want %q", got, want)
 	}
 }
 
@@ -1477,6 +1483,7 @@ func TestFormatCorpusResults_SameRelativePathDifferentCorpora(t *testing.T) {
 		corpusKindFolder,
 		[]string{"/tmp/a", "/tmp/b"},
 		"same.txt",
+		[]string{"/tmp/a/same.txt", "/tmp/b/same.txt"},
 		"folder",
 	)
 }
@@ -1521,6 +1528,7 @@ func TestFormatCorpusResults_GitCorpusContext(t *testing.T) {
 		corpusKindGit,
 		[]string{"/tmp/repo-a", "/tmp/repo-b"},
 		"same.go",
+		[]string{"/tmp/repo-a/same.go", "/tmp/repo-b/same.go"},
 		"git",
 	)
 }
@@ -1530,6 +1538,7 @@ func testFormatSamePathAcrossCorpora(
 	kind corpusKind,
 	roots []string,
 	fileName string,
+	wantHeaders []string,
 	tag string,
 ) {
 	t.Helper()
@@ -1552,9 +1561,9 @@ func testFormatSamePathAcrossCorpora(
 	}
 
 	out := formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext, plainPalette)
-	for _, root := range roots {
-		if !strings.Contains(out, "## "+filepath.Join(root, fileName)) {
-			t.Fatalf("expected absolute path for %s, got:\n%s", root, out)
+	for _, header := range wantHeaders {
+		if !strings.Contains(out, "## "+header+" (") {
+			t.Fatalf("expected absolute path %s, got:\n%s", header, out)
 		}
 	}
 	if strings.Count(out, "["+tag+"]") != len(roots) {

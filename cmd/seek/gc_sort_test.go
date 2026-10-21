@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -221,6 +223,8 @@ func TestGCCmd_DryRun_NoCorpora(t *testing.T) {
 // order, which takes the interleaved branch instead.
 func TestGCCmd_SortedCtxCancel_EvictsNothing(t *testing.T) {
 	root := cacheRootForTest(t)
+	// Over the budget, so an uncanceled run evicts both corpora.
+	t.Setenv(envCacheBudget, "1")
 	stale := time.Now().Add(-30 * 24 * time.Hour)
 	dirs := []string{
 		seedCorpusWithSize(t, root, fakeCorpusHash(1), stale, 1024),
@@ -264,27 +268,42 @@ func TestGC_EmitGCRow_TrashedCountsAsEvicted(t *testing.T) {
 	}
 }
 
-// TestGC_PredictGCAction_Boundary pins the TTL predicate at exact equality
-// (usedAt == cutoff), which no seeded fixture reaches — mtime and the
-// runtime-computed cutoff never coincide to the nanosecond. Semantics:
-// strictly-after the cutoff is kept, at-or-before is evicted. This is the
-// dry-run half of the predict-vs-evict contract; a boundary flip to
-// !Before would silently invert it here.
-func TestGC_PredictGCAction_Boundary(t *testing.T) {
-	cutoff := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	cases := []struct {
-		name   string
-		usedAt time.Time
-		want   gcAction
-	}{
-		{"exactly at cutoff", cutoff, actionEvicted},
-		{"one ns after", cutoff.Add(time.Nanosecond), actionKept},
-		{"one ns before", cutoff.Add(-time.Nanosecond), actionEvicted},
+// TestGC_PlanCorpusEviction pins the eviction plan: least recently used
+// first, corpora that the search holds are skipped, and eviction stops at the
+// budget; --all evicts everything. The dry-run prediction follows the plan.
+func TestGC_PlanCorpusEviction(t *testing.T) {
+	root := cacheRootForTest(t)
+	t.Setenv(envCacheBudget, strconv.Itoa(2*seededCorpusBytes))
+	now := time.Now()
+	// Age order is the reverse of name order (hash 4 is the oldest), so a
+	// plan in name order fails.
+	for i := 1; i <= 4; i++ {
+		seedCorpus(t, root, fakeCorpusHash(i), now.Add(-time.Duration(i)*time.Hour))
 	}
-	for _, c := range cases {
-		got := predictGCAction(corpusDirEntry{usedAt: c.usedAt}, cutoff).action
-		if got != c.want {
-			t.Errorf("%s: predictGCAction action = %d, want %d", c.name, got, c.want)
+	entries, err := enumerateCorpusDirs(filepath.Join(root, corporaDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keep := map[corpusID]bool{corpusID(fakeCorpusHash(4)): true}
+	evict, err := planCorpusEviction(root, entries, false, keep, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[corpusID]bool{corpusID(fakeCorpusHash(3)): true, corpusID(fakeCorpusHash(2)): true}
+	if !maps.Equal(evict, want) {
+		t.Fatalf("evict=%v, want %v (LRU, skip the held corpus, stop at the budget)", evict, want)
+	}
+	all, err := planCorpusEviction(root, entries, true, nil, true)
+	if err != nil || len(all) != len(entries) {
+		t.Fatalf("--all plan=%v err=%v, want every corpus", all, err)
+	}
+	for _, entry := range entries {
+		wantAction := actionKept
+		if want[entry.name] {
+			wantAction = actionEvicted
+		}
+		if got := predictGCAction(entry, evict).action; got != wantAction {
+			t.Errorf("%s: predicted %d, want %d", entry.name, got, wantAction)
 		}
 	}
 }
@@ -339,7 +358,7 @@ func TestGC_StreamingDefault_RendersBeforeLaterCorporaProcessed(t *testing.T) {
 		rowToken:   []byte(truncateHash(corpusID(first))),
 		markerPath: marker,
 	}
-	runGC(context.Background(), gcOptions{maxAge: defaultGCMaxAge, skipThrottle: true, writer: w}, 0)
+	runGC(context.Background(), gcOptions{skipThrottle: true, writer: w}, 0)
 
 	if !w.sawRow {
 		t.Fatalf("no row rendered for first corpus; output:\n%s", w.buf.String())
@@ -405,9 +424,11 @@ func TestGCCmd_SortInvalid_Errors(t *testing.T) {
 }
 
 // TestGCCmd_Force_SortBySize_LiveOrderAndEviction — the live table follows
-// --sort and stale corpora are actually removed from disk.
+// --sort and corpora over the budget are actually removed from disk.
 func TestGCCmd_Force_SortBySize_LiveOrderAndEviction(t *testing.T) {
 	root := cacheRootForTest(t)
+	// Over the budget, so GC evicts every corpus that no search holds.
+	t.Setenv(envCacheBudget, "1")
 	stale := time.Now().Add(-30 * 24 * time.Hour)
 	small, large := fakeCorpusHash(1), fakeCorpusHash(2)
 	smallDir := seedCorpusWithSize(t, root, small, stale, 1024)
@@ -434,7 +455,7 @@ func TestGCCmd_All_DryRun_SortByAge(t *testing.T) {
 
 	out := runGCCapture(t, "--all", "--dry-run", "--sort=age")
 	requireRowOrder(t, out, older, newer)
-	// --all collapses the TTL to 0: everything is evictable.
+	// --all evicts every corpus that no search holds.
 	requireRow(t, out, older, "evicted")
 	requireRow(t, out, newer, "evicted")
 }
@@ -479,7 +500,7 @@ func assertDryRunLiveParity(t *testing.T, wantRows int, sortArg string) {
 	}
 }
 
-// TestGCCmd_SortBySize_DryRunLiveParity_Kept — fresh (within-TTL) fixtures:
+// TestGCCmd_SortBySize_DryRunLiveParity_Kept — fixtures within the budget:
 // the live run keeps everything and mutates nothing, so every "kept" row must
 // match the dry-run prediction byte-for-byte. Ages are days in the past so
 // the AGE cell cannot flip between the two runs.
@@ -491,15 +512,24 @@ func TestGCCmd_SortBySize_DryRunLiveParity_Kept(t *testing.T) {
 	assertDryRunLiveParity(t, 2, "--sort=size")
 }
 
-// TestGCCmd_SortBySize_DryRunLiveParity_Evicted — stale fixtures: dry-run
-// predicts "evicted" rows, live actually evicts them. The rendered rows
-// (size captured pre-eviction) must still match byte-for-byte, pinning the
-// evicted-row half of the byte-alignment promise that the kept variant
+// TestGCCmd_SortBySize_DryRunLiveParity_Evicted — fixtures over the budget:
+// dry-run predicts "evicted" rows, live actually evicts them. The rendered
+// rows (size captured pre-eviction) must still match byte-for-byte, pinning
+// the evicted-row half of the byte-alignment promise that the kept variant
 // cannot reach.
 func TestGCCmd_SortBySize_DryRunLiveParity_Evicted(t *testing.T) {
 	root := cacheRootForTest(t)
+	// Over the budget, so the plan evicts both corpora.
+	t.Setenv(envCacheBudget, "1")
 	stale := time.Now().Add(-30 * 24 * time.Hour)
-	seedCorpusWithSize(t, root, fakeCorpusHash(1), stale, 1024)
-	seedCorpusWithSize(t, root, fakeCorpusHash(2), stale, 64*1024)
+	small, large := fakeCorpusHash(1), fakeCorpusHash(2)
+	smallDir := seedCorpusWithSize(t, root, small, stale, 1024)
+	largeDir := seedCorpusWithSize(t, root, large, stale, 64*1024)
 	assertDryRunLiveParity(t, 2, "--sort=size")
+	// The parity must hold on evicted rows, so the live run must evict both.
+	for _, dir := range []string{smallDir, largeDir} {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("live run did not evict %s: err=%v", dir, err)
+		}
+	}
 }

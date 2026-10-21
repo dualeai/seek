@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"unicode"
 
 	"github.com/sourcegraph/zoekt"
+	"github.com/sourcegraph/zoekt/query"
 )
 
 // Long-line caps. A match line longer than maxLineBytes is windowed around
@@ -261,17 +261,6 @@ func rankCorpusResultsForDisplay(
 	return ranked
 }
 
-func rankCorpusResultsBM25(
-	results []corpusSearchResult,
-	dirtyByCorpus dirtyFilesByCorpus,
-) []corpusSearchResult {
-	ranked := deduplicateCorpusResults(results, dirtyByCorpus)
-	sort.SliceStable(ranked, func(i, j int) bool {
-		return lessCorpusResultBM25(ranked[i], ranked[j])
-	})
-	return ranked
-}
-
 func lessCorpusResultBM25(left, right corpusSearchResult) bool {
 	if left.file.Score != right.file.Score {
 		return left.file.Score > right.file.Score
@@ -393,6 +382,32 @@ func stableLineMatchScore(score float64) float64 {
 	return math.Round(score * 1e12)
 }
 
+// namesOnlyQuery reports a query whose root is type:file: an output mode that
+// prints file names only on every route.
+func namesOnlyQuery(raw query.Q) bool {
+	typed, ok := query.Simplify(raw).(*query.Type)
+	return ok && typed.Type == query.TypeFileName
+}
+
+// keepFileNamesOnly gives each result the one name line that Zoekt's own
+// type:file search returns, so a model route that ranked content matches
+// prints the same names-only form. A result that has Zoekt's name line keeps
+// it with its highlight.
+func keepFileNamesOnly(results []corpusSearchResult) {
+	for index := range results {
+		file := &results[index].file
+		name := zoekt.LineMatch{Line: []byte(file.FileName), FileName: true}
+		for _, line := range file.LineMatches {
+			if line.FileName {
+				name = line
+				break
+			}
+		}
+		file.LineMatches = []zoekt.LineMatch{name}
+		file.ChunkMatches = nil
+	}
+}
+
 func formatCorpusFileMatch(sb *corpusFormatWriter, result corpusSearchResult, displayMode corpusDisplayMode, hiddenMatches int, pal palette) {
 	fm := result.file
 	lang := fm.Language
@@ -400,23 +415,13 @@ func formatCorpusFileMatch(sb *corpusFormatWriter, result corpusSearchResult, di
 		lang = "unknown"
 	}
 
-	// File header. In multi-corpus mode emit the absolute, directly-openable
-	// path (displayRoot joined to the corpus-relative FileName) so an agent
-	// never has to reconstruct it; the corpus tag then only marks the kind.
-	// In single-corpus mode emit the operand-relative displayName, which
-	// collapses an explicitly-selected file to its basename so the output
-	// reads as the file the user selected.
+	// File header: the operand as typed plus the path below it
+	// (applyHeaders); a caller that set no header gets the node-relative path,
+	// or the absolute one in multi-node output. The [git]/[folder] tag marks
+	// the node kind in multi-node output.
 	showRoot := displayMode == showCorpusContext && result.displayRoot != ""
 	sb.writeString("## ")
-	if showRoot {
-		writeColoredSanitizedString(sb, pal.file, pal.reset, filepath.Join(result.displayRoot, fm.FileName))
-	} else {
-		name := result.displayName
-		if name == "" {
-			name = fm.FileName
-		}
-		writeColoredSanitizedString(sb, pal.file, pal.reset, name)
-	}
+	writeColoredSanitizedString(sb, pal.file, pal.reset, displayHeader(result, showRoot))
 	sb.writeString(" (")
 	writeSanitizedString(sb, lang)
 	sb.writeByte(')')
@@ -435,6 +440,26 @@ func formatCorpusFileMatch(sb *corpusFormatWriter, result corpusSearchResult, di
 		}
 	}
 	sb.writeByte('\n')
+	// Copies with the same content and match print once: the other
+	// paths follow the header, in tie order.
+	if len(result.also) > 0 {
+		sb.writeString("also: ")
+		for index, duplicate := range result.also {
+			if index > 0 {
+				sb.writeString(", ")
+			}
+			path := duplicate.header
+			switch {
+			case path != "":
+			case showRoot:
+				path = duplicate.displayPath()
+			default:
+				path = duplicate.path
+			}
+			writeSanitizedString(sb, path)
+		}
+		sb.writeByte('\n')
+	}
 
 	// Track the last line number we emitted so we can insert a blank separator
 	// between non-contiguous regions of context.

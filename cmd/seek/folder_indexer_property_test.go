@@ -120,7 +120,7 @@ func FuzzReadOneFolderFileStreaming_Sizes(f *testing.F) {
 		out := make(chan fileContent, 1)
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
-		readOneFolderFileStreaming(ctx, c, out)
+		readOneFolderFileStreaming(ctx, c, out, nil)
 		close(out)
 		sent := 0
 		// Every fuzzed size is far below the 100 MiB read-weight clamp, so a

@@ -9,10 +9,11 @@ import (
 	"fmt"
 	"hash/crc64"
 	"io"
+	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"sync"
 	"syscall"
@@ -21,7 +22,6 @@ import (
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/index"
 	"github.com/sourcegraph/zoekt/query"
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -41,9 +41,28 @@ type folderCandidate struct {
 	mode  os.FileMode
 	size  int64
 	mtime int64
+	// ctime moves on every write and on every metadata change, so a rewrite
+	// that keeps the size and puts the old mtime back is still seen.
+	ctime int64
 	dev   uint64
 	ino   uint64
+	// dataless marks a cloud-only file: it is indexed by name only, so the
+	// walk never downloads it.
+	dataless bool
 }
+
+// indexedBytes is the content that the index reads for the file: none for a
+// file indexed by name only.
+func (c folderCandidate) indexedBytes() int64 {
+	if c.dataless || !documentContentFits(c.size) {
+		return 0
+	}
+	return c.size
+}
+
+// folderBuildTestHook runs after the index builds and before the publish. Only
+// tests set it.
+var folderBuildTestHook func()
 
 // folderFamilyUsable checks the current shard family after the build lock is
 // acquired. A peer can publish after the pre-lock scan. One surviving shard is
@@ -63,7 +82,7 @@ func ensureFolderCorpusFreshWithExecution(
 	execution searchExecution,
 ) (corpusIndexState, error) {
 	// A folder corpus has no commit, so the head test does not apply.
-	semanticRequired := execution.vectorsWanted("")
+	semanticRequired := execution.buildsVectors("")
 	cachedState := readStateFile(plan.cacheDir)
 	// One scan checks both shard presence and manifest agreement. Presence alone
 	// accepts any one surviving shard; the manifest detects missing or changed
@@ -85,13 +104,20 @@ func ensureFolderCorpusFreshWithExecution(
 	// run below.
 	swapPending := readCacheFile(plan.cacheDir, swappingMarkerFile) != ""
 
-	if cachedState != "" && !swapPending {
+	// The graph expansion's walk serves every preparation of the command: its
+	// state and its files. After a route sees a change, the node walks again.
+	if hash, captured, ok := plan.folder.current(); ok {
+		stateHash, selected, selectedCount = hash, captured, len(captured)
+		stateReady, selectedLoaded = true, true
+	} else if cachedState != "" && !swapPending {
 		var err error
 		stateHash, selectedCount, err = folderCorpusFingerprint(ctx, plan)
 		if err != nil {
 			return corpusSearchable, folderCorpusError(plan, err)
 		}
 		stateReady = true
+	}
+	if stateReady && !swapPending {
 		if cachedState == stateHash {
 			if selectedCount == 0 {
 				return corpusKnownEmpty, nil
@@ -111,6 +137,11 @@ func ensureFolderCorpusFreshWithExecution(
 		return corpusSearchable, folderCorpusError(plan, fmt.Errorf("create folder index directory: %w", err))
 	}
 
+	release, err := acquireBuildSlot(ctx)
+	if err != nil {
+		return corpusSearchable, err
+	}
+	defer release()
 	buildFd, acquired, err := acquireBuildLock(ctx, plan.cacheDir, plan.indexDir)
 	if err != nil {
 		return corpusSearchable, folderCorpusError(plan, err)
@@ -274,6 +305,7 @@ func ensureFolderCorpusFreshWithExecution(
 				_, err := buildSemanticFolderGeneration(
 					ctx,
 					selected,
+					plan.indexDir,
 					semanticStaging,
 					semanticSource,
 					embedder,
@@ -285,6 +317,9 @@ func ensureFolderCorpusFreshWithExecution(
 		}
 	}
 	runJoinedIndexBuilds(lexicalBuild, semanticBuild)
+	if folderBuildTestHook != nil {
+		folderBuildTestHook()
+	}
 	if lexicalErr != nil {
 		dropStateUnlessPublished()
 		return corpusSearchable, folderCorpusError(plan, lexicalErr)
@@ -303,18 +338,9 @@ func ensureFolderCorpusFreshWithExecution(
 		}
 	}
 
-	postState, _, postStateErr := folderCorpusFingerprint(ctx, plan)
-	if postStateErr != nil {
-		dropStateUnlessPublished()
-		return corpusSearchable, folderCorpusError(plan, postStateErr)
-	}
-	if postState != stateHash {
-		dropStateUnlessPublished()
-		return corpusSearchable, folderCorpusError(
-			plan,
-			fmt.Errorf("folder changed during index build"),
-		)
-	}
+	// The index holds the bytes each file had when the build read it, under the
+	// state of the walk. A file that changed after the walk is a change for the
+	// next search: its stat no longer matches, so the next delta reads it again.
 
 	activateSemantic := func() {
 		removeJoinedGeneration(plan.cacheDir)
@@ -324,7 +350,7 @@ func ensureFolderCorpusFreshWithExecution(
 		var activationErr error
 		if semanticBuilt {
 			activationErr = publishAndBindSemanticGeneration(
-				plan.cacheDir, plan.indexDir, stateHash, semanticSource, semanticStaging,
+				plan.cacheDir, plan.indexDir, stateHash, semanticSource, semanticStaging, false,
 			)
 		} else if semanticPresent {
 			activationErr = bindSemanticGeneration(
@@ -392,32 +418,6 @@ func ensureFolderCorpusFreshWithExecution(
 	return corpusSearchable, nil
 }
 
-func folderCorpusState(ctx context.Context, plan corpusPlan) (string, []folderCandidate, error) {
-	if plan.rootType == rootTypeDirectory {
-		return folderCorpusStateParallel(ctx, plan)
-	}
-	stateHash, selected, _, err := scanFolderCorpus(ctx, plan, true)
-	if err != nil {
-		return "", nil, err
-	}
-	return stateHash, selected, nil
-}
-
-// errBareRepoNotSupported lets callers branch on the rejection via
-// errors.Is. The folder pipeline needs a working tree and does not index a bare
-// repository's internal object files as normal files.
-var errBareRepoNotSupported = errors.New("bare git repositories are not supported as folder corpora")
-
-// checkNotBareRepo gates the two folder-corpus entry points
-// (scanFolderCorpus, scanFolderRootEntriesParallel) against a bare-
-// repo root. Returns nil when the root is a normal directory.
-func checkNotBareRepo(plan corpusPlan) error {
-	if detectBareRepoAt(plan.root) {
-		return fmt.Errorf("%w: %s", errBareRepoNotSupported, plan.root)
-	}
-	return nil
-}
-
 type folderCorpusContextError struct {
 	root     string
 	cacheDir string
@@ -451,600 +451,10 @@ func folderCorpusError(plan corpusPlan, err error) error {
 	}
 }
 
-func folderCorpusFingerprint(ctx context.Context, plan corpusPlan) (string, int, error) {
-	if plan.rootType == rootTypeDirectory {
-		return folderCorpusFingerprintParallel(ctx, plan)
-	}
-	stateHash, _, selectedCount, err := scanFolderCorpus(ctx, plan, false)
-	return stateHash, selectedCount, err
-}
-
-func scanFolderCorpus(ctx context.Context, plan corpusPlan, collectSelected bool) (string, []folderCandidate, int, error) {
-	if plan.rootType == rootTypeDirectory {
-		if err := checkNotBareRepo(plan); err != nil {
-			return "", nil, 0, err
-		}
-	}
-	stateHasher := newFolderStateHasher(plan)
-	switch plan.rootType {
-	case rootTypeFile:
-		info, err := os.Lstat(plan.root)
-		if err != nil {
-			return "", nil, 0, fmt.Errorf("read file root: %w", err)
-		}
-		if !info.Mode().IsRegular() {
-			return "", nil, 0, fmt.Errorf("unsupported file root: %s", plan.root)
-		}
-		candidate := newFolderCandidate(filepath.Base(plan.root), plan.root, info)
-		appendFolderCandidateHash(stateHasher, candidate)
-		var indexedBytes int64
-		selected, selectedCandidate, err := selectFolderCandidate(nil, candidate, &indexedBytes, collectSelected)
-		if err != nil {
-			return "", nil, 0, err
-		}
-		selectedCount := 0
-		if selectedCandidate {
-			selectedCount = 1
-		}
-		return finishFolderStateHash(stateHasher), selected, selectedCount, nil
-	case rootTypeDirectory:
-	default:
-		return "", nil, 0, fmt.Errorf("unsupported folder root type: %s", plan.rootType)
-	}
-
-	scanner := folderCorpusScanner{
-		ctx:               ctx,
-		stateHasher:       stateHasher,
-		collectSelected:   collectSelected,
-		scanRoot:          plan.root,
-		excludeRoots:      plan.excludeRoots,
-		enqueueDiscovered: plan.discover,
-		discoveryEnabled:  discoveryEnabledForPlan(plan),
-	}
-	if err := scanner.walkDirectory(plan.root, ""); err != nil {
-		return "", nil, 0, err
-	}
-	return finishFolderStateHash(stateHasher), scanner.selected, scanner.selectedCount, nil
-}
-
-type folderCorpusScanner struct {
-	ctx             context.Context
-	stateHasher     *xxhash.Digest
-	selected        []folderCandidate
-	indexedBytes    int64
-	candidateCount  int
-	selectedCount   int
-	collectSelected bool
-	// Nested-git discovery fields.
-	//
-	// scanRoot bounds pointer-escape detection inside detectGitBoundary.
-	// discoveryEnabled gates the boundary check; when false the walker
-	// recurses without classifying. enqueueDiscovered receives confirmed
-	// boundaries; true means a corpus owns the subtree, false means the
-	// walker should descend as plain folder.
-	scanRoot          string
-	excludeRoots      []string
-	discoveryEnabled  bool
-	enqueueDiscovered func(gitBoundary) bool
-}
-
-func (s *folderCorpusScanner) walkDirectory(dir, relBase string) error {
-	dirFile, entries, err := openSortedDirectory(dir)
-	if err != nil {
-		if relBase == "" {
-			return fmt.Errorf("read folder root: %w", err)
-		}
-		return nil
-	}
-	defer func() { _ = dirFile.Close() }()
-	dirFD := int(dirFile.Fd())
-	separator := string(filepath.Separator)
-	for _, entry := range entries {
-		if s.ctx.Err() != nil {
-			return s.ctx.Err()
-		}
-		name := entry.Name()
-		if entry.Type()&os.ModeSymlink != 0 {
-			continue
-		}
-		rel := name
-		if relBase != "" {
-			rel = relBase + "/" + name
-		}
-		if entry.IsDir() {
-			// Skip .git, .gitkeep etc. before building the path string.
-			if isFolderMetadataDir(name) {
-				continue
-			}
-			path := dir + separator + name
-			if s.tryExcludeRoot(path, rel) {
-				continue
-			}
-			if s.tryDiscoverBoundary(path, rel) {
-				continue
-			}
-			if err := s.walkDirectory(path, rel); err != nil {
-				return err
-			}
-			continue
-		}
-		if s.collectSelected {
-			path := dir + separator + name
-			if err := s.addSelectedFile(dirFD, name, path, rel); err != nil {
-				return err
-			}
-		} else {
-			if err := s.addFingerprintFile(dirFD, name, rel); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func (s *folderCorpusScanner) tryExcludeRoot(path, rel string) bool {
-	if !isExcludedRoot(path, s.excludeRoots) {
-		return false
-	}
-	appendFolderFingerprintPart(s.stateHasher, "excluded-root")
-	appendFolderFingerprintPart(s.stateHasher, rel)
-	appendFolderFingerprintPart(s.stateHasher, canonicalCorpusPath(path))
-	return true
-}
-
-func isExcludedRoot(path string, excludeRoots []string) bool {
-	for _, root := range excludeRoots {
-		if path == root {
-			return true
-		}
-	}
-	return false
-}
-
-func openSortedDirectory(dir string) (*os.File, []os.DirEntry, error) {
-	dirFile, err := os.Open(dir)
-	if err != nil {
-		return nil, nil, err
-	}
-	entries, err := dirFile.ReadDir(-1)
-	if err != nil {
-		_ = dirFile.Close()
-		return nil, nil, err
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Name() < entries[j].Name()
-	})
-	return dirFile, entries, nil
-}
-
-func (s *folderCorpusScanner) addFingerprintFile(dirFD int, name, rel string) error {
-	stat, ok := fstatatRegularFile(dirFD, name)
-	if !ok {
-		return nil
-	}
-	s.candidateCount++
-	if s.candidateCount > maxFolderCandidateFiles {
-		return folderCapError("folder file cap exceeded", indexCapCandidateFiles, int64(s.candidateCount), maxFolderCandidateFiles)
-	}
-	appendFolderFileHash(s.stateHasher, rel, stat.mode, stat.size, stat.mtime, stat.dev, stat.ino)
-	s.selectedCount++
-	if documentContentFits(stat.size) {
-		s.indexedBytes += stat.size
-		if s.indexedBytes > maxFolderIndexedBytes {
-			return folderCapError("folder indexed byte cap exceeded", indexCapIndexedBytes, s.indexedBytes, maxFolderIndexedBytes)
-		}
-	}
-	return nil
-}
-
-func (s *folderCorpusScanner) addSelectedFile(dirFD int, name, path, rel string) error {
-	stat, ok := fstatatRegularFile(dirFD, name)
-	if !ok {
-		return nil
-	}
-	s.candidateCount++
-	if s.candidateCount > maxFolderCandidateFiles {
-		return folderCapError("folder file cap exceeded", indexCapCandidateFiles, int64(s.candidateCount), maxFolderCandidateFiles)
-	}
-	candidate := folderCandidate{
-		name:  rel,
-		path:  path,
-		mode:  stat.mode,
-		size:  stat.size,
-		mtime: stat.mtime,
-		dev:   stat.dev,
-		ino:   stat.ino,
-	}
-	appendFolderCandidateHash(s.stateHasher, candidate)
-	selected, selectedCandidate, err := selectFolderCandidate(
-		s.selected,
-		candidate,
-		&s.indexedBytes,
-		s.collectSelected,
-	)
-	if err != nil {
-		return err
-	}
-	s.selected = selected
-	if selectedCandidate {
-		s.selectedCount++
-	}
-	return nil
-}
-
-type folderFileStat struct {
-	mode  os.FileMode
-	size  int64
-	mtime int64
-	dev   uint64
-	ino   uint64
-}
-
-func fstatatRegularFile(dirFD int, name string) (folderFileStat, bool) {
-	var st unix.Stat_t
-	if err := unix.Fstatat(dirFD, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return folderFileStat{}, false
-	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		return folderFileStat{}, false
-	}
-	return folderFileStat{
-		mode:  regularFileMode(uint32(st.Mode)),
-		size:  st.Size,
-		mtime: st.Mtim.Nano(),
-		dev:   uint64(st.Dev),
-		ino:   uint64(st.Ino),
-	}, true
-}
-
-func regularFileMode(mode uint32) os.FileMode {
-	out := os.FileMode(mode & 0o777)
-	if mode&unix.S_ISUID != 0 {
-		out |= os.ModeSetuid
-	}
-	if mode&unix.S_ISGID != 0 {
-		out |= os.ModeSetgid
-	}
-	if mode&unix.S_ISVTX != 0 {
-		out |= os.ModeSticky
-	}
-	return out
-}
-
-func isFolderMetadataDir(name string) bool {
-	return name == ".git"
-}
-
-// tryDiscoverBoundary checks whether `path` is a nested git boundary
-// and, if so, enqueues a discovered corpus plan via the scanner's
-// callback. Returns true when the caller must stop further descent
-// into the subtree (a corpus took ownership of the content); returns
-// false when the caller should descend as plain folder.
-//
-// The callback accepts the boundary when a new or existing pool corpus owns
-// it. Only then does the scanner emit the "git-boundary" fingerprint marker.
-// If no corpus accepts ownership, the walker descends as a plain folder so it
-// does not omit the subtree.
-func (s *folderCorpusScanner) tryDiscoverBoundary(path, rel string) bool {
-	if !s.discoveryEnabled {
-		return false
-	}
-	b, status := detectGitBoundary(path, s.scanRoot)
-	switch status {
-	case ambiguous:
-		// Debug-level so it shows under -v / SEEK_DEBUG: gives users a
-		// trail when a repo they expected discovered was structurally
-		// invalid (missing HEAD/objects/refs, broken worktree pointer,
-		// `.git` symlink that the detector refuses). Subtree gets
-		// indexed under the parent folder corpus — gitignored files
-		// inside will appear in search results.
-		slog.Debug("discovery: ambiguous boundary, descending as plain folder",
-			"path", path, "scan_root", s.scanRoot)
-		return false
-	case notBoundary:
-		return false
-	}
-	if s.enqueueDiscovered != nil {
-		if !s.enqueueDiscovered(b) {
-			// The callback rejected the boundary, so no corpus owns
-			// this subtree. Fall back to plain recursion so content is
-			// not dropped.
-			slog.Debug("discovery: boundary rejected by pool, descending as plain folder",
-				"path", path, "repo", b.RepoDir)
-			return false
-		}
-	}
-	slog.Debug("discovery: boundary covered by git corpus",
-		"repo", b.RepoDir, "mode", b.Mode)
-	s.emitBoundaryMarker(rel, b)
-	return true
-}
-
-// emitBoundaryMarker mixes a "git-boundary" namespaced contribution
-// into the parent's state hash. The marker payload includes the boundary's
-// relative path and the .git entry's device and inode so:
-//
-//   - boundary appears   → marker absent before, present after → hash flips
-//   - boundary disappears → marker present before, absent after → hash flips
-//   - boundary re-init   → new dev:ino → marker payload changes → hash flips
-//   - commits inside repo → marker payload unchanged → parent hash stable
-//
-// Uses a distinct namespace tag from appendFolderFileHash's "file" so
-// a regular file at the same relative path could never collide.
-func (s *folderCorpusScanner) emitBoundaryMarker(rel string, b gitBoundary) {
-	appendFolderFingerprintPart(s.stateHasher, "git-boundary")
-	appendFolderFingerprintPart(s.stateHasher, rel)
-	// Stat the .git entry for dev:ino. Best-effort: any error
-	// degrades to a marker that still includes the boundary's relative
-	// path so appearance/disappearance still flips the hash; only
-	// re-init detection requires the dev:ino part.
-	if info, err := os.Lstat(filepath.Join(b.RepoDir, ".git")); err == nil {
-		dev, ino, _ := fileInfoIdentity(info)
-		// Single stack buffer reused across the three numeric fields
-		// via the helper below — heap-free even though we write three
-		// labelled parts.
-		var buf [20]byte
-		appendBoundaryUintField(s.stateHasher, buf[:], "mode", uint64(info.Mode()))
-		appendBoundaryUintField(s.stateHasher, buf[:], "dev", dev)
-		appendBoundaryUintField(s.stateHasher, buf[:], "ino", ino)
-	}
-}
-
-// appendBoundaryUintField writes one labeled numeric field.
-func appendBoundaryUintField(h *xxhash.Digest, buf []byte, label string, value uint64) {
-	appendFolderFingerprintPart(h, label)
-	appendFolderFingerprintBytes(h, strconv.AppendUint(buf[:0], value, 10))
-}
-
-func selectFolderCandidate(
-	selected []folderCandidate,
-	candidate folderCandidate,
-	indexedBytes *int64,
-	collectSelected bool,
-) ([]folderCandidate, bool, error) {
-	// A file too large for the index is still selected, by name only: it adds
-	// no content bytes.
-	if documentContentFits(candidate.size) {
-		*indexedBytes += candidate.size
-		if *indexedBytes > maxFolderIndexedBytes {
-			return selected, false, folderCapError("folder indexed byte cap exceeded", indexCapIndexedBytes, *indexedBytes, maxFolderIndexedBytes)
-		}
-	}
-	if !collectSelected {
-		return selected, true, nil
-	}
-	return append(selected, candidate), true, nil
-}
-
-type folderFingerprintPiece struct {
-	hash               uint64
-	candidates         int
-	selected           int
-	indexedBytes       int64
-	selectedCandidates []folderCandidate
-	present            bool
-}
-
-func folderCorpusFingerprintParallel(ctx context.Context, plan corpusPlan) (string, int, error) {
-	stateHash, selectedCount, _, err := scanFolderRootEntriesParallel(ctx, plan, false)
-	return stateHash, selectedCount, err
-}
-
-func folderCorpusStateParallel(ctx context.Context, plan corpusPlan) (string, []folderCandidate, error) {
-	stateHash, _, selected, err := scanFolderRootEntriesParallel(ctx, plan, true)
-	return stateHash, selected, err
-}
-
-func scanFolderRootEntriesParallel(
-	ctx context.Context,
-	plan corpusPlan,
-	collectSelected bool,
-) (string, int, []folderCandidate, error) {
-	if err := checkNotBareRepo(plan); err != nil {
-		return "", 0, nil, err
-	}
-	entries, err := os.ReadDir(plan.root)
-	if err != nil {
-		return "", 0, nil, fmt.Errorf("read folder root: %w", err)
-	}
-	if len(entries) <= 1 {
-		stateHash, selected, selectedCount, err := scanFolderCorpus(ctx, plan, collectSelected)
-		return stateHash, selectedCount, selected, err
-	}
-
-	// Compute discovery gate once per scan. The answer is plan-wide and
-	// fingerprintRootEntry runs once per root entry.
-	discoveryEnabled := discoveryEnabledForPlan(plan)
-
-	workers := fileReadWorkerCount(indexParallelism(), len(entries))
-	// Size jobs to len(entries) so the feeder can send every entry without
-	// waiting for a worker.
-	jobs := make(chan int, len(entries))
-	pieces := make([]folderFingerprintPiece, len(entries))
-	errCh := make(chan error, 1)
-	var wg sync.WaitGroup
-	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := range jobs {
-				if ctx.Err() != nil {
-					continue
-				}
-				piece, err := fingerprintRootEntry(ctx, plan, entries[i], collectSelected, discoveryEnabled)
-				if err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
-					continue
-				}
-				pieces[i] = piece
-			}
-		}()
-	}
-	for i := range entries {
-		select {
-		case jobs <- i:
-		case <-ctx.Done():
-			close(jobs)
-			wg.Wait()
-			return "", 0, nil, ctx.Err()
-		}
-	}
-	close(jobs)
-	wg.Wait()
-	select {
-	case err := <-errCh:
-		return "", 0, nil, err
-	default:
-	}
-	if err := ctx.Err(); err != nil {
-		return "", 0, nil, err
-	}
-
-	stateHasher := newFolderStateHasher(plan)
-	var candidateCount int
-	var selectedCount int
-	var indexedBytes int64
-	var selected []folderCandidate
-	if collectSelected {
-		// Compute the exact capacity before appending the selected candidates.
-		capEst := 0
-		for _, p := range pieces {
-			if p.present {
-				capEst += len(p.selectedCandidates)
-			}
-		}
-		selected = make([]folderCandidate, 0, capEst)
-	}
-	var numBuf [20]byte
-	for _, piece := range pieces {
-		if !piece.present {
-			continue
-		}
-		appendFolderFingerprintPart(stateHasher, "entry")
-		appendFolderFingerprintBytes(stateHasher, strconv.AppendUint(numBuf[:0], piece.hash, 10))
-		candidateCount += piece.candidates
-		if candidateCount > maxFolderCandidateFiles {
-			return "", 0, nil, folderCapError("folder file cap exceeded", indexCapCandidateFiles, int64(candidateCount), maxFolderCandidateFiles)
-		}
-		indexedBytes += piece.indexedBytes
-		if indexedBytes > maxFolderIndexedBytes {
-			return "", 0, nil, folderCapError("folder indexed byte cap exceeded", indexCapIndexedBytes, indexedBytes, maxFolderIndexedBytes)
-		}
-		selectedCount += piece.selected
-		if collectSelected {
-			selected = append(selected, piece.selectedCandidates...)
-		}
-	}
-	return finishFolderStateHash(stateHasher), selectedCount, selected, nil
-}
-
-// discoveryEnabledForPlan gates walker discovery on a per-plan basis.
-// Discovery requires the pool to install a dynamic-enqueue callback; only
-// folder plans get one.
-func discoveryEnabledForPlan(plan corpusPlan) bool {
-	if plan.discover == nil {
-		slog.Debug("discovery: disabled — plan.discover is nil (non-folder plan or pool bypass)",
-			"root", plan.root, "kind", plan.kind)
-		return false
-	}
-	return true
-}
-
-func fingerprintRootEntry(
-	ctx context.Context,
-	plan corpusPlan,
-	entry os.DirEntry,
-	collectSelected bool,
-	discoveryEnabled bool,
-) (folderFingerprintPiece, error) {
-	root := plan.root
-	name := entry.Name()
-	if entry.Type()&os.ModeSymlink != 0 {
-		return folderFingerprintPiece{}, nil
-	}
-	path := root + string(filepath.Separator) + name
-	if entry.IsDir() {
-		if isFolderMetadataDir(name) {
-			return folderFingerprintPiece{}, nil
-		}
-		var h xxhash.Digest
-		h.Reset()
-		scanner := folderCorpusScanner{
-			ctx:               ctx,
-			stateHasher:       &h,
-			collectSelected:   collectSelected,
-			scanRoot:          plan.root,
-			excludeRoots:      plan.excludeRoots,
-			enqueueDiscovered: plan.discover,
-			discoveryEnabled:  discoveryEnabled,
-		}
-		if scanner.tryExcludeRoot(path, name) {
-			return folderFingerprintPiece{
-				hash:    h.Sum64(),
-				present: true,
-			}, nil
-		}
-		// This root entry is a nested Git repository. Record the boundary,
-		// enqueue it, and do not descend into it.
-		if scanner.tryDiscoverBoundary(path, name) {
-			return folderFingerprintPiece{
-				hash:    h.Sum64(),
-				present: true, // marker still contributes to fingerprint
-			}, nil
-		}
-		if err := scanner.walkDirectory(path, name); err != nil {
-			return folderFingerprintPiece{}, err
-		}
-		return folderFingerprintPiece{
-			hash:               h.Sum64(),
-			candidates:         scanner.candidateCount,
-			selected:           scanner.selectedCount,
-			indexedBytes:       scanner.indexedBytes,
-			selectedCandidates: scanner.selected,
-			present:            scanner.candidateCount > 0,
-		}, nil
-	}
-	// Skip known non-regular entries before loading their metadata.
-	if entry.Type() != 0 {
-		return folderFingerprintPiece{}, nil
-	}
-	info, err := entry.Info()
-	if err != nil {
-		return folderFingerprintPiece{}, nil
-	}
-	if !info.Mode().IsRegular() {
-		return folderFingerprintPiece{}, nil
-	}
-	var h xxhash.Digest
-	h.Reset()
-	dev, ino, mtime := fileInfoIdentity(info)
-	appendFolderFileHash(&h, name, info.Mode(), info.Size(), mtime, dev, ino)
-	piece := folderFingerprintPiece{
-		hash:       h.Sum64(),
-		candidates: 1,
-		present:    true,
-	}
-	piece.selected = 1
-	if documentContentFits(info.Size()) {
-		piece.indexedBytes = info.Size()
-	}
-	if collectSelected {
-		piece.selectedCandidates = []folderCandidate{{
-			name:  name,
-			path:  path,
-			mode:  info.Mode(),
-			size:  info.Size(),
-			mtime: mtime,
-			dev:   dev,
-			ino:   ino,
-		}}
-	}
-	return piece, nil
-}
-
+// indexFolderDocuments indexes selected into plan.indexDir: a delta on the
+// prior shards when tryDelta holds and the family has at most
+// maxFolderDeltaShards shards, else a full build. A read error that may pass
+// fails the build with a folderReadError.
 func indexFolderDocuments(
 	ctx context.Context,
 	plan corpusPlan,
@@ -1073,8 +483,14 @@ func indexFolderDocuments(
 			slog.Debug("Folder delta shard limit reached, falling back to full rebuild", "shards", shardCount)
 		}
 	}
-	fileCh := streamFolderFiles(ctx, selected, parallelism)
-	return indexDocuments(ctx, plan.indexDir, repoName, plan.root, fileCh, parallelism)
+	readCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	fileCh := streamFolderFiles(readCtx, selected, parallelism, cancel)
+	indexed, err := indexDocuments(readCtx, plan.indexDir, repoName, plan.root, fileCh, parallelism)
+	if readErr, ok := errors.AsType[*folderReadError](context.Cause(readCtx)); ok {
+		return false, readErr
+	}
+	return indexed, err
 }
 
 func indexFolderDocumentsDelta(
@@ -1094,10 +510,10 @@ func indexFolderDocumentsDelta(
 	if len(changedDocs) == 0 {
 		return false, fmt.Errorf("folder delta contains only removals")
 	}
-	// Note: changedFolderDocumentsFromManifest already short-circuits
-	// on cumulative lstat size >= indexWindowBytes BEFORE any read,
-	// so by here the payload is safe to drive through the single-
-	// builder bulk-Release contract of indexDeltaDocuments.
+	// On the manifest path, changedFolderDocumentsFromManifest stops before
+	// it reads the file that brings the changed size to the build's window,
+	// so the payload fits the single-builder bulk-Release contract of
+	// indexDeltaDocuments.
 	return indexDeltaDocuments(plan.indexDir, repoName, plan.root, changedDocs, folderDeltaShardMax, changedPaths)
 }
 
@@ -1109,15 +525,14 @@ func changedFolderDocumentsSinceCachedState(
 	cachedState string,
 ) ([]fileContent, []string, error) {
 	if manifest, ok := readFolderManifest(plan.cacheDir, cachedState); ok {
-		return changedFolderDocumentsFromManifest(selected, manifest)
+		return changedFolderDocumentsFromManifest(selected, manifest, indexWindow(ctx))
 	}
 
 	oldChecksums, err := enumerateIndexedFolderChecksums(ctx, plan.indexDir, repoName)
 	if err != nil {
 		return nil, nil, err
 	}
-	changedDocs, changedPaths := changedFolderDocuments(selected, oldChecksums)
-	return changedDocs, changedPaths, nil
+	return changedFolderDocuments(selected, oldChecksums)
 }
 
 func enumerateIndexedFolderChecksums(ctx context.Context, indexDir, repoName string) (map[string]uint64, error) {
@@ -1131,12 +546,8 @@ func enumerateIndexedFolderChecksums(ctx context.Context, indexDir, repoName str
 		}
 	}()
 
-	opts := zoekt.SearchOptions{
-		TotalMaxMatchCount: maxFolderCandidateFiles + 1,
-		ShardMaxMatchCount: maxFolderCandidateFiles + 1,
-		MaxDocDisplayCount: maxFolderCandidateFiles + 1,
-		MaxWallTime:        searchTimeout,
-	}
+	// Every document: 0 would become Zoekt's default of 100,000 (SetDefaults).
+	opts := zoekt.SearchOptions{ShardMaxMatchCount: math.MaxInt}
 	oldChecksums := make(map[string]uint64)
 	for _, searcher := range searchers {
 		result, err := searcher.Search(ctx, &query.Const{Value: true}, &opts)
@@ -1156,7 +567,9 @@ func enumerateIndexedFolderChecksums(ctx context.Context, indexDir, repoName str
 	return oldChecksums, nil
 }
 
-func changedFolderDocuments(selected []folderCandidate, oldChecksums map[string]uint64) ([]fileContent, []string) {
+// changedFolderDocuments finds the changed files by content checksum, for a
+// cached state with no matching manifest. It reads every selected file.
+func changedFolderDocuments(selected []folderCandidate, oldChecksums map[string]uint64) ([]fileContent, []string, error) {
 	changedDocs := make([]fileContent, 0, 1)
 	changedPaths := make([]string, 0, 1)
 	seen := make(map[string]struct{}, len(selected))
@@ -1164,6 +577,9 @@ func changedFolderDocuments(selected []folderCandidate, oldChecksums map[string]
 	for _, candidate := range selected {
 		seen[candidate.name] = struct{}{}
 		doc, err := readFolderDocument(candidate)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, nil, err
+		}
 		if err != nil {
 			if _, ok := oldChecksums[candidate.name]; ok {
 				changedPaths = append(changedPaths, candidate.name)
@@ -1190,7 +606,7 @@ func changedFolderDocuments(selected []folderCandidate, oldChecksums map[string]
 			changedPaths = append(changedPaths, name)
 		}
 	}
-	return changedDocs, changedPaths
+	return changedDocs, changedPaths, nil
 }
 
 type folderManifest struct {
@@ -1200,12 +616,14 @@ type folderManifest struct {
 }
 
 type folderManifestEntry struct {
-	Name  string      `json:"name"`
-	Mode  os.FileMode `json:"mode"`
-	Size  int64       `json:"size"`
-	Mtime int64       `json:"mtime"`
-	Dev   uint64      `json:"dev"`
-	Ino   uint64      `json:"ino"`
+	Name     string      `json:"name"`
+	Mode     os.FileMode `json:"mode"`
+	Size     int64       `json:"size"`
+	Mtime    int64       `json:"mtime"`
+	Ctime    int64       `json:"ctime"`
+	Dev      uint64      `json:"dev"`
+	Ino      uint64      `json:"ino"`
+	Dataless bool        `json:"dataless,omitempty"`
 }
 
 func readFolderManifest(cacheDir, expectedState string) (folderManifest, bool) {
@@ -1228,12 +646,14 @@ func writeFolderManifest(cacheDir, state string, selected []folderCandidate) err
 	}
 	for i, candidate := range selected {
 		manifest.Files[i] = folderManifestEntry{
-			Name:  candidate.name,
-			Mode:  candidate.mode,
-			Size:  candidate.size,
-			Mtime: candidate.mtime,
-			Dev:   candidate.dev,
-			Ino:   candidate.ino,
+			Name:     candidate.name,
+			Mode:     candidate.mode,
+			Size:     candidate.size,
+			Mtime:    candidate.mtime,
+			Ctime:    candidate.ctime,
+			Dev:      candidate.dev,
+			Ino:      candidate.ino,
+			Dataless: candidate.dataless,
 		}
 	}
 	path := filepath.Join(cacheDir, folderManifestFileName)
@@ -1261,30 +681,37 @@ func writeFolderManifest(cacheDir, state string, selected []folderCandidate) err
 
 // changedFolderDocumentsFromManifest compares selected files with the manifest
 // and reads only changed files. It returns errDeltaPayloadExceedsWindow when
-// their cumulative stat size reaches indexWindowBytes. The caller then uses a
-// windowed full rebuild.
-func changedFolderDocumentsFromManifest(selected []folderCandidate, manifest folderManifest) ([]fileContent, []string, error) {
-	// Both slices are in scanner order: root entries are sorted, subdirectories
-	// are sorted, and manifests preserve the selected list order.
+// their cumulative stat size reaches window. The caller then uses a windowed
+// full rebuild.
+func changedFolderDocumentsFromManifest(
+	selected []folderCandidate,
+	manifest folderManifest,
+	window int64,
+) ([]fileContent, []string, error) {
+	// Both slices are sorted by name: the walk sorts the selected files, and
+	// the manifest keeps their order.
 	changedDocs := make([]fileContent, 0, 1)
 	changedPaths := make([]string, 0, 1)
 	selectedIndex := 0
 	manifestIndex := 0
 	var estContent int64
 
-	readCandidate := func(candidate folderCandidate) bool {
+	readCandidate := func(candidate folderCandidate) error {
 		// A name-only file reads no content, so it adds nothing to the payload.
-		if documentContentFits(candidate.size) {
-			estContent += candidate.size
-			if estContent >= indexWindowBytes {
-				return false
+		if content := candidate.indexedBytes(); content > 0 {
+			estContent += content
+			if estContent >= window {
+				return errDeltaPayloadExceedsWindow
 			}
 		}
 		changedPaths = append(changedPaths, candidate.name)
-		if doc, err := readFolderDocument(candidate); err == nil {
+		doc, err := readFolderDocument(candidate)
+		if err == nil {
 			changedDocs = append(changedDocs, doc)
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return err
 		}
-		return true
+		return nil
 	}
 
 	for selectedIndex < len(selected) && manifestIndex < len(manifest.Files) {
@@ -1293,15 +720,15 @@ func changedFolderDocumentsFromManifest(selected []folderCandidate, manifest fol
 		switch {
 		case candidate.name == old.Name:
 			if !folderManifestFileMatchesCandidate(old, candidate) {
-				if !readCandidate(candidate) {
-					return nil, nil, errDeltaPayloadExceedsWindow
+				if err := readCandidate(candidate); err != nil {
+					return nil, nil, err
 				}
 			}
 			selectedIndex++
 			manifestIndex++
 		case candidate.name < old.Name:
-			if !readCandidate(candidate) {
-				return nil, nil, errDeltaPayloadExceedsWindow
+			if err := readCandidate(candidate); err != nil {
+				return nil, nil, err
 			}
 			selectedIndex++
 		default:
@@ -1311,8 +738,8 @@ func changedFolderDocumentsFromManifest(selected []folderCandidate, manifest fol
 	}
 
 	for ; selectedIndex < len(selected); selectedIndex++ {
-		if !readCandidate(selected[selectedIndex]) {
-			return nil, nil, errDeltaPayloadExceedsWindow
+		if err := readCandidate(selected[selectedIndex]); err != nil {
+			return nil, nil, err
 		}
 	}
 
@@ -1326,13 +753,15 @@ func folderManifestFileMatchesCandidate(file folderManifestEntry, candidate fold
 	return file.Mode == candidate.mode &&
 		file.Size == candidate.size &&
 		file.Mtime == candidate.mtime &&
+		file.Ctime == candidate.ctime &&
 		file.Dev == candidate.dev &&
-		file.Ino == candidate.ino
+		file.Ino == candidate.ino &&
+		file.Dataless == candidate.dataless
 }
 
 func newFolderCandidate(name, path string, info os.FileInfo) folderCandidate {
 	dev, ino, mtime := fileInfoIdentity(info)
-	return folderCandidate{
+	candidate := folderCandidate{
 		name:  name,
 		path:  path,
 		mode:  info.Mode(),
@@ -1341,6 +770,11 @@ func newFolderCandidate(name, path string, info os.FileInfo) folderCandidate {
 		dev:   dev,
 		ino:   ino,
 	}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		candidate.ctime = statCtimeNano(*st)
+		candidate.dataless = statDatalessFlags(uint32(statFlags(*st)))
+	}
+	return candidate
 }
 
 func fileInfoIdentity(info os.FileInfo) (uint64, uint64, int64) {
@@ -1354,7 +788,7 @@ func newFolderStateHasher(plan corpusPlan) *xxhash.Digest {
 	h := xxhash.New()
 	_, _ = h.WriteString(stateVersion)
 
-	appendFolderFingerprintPart(h, "folder-state-v3")
+	appendFolderFingerprintPart(h, "folder-state-v4")
 	appendFolderFingerprintPart(h, "index_generation")
 	appendFolderFingerprintPart(h, seekIndexGeneration)
 	appendFolderFingerprintPart(h, "cache_layout")
@@ -1365,8 +799,6 @@ func newFolderStateHasher(plan corpusPlan) *xxhash.Digest {
 	appendFolderFingerprintPart(h, zoektCompatibilityVersion)
 	appendFolderFingerprintPart(h, "index_options")
 	appendFolderFingerprintPart(h, indexOptionsHash())
-	appendFolderFingerprintPart(h, "root")
-	appendFolderFingerprintPart(h, canonicalCorpusPath(plan.root))
 	appendFolderFingerprintPart(h, "root_type")
 	appendFolderFingerprintPart(h, string(plan.rootType))
 
@@ -1377,27 +809,17 @@ func newFolderStateHasher(plan corpusPlan) *xxhash.Digest {
 	return h
 }
 
-func appendFolderCandidateHash(h *xxhash.Digest, candidate folderCandidate) {
-	appendFolderFileHash(h, candidate.name, candidate.mode, candidate.size, candidate.mtime, candidate.dev, candidate.ino)
-}
-
-func appendFolderFileHash(
-	h *xxhash.Digest,
-	name string,
-	mode os.FileMode,
-	size int64,
-	mtime int64,
-	dev uint64,
-	ino uint64,
-) {
+func appendFolderCandidateHash(h *xxhash.Digest, c folderCandidate) {
 	var numBuf [20]byte
 	appendFolderFingerprintPart(h, "file")
-	appendFolderFingerprintPart(h, name)
-	appendFolderFingerprintBytes(h, strconv.AppendUint(numBuf[:0], uint64(mode), 10))
-	appendFolderFingerprintBytes(h, strconv.AppendInt(numBuf[:0], size, 10))
-	appendFolderFingerprintBytes(h, strconv.AppendInt(numBuf[:0], mtime, 10))
-	appendFolderFingerprintBytes(h, strconv.AppendUint(numBuf[:0], dev, 10))
-	appendFolderFingerprintBytes(h, strconv.AppendUint(numBuf[:0], ino, 10))
+	appendFolderFingerprintPart(h, c.name)
+	appendFolderFingerprintBytes(h, strconv.AppendUint(numBuf[:0], uint64(c.mode), 10))
+	appendFolderFingerprintBytes(h, strconv.AppendInt(numBuf[:0], c.size, 10))
+	appendFolderFingerprintBytes(h, strconv.AppendInt(numBuf[:0], c.mtime, 10))
+	appendFolderFingerprintBytes(h, strconv.AppendInt(numBuf[:0], c.ctime, 10))
+	appendFolderFingerprintBytes(h, strconv.AppendUint(numBuf[:0], c.dev, 10))
+	appendFolderFingerprintBytes(h, strconv.AppendUint(numBuf[:0], c.ino, 10))
+	appendFolderFingerprintBytes(h, strconv.AppendBool(numBuf[:0], c.dataless))
 }
 
 func finishFolderStateHash(h *xxhash.Digest) string {
@@ -1425,9 +847,18 @@ func appendFolderFingerprintBytes(h *xxhash.Digest, part []byte) {
 // releases that weight after Builder.Finish stops using the content. A caller
 // must drain the channel or cancel ctx.
 //
-// Synchronous folder-delta reads use readFolderFile directly and have zero
-// weight. readSemaphore does not limit those reads.
-func streamFolderFiles(ctx context.Context, candidates []folderCandidate, parallelism int) <-chan fileContent {
+// Synchronous folder-delta reads use readFolderDocument and have zero weight.
+// readSemaphore does not limit those reads.
+//
+// A read error that may pass (folderReadError) calls fail and stops the
+// stream: the build then publishes nothing, so the next search reads the file
+// again.
+func streamFolderFiles(
+	ctx context.Context,
+	candidates []folderCandidate,
+	parallelism int,
+	fail context.CancelCauseFunc,
+) <-chan fileContent {
 	workers := fileReadWorkerCount(parallelism, len(candidates))
 	out := make(chan fileContent)
 	work := make(chan folderCandidate, workers)
@@ -1441,7 +872,7 @@ func streamFolderFiles(ctx context.Context, candidates []folderCandidate, parall
 				if ctx.Err() != nil {
 					continue
 				}
-				readOneFolderFileStreaming(ctx, candidate, out)
+				readOneFolderFileStreaming(ctx, candidate, out, fail)
 			}
 		}()
 	}
@@ -1467,11 +898,22 @@ func streamFolderFiles(ctx context.Context, candidates []folderCandidate, parall
 
 // readOneFolderFileStreaming acquires readSemaphore weight for one candidate.
 // A successful send transfers release ownership to the consumer. On all other
-// paths, this function releases the weight. A candidate whose content does not
-// fit the index, or that starts with binary content (readContent), is sent by
-// name only, with no weight.
-func readOneFolderFileStreaming(ctx context.Context, candidate folderCandidate, out chan<- fileContent) {
+// paths, this function releases the weight. A cloud-only file, a file whose
+// content does not fit the index, an unreadable file, and a file that starts
+// with binary content (readContent) are sent by name only, with no weight. A
+// read error that may pass calls fail and sends nothing.
+func readOneFolderFileStreaming(
+	ctx context.Context,
+	candidate folderCandidate,
+	out chan<- fileContent,
+	fail context.CancelCauseFunc,
+) {
 	size := candidate.size
+	if candidate.dataless {
+		// A cloud-only file is indexed by name, with no content.
+		sendNameOnly(ctx, out, candidate.name, seekNoBytesReason)
+		return
+	}
 	if !documentContentFits(size) {
 		sendNameOnly(ctx, out, candidate.name, index.SkipReasonTooLarge)
 		return
@@ -1488,7 +930,24 @@ func readOneFolderFileStreaming(ctx context.Context, candidate folderCandidate, 
 	}()
 
 	content, binary, err := readFolderFile(candidate)
+	if errors.Is(err, fs.ErrNotExist) {
+		// Removed after the walk: the next search's delta drops it.
+		return
+	}
+	if err != nil && !folderReadIsLasting(err) {
+		if fail != nil {
+			fail(&folderReadError{path: candidate.path, err: err})
+		}
+		return
+	}
 	if err != nil {
+		// An unreadable file (permissions, a path too long to open) stays
+		// searchable by name.
+		slog.Debug("Indexing an unreadable folder file by name only", "path", candidate.path, "error", err)
+		select {
+		case out <- fileContent{name: candidate.name, skipReason: seekNoBytesReason}:
+		case <-ctx.Done():
+		}
 		return
 	}
 	if binary {
@@ -1506,19 +965,56 @@ func readOneFolderFileStreaming(ctx context.Context, candidate folderCandidate, 
 
 // readFolderDocument returns the document for one candidate, with no
 // readSemaphore weight: its content, or a name-only document when the file is
-// too large for the index or starts with binary content.
+// cloud-only, too large for the index, unreadable, or starts with binary
+// content. A read error that may pass returns a folderReadError.
 func readFolderDocument(candidate folderCandidate) (fileContent, error) {
+	if candidate.dataless {
+		return fileContent{name: candidate.name, skipReason: seekNoBytesReason}, nil
+	}
 	if !documentContentFits(candidate.size) {
 		return fileContent{name: candidate.name, skipReason: index.SkipReasonTooLarge}, nil
 	}
 	content, binary, err := readFolderFile(candidate)
-	if err != nil {
+	if errors.Is(err, fs.ErrNotExist) {
 		return fileContent{}, err
+	}
+	if err != nil && !folderReadIsLasting(err) {
+		return fileContent{}, &folderReadError{path: candidate.path, err: err}
+	}
+	if err != nil {
+		// An unreadable file stays searchable by name.
+		slog.Debug("Indexing an unreadable folder file by name only", "path", candidate.path, "error", err)
+		return fileContent{name: candidate.name, skipReason: seekNoBytesReason}, nil
 	}
 	if binary {
 		return fileContent{name: candidate.name, skipReason: index.SkipReasonBinary}, nil
 	}
 	return fileContent{name: candidate.name, content: content}, nil
+}
+
+// folderOpenFile opens a folder file for reading; tests replace it to inject
+// read errors.
+var folderOpenFile = os.Open
+
+var errFolderFileGrew = errors.New("file grew beyond max size")
+
+// folderReadError is a read error that may pass (EMFILE, EIO, ESTALE, a
+// network timeout): the build stops and publishes nothing.
+type folderReadError struct {
+	path string
+	err  error
+}
+
+func (e *folderReadError) Error() string { return fmt.Sprintf("read %s: %v", e.path, e.err) }
+func (e *folderReadError) Unwrap() error { return e.err }
+
+// folderReadIsLasting reports a read error that the next search would see
+// again: the file stays searchable by name. Permissions heal through a ctime
+// change, which the state hash sees.
+func folderReadIsLasting(err error) bool {
+	return errors.Is(err, fs.ErrPermission) || errors.Is(err, errFolderFileGrew) ||
+		errors.Is(err, syscall.ENAMETOOLONG) || errors.Is(err, syscall.ELOOP) ||
+		errors.Is(err, syscall.EISDIR)
 }
 
 // readFolderFile reads one candidate. binary is true, with no content, when the
@@ -1527,7 +1023,7 @@ func readFolderFile(candidate folderCandidate) (content []byte, binary bool, err
 	if !documentContentFits(candidate.size) {
 		return nil, false, fmt.Errorf("file exceeds max size")
 	}
-	file, err := os.Open(candidate.path)
+	file, err := folderOpenFile(candidate.path)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1547,7 +1043,7 @@ func readFolderFile(candidate folderCandidate) (content []byte, binary bool, err
 		return nil, false, err
 	}
 	if extraN > 0 {
-		return nil, false, fmt.Errorf("file grew beyond max size")
+		return nil, false, errFolderFileGrew
 	}
 	return content, false, nil
 }

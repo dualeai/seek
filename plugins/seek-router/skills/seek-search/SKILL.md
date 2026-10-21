@@ -32,10 +32,10 @@ model-ranked result can lack one or more query words.
 
 | Flag | Effect |
 | --- | --- |
-| `-n N` | display at most N files (0 = all files returned within search bounds) |
+| `-n N` | display at most N files (0 = all returned files) |
 | `-m N` | display at most N matches per file (0 = all returned matches) |
-| `-A N` | N lines after each match (0-512) |
-| `-C N` | N lines before and after each match (0-512) |
+| `-A N` | N lines after each match |
+| `-C N` | N lines before and after each match |
 | `--lexical-only` | skip meaning-based indexing, search, and model ranking |
 
 Flags go before the query. Do not combine `-A` and `-C`.
@@ -63,38 +63,35 @@ seek -n 5 -m 2 -C 1 'validate search query syntax'
 seek 'find request parser lang:go -file:_test\.go$'
 ```
 
-Plain queries with two or more words can use the bundled local model. One clean
-Git worktree, one file, or one folder can also add matches based on code meaning.
-Other searches can still use the model to rank text matches.
+Plain queries with two or more words use the bundled local model: every
+searched folder and repository adds matches based on code meaning, and the
+model ranks them with the text matches. Filters (`lang:`, `file:`, `-file:`,
+`sym:`, `content:`, a path operand) apply to both. One-word queries, a lone
+quoted phrase, and `or` between descriptions use text ranking. The README
+"Support table" lists each query form.
 
-A description can include `lang:`, `file:`, and `-file:` filters. These filters
-stay active if Seek uses another search method. Exact identifiers, quoted
-phrases, one-word queries, other filters, Boolean alternatives, and general
-negation use text ranking.
-
-Seek considers at most 128 files for a description. Each text-search pass is
-limited to 10,000 matches and 60 seconds. These bounds are separate from `-n`.
 Meaning-based search is approximate. A result can contain none of the query
-words.
+words. A result that the model adds must pass its score threshold; files that
+contain every query word stay. With no result, Seek returns no output and exits
+with code 1. This does not prove absence. If the model fails, Seek returns the
+text matches.
 
-When no file contains every query word, Seek returns results that omit some
-query words only if the best model score is strong enough. Otherwise, it returns
-no output and exits with code 1. This does not prove absence. If the model fails,
-Seek returns results that contain every query word.
-
-Unless `--lexical-only` is set, Seek keeps its text and meaning-based indexes up
-to date. The first search of a large repository can take tens of seconds or
-longer and use several GiB of memory. Use `--lexical-only` to skip the
-meaning-based index and all model work.
+Unless `--lexical-only` is set, a description search keeps the text and
+meaning-based indexes up to date; other searches keep only the text index up to
+date. The first search of a large repository can take tens of seconds or
+longer and use several GiB of memory. A first routed `grep` on a large cold
+folder waits for the full text build, with no deadline. Use `--lexical-only`
+to skip the meaning-based index and all model work.
 
 ## Paths
 
-With no path, seek searches the current Git worktree. You can mix directories
-and exact files from inside or outside it. Across multiple roots, headers use
-absolute paths and a `[git]` or `[folder]` tag.
+With no path, seek searches the current folder, the same as `.`. You can mix
+directories and exact files from inside or outside it. A header is the path as
+you typed it plus the path below it; across several roots it also has a `[git]`
+or `[folder]` tag. `file:` and `-file:` match that same path.
 
 Path operands limit results. `file:` and `-file:` filters apply after indexing,
-so they do not reduce index size limits.
+so they do not change what Seek indexes.
 
 ## Pitfalls
 
@@ -106,9 +103,9 @@ so they do not reduce index size limits.
 
 ## When seek is the wrong tool
 
-By default, `-n 0` and `-m 0` display all results returned within Seek's search
-bounds. The router uses `-n 20 -m 3`. For every occurrence, such as for a rename,
-refactor, or call-site count, use grep directly:
+By default, `-n 0` and `-m 0` display all returned results. The router uses
+`-n 20 -m 3`. For every occurrence, such as for a rename, refactor, or
+call-site count, use grep directly:
 
 ```sh
 SEEK_ROUTER=off grep -rn 'PATTERN' .

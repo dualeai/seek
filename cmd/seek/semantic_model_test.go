@@ -39,18 +39,10 @@ func TestSemanticCPUParallelismProvidesCapacityForEffectiveCPU(t *testing.T) {
 }
 
 type countingSemanticScorer struct {
-	prepareCalls   atomic.Int32
-	scoreCalls     atomic.Int32
-	closeCalls     atomic.Int32
-	scoreMask      []bool
-	queryTruncated bool
-}
-
-func (*countingSemanticScorer) PackSemanticUnits(
-	_ context.Context,
-	units []semanticUnit,
-) ([]semanticUnit, error) {
-	return units, nil
+	prepareCalls atomic.Int32
+	scoreCalls   atomic.Int32
+	closeCalls   atomic.Int32
+	scoreMask    []bool
 }
 
 func (scorer *countingSemanticScorer) Scores(
@@ -93,7 +85,6 @@ func (scorer *countingSemanticScorer) PrepareSemanticQuery(
 	return &semanticQueryEmbedding{
 		modelQuery: query,
 		scoreMask:  scoreMask,
-		truncated:  scorer.queryTruncated,
 	}, nil
 }
 
@@ -115,8 +106,7 @@ func (*countingSemanticScorer) SemanticCallCPUs(context.Context) int { return 1 
 
 func TestSemanticModelFutureReusesOneQueryForRetrievalAndRerank(t *testing.T) {
 	scorer := &countingSemanticScorer{
-		scoreMask:      []bool{true, false, true},
-		queryTruncated: true,
+		scoreMask: []bool{true, false, true},
 	}
 	var factoryCalls atomic.Int32
 	future := newSemanticModelFuture(func(context.Context) (semanticModel, error) {
@@ -142,16 +132,13 @@ func TestSemanticModelFutureReusesOneQueryForRetrievalAndRerank(t *testing.T) {
 	}
 	wait.Wait()
 
-	batch, err := future.scores(
-		t.Context(),
-		"find request handler",
-		[]rerankDocument{{Text: "handler"}},
-	)
+	model, prepared, err := future.prepareQuery(t.Context(), "find request handler")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if batch.activeQueryTokens != 2 || !batch.queryTruncated || len(batch.values) != 1 {
-		t.Fatalf("score metadata=%+v", batch)
+	values, err := model.ScoresWithSemanticQuery(t.Context(), prepared, []rerankDocument{{Text: "handler"}})
+	if err != nil || len(values) != 1 || len(prepared.scoreMask) != 3 {
+		t.Fatalf("values=%v mask=%v err=%v", values, prepared.scoreMask, err)
 	}
 	if err := future.Close(); err != nil {
 		t.Fatal(err)

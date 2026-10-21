@@ -28,11 +28,12 @@ func TestRunSearchCommandEmbeddingFaultRecordsOnce(t *testing.T) {
 			scorer := &hybridTestScorer{embedErr: errDegenerateSemanticVector}
 
 			// Start with no index. Query preparation and final scoring still work
-			// when the vector build fails, so both lexical candidates can return.
+			// when the vector build fails, so the strict file returns; a relaxed
+			// match alone is no candidate.
 			output, err := runHybridTestSearch(t, "alpha beta", []string{root}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
 				return scorer, nil
 			})
-			if err != nil || !strings.Contains(output, "strict.go") || !strings.Contains(output, "relaxed.go") {
+			if err != nil || !strings.Contains(output, "strict.go") || strings.Contains(output, "relaxed.go") {
 				t.Fatalf("embedding fault fallback: output=%q error=%v", output, err)
 			}
 			if scorer.embedCalls.Load() != 1 || scorer.prepareCalls.Load() != 1 ||

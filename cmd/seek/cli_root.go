@@ -94,21 +94,23 @@ func newRootCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "seek [flags] <query> [path...]",
 		Short: "Ranked local code search with exact and descriptive queries",
-		Long: `Seek searches the current Git worktree or selected files and folders.
-Descriptions of two or more words can use the bundled local model to find and
-rank code by meaning.
+		Long: `Seek searches the current folder, the same as ".", or the selected files
+and folders, with each Git repository below them in Git's own view.
+Descriptions of two or more words use the bundled local model to find and rank
+code by meaning.
 
-Results are ranked, not exhaustive. A description considers at most 128 files.
-Each text-search pass is limited to 10,000 matches and 60 seconds. With -n 0,
-Seek displays every file returned within these bounds. Use an exhaustive search
-for counts, renames, and absence checks.
+Results are ranked, not exhaustive. Text search counts every match. With -n 0,
+Seek displays every returned file. Use an exhaustive search for counts,
+renames, and absence checks.
 
-If model-added results are too weak, Seek keeps results that contain every query
-word. If none remain, it prints nothing and exits with code 1. This does not
-prove absence.
+A result that the model adds must pass its score threshold; files that contain
+every query word stay. With no result, Seek prints nothing and exits with code
+1. This does not prove absence.
 
-The first search of a large repository can take tens of seconds and use several
-GiB while Seek builds text and meaning-based indexes. Use --lexical-only to skip
+The README "Support table" lists each query form and what Seek does with it.
+
+The first search of a large folder can take tens of seconds and use several GiB
+while Seek builds text and meaning-based indexes. Use --lexical-only to skip
 the meaning-based index and all model work.`,
 		Example: `  seek 'sym:Foo'              find definitions named Foo (ctags)
   seek 'lang:go func main'    rank Go files for this description
@@ -172,8 +174,8 @@ the meaning-based index and all model work.`,
 	cmd.Flags().BoolVar(&flags.lexicalOnly, "lexical-only", false, "text search only; skip the meaning-based index and model")
 	cmd.Flags().IntVarP(&flags.limit, "limit", "n", 0, "maximum files to display (0 = all returned files)")
 	cmd.Flags().IntVarP(&flags.maxMatches, "max-matches", "m", 0, "maximum matches per file (0 = all returned matches)")
-	cmd.Flags().IntVarP(&flags.afterContext, "after-context", "A", 0, "lines to display after each match (0–512)")
-	cmd.Flags().IntVarP(&flags.context, "context", "C", 0, "lines to display before and after each match (0–512)")
+	cmd.Flags().IntVarP(&flags.afterContext, "after-context", "A", 0, "lines to display after each match")
+	cmd.Flags().IntVarP(&flags.context, "context", "C", 0, "lines to display before and after each match")
 
 	// Version output keeps current format: `seek <ver>` with no doubling.
 	cmd.Version = strings.TrimPrefix(versionString(), "seek ")
@@ -198,13 +200,14 @@ the meaning-based index and all model work.`,
 	return cmd
 }
 
+// defaultSearchRunConfig returns the run config of policy. Only a policy with
+// semantic search gets the model factory.
 func defaultSearchRunConfig(policy searchPolicy) searchRunConfig {
 	config := searchRunConfig{policy: policy}
 	if !policy.semanticEnabled() {
 		return config
 	}
 	config.newModel = newLateOnSemanticModel
-	config.newAcceptancePolicies = defaultRerankAcceptancePolicies
 	return config
 }
 
@@ -212,6 +215,9 @@ func configureCLILogging(w io.Writer, verbose bool) {
 	slog.SetDefault(newCLILogger(w, verbose))
 }
 
+// selectSearchConfig sets flags.search from --after-context or --context, or
+// to the default. It rejects both flags together and a negative line count;
+// the count has no upper bound.
 func selectSearchConfig(cmd *cobra.Command, flags *cliFlags) error {
 	afterChanged := cmd.Flags().Changed("after-context")
 	contextChanged := cmd.Flags().Changed("context")
@@ -219,15 +225,15 @@ func selectSearchConfig(cmd *cobra.Command, flags *cliFlags) error {
 		return fmt.Errorf("--after-context and --context cannot be used together")
 	}
 	if afterChanged {
-		if flags.afterContext < 0 || flags.afterContext > maxSearchContextLines {
-			return fmt.Errorf("--after-context must be between 0 and %d, got %d", maxSearchContextLines, flags.afterContext)
+		if flags.afterContext < 0 {
+			return fmt.Errorf("--after-context must be 0 or more, got %d", flags.afterContext)
 		}
 		flags.search = explicitSearchConfig(flags.afterContext, true)
 		return nil
 	}
 	if contextChanged {
-		if flags.context < 0 || flags.context > maxSearchContextLines {
-			return fmt.Errorf("--context must be between 0 and %d, got %d", maxSearchContextLines, flags.context)
+		if flags.context < 0 {
+			return fmt.Errorf("--context must be 0 or more, got %d", flags.context)
 		}
 		flags.search = explicitSearchConfig(flags.context, false)
 		return nil

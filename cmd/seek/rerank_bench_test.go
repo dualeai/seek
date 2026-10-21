@@ -35,8 +35,8 @@ func BenchmarkCLIProcess(b *testing.B) {
 	fixture := filepath.Join(root, "fixture")
 	lexicalCache := filepath.Join(root, "lexical-cache")
 	semanticCache := filepath.Join(root, "semantic-cache")
-	// Use more than the model pool so the timed relaxed search also covers the
-	// candidate bound before deep result cloning.
+	// Write 256 files, twice the model batch: every file holds a query word,
+	// and five hold all three.
 	for i := range 256 {
 		terms := []string{"parse", "request", "handler"}
 		if i >= 5 {
@@ -63,8 +63,8 @@ func BenchmarkCLIProcess(b *testing.B) {
 	// retrieval can expand it before final scoring.
 	semanticExpansionArgs := []string{"candidate0 candidate_00", fixture}
 
-	// Keep the lexical-only no-model check independent from default searches,
-	// which can build semantic data even when a query is not eligible to rerank.
+	// Keep the lexical-only no-model check in its own cache, so the semantic
+	// data that default searches build cannot reach it.
 	output, err := runSeekBenchmarkCommand(
 		b.Context(), binary, lexicalCache, fixture, lexicalArgs, false,
 	)
@@ -199,7 +199,7 @@ func BenchmarkLateOnScoring_Top20(b *testing.B) {
 }
 
 func BenchmarkLateOnScoring_FullBatch(b *testing.B) {
-	benchmarkLateOnScoring(b, rerankCandidateLimit)
+	benchmarkLateOnScoring(b, semanticModelBatchRows)
 }
 
 func benchmarkLateOnScoring(b *testing.B, documentCount int) {
@@ -254,13 +254,6 @@ func BenchmarkSemanticModelPass100k(b *testing.B) {
 		}
 	})
 
-	// Real bulk work packs source units before embedding prepared rows.
-	if _, err := embedder.PackSemanticUnits(b.Context(), []semanticUnit{{
-		path: "benchmark.go", text: []byte("package benchmark\n"),
-	}}); err != nil {
-		b.Fatalf("prepare bulk tokenizers: %v", err)
-	}
-
 	const rowCount = 100_000
 	units := make([]semanticUnit, rowCount)
 	modelInputs := make([]int, rowCount*lateOnSequenceLength)
@@ -288,7 +281,7 @@ func BenchmarkSemanticModelPass100k(b *testing.B) {
 		for sequence := range batchCount {
 			start := sequence * semanticModelBatchRows
 			end := min(start+semanticModelBatchRows, len(units))
-			batches <- semanticBuildBatch{sequence: sequence, units: units[start:end]}
+			batches <- semanticBuildBatch{units: units[start:end]}
 		}
 		close(batches)
 		encoded := make(chan semanticEncodedBatch)
@@ -325,7 +318,7 @@ func BenchmarkLateOnDocumentTokenization_Top20Truncated(b *testing.B) {
 }
 
 func BenchmarkLateOnDocumentTokenization_FullBatchTruncated(b *testing.B) {
-	benchmarkLateOnDocumentTokenization(b, rerankCandidateLimit)
+	benchmarkLateOnDocumentTokenization(b, semanticModelBatchRows)
 }
 
 func benchmarkLateOnDocumentTokenization(b *testing.B, documentCount int) {

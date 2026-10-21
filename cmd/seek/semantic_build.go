@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -10,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	ctags "github.com/sourcegraph/go-ctags"
 	"github.com/sourcegraph/zoekt/index"
@@ -28,9 +31,8 @@ type semanticExtractedFile struct {
 }
 
 type semanticBuildBatch struct {
-	sequence int
-	units    []semanticUnit
-	owners   []*semanticBuildOwner
+	units  []semanticUnit
+	owners []*semanticBuildOwner
 }
 
 // semanticBuildOwner keeps one source file admitted until every model batch
@@ -64,20 +66,23 @@ func (owner *semanticBuildOwner) releaseIfDone() {
 }
 
 type semanticEncodedBatch struct {
-	sequence   int
 	units      []semanticUnit
 	embeddings []semanticUnitEmbedding
 	err        error
 }
 
-type semanticBuildOutput struct {
-	units           []semanticUnit
-	vectorsArtifact semanticSizedArtifact
-	err             error
+// semanticCopiedRow is a row whose vectors the build copies from a live
+// generation (semanticReuseIndex).
+type semanticCopiedRow struct {
+	row uint64
+	ref semanticReuseRef
 }
 
-type semanticCollectedBatch struct {
-	units []semanticUnit
+type semanticBuildOutput struct {
+	rows            uint64
+	vectorsArtifact semanticSizedArtifact
+	coarseArtifact  semanticSizedArtifact
+	err             error
 }
 
 type semanticCoarseBatch struct {
@@ -302,20 +307,25 @@ func (controller *semanticConcurrencyController) invalidateWindow() {
 
 // buildSemanticGitGeneration reads the same captured commit as the Zoekt
 // branch. Extraction keeps source order. Model completion order cannot change
-// row IDs or artifact bytes.
+// row IDs or artifact bytes. indexDir holds the node's previous generations,
+// whose rows the build copies.
 func buildSemanticGitGeneration(
 	ctx context.Context,
 	repoDir string,
 	snapshot gitSnapshot,
-	scope *gitDirtyScope,
+	indexDir string,
+	lineage string,
 	dir string,
 	source string,
 	embedder semanticModel,
 	resources searchResources,
+	missing *[]missingBlob,
 ) (semanticManifest, error) {
 	if err := requireNativeGitVersion(ctx, repoDir); err != nil {
 		return semanticManifest{}, err
 	}
+	reuse := loadSemanticReuse(indexDir, dir, lineage)
+	defer reuse.Close()
 	return buildSemanticGeneration(
 		ctx,
 		dir,
@@ -323,20 +333,28 @@ func buildSemanticGitGeneration(
 		embedder,
 		resources,
 		func(streamCtx context.Context) (<-chan fileContent, func() error) {
-			documents, result := streamNativeGitDocuments(streamCtx, repoDir, snapshot, scope)
-			return documents, func() error { return (<-result).err }
+			documents, result := streamNativeGitDocuments(streamCtx, repoDir, snapshot, missing)
+			return documents, func() error { return <-result }
 		},
+		reuse,
 	)
 }
 
+// buildSemanticFolderGeneration embeds the selected files of a folder node.
+// indexDir holds the node's previous generations, whose rows the build copies.
+// A read error that may pass fails the build, so the next search reads the
+// file again.
 func buildSemanticFolderGeneration(
 	ctx context.Context,
 	selected []folderCandidate,
+	indexDir string,
 	dir string,
 	source string,
 	embedder semanticModel,
 	resources searchResources,
 ) (semanticManifest, error) {
+	reuse := loadSemanticReuse(indexDir, dir, "")
+	defer reuse.Close()
 	return buildSemanticGeneration(
 		ctx,
 		dir,
@@ -344,9 +362,17 @@ func buildSemanticFolderGeneration(
 		embedder,
 		resources,
 		func(streamCtx context.Context) (<-chan fileContent, func() error) {
-			documents := streamFolderFiles(streamCtx, selected, resources.cpuLimit())
-			return documents, func() error { return nil }
+			readCtx, cancel := context.WithCancelCause(streamCtx)
+			documents := streamFolderFiles(readCtx, selected, resources.cpuLimit(), cancel)
+			return documents, func() error {
+				defer cancel(nil)
+				if readErr, ok := errors.AsType[*folderReadError](context.Cause(readCtx)); ok {
+					return readErr
+				}
+				return nil
+			}
 		},
+		reuse,
 	)
 }
 
@@ -357,6 +383,7 @@ func buildSemanticGeneration(
 	embedder semanticModel,
 	resources searchResources,
 	documentSource semanticDocumentSource,
+	reuse *semanticReuseIndex,
 ) (semanticManifest, error) {
 	started := time.Now()
 	if embedder == nil || documentSource == nil {
@@ -387,6 +414,15 @@ func buildSemanticGeneration(
 			parser.Close()
 		}
 	}()
+	tokenizers, err := takeSemanticWindowTokenizers(ctx, workerCount)
+	if err != nil {
+		return semanticManifest{}, err
+	}
+	defer func() {
+		for _, tokenizer := range tokenizers {
+			lateOnTokenizers.release(tokenizer)
+		}
+	}()
 
 	buildCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -400,7 +436,8 @@ func buildSemanticGeneration(
 	go dispatchSemanticDocuments(buildCtx, documents, jobs, dispatchDone)
 
 	var extractWait sync.WaitGroup
-	for _, parser := range parsers {
+	for worker, parser := range parsers {
+		tokenizer := tokenizers[worker]
 		extractWait.Add(1)
 		go func(parser semanticTagParser) {
 			defer extractWait.Done()
@@ -410,7 +447,8 @@ func buildSemanticGeneration(
 				parser,
 				checker,
 				indexOptions,
-				embedder,
+				tokenizer,
+				reuse,
 				resources,
 				jobs,
 				extracted,
@@ -433,13 +471,22 @@ func buildSemanticGeneration(
 		cancel,
 		resources.withModelCallCost(semanticModelCallCPUs(buildCtx, embedder)),
 	)
-	coarseReady := make(chan semanticCoarseBatch)
+	// An overlay gets no USearch graph: its search scores every row with the
+	// exact fine vectors, and the graph would be half the cost of a save.
+	var coarseReady chan semanticCoarseBatch
 	usearchBuilt := make(chan semanticUSearchBuildResult, 1)
-	go buildSemanticUSearchStream(buildCtx, dir, coarseReady, cancel, resources, usearchBuilt)
+	if semanticSourceHasGraph(source) {
+		coarseReady = make(chan semanticCoarseBatch)
+		go buildSemanticUSearchStream(buildCtx, dir, coarseReady, cancel, resources, usearchBuilt)
+	} else {
+		usearchBuilt <- semanticUSearchBuildResult{}
+	}
+	copied := make(chan []semanticCopiedRow)
 	collected := make(chan semanticBuildOutput, 1)
 	go collectSemanticBatches(
 		encoded,
-		filepath.Join(dir, semanticVectorsFile),
+		copied,
+		dir,
 		coarseReady,
 		cancel,
 		collected,
@@ -447,17 +494,17 @@ func buildSemanticGeneration(
 
 	nextFile := 0
 	nextRow := uint64(0)
-	batchSequence := 0
 	pending := make(map[int]semanticExtractedFile, workerCount)
 	pendingBatch := semanticBuildBatch{}
+	var pendingCopy []semanticCopiedRow
+	// rows is the stored metadata of every row, in row order.
+	var rows []semanticUnit
 	failed := false
 	var extractionErr error
 	sendBatch := func() {
 		if len(pendingBatch.units) == 0 {
 			return
 		}
-		pendingBatch.sequence = batchSequence
-		batchSequence++
 		select {
 		case batches <- pendingBatch:
 		case <-buildCtx.Done():
@@ -465,6 +512,17 @@ func buildSemanticGeneration(
 			failed = true
 		}
 		pendingBatch = semanticBuildBatch{}
+	}
+	sendCopy := func() {
+		if len(pendingCopy) == 0 {
+			return
+		}
+		select {
+		case copied <- pendingCopy:
+		case <-buildCtx.Done():
+			failed = true
+		}
+		pendingCopy = nil
 	}
 
 	for result := range extracted {
@@ -497,6 +555,9 @@ func buildSemanticGeneration(
 			for index := range ready.units {
 				ready.units[index].row = nextRow
 				nextRow++
+				stored := ready.units[index]
+				stored.text, stored.modelInput, stored.reuse = nil, nil, nil
+				rows = append(rows, stored)
 			}
 			if len(ready.units) == 0 {
 				if ready.weight > 0 {
@@ -504,18 +565,36 @@ func buildSemanticGeneration(
 				}
 				continue
 			}
+			// A copied row needs no model call; the file's bytes stay held
+			// only while a model batch reads a view of them.
 			owner := &semanticBuildOwner{weight: ready.weight}
-			for len(ready.units) > 0 && !failed {
-				count := min(len(ready.units), semanticModelBatchRows-len(pendingBatch.units))
-				owner.retain()
-				pendingBatch.owners = append(pendingBatch.owners, owner)
-				pendingBatch.units = append(pendingBatch.units, ready.units[:count]...)
-				ready.units = ready.units[count:]
+			retained := false
+			for _, unit := range ready.units {
+				if failed {
+					break
+				}
+				if unit.reuse != nil {
+					pendingCopy = append(pendingCopy, semanticCopiedRow{row: unit.row, ref: *unit.reuse})
+					if len(pendingCopy) == semanticModelBatchRows {
+						sendCopy()
+					}
+					continue
+				}
+				if !retained {
+					owner.retain()
+					pendingBatch.owners = append(pendingBatch.owners, owner)
+					retained = true
+				}
+				pendingBatch.units = append(pendingBatch.units, unit)
 				if len(pendingBatch.units) == semanticModelBatchRows {
 					sendBatch()
+					retained = false
 				}
 			}
 			owner.seal()
+			// Copied rows of a file go now, so the USearch stream gets full
+			// blocks while the model runs.
+			sendCopy()
 			if failed {
 				break
 			}
@@ -533,10 +612,12 @@ func buildSemanticGeneration(
 	elapsedToExtractionDrain := time.Since(started)
 	if !failed {
 		sendBatch()
+		sendCopy()
 	} else {
 		releaseSemanticBuildBatch(pendingBatch)
 	}
 	close(batches)
+	close(copied)
 	output := <-collected
 	usearchOutput := <-usearchBuilt
 	elapsedToModelAndUSearch := time.Since(started)
@@ -563,10 +644,10 @@ func buildSemanticGeneration(
 	if output.err != nil {
 		return semanticManifest{}, output.err
 	}
-	if uint64(len(output.units)) != nextRow {
+	if output.rows != nextRow || uint64(len(rows)) != nextRow {
 		return semanticManifest{}, fmt.Errorf(
-			"semantic model completed %d rows, want %d",
-			len(output.units),
+			"semantic build completed %d rows, want %d",
+			output.rows,
 			nextRow,
 		)
 	}
@@ -578,15 +659,16 @@ func buildSemanticGeneration(
 		ctx,
 		dir,
 		source,
-		output.units,
+		rows,
 		output.vectorsArtifact,
+		output.coarseArtifact,
 		usearchOutput.shards,
 	)
 	if err == nil {
 		slog.Debug(
 			"Built semantic index",
 			"files", dispatched,
-			"rows", len(output.units),
+			"rows", len(rows),
 			"elapsed_to_extraction_drain", elapsedToExtractionDrain,
 			"elapsed_to_model_and_usearch", elapsedToModelAndUSearch,
 			"write", time.Since(writeStarted),
@@ -594,6 +676,27 @@ func buildSemanticGeneration(
 		)
 	}
 	return manifest, err
+}
+
+// takeSemanticWindowTokenizers takes one tokenizer per extraction worker for
+// the window split, building the missing ones at the same time.
+func takeSemanticWindowTokenizers(ctx context.Context, count int) ([]*lateOnTokenizer, error) {
+	tokenizers := make([]*lateOnTokenizer, count)
+	errs := make([]error, count)
+	var wait sync.WaitGroup
+	for index := range tokenizers {
+		wait.Go(func() {
+			tokenizers[index], errs[index] = lateOnTokenizers.take(ctx)
+		})
+	}
+	wait.Wait()
+	if err := errors.Join(errs...); err != nil {
+		for _, tokenizer := range tokenizers {
+			lateOnTokenizers.release(tokenizer)
+		}
+		return nil, fmt.Errorf("start semantic window tokenizer: %w", err)
+	}
+	return tokenizers, nil
 }
 
 func dispatchSemanticDocuments(
@@ -630,7 +733,8 @@ func extractSemanticDocuments(
 	parser semanticTagParser,
 	checker *index.DocChecker,
 	indexOptions index.Options,
-	packer semanticModel,
+	tokenizer *lateOnTokenizer,
+	reuse *semanticReuseIndex,
 	resources searchResources,
 	jobs <-chan semanticSourceDocument,
 	results chan<- semanticExtractedFile,
@@ -645,24 +749,27 @@ func extractSemanticDocuments(
 			}
 			return
 		}
-		var entries []*ctags.Entry
-		var parseErr error
-		eligible := semanticContentIsEligible(document.content)
-		if eligible {
-			entries, parseErr = parser.Parse(document.name, document.content)
-		}
 		var units []semanticUnit
-		if eligible {
-			fileLanguage := semanticDocumentLanguage(checker, indexOptions, document)
-			units = extractEligibleSemanticUnits(
-				document.name, document.content, entries, parseErr, fileLanguage,
-			)
-		}
 		var packErr error
-		if len(units) > 0 {
-			units, packErr = packer.PackSemanticUnits(ctx, units)
-			if packErr != nil {
-				cancel()
+		if semanticContentIsEligible(document.content) {
+			contentID := semanticContentID(sha256.Sum256(document.content))
+			var reused bool
+			// A file that a live generation holds under the same path tail
+			// and content copies its rows with no parse and no tokenization.
+			if units, reused = reuse.fileRows(document.name, contentID); !reused {
+				entries, parseErr := parser.Parse(document.name, document.content)
+				fileLanguage := semanticDocumentLanguage(checker, indexOptions, document)
+				units = extractSemanticUnitsWithID(
+					document.name, document.content, contentID, entries, parseErr, fileLanguage,
+				)
+				if len(units) > 0 {
+					units, packErr = windowSemanticUnits(ctx, tokenizer, units)
+				}
+				if packErr != nil {
+					cancel()
+				} else {
+					reuse.markReused(units)
+				}
 			}
 		}
 		cpu.release()
@@ -757,11 +864,13 @@ func encodeSemanticBatches(
 		maxActive = max(maxActive, active)
 		controller.noteActive(active, resources.currentTime())
 		go func() {
-			defer cpu.release()
 			embeddings, err := embedder.EmbedSemanticUnits(ctx, batch.units)
+			// Give the lease back before the send: the loop of another build of
+			// the command can wait for CPU while this result waits for this
+			// loop.
+			cpu.release()
 			releaseSemanticBuildBatch(batch)
 			completed <- semanticEncodedBatch{
-				sequence:   batch.sequence,
 				units:      batch.units,
 				embeddings: embeddings,
 				err:        err,
@@ -863,14 +972,18 @@ func encodeSemanticBatches(
 	)
 }
 
-// collectSemanticBatches writes out-of-order model batches at their fixed row
-// offsets and restores row order in its output. It sends coarse vectors only
-// after the fine-vector write succeeds. On the first collector error, it keeps
-// that error, cancels shared build work, and drains encoded until the producer
-// closes it.
+// collectSemanticBatches writes each row's fine and coarse vectors at the
+// row's offset: rows that the model embedded, out of order, and rows copied
+// from a live generation. It sends the coarse vectors of each complete
+// 128-row block to the USearch stream after its writes succeed. Both paths
+// store the coarse vectors as SNORM16 and send their decoded values, so a
+// copied row gives the same bytes as an embedded one. On the first collector
+// error, it keeps that error, cancels shared build work, and drains both
+// inputs until their producers close them.
 func collectSemanticBatches(
 	encoded <-chan semanticEncodedBatch,
-	vectorsPath string,
+	copied <-chan []semanticCopiedRow,
+	dir string,
 	coarseReady chan<- semanticCoarseBatch,
 	cancel context.CancelFunc,
 	done chan<- semanticBuildOutput,
@@ -885,128 +998,295 @@ func collectSemanticBatches(
 			cancel()
 		}
 	}
-	batches := make(map[int]semanticCollectedBatch)
-	maxSequence := -1
-	totalRows := 0
-	maxBatches := (semanticMaxRows + semanticModelBatchRows - 1) / semanticModelBatchRows
-	vectorFile, err := os.OpenFile(vectorsPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
+	writer, err := newSemanticRowWriter(dir)
+	fail(err)
+	for encoded != nil || copied != nil {
+		select {
+		case batch, ok := <-encoded:
+			if !ok {
+				encoded = nil
+				continue
+			}
+			for index := range batch.units {
+				batch.units[index].text = nil
+				batch.units[index].modelInput = nil
+			}
+			if output.err != nil {
+				continue
+			}
+			if batch.err != nil {
+				fail(batch.err)
+				continue
+			}
+			if len(batch.units) == 0 || len(batch.units) != len(batch.embeddings) ||
+				len(batch.units) > semanticModelBatchRows {
+				fail(fmt.Errorf("semantic model batch has mismatched rows"))
+				continue
+			}
+			fail(writer.writeEmbedded(batch.units, batch.embeddings, coarseReady))
+		case rows, ok := <-copied:
+			if !ok {
+				copied = nil
+				continue
+			}
+			if output.err == nil {
+				fail(writer.writeCopied(rows, coarseReady))
+			}
+		}
+	}
+	if writer != nil {
+		var err error
+		output.rows, output.vectorsArtifact, output.coarseArtifact, err = writer.finish(output.err == nil, coarseReady)
 		fail(err)
 	}
-	vectorBuffer := make([]byte, semanticModelBatchRows*semanticFineVectorBytesPerUnit)
-	for batch := range encoded {
-		for index := range batch.units {
-			batch.units[index].text = nil
-			batch.units[index].modelInput = nil
-		}
-		if output.err != nil {
-			continue
-		}
-		if batch.err != nil {
-			fail(batch.err)
-			continue
-		}
-		if batch.sequence < 0 || batch.sequence >= maxBatches {
-			fail(fmt.Errorf("semantic model batch %d exceeds limit", batch.sequence))
-			continue
-		}
-		if _, exists := batches[batch.sequence]; exists {
-			fail(fmt.Errorf("semantic model batch %d was repeated", batch.sequence))
-			continue
-		}
-		if len(batch.units) == 0 || len(batch.units) != len(batch.embeddings) ||
-			len(batch.units) > semanticModelBatchRows {
-			fail(fmt.Errorf("semantic model batch %d has mismatched rows", batch.sequence))
-			continue
-		}
-		start := batch.sequence * semanticModelBatchRows
-		for index, unit := range batch.units {
-			wantRow := start + index
-			if unit.row != uint64(wantRow) || wantRow >= semanticMaxRows {
-				fail(fmt.Errorf(
-					"semantic model batch %d row %d is %d, want %d",
-					batch.sequence,
-					index,
-					unit.row,
-					wantRow,
-				))
-				break
-			}
-		}
-		if output.err != nil {
-			continue
-		}
-		encodedVectors, err := encodeSemanticFineVectors(vectorBuffer, batch.embeddings, start)
-		if err != nil {
-			fail(err)
-			continue
-		}
-		offset := int64(start * semanticFineVectorBytesPerUnit)
-		written, err := vectorFile.WriteAt(encodedVectors, offset)
-		if err != nil || written != len(encodedVectors) {
-			if err == nil {
-				err = fmt.Errorf("semantic vector write was short")
-			}
-			fail(err)
-			continue
-		}
-		coarse := make([]semanticCoarseVectors, len(batch.embeddings))
-		for row := range batch.embeddings {
-			coarse[row] = batch.embeddings[row].coarse
-		}
-		batches[batch.sequence] = semanticCollectedBatch{units: batch.units}
-		if coarseReady != nil {
-			coarseReady <- semanticCoarseBatch{sequence: batch.sequence, coarse: coarse}
-		}
-		maxSequence = max(maxSequence, batch.sequence)
-		totalRows += len(batch.units)
-	}
-	if output.err == nil && len(batches) > 0 {
-		if len(batches) != maxSequence+1 {
-			for sequence := range maxSequence + 1 {
-				if _, exists := batches[sequence]; !exists {
-					fail(fmt.Errorf("semantic model batch %d did not complete", sequence))
-					break
-				}
-			}
-		}
-	}
-	if output.err == nil {
-		output.units = make([]semanticUnit, 0, totalRows)
-		for sequence := range maxSequence + 1 {
-			batch := batches[sequence]
-			if sequence < maxSequence && len(batch.units) != semanticModelBatchRows {
-				fail(fmt.Errorf(
-					"semantic model batch %d has %d rows, want %d",
-					sequence,
-					len(batch.units),
-					semanticModelBatchRows,
-				))
-				break
-			}
-			output.units = append(output.units, batch.units...)
-		}
-	}
-	if vectorFile != nil {
-		if output.err == nil {
-			wantBytes, sizeOK := checkedSemanticVectorBytes(uint64(totalRows))
-			if !sizeOK {
-				fail(fmt.Errorf("semantic vector size is invalid"))
-			} else if truncateErr := vectorFile.Truncate(int64(wantBytes)); truncateErr != nil {
-				fail(truncateErr)
-			} else {
-				output.vectorsArtifact = semanticSizedArtifact{Bytes: wantBytes}
-			}
-		}
-		if closeErr := vectorFile.Close(); output.err == nil && closeErr != nil {
-			fail(closeErr)
-		}
-	}
 	done <- output
+}
+
+// semanticRowWriter places vectors at row offsets and tracks which rows and
+// 128-row coarse blocks are complete.
+type semanticRowWriter struct {
+	fine   *os.File
+	coarse *os.File
+	seen   []bool
+	rows   uint64
+	blocks map[uint64]*semanticCoarseBlock
+	buffer []byte
+}
+
+type semanticCoarseBlock struct {
+	count  int
+	coarse [semanticModelBatchRows]semanticCoarseVectors
+}
+
+// newSemanticRowWriter creates the fine and coarse vector files of a new
+// generation in dir. It fails when either file exists.
+func newSemanticRowWriter(dir string) (*semanticRowWriter, error) {
+	fine, err := os.OpenFile(filepath.Join(dir, semanticVectorsFile), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	coarse, err := os.OpenFile(filepath.Join(dir, semanticCoarseFile), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		_ = fine.Close()
+		return nil, err
+	}
+	return &semanticRowWriter{fine: fine, coarse: coarse, blocks: make(map[uint64]*semanticCoarseBlock)}, nil
+}
+
+// writeEmbedded encodes and writes the vectors that the model gave units.
+func (w *semanticRowWriter) writeEmbedded(
+	units []semanticUnit,
+	embeddings []semanticUnitEmbedding,
+	coarseReady chan<- semanticCoarseBatch,
+) error {
+	return w.writeRuns(len(units), func(i int) uint64 { return units[i].row }, func(i int, fine, coarse []byte) (semanticCoarseSNORM16Vectors, error) {
+		encoded, err := encodeSemanticFineVectors(fine, embeddings[i:i+1], int(units[i].row))
+		if err != nil || len(encoded) != semanticFineVectorBytesPerUnit {
+			return semanticCoarseSNORM16Vectors{}, errors.Join(err, fmt.Errorf("semantic row %d fine vectors", units[i].row))
+		}
+		var stored semanticCoarseSNORM16Vectors
+		for centroid := range embeddings[i].coarse {
+			if stored[centroid], err = encodeSemanticSNORM16Vector(&embeddings[i].coarse[centroid]); err != nil {
+				return stored, fmt.Errorf("semantic row %d coarse centroid %d: %w", units[i].row, centroid, err)
+			}
+		}
+		putSemanticCoarse(coarse, &stored)
+		return stored, nil
+	}, coarseReady)
+}
+
+// writeCopied writes the stored vectors that each copied row refers to.
+func (w *semanticRowWriter) writeCopied(rows []semanticCopiedRow, coarseReady chan<- semanticCoarseBatch) error {
+	return w.writeRuns(len(rows), func(i int) uint64 { return rows[i].row }, func(i int, fine, coarse []byte) (semanticCoarseSNORM16Vectors, error) {
+		ref := rows[i].ref
+		if ref.record == nil && (ref.generation == nil || ref.row >= uint64(len(ref.generation.vectors)) ||
+			ref.row >= uint64(len(ref.generation.coarse))) {
+			return semanticCoarseSNORM16Vectors{}, fmt.Errorf("semantic row %d copies a missing row", rows[i].row)
+		}
+		// The mapped rows and store records are little-endian bytes
+		// (mapSemanticVectors): copy them as they are.
+		sourceFine, sourceCoarse := ref.vectors()
+		copy(fine, unsafe.Slice((*byte)(unsafe.Pointer(sourceFine)), semanticFineVectorBytesPerUnit))
+		stored := *sourceCoarse
+		copy(coarse, unsafe.Slice((*byte)(unsafe.Pointer(&stored)), semanticCoarseVectorBytesPerUnit))
+		return stored, nil
+	}, coarseReady)
+}
+
+// writeRuns encodes count rows and writes each run of consecutive rows with
+// one write per file.
+func (w *semanticRowWriter) writeRuns(
+	count int,
+	rowOf func(int) uint64,
+	encode func(i int, fine, coarse []byte) (semanticCoarseSNORM16Vectors, error),
+	coarseReady chan<- semanticCoarseBatch,
+) error {
+	if w == nil {
+		return fmt.Errorf("semantic vector files are unavailable")
+	}
+	const fineBytes, coarseBytes = semanticFineVectorBytesPerUnit, semanticCoarseVectorBytesPerUnit
+	if need := count * (fineBytes + coarseBytes); cap(w.buffer) < need {
+		w.buffer = make([]byte, need)
+	}
+	fine := w.buffer[:count*fineBytes]
+	coarse := w.buffer[count*fineBytes : count*(fineBytes+coarseBytes)]
+	stored := make([]semanticCoarseSNORM16Vectors, count)
+	for i := range count {
+		var err error
+		if stored[i], err = encode(i, fine[i*fineBytes:(i+1)*fineBytes], coarse[i*coarseBytes:(i+1)*coarseBytes]); err != nil {
+			return err
+		}
+	}
+	for first := 0; first < count; {
+		last := first + 1
+		for last < count && rowOf(last) == rowOf(last-1)+1 {
+			last++
+		}
+		row := rowOf(first)
+		if err := writeSemanticAt(w.fine, fine[first*fineBytes:last*fineBytes], row*fineBytes); err != nil {
+			return err
+		}
+		if err := writeSemanticAt(w.coarse, coarse[first*coarseBytes:last*coarseBytes], row*coarseBytes); err != nil {
+			return err
+		}
+		first = last
+	}
+	for i := range count {
+		if err := w.complete(rowOf(i), &stored[i], coarseReady); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeSemanticAt(file *os.File, data []byte, offset uint64) error {
+	written, err := file.WriteAt(data, int64(offset))
+	if err == nil && written != len(data) {
+		err = fmt.Errorf("semantic vector write was short")
+	}
+	return err
+}
+
+func putSemanticCoarse(dst []byte, stored *semanticCoarseSNORM16Vectors) {
+	at := 0
+	for centroid := range stored {
+		for dimension := range stored[centroid] {
+			binary.LittleEndian.PutUint16(dst[at:at+2], uint16(stored[centroid][dimension]))
+			at += 2
+		}
+	}
+}
+
+// complete records one written row and sends its 128-row block to the
+// USearch stream when the block is full.
+func (w *semanticRowWriter) complete(row uint64, stored *semanticCoarseSNORM16Vectors, coarseReady chan<- semanticCoarseBatch) error {
+	for uint64(len(w.seen)) <= row {
+		w.seen = append(w.seen, false)
+	}
+	if w.seen[row] {
+		return fmt.Errorf("semantic row %d was written twice", row)
+	}
+	w.seen[row] = true
+	w.rows++
+	sequence := row / semanticModelBatchRows
+	block := w.blocks[sequence]
+	if block == nil {
+		block = &semanticCoarseBlock{}
+		w.blocks[sequence] = block
+	}
+	for centroid := range stored {
+		block.coarse[row%semanticModelBatchRows][centroid] = decodeSemanticSNORM16Vector(stored[centroid])
+	}
+	block.count++
+	if block.count == semanticModelBatchRows {
+		delete(w.blocks, sequence)
+		if coarseReady != nil {
+			coarseReady <- semanticCoarseBatch{sequence: int(sequence), coarse: block.coarse[:]}
+		}
+	}
+	return nil
+}
+
+// finish checks that every row from 0 was written, sends the last short
+// block, sizes both files, and closes them.
+func (w *semanticRowWriter) finish(ok bool, coarseReady chan<- semanticCoarseBatch) (uint64, semanticSizedArtifact, semanticSizedArtifact, error) {
+	var err error
+	if ok {
+		if uint64(len(w.seen)) != w.rows {
+			err = fmt.Errorf("semantic build wrote %d of %d rows", w.rows, len(w.seen))
+		} else if len(w.blocks) > 1 {
+			err = fmt.Errorf("semantic build left %d coarse blocks short", len(w.blocks))
+		}
+		for sequence, block := range w.blocks {
+			if err == nil && (sequence+1)*semanticModelBatchRows < w.rows {
+				err = fmt.Errorf("semantic coarse block %d is short", sequence)
+			}
+			if err == nil && coarseReady != nil {
+				coarseReady <- semanticCoarseBatch{sequence: int(sequence), coarse: block.coarse[:block.count]}
+			}
+		}
+	}
+	fineBytes, fineOK := checkedSemanticVectorBytes(w.rows)
+	coarseBytes, coarseOK := checkedSemanticCoarseBytes(w.rows)
+	if ok && err == nil && (!fineOK || !coarseOK) {
+		err = fmt.Errorf("semantic vector size is invalid")
+	}
+	if ok && err == nil {
+		err = errors.Join(w.fine.Truncate(int64(fineBytes)), w.coarse.Truncate(int64(coarseBytes)))
+	}
+	err = errors.Join(err, w.fine.Close(), w.coarse.Close())
+	return w.rows, semanticSizedArtifact{Bytes: fineBytes}, semanticSizedArtifact{Bytes: coarseBytes}, err
 }
 
 func releaseSemanticBuildBatch(batch semanticBuildBatch) {
 	for _, owner := range batch.owners {
 		owner.done()
 	}
+}
+
+// buildSemanticOverlayGeneration embeds the work-tree bytes of a Git node's
+// dirty files. Each file is read once, and its windows are keyed by the bytes
+// read: a window that a live generation or the unit store holds is copied, not
+// embedded again. Deleted files have no rows; the base rows of every dirty
+// path are masked at the read.
+func buildSemanticOverlayGeneration(
+	ctx context.Context,
+	repoDir string,
+	indexDir string,
+	lineage string,
+	dir string,
+	source string,
+	files []string,
+	embedder semanticModel,
+	resources searchResources,
+	base string,
+) (semanticManifest, error) {
+	// base is the staged base generation of the same build, or "": the
+	// overlay reuses its windows, so a modified file embeds only its changed
+	// windows.
+	var extra []string
+	if base != "" {
+		extra = append(extra, base)
+	}
+	reuse := loadSemanticReuse(indexDir, dir, lineage, extra...)
+	defer reuse.Close()
+	return buildSemanticGeneration(
+		ctx,
+		dir,
+		source,
+		embedder,
+		resources,
+		func(streamCtx context.Context) (<-chan fileContent, func() error) {
+			readCtx, cancel := context.WithCancelCause(streamCtx)
+			documents := streamDirtyFiles(readCtx, repoDir, files, resources.cpuLimit(), &dirtyFailure{stop: cancel})
+			return documents, func() error {
+				defer cancel(nil)
+				if readErr, ok := errors.AsType[*folderReadError](context.Cause(readCtx)); ok {
+					return readErr
+				}
+				return nil
+			}
+		},
+		reuse,
+	)
 }

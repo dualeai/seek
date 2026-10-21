@@ -7,14 +7,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSemanticModelCompatibilityCoversModelAndTokenizer(t *testing.T) {
@@ -120,37 +121,37 @@ func writeTestSemanticGeneration(
 		start := sequence * semanticModelBatchRows
 		end := min(start+semanticModelBatchRows, len(units))
 		encoded <- semanticEncodedBatch{
-			sequence:   sequence,
 			units:      append([]semanticUnit(nil), units[start:end]...),
 			embeddings: embeddings[start:end],
 		}
 	}
 	close(encoded)
+	copied := make(chan []semanticCopiedRow)
+	close(copied)
 	done := make(chan semanticBuildOutput, 1)
 	buildCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	collectSemanticBatches(
-		encoded,
-		filepath.Join(dir, semanticVectorsFile),
-		nil,
-		cancel,
-		done,
-	)
+	collectSemanticBatches(encoded, copied, dir, nil, cancel, done)
 	output := <-done
 	if output.err != nil {
 		return semanticManifest{}, output.err
 	}
 
-	shards, err := writeTestUSearchShard(dir, len(units))
-	if err != nil {
-		return semanticManifest{}, err
+	// An overlay holds no USearch graph, as the build makes it.
+	var shards []semanticUSearchShard
+	if semanticSourceHasGraph(source) {
+		var err error
+		if shards, err = writeTestUSearchShard(dir, len(units)); err != nil {
+			return semanticManifest{}, err
+		}
 	}
 	return writeSemanticGenerationFromParts(
 		buildCtx,
 		dir,
 		source,
-		output.units,
+		units,
 		output.vectorsArtifact,
+		output.coarseArtifact,
 		shards,
 	)
 }
@@ -170,7 +171,12 @@ func writeTestUSearchShard(dir string, rows int) ([]semanticUSearchShard, error)
 	if err != nil {
 		return nil, err
 	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
 	return []semanticUSearchShard{{
+		Check:            semanticRowsCheckOf(info),
 		Name:             name,
 		Start:            0,
 		Rows:             uint64(rows),
@@ -186,7 +192,7 @@ func TestSemanticGenerationRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Format != 5 || manifest.Rows != 1 || manifest.Dimensions != 48 ||
+	if manifest.Format != 6 || manifest.Rows != 1 || manifest.Dimensions != 48 ||
 		manifest.VectorCodec != "snorm16-le-rne-s32767-v1" ||
 		manifest.VectorStride != 1_920 {
 		t.Fatalf("manifest=%+v", manifest)
@@ -203,7 +209,14 @@ func TestSemanticGenerationRoundTrip(t *testing.T) {
 	if !reflect.DeepEqual(got.rows, wantRows) {
 		t.Fatalf("rows changed:\nwant=%+v\ngot=%+v", wantRows, got.rows)
 	}
-	wantVectors := testSemanticFineVectors(embeddings)
+	// The golden codes: -0.5, 0.5 and sqrt(0.5) times 32767, rounded half to
+	// even, then 1 and -1 at full scale (TestSemanticSNORM16LittleEndianGolden).
+	wantVectors := make([]semanticFineSNORM16Vectors, 1)
+	wantVectors[0][0][0], wantVectors[0][0][1], wantVectors[0][0][2] = -16_384, 16_384, 23_170
+	for centroid := 1; centroid < 19; centroid++ {
+		wantVectors[0][centroid][centroid] = 32_767
+	}
+	wantVectors[0][19][47] = -32_767
 	if !reflect.DeepEqual(got.vectors, wantVectors) {
 		t.Fatalf("vectors changed: want=%v got=%v", wantVectors, got.vectors)
 	}
@@ -249,7 +262,7 @@ func BenchmarkReadSemanticRows(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		decoded, err := readSemanticRowsFrom(bytes.NewReader(encoded), 4_096)
+		decoded, err := readSemanticRowsFrom(bytes.NewReader(encoded), 4_096, true)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -337,6 +350,10 @@ func writeSemanticOpenBenchmarkGeneration(
 	if err := vectorsFile.Close(); err != nil {
 		b.Fatal(err)
 	}
+	coarseBytes, _ := checkedSemanticCoarseBytes(uint64(rowCount))
+	if err := os.WriteFile(filepath.Join(dir, semanticCoarseFile), make([]byte, coarseBytes), 0o600); err != nil {
+		b.Fatal(err)
+	}
 	const shardRows = 4_096
 	shardCount := (rowCount + shardRows - 1) / shardRows
 	shards := make([]semanticUSearchShard, shardCount)
@@ -358,7 +375,8 @@ func writeSemanticOpenBenchmarkGeneration(
 		}
 	}
 	if _, err := writeSemanticGenerationFromParts(
-		b.Context(), dir, source, units, semanticSizedArtifact{Bytes: vectorBytes}, shards,
+		b.Context(), dir, source, units, semanticSizedArtifact{Bytes: vectorBytes},
+		semanticSizedArtifact{Bytes: coarseBytes}, shards,
 	); err != nil {
 		b.Fatal(err)
 	}
@@ -395,17 +413,6 @@ func semanticRowsBenchmarkFixture(b *testing.B) ([]byte, semanticArtifact) {
 	return encoded, artifact
 }
 
-type semanticCountingReader struct {
-	reader io.Reader
-	bytes  int
-}
-
-func (reader *semanticCountingReader) Read(buffer []byte) (int, error) {
-	read, err := reader.reader.Read(buffer)
-	reader.bytes += read
-	return read, err
-}
-
 func TestReadVerifiedSemanticRowsReadsInputOnce(t *testing.T) {
 	rows := []semanticUnit{{
 		row: 0, path: "main.go", start: 1, end: 2, kind: semanticUnitSymbol,
@@ -426,7 +433,7 @@ func TestReadVerifiedSemanticRowsReadsInputOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(decoded) != 1 || reader.bytes != len(encoded) {
+	if len(decoded) != 1 || reader.bytes != int64(len(encoded)) {
 		t.Fatalf("decoded rows=%d bytes=%d, want 1 and %d", len(decoded), reader.bytes, len(encoded))
 	}
 }
@@ -654,7 +661,10 @@ func TestDecodeSemanticManifestRejectsUnknownAndDuplicateFields(t *testing.T) {
 	}
 }
 
-func TestValidateSemanticManifestChecksMinimumRowsLength(t *testing.T) {
+// testLargeSemanticManifest returns a valid manifest of rows rows, with one
+// USearch shard entry per 4,096 rows.
+func testLargeSemanticManifest(t *testing.T, rows uint64) semanticManifest {
+	t.Helper()
 	manifest := semanticManifest{
 		Format:         semanticFormatVersion,
 		Source:         "head",
@@ -664,14 +674,52 @@ func TestValidateSemanticManifestChecksMinimumRowsLength(t *testing.T) {
 		VectorCodec:    semanticVectorCodec,
 		VectorStride:   semanticFineVectorBytesPerUnit,
 		USearch:        testSemanticUSearchCompatibility(t),
+		Runtime:        semanticInferenceRuntime(),
 		Dimensions:     semanticEmbeddingDimensions,
-		Rows:           semanticMaxRows,
-		RowsFile: semanticArtifact{
-			Bytes:  16,
-			SHA256: string(make([]byte, sha256.Size*2)),
-		},
+		Rows:           rows,
 	}
-	manifest.VectorsFile.Bytes, _ = checkedSemanticVectorBytes(manifest.Rows)
+	manifest.RowsFile.Bytes, _ = checkedSemanticRowsMinimumBytes(rows)
+	manifest.RowsFile.SHA256 = strings.Repeat("0", sha256.Size*2)
+	manifest.VectorsFile.Bytes, _ = checkedSemanticVectorBytes(rows)
+	manifest.CoarseFile.Bytes, _ = checkedSemanticCoarseBytes(rows)
+	for start := uint64(0); start < rows; start += semanticUSearchUnitsPerShard {
+		manifest.USearchFiles = append(manifest.USearchFiles, semanticUSearchShard{
+			Name: semanticUSearchShardName(len(manifest.USearchFiles)), Start: start,
+			Rows:             min(semanticUSearchUnitsPerShard, rows-start),
+			semanticArtifact: semanticArtifact{Bytes: 1, SHA256: strings.Repeat("0", sha256.Size*2)},
+		})
+	}
+	return manifest
+}
+
+// TestSemanticGenerationAboveOldRowLimitBinds writes a manifest of
+// 10,000,001 rows, so more than 431 shard entries (1,765,376 rows) and more
+// than 64 KiB of JSON: it decodes and validates, as no row count or manifest
+// size limits a generation.
+func TestSemanticGenerationAboveOldRowLimitBinds(t *testing.T) {
+	manifest := testLargeSemanticManifest(t, 10_000_001)
+	if len(manifest.USearchFiles) <= 431 {
+		t.Fatalf("shards=%d", len(manifest.USearchFiles))
+	}
+	dir := t.TempDir()
+	if err := writeSemanticManifest(filepath.Join(dir, semanticManifestFile), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(filepath.Join(dir, semanticManifestFile)); err != nil || info.Size() <= 64<<10 {
+		t.Fatalf("manifest size: %v", err)
+	}
+	got, err := readSemanticManifest(dir, "head")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSemanticUSearchShardMetadata(got.Rows, got.USearchFiles, true); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateSemanticManifestChecksMinimumRowsLength(t *testing.T) {
+	manifest := testLargeSemanticManifest(t, 1_765_377)
+	manifest.RowsFile.Bytes = 16
 	if err := validateSemanticManifest(manifest, "head"); err == nil {
 		t.Fatal("short row file must fail before row allocation")
 	}
@@ -721,7 +769,9 @@ func TestExactSemanticSearchStableOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	half := float32(16384) * semanticSNORM16InverseScale
+	// 0.5 is stored as 16,384 (0.5 times 32767, rounded half to even), so
+	// its score is 16,384/32,767.
+	half := float32(16_384.0 / 32_767)
 	want := []semanticHit{{row: 0, score: 1}, {row: 2, score: 1}, {row: 1, score: half}}
 	if !reflect.DeepEqual(hits, want) {
 		t.Fatalf("hits=%+v, want %+v", hits, want)
@@ -765,7 +815,9 @@ func TestExactSemanticSearchParallelMatchesSerialExpected(t *testing.T) {
 	third := semanticVector{0: 0.5, 1: float32(math.Sqrt(0.75))}
 	vectors[599] = testSemanticStoredFineVectors(third)
 	query := testSemanticQuery(best)
-	half := float32(16384) * semanticSNORM16InverseScale
+	// 0.5 is stored as 16,384 (0.5 times 32767, rounded half to even), so
+	// its score is 16,384/32,767.
+	half := float32(16_384.0 / 32_767)
 	want := []semanticHit{
 		{row: 17, score: 1},
 		{row: 300, score: 1},
@@ -853,7 +905,7 @@ func BenchmarkExactSemanticRange(b *testing.B) {
 }
 
 // BenchmarkExactSemanticRangeCandidateLimits compares a moderate result limit
-// with the semantic unit limit used before file collapse.
+// (160) with a large one (1,024).
 func BenchmarkExactSemanticRangeCandidateLimits(b *testing.B) {
 	const rowCount = 2_048
 	vectors := make([]semanticFineSNORM16Vectors, rowCount)
@@ -875,7 +927,7 @@ func BenchmarkExactSemanticRangeCandidateLimits(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	for _, limit := range []int{160, hybridSemanticUnitLimit} {
+	for _, limit := range []int{160, 1024} {
 		b.Run(fmt.Sprintf("limit-%d", limit), func(b *testing.B) {
 			ctx := context.Background()
 			b.ReportAllocs()
@@ -898,5 +950,84 @@ func TestSemanticContentIDUsesRawBytes(t *testing.T) {
 	unit := extractSemanticUnits(string([]byte{'x', 0xff}), content, nil, nil)[0]
 	if unit.contentID != semanticContentID(sha256.Sum256(content)) {
 		t.Fatal("content ID changed raw bytes")
+	}
+}
+
+// TestUSearchShardTrustedOnlyAsChecked opens a generation three times: an
+// untouched shard is trusted with no hash; a touched shard is hashed and
+// passes; a touched shard with other bytes of the same length fails.
+func TestUSearchShardTrustedOnlyAsChecked(t *testing.T) {
+	units, embeddings := testSemanticRowsAndVectors(t)
+	dir := filepath.Join(t.TempDir(), "semantic")
+	if _, err := writeTestSemanticGeneration(t.Context(), dir, "head", units, embeddings); err != nil {
+		t.Fatal(err)
+	}
+	shard := filepath.Join(dir, semanticUSearchShardName(0))
+	validate := func() (bool, error) {
+		t.Helper()
+		generation, err := openSemanticGenerationForSearch(dir, "head")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = generation.Close() }()
+		before := semanticShardsHashed.Load()
+		err = generation.validateUSearchShard(0)
+		return semanticShardsHashed.Load() > before, err
+	}
+	if hashed, err := validate(); hashed || err != nil {
+		t.Fatalf("untouched shard: hashed=%t err=%v, want trusted", hashed, err)
+	}
+	later := time.Now().Add(time.Minute)
+	if err := os.Chtimes(shard, later, later); err != nil {
+		t.Fatal(err)
+	}
+	if hashed, err := validate(); !hashed || err != nil {
+		t.Fatalf("touched shard: hashed=%t err=%v, want a passing full check", hashed, err)
+	}
+	content, err := os.ReadFile(shard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content[0] ^= 0xff
+	if err := os.WriteFile(shard, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validate(); err == nil {
+		t.Fatal("a changed shard of the same length passed")
+	}
+}
+
+// TestFullCheckRejectsRowWithWrongID writes a rows.bin whose hash matches the
+// manifest but whose row holds a wrong unit ID: the full check fails.
+func TestFullCheckRejectsRowWithWrongID(t *testing.T) {
+	units, embeddings := testSemanticRowsAndVectors(t)
+	dir := filepath.Join(t.TempDir(), "semantic")
+	if _, err := writeTestSemanticGeneration(t.Context(), dir, "head", units, embeddings); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := readSemanticManifestUnchecked(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken := slices.Clone(units)
+	broken[0].id[0] ^= 0xff
+	path := filepath.Join(dir, semanticRowsFile)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := writeSemanticRows(path, broken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.RowsFile = artifact
+	manifest.RowsCheck = semanticRowsCheck{}
+	if err := os.Remove(filepath.Join(dir, semanticManifestFile)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSemanticManifest(filepath.Join(dir, semanticManifestFile), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openSemanticGeneration(dir, "head"); err == nil {
+		t.Fatal("a row with a wrong unit ID passed the full check")
 	}
 }

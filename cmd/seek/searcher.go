@@ -4,28 +4,27 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
-	"time"
 	"unicode"
 
+	grafanaregexp "github.com/grafana/regexp"
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/index"
 	"github.com/sourcegraph/zoekt/query"
+	"golang.org/x/sync/errgroup"
+	"log/slog"
+	"path/filepath"
 )
 
-const (
-	// searchTimeout is the maximum wall-clock time for a single search.
-	// Matches the pollLock timeout used by the lock acquisition helpers.
-	searchTimeout = 60 * time.Second
-	// searchContextLines is the number of context lines included before and
-	// after each match.
-	searchContextLines    = 3
-	maxSearchContextLines = 512
-)
+// searchContextLines is the number of context lines included before and after
+// each match.
+const searchContextLines = 3
 
 // searchOpts are the zoekt search options used for every search. Defined
 // at package level to avoid per-search heap allocation.
@@ -35,16 +34,22 @@ var searchOpts = zoekt.SearchOptions{
 	// which applies after dedup and BM25 sort. A zoekt-level display cap
 	// would silently drop low-ranked files before seek or downstream
 	// pipes (| grep, | head) see them, causing false negatives.
-	// Search work is bounded by TotalMaxMatchCount and ShardMaxMatchCount.
-	TotalMaxMatchCount: 10000,
-	ShardMaxMatchCount: 10000,
+	//
+	// Seek searches each shard with Zoekt's per-shard searcher, which reads
+	// only ShardMaxMatchCount. It stays at math.MaxInt so that every match in
+	// a shard counts: 0 would become Zoekt's default of 100,000. SetDefaults
+	// then sets the total match budget to ten times this value, which
+	// overflows, but only the search package's aggregator reads that budget.
+	ShardMaxMatchCount: math.MaxInt,
 	NumContextLines:    searchContextLines,
 	UseBM25Scoring:     true,
-	MaxWallTime:        searchTimeout,
 }
 
 type searchConfig struct {
-	opts              *zoekt.SearchOptions
+	opts *zoekt.SearchOptions
+	// bm25 marks a strict search whose hits the command rescores with one
+	// global average file length.
+	bm25              bool
 	afterOnly         bool
 	contextMatchLimit int
 	contextFileLimit  int
@@ -73,9 +78,13 @@ func defaultSearchConfig() searchConfig {
 	return searchConfig{opts: &searchOpts}
 }
 
+// explicitSearchConfig limits the context count to zoektShardFormatBytes: no
+// document holds more lines than a shard holds bytes, so the cap shows the
+// same lines. Zoekt adds the line number to this count, and a value near
+// math.MaxInt would overflow and drop every line after the match.
 func explicitSearchConfig(contextLines int, afterOnly bool) searchConfig {
 	opts := searchOpts
-	opts.NumContextLines = contextLines
+	opts.NumContextLines = min(contextLines, zoektShardFormatBytes)
 	return searchConfig{opts: &opts, afterOnly: afterOnly}
 }
 
@@ -128,10 +137,9 @@ func loadShardsOptional(indexDir string) ([]zoekt.Searcher, error) {
 // searchableShardPaths lists the non-directory .zoekt entries that a search
 // will try to open.
 //
-// The caller normally holds the shared publish lock, so this scan cannot
-// interleave with a successful swap. acquireReadLock can permit an unlocked
-// read after its timeout; that path scans the shards that remain. This
-// function needs names only and does not load size metadata.
+// The caller holds the shared publish lock, so this scan cannot interleave
+// with a successful swap. This function needs names only and does not load
+// size metadata.
 func searchableShardPaths(indexDir string) ([]string, error) {
 	return familyShardNames(indexDir)
 }
@@ -154,26 +162,26 @@ func loadShardPaths(indexDir string, paths []string) ([]zoekt.Searcher, error) {
 	}
 
 	// Multiple shards — load in parallel to overlap mmap + metadata parsing.
-	results := make(chan shardLoadResult, len(paths))
+	// The searchers keep the path order, which the BM25 rescore reads.
+	results := make([]shardLoadResult, len(paths))
 	var wg sync.WaitGroup
-	for _, p := range paths {
+	for index, p := range paths {
 		wg.Add(1)
-		go func(path string) {
+		go func(index int, path string) {
 			defer wg.Done()
 			s, err := openShard(path)
 			if err != nil {
-				results <- shardLoadResult{path: path, err: err}
+				results[index] = shardLoadResult{path: path, err: err}
 				return
 			}
-			results <- shardLoadResult{searcher: s, path: path}
-		}(p)
+			results[index] = shardLoadResult{searcher: s, path: path}
+		}(index, p)
 	}
 	wg.Wait()
-	close(results)
 
 	searchers := make([]zoekt.Searcher, 0, len(paths))
 	var loadErr error
-	for result := range results {
+	for _, result := range results {
 		if result.err != nil {
 			if loadErr == nil {
 				loadErr = fmt.Errorf("load shard %s: %w", result.path, result.err)
@@ -207,50 +215,110 @@ func loadShardPaths(indexDir string, paths []string) ([]zoekt.Searcher, error) {
 var errShardUnloadable = errors.New("index damage")
 
 func parseSearchQueryForms(pattern string) (query.Q, query.Q, error) {
-	raw, err := query.Parse(pattern)
+	raw, strict, _, err := parseQueryHalves(pattern)
+	return raw, strict, err
+}
+
+// parseQueryHalves parses pattern and expands each bare word into a file-name
+// and a content atom, as Zoekt does. halves holds the file-name atoms that the
+// expansion made: they keep Zoekt's meaning, so only an explicit file: atom
+// reads the header.
+func parseQueryHalves(pattern string) (raw, strict query.Q, halves map[query.Q]struct{}, err error) {
+	raw, err = query.Parse(pattern)
 	if err != nil {
 		var ok bool
 		raw, ok = parsePlainDescriptionFallback(pattern)
 		if !ok {
-			return nil, nil, &querySyntaxError{query: pattern, cause: err}
+			return nil, nil, nil, &querySyntaxError{query: pattern, cause: err}
 		}
 	}
-	expanded := query.Map(raw, query.ExpandFileContent)
-	return raw, query.Simplify(expanded), nil
-}
-
-// parsePlainDescriptionFallback keeps programming names such as C++ usable in
-// descriptive search. Zoekt parses bare terms as regular expressions, so a
-// valid programming name can otherwise fail before the semantic path starts.
-// Only use this path after Zoekt rejects the query, and reject all explicit
-// query syntax so malformed filters and regular expressions stay errors.
-func parsePlainDescriptionFallback(pattern string) (query.Q, bool) {
-	terms := strings.Fields(pattern)
-	if len(terms) < 2 {
-		return nil, false
-	}
-	children := make([]query.Q, 0, len(terms))
-	for _, term := range terms {
-		if strings.EqualFold(term, "or") {
-			return nil, false
-		}
-		parsed, err := query.Parse(term)
-		if err == nil {
-			if substring, ok := parsed.(*query.Substring); ok &&
-				!substring.FileName && !substring.Content && substring.Pattern == term {
-				children = append(children, substring)
-				continue
+	halves = map[query.Q]struct{}{}
+	expanded := query.Map(raw, func(q query.Q) query.Q {
+		out := query.ExpandFileContent(q)
+		if or, ok := out.(*query.Or); ok && out != q {
+			for _, child := range or.Children {
+				if fileNameAtom(child) {
+					halves[child] = struct{}{}
+				}
 			}
 		}
-		if !plainProgrammingName(term) {
-			return nil, false
-		}
-		children = append(children, &query.Substring{
-			Pattern:       term,
-			CaseSensitive: strings.ToLower(term) != term,
-		})
+		return out
+	})
+	strict = query.Simplify(expanded)
+	if err := compileRegexpAtoms(strict); err != nil {
+		return nil, nil, nil, &querySyntaxError{query: pattern, cause: err}
 	}
-	return query.NewAnd(children...), true
+	return raw, strict, halves, nil
+}
+
+// compileRegexpAtoms compiles each regexp atom of q as Zoekt does
+// (index/matchtree.go regexpPattern and MustCompile): a regexp that Go's
+// parser rejects after Zoekt's simplification, such as a{1,501}, is a query
+// error, not a panic in the search.
+func compileRegexpAtoms(q query.Q) error {
+	var err error
+	check := func(atom *query.Regexp) {
+		if err != nil || atom == nil {
+			return
+		}
+		pattern := atom.RegexpString()
+		if !atom.CaseSensitive {
+			pattern = "(?i)" + pattern
+		}
+		if _, compileErr := grafanaregexp.Compile(pattern); compileErr != nil {
+			// Go's message ends with the whole expanded expression.
+			message, _, _ := strings.Cut(compileErr.Error(), ": `")
+			err = errors.New(message)
+		}
+	}
+	query.VisitAtoms(q, func(atom query.Q) {
+		switch typed := atom.(type) {
+		case *query.Regexp:
+			check(typed)
+		case *query.Symbol:
+			if expr, ok := typed.Expr.(*query.Regexp); ok {
+				check(expr)
+			}
+		}
+	})
+	return err
+}
+
+// parsePlainDescriptionFallback keeps programming names such as C++ usable.
+// Zoekt parses bare terms as regular expressions, so a valid programming name
+// can otherwise fail the whole query. Only after Zoekt rejects the query, it
+// quotes each programming name (C++, X[], X(), with :: qualifiers) and parses
+// the rewritten query again, so filters keep their meaning. A name
+// such as at() is also a valid expression, but next to C++ it means the
+// literal name. The quoted term parses to the literal name, which the model
+// reads.
+func parsePlainDescriptionFallback(pattern string) (query.Q, bool) {
+	var rewritten strings.Builder
+	changed := false
+	for at := 0; at < len(pattern); {
+		// Zoekt splits words on space and tab; keep every separator as typed.
+		end := at
+		for end < len(pattern) && pattern[end] != ' ' && pattern[end] != '\t' {
+			end++
+		}
+		term := pattern[at:end]
+		if plainProgrammingName(term) {
+			// QuoteMeta leaves ':', which would make "content::X()" a filter.
+			term = strings.ReplaceAll(regexp.QuoteMeta(term), ":", `\:`)
+			changed = true
+		}
+		rewritten.WriteString(term)
+		if end < len(pattern) {
+			rewritten.WriteByte(pattern[end])
+			end++
+		}
+		at = end
+	}
+	if !changed {
+		return nil, false
+	}
+	parsed, err := query.Parse(rewritten.String())
+	return parsed, err == nil
 }
 
 func plainProgrammingName(term string) bool {
@@ -287,13 +355,22 @@ func executeParsedSearchScopedDirs(
 ) ([]zoekt.FileMatch, error) {
 	q := userQ
 	if scope != nil {
-		q = query.NewAnd(q, scope)
+		// Zoekt gathers no match under a file-name type, so the scope filters
+		// the files and adds no file-name term to their BM25 score: a file in
+		// the scope scores as in an unscoped search. Unlike a double
+		// negation, it keeps Zoekt's shard and file skips.
+		q = query.NewAnd(q, &query.Type{Type: query.TypeFileName, Child: scope})
 		q = query.Simplify(q)
 	}
 
 	var searchers []zoekt.Searcher
+	var shardPaths []string
 	for _, indexDir := range indexDirs {
-		loaded, err := loadShardsOptional(indexDir)
+		paths, err := searchableShardPaths(indexDir)
+		var loaded []zoekt.Searcher
+		if err == nil && len(paths) > 0 {
+			loaded, err = loadShardPaths(indexDir, paths)
+		}
 		if err != nil {
 			for _, s := range searchers {
 				s.Close()
@@ -301,19 +378,143 @@ func executeParsedSearchScopedDirs(
 			return nil, fmt.Errorf("load index: %w", err)
 		}
 		searchers = append(searchers, loaded...)
+		shardPaths = append(shardPaths, paths...)
 	}
 	if len(searchers) == 0 {
 		return nil, fmt.Errorf("%w: no loadable shards", errShardUnloadable)
 	}
-	return searchLoadedShards(ctx, searchers, q, config)
+	parts, err := bm25ShardParts(ctx, searchers, shardPaths, q, &config)
+	if err != nil {
+		for _, s := range searchers {
+			s.Close()
+		}
+		return nil, err
+	}
+	return searchLoadedShards(ctx, searchers, q, config, parts)
 }
 
+// bm25ShardParts prepares the rescore of a strict search: it records
+// each shard's counts for the command's average, asks Zoekt for its score
+// debug line, and returns the function that rebuilds each hit's parts. Other
+// searches get nil.
+func bm25ShardParts(ctx context.Context, searchers []zoekt.Searcher, paths []string, q query.Q, config *searchConfig) (func(int, []zoekt.FileMatch), error) {
+	command, ok := ctx.Value(bm25CommandKey{}).(*bm25Command)
+	if !ok || !config.bm25 || config.opts == nil || !config.opts.UseBM25Scoring || len(paths) != len(searchers) {
+		return nil, nil
+	}
+	if command.nodes == 1 && len(paths) == 1 {
+		// One node of one shard: Zoekt's average is the command's, so
+		// Zoekt's scores are final.
+		return nil, nil
+	}
+	records := map[string]*shardStatsRecord{}
+	shards := make([]shardLengthStats, len(paths))
+	var group errgroup.Group
+	group.SetLimit(runtime.GOMAXPROCS(0))
+	for index, path := range paths {
+		indexDir := filepath.Dir(path)
+		record, ok := records[indexDir]
+		if !ok {
+			record = readShardStatsRecord(indexDir)
+			records[indexDir] = record
+		}
+		group.Go(func() error {
+			stats, err := record.stats(ctx, path, searchers[index])
+			if err != nil {
+				return err
+			}
+			shards[index] = stats
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		// A shard whose counts Seek cannot read keeps Zoekt's scores, and
+		// the command's average gets none of this search's counts.
+		slog.Debug("BM25 shard counts unavailable", "error", err)
+		return nil, nil
+	}
+	// The counts replace those of an earlier search of the same index
+	// directories, such as a repaired attempt.
+	command.set(paths, shards)
+	averages := make([]float64, len(paths))
+	for index, stats := range shards {
+		averages[index] = stats.average()
+	}
+	for indexDir, record := range records {
+		var live []string
+		for _, path := range paths {
+			if filepath.Dir(path) == indexDir {
+				live = append(live, path)
+			}
+		}
+		record.save(live)
+	}
+	opts := *config.opts
+	opts.DebugScore = true
+	config.opts = &opts
+	// The clone keeps context lines for the best files by score. With
+	// one node these shards are all of the command's, so each hit gets its
+	// final score here (with one shard Zoekt's score is final). Otherwise the
+	// command rescore can reorder the files after the clone, and every strict
+	// file keeps its context.
+	global, final := 0.0, false
+	if command.nodes == 1 {
+		global, final = shardsAverage(shards)
+		command.final.Store(final)
+	} else {
+		config.contextFileLimit = 0
+	}
+	bq := compileBM25Query(q)
+	rebuild := func(file *zoekt.FileMatch, average float64) {
+		if !bm25Parts(file, bq, average) {
+			command.kept.Add(1)
+			return
+		}
+		command.rebuilt.Add(1)
+		if !final {
+			return
+		}
+		if score, ok := bm25Rescore(*file, global); ok {
+			file.Score = score
+		}
+	}
+	return func(index int, files []zoekt.FileMatch) {
+		// One hit's rebuild reads only that hit: the hits of one shard
+		// spread over the host's CPUs, so the shard with the most ambiguous
+		// lines does not hold the search.
+		workers := min(runtime.GOMAXPROCS(0), max(1, len(files)/bm25FilesPerWorker))
+		var group sync.WaitGroup
+		for worker := range workers {
+			group.Go(func() {
+				for file := worker; file < len(files); file += workers {
+					rebuild(&files[file], averages[index])
+				}
+			})
+		}
+		group.Wait()
+	}, nil
+}
+
+// bm25FilesPerWorker is the share of a shard's hits below which one more
+// goroutine costs more than it saves: 4 halves the rebuild phase on
+// Kubernetes, whose shards hold few hits each.
+const bm25FilesPerWorker = 4
+
 // searchLoadedShards closes each searcher after all search workers return.
+//
+// NOTE(zoekt): a query with a `query.Type` other than type:file panics inside
+// index.Searcher.Search (index/matchtree.go:1298, log.Panicf("type %T")).
+// Seek leaves the crash until Zoekt fixes it.
+// TODO: add the upstream Zoekt issue link once it is filed.
 func searchLoadedShards(
 	ctx context.Context,
 	searchers []zoekt.Searcher,
 	q query.Q,
 	config searchConfig,
+	parts func(int, []zoekt.FileMatch),
 ) ([]zoekt.FileMatch, error) {
 	defer func() {
 		for _, s := range searchers {
@@ -330,6 +531,10 @@ func searchLoadedShards(
 		if err != nil {
 			return nil, fmt.Errorf("search: %w", err)
 		}
+		if parts != nil {
+			parts(0, result.Files)
+		}
+		roundScores(result.Files)
 		return cloneFileMatches(result.Files, config), nil
 	}
 
@@ -363,6 +568,11 @@ func searchLoadedShards(
 				results[i] = shardResult{err: err}
 				return
 			}
+			// The parts read every match, before the display limits drop any.
+			if parts != nil {
+				parts(i, r.Files)
+			}
+			roundScores(r.Files)
 			results[i] = shardResult{files: r.Files}
 		}(i, s)
 	}
@@ -378,6 +588,15 @@ func searchLoadedShards(
 		allFiles = append(allFiles, r.files...)
 	}
 	return cloneFileMatches(allFiles, config), nil
+}
+
+// roundScores rounds each score once, after the parts read the exact value:
+// Zoekt sums a score over a Go map, so equal true scores differ in their last
+// bits from run to run, and rounded ties sort by name.
+func roundScores(files []zoekt.FileMatch) {
+	for index := range files {
+		files[index].Score = math.Round(files[index].Score*1e9) / 1e9
+	}
 }
 
 func cloneFileMatches(files []zoekt.FileMatch, config searchConfig) []zoekt.FileMatch {

@@ -134,6 +134,9 @@ func TestGitVisibility_AllPrefilteredNoSubprocess(t *testing.T) {
 
 	repo := initGitRepoNoRemote(t, "a.go", "package main\n")
 	outside := filepath.Dir(repo)
+	// No Git executable from here: a check-ignore subprocess would fail the
+	// call.
+	t.Setenv("PATH", t.TempDir())
 
 	got, err := classifyVisibility(context.Background(), repo, []string{repo, outside})
 	if err != nil {

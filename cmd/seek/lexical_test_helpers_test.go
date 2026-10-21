@@ -14,18 +14,17 @@ func testLexicalSearchExecution() searchExecution {
 // testSemanticSearchExecution offers a model to a corpus build and asks for
 // vector preparation, closing the future when the test ends.
 //
-// prepareVectors is set here because routing decides it in production, from the
-// query and corpus shape, and a test that calls a corpus entry point directly
-// bypasses that decision. A test that drives a whole search must not use this:
-// it should let runSearchCommand decide.
+// vectors is set here because runSearchCommand decides it in production from
+// the query, and a test that calls a corpus entry point directly bypasses
+// that decision. A test that drives a whole search must not use this.
 func testSemanticSearchExecution(tb testing.TB, factory semanticModelFactory) searchExecution {
 	tb.Helper()
 	future := newSemanticModelFuture(factory)
 	tb.Cleanup(func() { _ = future.Close() })
 	return searchExecution{
-		policy:         defaultSearchPolicy(),
-		model:          future,
-		prepareVectors: true,
+		policy:  defaultSearchPolicy(),
+		model:   future,
+		vectors: true,
 	}
 }
 
@@ -59,19 +58,15 @@ func prepareAndSearchCorpus(
 	userQ query.Q,
 	config searchConfig,
 ) ([]corpusSearchResult, dirtyFileSet, error) {
-	return prepareAndSearchCorpusWithExecution(
-		ctx,
-		plan,
-		paths,
-		userQ,
-		config,
-		testLexicalSearchExecution(),
-	)
+	if plan.gitPaths == nil && paths != nil {
+		plan.gitPaths = paths
+	}
+	return strictNode(ctx, plan, queryPlan{strict: userQ}, config, testLexicalSearchExecution())
 }
 
 func ensureGitCorpusFresh(
 	ctx context.Context,
-	plan *corpusPlan,
+	plan corpusPlan,
 	paths gitPaths,
 ) (repoState, corpusIndexState, error) {
 	return ensureGitCorpusFreshWithExecution(ctx, plan, paths, testLexicalSearchExecution())

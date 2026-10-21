@@ -34,6 +34,14 @@ func readContent(r io.Reader, size int64) (content []byte, binary bool, consumed
 	return content[:n+rest], false, int64(n + rest), err
 }
 
+// seekNoBytesReason marks the documents that Seek indexes by name because it
+// has none of their bytes: cloud-only files, blobs that a partial clone lacks,
+// and files that Seek cannot read or that grow during the read. Zoekt never
+// assigns it, since TrigramMax equals the content limit (indexBuildOptions),
+// so the name-only notice can tell these documents from Zoekt's own too-small
+// ones (under 3 bytes).
+const seekNoBytesReason = index.SkipReasonTooManyTrigrams
+
 // sendNameOnly sends a document that keeps only its name, with no content and
 // no readSemaphore weight, or gives up when ctx ends. Zoekt stores its
 // NOT-INDEXED marker for reason, and the name stays searchable.
