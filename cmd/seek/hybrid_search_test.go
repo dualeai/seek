@@ -54,14 +54,6 @@ func runHybridTestSearch(
 	})
 }
 
-func (scorer *hybridTestScorer) Scores(
-	ctx context.Context,
-	query string,
-	documents []rerankDocument,
-) ([]float32, error) {
-	return scoreWithTestSemanticEmbedder(ctx, scorer, query, documents)
-}
-
 func (scorer *hybridTestScorer) EmbedSemanticUnits(
 	_ context.Context,
 	units []semanticUnit,
@@ -263,9 +255,7 @@ func TestRunDefaultJoinedSearchAddsSemanticOnlyFile(t *testing.T) {
 
 	state := mustGitRepoStateIn(t, t.Context(), repo)
 	stateHash := gitCorpusStateHash(paths, state)
-	if !joinedGenerationMatches(
-		plan.cacheDir, plan.indexDir, stateHash, state.HeadSHA,
-	) {
+	if !plan.joinedGenerationsMatch(stateHash, state.HeadSHA, "") {
 		t.Fatalf("default build did not publish %s", filepath.Join(plan.cacheDir, joinedGenerationFile))
 	}
 }
@@ -298,7 +288,7 @@ func TestRunDefaultFolderJoinedSearchAddsSemanticOnlyFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !joinedGenerationMatches(plan.cacheDir, plan.indexDir, state, state) {
+	if !plan.joinedGenerationsMatch(state, state, "") {
 		t.Fatal("default folder search did not keep a joined generation")
 	}
 }
@@ -371,13 +361,12 @@ func TestRunDefaultFilteredNativeFailureRecoversExactly(t *testing.T) {
 	t.Chdir(t.TempDir())
 	folder := t.TempDir()
 	writeFileAt(t, folder, "allowed/strict.go", "package sample\n// seed alpha beta\n")
+	// kept lists the files that the filters of the query below keep.
+	kept := []string{"allowed/strict.go", "allowed/meaning.go"}
 	for index := range semanticFilteredExactRows + 8 {
-		writeFileAt(
-			t,
-			folder,
-			fmt.Sprintf("allowed/candidate-%03d.go", index),
-			"package sample\n// alpha lexical candidate\n",
-		)
+		path := fmt.Sprintf("allowed/candidate-%03d.go", index)
+		writeFileAt(t, folder, path, "package sample\n// alpha lexical candidate\n")
+		kept = append(kept, path)
 	}
 	writeFileAt(t, folder, "allowed/leak_test.go", "package sample\n// alpha beta TEST_LEAK\n")
 	writeFileAt(t, folder, "allowed/leak.py", "# alpha beta LANGUAGE_LEAK\n")
@@ -404,21 +393,13 @@ func TestRunDefaultFilteredNativeFailureRecoversExactly(t *testing.T) {
 		t.Fatal(err)
 	}
 	semanticDir := semanticGenerationDir(plan.indexDir, state)
-	generation, err := openSemanticGeneration(semanticDir, state)
+	generation, err := openSemanticGenerationForSearch(semanticDir, state)
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, _, err := parseSearchQueryForms(
-		`alpha beta lang:go file:allowed/ -file:_test\.go$`,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rerankPlan, ok := planRerankQuery(raw)
-	if !ok || rerankPlan.semanticFilter == nil {
-		t.Fatal("filtered fallback query is not eligible")
-	}
-	mask, err := buildSemanticFilterMask(t.Context(), generation, rerankPlan.semanticFilter.matches)
+	// The kept files hold more rows than the direct exact route takes, so the
+	// filtered search reads the USearch graph that the test damages below.
+	mask, err := buildSemanticFilterMask(t.Context(), generation, selectedFilesKeep(kept...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,9 +414,9 @@ func TestRunDefaultFilteredNativeFailureRecoversExactly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Damage the graph, then refresh its manifest digest. This bypasses the
-	// open-time artifact check so the query reaches the native search error and
-	// the exact-vector recovery.
+	// Damage the graph, then refresh its manifest digest. The shard check
+	// before the first native use (validateUSearchShard) then passes, so the
+	// query reaches the native search error and the exact-vector recovery.
 	shardPath := filepath.Join(semanticDir, manifest.USearchFiles[0].Name)
 	shard, err := os.OpenFile(shardPath, os.O_WRONLY, 0)
 	if err != nil {
@@ -462,7 +443,7 @@ func TestRunDefaultFilteredNativeFailureRecoversExactly(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if !joinedGenerationMatches(plan.cacheDir, plan.indexDir, state, state) {
+	if !plan.joinedGenerationsMatch(state, state, "") {
 		t.Fatal("fault fixture did not keep the joined generation eligible")
 	}
 
@@ -561,7 +542,7 @@ func TestRunDefaultExactQuerySkipsJoinedIndex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if joinedGenerationMatches(plan.cacheDir, plan.indexDir, state, state) {
+	if plan.joinedGenerationsMatch(state, state, "") {
 		t.Fatal("an exact query built a joined index that no route can read")
 	}
 	if got := scorer.embedCalls.Load(); got != 0 {
@@ -614,7 +595,7 @@ func TestRunDefaultRepairsDamagedSemanticGeneration(t *testing.T) {
 	if err := os.WriteFile(manifestPath, []byte("damaged\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if joinedGenerationMatches(plan.cacheDir, plan.indexDir, state, state) {
+	if plan.joinedGenerationsMatch(state, state, "") {
 		t.Fatal("damaged semantic data stayed active")
 	}
 
@@ -625,18 +606,8 @@ func TestRunDefaultRepairsDamagedSemanticGeneration(t *testing.T) {
 	if repair.embedCalls.Load() == 0 {
 		t.Fatal("repair did not rebuild semantic data")
 	}
-	generation, err := openSemanticGeneration(
-		semanticGenerationDir(plan.indexDir, state),
-		state,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = generation.Close() }()
-	if generation.usearchErr != nil {
-		t.Fatalf("repaired USearch data: %v", generation.usearchErr)
-	}
-	if !joinedGenerationMatches(plan.cacheDir, plan.indexDir, state, state) {
+	requireSearchableGeneration(t, plan, state)
+	if !plan.joinedGenerationsMatch(state, state, "") {
 		t.Fatal("repair did not activate the joined generation")
 	}
 }
@@ -717,19 +688,29 @@ func TestRunDefaultSemanticBuildFailureKeepsLexicalSearchAndCanRepair(t *testing
 		t.Fatal(err)
 	}
 	if repairScorer.embedCalls.Load() == 0 ||
-		!joinedGenerationMatches(plan.cacheDir, plan.indexDir, state, state) {
+		!plan.joinedGenerationsMatch(state, state, "") {
 		t.Fatal("a later healthy run did not repair the joined index")
 	}
-	generation, err := openSemanticGeneration(
-		semanticGenerationDir(plan.indexDir, state),
-		state,
-	)
+	requireSearchableGeneration(t, plan, state)
+}
+
+// requireSearchableGeneration opens the generation of source as a search
+// does, then runs the check that a native search runs before it reads each
+// USearch shard.
+func requireSearchableGeneration(t *testing.T, plan node, source string) {
+	t.Helper()
+	generation, err := plan.openJoinedSemanticGeneration(source)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("open repaired semantic data: %v", err)
 	}
 	defer func() { _ = generation.Close() }()
-	if generation.usearchErr != nil {
-		t.Fatalf("repaired USearch data: %v", generation.usearchErr)
+	if len(generation.usearch) == 0 {
+		t.Fatal("repaired semantic data has no USearch shard")
+	}
+	for index := range generation.usearch {
+		if err := generation.validateUSearchShard(index); err != nil {
+			t.Fatalf("repaired USearch shard %d: %v", index, err)
+		}
 	}
 }
 
@@ -898,7 +879,7 @@ func TestDefaultFolderBuildPublishesAndUpdatesJoinedGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !joinedGenerationMatches(plan.cacheDir, plan.indexDir, firstState, firstState) {
+	if !plan.joinedGenerationsMatch(firstState, firstState, "") {
 		t.Fatal("default folder build did not activate a joined generation")
 	}
 
@@ -913,7 +894,7 @@ func TestDefaultFolderBuildPublishesAndUpdatesJoinedGeneration(t *testing.T) {
 	if secondState == firstState {
 		t.Fatal("folder state did not change")
 	}
-	if !joinedGenerationMatches(plan.cacheDir, plan.indexDir, secondState, secondState) {
+	if !plan.joinedGenerationsMatch(secondState, secondState, "") {
 		t.Fatal("updated folder build did not activate a joined generation")
 	}
 	semanticDirs := semanticGenerationDirs(t, plan.indexDir)

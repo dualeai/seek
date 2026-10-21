@@ -78,15 +78,15 @@ func nativeGitDeltaStaticMetadataEqual(existing, target *zoekt.Repository) bool 
 func prepareNativeGitDelta(
 	ctx context.Context,
 	repoDir string,
-	cacheDir string,
-	indexDir string,
+	store corpusStore,
 	target gitSnapshot,
 	scan familyScan,
 ) (*nativeGitDelta, bool, error) {
-	if !scan.hasCommittedShard() || !scan.contiguous(familyCommitted) || !scan.matchesManifestFamily(indexDir, familyCommitted) {
+	cacheDir, indexDir := store.cacheDir, store.indexDir
+	if !scan.hasShard(familyCommitted) || !scan.contiguous(familyCommitted) || !scan.matchesManifestFamily(indexDir, familyCommitted) {
 		return nil, false, nil
 	}
-	if err := requireNativeGitVersion(ctx, repoDir); err != nil {
+	if err := requireNativeGitVersion(ctx); err != nil {
 		return nil, false, err
 	}
 	// This also resolves the verified `ctags` fallback before index options are
@@ -159,7 +159,7 @@ func prepareNativeGitDelta(
 		return nil, false, err
 	}
 	for _, entry := range diff {
-		if entry.oldPath == ".sourcegraph/ignore" || entry.newPath == ".sourcegraph/ignore" {
+		if entry.path == ".sourcegraph/ignore" {
 			return nil, false, nil
 		}
 	}
@@ -180,8 +180,8 @@ func prepareNativeGitDelta(
 
 	changedPaths := make([]string, 0, len(diff))
 	for _, entry := range diff {
-		if nativeGitBlobMode(entry.oldMode) && !matcher.Match(entry.oldPath) {
-			changedPaths = append(changedPaths, entry.oldPath)
+		if nativeGitBlobMode(entry.oldMode) && !matcher.Match(entry.path) {
+			changedPaths = append(changedPaths, entry.path)
 		}
 	}
 	return &nativeGitDelta{
@@ -205,37 +205,23 @@ func scanNativeGitDeltaChanges(
 	matcher *ignore.Matcher,
 	diff []gitDiffEntry,
 ) ([]gitBlobInfo, error) {
-	type requestRole struct {
-		diffIndex int
-	}
 	entries := make([]gitTreeEntry, 0, len(diff))
-	roles := make([]requestRole, 0, len(diff))
-	for i, entry := range diff {
+	for _, entry := range diff {
 		if nativeGitBlobMode(entry.newMode) {
-			entries = append(entries, gitTreeEntry{mode: entry.newMode, oid: entry.newOID, path: entry.newPath})
-			roles = append(roles, requestRole{diffIndex: i})
+			entries = append(entries, gitTreeEntry{mode: entry.newMode, oid: entry.newOID, path: entry.path})
 		}
 	}
-	newInfos := make([]gitBlobInfo, len(diff))
-	newPresent := make([]bool, len(diff))
-	roleIndex := 0
-	if err := checkNativeGitBlobs(ctx, repoDir, entries, func(infos []gitBlobInfo) error {
+	targetInfos := make([]gitBlobInfo, 0, len(entries))
+	err := checkNativeGitBlobs(ctx, repoDir, entries, func(infos []gitBlobInfo) error {
 		for _, info := range infos {
-			role := roles[roleIndex]
-			roleIndex++
-			newInfos[role.diffIndex] = info
-			newPresent[role.diffIndex] = true
+			if !matcher.Match(info.entry.path) {
+				targetInfos = append(targetInfos, info)
+			}
 		}
 		return nil
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, err
-	}
-
-	targetInfos := make([]gitBlobInfo, 0, len(diff))
-	for i, entry := range diff {
-		if newPresent[i] && !matcher.Match(entry.newPath) {
-			targetInfos = append(targetInfos, newInfos[i])
-		}
 	}
 	return targetInfos, nil
 }

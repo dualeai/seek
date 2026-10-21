@@ -72,11 +72,14 @@ func TestSemanticSNORM16ComponentCodes(t *testing.T) {
 	}
 }
 
+// TestSemanticSNORM16ComponentRoundTripAllCodes decodes every valid code with
+// the production decoder and encodes the result again. The float64 quotient
+// code/32767 is the exact value that the decoder must round to float32.
 func TestSemanticSNORM16ComponentRoundTripAllCodes(t *testing.T) {
 	var maximumDecodeError float64
-	for value := -semanticSNORM16Scale; value <= semanticSNORM16Scale; value++ {
+	for value := -32_767; value <= 32_767; value++ {
 		code := int16(value)
-		decoded := float32(code) / float32(semanticSNORM16Scale)
+		decoded := decodeSemanticSNORM16Vector(semanticSNORM16Vector{0: code})[0]
 		got, err := encodeSemanticSNORM16Component(decoded)
 		if err != nil {
 			t.Fatalf("code %d: %v", code, err)
@@ -84,7 +87,7 @@ func TestSemanticSNORM16ComponentRoundTripAllCodes(t *testing.T) {
 		if got != code {
 			t.Fatalf("code %d round-tripped as %d", code, got)
 		}
-		decodeError := math.Abs(float64(decoded) - float64(code)/semanticSNORM16Scale)
+		decodeError := math.Abs(float64(decoded) - float64(code)/32_767)
 		maximumDecodeError = max(maximumDecodeError, decodeError)
 	}
 	if maximumDecodeError != semanticSNORM16MaximumDecodeError {
@@ -93,10 +96,6 @@ func TestSemanticSNORM16ComponentRoundTripAllCodes(t *testing.T) {
 			maximumDecodeError,
 			semanticSNORM16MaximumDecodeError,
 		)
-	}
-	code := int16(-32672)
-	if float32(code)/float32(semanticSNORM16Scale) == float32(code)*semanticSNORM16InverseScale {
-		t.Fatal("decoder oracle collapsed into the production pre-scale operation")
 	}
 }
 
@@ -227,18 +226,20 @@ func TestSemanticSNORM16IntegerNormThreshold(t *testing.T) {
 			maximumDecodedError,
 		)
 	}
+	// The stored format accepts squared-code sums within 1,301,295 of
+	// 32767^2 = 1,073,676,289: floor(0.001212 * 32767^2).
 	for _, squaredNorm := range []int64{
-		semanticSNORM16SquaredScale - semanticSNORM16SquaredNormCodeTolerance,
-		semanticSNORM16SquaredScale,
-		semanticSNORM16SquaredScale + semanticSNORM16SquaredNormCodeTolerance,
+		1_072_374_994,
+		1_073_676_289,
+		1_074_977_584,
 	} {
 		if !validSemanticSNORM16SquaredNorm(squaredNorm) {
 			t.Fatalf("boundary sum %d was rejected", squaredNorm)
 		}
 	}
 	for _, squaredNorm := range []int64{
-		semanticSNORM16SquaredScale - semanticSNORM16SquaredNormCodeTolerance - 1,
-		semanticSNORM16SquaredScale + semanticSNORM16SquaredNormCodeTolerance + 1,
+		1_072_374_993,
+		1_074_977_585,
 	} {
 		if validSemanticSNORM16SquaredNorm(squaredNorm) {
 			t.Fatalf("out-of-range sum %d was accepted", squaredNorm)

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -112,23 +113,33 @@ var gitVersions sync.Map
 // Git ignores GIT_NO_LAZY_FETCH: such a Git would fetch missing blobs from the
 // network during a search.
 func requireNoLazyFetch(ctx context.Context) error {
-	gitPath, err := exec.LookPath("git")
+	out, err := gitVersion(ctx)
 	if err != nil {
-		return &gitUnavailableError{cause: err}
+		return err
 	}
-	out, cached := gitVersions.Load(gitPath)
-	if !cached {
-		version, err := gitOutput(ctx, gitCommand(ctx, "", []string{"version"}), "git version")
-		if err != nil {
-			return err
-		}
-		out, _ = gitVersions.LoadOrStore(gitPath, version)
-	}
-	if gitHonorsNoLazyFetch(out.([]byte)) {
+	if gitHonorsNoLazyFetch(out) {
 		return nil
 	}
 	return fmt.Errorf("a partial clone needs Git 2.45 or later (or 2.39.4, 2.40.2, 2.41.1, 2.42.2, 2.43.4, 2.44.1) so that a search never fetches; found %s",
-		strings.TrimSpace(string(out.([]byte))))
+		strings.TrimSpace(string(out)))
+}
+
+// gitVersion returns the `git version` output of the Git on PATH, once per
+// executable path in a command.
+func gitVersion(ctx context.Context) ([]byte, error) {
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		return nil, &gitUnavailableError{cause: err}
+	}
+	if out, cached := gitVersions.Load(gitPath); cached {
+		return out.([]byte), nil
+	}
+	version, err := gitOutput(ctx, gitCommand(ctx, "", []string{"version"}), "git version")
+	if err != nil {
+		return nil, err
+	}
+	out, _ := gitVersions.LoadOrStore(gitPath, version)
+	return out.([]byte), nil
 }
 
 // gitCommand creates a Git command with gitHardeningArgs and a sanitized
@@ -146,7 +157,8 @@ func gitCommand(ctx context.Context, repoDir string, args []string) *exec.Cmd {
 	cmd.Dir = repoDir
 	cmd.Env = sanitizedGitEnv(os.Environ())
 	cmd.Cancel = func() error {
-		return cmd.Process.Signal(gitCancelSignal())
+		// SIGTERM lets Git release its index locks before it exits.
+		return cmd.Process.Signal(syscall.SIGTERM)
 	}
 	cmd.WaitDelay = 3 * time.Second
 	return cmd
@@ -165,13 +177,6 @@ func (e *gitUnavailableError) Unwrap() error {
 	return e.cause
 }
 
-// gitLocationEnv names the variables that redirect git at a different
-// repository than the one Seek resolved from the filesystem. Seek removes them
-// from all Git commands.
-var gitLocationEnv = [5]string{
-	"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
-}
-
 // sanitizedGitEnv removes variables that change pathspec rules, prompts,
 // locale, or the target repository, then sets stable values. A search never
 // reaches the network: GIT_NO_LAZY_FETCH stops a partial clone from fetching
@@ -186,7 +191,7 @@ func sanitizedGitEnv(env []string) []string {
 			continue
 		// Corpus identity comes from the filesystem. A location variable could
 		// make Git describe a different repository from the indexed corpus.
-		case gitLocationEnv[0], gitLocationEnv[1], gitLocationEnv[2], gitLocationEnv[3], gitLocationEnv[4]:
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR":
 			continue
 		default:
 			filtered = append(filtered, kv)

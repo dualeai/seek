@@ -9,8 +9,10 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -18,6 +20,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/daulet/tokenizers"
 	"github.com/klauspost/compress/zstd"
@@ -63,14 +66,24 @@ type lateOnRuntimeManifest struct {
 	SHA256   string `json:"sha256"`
 }
 
-// lateOnModel lazily creates one row encoder and ONNX session and borrows
-// tokenizers from the process-wide pool. Active methods can run concurrently.
-// The command closes the model only after all borrowers have finished.
+// lateOnModel lazily creates its row encoders, each with one ONNX session,
+// and borrows tokenizers from the process-wide pool. The first call makes the
+// first encoder; an index build can add a second CPU encoder
+// (semanticRowEncoder). Active methods can run concurrently. The command
+// closes the model only after all borrowers have finished.
 type lateOnModel struct {
 	punctuation map[int]struct{}
 	encoderOnce sync.Once
 	encoder     *lateOnStaticRowEncoder
 	encoderErr  error
+	// buildOnce and build are a second CPU session for the index build, made
+	// only when the first one is sized for one call (semanticRowEncoder).
+	buildOnce sync.Once
+	build     *lateOnStaticRowEncoder
+	buildErr  error
+	// closed makes every encoder request (semanticRowEncoder) after Close
+	// return errLateOnModelClosed.
+	closed atomic.Bool
 }
 
 // lateOnTokenizerJSON is the decoded tokenizer asset, read once per process.
@@ -244,14 +257,6 @@ func ensureLateOnEnvironment(runtimePath string) error {
 	return lateOnEnvironmentErr
 }
 
-func (s *lateOnModel) takeTokenizer(ctx context.Context) (*lateOnTokenizer, error) {
-	return lateOnTokenizers.take(ctx)
-}
-
-func (s *lateOnModel) releaseTokenizer(tokenizer *lateOnTokenizer) {
-	lateOnTokenizers.release(tokenizer)
-}
-
 func runLateOnSessionRows(
 	ctx context.Context,
 	session *ort.DynamicAdvancedSession,
@@ -319,7 +324,7 @@ func (s *lateOnModel) EmbedSemanticUnits(
 			semanticModelBatchRows,
 		)
 	}
-	encoder, err := s.semanticRowEncoder(ctx)
+	encoder, err := s.semanticRowEncoder(ctx, false)
 	if err != nil {
 		return nil, err
 	}
@@ -327,11 +332,11 @@ func (s *lateOnModel) EmbedSemanticUnits(
 }
 
 func (s *lateOnModel) SemanticCallCPUs(ctx context.Context) int {
-	encoder, err := s.semanticRowEncoder(ctx)
+	encoder, err := s.semanticRowEncoder(ctx, false)
 	if err != nil {
 		return 1
 	}
-	return max(0, encoder.CallCPUs())
+	return encoder.CallCPUs()
 }
 
 func (s *lateOnModel) embedSemanticUnitBatch(
@@ -344,7 +349,7 @@ func (s *lateOnModel) embedSemanticUnitBatch(
 	var tokenizer *lateOnTokenizer
 	if slices.ContainsFunc(units, func(unit semanticUnit) bool { return len(unit.modelInput) == 0 }) {
 		var err error
-		if tokenizer, err = s.takeTokenizer(ctx); err != nil {
+		if tokenizer, err = lateOnTokenizers.take(ctx); err != nil {
 			return nil, err
 		}
 	}
@@ -354,7 +359,7 @@ func (s *lateOnModel) embedSemanticUnitBatch(
 		units,
 	)
 	if tokenizer != nil {
-		s.releaseTokenizer(tokenizer)
+		lateOnTokenizers.release(tokenizer)
 	}
 	if tokenizeErr != nil {
 		return nil, tokenizeErr
@@ -381,17 +386,17 @@ func (s *lateOnModel) PrepareSemanticQuery(
 	ctx context.Context,
 	modelQuery string,
 ) (*semanticQueryEmbedding, error) {
-	tokenizer, err := s.takeTokenizer(ctx)
+	tokenizer, err := lateOnTokenizers.take(ctx)
 	if err != nil {
 		return nil, err
 	}
 	windows, encodeErr := lateOnQueryWindows(tokenizer, modelQuery)
-	s.releaseTokenizer(tokenizer)
+	lateOnTokenizers.release(tokenizer)
 	if encodeErr != nil {
 		return nil, encodeErr
 	}
 	inputIDs, attention, masks := packLateOnRows(windows, nil, true)
-	encoder, err := s.semanticRowEncoder(ctx)
+	encoder, err := s.semanticRowEncoder(ctx, true)
 	if err != nil {
 		return nil, err
 	}
@@ -434,7 +439,7 @@ func (s *lateOnModel) ScoresWithSemanticQuery(
 	if len(documents) == 0 {
 		return nil, nil
 	}
-	encoder, err := s.semanticRowEncoder(ctx)
+	encoder, err := s.semanticRowEncoder(ctx, true)
 	if err != nil {
 		return nil, err
 	}
@@ -443,7 +448,7 @@ func (s *lateOnModel) ScoresWithSemanticQuery(
 	// number of candidates gets a score.
 	scores := make([]float32, len(documents))
 	group, groupCtx := errgroup.WithContext(ctx)
-	group.SetLimit(semanticModelCallLimit(runtime.GOMAXPROCS(0), max(0, encoder.CallCPUs())))
+	group.SetLimit(semanticModelCallLimit(runtime.GOMAXPROCS(0), encoder.CallCPUs()))
 	for start := 0; start < len(documents); start += semanticModelBatchRows {
 		batch := documents[start:min(start+semanticModelBatchRows, len(documents))]
 		group.Go(func() error {
@@ -469,7 +474,7 @@ func (s *lateOnModel) scoreDocumentBatch(
 	prepared *semanticQueryEmbedding,
 	documents []rerankDocument,
 ) ([]float32, error) {
-	tokenizer, err := s.takeTokenizer(ctx)
+	tokenizer, err := lateOnTokenizers.take(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -478,7 +483,7 @@ func (s *lateOnModel) scoreDocumentBatch(
 		s.punctuation,
 		documents,
 	)
-	s.releaseTokenizer(tokenizer)
+	lateOnTokenizers.release(tokenizer)
 	if tokenizeErr != nil {
 		return nil, tokenizeErr
 	}
@@ -491,18 +496,55 @@ func (s *lateOnModel) scoreDocumentBatch(
 	return scores, err
 }
 
-func (s *lateOnModel) semanticRowEncoder(ctx context.Context) (*lateOnStaticRowEncoder, error) {
+// semanticRowEncoder returns the encoder for one kind of call. interactive
+// reports a call that runs once while the user waits: a query, or the scores
+// of one candidate set. The first call builds the first encoder, and its kind
+// sets the session's CPU threads (newLateOnRowEncoder). A query gets many
+// threads for one call at a time. An index build gets few threads for many
+// calls at the same time. So a warm description search makes one session.
+// The CLI starts the query before any vector build. So when a command also
+// builds vectors on the CPU provider, a build call gets a second CPU session
+// with the build's thread count. That session takes about 90 ms to make. If
+// it fails, build calls use the first session.
+// On 18 CPUs, one call at a time on 12 threads encodes about 245 rows/s
+// (523 ms per 128 rows). The build's calls, 3 threads each, encode about
+// 650 rows/s in total (the 100k-row pass took 153.9 s).
+func (s *lateOnModel) semanticRowEncoder(ctx context.Context, interactive bool) (*lateOnStaticRowEncoder, error) {
+	if s.closed.Load() {
+		return nil, errLateOnModelClosed
+	}
 	s.encoderOnce.Do(func() {
-		s.encoder, s.encoderErr = newLateOnRowEncoder(ctx)
+		s.encoder, s.encoderErr = newLateOnRowEncoder(ctx, interactive)
 	})
-	return s.encoder, s.encoderErr
+	if interactive || s.encoderErr != nil || !s.encoder.interactive {
+		return s.encoder, s.encoderErr
+	}
+	s.buildOnce.Do(func() {
+		s.build, s.buildErr = newLateOnCPUBuildEncoder(ctx)
+	})
+	if s.buildErr != nil {
+		// The first session still works, with fewer calls at a time.
+		slog.Debug("Index build session unavailable; using the query session", "error", s.buildErr)
+		return s.encoder, nil
+	}
+	return s.build, nil
 }
 
+// errLateOnModelClosed is the error of every encoder request
+// (semanticRowEncoder) after Close.
+var errLateOnModelClosed = errors.New("the semantic model is closed")
+
 func (s *lateOnModel) Close() error {
+	s.closed.Store(true)
+	// Each Once waits for a construction in flight. With none, it stops a
+	// later call from building one. So Close reads the encoder fields after
+	// their write. Close writes neither encoder pointer, because a call that
+	// passed the closed check can still read both.
+	s.encoderOnce.Do(func() { s.encoderErr = errLateOnModelClosed })
+	s.buildOnce.Do(func() { s.buildErr = errLateOnModelClosed })
 	var closeErr error
-	if s.encoder != nil {
-		closeErr = s.encoder.Close()
-		s.encoder = nil
+	for _, encoder := range []*lateOnStaticRowEncoder{s.encoder, s.build} {
+		closeErr = errors.Join(closeErr, encoder.Close())
 	}
 	// Keep the process-wide tokenizers and the shared environment loaded for
 	// the process lifetime. Unloading the ONNX library after inference can
@@ -750,10 +792,11 @@ func lateOnMaxSimPrepared(
 	return scores, nil
 }
 
-// lateOnRowHasUsableToken reports whether a row (a document or a query window)
-// keeps one masked token with a finite, non-zero vector. A provider fault can return a zero vector. That
-// vector contributes a dot product of zero, which keeps the score finite and
-// hides the fault, so the existing "no scoreable token" guard never sees it.
+// lateOnRowHasUsableToken reports whether a row (a document or a query
+// window) keeps one masked token with a finite, non-zero vector. A provider
+// fault can return a zero vector. That vector contributes a dot product of
+// zero, which keeps the score finite and hides the fault, so the "no
+// scoreable token" guard of lateOnMaxSimPrepared never sees it.
 func lateOnRowHasUsableToken(documents []float32, document int, mask []bool) bool {
 	for documentToken, keepDocument := range mask {
 		if !keepDocument {
@@ -765,10 +808,10 @@ func lateOnRowHasUsableToken(documents []float32, document int, mask []bool) boo
 		for dimension := range semanticEmbeddingDimensions {
 			value := float64(documents[offset+dimension])
 			if math.IsNaN(value) || math.IsInf(value, 0) {
-				// Keep looking. A later token can still carry the row, which is
-				// what the scoring loop of lateOnMaxSimPrepared relies on: a
-				// comparison against a non-finite value is false, so such a token
-				// never wins the maximum.
+				// Keep looking. A later token can still carry the row. In the
+				// scoring loop of lateOnMaxSimPrepared, a NaN or -Inf dot
+				// product never wins the maximum, and a +Inf one makes the score
+				// not finite, which fails the call.
 				finite = false
 				break
 			}
@@ -809,16 +852,15 @@ func encodeLateOnDocument(
 	), nil
 }
 
+// sanitizeLateOnDocumentInput sanitizes each part of text and moves the three
+// offsets to the sanitized text. serializeLateOnDocumentWithMatch gives
+// 0 <= metadataEnd <= matchAt <= matchEnd <= len(text).
 func sanitizeLateOnDocumentInput(
 	text string,
 	metadataEnd int,
 	matchAt int,
 	matchEnd int,
 ) (string, int, int, int) {
-	if metadataEnd < 0 || metadataEnd > matchAt || matchAt > matchEnd || matchEnd > len(text) {
-		sanitized := sanitizeLateOnTokenizerInput(text)
-		return sanitized, 0, 0, len(sanitized)
-	}
 	metadata := sanitizeLateOnTokenizerInput(text[:metadataEnd])
 	beforeMatch := sanitizeLateOnTokenizerInput(text[metadataEnd:matchAt])
 	match := sanitizeLateOnTokenizerInput(text[matchAt:matchEnd])
@@ -911,20 +953,11 @@ func truncateLateOnDocumentTokens(
 	return out
 }
 
-func encodeLateOnText(
-	tokenizer *lateOnTokenizer,
-	text string,
-) ([]int, error) {
-	encoded, _, err := tokenizer.encode(text, true, false)
-	if err != nil {
-		return nil, err
-	}
-	return truncateLateOnHead(encoded, lateOnSequenceLength), nil
-}
-
 // lateOnQueryWindows splits a query into 128-token windows: each window holds
 // CLS, the query prefix, a part of the query tokens, and SEP, so a long query
-// keeps every token. A query that fits gives one window.
+// keeps every token. A query that fits gives one window. The windows go in
+// one model call, so a query of more than semanticModelBatchRows windows
+// fails.
 func lateOnQueryWindows(tokenizer *lateOnTokenizer, modelQuery string) ([][]int, error) {
 	encoded, _, err := tokenizer.encode(lateOnQueryPrefix+modelQuery, true, false)
 	if err != nil {
@@ -988,6 +1021,7 @@ func ensureLateOnRuntime(bundle lateOnRuntimeBundle) (string, bool, error) {
 		bundle.version,
 		bundle.sha256,
 	)
+	defer touchRuntimeUse(directory)
 	return installPrivateAsset(
 		directory,
 		bundle.fileName,

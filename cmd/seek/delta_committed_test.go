@@ -12,8 +12,8 @@ import (
 )
 
 // reindexGit runs one full indexing cycle for the committed and uncommitted
-// families in the given repository and corpus plan.
-func reindexGit(t *testing.T, ctx context.Context, paths gitPaths, plan corpusPlan) {
+// families in the given repository and node.
+func reindexGit(t *testing.T, ctx context.Context, paths gitPaths, plan node) {
 	t.Helper()
 	state := mustGitRepoStateIn(t, ctx, paths.RepoDir)
 	hash := gitCorpusStateHash(paths, state)
@@ -276,8 +276,8 @@ func TestDeltaCommitted_ShardThresholdTriggersFullRebuild(t *testing.T) {
 		t.Fatalf("delta path never stacked extra shards (series=%v) — silent fallback likely", shardSeries)
 	}
 	if peak < maxCommittedDeltaShards-1 {
-		// Allow some slack for empty-shard cleanup but the run must climb
-		// at least near the cap to prove the threshold path is meaningful.
+		// Allow one shard of slack, but the run must climb at least near the
+		// cap to prove the threshold path is meaningful.
 		t.Fatalf("peak shard count %d never approached threshold %d — series=%v", peak, maxCommittedDeltaShards, shardSeries)
 	}
 	finalShards := shardSeries[len(shardSeries)-1]

@@ -203,8 +203,7 @@ func rowNames(rows []gcRow) []corpusID {
 
 // TestGCCmd_DryRun_NoCorpora — an empty cache under --dry-run prints the
 // banner + "no corpora" and returns before the table, with NO summary line
-// (exercises printGCTableBanner's false return, which the live path ignores
-// but the dry-run path consumes as an early return).
+// (reportGCPlan returns right after the banner when the cache has no corpus).
 func TestGCCmd_DryRun_NoCorpora(t *testing.T) {
 	cacheRootForTest(t)
 	out := runGCCapture(t, "--dry-run")
@@ -333,9 +332,9 @@ func (w *rowProbeWriter) Write(p []byte) (int, error) {
 
 // TestGC_StreamingDefault_RendersBeforeLaterCorporaProcessed — with the
 // default name order the live table must stream: row i renders before
-// corpora i+1..n are processed (pre-materialization behavior: incremental
-// output, and a Ctrl-C keeps the already-evicted prefix). Ordering-based
-// via a synchronous writer probe — no timing, fully deterministic.
+// corpora i+1..n are processed (incremental output, and a Ctrl-C keeps the
+// already-evicted prefix). Ordering-based via a synchronous writer probe — no
+// timing, fully deterministic.
 func TestGC_StreamingDefault_RendersBeforeLaterCorporaProcessed(t *testing.T) {
 	root := cacheRootForTest(t)
 	stale := time.Now().Add(-30 * 24 * time.Hour)
@@ -358,7 +357,7 @@ func TestGC_StreamingDefault_RendersBeforeLaterCorporaProcessed(t *testing.T) {
 		rowToken:   []byte(truncateHash(corpusID(first))),
 		markerPath: marker,
 	}
-	runGC(context.Background(), gcOptions{skipThrottle: true, writer: w}, 0)
+	runGC(context.Background(), gcOptions{skipThrottle: true, writer: w})
 
 	if !w.sawRow {
 		t.Fatalf("no row rendered for first corpus; output:\n%s", w.buf.String())
@@ -393,7 +392,7 @@ func TestGCCmd_DryRun_SortByAge_OldestFirst(t *testing.T) {
 }
 
 // TestGCCmd_DryRun_DefaultOrderIsHash — without --sort the table must keep
-// the historical hash order even when sizes would order differently.
+// the hash order even when sizes would order differently.
 func TestGCCmd_DryRun_DefaultOrderIsHash(t *testing.T) {
 	root := cacheRootForTest(t)
 	now := time.Now()

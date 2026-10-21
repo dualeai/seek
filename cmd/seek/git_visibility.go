@@ -8,45 +8,30 @@ import (
 	"strings"
 )
 
-// visibility is the routing decision for a single path operand resolved
-// against one git worktree.
-type visibility uint8
-
-const (
-	// visGit: the path is part of the repo's indexable content (tracked,
-	// or untracked-but-not-ignored). Route to the repo's git corpus and
-	// scope inside the zoekt index.
-	visGit visibility = iota
-	// visFallback: the path is excluded from the repo by a .gitignore rule,
-	// so the git index never contains it. Route to a standalone folder/file
-	// corpus so its content is still searched.
-	visFallback
-	// visOutside: the path is not owned by this repo — outside the worktree
-	// or inside a nested submodule. The caller routes it to a plain
-	// folder/file corpus (same as visFallback).
-	visOutside
-)
-
 // classifyVisibility classifies every path against the single repo rooted at
 // repoRoot. paths must be canonical absolute paths; callers must group by
 // repo root and not mix roots in one call. Every input path appears in the
-// returned map. git check-ignore exit 1 (nothing ignored) and an exit 128
-// that names a submodule boundary or a path outside the repository are normal
-// signals. Any other failure is an error: Seek never searches a repository
-// that Git cannot read as a folder. It owns no boundary discovery (that is
-// detectGitBoundary) and constructs no corpora.
-func classifyVisibility(ctx context.Context, repoRoot string, paths []string) (map[string]visibility, error) {
-	out := make(map[string]visibility, len(paths))
+// returned map. True means that the path is indexable content of the
+// repository (tracked, or untracked and not ignored): the Git corpus holds it,
+// and the search scopes inside its index. False means that the path is
+// ignored, outside the worktree, or inside a nested submodule: a folder or
+// file corpus searches its content. git check-ignore exit 1 (nothing ignored)
+// and an exit 128 that names a submodule boundary or a path outside the
+// repository are normal signals. Any other failure is an error: Seek never
+// searches a repository that Git cannot read as a folder. It owns no boundary
+// discovery (that is detectGitBoundary) and constructs no corpora.
+func classifyVisibility(ctx context.Context, repoRoot string, paths []string) (map[string]bool, error) {
+	out := make(map[string]bool, len(paths))
 	relOf := make(map[string]string, len(paths)) // slash-relative -> canonical abs
 	within := make([]string, 0, len(paths))
 	for _, p := range paths {
 		rel, ok := relWithin(repoRoot, p)
 		if !ok {
-			out[p] = visOutside // not inside this worktree
+			out[p] = false // not inside this worktree
 			continue
 		}
 		if rel == "." {
-			out[p] = visGit // the worktree root itself is never ignored
+			out[p] = true // the worktree root itself is never ignored
 			continue
 		}
 		slashRel := filepath.ToSlash(rel)
@@ -63,7 +48,7 @@ func classifyVisibility(ctx context.Context, repoRoot string, paths []string) (m
 	}
 	if !aborted {
 		for rel, p := range relOf {
-			out[p] = decideVisibility(ignored[rel])
+			out[p] = !ignored[rel]
 		}
 		return out, nil
 	}
@@ -76,20 +61,10 @@ func classifyVisibility(ctx context.Context, repoRoot string, paths []string) (m
 		if err != nil {
 			return nil, err
 		}
-		if aborted1 {
-			out[p] = visOutside // this path is the one inside a submodule
-			continue
-		}
-		out[p] = decideVisibility(ign[rel])
+		// An aborted path is the one inside a submodule.
+		out[p] = !aborted1 && !ign[rel]
 	}
 	return out, nil
-}
-
-func decideVisibility(ignored bool) visibility {
-	if ignored {
-		return visFallback
-	}
-	return visGit
 }
 
 // checkGitIgnore runs `git check-ignore -z --stdin` in DEFAULT (index-aware)

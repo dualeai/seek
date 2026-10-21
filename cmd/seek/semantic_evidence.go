@@ -35,9 +35,6 @@ const (
 )
 
 func configuredContextLines(config searchConfig) int {
-	if config.opts == nil {
-		return 0
-	}
 	return max(0, config.opts.NumContextLines)
 }
 
@@ -46,7 +43,7 @@ func configuredContextLines(config searchConfig) int {
 // result and the model document.
 func materializeSemanticCandidates(
 	ctx context.Context,
-	plan corpusPlan,
+	plan node,
 	paths gitPaths,
 	head string,
 	candidates []semanticFileCandidate,
@@ -141,21 +138,12 @@ func materializeSemanticCandidates(
 	return candidates, nil
 }
 
-func materializeFolderSemanticCandidates(
-	ctx context.Context,
-	plan corpusPlan,
-	candidates []semanticFileCandidate,
-	contextLines int,
-) ([]semanticFileCandidate, error) {
-	return materializeWorkTreeSemanticCandidates(ctx, plan, folderRepoName(plan), candidates, contextLines)
-}
-
 // materializeWorkTreeSemanticCandidates reads the evidence of each candidate
 // from the file on disk below plan.root: a folder node's files, or the dirty
 // files of a Git node's overlay, which print as repository.
 func materializeWorkTreeSemanticCandidates(
 	ctx context.Context,
-	plan corpusPlan,
+	plan node,
 	repository string,
 	candidates []semanticFileCandidate,
 	contextLines int,

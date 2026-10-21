@@ -137,7 +137,7 @@ func mustGitRepoStateIn(tb testing.TB, ctx context.Context, dir string) repoStat
 	return state
 }
 
-func planGitTestCorpus(tb testing.TB, repoDir string) (gitPaths, corpusPlan) {
+func planGitTestCorpus(tb testing.TB, repoDir string) (gitPaths, node) {
 	tb.Helper()
 	setTestUserCache(tb)
 
@@ -158,7 +158,7 @@ func planGitTestCorpus(tb testing.TB, repoDir string) (gitPaths, corpusPlan) {
 	return paths, plan
 }
 
-func planFolderTestCorpus(tb testing.TB, root string) corpusPlan {
+func planFolderTestCorpus(tb testing.TB, root string) node {
 	tb.Helper()
 	setTestUserCache(tb)
 
@@ -213,14 +213,14 @@ func formattedOutputFileNamesForTest(output string) []string {
 }
 
 // runSeekInPlannedGitCorpus is a white-box helper for tests and benchmarks that
-// need to reuse a precomputed corpus plan. Integration tests should prefer
+// need to reuse a precomputed node. Integration tests should prefer
 // runSeekInRepo or run so they exercise CLI planning, freshness, search, and
 // formatting together.
 func runSeekInPlannedGitCorpus(
 	ctx context.Context,
 	pattern string,
 	paths gitPaths,
-	plan corpusPlan,
+	plan node,
 ) ([]string, error) {
 	query, err := parseSearchQuery(pattern)
 	if err != nil {
@@ -475,7 +475,7 @@ func TestEnsureCombinedGitCorpusPublishesEmptyNativeSnapshot(t *testing.T) {
 	}
 }
 
-func publishedGitGenerationBytes(t *testing.T, plan corpusPlan) map[string]string {
+func publishedGitGenerationBytes(t *testing.T, plan node) map[string]string {
 	t.Helper()
 	paths := familyShardFilesForTest(t, plan.indexDir, familyAll)
 	paths = append(paths, filepath.Join(plan.indexDir, familyManifestFile))
@@ -1941,7 +1941,8 @@ func TestRun_ExternalExactFileDoesNotSearchSibling(t *testing.T) {
 	if !strings.Contains(out, "## "+target) {
 		t.Fatalf("expected exact file result, got:\n%s", out)
 	}
-	if strings.Contains(out, "## "+filepath.Join(target, "sibling.txt")) {
+	// Only a sibling result prints the sibling's name.
+	if strings.Contains(out, "sibling.txt") {
 		t.Fatalf("exact file search should not include sibling, got:\n%s", out)
 	}
 }
@@ -2062,7 +2063,7 @@ func TestRun_SymlinkInsideWorktreeSearchesResolvedFile(t *testing.T) {
 	if !strings.Contains(out, "## "+link) {
 		t.Fatalf("expected scoped output to include resolved target file, got:\n%s", out)
 	}
-	if strings.Contains(out, "## "+filepath.Join(link, "b/app.go")) || strings.Contains(out, "package b") {
+	if strings.Contains(out, "b/app.go") || strings.Contains(out, "package b") {
 		t.Fatalf("expected scoped output to exclude b/app.go, got:\n%s", out)
 	}
 }
@@ -2508,7 +2509,7 @@ func TestRun_FirstNativeFailureDoesNotOpenLegacyGeneration(t *testing.T) {
 	if err := indexNativeGitFull(t.Context(), paths.RepoDir, legacyPlan.indexDir, snapshot, 1, nil); err != nil {
 		t.Fatalf("build legacy-generation decoy: %v", err)
 	}
-	if matches, err := executeUnscopedShardSearchForTest(t.Context(), legacyPlan.indexDir, "LEGACY_GENERATION_DECOY"); err != nil || len(matches) != 1 {
+	if matches, err := searchPlannedCorpusForTest(t.Context(), legacyPlan, "LEGACY_GENERATION_DECOY"); err != nil || len(matches) != 1 {
 		t.Fatalf("legacy-generation decoy is not searchable: matches=%v error=%v", matches, err)
 	}
 
@@ -2905,12 +2906,24 @@ func captureStdout(t *testing.T, fn func() error) (string, error) {
 		t.Fatal(err)
 	}
 
+	// Read while fn runs: output larger than the pipe buffer must not block
+	// the command.
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	read := make(chan readResult, 1)
+	go func() {
+		data, err := io.ReadAll(reader)
+		read <- readResult{data, err}
+	}()
 	os.Stdout = writer
 	fnErr := fn()
 	_ = writer.Close()
 	os.Stdout = oldStdout
 
-	data, readErr := io.ReadAll(reader)
+	result := <-read
+	data, readErr := result.data, result.err
 	_ = reader.Close()
 	if readErr != nil {
 		t.Fatalf("read captured stdout: %v", readErr)
@@ -3233,8 +3246,8 @@ func TestRun_NestedRepoVenvNotLeakedToParent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The second scan must keep the nested repository boundary when the pool has
-	// already seen that corpus. It must not index .venv as parent-folder content.
+	// The second scan, with a warm cache, must keep the nested repository
+	// boundary. It must not index .venv as parent-folder content.
 	out, err := captureStdout(t, func() error {
 		return run(context.Background(), marker, []string{parent})
 	})
@@ -3246,10 +3259,10 @@ func TestRun_NestedRepoVenvNotLeakedToParent(t *testing.T) {
 	}
 }
 
-// I6 (split case) — a tracked file and a gitignored file of the SAME repo,
-// passed together, are searched by exactly one corpus each: the tracked file
-// through the Git corpus, the ignored file through a folder fallback. Both
-// are found and neither file is duplicated.
+// TestRun_TrackedAndIgnoredFileOperandsBothSearchedOnce passes a tracked file
+// and a gitignored file of the SAME repo together. Each is searched by exactly
+// one corpus: the tracked file through the Git corpus, the ignored file
+// through a folder fallback. Both are found and neither file is duplicated.
 func TestRun_TrackedAndIgnoredFileOperandsBothSearchedOnce(t *testing.T) {
 	requireTools(t)
 
@@ -3272,9 +3285,9 @@ func TestRun_TrackedAndIgnoredFileOperandsBothSearchedOnce(t *testing.T) {
 	if !strings.Contains(out, "splitneedle ignored") {
 		t.Fatalf("ignored file content missing (folder fallback), got:\n%s", out)
 	}
-	// Multi-corpus mode renders absolute headers; the file names appear only
-	// in headers (not in the content), so a single occurrence each proves
-	// neither file is searched by two corpora.
+	// Each header is the file operand as typed. The file names appear only in
+	// headers, not in the content, so one occurrence each proves that no file
+	// is searched by two corpora.
 	if n := strings.Count(out, "tracked.go"); n != 1 {
 		t.Fatalf("tracked.go should appear once, got %d:\n%s", n, out)
 	}
@@ -3379,10 +3392,10 @@ func TestRun_SymlinkToIgnoredFileSearchesContent(t *testing.T) {
 	}
 }
 
-// A scoped search over a CLEAN in-scope tree must mint only the committed
-// layer (one corpus dir) — the empty dirty layer is elided. Result is found
-// and not tagged [uncommitted].
-func TestRun_CleanScopedSearchElidesDirtyLayer(t *testing.T) {
+// A scoped search over a CLEAN in-scope tree makes one corpus directory, the
+// combined whole-repo index. The result is found and not tagged
+// [uncommitted].
+func TestRun_CleanScopedSearchUsesTheCombinedIndex(t *testing.T) {
 	requireTools(t)
 
 	repo := initGitRepo(t, "committed.go", "package main\n")
@@ -3403,7 +3416,7 @@ func TestRun_CleanScopedSearchElidesDirtyLayer(t *testing.T) {
 		t.Fatalf("clean scope must not be tagged uncommitted, got:\n%s", out)
 	}
 	if n := countCorpora(t); n != 1 {
-		t.Fatalf("clean scoped search must mint 1 corpus (committed only, dirty elided), got %d", n)
+		t.Fatalf("clean scoped search must make 1 corpus (the combined whole-repo index), got %d", n)
 	}
 }
 
@@ -3434,9 +3447,9 @@ func TestRun_DirtyScopedSearchReusesCombinedIndex(t *testing.T) {
 	}
 }
 
-// Two clean scoped searches of different subtrees of one under-cap repo must
-// resolve to a SINGLE shared whole-repo committed index (collapse), while
-// search-time scope filtering still excludes the sibling subtree.
+// Two clean scoped searches of different subtrees of one repo must resolve to
+// a SINGLE shared whole-repo index (one corpus directory), while search-time
+// scope filtering still excludes the sibling subtree.
 func TestRun_ScopedSearchesShareCommittedIndex(t *testing.T) {
 	requireTools(t)
 
@@ -3462,14 +3475,14 @@ func TestRun_ScopedSearchesShareCommittedIndex(t *testing.T) {
 		}
 	}
 	if n := countCorpora(t); n != 1 {
-		t.Fatalf("two clean scoped searches of one under-cap repo must share 1 committed corpus, got %d", n)
+		t.Fatalf("two clean scoped searches of one repo must share 1 corpus, got %d", n)
 	}
 }
 
 // resultFileBasenames extracts the set of file basenames from seek's output
-// headers ("## <path> (<Lang>)[ [uncommitted]]"). Scoped output renders
-// operand-relative paths and unscoped renders repo-relative paths, so we
-// compare by basename (unique per file in the equivalence fixtures).
+// headers ("## <path> (<Lang>)[ [uncommitted]]"). A scoped header starts with
+// the operand as typed, and an unscoped header is repo-relative, so the tests
+// compare basenames (unique per file in the equivalence fixtures).
 func resultFileBasenames(out string) map[string]bool {
 	set := map[string]bool{}
 	for _, line := range strings.Split(out, "\n") {
@@ -3778,7 +3791,7 @@ func TestRace_ConcurrentScopedUnscopedSameRepo(t *testing.T) {
 	}
 
 	if n := countCorpora(t); n != 1 {
-		t.Fatalf("concurrent scoped+unscoped on one under-cap repo must share 1 combined corpus, got %d", n)
+		t.Fatalf("concurrent scoped+unscoped on one repo must share 1 combined corpus, got %d", n)
 	}
 	files, err := runSeekInRepo(t, repo, "CONCURRENT_MARKER")
 	if err != nil || len(files) == 0 {
@@ -3786,9 +3799,10 @@ func TestRace_ConcurrentScopedUnscopedSameRepo(t *testing.T) {
 	}
 }
 
-// The shared committed index is HEAD-keyed; a new commit must rebuild it. A
-// stale (non-rebuilt) index would not contain the new content.
-func TestRun_SharedCommittedIndexRebuildsOnHeadChange(t *testing.T) {
+// The shared committed index is bound to HEAD: a new commit must update it,
+// with a delta or a full build. An index that is not updated does not hold the
+// new content.
+func TestRun_SharedCommittedIndexUpdatesOnHeadChange(t *testing.T) {
 	requireTools(t)
 
 	repo := initGitRepo(t, "root.go", "package main\n")

@@ -25,60 +25,29 @@ type committedGitState struct {
 
 func readCommittedGitState(cacheDir string) (committedGitState, bool) {
 	data, err := os.ReadFile(filepath.Join(cacheDir, committedGitStateFile))
-	if err != nil || len(data) == 0 || data[len(data)-1] != '\n' {
-		return committedGitState{}, false
-	}
-	raw := strings.TrimSuffix(string(data), "\n")
-	lines := strings.Split(raw, "\n")
-	if len(lines) != 4 || lines[0] != committedGitStateVersion {
-		return committedGitState{}, false
-	}
-	value := func(line, prefix string) (string, bool) {
-		if !strings.HasPrefix(line, prefix) {
-			return "", false
-		}
-		v := strings.TrimPrefix(line, prefix)
-		return v, v != ""
-	}
-	headRaw, ok := value(lines[1], "head ")
-	if !ok {
-		return committedGitState{}, false
-	}
-	head, err := parseGitObjectID([]byte(headRaw))
 	if err != nil {
 		return committedGitState{}, false
 	}
-	parseNonnegative := func(line, prefix string) (int64, bool) {
-		rawValue, ok := value(line, prefix)
-		if !ok {
-			return 0, false
-		}
-		n, err := strconv.ParseInt(rawValue, 10, 64)
-		return n, err == nil && n >= 0
-	}
-	baseHeadRaw, ok := value(lines[2], "base_head ")
-	if !ok {
+	// Four lines, each with its newline: the split ends with one empty string.
+	lines := strings.Split(string(data), "\n")
+	if len(lines) != 5 || lines[0] != committedGitStateVersion || lines[4] != "" {
 		return committedGitState{}, false
 	}
-	baseHead, err := parseGitObjectID([]byte(baseHeadRaw))
-	if err != nil || len(baseHead) != len(head) {
+	headRaw, headOK := strings.CutPrefix(lines[1], "head ")
+	baseRaw, baseOK := strings.CutPrefix(lines[2], "base_head ")
+	shardsRaw, shardsOK := strings.CutPrefix(lines[3], "base_shards ")
+	head, headErr := parseGitObjectID([]byte(headRaw))
+	baseHead, baseErr := parseGitObjectID([]byte(baseRaw))
+	baseShards, shardsErr := strconv.Atoi(shardsRaw)
+	if !headOK || !baseOK || !shardsOK || headErr != nil || baseErr != nil || shardsErr != nil ||
+		len(baseHead) != len(head) || baseShards < 0 {
 		return committedGitState{}, false
 	}
-	baseShards64, ok := parseNonnegative(lines[3], "base_shards ")
-	if !ok || baseShards64 > int64(maxInt()) {
-		return committedGitState{}, false
-	}
-	return committedGitState{
-		head:       head,
-		baseHead:   baseHead,
-		baseShards: int(baseShards64),
-	}, true
+	return committedGitState{head: head, baseHead: baseHead, baseShards: baseShards}, true
 }
 
 func writeCommittedGitState(cacheDir string, state committedGitState) error {
-	head, headErr := parseGitObjectID([]byte(state.head))
-	baseHead, baseHeadErr := parseGitObjectID([]byte(state.baseHead))
-	if headErr != nil || baseHeadErr != nil || head != state.head || baseHead != state.baseHead ||
+	if !validGitObjectID([]byte(state.head)) || !validGitObjectID([]byte(state.baseHead)) ||
 		len(state.head) != len(state.baseHead) || state.baseShards < 0 {
 		return fmt.Errorf("invalid committed Git state")
 	}
@@ -95,8 +64,4 @@ func writeCommittedGitState(cacheDir string, state committedGitState) error {
 func deleteCommittedGitState(cacheDir string) {
 	removeCacheFile(cacheDir, committedGitStateFile)
 	removeCacheFile(cacheDir, committedGitStateFile+".tmp")
-}
-
-func maxInt() int {
-	return int(^uint(0) >> 1)
 }

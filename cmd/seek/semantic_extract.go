@@ -2,10 +2,11 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/sha256"
 	"encoding/binary"
 	"hash"
-	"sort"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -51,25 +52,19 @@ type semanticUnit struct {
 	parserResult semanticParserResult
 	// language describes this extracted unit in model and result documents.
 	language string
-	// fileLanguage is Zoekt's whole-file language for lang: filter matching.
-	fileLanguage string
-	symbol       string
-	text         []byte
+	symbol   string
+	text     []byte
 	// key identifies the row's model input (makeSemanticRowKey): a build
 	// copies the vectors of a key that a live generation or the unit store
 	// holds.
 	key semanticRowKey
 	// modelInput is transient. The window split supplies the token IDs that
-	// the encoder consumes, then the collector clears them before storage.
+	// the encoder consumes; the build clears them, text, and reuse in the
+	// stored copy of each row.
 	modelInput []int
-	// reuse is transient: the live generation row whose vectors this row
-	// copies, or nil when the model embeds it.
+	// reuse is transient: the live generation row or unit store record whose
+	// vectors this row copies, or nil when the model embeds it.
 	reuse *semanticReuseRef
-}
-
-type semanticTagParser interface {
-	Parse(path string, content []byte) ([]*ctags.Entry, error)
-	Close()
 }
 
 type semanticAnchor struct {
@@ -78,44 +73,19 @@ type semanticAnchor struct {
 	symbol   string
 }
 
-// extractSemanticUnits covers each eligible non-empty source byte once. It
-// excludes binary files and keeps generated files. Valid ctags starts create
-// symbol units. Prefixes and parser gaps create gap units. A parser failure or
-// a file without valid symbols creates fallback units.
-func extractSemanticUnits(
-	path string,
-	content []byte,
-	entries []*ctags.Entry,
-	parseErr error,
-) []semanticUnit {
-	if !semanticContentIsEligible(content) {
-		return nil
-	}
-	return extractEligibleSemanticUnits(path, content, entries, parseErr, "")
-}
-
-// extractEligibleSemanticUnits extracts content after its caller has checked
-// the semantic source boundary. fileLanguage becomes part of each stable ID.
-func extractEligibleSemanticUnits(
-	path string,
-	content []byte,
-	entries []*ctags.Entry,
-	parseErr error,
-	fileLanguage string,
-) []semanticUnit {
-	return extractSemanticUnitsWithID(
-		path, content, semanticContentID(sha256.Sum256(content)), entries, parseErr, fileLanguage,
-	)
-}
-
-// extractSemanticUnitsWithID extracts content whose SHA-256 the caller has.
+// extractSemanticUnitsWithID extracts content whose SHA-256 the caller has
+// (contentID). The caller has checked that content is eligible
+// (semanticContentIsEligible). The units cover each source byte once, in
+// parts of at most semanticUnitMaxBytes. Valid ctags starts create symbol
+// units, and the bytes before the first start create a gap unit. A parser
+// failure, invalid UTF-8, or a file without valid symbols creates fallback
+// units.
 func extractSemanticUnitsWithID(
 	path string,
 	content []byte,
 	contentID semanticContentID,
 	entries []*ctags.Entry,
 	parseErr error,
-	fileLanguage string,
 ) []semanticUnit {
 	var idBuffer []byte
 	parserResult := semanticParserCTags
@@ -145,28 +115,24 @@ func extractSemanticUnitsWithID(
 			symbol:   symbol,
 		})
 	}
-	sort.Slice(anchors, func(i, j int) bool {
-		if anchors[i].offset != anchors[j].offset {
-			return anchors[i].offset < anchors[j].offset
-		}
-		if anchors[i].symbol != anchors[j].symbol {
-			return anchors[i].symbol < anchors[j].symbol
-		}
-		return anchors[i].language < anchors[j].language
+	slices.SortFunc(anchors, func(a, b semanticAnchor) int {
+		return cmp.Or(cmp.Compare(a.offset, b.offset), strings.Compare(a.symbol, b.symbol),
+			strings.Compare(a.language, b.language))
 	})
-	anchors = compactSemanticAnchors(anchors)
+	// The first anchor of each offset, by symbol then language, starts the unit.
+	anchors = slices.CompactFunc(anchors, func(a, b semanticAnchor) bool { return a.offset == b.offset })
 	if len(anchors) == 0 {
 		if parserResult == semanticParserCTags {
 			parserResult = semanticParserNoSymbols
 		}
 		return appendSemanticSpan(nil, path, content, contentID, 0, len(content),
-			semanticUnitFallback, parserResult, "", fileLanguage, "", &idBuffer)
+			semanticUnitFallback, parserResult, "", "", &idBuffer)
 	}
 
 	units := make([]semanticUnit, 0, len(anchors)+1)
 	if anchors[0].offset > 0 {
 		units = appendSemanticSpan(units, path, content, contentID, 0,
-			anchors[0].offset, semanticUnitGap, parserResult, "", fileLanguage, "", &idBuffer)
+			anchors[0].offset, semanticUnitGap, parserResult, "", "", &idBuffer)
 	}
 	for i, current := range anchors {
 		end := len(content)
@@ -178,7 +144,7 @@ func extractSemanticUnitsWithID(
 		}
 		units = appendSemanticSpan(units, path, content, contentID,
 			current.offset, end, semanticUnitSymbol, parserResult,
-			current.language, fileLanguage, current.symbol, &idBuffer)
+			current.language, current.symbol, &idBuffer)
 	}
 	return units
 }
@@ -223,22 +189,6 @@ func semanticLineStarts(content []byte) []int {
 	return starts
 }
 
-func compactSemanticAnchors(anchors []semanticAnchor) []semanticAnchor {
-	if len(anchors) < 2 {
-		return anchors
-	}
-	out := anchors[:1]
-	lastOffset := anchors[0].offset
-	for _, item := range anchors[1:] {
-		if item.offset == lastOffset {
-			continue
-		}
-		out = append(out, item)
-		lastOffset = item.offset
-	}
-	return out
-}
-
 // appendSemanticSpan splits one source span and assigns a stable ID to each
 // part. idBuffer must point to caller-owned scratch storage. The caller reuses
 // that storage for all spans from one source file.
@@ -252,7 +202,6 @@ func appendSemanticSpan(
 	kind semanticUnitKind,
 	parserResult semanticParserResult,
 	language string,
-	fileLanguage string,
 	symbol string,
 	idBuffer *[]byte,
 ) []semanticUnit {
@@ -271,7 +220,6 @@ func appendSemanticSpan(
 			kind:         kind,
 			parserResult: parserResult,
 			language:     language,
-			fileLanguage: fileLanguage,
 			symbol:       symbol,
 			// The caller owns content until it finishes encoding this unit. Keeping
 			// a view avoids a second full-file allocation during index builds.
@@ -292,44 +240,28 @@ func makeSemanticUnitID(unit semanticUnit) semanticUnitID {
 // makeSemanticUnitIDBuffered hashes the stable v1 byte encoding. The encoding
 // contains the version prefix; length-prefixed path and content ID; little-
 // endian start and end; kind and parser-result bytes; and length-prefixed unit
-// language, whole-file language, and symbol, in that order. buffer is
-// caller-owned scratch storage. The returned slice can be reused and is not
-// part of the ID.
+// language and symbol, in that order. buffer is caller-owned scratch storage.
+// The returned slice can be reused and is not part of the ID.
 func makeSemanticUnitIDBuffered(unit semanticUnit, buffer []byte) (semanticUnitID, []byte) {
 	const prefix = "seek-semantic-unit-v1\x00"
-	wantBytes := len(prefix) + 5*8 + len(unit.path) + len(unit.contentID) + 2*8 + 2 +
-		len(unit.language) + len(unit.fileLanguage) + len(unit.symbol)
-	if cap(buffer) < wantBytes {
-		buffer = make([]byte, 0, wantBytes)
-	} else {
-		buffer = buffer[:0]
-	}
+	wantBytes := len(prefix) + 4*8 + len(unit.path) + len(unit.contentID) + 2*8 + 2 +
+		len(unit.language) + len(unit.symbol)
+	buffer = slices.Grow(buffer[:0], wantBytes)
 	buffer = append(buffer, prefix...)
-	buffer = appendSemanticUnitIDString(buffer, unit.path)
-	buffer = appendSemanticUnitIDBytes(buffer, unit.contentID[:])
-	var number [8]byte
-	binary.LittleEndian.PutUint64(number[:], unit.start)
-	buffer = append(buffer, number[:]...)
-	binary.LittleEndian.PutUint64(number[:], unit.end)
-	buffer = append(buffer, number[:]...)
+	buffer = appendSemanticUnitIDField(buffer, unit.path)
+	buffer = appendSemanticUnitIDField(buffer, unit.contentID[:])
+	buffer = binary.LittleEndian.AppendUint64(buffer, unit.start)
+	buffer = binary.LittleEndian.AppendUint64(buffer, unit.end)
 	buffer = append(buffer, byte(unit.kind), byte(unit.parserResult))
-	buffer = appendSemanticUnitIDString(buffer, unit.language)
-	buffer = appendSemanticUnitIDString(buffer, unit.fileLanguage)
-	buffer = appendSemanticUnitIDString(buffer, unit.symbol)
+	buffer = appendSemanticUnitIDField(buffer, unit.language)
+	buffer = appendSemanticUnitIDField(buffer, unit.symbol)
 	return semanticUnitID(sha256.Sum256(buffer)), buffer
 }
 
-func appendSemanticUnitIDString(buffer []byte, value string) []byte {
-	var size [8]byte
-	binary.LittleEndian.PutUint64(size[:], uint64(len(value)))
-	buffer = append(buffer, size[:]...)
-	return append(buffer, value...)
-}
-
-func appendSemanticUnitIDBytes(buffer, value []byte) []byte {
-	var size [8]byte
-	binary.LittleEndian.PutUint64(size[:], uint64(len(value)))
-	buffer = append(buffer, size[:]...)
+// appendSemanticUnitIDField appends the little-endian length of value, then
+// value.
+func appendSemanticUnitIDField[T ~string | ~[]byte](buffer []byte, value T) []byte {
+	buffer = binary.LittleEndian.AppendUint64(buffer, uint64(len(value)))
 	return append(buffer, value...)
 }
 

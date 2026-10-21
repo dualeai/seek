@@ -19,14 +19,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
 )
 
 // The cache budget is the one limit on the disk that Seek's indexes use. It
-// covers the whole corpora tree. Every corpus records its size
-// in a ledger file when it publishes. A search checks before any build that
-// its new generations fit, and after the search it evicts the least recently
-// used corpora that it did not use until the cache fits again.
+// covers the whole corpora tree. After a search, each corpus that it
+// published records its size in a ledger file. A search checks before any
+// build that its new generations fit, and after the search it evicts the least
+// recently used corpora that it did not use until the cache fits again.
 const (
 	envCacheBudget = "SEEK_CACHE_BUDGET"
 	// corpusSizeFile is the ledger entry of one corpus: its bytes on disk.
@@ -85,16 +86,11 @@ func cacheVolume(dir string) (capacity, free int64, err error) {
 	return int64(st.Blocks) * blockSize, int64(st.Bavail) * blockSize, nil
 }
 
-// cacheBudgetBytes returns the byte budget of the corpora tree: the smaller of
-// 10 % of the cache volume and the bytes that keep 5 % of the volume free with
-// the current corpora counted as reusable. SEEK_CACHE_BUDGET overrides it.
-func cacheBudgetBytes(cacheRoot string, corporaBytes int64) (int64, error) {
-	budget, _, err := cacheBudget(cacheRoot, func() int64 { return corporaBytes })
-	return budget, err
-}
-
-// cacheBudget returns the budget and whether the 5 % free-space floor sets it.
-// corpora is called only when the volume formula needs the corpora total.
+// cacheBudget returns the byte budget of the corpora tree: the smaller of 10 %
+// of the cache volume and the bytes that keep 5 % of the volume free with the
+// current corpora counted as reusable. SEEK_CACHE_BUDGET overrides it.
+// freeBound reports a budget that the 5 % free-space floor sets. corpora is
+// called only when the volume formula needs the corpora total.
 func cacheBudget(cacheRoot string, corpora func() int64) (budget int64, freeBound bool, err error) {
 	if value := os.Getenv(envCacheBudget); value != "" {
 		budget, err := parseByteSize(value)
@@ -117,7 +113,7 @@ func budgetFloorBinds(capacity, budget int64) bool {
 	return budget < capacity/10
 }
 
-// budgetFromVolume is the default budget (cacheBudgetBytes) for a volume's
+// budgetFromVolume is the default budget (cacheBudget) for a volume's
 // capacity and free bytes and the corpora total.
 func budgetFromVolume(capacity, free, corporaBytes int64) int64 {
 	return max(0, min(capacity/10, corporaBytes+free-capacity/20))
@@ -175,7 +171,7 @@ func corpusSize(dir string, record bool) int64 {
 func recordCorpusSize(dir string) int64 {
 	total := corpusDirSize(dir)
 	info, statErr := os.Stat(dir)
-	_ = writeCacheFile(dir, corpusSizeFile, strconv.FormatInt(total, 10))
+	_ = writeSharedCacheFile(dir, corpusSizeFile, strconv.FormatInt(total, 10))
 	if _, ok := readUsedAt(dir); !ok && statErr == nil {
 		_ = os.Chtimes(dir, info.ModTime(), info.ModTime())
 	}
@@ -186,7 +182,7 @@ func recordCorpusSize(dir string) int64 {
 // and the corpora it reuses do not fit the budget. Every other corpus can be
 // evicted after the search, and a rebuilt corpus's old generation does not
 // count.
-func checkCacheBudget(ctx context.Context, plans []corpusPlan, vectors bool) error {
+func checkCacheBudget(ctx context.Context, plans []node, vectors bool) error {
 	// The first pass counts every file by its stat size. Only when that does
 	// not fit does the search read file heads to count binary files as 0.
 	planned, rebuilds, err := plannedCacheBytes(ctx, plans, vectors, false)
@@ -199,15 +195,16 @@ func checkCacheBudget(ctx context.Context, plans []corpusPlan, vectors bool) err
 	if err != nil {
 		return err
 	}
-	fits, err := plannedFits(cacheRoot, planned)
-	if err != nil || fits {
-		return err
-	}
-	if planned, _, err = plannedCacheBytes(ctx, plans, vectors, true); err != nil {
+	// The budget does not shrink when the corpora total grows, so a size
+	// within the budget of an empty cache fits with no listing of the corpora.
+	if budget, _, err := cacheBudget(cacheRoot, func() int64 { return 0 }); err != nil || planned <= budget {
 		return err
 	}
 	budget, freeBound, err := cacheBudget(cacheRoot, func() int64 { return corporaBytes(cacheRoot) })
 	if err != nil || planned <= budget {
+		return err
+	}
+	if planned, _, err = plannedCacheBytes(ctx, plans, vectors, true); err != nil || planned <= budget {
 		return err
 	}
 	var published int64
@@ -215,23 +212,6 @@ func checkCacheBudget(ctx context.Context, plans []corpusPlan, vectors bool) err
 		published += publishedCorpusBytes(plan.cacheDir)
 	}
 	return &cacheBudgetError{planned: planned, growth: max(0, planned-published), budget: budget, freeBound: freeBound}
-}
-
-// plannedFits reports a planned size that fits the budget. The volume formula
-// cannot go below min(10 %, free - 5 %) for any corpora total, so a size under
-// that bound fits with no listing of the corpora.
-func plannedFits(cacheRoot string, planned int64) (bool, error) {
-	if os.Getenv(envCacheBudget) == "" {
-		capacity, free, err := cacheVolume(cacheRoot)
-		if err != nil {
-			return false, err
-		}
-		if planned <= min(capacity/10, free-capacity/20) {
-			return true, nil
-		}
-	}
-	budget, _, err := cacheBudget(cacheRoot, func() int64 { return corporaBytes(cacheRoot) })
-	return planned <= budget, err
 }
 
 // corporaBytes is the ledger total of every corpus plus the unit-store
@@ -262,16 +242,15 @@ func fileSize(path string) int64 {
 // corpusSizes reads the ledger of every corpus at the same time.
 func corpusSizes(entries []corpusDirEntry, record bool) map[corpusID]int64 {
 	values := make([]int64, len(entries))
-	var wg sync.WaitGroup
-	next := atomic.Int64{}
-	for range min(len(entries), max(1, runtime.GOMAXPROCS(0))) {
-		wg.Go(func() {
-			for at := next.Add(1) - 1; at < int64(len(entries)); at = next.Add(1) - 1 {
-				values[at] = corpusSize(entries[at].path, record)
-			}
+	var group errgroup.Group
+	group.SetLimit(runtime.GOMAXPROCS(0))
+	for at, entry := range entries {
+		group.Go(func() error {
+			values[at] = corpusSize(entry.path, record)
+			return nil
 		})
 	}
-	wg.Wait()
+	_ = group.Wait()
 	sizes := make(map[corpusID]int64, len(entries))
 	for index, entry := range entries {
 		sizes[entry.name] = values[index]
@@ -282,21 +261,19 @@ func corpusSizes(entries []corpusDirEntry, record bool) map[corpusID]int64 {
 // plannedCacheBytes estimates the cache that the search needs: for a node
 // that the search rebuilds, its new generation; for any other node, its
 // ledger size. rebuilds reports whether any node rebuilds.
-func plannedCacheBytes(ctx context.Context, plans []corpusPlan, vectors, probe bool) (int64, bool, error) {
+func plannedCacheBytes(ctx context.Context, plans []node, vectors, probe bool) (int64, bool, error) {
 	var planned atomic.Int64
 	var rebuilds atomic.Bool
-	var wg sync.WaitGroup
-	errs := make(chan error, len(plans))
+	var group errgroup.Group
 	for _, plan := range plans {
-		wg.Go(func() {
+		group.Go(func() error {
 			bytes, rebuild, err := plannedNodeBytes(ctx, plan, vectors, probe)
 			if rebuild {
 				rebuilds.Store(true)
 			}
 			if err != nil {
 				if ctx.Err() != nil {
-					errs <- ctx.Err()
-					return
+					return ctx.Err()
 				}
 				// The build reports the cause; the estimate counts the node's
 				// published size only.
@@ -304,102 +281,165 @@ func plannedCacheBytes(ctx context.Context, plans []corpusPlan, vectors, probe b
 				bytes = publishedCorpusBytes(plan.cacheDir)
 			}
 			planned.Add(bytes)
+			return nil
 		})
 	}
-	wg.Wait()
-	close(errs)
-	if err := <-errs; err != nil {
+	if err := group.Wait(); err != nil {
 		return 0, false, err
 	}
 	return planned.Load(), rebuilds.Load(), nil
 }
 
-// plannedNodeBytes estimates one node. rebuild reports a node that the
-// search builds: no published state, a state other than the capture, or
-// vectors that the search wants and the node has no generation for (the same
-// rule as the build). probe reads file heads so that binary files count 0;
-// without it every file counts by its size. A vector build copies the rows of
-// a node's live generation, so with one it adds only the changed content;
-// with none it adds all of it.
-func plannedNodeBytes(ctx context.Context, plan corpusPlan, vectors, probe bool) (bytes int64, rebuild bool, err error) {
-	published := readStateFile(plan.cacheDir)
-	hasGeneration := len(semanticGenerationDirsIn(plan.indexDir, "")) > 0
-	switch plan.kind {
-	case corpusKindFolder:
-		state, selected, ok := plan.folder.current()
-		if !ok {
-			return publishedCorpusBytes(plan.cacheDir), false, nil
-		}
-		vectorsMissing := vectors && !semanticManifestPresent(plan.indexDir, state)
-		if published == state && !vectorsMissing {
-			return publishedCorpusBytes(plan.cacheDir), false, nil
-		}
-		if published == "" {
-			content, err := folderContentBytes(ctx, selected, probe)
-			return generationBytes(content, vectors), true, err
-		}
-		changed := changedFolderCandidates(plan.cacheDir, published, selected)
-		delta, err := folderContentBytes(ctx, changed, probe)
-		bytes = publishedCorpusBytes(plan.cacheDir) + int64(float64(delta)*zoektIndexRatio)
-		switch {
-		case vectorsMissing && hasGeneration:
-			bytes += semanticBytes(delta)
-		case vectorsMissing:
-			all, allErr := folderContentBytes(ctx, selected, probe)
-			bytes += semanticBytes(all)
-			err = errors.Join(err, allErr)
-		}
-		return bytes, true, err
-	case corpusKindGit:
-		state, ok := plan.gitState.current()
-		if !ok || plan.gitPaths == nil {
-			return publishedCorpusBytes(plan.cacheDir), false, nil
-		}
-		current := gitCorpusStateHash(*plan.gitPaths, state)
-		// The build's rules (runIndexingWithCacheExecution): a commit builds
-		// its base generation, and dirty files build the overlay of their
-		// work-tree bytes, also with no commit. A generation is present when
-		// its manifest reads, the check of the warm path
-		// (joinedGenerationsMatch).
-		baseMissing := vectors && state.HeadSHA != "no-head" &&
-			!semanticManifestPresent(plan.indexDir, state.HeadSHA)
-		overlayMissing := vectors && len(state.Files) > 0 &&
-			!semanticManifestPresent(plan.indexDir, semanticOverlaySource(current))
-		if published == current && !baseMissing && !overlayMissing {
-			return publishedCorpusBytes(plan.cacheDir), false, nil
-		}
-		dirty := dirtyContentBytes(plan.gitPaths.RepoDir, state.Files, probe)
-		if overlayMissing {
-			bytes = semanticBytes(dirty)
-		}
-		committedState, known := readCommittedGitState(plan.cacheDir)
-		if published == "" || !known {
-			committed, err := committedContentBytes(ctx, *plan.gitPaths, state.HeadSHA, probe)
-			bytes += int64(float64(committed+dirty) * zoektIndexRatio)
-			if baseMissing {
-				bytes += semanticBytes(committed)
-			}
-			return bytes, true, err
-		}
-		// A moved HEAD adds the blobs that the commit changed: the committed
-		// delta reads only those.
-		var delta int64
-		if head := string(committedState.head); head != state.HeadSHA {
-			delta, err = committedDeltaBytes(ctx, *plan.gitPaths, head, state.HeadSHA, probe)
-		}
-		bytes += publishedCorpusBytes(plan.cacheDir) + int64(float64(delta+dirty)*zoektIndexRatio)
-		switch {
-		case baseMissing && hasGeneration:
-			bytes += semanticBytes(delta)
-		case baseMissing:
-			committed, allErr := committedContentBytes(ctx, *plan.gitPaths, state.HeadSHA, probe)
-			bytes += semanticBytes(committed)
-			err = errors.Join(err, allErr)
-		}
-		return bytes, true, err
-	default:
+// plannedNodeBytes estimates one node with its kind (nodeKind.estimate). A
+// node with no kind (a failed Git node's cache record) counts its published
+// size and no rebuild. rebuild reports a node that the search builds: no
+// published state, a state other than the capture, or vectors that the search
+// wants and the node has no generation for (the same rule as the build).
+// probe reads file heads so that binary files count 0; without it every file
+// counts by its size. A vector build copies the rows of a node's live
+// generation, so with one it adds only the changed content; with none it adds
+// all of it.
+func plannedNodeBytes(ctx context.Context, plan node, vectors, probe bool) (bytes int64, rebuild bool, err error) {
+	if plan.behavior == nil {
 		return publishedCorpusBytes(plan.cacheDir), false, nil
 	}
+	return plan.behavior.estimate(ctx, plan, vectors, probe)
+}
+
+// estimate gives the folder's next generation from the walk capture: all
+// content when nothing is published, else the changed files.
+func (*folderNode) estimate(ctx context.Context, plan node, vectors, probe bool) (bytes int64, rebuild bool, err error) {
+	published := readStateFile(plan.cacheDir)
+	state, selected, ok := plan.folder.current()
+	if !ok {
+		return publishedCorpusBytes(plan.cacheDir), false, nil
+	}
+	// decideFolderBuild uses the same rule. The manifest is read only when
+	// the search wants vectors.
+	present := vectors && semanticManifestPresent(plan.indexDir, state)
+	vectorsMissing := vectorGenerationNeeded(vectors, present, false)
+	if published == state && !vectorsMissing {
+		return publishedCorpusBytes(plan.cacheDir), false, nil
+	}
+	if published == "" {
+		content, err := folderContentBytes(ctx, selected, probe)
+		return generationBytes(content, vectors), true, err
+	}
+	changed := changedFolderCandidates(plan.cacheDir, published, selected)
+	delta, err := folderContentBytes(ctx, changed, probe)
+	bytes = publishedCorpusBytes(plan.cacheDir) + int64(float64(delta)*zoektIndexRatio)
+	switch {
+	case vectorsMissing && semanticManifestPresent(plan.indexDir, published):
+		// The vectors hold the published state: the build adds the
+		// changed files.
+		bytes += semanticBytes(delta)
+	case vectorsMissing:
+		// The vectors hold an older state, or none: a text search moved
+		// the index alone. Count all content, an overcount at most.
+		all, allErr := folderContentBytes(ctx, selected, probe)
+		bytes += semanticBytes(all)
+		err = errors.Join(err, allErr)
+	}
+	return bytes, true, err
+}
+
+// estimate gives the Git node's next generation from the captured status:
+// the commit's content when nothing is known, else the commit range and the
+// dirty files.
+func (g *gitNode) estimate(ctx context.Context, plan node, vectors, probe bool) (bytes int64, rebuild bool, err error) {
+	published := readStateFile(plan.cacheDir)
+	state, ok := plan.gitState.current()
+	if !ok {
+		return publishedCorpusBytes(plan.cacheDir), false, nil
+	}
+	current := gitCorpusStateHash(g.paths, state)
+	// The build's rules (decideGitBuild, vectorGenerationNeeded): a commit
+	// builds its base generation, and dirty files build the overlay of their
+	// work-tree bytes, also with no commit. A generation is present when its
+	// manifest reads, the check of the warm path (joinedGenerationsMatch).
+	// Stale is false: the estimate runs before the missing-blob recheck,
+	// which writes its records under the build lock.
+	wantBase := vectors && state.HeadSHA != "no-head"
+	wantOverlay := vectors && len(state.Files) > 0
+	baseMissing := vectorGenerationNeeded(wantBase,
+		wantBase && semanticManifestPresent(plan.indexDir, state.HeadSHA), false)
+	overlayMissing := vectorGenerationNeeded(wantOverlay,
+		wantOverlay && semanticManifestPresent(plan.indexDir, semanticOverlaySource(current)), false)
+	if published == current && !baseMissing && !overlayMissing {
+		return publishedCorpusBytes(plan.cacheDir), false, nil
+	}
+	dirty := dirtyContentBytes(g.paths.RepoDir, state.Files, probe)
+	if overlayMissing {
+		bytes = semanticBytes(dirty)
+	}
+	// A current text index builds vectors only, so the dirty files add
+	// no text index bytes.
+	dirtyText := dirty
+	if published == current {
+		dirtyText = 0
+	}
+	// committed counts the committed content that a generation adds: the
+	// commit range from a commit to HEAD, or all of HEAD for "". A range from
+	// HEAD adds nothing. The text index and the base vectors can need the
+	// same range, so Git counts each range once.
+	counted := map[string]int64{state.HeadSHA: 0}
+	committed := func(from string) (int64, error) {
+		if n, ok := counted[from]; ok {
+			return n, nil
+		}
+		var n int64
+		var err error
+		if from == "" {
+			n, err = committedContentBytes(ctx, g.paths, state.HeadSHA, probe)
+		} else {
+			n, err = committedDeltaBytes(ctx, g.paths, from, state.HeadSHA, probe)
+		}
+		if err == nil {
+			counted[from] = n
+		}
+		return n, err
+	}
+	// The text index adds all of HEAD when nothing is known, else the commit
+	// range from the commit that it holds.
+	committedState, known := readCommittedGitState(plan.cacheDir)
+	cold := published == "" || !known
+	textFrom := string(committedState.head)
+	if cold {
+		textFrom = ""
+	}
+	text, err := committed(textFrom)
+	if baseMissing {
+		// The build reuses the rows of the live base generation, so it embeds
+		// the commit range from that generation's commit. A text search moves
+		// the text index alone, so that commit can be older than the text
+		// index's. With no live base, or a commit that Git no longer has, it
+		// counts all of HEAD: an overcount at most.
+		source, _ := liveBaseSource(plan.indexDir)
+		content, vectorErr := committed(source)
+		if vectorErr != nil && source != "" {
+			content, vectorErr = committed("")
+		}
+		bytes += semanticBytes(content)
+		err = errors.Join(err, vectorErr)
+	}
+	if cold {
+		return bytes + int64(float64(text+dirty)*zoektIndexRatio), true, err
+	}
+	bytes += publishedCorpusBytes(plan.cacheDir) + int64(float64(text+dirtyText)*zoektIndexRatio)
+	return bytes, true, err
+}
+
+// liveBaseSource gives the commit of a base generation in indexDir that the
+// current model can reuse.
+func liveBaseSource(indexDir string) (string, bool) {
+	for _, dir := range semanticGenerationDirsIn(indexDir, "") {
+		manifest, err := readSemanticManifestUnchecked(dir)
+		if err != nil || !semanticSourceHasGraph(manifest.Source) || validateSemanticManifest(manifest, manifest.Source) != nil {
+			continue
+		}
+		return manifest.Source, true
+	}
+	return "", false
 }
 
 // semanticManifestPresent reports a published generation for source in
@@ -456,8 +496,8 @@ func changedFolderCandidates(cacheDir, published string, selected []folderCandid
 
 // folderContentBytes sums the content that the index holds for candidates.
 // With probe it reads the head of every file, as the index does, so a binary
-// file (indexed by name only) counts 0; without it every file counts by its
-// stat size.
+// file (indexed by name only) counts 0; without it every file whose content
+// the index reads (indexedBytes) counts by its stat size.
 func folderContentBytes(ctx context.Context, candidates []folderCandidate, probe bool) (int64, error) {
 	if !probe {
 		var total int64
@@ -490,10 +530,10 @@ func folderContentBytes(ctx context.Context, candidates []folderCandidate, probe
 }
 
 // fileIsBinary applies the index's binary probe: a NUL byte in the first
-// binaryProbeBytes. An unreadable file counts as binary: the index cannot
-// read it either.
+// binaryProbeBytes. An unreadable file, or one that is no longer regular,
+// counts as binary: the index cannot read it either.
 func fileIsBinary(path string) bool {
-	file, err := os.Open(path)
+	file, err := openWorkTreeFile(path)
 	if err != nil {
 		return true
 	}
@@ -549,6 +589,13 @@ func committedContentBytes(ctx context.Context, paths gitPaths, head string, pro
 // committedDeltaBytes sums the blobs that a commit range adds or changes,
 // from one git diff-tree and their sizes.
 func committedDeltaBytes(ctx context.Context, paths gitPaths, from, to string, probe bool) (int64, error) {
+	// A move to no commit (an orphan branch) has no tree and adds no
+	// content. The from side is always a commit: the build records a
+	// committed state only for a commit, and only a commit has a base
+	// generation.
+	if normalizeCommittedTreeish(to) == "no-head" {
+		return 0, nil
+	}
 	cmd := newGitCommand(ctx, paths.RepoDir, "diff-tree", "-r", "-z", "--no-renames", "--no-commit-id", from, to)
 	out, err := gitOutput(ctx, cmd, "git diff-tree")
 	if err != nil {
@@ -656,7 +703,7 @@ func committedBlobBytes(ctx context.Context, paths gitPaths, blobs []gitSizedBlo
 // corpora that the search used, then evicts the least recently used corpora
 // that it did not use until the cache fits the budget. It has no time limit:
 // the budget is the only disk limit.
-func enforceCacheBudget(plans []corpusPlan) {
+func enforceCacheBudget(plans []node) {
 	cacheRoot, err := seekUserCacheRoot()
 	if err != nil || isOnNFS(cacheRoot) {
 		return
@@ -773,7 +820,7 @@ func planCorpusEviction(
 		unitSizes[unit.name] = fileSize(unit.path)
 		total += unitSizes[unit.name]
 	}
-	budget, err := cacheBudgetBytes(cacheRoot, total)
+	budget, _, err := cacheBudget(cacheRoot, func() int64 { return total })
 	if err != nil {
 		return nil, err
 	}

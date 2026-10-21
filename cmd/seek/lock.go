@@ -14,8 +14,12 @@ import (
 
 // errCorpusEvicted is returned by acquirePublishLock when the corpus directory
 // no longer exists. GC can remove it during a build outside the publish lock.
-// The caller must discard its temporary build and let the next search rebuild
-// it. The caller must not recreate the lock file and its missing corpus.
+// The caller discards its temporary build and does not make the lock file
+// again. The read of a Git node opens .lock with O_CREATE, finds no shard,
+// and repairs: the node is rebuilt in the same command, with an "Index damage
+// detected" warning. A folder node whose read cannot open .lock is skipped
+// with a warning, and the next search builds it
+// (TestEvictionDuringBuildPerKind).
 var errCorpusEvicted = errors.New("corpus evicted during build")
 
 // The build and publish locks have separate scopes:
@@ -63,11 +67,11 @@ func checkLockOrder(ctx context.Context) error {
 // build. If another builder holds it and any shard exists, it returns
 // (nil, false, nil), and the caller uses the current shards. A corpus with no
 // shards waits for the lock so its first build is not skipped.
-func acquireBuildLock(ctx context.Context, cacheDir, indexDir string) (*os.File, bool, error) {
+func (store corpusStore) acquireBuildLock(ctx context.Context) (*os.File, bool, error) {
 	if err := checkLockOrder(ctx); err != nil {
 		return nil, false, err
 	}
-	lockPath := filepath.Join(cacheDir, buildLockFile)
+	lockPath := filepath.Join(store.cacheDir, buildLockFile)
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, false, fmt.Errorf("open build lock file: %w", err)
@@ -78,11 +82,11 @@ func acquireBuildLock(ctx context.Context, cacheDir, indexDir string) (*os.File,
 			_ = f.Close()
 			return nil, false, fmt.Errorf("lock %s: %w", lockPath, err)
 		}
-		if shardsExist(indexDir) {
+		if shardsExist(store.indexDir) {
 			_ = f.Close()
 			return nil, false, nil
 		}
-		slog.Debug("Waiting for another build of the node", "cache_dir", cacheDir)
+		slog.Debug("Waiting for another build of the node", "cache_dir", store.cacheDir)
 		if perr := pollLock(ctx, lockPath, func() error { return lockFileExclusive(f) }, 100*time.Millisecond, 2*time.Second); perr != nil {
 			_ = f.Close()
 			return nil, false, perr
@@ -91,14 +95,14 @@ func acquireBuildLock(ctx context.Context, cacheDir, indexDir string) (*os.File,
 	// Ensure the publish lock file exists so acquirePublishLock (which opens it
 	// without O_CREATE) can distinguish a first build (file present, lockable)
 	// from a gc-evicted corpus (file gone → errCorpusEvicted).
-	if lf, lerr := os.OpenFile(filepath.Join(cacheDir, lockFile), os.O_CREATE|os.O_RDWR, 0o644); lerr == nil {
+	if lf, lerr := os.OpenFile(filepath.Join(store.cacheDir, lockFile), os.O_CREATE|os.O_RDWR, 0o644); lerr == nil {
 		_ = lf.Close()
 	}
 	// Mark the corpus in-use at build START so a concurrent gc does not evict it
 	// in the window between the build releasing this lock and the search
 	// re-opening the corpus's publish lock (which would ENOENT on the just-
 	// trashed dir). gc's readUsedAt > cutoff check then keeps it (gc.go).
-	touchUsed(cacheDir)
+	touchUsed(store.cacheDir)
 	return f, true, nil
 }
 
@@ -117,6 +121,33 @@ func tryBuildLock(cacheDir string) (*os.File, bool, error) {
 		return nil, false, nil
 	}
 	return f, true, nil
+}
+
+// lockBuild takes the build lock of the store and repairs a swap that a crash
+// left. With acquired false, a peer builds and shards exist: the caller serves
+// the current shards.
+func (store corpusStore) lockBuild(ctx context.Context) (unlock func(), acquired bool, err error) {
+	buildFd, acquired, err := store.acquireBuildLock(ctx)
+	if err != nil || !acquired {
+		if err == nil {
+			slog.Debug("Another process is indexing; serving current index")
+		}
+		return nil, false, err
+	}
+	// Repair a crash that left a half-published swap before trusting state.
+	store.recoverIncompleteSwap()
+	return func() { releaseLock(buildFd) }, true, nil
+}
+
+// servesStale reports whether a node whose update failed with err serves its
+// published shards: it warns once, as the stale-index notice, when shards
+// exist; with none the error fails the node.
+func (store corpusStore) servesStale(err error) bool {
+	if !shardsExist(store.indexDir) {
+		return false
+	}
+	reportStaleIndexWarning(err)
+	return true
 }
 
 // acquirePublishLock takes the brief publish lock (LOCK_EX on cacheDir/.lock).

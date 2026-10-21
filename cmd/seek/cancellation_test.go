@@ -93,9 +93,12 @@ func TestReadOneFolderFileStreaming_CancelWithoutReceiverReleasesWeight(t *testi
 	out := make(chan fileContent)
 
 	ctx, cancel := context.WithCancel(t.Context())
+	// The build gives the reader a failure function; it cancels the read.
+	readCtx, fail := context.WithCancelCause(ctx)
+	defer fail(nil)
 	done := make(chan struct{})
 	go func() {
-		readOneFolderFileStreaming(ctx, candidate, out, nil)
+		readOneFolderFileStreaming(readCtx, candidate, out, fail)
 		close(done)
 	}()
 	// One worker and a file that fits the budget mean a lower probe result

@@ -28,7 +28,7 @@ func testSemanticSearchExecution(tb testing.TB, factory semanticModelFactory) se
 	}
 }
 
-func ensureFolderCorpusFresh(ctx context.Context, plan corpusPlan) (corpusIndexState, error) {
+func ensureFolderCorpusFresh(ctx context.Context, plan node) (corpusIndexState, error) {
 	return ensureFolderCorpusFreshWithExecution(ctx, plan, testLexicalSearchExecution())
 }
 
@@ -40,43 +40,42 @@ func runIndexingWithCache(
 	state repoState,
 	preState string,
 ) error {
-	return runIndexingWithCacheExecution(
+	_, err := (&gitNode{paths: paths}).build(
 		ctx,
-		paths,
-		cacheDir,
-		indexDir,
+		corpusStore{cacheDir: cacheDir, indexDir: indexDir},
 		state,
 		preState,
 		testLexicalSearchExecution(),
 	)
+	return err
 }
 
 func prepareAndSearchCorpus(
 	ctx context.Context,
-	plan corpusPlan,
+	plan node,
 	paths *gitPaths,
 	userQ query.Q,
 	config searchConfig,
 ) ([]corpusSearchResult, dirtyFileSet, error) {
-	if plan.gitPaths == nil && paths != nil {
-		plan.gitPaths = paths
+	if plan.behavior == nil && paths != nil {
+		plan.behavior = &gitNode{paths: *paths}
 	}
 	return strictNode(ctx, plan, queryPlan{strict: userQ}, config, testLexicalSearchExecution())
 }
 
 func ensureGitCorpusFresh(
 	ctx context.Context,
-	plan corpusPlan,
+	plan node,
 	paths gitPaths,
 ) (repoState, corpusIndexState, error) {
-	return ensureGitCorpusFreshWithExecution(ctx, plan, paths, testLexicalSearchExecution())
+	return (&gitNode{paths: paths}).refresh(ctx, plan, testLexicalSearchExecution())
 }
 
 func ensureCombinedGitCorpus(
 	ctx context.Context,
-	plan corpusPlan,
+	plan node,
 	paths gitPaths,
 	state repoState,
 ) (corpusIndexState, error) {
-	return ensureCombinedGitCorpusWithExecution(ctx, plan, paths, state, testLexicalSearchExecution())
+	return (&gitNode{paths: paths}).refreshState(ctx, plan, state, testLexicalSearchExecution())
 }

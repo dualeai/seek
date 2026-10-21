@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 // corpusHashHexLen is the hex-encoded length of a corpus ID produced by
@@ -51,8 +52,11 @@ func indexOptionsParts() []string {
 	}
 }
 
+// gitCorpusFingerprint joins its parts with a 0x00 separator, with no 0x00
+// after the last part. hashParts ends every part with 0x00. The two framings
+// are not interchangeable: a change of framing rotates every state key.
 func gitCorpusFingerprint(paths gitPaths, state repoState) string {
-	return stringsJoinNUL(
+	return strings.Join([]string{
 		"git-state-v2",
 		"index_generation", seekIndexGeneration,
 		"cache_layout", seekCacheLayoutVersion,
@@ -62,34 +66,11 @@ func gitCorpusFingerprint(paths gitPaths, state repoState) string {
 		"worktree", pathIdentityOrClean(paths.RepoDir),
 		"common_dir", pathIdentityOrClean(paths.CommonDir),
 		"repo_state", repoStateFingerprint(paths.RepoDir, state),
-	)
+	}, "\x00")
 }
 
 func gitCorpusStateHash(paths gitPaths, state repoState) string {
 	return computeStateHash(gitCorpusFingerprint(paths, state))
-}
-
-// stringsJoinNUL joins parts with a single 0x00 SEPARATOR (n-1 NULs, no
-// trailing) — distinct from hashParts, which TERMINATES every part with 0x00.
-// The two framings are NOT interchangeable: both feed the cache-key path
-// (hashParts → corpus IDs, stringsJoinNUL → state fingerprints), so swapping
-// one for the other would silently rotate every key.
-func stringsJoinNUL(parts ...string) string {
-	if len(parts) == 0 {
-		return ""
-	}
-	n := len(parts) - 1
-	for _, part := range parts {
-		n += len(part)
-	}
-	buf := make([]byte, 0, n)
-	for i, part := range parts {
-		if i > 0 {
-			buf = append(buf, 0)
-		}
-		buf = append(buf, part...)
-	}
-	return string(buf)
 }
 
 // pathIdentityOrClean returns the file identity (dev:ino) of path, so a state

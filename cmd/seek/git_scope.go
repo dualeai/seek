@@ -2,16 +2,18 @@ package main
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/sourcegraph/zoekt/query"
 )
 
 // This file builds the scope that restricts a Git corpus search to selected
-// paths. gitScopeSpec holds the parsed paths and builds the committed query.
+// paths. gitScopeSpec holds the parsed paths and builds the search-time filter.
 // The remaining helpers collapse and deduplicate the selection.
 
 type gitScopeSpec struct {
@@ -28,10 +30,10 @@ type gitScopeSpec struct {
 // fall back to the set. A var (not const) so tests can force either path.
 var maxRegexpFileOperands = 64
 
-func buildCurrentGitScope(root string, operands []string) (query.Q, error) {
-	spec, err := buildGitScopeSpec(root, operands)
-	if err != nil || spec.rootIncluded {
-		return nil, err
+// query is the search-time filter of spec; nil covers the whole work tree.
+func (spec gitScopeSpec) query() (query.Q, error) {
+	if spec.rootIncluded {
+		return nil, nil
 	}
 
 	queries := make([]query.Q, 0, len(spec.files)+len(spec.dirs))
@@ -97,8 +99,8 @@ func buildGitScopeSpec(root string, operands []string) (gitScopeSpec, error) {
 		}
 		fileSet[name] = struct{}{}
 	}
-	dirs := collapseDirectoryScopes(sortedKeys(dirSet))
-	files := dropFilesCoveredByDirs(sortedKeys(fileSet), dirs)
+	dirs := collapseDirectoryScopes(slices.Sorted(maps.Keys(dirSet)))
+	files := dropFilesCoveredByDirs(slices.Sorted(maps.Keys(fileSet)), dirs)
 	return gitScopeSpec{dirs: dirs, files: files}, nil
 }
 

@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -275,7 +276,9 @@ func requireProcessGone(t *testing.T, pidFile string) {
 	if err != nil {
 		return
 	}
-	deadline := time.Now().Add(time.Second)
+	// The bound only stops a stuck test: the loop returns once the process
+	// is gone.
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		err = process.Signal(syscall.Signal(0))
 		if err != nil {
@@ -321,7 +324,7 @@ func TestRequireNativeGitVersion(t *testing.T) {
 		t.Run(tc.mode, func(t *testing.T) {
 			installFakeGit(t)
 			t.Setenv("FAKE_GIT_MODE", tc.mode)
-			err := requireNativeGitVersion(t.Context(), t.TempDir())
+			err := requireNativeGitVersion(t.Context())
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("error=%v, want error=%t", err, tc.wantErr)
 			}
@@ -332,7 +335,7 @@ func TestRequireNativeGitVersion(t *testing.T) {
 	}
 	t.Run("unavailable", func(t *testing.T) {
 		t.Setenv("PATH", t.TempDir())
-		err := requireNativeGitVersion(t.Context(), t.TempDir())
+		err := requireNativeGitVersion(t.Context())
 		if !errors.Is(err, exec.ErrNotFound) {
 			t.Fatalf("error=%v, want Git executable failure", err)
 		}
@@ -486,23 +489,24 @@ func TestNativeGitTreeParseFailureKillsAndJoinsChild(t *testing.T) {
 
 func TestNativeGitTreeCancellationAndDeadline(t *testing.T) {
 	for _, test := range []struct {
-		name    string
-		context func() (context.Context, context.CancelFunc)
+		name string
+		// context gives the context and the call that ends it.
+		context func() (context.Context, func())
 		want    error
 	}{
 		{
 			name: "cancellation",
-			context: func() (context.Context, context.CancelFunc) {
+			context: func() (context.Context, func()) {
 				ctx, cancel := context.WithCancel(context.Background())
-				time.AfterFunc(500*time.Millisecond, cancel)
 				return ctx, cancel
 			},
 			want: context.Canceled,
 		},
 		{
 			name: "deadline",
-			context: func() (context.Context, context.CancelFunc) {
-				return context.WithTimeout(context.Background(), 500*time.Millisecond)
+			context: func() (context.Context, func()) {
+				ctx := newExpiringContext()
+				return ctx, ctx.expire
 			},
 			want: context.DeadlineExceeded,
 		},
@@ -512,14 +516,59 @@ func TestNativeGitTreeCancellationAndDeadline(t *testing.T) {
 			pidFile := filepath.Join(t.TempDir(), fmt.Sprintf("%s.pid", test.name))
 			t.Setenv("FAKE_GIT_PID_FILE", pidFile)
 			t.Setenv("FAKE_GIT_MODE", "hang")
-			ctx, cancel := test.context()
-			defer cancel()
+			ctx, end := test.context()
+			defer end()
+			stopWhenFakeGitStarts(t, pidFile, end)
 			err := readNativeGitTreeRecords(ctx, t.TempDir(), []string{"ls-tree"}, func([]gitTreeEntry) error { return nil })
 			if !errors.Is(err, test.want) {
 				t.Fatalf("error=%v, want %v", err, test.want)
 			}
 			requireProcessGone(t, pidFile)
 		})
+	}
+}
+
+// stopWhenFakeGitStarts calls stop once the fake Git has written its whole
+// PID line to pidFile, so a test cancels the child only after it runs, however
+// slow the host is. The shell creates the file before it writes the PID, so
+// the file alone is not enough.
+func stopWhenFakeGitStarts(t *testing.T, pidFile string, stop func()) {
+	go func() {
+		for {
+			if raw, err := os.ReadFile(pidFile); err == nil && strings.HasSuffix(string(raw), "\n") {
+				stop()
+				return
+			}
+			select {
+			case <-t.Context().Done():
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}()
+}
+
+// expiringContext expires with context.DeadlineExceeded when expire is
+// called, as a timeout does, but at a point the test chooses.
+type expiringContext struct {
+	context.Context
+	done chan struct{}
+	once sync.Once
+}
+
+func newExpiringContext() *expiringContext {
+	return &expiringContext{Context: context.Background(), done: make(chan struct{})}
+}
+
+func (c *expiringContext) expire()               { c.once.Do(func() { close(c.done) }) }
+func (c *expiringContext) Done() <-chan struct{} { return c.done }
+
+func (c *expiringContext) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
 	}
 }
 
@@ -641,8 +690,9 @@ func TestCheckNativeGitBlobCancellationKillsChild(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "batch.pid")
 	t.Setenv("FAKE_GIT_PID_FILE", pidFile)
 	t.Setenv("FAKE_GIT_MODE", "hang")
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
+	ctx := newExpiringContext()
+	defer ctx.expire()
+	stopWhenFakeGitStarts(t, pidFile, ctx.expire)
 	err := checkNativeGitBlobs(
 		ctx,
 		t.TempDir(),
@@ -765,8 +815,9 @@ func TestReadNativeGitBlobCancellationKillsChild(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "content.pid")
 	t.Setenv("FAKE_GIT_PID_FILE", pidFile)
 	t.Setenv("FAKE_GIT_MODE", "hang")
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
+	ctx := newExpiringContext()
+	defer ctx.expire()
+	stopWhenFakeGitStarts(t, pidFile, ctx.expire)
 	info := gitBlobInfo{entry: fakeTreeEntry(nativeTestOID), size: 3}
 	err := readNativeGitBlobs(ctx, t.TempDir(), []gitBlobInfo{info}, func(fileContent) error { return nil })
 	if !errors.Is(err, context.DeadlineExceeded) {
@@ -794,7 +845,7 @@ func TestParseNativeGitDiffHeader(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if entry.oldMode != test.oldMode || entry.newMode != test.newMode || entry.oldOID.String() != test.oldOID || entry.newOID.String() != test.newOID || entry.oldPath != "a\tpath\n.go" {
+		if entry.oldMode != test.oldMode || entry.newMode != test.newMode || entry.oldOID.String() != test.oldOID || entry.newOID.String() != test.newOID || entry.path != "a\tpath\n.go" {
 			t.Fatalf("entry=%+v", entry)
 		}
 	}
@@ -841,8 +892,9 @@ func TestReadNativeGitDiffCancellationKillsChild(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "diff-cancel.pid")
 	t.Setenv("FAKE_GIT_PID_FILE", pidFile)
 	t.Setenv("FAKE_GIT_MODE", "hang")
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
+	ctx := newExpiringContext()
+	defer ctx.expire()
+	stopWhenFakeGitStarts(t, pidFile, ctx.expire)
 	_, err := readNativeGitDiff(ctx, t.TempDir(), gitObjectID(nativeTestOID), gitObjectID(strings.Repeat("a", 40)), 10)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error=%v, want deadline", err)

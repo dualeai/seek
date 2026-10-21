@@ -28,14 +28,14 @@ func TestDrift_BuildPublishesItsCaptureAndTheNextSearchSeesTheChange(t *testing.
 		return scorer, nil
 	})
 	state := mustGitRepoStateIn(t, ctx, repo)
-	if _, err := ensureCombinedGitCorpusWithExecution(ctx, plan, paths, state, execution); err != nil {
+	if _, err := (&gitNode{paths: paths}).refreshState(ctx, plan, state, execution); err != nil {
 		t.Fatal(err)
 	}
 	if got := readStateFile(plan.cacheDir); got != gitCorpusStateHash(paths, state) {
 		t.Fatalf("the build published state %q, want its capture", got)
 	}
 	if dirs := semanticGenerationDirs(t, plan.indexDir); len(dirs) != 1 ||
-		!joinedGenerationMatches(plan.cacheDir, plan.indexDir, readStateFile(plan.cacheDir), state.HeadSHA) {
+		!plan.joinedGenerationsMatch(readStateFile(plan.cacheDir), state.HeadSHA, "") {
 		t.Fatalf("the build did not bind its committed generation: %v", dirs)
 	}
 	next := mustGitRepoStateIn(t, ctx, repo)

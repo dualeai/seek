@@ -47,14 +47,10 @@ func onDiskPath(path string) string {
 	if _, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), uintptr(unix.F_GETPATH), uintptr(unsafe.Pointer(&buf[0]))); errno != 0 {
 		return path
 	}
-	n := 0
-	for n < len(buf) && buf[n] != 0 {
-		n++
+	if s := unix.ByteSliceToString(buf[:]); s != "" {
+		return s
 	}
-	if n == 0 {
-		return path
-	}
-	return string(buf[:n])
+	return path
 }
 
 // storedName returns the name that the file system stores for the last

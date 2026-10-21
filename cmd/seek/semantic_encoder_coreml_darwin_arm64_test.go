@@ -104,7 +104,6 @@ func TestLateOnCoreMLCacheKeyTracksRuntimeAndProvider(t *testing.T) {
 	for _, key := range []string{
 		"RequireStaticInputShapes",
 		"ModelFormat",
-		"EnableOnSubgraphs",
 		"MLComputeUnits",
 	} {
 		reorderedOptions[key] = options[key]
@@ -123,7 +122,7 @@ func TestLateOnRejectedVerdictSelectsCPUProvider(t *testing.T) {
 	if err := os.WriteFile(verdict, []byte(lateOnVerdictRejected+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	encoder, err := lateOn.semanticRowEncoder(t.Context())
+	encoder, err := lateOn.semanticRowEncoder(t.Context(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,9 +196,12 @@ func TestRunCoreMLCacheDirectoryRefusesUninitializedRuntime(t *testing.T) {
 }
 
 func TestRunCoreMLCacheDirectoryIsStableAcrossCacheRoots(t *testing.T) {
-	if _, err := newLateOnSemanticModel(t.Context()); err != nil {
+	// The model initializes the run time, which the cache key reads.
+	semantic, err := newLateOnSemanticModel(t.Context())
+	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = semantic.Close() })
 	model, err := decodeLateOnAsset(lateOnCompressedModel)
 	if err != nil {
 		t.Fatal(err)
@@ -264,15 +266,18 @@ func TestRejectedModelStopsRefreshingItsAccessMarker(t *testing.T) {
 func TestSearchFallbacksRecordAProviderFault(t *testing.T) {
 	// A wrong provider on an already-built index makes the search fall back to
 	// strict order. The fallback must record one provider fault, or the
-	// provider never earns a demotion. The query model and the re-rank model
-	// each fail with degenerate output on the second search; the first search
-	// builds the vectors with a working model.
+	// provider never earns a demotion. The query model, the re-rank model and
+	// the vector scan each fail with degenerate output on the second search;
+	// the first search builds the vectors with a working model.
 	for _, test := range []struct {
 		name string
 		fail func(*hybridTestScorer, error)
 	}{
 		{name: "query preparation", fail: func(scorer *hybridTestScorer, err error) { scorer.prepareErr = err }},
 		{name: "re-ranking", fail: func(scorer *hybridTestScorer, err error) { scorer.scoreErr = err }},
+		// A zero query token passes the query preparation and fails in the
+		// scan's token normalization.
+		{name: "vector scan", fail: func(scorer *hybridTestScorer, _ error) { scorer.queryVector = &semanticVector{} }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			requireTools(t)
@@ -305,16 +310,17 @@ func TestSearchFallbacksRecordAProviderFault(t *testing.T) {
 	}
 }
 
-func TestRecordSemanticProviderFaultOnlyActsOnProviderFaults(t *testing.T) {
+func TestRecordFaultOnlyActsOnProviderFaults(t *testing.T) {
 	// Every search-path fallback funnels through this, so it decides whether a
 	// wrong provider on an already-built index is ever recorded.
 	path := pinAcceleratedProviderForTest(t)
+	future := &semanticModelFuture{}
 
-	recordSemanticProviderFault(errors.New("no space left on device"))
+	future.recordFault(errors.New("no space left on device"))
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("an unrelated failure recorded a provider fault: %v", err)
 	}
-	recordSemanticProviderFault(fmt.Errorf("scoring: %w", errDegenerateSemanticVector))
+	future.recordFault(fmt.Errorf("scoring: %w", errDegenerateSemanticVector))
 	if readLateOnProviderRecord(path).faults != 1 {
 		t.Fatal("a provider fault on the search path was not recorded")
 	}
@@ -322,7 +328,7 @@ func TestRecordSemanticProviderFaultOnlyActsOnProviderFaults(t *testing.T) {
 
 // pinAcceleratedProviderForTest arranges the state a real selection leaves — the
 // accelerated provider in use, with its verdict at a known path — and returns
-// that path. Five tests need it, and the save and restore is easy to get subtly
+// that path. Many tests need it, and the save and restore is easy to get subtly
 // wrong in each of them.
 func pinAcceleratedProviderForTest(t *testing.T) string {
 	t.Helper()
@@ -405,7 +411,7 @@ func TestReadLateOnProviderRecordRejectsMalformedRecords(t *testing.T) {
 }
 
 func TestProviderFaultCountSurvivesAPassingProbe(t *testing.T) {
-	// A provider that agrees on the fixed probe row but fails on real work must
+	// A provider that agrees on the fixed probe batch but fails on real work must
 	// still earn a demotion. If a passing probe cleared the count, the two
 	// records would alternate for ever and nothing would change.
 	rawModel, _, path := newModelWithVerdictPath(t)
@@ -417,7 +423,7 @@ func TestProviderFaultCountSurvivesAPassingProbe(t *testing.T) {
 	if !ok {
 		t.Fatalf("model type is %T, want *lateOnModel", rawModel)
 	}
-	if _, err := lateOn.semanticRowEncoder(t.Context()); err != nil {
+	if _, err := lateOn.semanticRowEncoder(t.Context(), false); err != nil {
 		t.Fatal(err)
 	}
 	if got := semanticProviderName(); got != lateOnAcceleratedProviderName {
@@ -471,10 +477,10 @@ func TestRecheckVerdictMakesTheNextProcessMeasureAgain(t *testing.T) {
 }
 
 // newModelWithVerdictPath builds the model under a fresh cache, then returns the
-// decoded model bytes and the path its provider verdict will live at. Four tests
-// need exactly this preamble, and it has an ordering trap: the cache key carries
-// the ONNX Runtime version, which is empty until the model initializes the run
-// time, so resolving the directory first yields a different key.
+// decoded model bytes and the path its provider verdict will live at. Several
+// tests need exactly this preamble, and it has an ordering trap: the cache key
+// carries the ONNX Runtime version, which is empty until the model initializes
+// the run time, so resolving the directory first yields a different key.
 func newModelWithVerdictPath(t *testing.T) (semanticModel, []byte, string) {
 	t.Helper()
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
@@ -496,4 +502,53 @@ func newModelWithVerdictPath(t *testing.T) (semanticModel, []byte, string) {
 		t.Fatal(err)
 	}
 	return built, model, filepath.Join(directory, lateOnProviderVerdictFile)
+}
+
+// TestOverlayScanFaultIsRecorded searches a repository with no commit, whose
+// vectors are an overlay only, with a zero query token: the overlay scan
+// fails on degenerate output and records one provider fault.
+func TestOverlayScanFaultIsRecorded(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	repo := t.TempDir()
+	initEmptyGitRepoNoRemoteAt(t, repo)
+	writeFileAt(t, repo, "strict.go", "package sample\n// alpha beta\n")
+	path := pinAcceleratedProviderForTest(t)
+	search := func(scorer *hybridTestScorer) {
+		t.Helper()
+		output, err := runHybridTestSearch(t, "alpha beta", []string{repo}, defaultSearchPolicy(),
+			func(context.Context) (semanticModel, error) { return scorer, nil })
+		if err != nil || !strings.Contains(output, "strict.go") {
+			t.Fatalf("output=%q err=%v, want the strict file", output, err)
+		}
+	}
+	search(&hybridTestScorer{})
+	search(&hybridTestScorer{queryVector: &semanticVector{}})
+	if record := readLateOnProviderRecord(path); record.faults != 1 {
+		t.Fatalf("provider record=%+v, want one fault from the overlay scan", record)
+	}
+}
+
+// TestOneCommandRecordsOneProviderFault runs one description whose vector
+// build and ranking both give degenerate output: the command records one
+// provider fault, not one per failure.
+func TestOneCommandRecordsOneProviderFault(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	folder := t.TempDir()
+	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
+	path := pinAcceleratedProviderForTest(t)
+	degenerate := fmt.Errorf("both: %w", errDegenerateSemanticVector)
+	scorer := &hybridTestScorer{embedErr: degenerate, scoreErr: degenerate}
+	output, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(),
+		func(context.Context) (semanticModel, error) { return scorer, nil })
+	if err != nil || !strings.Contains(output, "strict.go") {
+		t.Fatalf("output=%q err=%v, want the strict file", output, err)
+	}
+	if scorer.embedCalls.Load() == 0 || scorer.scoreCalls.Load() == 0 {
+		t.Fatalf("embed calls=%d score calls=%d: both must fail", scorer.embedCalls.Load(), scorer.scoreCalls.Load())
+	}
+	if record := readLateOnProviderRecord(path); record.faults != 1 {
+		t.Fatalf("provider record=%+v, want one fault for the command", record)
+	}
 }

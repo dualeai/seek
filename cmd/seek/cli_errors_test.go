@@ -13,7 +13,7 @@ import (
 )
 
 func TestFormatCLIError(t *testing.T) {
-	plan := corpusPlan{
+	plan := node{
 		root:     "/work/src",
 		cacheDir: "/cache/corpus",
 		indexDir: "/cache/corpus/index",
@@ -169,8 +169,7 @@ func TestReportStaleIndexWarning_CtagsHidesTechnicalContextAtWarn(t *testing.T) 
 	if !ok {
 		t.Fatalf("debug error=%T, want error", testLogAttrs(debugRecord)["error"])
 	}
-	corpusErr, ok := errors.AsType[*gitCorpusContextError](debugErr)
-	if !ok || corpusErr.root != "/secret/repo" || corpusErr.indexDir != "/secret/cache/index" {
+	if !strings.Contains(debugErr.Error(), `git corpus root="/secret/repo" index="/secret/cache/index": `) {
 		t.Errorf("debug error=%v, want Git corpus context", debugErr)
 	}
 	ctagsErr, ok := errors.AsType[*ctagsUnavailableError](debugErr)

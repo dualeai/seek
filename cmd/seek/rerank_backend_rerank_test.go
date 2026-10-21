@@ -40,13 +40,18 @@ func openLateOnTestTokenizer(tb testing.TB) (*lateOnTokenizer, map[int]struct{})
 	return tokenizer, punctuation
 }
 
-func mustEncodeLateOnText(tb testing.TB, tokenizer *lateOnTokenizer, text string) []int {
+// mustLateOnQueryIDs returns the token IDs of a query that fits one model
+// window, through the production query path (lateOnQueryWindows).
+func mustLateOnQueryIDs(tb testing.TB, tokenizer *lateOnTokenizer, modelQuery string) []int {
 	tb.Helper()
-	ids, err := encodeLateOnText(tokenizer, text)
+	windows, err := lateOnQueryWindows(tokenizer, modelQuery)
 	if err != nil {
 		tb.Fatal(err)
 	}
-	return ids
+	if len(windows) != 1 {
+		tb.Fatalf("query %q gives %d windows, want 1", modelQuery, len(windows))
+	}
+	return windows[0]
 }
 
 func TestLateOnRuntimeManifestRejectsIncompleteAssets(t *testing.T) {
@@ -73,32 +78,49 @@ func TestLateOnRuntimeManifestRejectsIncompleteAssets(t *testing.T) {
 func TestLateOnTokenizerMatchesPyLate(t *testing.T) {
 	tokenizer, _ := openLateOnTestTokenizer(t)
 
-	const probe = "[Q] where is the function that parses HTTP请求?"
+	// PyLate encodes "[Q] where is the function that parses HTTP请求?" to
+	// these IDs.
+	const probe = "where is the function that parses HTTP请求?"
 	want := []int{
 		50281, 50368, 2811, 310, 253, 1159, 326, 13328,
 		265, 17607, 44673, 43741, 32, 50282,
 	}
-	if got := mustEncodeLateOnText(t, tokenizer, probe); !reflect.DeepEqual(got, want) {
+	if got := mustLateOnQueryIDs(t, tokenizer, probe); !reflect.DeepEqual(got, want) {
 		t.Fatalf("probe IDs = %v, want %v", got, want)
 	}
-	upper := mustEncodeLateOnText(t, tokenizer, "[Q] MyHTTPHandler")
-	lower := mustEncodeLateOnText(t, tokenizer, "[Q] myhttphandler")
+	upper := mustLateOnQueryIDs(t, tokenizer, "MyHTTPHandler")
+	lower := mustLateOnQueryIDs(t, tokenizer, "myhttphandler")
 	if reflect.DeepEqual(upper, lower) {
 		t.Fatal("tokenizer unexpectedly lowercased the input")
 	}
-	composed := mustEncodeLateOnText(t, tokenizer, "[Q] café")
-	decomposed := mustEncodeLateOnText(t, tokenizer, "[Q] cafe\u0301")
+	composed := mustLateOnQueryIDs(t, tokenizer, "café")
+	decomposed := mustLateOnQueryIDs(t, tokenizer, "cafe\u0301")
 	if !reflect.DeepEqual(composed, decomposed) {
 		t.Fatalf("NFC IDs differ: %v and %v", composed, decomposed)
 	}
 
-	long := mustEncodeLateOnText(
-		t,
+	text := strings.Repeat("identifier ", 300)
+	long, err := encodeLateOnDocument(
 		tokenizer,
-		lateOnDocumentPrefix+strings.Repeat("identifier ", 300),
+		rerankDocument{Text: text, matchEnd: len(text)},
+		lateOnSequenceLength,
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(long) != lateOnSequenceLength || long[len(long)-1] != lateOnSEPTokenID {
 		t.Fatalf("truncated sequence has length %d and final ID %d", len(long), long[len(long)-1])
+	}
+	// With an empty match span, the truncation keeps the head
+	// (truncateLateOnHead): the first 127 IDs, then SEP.
+	ids, spans, err := tokenizer.encode(lateOnDocumentPrefix+text, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := truncateLateOnDocumentTokens(ids, spans, 0, 0, 0, lateOnSequenceLength)
+	if len(head) != lateOnSequenceLength || head[len(head)-1] != lateOnSEPTokenID ||
+		!slices.Equal(head[:len(head)-1], ids[:len(head)-1]) {
+		t.Fatalf("head truncation has length %d and final ID %d", len(head), head[len(head)-1])
 	}
 }
 
@@ -171,11 +193,12 @@ func TestLateOnPrepareSemanticQueryUsesWindows(t *testing.T) {
 func TestLateOnTokenizationMasksPunctuationAndPadding(t *testing.T) {
 	tokenizer, punctuation := openLateOnTestTokenizer(t)
 
-	query, err := encodeLateOnText(tokenizer, lateOnQueryPrefix+"请求?")
+	// PrepareSemanticQuery packs the query windows with the query flag set.
+	windows, err := lateOnQueryWindows(tokenizer, "请求?")
 	if err != nil {
 		t.Fatal(err)
 	}
-	queryIDs, queryAttention, queryMask := packLateOnRows([][]int{query}, nil, true)
+	queryIDs, queryAttention, queryMask := packLateOnRows(windows, nil, true)
 	documentIDs, documentAttention, documentMask, err := tokenizeLateOnDocuments(
 		tokenizer,
 		punctuation,
@@ -301,26 +324,6 @@ func TestLateOnTokenizerSanitizesNativeStringInputs(t *testing.T) {
 	)
 	if err != nil || len(ids) == 0 {
 		t.Fatalf("sanitized document IDs=%v: %v", ids, err)
-	}
-}
-
-func TestLateOnSemanticDocumentKeepsFileLanguageOutOfModelInput(t *testing.T) {
-	unit := semanticUnit{
-		path:         "main.go",
-		language:     "Go",
-		fileLanguage: "Go",
-		text:         []byte("package main\n"),
-	}
-	first, firstMetadataEnd, firstMatchAt, firstMatchEnd := serializeLateOnDocumentWithMatch(
-		lateOnSemanticDocument(unit),
-	)
-	unit.fileLanguage = "Python"
-	second, secondMetadataEnd, secondMatchAt, secondMatchEnd := serializeLateOnDocumentWithMatch(
-		lateOnSemanticDocument(unit),
-	)
-	if first != second || firstMetadataEnd != secondMetadataEnd ||
-		firstMatchAt != secondMatchAt || firstMatchEnd != secondMatchEnd {
-		t.Fatalf("file language changed model input:\nfirst=%q\nsecond=%q", first, second)
 	}
 }
 
@@ -601,19 +604,12 @@ func lateOnReferenceScoreCheck(t *testing.T, gate bool) {
 
 func TestLateOnEncoderConcurrentOutputsAreIsolated(t *testing.T) {
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
-	rawModel, err := newLateOnSemanticModel(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
+	model := newTestLateOnModel(t)
 	t.Cleanup(func() {
-		if err := rawModel.Close(); err != nil {
+		if err := model.Close(); err != nil {
 			t.Errorf("close model: %v", err)
 		}
 	})
-	model, ok := rawModel.(*lateOnModel)
-	if !ok {
-		t.Fatalf("model type is %T, want *lateOnModel", rawModel)
-	}
 
 	texts := []string{
 		"func parseRequest() { validateHeaders() }",
@@ -630,7 +626,7 @@ func TestLateOnEncoderConcurrentOutputsAreIsolated(t *testing.T) {
 			text:     []byte(source),
 		}
 	}
-	tokenizer, err := model.takeTokenizer(t.Context())
+	tokenizer, err := lateOnTokenizers.take(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -639,11 +635,11 @@ func TestLateOnEncoderConcurrentOutputsAreIsolated(t *testing.T) {
 		model.punctuation,
 		units,
 	)
-	model.releaseTokenizer(tokenizer)
+	lateOnTokenizers.release(tokenizer)
 	if tokenizeErr != nil {
 		t.Fatal(tokenizeErr)
 	}
-	encoder, err := model.semanticRowEncoder(t.Context())
+	encoder, err := model.semanticRowEncoder(t.Context(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -942,7 +938,7 @@ func TestLateOnRowUsableTokenScansEveryMaskedToken(t *testing.T) {
 	if lateOnRowHasUsableToken(documents, 1, mask) {
 		t.Fatal("an empty second row reported a usable token")
 	}
-	// A masked token outside the mask must not rescue the row.
+	// A token outside the mask must not rescue the row.
 	documents[lateOnSequenceLength*semanticEmbeddingDimensions+5*semanticEmbeddingDimensions] = 1
 	if lateOnRowHasUsableToken(documents, 1, mask) {
 		t.Fatal("an unmasked token rescued the row")
@@ -1099,27 +1095,15 @@ func TestLateOnOutputsAgreeSeparatesFaultFromNoise(t *testing.T) {
 	}
 }
 
-func TestSemanticProviderNameReportsSelectionState(t *testing.T) {
-	// The fallback logs print this value, so it must never read "unset" while an
-	// encoder is being built: that is the moment provider selection itself can
-	// fail, and a record naming no provider is least useful there. Arrange each
-	// state the encoder stores and assert what a log would show.
+func TestSemanticProviderNameIsSettledAfterConstruction(t *testing.T) {
+	// The fallback logs print this value. A real construction must leave a
+	// settled provider, not an intent.
 	previous := lateOnSelectedProvider.Load()
 	t.Cleanup(func() {
 		if previous != nil {
 			lateOnSelectedProvider.Store(previous)
 		}
 	})
-	lateOnSelectedProvider.Store("selecting:" + lateOnAcceleratedProviderName)
-	if got := semanticProviderName(); got != "selecting:"+lateOnAcceleratedProviderName {
-		t.Fatalf("provider name during selection = %q", got)
-	}
-	lateOnSelectedProvider.Store(lateOnCPUProviderName)
-	if got := semanticProviderName(); got != lateOnCPUProviderName {
-		t.Fatalf("provider name after selection = %q", got)
-	}
-
-	// A real construction must leave a settled provider, not an intent.
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
 	model, err := newLateOnSemanticModel(t.Context())
 	if err != nil {
@@ -1198,4 +1182,155 @@ func TestScoresWithSemanticQueryBatchesAboveModelWidth(t *testing.T) {
 			}
 		}
 	}
+}
+
+// newTestLateOnModel returns a new LateOn model; the caller closes it.
+func newTestLateOnModel(t *testing.T) *lateOnModel {
+	t.Helper()
+	model, err := newLateOnSemanticModel(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lateOn, ok := model.(*lateOnModel)
+	if !ok {
+		t.Fatalf("model type is %T, want *lateOnModel", model)
+	}
+	return lateOn
+}
+
+// TestLateOnModelCloseAtEachStage closes a model before its first call,
+// after it, while the first call builds the encoder, and while a later call
+// builds the second CPU session, which Close must close. A call after Close
+// gets the closed error, and -race sees no write of an encoder field after
+// its read.
+func TestLateOnModelCloseAtEachStage(t *testing.T) {
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	t.Run("close first", func(t *testing.T) {
+		model := newTestLateOnModel(t)
+		if err := model.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := model.semanticRowEncoder(t.Context(), false); !errors.Is(err, errLateOnModelClosed) {
+			t.Fatalf("call after Close: err=%v, want errLateOnModelClosed", err)
+		}
+	})
+	t.Run("close after use", func(t *testing.T) {
+		model := newTestLateOnModel(t)
+		if _, err := model.semanticRowEncoder(t.Context(), false); err != nil {
+			t.Fatal(err)
+		}
+		if err := model.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := model.semanticRowEncoder(t.Context(), false); !errors.Is(err, errLateOnModelClosed) {
+			t.Fatalf("call after Close: err=%v, want errLateOnModelClosed", err)
+		}
+	})
+	t.Run("close during the first build", func(t *testing.T) {
+		model := newTestLateOnModel(t)
+		built := make(chan error, 1)
+		go func() {
+			encoder, err := model.semanticRowEncoder(t.Context(), false)
+			if err == nil && encoder == nil {
+				err = errors.New("no encoder and no error")
+			}
+			if errors.Is(err, errLateOnModelClosed) {
+				err = nil
+			}
+			built <- err
+		}()
+		// Let the build start before Close in most runs.
+		time.Sleep(50 * time.Millisecond)
+		if err := model.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-built; err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("close during the build session", func(t *testing.T) {
+		t.Setenv(lateOnProviderEnv, lateOnCPUProviderName)
+		model := newTestLateOnModel(t)
+		if _, err := model.semanticRowEncoder(t.Context(), true); err != nil {
+			t.Fatal(err)
+		}
+		if !model.encoder.interactive {
+			t.Fatal("the first CPU session is not sized for one call")
+		}
+		built := make(chan error, 1)
+		go func() {
+			_, err := model.semanticRowEncoder(t.Context(), false)
+			if errors.Is(err, errLateOnModelClosed) {
+				err = nil
+			}
+			built <- err
+		}()
+		// Let the build session start before Close in most runs.
+		time.Sleep(50 * time.Millisecond)
+		if err := model.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-built; err != nil {
+			t.Fatal(err)
+		}
+		if model.build != nil && model.build.session != nil {
+			t.Fatal("Close left the build session open")
+		}
+	})
+}
+
+// TestLateOnSessionThreadsFollowTheFirstUse pins the CPU provider. A model
+// whose first call is the index build gets the build's thread count, and a
+// later query makes no second session. A model whose first call is a query
+// gets the interactive count, and a scoring call uses that session. A later
+// index build gets a session of its own with the build's count. The test
+// skips when the two counts are equal on this host.
+func TestLateOnSessionThreadsFollowTheFirstUse(t *testing.T) {
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	t.Setenv(lateOnProviderEnv, lateOnCPUProviderName)
+	cpus := runtime.GOMAXPROCS(0)
+	build, interactive := lateOnCPUIntraOpThreads(cpus), lateOnCPUInteractiveThreads(cpus)
+	if build == interactive {
+		t.Skipf("the two thread counts are equal on %d CPUs", cpus)
+	}
+	newModel := func(t *testing.T) *lateOnModel {
+		t.Helper()
+		model := newTestLateOnModel(t)
+		t.Cleanup(func() { _ = model.Close() })
+		return model
+	}
+	t.Run("build first", func(t *testing.T) {
+		model := newModel(t)
+		if got := model.SemanticCallCPUs(t.Context()); got != build {
+			t.Fatalf("build call CPUs=%d, want %d", got, build)
+		}
+		if _, err := model.PrepareSemanticQuery(t.Context(), "parse the request"); err != nil {
+			t.Fatal(err)
+		}
+		if model.build != nil {
+			t.Fatal("a query after the build made a second session")
+		}
+	})
+	t.Run("query first", func(t *testing.T) {
+		model := newModel(t)
+		if _, err := model.PrepareSemanticQuery(t.Context(), "parse the request"); err != nil {
+			t.Fatal(err)
+		}
+		if model.encoder.callCPUs != interactive {
+			t.Fatalf("query session threads=%d, want %d", model.encoder.callCPUs, interactive)
+		}
+		// Scoring is one call too: it uses the query session.
+		if _, err := scoreWithTestSemanticEmbedder(t.Context(), model, "parse the request", lateOnBenchmarkDocuments(4)); err != nil {
+			t.Fatal(err)
+		}
+		if model.build != nil {
+			t.Fatal("a scoring call made the build session")
+		}
+		if got := model.SemanticCallCPUs(t.Context()); got != build {
+			t.Fatalf("build call CPUs after a query=%d, want %d (a session of its own)", got, build)
+		}
+		if model.build == nil || model.build == model.encoder {
+			t.Fatal("the build did not get a session of its own")
+		}
+	})
 }

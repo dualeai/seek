@@ -108,7 +108,7 @@ func applyHeaders(results []corpusSearchResult, operands displayOperands) {
 			// one in a part that the header drops goes.
 			var fragments []zoekt.LineFragmentMatch
 			if name := result.file.FileName; string(line.Line) == name {
-				shared := bm25SharedPathSuffix(headerLine, name)
+				shared := sharedPathSuffix(headerLine, name)
 				pathStart, headerStart := len(name)-len(shared), len(headerLine)-len(shared)
 				for _, fragment := range line.LineFragments {
 					if fragment.LineOffset >= pathStart {
@@ -125,6 +125,21 @@ func applyHeaders(results []corpusSearchResult, operands displayOperands) {
 			duplicate.header = operands.header(filepath.Join(duplicate.displayRoot, filepath.FromSlash(duplicate.path)))
 		}
 	}
+}
+
+// sharedPathSuffix returns the longest end of path components that a and b
+// share.
+func sharedPathSuffix(a, b string) string {
+	i, j := len(a), len(b)
+	for i > 0 && j > 0 && a[i-1] == b[j-1] {
+		i--
+		j--
+	}
+	for i < len(a) && ((i > 0 && a[i-1] != '/') || (j > 0 && b[j-1] != '/')) {
+		i++
+		j++
+	}
+	return a[i:]
 }
 
 // fileNameAtom reports a Zoekt atom that matches the file name.
@@ -159,7 +174,8 @@ func hasFileNameAtom(halves map[query.Q]struct{}, queries ...query.Q) bool {
 // set of the node's files whose display path it matches, with Zoekt's case
 // rules. The strict, relaxed and mask queries all read the sets, so lexical
 // and semantic retrieval keep one rule.
-func nodeHeaderQuery(ctx context.Context, plan corpusPlan, qp queryPlan, operands displayOperands) (queryPlan, error) {
+func nodeHeaderQuery(ctx context.Context, read *nodeRead, qp queryPlan, operands displayOperands) (queryPlan, error) {
+	plan := read.plan
 	queries := []query.Q{qp.strict}
 	if qp.model != nil {
 		queries = append(queries, qp.model.relaxedQ)
@@ -177,7 +193,7 @@ func nodeHeaderQuery(ctx context.Context, plan corpusPlan, qp queryPlan, operand
 	opts := searchOpts
 	opts.NumContextLines = 0
 	all := &query.Type{Type: query.TypeFileName, Child: &query.Const{Value: true}}
-	files, err := executeParsedSearchScopedDirs(ctx, []string{plan.indexDir}, all, plan.scope, searchConfig{opts: &opts})
+	files, err := read.search(ctx, all, searchConfig{opts: &opts})
 	if err != nil {
 		return queryPlan{}, err
 	}
@@ -200,9 +216,9 @@ func nodeHeaderQuery(ctx context.Context, plan corpusPlan, qp queryPlan, operand
 		var filter semanticPathFilter
 		switch typed := atom.(type) {
 		case *query.Substring:
-			filter, compileErr = newSemanticSubstringFilter(typed, false)
+			filter, compileErr = newSemanticSubstringFilter(typed)
 		case *query.Regexp:
-			filter, compileErr = newSemanticRegexpFilter(typed, false)
+			filter, compileErr = newSemanticRegexpFilter(typed)
 		}
 		if compileErr != nil {
 			return atom

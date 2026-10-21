@@ -89,7 +89,7 @@ func TestLockFileExclusive_ReleaseAndReacquire(t *testing.T) {
 func TestAcquireBuildLock_SingleFlight(t *testing.T) {
 	dir := t.TempDir()
 	indexDir := filepath.Join(dir, "index")
-	first, acquired, err := acquireBuildLock(context.Background(), dir, indexDir)
+	first, acquired, err := corpusStore{cacheDir: dir, indexDir: indexDir}.acquireBuildLock(context.Background())
 	if err != nil || !acquired {
 		t.Fatalf("first acquireBuildLock: acquired=%v err=%v", acquired, err)
 	}
@@ -110,7 +110,7 @@ func TestAcquireBuildLock_SingleFlight(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(indexDir, "x_v16.00000.zoekt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	f4, ok4, err := acquireBuildLock(context.Background(), dir, indexDir)
+	f4, ok4, err := corpusStore{cacheDir: dir, indexDir: indexDir}.acquireBuildLock(context.Background())
 	if err != nil {
 		t.Fatalf("second acquireBuildLock: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestLockOrderNoReadLockWhileWaitingForPublish(t *testing.T) {
 	if _, err := acquirePublishLock(held, dir); !errors.Is(err, errLockOrder) || !errors.Is(err, errInvariant) {
 		t.Fatalf("publish wait under a read lock: %v", err)
 	}
-	if _, _, err := acquireBuildLock(held, dir, indexDir); !errors.Is(err, errLockOrder) {
+	if _, _, err := (corpusStore{cacheDir: dir, indexDir: indexDir}).acquireBuildLock(held); !errors.Is(err, errLockOrder) {
 		t.Fatalf("build wait under a read lock: %v", err)
 	}
 	if f, err := acquirePublishLock(t.Context(), dir); err != nil {
@@ -321,7 +321,7 @@ func TestAcquireBuildLock_TouchesUsedAtStart(t *testing.T) {
 	if err := os.MkdirAll(indexDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	f, ok, err := acquireBuildLock(context.Background(), dir, indexDir)
+	f, ok, err := corpusStore{cacheDir: dir, indexDir: indexDir}.acquireBuildLock(context.Background())
 	if err != nil || !ok {
 		t.Fatalf("acquireBuildLock: ok=%v err=%v", ok, err)
 	}
@@ -409,5 +409,42 @@ func TestReaderDoesNotWaitForAFullRebuild(t *testing.T) {
 	}
 	if result.code != 0 || !strings.Contains(result.stdout, "b.txt") || elapsed > lockWaitProof-time.Second {
 		t.Fatalf("reader: code=%d after %v, want the live index at once:\n%s%s", result.code, elapsed, result.stdout, result.stderr)
+	}
+}
+
+// TestOpenNodeReadLock opens a read on a cache with no .lock: the read makes
+// the file and marks only its own context. Its lock is shared: an exclusive
+// lock fails, and a second read opens. Close releases the lock, and a second
+// close does nothing.
+func TestOpenNodeReadLock(t *testing.T) {
+	cacheDir := t.TempDir()
+	plan := node{corpusStore: corpusStore{cacheDir: cacheDir, indexDir: filepath.Join(cacheDir, "index")}}
+	read, readCtx, err := openNodeRead(t.Context(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(checkLockOrder(readCtx), errLockOrder) || checkLockOrder(t.Context()) != nil {
+		t.Fatal("only the read's context must be marked")
+	}
+	other, err := os.OpenFile(filepath.Join(cacheDir, lockFile), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("the read must make .lock: %v", err)
+	}
+	defer func() { _ = other.Close() }()
+	if err := lockFileExclusive(other); !lockHeld(err) {
+		t.Fatalf("exclusive lock during the read: err=%v, want held", err)
+	}
+	// The lock is shared: a second read opens while the first one holds it.
+	secondCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	second, _, err := openNodeRead(secondCtx, plan)
+	if err != nil {
+		t.Fatalf("a second read during the first: %v", err)
+	}
+	second.close()
+	read.close()
+	read.close()
+	if err := lockFileExclusive(other); err != nil {
+		t.Fatalf("exclusive lock after close: %v", err)
 	}
 }

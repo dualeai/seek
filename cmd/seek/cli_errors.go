@@ -72,10 +72,10 @@ func (h zoektWarningHandler) Handle(ctx context.Context, r slog.Record) error {
 		if !isZoektDamageNotice(r.Message) {
 			return nil
 		}
-		if h.promoted.Add(1) > maxPromotedDamageNotices {
+		if promoted := h.promoted.Add(1); promoted > maxPromotedDamageNotices {
 			// Report at most one notice per affected file up to the limit, then
 			// report one summary.
-			if h.promoted.Load() == maxPromotedDamageNotices+1 {
+			if promoted == maxPromotedDamageNotices+1 {
 				sum := slog.NewRecord(r.Time, slog.LevelWarn,
 					"Further index-damage notices suppressed; the index is incomplete", 0)
 				return h.Handler.Handle(ctx, sum)

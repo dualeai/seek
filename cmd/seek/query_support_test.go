@@ -4,10 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"reflect"
-	"slices"
 	"strings"
 	"testing"
 
@@ -113,8 +110,7 @@ func TestQuerySupportRowsRoute(t *testing.T) {
 				// case:yes sets the case of the atoms; nothing else changes.
 				relaxed := strings.ReplaceAll(fmt.Sprint(plan.relaxedQ), "case_", "")
 				if !ok || plan.modelQuery != base.modelQuery ||
-					!reflect.DeepEqual(plan.semanticFilter, base.semanticFilter) ||
-					plan.semanticUnfiltered != base.semanticUnfiltered ||
+					len(plan.filters) != len(base.filters) ||
 					(row.id != "T41" && relaxed != fmt.Sprint(base.relaxedQ)) {
 					t.Fatalf("modifier %q changed the plan: eligible=%t %#v", row.example, ok, plan)
 				}
@@ -125,7 +121,7 @@ func TestQuerySupportRowsRoute(t *testing.T) {
 
 // TestPlannerIgnoresSpelling checks that the route follows Zoekt's parsed tree:
 // a parse directive changes nothing, and punctuation in a word keeps the
-// query on the model routes with vectors.
+// query on the model routes.
 func TestPlannerIgnoresSpelling(t *testing.T) {
 	plain := planFor(t, "x y")
 	directive := planFor(t, "case:auto x y")
@@ -139,9 +135,8 @@ func TestPlannerIgnoresSpelling(t *testing.T) {
 		"parse request line .":          "parse request line",
 	} {
 		plan := planFor(t, pattern)
-		if plan.modelQuery != model || !plan.semanticRetrievable() {
-			t.Errorf("%q: model=%q vectors=%t, want %q with vectors",
-				pattern, plan.modelQuery, plan.semanticRetrievable(), model)
+		if plan.modelQuery != model {
+			t.Errorf("%q: model=%q, want %q", pattern, plan.modelQuery, model)
 		}
 	}
 }
@@ -157,7 +152,7 @@ func TestCppFallbackKeepsFilters(t *testing.T) {
 	writeFileAt(t, folder, "parse.py", "# parse C++ request\n")
 
 	plan := planFor(t, "parse C++ request lang:go")
-	if plan.modelQuery != "parse C++ request" || plan.semanticFilter == nil {
+	if plan.modelQuery != "parse C++ request" || len(plan.filters) == 0 {
 		t.Fatalf("plan=%#v, want the name in the model query and the language filter", plan)
 	}
 	output, err := captureStdout(t, func() error {
@@ -181,9 +176,9 @@ func TestCppFallbackKeepsFilters(t *testing.T) {
 		"lang::Foo() C++ value":            "lang::Foo() C++ value",
 		"find t::size() C++":               "find t::size() C++",
 	} {
-		if got := planFor(t, pattern); got.modelQuery != model || got.semanticFilter != nil {
-			t.Errorf("%q: model=%q filter=%t, want %q with no filter",
-				pattern, got.modelQuery, got.semanticFilter != nil, model)
+		if got := planFor(t, pattern); got.modelQuery != model || len(got.filters) != 0 {
+			t.Errorf("%q: model=%q filters=%d, want %q with no filter",
+				pattern, got.modelQuery, len(got.filters), model)
 		}
 	}
 	raw, _, err := parseSearchQueryForms("\"foo  bar\" C++")
@@ -348,47 +343,6 @@ func TestCLIFilterMasksSemanticRetrieval(t *testing.T) {
 	}
 	if dirs := semanticGenerationDirs(t, plans[0].indexDir); len(dirs) != 1 {
 		t.Fatalf("built %d vector generations, want 1", len(dirs))
-	}
-}
-
-// TestQuerySupportReadmeMatchesTable keeps the README support table equal to
-// the Go table, row for row: a change to either fails here.
-func TestQuerySupportReadmeMatchesTable(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, section, ok := strings.Cut(string(data), "\n### Support table\n")
-	if !ok {
-		t.Fatal("README has no support table")
-	}
-	var rows [][]string
-	for line := range strings.Lines(section) {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "### ") || strings.HasPrefix(line, "## ") {
-			break
-		}
-		if !strings.HasPrefix(line, "| T") {
-			continue
-		}
-		fields := strings.Split(strings.Trim(line, "|"), " | ")
-		for index := range fields {
-			fields[index] = strings.TrimSpace(fields[index])
-		}
-		rows = append(rows, fields)
-	}
-	if len(rows) != len(querySupport) {
-		t.Fatalf("README rows=%d, Go rows=%d", len(rows), len(querySupport))
-	}
-	for index, row := range querySupport {
-		example := ""
-		if row.example != "" {
-			example = "`" + row.example + "`"
-		}
-		want := []string{row.id, row.spelling, string(row.role), row.meaning, example}
-		if !slices.Equal(rows[index], want) {
-			t.Errorf("README row %d=%q, Go row=%q", index+1, rows[index], want)
-		}
 	}
 }
 

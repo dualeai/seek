@@ -40,9 +40,8 @@ const semanticRetrievalDelta float32 = 0.1158
 // repository families).
 const pipelineTauFile float32 = 0.6
 
-func semanticRetrievalRadius(tauFile float32) float32 {
-	return tauFile - semanticRetrievalDelta
-}
+// semanticRetrievalRadius is the fine MeanMaxSim that a semantic hit reaches.
+const semanticRetrievalRadius = pipelineTauFile - semanticRetrievalDelta
 
 // semanticUSearchDeepenSimilarity is the coarse similarity down to which
 // USearch keeps returning keys for a token: an approximation parameter, not a
@@ -122,20 +121,13 @@ func compareNodeHits(left, right nodeHit) int {
 	return 0
 }
 
-// mergeNodeHits concatenates the hits of every node, sorts them once with the
-// tie key, and collapses copies with the same content and match on the sorted
-// list: the representative is the copy with the smallest tie key, and the
-// other paths follow in order. The same (corpus, path) twice keeps its first,
-// best hit. No step cuts a node's hits.
-func mergeNodeHits(nodes ...nodeHits) nodeHits {
-	total := 0
-	for _, hits := range nodes {
-		total += len(hits)
-	}
-	merged := make(nodeHits, 0, total)
-	for _, hits := range nodes {
-		merged = append(merged, hits...)
-	}
+// mergeNodeHits sorts a copy of the hits of every node once with the tie key,
+// and collapses copies with the same content and match on the sorted list:
+// the representative is the copy with the smallest tie key, and the other
+// paths follow in order. The same (corpus, path) twice keeps its first, best
+// hit. No step cuts a node's hits.
+func mergeNodeHits(hits nodeHits) nodeHits {
+	merged := slices.Clone(hits)
 	sortNodeHits(merged)
 	type fileKey struct {
 		corpus corpusID
@@ -212,22 +204,23 @@ func acceptFiles(
 	if activeTokens <= 0 {
 		return ranked{}, fmt.Errorf("semantic query has no active tokens")
 	}
-	lexical := make([]int, len(scored))
-	for index := range lexical {
-		lexical[index] = index
-	}
-	slices.SortStableFunc(lexical, func(left, right int) int {
+	lexicalRank := ranks(len(scored), func(left, right int) int {
 		return compareLexicalRank(scored[left], scored[right])
 	})
-	lexicalRank := make([]int, len(scored))
-	for rank, index := range lexical {
-		lexicalRank[index] = rank + 1
+	// Semantic-only files share the last lexical rank, so the model alone
+	// orders them; their vector score is not a lexical signal.
+	lexicalFiles := 0
+	for _, hit := range scored {
+		if hit.strict || hit.lexical {
+			lexicalFiles++
+		}
 	}
-	model := make([]int, len(scored))
-	for index := range model {
-		model[index] = index
+	for index, hit := range scored {
+		if !hit.strict && !hit.lexical {
+			lexicalRank[index] = lexicalFiles + 1
+		}
 	}
-	slices.SortStableFunc(model, func(left, right int) int {
+	modelRank := ranks(len(scored), func(left, right int) int {
 		switch {
 		case scores[left] > scores[right]:
 			return -1
@@ -236,10 +229,6 @@ func acceptFiles(
 		}
 		return compareNodeHits(scored[left], scored[right])
 	})
-	modelRank := make([]int, len(scored))
-	for rank, index := range model {
-		modelRank[index] = rank + 1
-	}
 	accepted := make(nodeHits, 0, len(scored)+len(nameOnly))
 	for index, hit := range scored {
 		if math.IsNaN(float64(scores[index])) || math.IsInf(float64(scores[index]), 0) {
@@ -258,9 +247,24 @@ func acceptFiles(
 	return ranked{hits: accepted}, nil
 }
 
+// ranks gives each of n items its rank from 1 in the stable order of compare,
+// which compares two item indexes.
+func ranks(n int, compare func(left, right int) int) []int {
+	order := make([]int, n)
+	for index := range order {
+		order[index] = index
+	}
+	slices.SortStableFunc(order, compare)
+	rank := make([]int, n)
+	for position, index := range order {
+		rank[index] = position + 1
+	}
+	return rank
+}
+
 // compareLexicalRank orders strict all-word files first, then relaxed lexical
 // files, each by their lexical score and the tie key; semantic-only files
-// come last.
+// come last (acceptFiles gives them one shared rank).
 func compareLexicalRank(left, right nodeHit) int {
 	rank := func(hit nodeHit) int {
 		switch {
@@ -277,69 +281,64 @@ func compareLexicalRank(left, right nodeHit) int {
 	return compareNodeHits(left, right)
 }
 
-// openedNode is a node whose index is current: what the read step of a route
-// reads. state is the Git status that the index holds.
+// openedNode is a prepared node: what the read step of a route reads. Its
+// index is current, or with indexState corpusStale the last complete one (a
+// failed build, a peer's build). state is the Git status of the capture.
 type openedNode struct {
-	plan       corpusPlan
+	plan       node
 	state      repoState
 	indexState corpusIndexState
 	dirty      dirtyFileSet
+	// version gives the state that the index must hold at read time and the
+	// semantic source of that state: the commit of a Git node, the walk
+	// state of a folder node. nil reads text only.
+	version func() (state, source string, ok bool)
 }
 
 // openNode makes one node's index current, then runs read on it: the build or
-// delta under the node locks, swap recovery, and a folder's stale-index rule
-// (a failed update with published shards warns and serves them). A read that
-// finds a shard it cannot load drops the family manifest and opens the node
-// once more (errShardUnloadable); a second failure returns. Every prepare
-// path of a search goes through openNode.
+// delta under the node locks, swap recovery, and the stale-index rule
+// (servesStale: a failed update with published shards warns and serves them).
+// A read that finds a shard it cannot load removes the family manifest that
+// it saw (removeDamagedFamilyManifest) and opens the node once more
+// (errShardUnloadable); a second failure returns. A read that sees the tree
+// change opens the node once more from a new capture. Every prepare path of a
+// search goes through openNode.
 func openNode(
 	ctx context.Context,
-	plan corpusPlan,
+	plan node,
 	execution searchExecution,
 	read func(openedNode) error,
 ) error {
 	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
-			// The attempt saw damage: read the tree again.
+			// The first read saw damage or a tree change: read the tree
+			// again.
 			plan.gitState.invalidate()
 			plan.folder.invalidate()
 		}
-		if attempt > 0 {
-			execution.opened.forget(plan.id)
-		}
-		node, err := execution.opened.open(ctx, plan, execution.vectors, func() (openedNode, error) {
-			node, err := prepareNode(ctx, plan, execution)
-			if err != nil {
-				return openedNode{}, asNodeFailure(ctx, err)
-			}
-			return node, nil
-		})
+		opened, err := prepareNode(ctx, plan, execution)
 		if err != nil {
-			return err
-		}
-		err = read(node)
-		switch {
-		case errors.Is(err, errShardUnloadable) && attempt == 0:
-			// Invalidate the manifest so the retry rebuilds the committed family
-			// or a complete folder family. Keep current shards until publication.
-			removeFamilyManifest(plan.indexDir)
-			slog.Warn("Index damage detected; rebuilding the corpus", "root", plan.root, "error", err)
-			continue
-		case errors.Is(err, errShardUnloadable):
-			// The repair did not help: every later pass of the command reads
-			// this failure, with no third preparation.
-			failure := asNodeFailure(ctx, err)
-			execution.opened.fail(plan.id, failure)
-			return failure
-		case errors.Is(err, errGitIndexStateChanged) && attempt == 0:
-			// The read saw the tree change (treeChanged dropped the
-			// captures): prepare the node from a new capture and read again.
-			execution.opened.forget(plan.id)
-			continue
-		case errors.Is(err, errGitIndexStateChanged):
-			execution.opened.forget(plan.id)
 			return asNodeFailure(ctx, err)
-		case err != nil:
+		}
+		err = read(opened)
+		retry := errors.Is(err, errShardUnloadable) || errors.Is(err, errGitIndexStateChanged)
+		switch {
+		case retry && attempt == 0:
+			if errors.Is(err, errShardUnloadable) {
+				// Invalidate the manifest so the retry rebuilds the committed
+				// family or a complete folder family. Keep current shards until
+				// publication.
+				removeDamagedFamilyManifest(ctx, plan, err)
+				slog.Warn("Index damage detected; rebuilding the corpus", "root", plan.root, "error", err)
+			}
+			continue
+		case retry:
+			// The repair or the new capture did not help.
+			return asNodeFailure(ctx, err)
+		}
+		// The not-indexed check reads this node, also after a read error.
+		execution.opened.add(plan.id)
+		if err != nil {
 			// A read error fails this node only.
 			return asNodeFailure(ctx, err)
 		}
@@ -347,160 +346,84 @@ func openNode(
 	}
 }
 
+// removeDamagedFamilyManifest removes the family manifest that a damaged read
+// saw, so the next preparation rebuilds the family. A peer can publish a new
+// family, with a new manifest, after the read released its lock: so the
+// removal takes the publish lock, which waits for every reader of the node,
+// and removes the manifest only when it is still the file that the read saw.
+// On cancellation or eviction it removes nothing.
+func removeDamagedFamilyManifest(ctx context.Context, plan node, err error) {
+	damage, ok := errors.AsType[*shardDamage](err)
+	if !ok || damage.manifest == nil {
+		return
+	}
+	lock, err := acquirePublishLock(ctx, plan.cacheDir)
+	if err != nil {
+		slog.Debug("Kept the family manifest of the damaged index", "root", plan.root, "error", err)
+		return
+	}
+	defer releaseLock(lock)
+	// A publish writes a new file and renames it; the time also covers a
+	// reused inode.
+	current, err := os.Stat(filepath.Join(plan.indexDir, familyManifestFile))
+	if err == nil && os.SameFile(current, damage.manifest) && current.ModTime().Equal(damage.manifest.ModTime()) {
+		removeFamilyManifest(plan.indexDir)
+	}
+}
+
 // nodePreparations counts prepareNode calls; tests read it to see one
 // preparation per node per command.
 var nodePreparations atomic.Int64
 
-// prepareNode makes the index of one node current: the build or delta of a Git
-// node, or the build of a folder node. A folder whose update fails while
-// shards exist serves them with a warning.
+// nodeShardLoads counts the shard loads of node reads; tests read it to see
+// one load per node read.
+var nodeShardLoads atomic.Int64
+
+// prepareNode makes the index of one node current through its kind
+// (nodeKind.prepare) and counts the preparation.
 func prepareNode(
 	ctx context.Context,
-	plan corpusPlan,
+	plan node,
 	execution searchExecution,
 ) (openedNode, error) {
 	nodePreparations.Add(1)
-	node := openedNode{plan: plan}
-	switch plan.kind {
-	case corpusKindGit:
-		planPaths := plan.gitPaths
-		if planPaths == nil {
-			return openedNode{}, fmt.Errorf("%w: a Git node without Git paths", errInvariant)
-		}
-		node.plan.gitPaths = planPaths
-		// One combined whole-repo index serves both scoped and unscoped
-		// searches; scope is applied at search time.
-		state, indexState, err := ensureGitCorpusFreshWithExecution(ctx, plan, *planPaths, execution)
-		if err != nil {
-			return openedNode{}, err
-		}
-		node.state, node.indexState, node.dirty = state, indexState, dirtyFileSetFromState(state)
-	case corpusKindFolder:
-		indexState, err := ensureFolderCorpusFreshWithExecution(ctx, plan, execution)
-		if err != nil {
-			if !shardsExist(plan.indexDir) {
-				return openedNode{}, err
-			}
-			reportStaleIndexWarning(err)
-			indexState = corpusStale
-		}
-		node.indexState = indexState
-	default:
-		return openedNode{}, fmt.Errorf("%w: unsupported corpus kind %s", errInvariant, plan.kind)
+	if plan.behavior == nil {
+		return openedNode{}, fmt.Errorf("%w: the %s node %s has no kind behavior", errInvariant, plan.kind, plan.root)
 	}
-	return node, nil
+	return plan.behavior.prepare(ctx, plan, execution)
 }
 
-// openedNodes holds the nodes that one command opened: each node is prepared
-// once per command, and every retrieval pass of the command reads
-// that one preparation, as the snapshot contract says (a search shows the
-// tree as captured at its start). A failed preparation is kept too, so the
-// node fails once. Nil prepares on every call.
+// openedNodes records the nodes that one command opened, for the not-indexed
+// check (warnUnindexedFileOperands). openNode records a node after a read that
+// saw no damage and no tree change, also when that read failed. A node whose
+// preparation failed is not recorded. Nil records nothing.
 type openedNodes struct {
-	mu    sync.Mutex
-	nodes map[corpusID]*openedNodeEntry
+	mu  sync.Mutex
+	ids map[corpusID]struct{}
 }
 
-type openedNodeEntry struct {
-	mu   sync.Mutex
-	done bool
-	// vectors reports that the preparation built or checked the node's
-	// vectors; a preparation without them cannot serve a route that wants
-	// them.
-	vectors bool
-	node    openedNode
-	err     error
-}
-
-// open returns the command's preparation of plan, and runs prepare when there
-// is none or when it lacks the vectors the caller wants. A cancelled
-// preparation and a failed upgrade to vectors are not kept.
-func (nodes *openedNodes) open(ctx context.Context, plan corpusPlan, vectors bool, prepare func() (openedNode, error)) (openedNode, error) {
-	if nodes == nil {
-		return prepare()
-	}
-	nodes.mu.Lock()
-	if nodes.nodes == nil {
-		nodes.nodes = make(map[corpusID]*openedNodeEntry)
-	}
-	entry := nodes.nodes[plan.id]
-	if entry == nil {
-		entry = &openedNodeEntry{}
-		nodes.nodes[plan.id] = entry
-	}
-	nodes.mu.Unlock()
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
-	if entry.done && vectors && !entry.vectors && entry.err == nil {
-		// An upgrade to vectors that fails keeps the good preparation for the
-		// routes that need none.
-		node, err := prepare()
-		if err != nil {
-			return openedNode{}, err
-		}
-		entry.vectors, entry.node = true, node
-	}
-	if !entry.done {
-		node, err := prepare()
-		if ctx.Err() != nil {
-			return node, err
-		}
-		entry.done, entry.vectors, entry.node, entry.err = true, vectors, node, err
-	}
-	if entry.err != nil {
-		return openedNode{}, entry.err
-	}
-	// Another route can give the same corpus another scope.
-	node := entry.node
-	node.plan = plan
-	if node.plan.gitPaths == nil {
-		node.plan.gitPaths = entry.node.plan.gitPaths
-	}
-	return node, nil
-}
-
-// plan returns the plan of a node that the command opened, with its Git
-// paths.
-func (nodes *openedNodes) plan(id corpusID) (corpusPlan, bool) {
-	if nodes == nil {
-		return corpusPlan{}, false
-	}
-	nodes.mu.Lock()
-	entry := nodes.nodes[id]
-	nodes.mu.Unlock()
-	if entry == nil {
-		return corpusPlan{}, false
-	}
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
-	if !entry.done || entry.err != nil {
-		return corpusPlan{}, false
-	}
-	return entry.node.plan, true
-}
-
-// fail keeps err as the node's preparation for the rest of the command.
-func (nodes *openedNodes) fail(id corpusID, err error) {
+// add records that the command opened the node.
+func (nodes *openedNodes) add(id corpusID) {
 	if nodes == nil {
 		return
 	}
 	nodes.mu.Lock()
-	if nodes.nodes == nil {
-		nodes.nodes = make(map[corpusID]*openedNodeEntry)
+	defer nodes.mu.Unlock()
+	if nodes.ids == nil {
+		nodes.ids = make(map[corpusID]struct{})
 	}
-	nodes.nodes[id] = &openedNodeEntry{done: true, vectors: true, err: err}
-	nodes.mu.Unlock()
+	nodes.ids[id] = struct{}{}
 }
 
-// forget drops the preparation of a node, so the next route prepares it
-// again: a read found damage, or saw the tree change.
-func (nodes *openedNodes) forget(id corpusID) {
+// has reports whether the command opened the node.
+func (nodes *openedNodes) has(id corpusID) bool {
 	if nodes == nil {
-		return
+		return false
 	}
 	nodes.mu.Lock()
-	delete(nodes.nodes, id)
-	nodes.mu.Unlock()
+	defer nodes.mu.Unlock()
+	_, ok := nodes.ids[id]
+	return ok
 }
 
 // nodeOpenError marks a node that failed to open: its build, its Git state, a
@@ -596,11 +519,11 @@ func acquireBuildSlot(ctx context.Context) (func(), error) {
 // outputs are concatenated in plan order; the next stage orders them.
 func searchNodes[T any](
 	ctx context.Context,
-	plans []corpusPlan,
-	search func(context.Context, corpusPlan) ([]T, dirtyFileSet, error),
+	plans []node,
+	search func(context.Context, node) ([]T, dirtyFileSet, error),
 ) ([]T, dirtyFilesByCorpus, error) {
 	type nodeResult struct {
-		plan    corpusPlan
+		plan    node
 		results []T
 		dirty   dirtyFileSet
 		err     error
@@ -636,12 +559,10 @@ func searchNodes[T any](
 		if !outcome.run {
 			continue
 		}
+		// Wait or the ctx.Err() check returned every other error.
 		if failure, ok := errors.AsType[*nodeOpenError](outcome.err); ok {
 			warnSkippedNode(ctx, outcome.plan.displayRoot, failure.err)
 			continue
-		}
-		if outcome.err != nil {
-			return nil, nil, outcome.err
 		}
 		if len(outcome.dirty) > 0 {
 			dirtyByCorpus[outcome.plan.id] = outcome.dirty
@@ -666,9 +587,9 @@ func warnSkippedNode(ctx context.Context, root string, err error) {
 }
 
 // skippedNodes holds the roots that one command already warned about: the
-// operand resolver, the walks, and every retrieval pass can meet one failed
-// node, and it gets one warning. A root is keyed by its file identity,
-// so two spellings of one directory are one root.
+// operand resolver, the walks, and the node search can meet one failed node,
+// and it gets one warning. A root is keyed by its file identity, so two
+// spellings of one directory are one root.
 type skippedNodes struct {
 	mu    sync.Mutex
 	roots map[string]struct{}
@@ -725,7 +646,7 @@ func planQuery(pattern string, policy searchPolicy) (queryPlan, error) {
 
 // strictNode opens one node and runs the strict query on it: the route of a
 // query with no model stage.
-func strictNode(ctx context.Context, plan corpusPlan, qp queryPlan, config searchConfig, execution searchExecution) ([]corpusSearchResult, dirtyFileSet, error) {
+func strictNode(ctx context.Context, plan node, qp queryPlan, config searchConfig, execution searchExecution) ([]corpusSearchResult, dirtyFileSet, error) {
 	var results []corpusSearchResult
 	var dirty dirtyFileSet
 	var nameOnly int64
@@ -735,34 +656,25 @@ func strictNode(ctx context.Context, plan corpusPlan, qp queryPlan, config searc
 			touchPlanUsed(node.plan)
 			return nil
 		}
-		config.contextGitCorpus = node.plan.kind == corpusKindGit
 		config.contextDirtyFiles = node.dirty
-		// One read lock covers the file listing, the search and the count, so
-		// a publish cannot remove a shard between them.
-		lock, err := os.OpenFile(filepath.Join(node.plan.cacheDir, lockFile), os.O_CREATE|os.O_RDWR, 0o644)
-		if err != nil {
-			return fmt.Errorf("open search lock: %w", err)
-		}
-		defer func() { _ = lock.Close() }()
-		if err := acquireReadLock(ctx, node.plan.indexDir, lock); err != nil {
-			return fmt.Errorf("acquire search lock: %w", err)
-		}
-		defer unlockFile(lock)
-		ctx := withReadLockHeld(ctx)
-		nodeQP, err := nodeHeaderQuery(ctx, node.plan, qp, execution.operands)
+		// One read lock and one shard load cover the file listing, the search
+		// and the count, so a publish cannot remove a shard between them.
+		read, ctx, err := openNodeRead(ctx, node.plan)
 		if err != nil {
 			return err
 		}
-		search := func(q query.Q, searchConfig searchConfig) ([]zoekt.FileMatch, error) {
-			return executeParsedSearchScopedDirs(ctx, []string{node.plan.indexDir}, q, node.plan.scope, searchConfig)
+		defer read.close()
+		nodeQP, err := nodeHeaderQuery(ctx, read, qp, execution.operands)
+		if err != nil {
+			return err
 		}
 		var counted sync.WaitGroup
 		counted.Go(func() {
-			nameOnly = countNameOnlyFiles(ctx, node.plan, nodeQP.strict, node.dirty, search)
+			nameOnly = countNameOnlyFiles(ctx, read, nodeQP.strict, node.dirty)
 		})
 		strictConfig := config
 		strictConfig.bm25 = true
-		files, err := search(nodeQP.strict, strictConfig)
+		files, err := read.search(ctx, nodeQP.strict, strictConfig)
 		counted.Wait()
 		if err != nil {
 			return err
@@ -783,7 +695,7 @@ func strictNode(ctx context.Context, plan corpusPlan, qp queryPlan, config searc
 // the query's filters and the node's scope allow, and the relaxed lexical rank
 // of each semantic hit, under one read lock on one generation. It gives one
 // hit per file with its display result and its model document.
-func retrieveNode(ctx context.Context, plan corpusPlan, qp queryPlan, config searchConfig, execution searchExecution) ([]nodeHit, dirtyFileSet, error) {
+func retrieveNode(ctx context.Context, plan node, qp queryPlan, config searchConfig, execution searchExecution) ([]nodeHit, dirtyFileSet, error) {
 	var hits nodeHits
 	var dirty dirtyFileSet
 	var nameOnly int64
@@ -807,27 +719,6 @@ func retrieveNode(ctx context.Context, plan corpusPlan, qp queryPlan, config sea
 	return hits, dirty, nil
 }
 
-// nodeSource is the semantic source of an opened node: the commit of a Git
-// node, the walk state of a folder node.
-func nodeSource(node openedNode) (state, source string, ok bool) {
-	switch node.plan.kind {
-	case corpusKindGit:
-		if node.plan.gitPaths == nil {
-			return "", "", false
-		}
-		// A node with no commit has no base; its overlay holds every file.
-		state = gitCorpusStateHash(*node.plan.gitPaths, node.state)
-		if node.state.HeadSHA == "no-head" {
-			return state, "", true
-		}
-		return state, node.state.HeadSHA, true
-	case corpusKindFolder:
-		state, _, ok = node.plan.folder.current()
-		return state, state, ok
-	}
-	return "", "", false
-}
-
 // readNodeEvidence reads one opened node for a description. Under the node's
 // read lock it runs the strict search, the name-only count, semantic retrieval
 // on the bound generation and the overlay, and the relaxed lexical rank of
@@ -835,45 +726,39 @@ func nodeSource(node openedNode) (state, source string, ok bool) {
 // file for its display.
 func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config searchConfig, execution searchExecution, nameOnlyFiles *int64) (nodeHits, error) {
 	plan := node.plan
-	lock, err := os.OpenFile(filepath.Join(plan.cacheDir, lockFile), os.O_CREATE|os.O_RDWR, 0o644)
+	read, ctx, err := openNodeRead(ctx, plan)
 	if err != nil {
-		return nil, fmt.Errorf("open search lock: %w", err)
+		return nil, err
 	}
-	defer func() { _ = lock.Close() }()
-	if err := acquireReadLock(ctx, plan.indexDir, lock); err != nil {
-		return nil, fmt.Errorf("acquire search lock: %w", err)
-	}
-	ctx = withReadLockHeld(ctx)
-	locked := true
-	defer func() {
-		if locked {
-			unlockFile(lock)
-		}
-	}()
+	defer read.close()
 
 	// One capture per node per command: under the lock the index
 	// must hold the captured state, and the bound generation that state.
 	// The base generation holds the commit; the overlay of a dirty Git node
 	// holds the work-tree bytes of its dirty files.
 	var generation, overlay *semanticGeneration
-	state, source, ok := nodeSource(node)
-	if node.indexState == corpusStale {
-		// The build failed and the prior index serves with a warning: it
-		// holds no captured state, so no bound vectors either.
-		slog.Debug("vectors unavailable", "root", plan.displayRoot, "cause", "the index update failed")
-		ok = false
+	var state, source string
+	var ok bool
+	switch {
+	case node.indexState == corpusStale:
+		// The build failed or a peer builds: the prior index holds no
+		// captured state, so no bound vectors either.
+		slog.Debug("vectors unavailable", "root", plan.displayRoot, "cause", "the index is not current")
+	case node.version != nil:
+		state, source, ok = node.version()
 	}
 	if ok {
 		if readStateFile(plan.cacheDir) != state {
 			return nil, treeChanged(plan)
 		}
 		overlaySource := ""
-		if plan.kind == corpusKindGit && execution.buildsOverlay(len(node.dirty) > 0) {
+		// Only the Git prepare sets dirty files.
+		if execution.buildsOverlay(len(node.dirty) > 0) {
 			overlaySource = semanticOverlaySource(state)
 		}
-		if joinedGenerationsMatch(plan.cacheDir, plan.indexDir, state, source, overlaySource) {
+		if plan.joinedGenerationsMatch(state, source, overlaySource) {
 			if source != "" {
-				generation, err = openJoinedSemanticGeneration(plan.cacheDir, plan.indexDir, source)
+				generation, err = plan.openJoinedSemanticGeneration(source)
 			}
 			if err == nil && overlaySource != "" {
 				overlay, err = openSemanticGenerationForSearch(semanticGenerationDir(plan.indexDir, overlaySource), overlaySource)
@@ -901,36 +786,38 @@ func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config
 		defer func() { _ = overlay.Close() }()
 	}
 	// Under the lock: the file sets read the generation that the search reads.
-	qp, err = nodeHeaderQuery(ctx, plan, qp, execution.operands)
+	qp, err = nodeHeaderQuery(ctx, read, qp, execution.operands)
 	if err != nil {
 		return nil, err
 	}
 
 	modelConfig := rerankModelSearchConfig(config)
 	modelConfig.bm25 = true
-	modelConfig.contextGitCorpus = plan.kind == corpusKindGit
 	modelConfig.contextDirtyFiles = node.dirty
 	var strictFiles []zoekt.FileMatch
 	var semanticHits []semanticHit
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.Go(func() error {
 		var searchErr error
-		strictFiles, searchErr = executeParsedSearchScopedDirs(groupCtx, []string{plan.indexDir}, qp.strict, plan.scope, modelConfig)
+		strictFiles, searchErr = read.search(groupCtx, qp.strict, modelConfig)
 		return searchErr
 	})
 	group.Go(func() error {
-		*nameOnlyFiles = countNameOnlyFiles(groupCtx, plan, qp.strict, node.dirty, func(q query.Q, countConfig searchConfig) ([]zoekt.FileMatch, error) {
-			return executeParsedSearchScopedDirs(groupCtx, []string{plan.indexDir}, q, plan.scope, countConfig)
-		})
+		*nameOnlyFiles = countNameOnlyFiles(groupCtx, read, qp.strict, node.dirty)
 		return nil
+	})
+	// Both scans select their rows with one file-name query.
+	selection := sync.OnceValues(func() (map[string]struct{}, error) {
+		return nodeRowSelection(groupCtx, read, qp, node.dirty)
 	})
 	if generation != nil {
 		group.Go(func() error {
-			hits, scanErr := scanNode(groupCtx, node, qp, generation, execution)
+			hits, scanErr := scanNode(groupCtx, node, qp, generation, execution, selection)
 			if scanErr != nil && groupCtx.Err() == nil {
 				// The model failed: the node gives its lexical hits, and the
 				// model stages fall back to strict order.
 				slog.Debug("vectors unavailable", "root", plan.displayRoot, "cause", scanErr)
+				execution.model.recordFault(scanErr)
 				return nil
 			}
 			semanticHits = hits
@@ -940,9 +827,10 @@ func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config
 	var overlayHits []semanticHit
 	if overlay != nil && len(overlay.rows) > 0 {
 		group.Go(func() error {
-			hits, scanErr := scanOverlay(groupCtx, node, qp, overlay, execution)
+			hits, scanErr := scanOverlay(groupCtx, qp, overlay, execution, selection)
 			if scanErr != nil && groupCtx.Err() == nil {
 				slog.Debug("overlay vectors unavailable", "root", plan.displayRoot, "cause", scanErr)
+				execution.model.recordFault(scanErr)
 				return nil
 			}
 			overlayHits = hits
@@ -980,7 +868,7 @@ func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config
 		opts.NumContextLines = 0
 		relaxedQ := query.NewAnd(qp.model.relaxedQ, &query.FileNameSet{Set: pending})
 		// The relaxed rank reads the global average too.
-		relaxed, err := executeParsedSearchScopedDirs(ctx, []string{plan.indexDir}, relaxedQ, plan.scope, searchConfig{opts: &opts, bm25: true})
+		relaxed, err := read.search(ctx, relaxedQ, searchConfig{opts: &opts, bm25: true})
 		if err != nil {
 			return nil, err
 		}
@@ -996,19 +884,14 @@ func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config
 	}
 	// The rows and vectors stay mapped while the generation is open; the
 	// evidence reads the source, not the index.
-	unlockFile(lock)
-	locked = false
+	read.close()
 
 	contextLines := max(configuredContextLines(config), searchContextLines)
-	switch {
-	case len(semanticFiles) == 0:
-	case plan.kind == corpusKindGit:
-		semanticFiles, err = materializeSemanticCandidates(ctx, plan, *plan.gitPaths, node.state.HeadSHA, semanticFiles, contextLines)
-	default:
-		semanticFiles, err = materializeFolderSemanticCandidates(ctx, plan, semanticFiles, contextLines)
-	}
-	if err != nil {
-		return nil, err
+	if len(semanticFiles) > 0 {
+		semanticFiles, err = plan.behavior.materialize(ctx, node, semanticFiles, contextLines)
+		if err != nil {
+			return nil, err
+		}
 	}
 	// Overlay files print as the dirty files that they are.
 	overlayFiles, err = materializeWorkTreeSemanticCandidates(ctx, plan, repoUncommitted, overlayFiles, contextLines)
@@ -1020,122 +903,106 @@ func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config
 
 // scanNode runs semantic retrieval on one node through USearch: its filtered
 // search over the rows that the mask allows finds the candidates, and the
-// exact fine scores rank them with no final count. A row is a semantic hit
-// when its fine MeanMaxSim reaches the radius.
-func scanNode(ctx context.Context, node openedNode, qp queryPlan, generation *semanticGeneration, execution searchExecution) ([]semanticHit, error) {
-	_, prepared, err := execution.model.prepareQuery(ctx, qp.model.modelQuery)
-	if err != nil {
-		return nil, err
-	}
-	if prepared == nil {
-		return nil, errRerankUnavailable
-	}
-	tokens, err := semanticQueryTokenCount(prepared)
-	if err != nil {
-		return nil, err
-	}
-	var mask *semanticFilterMask
-	if keep, err := nodeRowFilter(ctx, node, qp); err != nil {
-		return nil, err
-	} else if keep != nil {
-		built, err := buildSemanticFilterMask(ctx, generation, func(path, _ string) bool { return keep(path) })
-		if err != nil {
-			return nil, err
+// exact fine scores rank them with no final count.
+func scanNode(ctx context.Context, node openedNode, qp queryPlan, generation *semanticGeneration, execution searchExecution, selection func() (map[string]struct{}, error)) ([]semanticHit, error) {
+	return scanWithinRadius(ctx, qp, execution, selection, func(prepared *semanticQueryEmbedding, selected map[string]struct{}, floor float32) ([]semanticHit, error) {
+		var mask *semanticFilterMask
+		if keep := nodeRowFilter(selected, node.dirty); keep != nil {
+			built, err := buildSemanticFilterMask(ctx, generation, keep)
+			if err != nil {
+				return nil, err
+			}
+			mask = &built
 		}
-		mask = &built
-	}
-	hits, err := semanticUSearchMasked(ctx, generation, prepared, mask, len(generation.rows))
-	if err != nil {
-		return nil, err
-	}
-	need := semanticRetrievalRadius(pipelineTauFile) * float32(tokens)
-	kept := hits[:0]
-	for _, hit := range hits {
-		if hit.score >= need {
-			hit.score /= float32(tokens)
-			kept = append(kept, hit)
-		}
-	}
-	return kept, nil
+		return semanticUSearchMasked(ctx, generation, prepared, mask, floor)
+	})
 }
 
 // scanOverlay scores every overlay row that the query's filters and the
 // node's scope allow with the exact fine vectors, on the scale of the base
-// rows, and keeps the rows within the radius.
-func scanOverlay(ctx context.Context, node openedNode, qp queryPlan, overlay *semanticGeneration, execution searchExecution) ([]semanticHit, error) {
-	_, prepared, err := execution.model.prepareQuery(ctx, qp.model.modelQuery)
-	if err != nil {
-		return nil, err
-	}
-	if prepared == nil {
-		return nil, errRerankUnavailable
-	}
-	tokens, err := semanticQueryTokenCount(prepared)
-	if err != nil {
-		return nil, err
-	}
-	selected, err := nodeRowSelection(ctx, node, qp)
-	if err != nil {
-		return nil, err
-	}
-	var hits []semanticHit
-	if selected == nil {
-		hits, err = exactSemanticSearch(ctx, overlay.vectors, prepared, len(overlay.rows))
-	} else {
+// rows.
+func scanOverlay(ctx context.Context, qp queryPlan, overlay *semanticGeneration, execution searchExecution, selection func() (map[string]struct{}, error)) ([]semanticHit, error) {
+	return scanWithinRadius(ctx, qp, execution, selection, func(prepared *semanticQueryEmbedding, selected map[string]struct{}, floor float32) ([]semanticHit, error) {
+		if selected == nil {
+			return exactSemanticSearch(ctx, overlay.vectors, prepared, floor)
+		}
 		var rows []uint64
 		for index := range overlay.rows {
 			if _, ok := selected[overlay.rows[index].path]; ok {
 				rows = append(rows, overlay.rows[index].row)
 			}
 		}
-		hits, err = exactSemanticSortedCandidates(ctx, overlay.vectors, prepared, rows, len(rows))
-	}
+		return exactSemanticSortedCandidates(ctx, overlay.vectors, prepared, rows, floor)
+	})
+}
+
+// scanWithinRadius runs one scan with the command's query and the node's row
+// selection. The scan keeps the rows whose summed fine MaxSim reaches the
+// radius times the query's token count; each kept row then takes its fine
+// MeanMaxSim as its score.
+func scanWithinRadius(
+	ctx context.Context,
+	qp queryPlan,
+	execution searchExecution,
+	selection func() (map[string]struct{}, error),
+	scan func(prepared *semanticQueryEmbedding, selected map[string]struct{}, floor float32) ([]semanticHit, error),
+) ([]semanticHit, error) {
+	_, prepared, err := execution.model.prepareQuery(ctx, qp.model.modelQuery)
 	if err != nil {
 		return nil, err
 	}
-	need := semanticRetrievalRadius(pipelineTauFile) * float32(tokens)
-	kept := hits[:0]
-	for _, hit := range hits {
-		if hit.score >= need {
-			hit.score /= float32(tokens)
-			kept = append(kept, hit)
-		}
+	if prepared == nil {
+		return nil, errRerankUnavailable
 	}
-	return kept, nil
+	tokens, err := semanticQueryTokenCount(prepared)
+	if err != nil {
+		return nil, err
+	}
+	selected, err := selection()
+	if err != nil {
+		return nil, err
+	}
+	hits, err := scan(prepared, selected, semanticRetrievalRadius*float32(tokens))
+	if err != nil {
+		return nil, err
+	}
+	for index := range hits {
+		hits[index].score /= float32(tokens)
+	}
+	return hits, nil
 }
 
 // nodeRowSelection gives the files that Zoekt selects on the node's own shards
-// for the query's filters and the node's scope; nil keeps every file.
-func nodeRowSelection(ctx context.Context, node openedNode, qp queryPlan) (map[string]struct{}, error) {
-	if len(qp.model.filters) == 0 && node.plan.scope == nil {
+// for the query's filters and the node's scope; nil keeps every file. Only the
+// current copy of a dirty file counts (currentCopy), as in the text results: a
+// committed copy that matches a filter does not select the work-tree copy.
+func nodeRowSelection(ctx context.Context, read *nodeRead, qp queryPlan, dirty dirtyFileSet) (map[string]struct{}, error) {
+	if len(qp.model.filters) == 0 && read.plan.scope == nil {
 		return nil, nil
 	}
 	opts := searchOpts
 	opts.NumContextLines = 0
 	filter := &query.Type{Type: query.TypeFileName, Child: query.NewAnd(append([]query.Q{&query.Const{Value: true}}, qp.model.filters...)...)}
-	files, err := executeParsedSearchScopedDirs(ctx, []string{node.plan.indexDir}, filter, node.plan.scope, searchConfig{opts: &opts})
+	files, err := read.search(ctx, filter, searchConfig{opts: &opts})
 	if err != nil {
 		return nil, err
 	}
 	selected := make(map[string]struct{}, len(files))
 	for _, file := range files {
-		selected[file.FileName] = struct{}{}
+		if currentCopy(file, dirty.contains(file.FileName)) {
+			selected[file.FileName] = struct{}{}
+		}
 	}
 	return selected, nil
 }
 
-// nodeRowFilter gives the files whose rows semantic retrieval reads: the files
-// that Zoekt selects on the node's own shards for the query's filters and the
-// node's scope, less the dirty files (their rows hold the commit; the overlay
-// adds the dirty bytes). A
-// query with no filter and no scope needs no Zoekt call; nil keeps every row.
-func nodeRowFilter(ctx context.Context, node openedNode, qp queryPlan) (func(string) bool, error) {
-	selected, err := nodeRowSelection(ctx, node, qp)
-	if err != nil {
-		return nil, err
-	}
-	if selected == nil && len(node.dirty) == 0 {
-		return nil, nil
+// nodeRowFilter gives the files whose rows semantic retrieval reads: the
+// selected files (nodeRowSelection; nil selects every file), less the dirty
+// files (their rows hold the commit; the overlay adds the dirty bytes). nil
+// keeps every row.
+func nodeRowFilter(selected map[string]struct{}, dirty dirtyFileSet) func(string) bool {
+	if selected == nil && len(dirty) == 0 {
+		return nil
 	}
 	return func(path string) bool {
 		if selected != nil {
@@ -1143,8 +1010,8 @@ func nodeRowFilter(ctx context.Context, node openedNode, qp queryPlan) (func(str
 				return false
 			}
 		}
-		return !node.dirty.contains(path)
-	}, nil
+		return !dirty.contains(path)
+	}
 }
 
 // semanticHitFiles gives one candidate per file: its best row (the hits come
@@ -1204,7 +1071,7 @@ func generationContentIDs(generation *semanticGeneration, wanted map[string]stru
 // clean file reads the base rows, a dirty file the overlay rows, and a
 // name-only file has none.
 func nodeEvidenceHits(
-	plan corpusPlan,
+	plan node,
 	dirty dirtyFileSet,
 	generation *semanticGeneration,
 	overlay *semanticGeneration,
@@ -1286,13 +1153,7 @@ func nodeEvidenceHits(
 // lexicalMatchKey names a file's best lexical match for duplicate collapse:
 // two copies with the same content match the same line.
 func lexicalMatchKey(file zoekt.FileMatch) string {
-	best := -1
-	for index, match := range file.LineMatches {
-		if best < 0 || match.Score > file.LineMatches[best].Score ||
-			(match.Score == file.LineMatches[best].Score && match.LineNumber < file.LineMatches[best].LineNumber) {
-			best = index
-		}
-	}
+	best := bestLineMatch(file.LineMatches)
 	if best < 0 {
 		return "name"
 	}
@@ -1338,7 +1199,7 @@ func rankDescription(ctx context.Context, hits nodeHits, qp queryPlan, execution
 		return ranked{}, ctxErr
 	}
 	slog.Debug("Model stages failed; using strict order", "provider", semanticProviderName(), "error", err)
-	recordSemanticProviderFault(err)
+	execution.model.recordFault(err)
 	var strict nodeHits
 	for _, hit := range merged {
 		if hit.strict {

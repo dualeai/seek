@@ -10,17 +10,44 @@ import (
 	"github.com/sourcegraph/zoekt/query"
 )
 
-func semanticFilterForTest(t testing.TB, source string) *semanticFilterPlan {
+// semanticPathFilterForTest parses source, which must hold one file: atom,
+// and compiles that atom as nodeHeaderQuery does to match display headers.
+func semanticPathFilterForTest(t testing.TB, source string) semanticPathFilter {
 	t.Helper()
 	node, err := query.Parse(source)
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan, err := compileSemanticFilterPlan([]query.Q{node})
+	return semanticPathFilterForAtom(t, node)
+}
+
+// semanticPathFilterForAtom compiles one file: atom as nodeHeaderQuery does.
+func semanticPathFilterForAtom(t testing.TB, atom query.Q) semanticPathFilter {
+	t.Helper()
+	var filter semanticPathFilter
+	var err error
+	switch typed := atom.(type) {
+	case *query.Substring:
+		filter, err = newSemanticSubstringFilter(typed)
+	case *query.Regexp:
+		filter, err = newSemanticRegexpFilter(typed)
+	default:
+		t.Fatalf("atom %s is %T, want one file: atom", atom, atom)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
-	return plan
+	return filter
+}
+
+// selectedFilesKeep gives the row predicate that scanNode gives
+// buildSemanticFilterMask when Zoekt selects exactly paths.
+func selectedFilesKeep(paths ...string) func(path string) bool {
+	selected := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		selected[path] = struct{}{}
+	}
+	return nodeRowFilter(selected, nil)
 }
 
 func TestSemanticFilenameFilterMatchesZoektCaseRules(t *testing.T) {
@@ -33,42 +60,31 @@ func TestSemanticFilenameFilterMatchesZoektCaseRules(t *testing.T) {
 		{name: "long folded sigma", filter: "file:σσσ", path: "ΣΣΣ.go", want: true},
 		{name: "long final sigma differs", filter: "file:σσσ", path: "ςςς.go", want: false},
 		{name: "short regexp fold", filter: "file:σσ", path: "ςς.go", want: true},
-		{name: "short Kelvin fold", filter: "file:k", path: "K.go", want: true},
+		{name: "short Kelvin fold", filter: "file:k", path: "K.go", want: true},
 		{name: "smart case", filter: "file:API", path: "api/client.go", want: false},
+		{name: "smart case match", filter: "file:API", path: "API/client.go", want: true},
 		{name: "anchored regexp", filter: `file:^cmd/.+\.go$`, path: "cmd/main.go", want: true},
 		{name: "anchored regexp miss", filter: `file:^cmd/.+\.go$`, path: "internal/main.go", want: false},
-		{name: "negative regexp", filter: `-file:_test\.go$`, path: "main.go", want: true},
-		{name: "negative regexp rejects", filter: `-file:_test\.go$`, path: "main_test.go", want: false},
+		{name: "suffix regexp miss", filter: `file:_test\.go$`, path: "main.go", want: false},
+		{name: "suffix regexp", filter: `file:_test\.go$`, path: "main_test.go", want: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			plan := semanticFilterForTest(t, test.filter)
-			if got := plan.matches(test.path, "Go"); got != test.want {
+			filter := semanticPathFilterForTest(t, test.filter)
+			if got := filter.matches(test.path); got != test.want {
 				t.Fatalf("matches(%q)=%t, want %t", test.path, got, test.want)
 			}
 		})
 	}
 }
 
-func TestSemanticLanguageFilterUsesCanonicalName(t *testing.T) {
-	plan := semanticFilterForTest(t, "lang:go")
-	if !plan.matches("main.go", "Go") {
-		t.Fatal("canonical Go language did not match")
-	}
-	for _, language := range []string{"go", "Python", ""} {
-		if plan.matches("main.go", language) {
-			t.Fatalf("noncanonical language %q matched", language)
-		}
-	}
-}
-
 func TestBuildSemanticFilterMask(t *testing.T) {
 	rows := []semanticUnit{
-		{row: 0, path: "keep/a.go", fileLanguage: "Go"},
-		{row: 1, path: "keep/a.go", fileLanguage: "Go"},
-		{row: 2, path: "drop/a.go", fileLanguage: "Go"},
-		{row: 3, path: "keep/b.go", fileLanguage: "Go"},
-		{row: 4, path: "keep/b.go", fileLanguage: "Go"},
+		{row: 0, path: "keep/a.go"},
+		{row: 1, path: "keep/a.go"},
+		{row: 2, path: "drop/a.go"},
+		{row: 3, path: "keep/b.go"},
+		{row: 4, path: "keep/b.go"},
 	}
 	generation := &semanticGeneration{
 		manifest: semanticManifest{
@@ -80,7 +96,7 @@ func TestBuildSemanticFilterMask(t *testing.T) {
 		},
 		rows: rows,
 	}
-	mask, err := buildSemanticFilterMask(t.Context(), generation, semanticFilterForTest(t, "file:^keep/").matches)
+	mask, err := buildSemanticFilterMask(t.Context(), generation, selectedFilesKeep("keep/a.go", "keep/b.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,11 +116,13 @@ func TestBuildSemanticFilterMask(t *testing.T) {
 		t.Fatalf("bitmap bytes=%d, want 1", len(mask.bits))
 	}
 
-	all, err := buildSemanticFilterMask(t.Context(), generation, semanticFilterForTest(t, "file:go").matches)
+	all, err := buildSemanticFilterMask(
+		t.Context(), generation, selectedFilesKeep("keep/a.go", "drop/a.go", "keep/b.go"),
+	)
 	if err != nil || all.mode != semanticFilterAll || len(all.bits) != 0 || len(all.shardAllowed) != 0 {
 		t.Fatalf("all mask=%+v error=%v", all, err)
 	}
-	none, err := buildSemanticFilterMask(t.Context(), generation, semanticFilterForTest(t, "file:^missing/").matches)
+	none, err := buildSemanticFilterMask(t.Context(), generation, selectedFilesKeep())
 	if err != nil || none.mode != semanticFilterNone || len(none.bits) != 0 || len(none.shardAllowed) != 0 {
 		t.Fatalf("none mask=%+v error=%v", none, err)
 	}
@@ -115,9 +133,9 @@ func TestBuildSemanticFilterMaskHonorsCancellation(t *testing.T) {
 	cancel()
 	generation := &semanticGeneration{
 		manifest: semanticManifest{Rows: 1},
-		rows:     []semanticUnit{{row: 0, path: "main.go", fileLanguage: "Go"}},
+		rows:     []semanticUnit{{row: 0, path: "main.go"}},
 	}
-	_, err := buildSemanticFilterMask(ctx, generation, semanticFilterForTest(t, "lang:go").matches)
+	_, err := buildSemanticFilterMask(ctx, generation, selectedFilesKeep("main.go"))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error=%v, want cancellation", err)
 	}
@@ -127,13 +145,11 @@ func TestBuildSemanticFilterMaskRejectsInvalidGroupedRow(t *testing.T) {
 	generation := &semanticGeneration{
 		manifest: semanticManifest{Rows: 2},
 		rows: []semanticUnit{
-			{row: 0, path: "main.go", fileLanguage: "Go"},
-			{row: 7, path: "main.go", fileLanguage: "Go"},
+			{row: 0, path: "main.go"},
+			{row: 7, path: "main.go"},
 		},
 	}
-	_, err := buildSemanticFilterMask(
-		t.Context(), generation, semanticFilterForTest(t, "lang:go").matches,
-	)
+	_, err := buildSemanticFilterMask(t.Context(), generation, selectedFilesKeep("main.go"))
 	if err == nil {
 		t.Fatal("invalid row identity was accepted")
 	}
@@ -146,7 +162,7 @@ func TestSemanticFilterMaskCrossesByteAndShardBoundary(t *testing.T) {
 		if row == 8 {
 			path = "keep.go"
 		}
-		rows[row] = semanticUnit{row: uint64(row), path: path, fileLanguage: "Go"}
+		rows[row] = semanticUnit{row: uint64(row), path: path}
 	}
 	generation := &semanticGeneration{
 		manifest: semanticManifest{
@@ -158,7 +174,7 @@ func TestSemanticFilterMaskCrossesByteAndShardBoundary(t *testing.T) {
 		},
 		rows: rows,
 	}
-	mask, err := buildSemanticFilterMask(t.Context(), generation, semanticFilterForTest(t, "file:^keep").matches)
+	mask, err := buildSemanticFilterMask(t.Context(), generation, selectedFilesKeep("keep.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,6 +184,9 @@ func TestSemanticFilterMaskCrossesByteAndShardBoundary(t *testing.T) {
 	}
 }
 
+// TestSemanticFilterMatchesRealZoektShard indexes one Zoekt shard. Each file:
+// atom, compiled as nodeHeaderQuery compiles it, must match the files that
+// Zoekt matches.
 func TestSemanticFilterMatchesRealZoektShard(t *testing.T) {
 	requireTools(t)
 	documents := []fileContent{
@@ -198,37 +217,6 @@ func TestSemanticFilterMatchesRealZoektShard(t *testing.T) {
 		t.Fatalf("build Zoekt fixture: indexed=%t error=%v", indexed, err)
 	}
 
-	options := indexBuildOptions("", 1)
-	options.SetDefaults()
-	checker := &index.DocChecker{}
-	languages := make(map[string]string, len(documents))
-	for _, document := range documents {
-		languages[document.name] = semanticDocumentLanguage(checker, options, document)
-	}
-	allFiles, err := executeParsedShardSearchForTest(
-		t.Context(), indexDir, &query.Const{Value: true}, defaultSearchConfig(),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	zoektLanguages := make(map[string]string, len(allFiles))
-	for _, file := range allFiles {
-		zoektLanguages[file.FileName] = file.Language
-	}
-	for _, document := range documents {
-		if got, want := languages[document.name], zoektLanguages[document.name]; got != want {
-			t.Errorf("file language for %q=%q, Zoekt=%q", document.name, got, want)
-		}
-	}
-	for path, want := range map[string]string{
-		"script":                   "Python",
-		"binary.unknown-seek-test": "",
-		"forced.py":                "Python",
-	} {
-		if got := languages[path]; got != want {
-			t.Errorf("fixture language for %q=%q, want %q", path, got, want)
-		}
-	}
 	for _, source := range []string{
 		"file:σσσ",
 		"file:σσ",
@@ -236,14 +224,11 @@ func TestSemanticFilterMatchesRealZoektShard(t *testing.T) {
 		`file:^cmd/[a-z_]+\.go$`,
 		`file:^(cmd|tools)/`,
 		`file:"my file"`,
-		`-file:_test\.go$`,
-		`file:^cmd/ -file:_test\.go$`,
-		`file:^cmd/ lang:go`,
-		`file:^cmd/ lang:python`,
-		`file:main file:cmd`,
+		`file:_test\.go$`,
+		"file:main",
+		"file:cmd",
+		"file:ΣΣ",
 		"file:�",
-		"lang:go",
-		"lang:python",
 	} {
 		t.Run(source, func(t *testing.T) {
 			node, err := query.Parse(source)
@@ -260,25 +245,10 @@ func TestSemanticFilterMatchesRealZoektShard(t *testing.T) {
 			for _, file := range files {
 				zoektMatches[file.FileName] = true
 			}
-			filterNodes := []query.Q{node}
-			if and, ok := node.(*query.And); ok {
-				filterNodes = and.Children
-			}
-			plan, err := compileSemanticFilterPlan(filterNodes)
-			if err != nil {
-				t.Fatal(err)
-			}
+			filter := semanticPathFilterForAtom(t, node)
 			for _, document := range documents {
-				got := plan.matches(document.name, languages[document.name])
-				if got != zoektMatches[document.name] {
-					t.Errorf(
-						"%s on %q=%t, Zoekt=%t (language %q)",
-						source,
-						document.name,
-						got,
-						zoektMatches[document.name],
-						languages[document.name],
-					)
+				if got := filter.matches(document.name); got != zoektMatches[document.name] {
+					t.Errorf("%s on %q=%t, Zoekt=%t", source, document.name, got, zoektMatches[document.name])
 				}
 			}
 		})

@@ -20,7 +20,7 @@ import (
 )
 
 // lateOnSelectedProvider records the provider the encoder settled on. Index and
-// search paths read it for their fallback logs; they do not hold the encoder.
+// search paths read it for their logs; they do not hold the encoder.
 var lateOnSelectedProvider atomic.Value
 
 // These are the two verdict spellings the selection path below compares against.
@@ -221,14 +221,17 @@ func lateOnOutputsAgree(accelerated, reference []float32) (bool, string) {
 // The pool works before session is set, which is how the provider check borrows
 // it while newLateOnRowEncoder is still deciding which session to keep.
 type lateOnStaticRowEncoder struct {
-	session    *ort.DynamicAdvancedSession
-	callCPUs   int
-	outputMu   sync.Mutex
-	outputFree []*ort.Tensor[float32]
-	outputAll  []*ort.Tensor[float32]
+	session  *ort.DynamicAdvancedSession
+	callCPUs int
+	// interactive marks a CPU session sized for one call at a time
+	// (lateOnCPUInteractiveThreads).
+	interactive bool
+	outputMu    sync.Mutex
+	outputFree  []*ort.Tensor[float32]
+	outputAll   []*ort.Tensor[float32]
 }
 
-// newLateOnRowEncoder builds the encoder for this process and decides which
+// newLateOnRowEncoder builds the first encoder of a model and decides which
 // execution provider it uses.
 //
 // On a target with an accelerator the order is: a pinned provider wins outright;
@@ -238,10 +241,14 @@ type lateOnStaticRowEncoder struct {
 // that matches the provider actually chosen, because the build scheduler freezes
 // that value before its first batch and cannot revise it.
 //
+// interactive reports a first use that is one call (a query or one batch of
+// scores) rather than the concurrent index build; it sets the CPU provider's
+// thread count, which a session keeps for its life.
+//
 // The returned encoder is created before its session so the check can borrow its
 // tensor pool. The deferred release covers every failure after that point; a
 // success path fills the session in and the release becomes a no-op.
-func newLateOnRowEncoder(ctx context.Context) (built *lateOnStaticRowEncoder, err error) {
+func newLateOnRowEncoder(ctx context.Context, interactive bool) (built *lateOnStaticRowEncoder, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -276,7 +283,7 @@ func newLateOnRowEncoder(ctx context.Context) (built *lateOnStaticRowEncoder, er
 	skipAcceleratedSession := lateOnProviderHasAccelerator &&
 		(forced == lateOnCPUProviderName || cachedVerdict == lateOnVerdictRejected)
 	if !lateOnProviderHasAccelerator || skipAcceleratedSession {
-		providerCallCPUs = lateOnCPUIntraOpThreads(runtime.GOMAXPROCS(0))
+		providerCallCPUs = lateOnCPUThreads(interactive)
 	}
 	// The encoder exists before its session so the probe can borrow its tensor
 	// pool. Any failure after that point must release what the pool holds, or a
@@ -290,8 +297,10 @@ func newLateOnRowEncoder(ctx context.Context) (built *lateOnStaticRowEncoder, er
 	var session *ort.DynamicAdvancedSession
 	var providerErr error
 	if skipAcceleratedSession {
-		// The operator pinned the CPU provider. Do not build the accelerated
-		// session at all, so the choice is reproducible in a bug report.
+		// The operator pinned the CPU provider, or a cached check rejected the
+		// accelerated one. Do not build the accelerated session at all: a pin
+		// stays reproducible in a bug report, and a rejected host compiles no
+		// Core ML model.
 		session, providerErr = newLateOnCPUSession(model, providerCallCPUs)
 		if providerErr != nil {
 			return nil, fmt.Errorf("create LateOn CPU session: %w", providerErr)
@@ -309,6 +318,7 @@ func newLateOnRowEncoder(ctx context.Context) (built *lateOnStaticRowEncoder, er
 		)
 		encoder.session = session
 		encoder.callCPUs = providerCallCPUs
+		encoder.interactive = interactive
 		return encoder, nil
 	}
 	session, providerErr = newLateOnStaticSession(model, func(options *ort.SessionOptions) error {
@@ -347,7 +357,7 @@ func newLateOnRowEncoder(ctx context.Context) (built *lateOnStaticRowEncoder, er
 		}
 	}
 	if providerErr != nil && lateOnProviderHasAccelerator {
-		providerCallCPUs = lateOnCPUIntraOpThreads(runtime.GOMAXPROCS(0))
+		providerCallCPUs = lateOnCPUThreads(interactive)
 		var cpuErr error
 		session, cpuErr = newLateOnCPUSession(model, providerCallCPUs)
 		if cpuErr != nil {
@@ -366,10 +376,11 @@ func newLateOnRowEncoder(ctx context.Context) (built *lateOnStaticRowEncoder, er
 	}
 	accountedCallCPUs := providerCallCPUs
 	if lateOnProviderHasAccelerator && providerErr == nil {
-		// Treat a Core ML call as accelerator work for shared-gate accounting. Core
-		// ML can still use the CPU, GPU, or Neural Engine. The adaptive call controller
-		// limits measured throughput and memory use. A zero reservation prevents
-		// provider waits from blocking ready tokenizer, ctags, or USearch CPU work.
+		// Treat a Core ML call as accelerator work for shared-gate accounting.
+		// Core ML can still use the CPU, GPU, or Neural Engine. The adaptive
+		// call controller limits measured throughput and memory use. A zero
+		// reservation prevents provider waits from blocking ready tokenizer,
+		// ctags, or USearch CPU work.
 		accountedCallCPUs = 0
 	}
 	selected := lateOnCPUProviderName
@@ -401,14 +412,37 @@ func newLateOnRowEncoder(ctx context.Context) (built *lateOnStaticRowEncoder, er
 	)
 	encoder.session = session
 	encoder.callCPUs = accountedCallCPUs
+	// Only a CPU session has threads to size; an accelerated call reserves
+	// none (accountedCallCPUs 0).
+	encoder.interactive = interactive && accountedCallCPUs > 0
 	return encoder, nil
 }
 
-// newLateOnCPUSession builds a session on the CPU provider. Two paths need one —
-// a provider this host has already ruled out, and a fallback after the
-// accelerated session proved unusable — and they must configure it identically,
-// because the reservation the build scheduler freezes is derived from the same
-// thread count.
+// newLateOnCPUBuildEncoder builds a CPU encoder with the index build's thread
+// count, with no provider selection: the model's first encoder is a CPU
+// session sized for one call, so the provider is chosen already.
+func newLateOnCPUBuildEncoder(ctx context.Context) (*lateOnStaticRowEncoder, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	model, err := decodeLateOnAsset(lateOnCompressedModel)
+	if err != nil {
+		return nil, fmt.Errorf("load LateOn model: %w", err)
+	}
+	threads := lateOnCPUThreads(false)
+	session, err := newLateOnCPUSession(model, threads)
+	if err != nil {
+		return nil, fmt.Errorf("create LateOn CPU build session: %w", err)
+	}
+	return &lateOnStaticRowEncoder{session: session, callCPUs: threads}, nil
+}
+
+// newLateOnCPUSession builds a session on the CPU provider. Three paths need
+// one: a CPU pin or a cached rejection of the accelerated provider, a fallback
+// after the accelerated session proved unusable, and the index build session
+// (newLateOnCPUBuildEncoder). They must configure it identically, because the
+// reservation the build scheduler freezes is derived from the same thread
+// count.
 func newLateOnCPUSession(model []byte, threads int) (*ort.DynamicAdvancedSession, error) {
 	return newLateOnStaticSession(model, func(options *ort.SessionOptions) error {
 		return configureLateOnCPUProvider(options, threads)
@@ -450,13 +484,32 @@ func configureLateOnCPUProvider(options *ort.SessionOptions, intraOpThreads int)
 	return nil
 }
 
-// lateOnCPUIntraOpThreads keeps both ONNX kernel work and independent model
-// calls available. Both dimensions grow with the effective CPU count. The
-// outer controller then reduces the call count when live memory or measured
+// lateOnCPUIntraOpThreads is the thread count of a CPU session for the index
+// build. It keeps both ONNX kernel work and independent model calls
+// available. Both dimensions grow with the effective CPU count. The outer
+// controller then reduces the call count when live memory or measured
 // throughput requires it.
 func lateOnCPUIntraOpThreads(cpuLimit int) int {
 	cpuLimit = max(1, cpuLimit)
 	return max(1, int(math.Round(math.Sqrt(float64(cpuLimit)/2))))
+}
+
+// lateOnCPUInteractiveThreads is the thread count of a session whose first
+// use is one call: a warm description search prepares one query and scores
+// one batch, so the index build's count leaves most CPUs idle. Measured with
+// Top-20 scoring on 18 CPUs: 828 ms on 3 threads, 559 ms on 6, 523 ms on 12,
+// and 624 ms on 18. So it takes two thirds of the CPUs, not all of them.
+func lateOnCPUInteractiveThreads(cpuLimit int) int {
+	return max(1, int(math.Round(float64(max(1, cpuLimit))*2/3)))
+}
+
+// lateOnCPUThreads is the CPU provider's thread count for a session whose
+// first use is interactive or the index build.
+func lateOnCPUThreads(interactive bool) int {
+	if interactive {
+		return lateOnCPUInteractiveThreads(runtime.GOMAXPROCS(0))
+	}
+	return lateOnCPUIntraOpThreads(runtime.GOMAXPROCS(0))
 }
 
 func (encoder *lateOnStaticRowEncoder) CallCPUs() int {

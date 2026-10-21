@@ -1,5 +1,3 @@
-//go:build linux
-
 package main
 
 import "syscall"
@@ -16,6 +14,8 @@ const (
 	fuseSuperMagic = 0x65735546
 )
 
+// isOnNFS reports whether path is on a file system with one of the magic
+// numbers above. A stat error reports false.
 func isOnNFS(path string) bool {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(path, &st); err != nil {

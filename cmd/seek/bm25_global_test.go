@@ -64,7 +64,7 @@ func TestParseZoektBM25Debug(t *testing.T) {
 // TestBM25NameAtomUnicodeName matches a file-name atom in a name whose lower
 // case is longer in bytes: no panic, one term.
 func TestBM25NameAtomUnicodeName(t *testing.T) {
-	atom := bm25NameAtom{substring: "zqfoo"}
+	atom := compileBM25Query(&query.Substring{Pattern: "zqfoo", FileName: true}).names[0]
 	if got := atom.matches("ȺȺȺzqfoo.go"); !slices.Equal(got, []string{"zqfoo"}) {
 		t.Fatalf("matches=%q", got)
 	}
@@ -171,34 +171,46 @@ func TestBM25NameAtomsSkipNegations(t *testing.T) {
 // with the command's rescore, and returns each file's score by path.
 func bm25NodeScores(t *testing.T, pattern string, operands ...string) map[string]float64 {
 	t.Helper()
+	scores, _ := bm25NodeSearch(t, pattern, operands...)
+	return scores
+}
+
+// bm25NodeSearch runs the strict route of runSearchCommand up to the display:
+// it searches the nodes of operands with searchNodes and strictNode, then
+// rescores the hits. The output hides the scores, so the test reads them
+// here. It returns each file's score by path and the command's BM25 state.
+func bm25NodeSearch(t *testing.T, pattern string, operands ...string) (map[string]float64, *bm25Command) {
+	t.Helper()
 	ctx := withSkippedNodes(context.Background())
 	plans, err := planCorpora(ctx, operands)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, command := withBM25Command(ctx, len(plans))
+	ctx = withIndexWindow(ctx, len(plans))
 	qp, err := planQuery(pattern, lexicalOnlySearchPolicy())
 	if err != nil {
 		t.Fatal(err)
 	}
-	execution := testLexicalSearchExecution()
-	execution.opened = &openedNodes{}
-	// The operands give the headers that file: atoms read, as in a search.
-	execution.operands = newDisplayOperands(operands)
-	var all []corpusSearchResult
-	for _, plan := range plans {
-		results, _, err := strictNode(ctx, plan, qp, defaultSearchConfig(), execution)
-		if err != nil {
-			t.Fatalf("%s: %v", pattern, err)
-		}
-		all = append(all, results...)
+	execution := searchExecution{
+		policy:    lexicalOnlySearchPolicy(),
+		resources: liveSearchResources(),
+		opened:    &openedNodes{},
+		// The operands give the headers that file: atoms read, as in a search.
+		operands: newDisplayOperands(operands),
+	}
+	ctx, command := withBM25Command(ctx, len(plans))
+	all, _, err := searchNodes(ctx, plans, func(nodeCtx context.Context, plan node) ([]corpusSearchResult, dirtyFileSet, error) {
+		return strictNode(nodeCtx, plan, qp, defaultSearchConfig(), execution)
+	})
+	if err != nil {
+		t.Fatalf("%s: %v", pattern, err)
 	}
 	rescoreStrictResults(all, command)
 	scores := map[string]float64{}
 	for _, result := range all {
 		scores[filepath.Join(result.displayRoot, result.file.FileName)] = result.file.Score
 	}
-	return scores
+	return scores, command
 }
 
 // TestBM25RescoreIsExact gives each query shape's hits, searched as two
@@ -224,6 +236,7 @@ func TestBM25RescoreIsExact(t *testing.T) {
 		"case:yes content:fo[a-z]x",
 		"case:yes content:foax|fobx",
 		"case:yes content:(foax)+",
+		"case:yes content:foax|bar",
 		"case:yes fo",
 		"case:yes foo file:foo",
 		"case:yes foo file:fo",
@@ -295,7 +308,7 @@ func TestBM25LineSplitAmbiguity(t *testing.T) {
 		t.Fatalf("debug=%q, want the split that the ratio fits", match.Debug)
 	}
 	// Under the same average the rescore gives Zoekt's score back.
-	if got, ok := bm25Rescore(match, 100); !ok || math.Abs(got-score) > 1e-9 {
+	if got, ok := bm25Rescore(match.Debug, 100); !ok || math.Abs(got-score) > 1e-9 {
 		t.Fatalf("rescore=%v ok=%t, want %v", got, ok, score)
 	}
 	off := file(ratio + 1)
@@ -393,72 +406,56 @@ func TestBM25NameCandidateEdges(t *testing.T) {
 		!slices.ContainsFunc(lists, func(keys []string) bool { return slices.Equal(keys, []string{""}) }) {
 		t.Fatalf("a tie between two keys gave %q ok=%t, want both keys as options", lists, ok)
 	}
-	atom := bm25NameAtom{substring: "foo"}
+	atom := compileBM25Query(&query.Substring{Pattern: "foo", FileName: true}).names[0]
 	found, ok := atom.candidates("ȺȺfooK.go")
 	if !ok || len(found) != 1 || found[0].at != len("ȺȺ") {
 		t.Fatalf("candidates=%+v ok=%t, want one at byte %d", found, ok, len("ȺȺ"))
 	}
 }
 
-// TestBM25InPlaceAverageReadsItsOwnShards runs two strict searches in one
-// one-node command, as a repaired attempt does: the second search, of two
-// shards, scores with the average of its own shards, not with the counts of
-// the first. The expected scores are Zoekt's own, from the same files in one
-// node of one shard.
+// TestBM25InPlaceAverageReadsItsOwnShards searches one node of two shards in
+// a one-node command: the search scores each hit in place with the average of
+// the node's shards. The expected scores are Zoekt's own, from the same files
+// in one node of one shard.
 func TestBM25InPlaceAverageReadsItsOwnShards(t *testing.T) {
 	requireTools(t)
 	root := t.TempDir()
-	for index := range 12 {
-		writeFixtureFile(t, filepath.Join(root, "old", fmt.Sprintf("s%02d.txt", index)), "foo\n")
-	}
-	for _, dir := range []string{"fresh", "whole"} {
+	for _, dir := range []string{"split", "whole"} {
 		writeFixtureFile(t, filepath.Join(root, dir, "a.go"), "package a\nfoo\n"+strings.Repeat("// filler\n", 20))
 		writeFixtureFile(t, filepath.Join(root, dir, "b.go"), "package a\nfoo foo\n")
 	}
 	setTestUserCache(t)
-	exact := map[string]float64{}
-	for path, score := range bm25NodeScores(t, "case:yes foo", filepath.Join(root, "whole")) {
-		exact[filepath.Base(path)] = score
-	}
-	whole, err := planCorpora(context.Background(), []string{filepath.Join(root, "whole")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if shards, _ := filepath.Glob(filepath.Join(whole[0].indexDir, "*.zoekt")); len(shards) != 1 {
-		t.Fatalf("whole: %d shards, want 1", len(shards))
-	}
-	// From here each file of old and fresh gets its own shard.
-	swapShardMaxForTest(t, 64)
-	ctx := withSkippedNodes(context.Background())
-	ctx, command := withBM25Command(ctx, 1)
-	qp, err := planQuery("case:yes foo", lexicalOnlySearchPolicy())
-	if err != nil {
-		t.Fatal(err)
-	}
-	execution := testLexicalSearchExecution()
-	execution.opened = &openedNodes{}
-	var last []corpusSearchResult
-	for _, operand := range []string{"old", "fresh"} {
-		plans, err := planCorpora(ctx, []string{filepath.Join(root, operand)})
+	shardCount := func(operand string) int {
+		t.Helper()
+		plans, err := planCorpora(context.Background(), []string{operand})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if last, _, err = strictNode(ctx, plans[0], qp, defaultSearchConfig(), execution); err != nil {
-			t.Fatal(err)
-		}
-		// With one shard Zoekt's score is final and no rescore runs.
-		if shards, _ := filepath.Glob(filepath.Join(plans[0].indexDir, "*.zoekt")); len(shards) < 2 {
-			t.Fatalf("%s: %d shards, want 2 or more", operand, len(shards))
-		}
+		shards, _ := filepath.Glob(filepath.Join(plans[0].indexDir, "*.zoekt"))
+		return len(shards)
 	}
-	rescoreStrictResults(last, command)
-	if !command.final.Load() || len(last) != 2 || len(exact) != 2 {
-		t.Fatalf("final=%t hits=%d expected=%d, want an in-place rescore of 2 hits", command.final.Load(), len(last), len(exact))
+	exact := map[string]float64{}
+	wholeScores, _ := bm25NodeSearch(t, "case:yes foo", filepath.Join(root, "whole"))
+	for path, score := range wholeScores {
+		exact[filepath.Base(path)] = score
 	}
-	for _, result := range last {
-		name := filepath.Base(result.file.FileName)
-		if want, ok := exact[name]; !ok || math.Abs(result.file.Score-want) > 1e-9*max(1, want) {
-			t.Errorf("%s: score %v, want Zoekt's %v", name, result.file.Score, want)
+	if shards := shardCount(filepath.Join(root, "whole")); shards != 1 {
+		t.Fatalf("whole: %d shards, want 1", shards)
+	}
+	// From here each file of split gets its own shard. With one shard Zoekt's
+	// score is final and no rescore runs.
+	swapShardMaxForTest(t, 64)
+	split, command := bm25NodeSearch(t, "case:yes foo", filepath.Join(root, "split"))
+	if shards := shardCount(filepath.Join(root, "split")); shards < 2 {
+		t.Fatalf("split: %d shards, want 2 or more", shards)
+	}
+	if !command.final.Load() || len(split) != 2 || len(exact) != 2 {
+		t.Fatalf("final=%t hits=%d expected=%d, want an in-place rescore of 2 hits", command.final.Load(), len(split), len(exact))
+	}
+	for path, score := range split {
+		name := filepath.Base(path)
+		if want, ok := exact[name]; !ok || math.Abs(score-want) > 1e-9*max(1, want) {
+			t.Errorf("%s: score %v, want Zoekt's %v", name, score, want)
 		}
 	}
 }
@@ -611,4 +608,14 @@ func TestEqualScoresSortByName(t *testing.T) {
 			t.Fatalf("run %d: %v, want name order", run, headers)
 		}
 	}
+}
+
+// matches returns the term keys of the atom's matches in name.
+func (atom bm25NameAtom) matches(name string) []string {
+	found, _ := atom.candidates(name)
+	keys := make([]string, len(found))
+	for index, candidate := range found {
+		keys[index] = candidate.key
+	}
+	return keys
 }

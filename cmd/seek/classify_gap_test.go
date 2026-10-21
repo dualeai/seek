@@ -48,7 +48,7 @@ func appendFileAt(tb testing.TB, repo, name, content string) {
 	}
 }
 
-func planForOperands(tb testing.TB, repo string, operands ...string) []corpusPlan {
+func planForOperands(tb testing.TB, repo string, operands ...string) []node {
 	tb.Helper()
 	plans, err := planCorpora(context.Background(), operands)
 	if err != nil {
@@ -57,7 +57,7 @@ func planForOperands(tb testing.TB, repo string, operands ...string) []corpusPla
 	return plans
 }
 
-// I3 — an untracked-but-visible file routes to the repo's scoped git corpus
+// An untracked-but-visible file routes to the repo's scoped git corpus
 // (its content is reached via the dirty layer), not a standalone folder corpus.
 func TestPlanCorpora_UntrackedVisibleFileUsesScopedGitCorpus(t *testing.T) {
 	requireGit(t)
@@ -78,7 +78,7 @@ func TestPlanCorpora_UntrackedVisibleFileUsesScopedGitCorpus(t *testing.T) {
 	}
 }
 
-// I4 — a tracked file inside a nested repo routes to the INNER repo.
+// A tracked file inside a nested repo routes to the INNER repo.
 func TestPlanCorpora_FileInNestedGitUsesChildRepo(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
@@ -96,7 +96,7 @@ func TestPlanCorpora_FileInNestedGitUsesChildRepo(t *testing.T) {
 	}
 }
 
-// I5 — multiple files of one repo collapse to a single scoped git plan.
+// Multiple files of one repo collapse to a single scoped git plan.
 func TestPlanCorpora_MultipleFilesSameRepoCollapseToOnePlan(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
@@ -134,7 +134,7 @@ func TestPlanCorpora_FileAndDirSameRepoCollapseToOnePlan(t *testing.T) {
 	}
 }
 
-// I1/I6 — a tracked file and an ignored file in the SAME repo split: the
+// A tracked file and an ignored file in the SAME repo split: the
 // tracked file is git-scoped, the ignored file falls back to its own
 // folder/file corpus so its content is still searched.
 func TestPlanCorpora_TrackedAndIgnoredFileSameRepoSplit(t *testing.T) {
@@ -149,7 +149,7 @@ func TestPlanCorpora_TrackedAndIgnoredFileSameRepoSplit(t *testing.T) {
 	if len(plans) != 2 {
 		t.Fatalf("expected two plans (git + folder fallback), got %d: %#v", len(plans), plans)
 	}
-	var git, folder *corpusPlan
+	var git, folder *node
 	for i := range plans {
 		switch plans[i].kind {
 		case corpusKindGit:
@@ -192,8 +192,7 @@ func TestRealCaseWithin(t *testing.T) {
 }
 
 // The set of corpus IDs a planning run produces must not depend on the
-// order operands are passed (closes the order-independence concern without
-// a full fuzzer).
+// order operands are passed.
 func TestPlanCorpora_OperandOrderIndependent(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
@@ -222,8 +221,8 @@ func TestPlanCorpora_OperandOrderIndependent(t *testing.T) {
 	}
 }
 
-// I10 — a symlink whose resolved target is gitignored falls back to a
-// file corpus (routing follows the resolved target).
+// A symlink whose resolved target is gitignored falls back to a file corpus
+// (routing follows the resolved target).
 func TestPlanCorpora_SymlinkToIgnoredFileFallsBack(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)

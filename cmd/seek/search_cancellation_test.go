@@ -140,8 +140,8 @@ func TestSearchLoadedShardsRejectsCancelledPartialResult(t *testing.T) {
 	if !errors.Is(err, context.Canceled) || len(files) != 0 {
 		t.Errorf("cancelled shard: files=%v error=%v, want no files and cancellation", files, err)
 	}
-	if shard.closeCalls.Load() != 1 {
-		t.Errorf("close calls=%d, want 1", shard.closeCalls.Load())
+	if shard.closeCalls.Load() != 0 {
+		t.Errorf("close calls=%d, want 0: the caller closes the shards", shard.closeCalls.Load())
 	}
 }
 
@@ -197,7 +197,7 @@ func TestSearchLoadedShardsJoinsWorkersBeforeCancellation(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("search did not return after all workers finished")
 	}
-	if first.closeCalls.Load() != 1 || second.closeCalls.Load() != 1 {
-		t.Errorf("close calls=%d/%d, want 1/1", first.closeCalls.Load(), second.closeCalls.Load())
+	if first.closeCalls.Load() != 0 || second.closeCalls.Load() != 0 {
+		t.Errorf("close calls=%d/%d, want 0/0: the caller closes the shards", first.closeCalls.Load(), second.closeCalls.Load())
 	}
 }

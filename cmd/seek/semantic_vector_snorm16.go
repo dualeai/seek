@@ -20,9 +20,9 @@ const (
 	semanticSNORM16Scale        = 32767
 	semanticSNORM16InverseScale = float32(1.0 / semanticSNORM16Scale)
 	semanticSNORM16SquaredScale = semanticSNORM16Scale * semanticSNORM16Scale
-	// This tolerance is floor(0.001212 * semanticSNORM16SquaredScale).
-	// TestSemanticSNORM16IntegerNormThreshold derives 0.001212 from the accepted
-	// float32 norm and the maximum 48-component codec error.
+	// This tolerance is floor(0.001212 * semanticSNORM16SquaredScale): 0.001212
+	// covers the accepted float32 norm and the maximum 48-component codec error.
+	// TestSemanticSNORM16IntegerNormThreshold checks that it is large enough.
 	semanticSNORM16SquaredNormCodeTolerance = 1_301_295
 	semanticFineVectorBytesPerUnit          = semanticFineCentroidsPerUnit * semanticEmbeddingDimensions * 2
 )

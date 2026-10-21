@@ -10,10 +10,10 @@ import (
 // windowSemanticUnits splits each unit into rows of at most one model input:
 // every 128-token window of every unit is a row, so every byte reaches a
 // vector. A window holds the tokens of one unit only. Each window repeats the
-// unit's path and language header, and its row keeps the byte span of its own
-// body tokens, so the final model scores the window that the vector found: a
-// unit's score is its best window. A window ends at a line or word start when
-// one is in its second half.
+// unit's header (semanticWindowHeader), and its row keeps the byte span of its
+// own body tokens, so the final model scores the window that the vector found:
+// a unit's score is its best window. A window ends at a line or word start
+// when one is in its second half.
 func windowSemanticUnits(
 	ctx context.Context,
 	tokenizer *lateOnTokenizer,
@@ -148,8 +148,8 @@ const semanticWindowSpareTokens = 2
 // semanticWindowCut picks the end of a window that would end at last: the
 // latest line start in the window's second half, else the latest word start,
 // else the latest valid cut; a window with no valid cut ends at last.
-func semanticWindowCut(first, last, room int, valid func(int) bool, kinds ...func(int) bool) int {
-	for _, kind := range append(kinds, func(int) bool { return true }) {
+func semanticWindowCut(first, last, room int, valid, lineStart, wordStart func(int) bool) int {
+	for _, kind := range [...]func(int) bool{lineStart, wordStart, func(int) bool { return true }} {
 		for cut := last; cut > first+room/2; cut-- {
 			if valid(cut) && kind(cut) {
 				return cut

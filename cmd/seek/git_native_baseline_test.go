@@ -19,7 +19,7 @@ import (
 
 func zoektIndexedPaths(t testing.TB, indexDir string) []string {
 	t.Helper()
-	searchers, err := loadShardsOptional(indexDir)
+	searchers, err := loadShards(indexDir)
 	if err != nil {
 		t.Fatalf("load Zoekt shards: %v", err)
 	}

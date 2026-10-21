@@ -37,7 +37,6 @@ func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 	if err != nil {
 		return fmt.Errorf("resolve cache root: %w", err)
 	}
-	cfg := gcConfigFromEnv()
 
 	corporaPath := filepath.Join(cacheRoot, corporaDir)
 	if opts.dryRun {
@@ -54,7 +53,11 @@ func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 		if err := reportGCPlan(ctx, os.Stdout, cacheRoot, entries, evict, sortKey); err != nil {
 			return err
 		}
-		reportProviderArtifactPlan(ctx, os.Stdout, cacheRoot, time.Now().Add(-providerArtifactAge(opts.all)))
+		before := time.Now().Add(-providerArtifactAge(opts.all))
+		reportDirPlan(os.Stdout, "compiled model files", agedProviderArtifacts(ctx, cacheRoot, before),
+			"Seek compiles these again when it needs them.")
+		reportDirPlan(os.Stdout, "retired runtimes", retiredRuntimes(cacheRoot, before),
+			"Seek extracts these again when a version that needs them runs.")
 		return nil
 	}
 
@@ -82,7 +85,7 @@ func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 		skipThrottle: opts.force || opts.all,
 		writer:       os.Stdout,
 		sortKey:      sortKey,
-	}, cfg.interval)
+	})
 	return nil
 }
 
@@ -106,12 +109,12 @@ func (s *gcTableStats) summary(w io.Writer, verb string) {
 }
 
 // gcSortKey selects the row order of the `seek gc` table. The zero value
-// (sortByName) preserves the historical hash order shared by the dry-run
-// and live paths — and is what the opportunistic path implicitly uses.
+// (sortByName) keeps the hash order shared by the dry-run and live paths —
+// and is what the opportunistic path implicitly uses.
 type gcSortKey uint8
 
 const (
-	sortByName gcSortKey = iota // corpus hash — historical, deterministic
+	sortByName gcSortKey = iota // corpus hash — deterministic
 	sortByAge                   // oldest .used first — matches eviction priority
 	sortBySize                  // largest first — "what is eating my disk"
 )
@@ -342,12 +345,7 @@ func truncateHash(h corpusID) string {
 	if len(s) <= 10 {
 		return s
 	}
-	var b strings.Builder
-	b.Grow(10)
-	b.WriteString(s[:5])
-	b.WriteString("...")
-	b.WriteString(s[len(s)-2:])
-	return b.String()
+	return s[:5] + "..." + s[len(s)-2:]
 }
 
 func humanDuration(d time.Duration) string {
@@ -430,11 +428,11 @@ func corpusDirSize(path string) int64 {
 	return total
 }
 
-// reportProviderArtifactPlan lists the compiled model files a collection would
-// remove. Without it a plan under-reports the deletion, because those files live
-// outside the corpus table.
-func reportProviderArtifactPlan(ctx context.Context, w io.Writer, cacheRoot string, cutoff time.Time) {
-	due := agedProviderArtifacts(ctx, cacheRoot, cutoff)
+// reportDirPlan lists the directories outside the corpus table that a
+// collection would remove (sweepAgedProviderArtifacts, sweepRetiredRuntimes).
+// Without it a plan under-reports the deletion. It prints nothing when no
+// directory is due.
+func reportDirPlan(w io.Writer, label string, due []string, footer string) {
 	if len(due) == 0 {
 		return
 	}
@@ -442,18 +440,13 @@ func reportProviderArtifactPlan(ctx context.Context, w io.Writer, cacheRoot stri
 	// dominates the cost of a plan, so the total and the rows must share it.
 	sizes := make([]int64, len(due))
 	var total int64
-	for i, entry := range due {
-		sizes[i] = corpusDirSize(entry.path())
+	for i, path := range due {
+		sizes[i] = corpusDirSize(path)
 		total += sizes[i]
 	}
-	_, _ = fmt.Fprintf(
-		w,
-		"\ncompiled model files to remove: %d (%s)\n",
-		len(due),
-		humanBytes(total),
-	)
-	for i, entry := range due {
-		_, _ = fmt.Fprintf(w, "  %s  %s\n", humanBytes(sizes[i]), entry.path())
+	_, _ = fmt.Fprintf(w, "\n%s to remove: %d (%s)\n", label, len(due), humanBytes(total))
+	for i, path := range due {
+		_, _ = fmt.Fprintf(w, "  %s  %s\n", humanBytes(sizes[i]), path)
 	}
-	_, _ = fmt.Fprintf(w, "Seek compiles these again when it needs them.\n")
+	_, _ = fmt.Fprintln(w, footer)
 }

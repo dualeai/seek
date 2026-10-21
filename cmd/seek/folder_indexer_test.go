@@ -120,16 +120,32 @@ func TestStreamFolderFiles_OutputChannelUnbuffered(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The test is the consumer: it gives back the weight of each document,
+	// and done checks that no weight leaks.
+	done := withReadSemLock(t)
+	defer done()
+	// The build gives the stream a failure function; it cancels the read.
+	ctx, fail := context.WithCancelCause(t.Context())
+	defer fail(nil)
 	ch := streamFolderFiles(
-		context.Background(),
+		ctx,
 		[]folderCandidate{newFolderCandidate("note.txt", path, info)},
 		4,
-		nil,
+		fail,
 	)
 	if cap(ch) != 0 {
 		t.Fatalf("streamFolderFiles output must be unbuffered, got cap=%d", cap(ch))
 	}
-	for range ch {
+	var docs []fileContent
+	for doc := range ch {
+		docs = append(docs, doc)
+		readSemaphore.Release(doc.weight)
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		t.Fatalf("the stream reported a failure: %v", cause)
+	}
+	if len(docs) != 1 || docs[0].name != "note.txt" || string(docs[0].content) != "folder stream marker\n" {
+		t.Fatalf("docs=%+v, want note.txt with its content", docs)
 	}
 }
 

@@ -18,13 +18,13 @@ import (
 // A builder creates a shard generation in a temporary directory, validates its
 // state, and publishes it under the publish lock. Normal readers hold a shared
 // lock while they list, open, and search shards, so they do not interleave with
-// a successful swap. A read-lock timeout can permit an unlocked read of the
-// shards that remain.
+// a successful swap. A reader waits for a publish until it ends or the user
+// cancels; it never reads the shards unlocked.
 // recoverIncompleteSwap uses .swapping to repair an interrupted or failed swap
 // on the next build.
 
 // shardFamily selects the shards for a swap or scan. A committed rebuild keeps
-// the uncommitted family. A folder or scoped fallback build replaces all shards.
+// the uncommitted family. A folder build replaces all shards.
 type shardFamily int
 
 const (
@@ -119,24 +119,6 @@ func scanFamily(dir string) (familyScan, error) {
 	return sc, nil
 }
 
-// familyHasShard checks for a shard without loading the size data needed for
-// manifest validation.
-func familyHasShard(dir string) (bool, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return false, nil
-		}
-		return false, fmt.Errorf("read shard dir %s: %w", dir, err)
-	}
-	for _, ent := range entries {
-		if !ent.IsDir() && strings.HasSuffix(ent.Name(), shardSuffix) {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
 // familyShardNames lists the .zoekt entries that a search can try to open. It
 // does not load size metadata.
 //
@@ -176,24 +158,15 @@ func scanFamilyOptional(dir string) (familyScan, error) {
 	return sc, nil
 }
 
-// hasShard reports whether any *.zoekt survives, in any family.
-func (s familyScan) hasShard() bool {
-	for _, m := range s.members {
-		if m.shard {
-			return true
-		}
-	}
-	return false
+// hasShard reports whether the family has a shard. Sidecars alone do not make
+// a family present.
+func (s familyScan) hasShard(fam shardFamily) bool {
+	return slices.ContainsFunc(s.members, func(m familyMember) bool { return m.shard && inFamily(fam, m) })
 }
 
 // hasMember reports whether the family has a shard or sidecar.
 func (s familyScan) hasMember(fam shardFamily) bool {
-	for _, m := range s.members {
-		if inFamily(fam, m) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(s.members, func(m familyMember) bool { return inFamily(fam, m) })
 }
 
 // parseShardName splits <repo>_v<format>.<NNNNN>.zoekt into its family prefix
@@ -231,17 +204,6 @@ func (s familyScan) paths(fam shardFamily) []string {
 		}
 	}
 	return out
-}
-
-// hasCommittedShard reports whether the committed family has a shard. Sidecars
-// alone do not make a family present.
-func (s familyScan) hasCommittedShard() bool {
-	for _, m := range s.members {
-		if m.shard && !m.uncommitted {
-			return true
-		}
-	}
-	return false
 }
 
 // contiguous reports whether each selected shard prefix is numbered 0..n-1
@@ -311,7 +273,7 @@ func familyShardFiles(dir string, fam shardFamily) ([]string, error) {
 // recorded. Presence alone accepts one survivor of a torn family, so the two
 // checks always travel together.
 func (s familyScan) familyComplete(indexDir string) bool {
-	return s.hasShard() && s.matchesManifest(indexDir)
+	return s.hasShard(familyAll) && s.matchesManifest(indexDir)
 }
 
 // familyManifestFile records the name and size of each published shard and
@@ -452,9 +414,6 @@ func newBuildDir(indexDir string) (string, error) {
 // discardBuildDir removes an abandoned build dir (validate-before-publish bailout
 // or error). Best-effort; the gc orphan sweep collects any leftover.
 func discardBuildDir(buildDir string) {
-	if buildDir == "" {
-		return
-	}
 	_ = os.RemoveAll(buildDir)
 }
 
@@ -464,8 +423,8 @@ func discardBuildDir(buildDir string) {
 // filesystem transaction; .swapping records an interrupted or failed swap for
 // repair on the next build. If GC removed the corpus during the build,
 // publication returns errCorpusEvicted and discards the build.
-func publishGeneration(ctx context.Context, cacheDir, indexDir, buildDir string, fam shardFamily, writeState func() error) error {
-	pub, err := acquirePublishLock(ctx, cacheDir)
+func (store corpusStore) publishGeneration(ctx context.Context, buildDir string, fam shardFamily, writeState func() error) error {
+	pub, err := acquirePublishLock(ctx, store.cacheDir)
 	if err != nil {
 		return err // includes errCorpusEvicted
 	}
@@ -473,38 +432,35 @@ func publishGeneration(ctx context.Context, cacheDir, indexDir, buildDir string,
 
 	// Corpus may have been evicted (renamed to trash) while the build ran
 	// outside the publish lock, even though its build-lock fd survived.
-	if _, err := os.Stat(indexDir); err != nil {
+	if _, err := os.Stat(store.indexDir); err != nil {
 		if os.IsNotExist(err) {
 			return errCorpusEvicted
 		}
 		return fmt.Errorf("stat index dir before swap: %w", err)
 	}
-	published, err := publishShardFamilyLocked(cacheDir, indexDir, buildDir, fam)
+	published, err := store.publishShardFamilyLocked(buildDir, fam)
 	if err != nil {
 		return err
 	}
 	// A wholesale publish replaces the complete family.
-	if err := writeFamilyManifest(indexDir, published); err != nil {
+	if err := writeFamilyManifest(store.indexDir, published); err != nil {
 		return err
 	}
-	if writeState != nil {
-		return writeState()
-	}
-	return nil
+	return writeState()
 }
 
 // publishShardFamilyLocked performs the delete-live-then-rename-new swap for one
 // family. The caller must hold the publish lock and confirm that the corpus
 // directory exists. The operations can fail after a partial replacement;
 // .swapping then makes the next build repair the family.
-func publishShardFamilyLocked(cacheDir, indexDir, buildDir string, fam shardFamily) ([]string, error) {
+func (store corpusStore) publishShardFamilyLocked(buildDir string, fam shardFamily) ([]string, error) {
 	// Mark the swap in progress so a crash mid-rename is repaired next build.
-	if err := writeCacheFile(cacheDir, swappingMarkerFile, fam.label()); err != nil {
+	if err := writeCacheFile(store.cacheDir, swappingMarkerFile, fam.label()); err != nil {
 		return nil, fmt.Errorf("write swapping marker: %w", err)
 	}
 	// Enumerate both sides before touching anything: a read failure must abort
 	// the swap, never delete the live family and rename a partial set in.
-	live, err := familyShardFiles(indexDir, fam)
+	live, err := familyShardFiles(store.indexDir, fam)
 	if err != nil {
 		return nil, err
 	}
@@ -524,7 +480,7 @@ func publishShardFamilyLocked(cacheDir, indexDir, buildDir string, fam shardFami
 	published := make([]string, 0, len(incoming))
 	for _, f := range incoming {
 		base := filepath.Base(f)
-		dst := filepath.Join(indexDir, base)
+		dst := filepath.Join(store.indexDir, base)
 		// A directory at this path is not in live, so the removal loop did not
 		// clear it. Remove any non-regular replacement before Rename.
 		if st, statErr := os.Lstat(dst); statErr == nil && !st.Mode().IsRegular() {
@@ -537,7 +493,7 @@ func publishShardFamilyLocked(cacheDir, indexDir, buildDir string, fam shardFami
 		}
 		published = append(published, base)
 	}
-	removeCacheFile(cacheDir, swappingMarkerFile)
+	removeCacheFile(store.cacheDir, swappingMarkerFile)
 	return published, nil
 }
 
@@ -545,22 +501,22 @@ func publishShardFamilyLocked(cacheDir, indexDir, buildDir string, fam shardFami
 // family may be torn (some shards deleted, some not renamed in), so clean that
 // family and clear state to force a full rebuild. It returns when no marker
 // exists.
-func recoverIncompleteSwap(cacheDir, indexDir string) {
-	marker := readCacheFile(cacheDir, swappingMarkerFile)
+func (store corpusStore) recoverIncompleteSwap() {
+	marker := readCacheFile(store.cacheDir, swappingMarkerFile)
 	if marker == "" {
 		return
 	}
-	torn, err := familyShardFiles(indexDir, shardFamilyFromLabel(marker))
+	torn, err := familyShardFiles(store.indexDir, shardFamilyFromLabel(marker))
 	if err != nil {
 		// Best-effort recovery: clearing state below still forces a rebuild.
-		slog.Warn("Cannot enumerate torn shard family", "index_dir", indexDir, "error", err)
+		slog.Warn("Cannot enumerate torn shard family", "index_dir", store.indexDir, "error", err)
 	}
 	for _, f := range torn {
 		_ = os.Remove(f)
 	}
-	removeFamilyManifest(indexDir)
-	deleteStateFiles(cacheDir)
-	removeCacheFile(cacheDir, swappingMarkerFile)
+	removeFamilyManifest(store.indexDir)
+	deleteStateFiles(store.cacheDir)
+	removeCacheFile(store.cacheDir, swappingMarkerFile)
 }
 
 // removeCacheFile deletes a metadata file from cacheDir (best-effort).

@@ -8,7 +8,6 @@ import (
 	"slices"
 	"sync/atomic"
 
-	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/query"
 )
 
@@ -29,22 +28,18 @@ var countedSkipReasons = []string{
 
 type nameOnlyCountKey struct{}
 
-// nameOnlyCount is the command's count of name-only files that could match.
-type nameOnlyCount struct {
-	files atomic.Int64
-}
-
-// withNameOnlyCount returns ctx with a new command count, and that count.
-func withNameOnlyCount(ctx context.Context) (context.Context, *nameOnlyCount) {
-	count := &nameOnlyCount{}
+// withNameOnlyCount returns ctx with a new command count of the name-only
+// files that could match, and that count.
+func withNameOnlyCount(ctx context.Context) (context.Context, *atomic.Int64) {
+	count := new(atomic.Int64)
 	return context.WithValue(ctx, nameOnlyCountKey{}, count), count
 }
 
 // addNameOnlyFiles adds a node's count once its read succeeded, so a read
 // that openNode repeats counts once.
 func addNameOnlyFiles(ctx context.Context, files int64) {
-	if count, ok := ctx.Value(nameOnlyCountKey{}).(*nameOnlyCount); ok {
-		count.files.Add(files)
+	if count, ok := ctx.Value(nameOnlyCountKey{}).(*atomic.Int64); ok {
+		count.Add(files)
 	}
 }
 
@@ -93,18 +88,16 @@ func nameOnlyFilter(q query.Q) (query.Q, bool) {
 }
 
 // countNameOnlyFiles counts the node's name-only files that pass the filter
-// subtree of q and that q does not already match, through search on the
-// node's shards under a read lock. Only the current copy of a dirty file
-// counts, and only a complete marker document. A failed count loses only the
-// notice.
+// subtree of q and that q does not already match, through read, which holds
+// the node's read lock. Only the current copy of a dirty file counts, and only
+// a complete marker document. A failed count loses only the notice.
 func countNameOnlyFiles(
 	ctx context.Context,
-	plan corpusPlan,
+	read *nodeRead,
 	q query.Q,
 	dirty dirtyFileSet,
-	search func(query.Q, searchConfig) ([]zoekt.FileMatch, error),
 ) int64 {
-	if _, ok := ctx.Value(nameOnlyCountKey{}).(*nameOnlyCount); !ok {
+	if _, ok := ctx.Value(nameOnlyCountKey{}).(*atomic.Int64); !ok {
 		return 0
 	}
 	filter, content := nameOnlyFilter(q)
@@ -115,9 +108,9 @@ func countNameOnlyFiles(
 	marker := &query.Substring{Pattern: zoektNotIndexedMarker, Content: true, CaseSensitive: true}
 	opts := searchOpts
 	opts.NumContextLines = 0
-	files, err := search(query.NewAnd(filter, marker, &query.Not{Child: q}), searchConfig{opts: &opts})
+	files, err := read.search(ctx, query.NewAnd(filter, marker, &query.Not{Child: q}), searchConfig{opts: &opts})
 	if err != nil {
-		slog.Debug("Name-only count failed", "root", plan.displayRoot, "error", err)
+		slog.Debug("Name-only count failed", "root", read.plan.displayRoot, "error", err)
 		return 0
 	}
 	var found int64

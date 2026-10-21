@@ -28,7 +28,8 @@ type semanticUnitEmbedding struct {
 }
 
 // semanticCoarseSet keeps only the graph vectors after each fine-vector batch
-// is on disk.
+// is on disk. The USearch stream builds each set from full 128-row batches and
+// at most one short last batch.
 type semanticCoarseSet struct {
 	batches [][]semanticCoarseVectors
 	rows    int
@@ -48,34 +49,6 @@ func (set semanticCoarseSet) At(row int) (*semanticCoarseVectors, bool) {
 		return nil, false
 	}
 	return &set.batches[batch][offset], true
-}
-
-func (set semanticCoarseSet) validate() error {
-	if set.rows < 0 {
-		return fmt.Errorf("semantic coarse count %d is invalid", set.rows)
-	}
-	if set.rows == 0 {
-		if len(set.batches) != 0 {
-			return fmt.Errorf("empty semantic coarse set has %d batches", len(set.batches))
-		}
-		return nil
-	}
-	wantBatches := (set.rows + semanticModelBatchRows - 1) / semanticModelBatchRows
-	if len(set.batches) != wantBatches {
-		return fmt.Errorf("semantic coarse set has %d batches, want %d", len(set.batches), wantBatches)
-	}
-	for batch := range set.batches {
-		wantRows := min(semanticModelBatchRows, set.rows-batch*semanticModelBatchRows)
-		if len(set.batches[batch]) != wantRows {
-			return fmt.Errorf(
-				"semantic coarse batch %d has %d rows, want %d",
-				batch,
-				len(set.batches[batch]),
-				wantRows,
-			)
-		}
-	}
-	return nil
 }
 
 type semanticCentroidWorkspace struct {

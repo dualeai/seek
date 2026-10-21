@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 )
@@ -15,7 +17,8 @@ const (
 
 // semanticQueryEmbedding holds the token vectors of one query model call: one
 // or more 128-token query windows, row after row, so a long query keeps every
-// token. The token vectors drive both USearch and LateOn MaxSim.
+// token (up to semanticModelBatchRows windows). The token vectors drive both
+// USearch and LateOn MaxSim.
 type semanticQueryEmbedding struct {
 	tokens     []float32
 	scoreMask  []bool
@@ -31,8 +34,9 @@ func validSemanticQuery(query *semanticQueryEmbedding) bool {
 
 // semanticModel is the command-wide LateOn model used by indexing, retrieval,
 // and final scoring. Implementations must permit concurrent method calls while
-// the command is active. The production implementation owns one shared
-// inference session. Zoekt and USearch stay outside this boundary.
+// the command is active. The production implementation shares one inference
+// session, plus a CPU session for the index build when the first one is sized
+// for one call. Zoekt and USearch stay outside this boundary.
 type semanticModel interface {
 	EmbedSemanticUnits(context.Context, []semanticUnit) ([]semanticUnitEmbedding, error)
 	PrepareSemanticQuery(context.Context, string) (*semanticQueryEmbedding, error)
@@ -46,10 +50,6 @@ type semanticModel interface {
 }
 
 type semanticModelFactory func(context.Context) (semanticModel, error)
-
-func semanticModelCallCPUs(ctx context.Context, model semanticModel) int {
-	return max(0, model.SemanticCallCPUs(ctx))
-}
 
 // semanticModelCallLimit keeps accelerator calls within the effective CPU
 // count even though those calls do not reserve CPU capacity in the shared
@@ -65,8 +65,8 @@ type semanticModelResult struct {
 	err   error
 }
 
-// semanticModelFuture owns one model session for one command. Index build,
-// semantic query, and final reranking borrow the same session.
+// semanticModelFuture owns the model of one command. Index build, semantic
+// query, and final reranking borrow the same model.
 type semanticModelFuture struct {
 	factory semanticModelFactory
 	once    sync.Once
@@ -79,6 +79,22 @@ type semanticModelFuture struct {
 	queryReady   chan struct{}
 	queryText    string
 	queryResult  semanticQueryResult
+
+	faultOnce sync.Once
+}
+
+// recordFault records the first provider fault of the command's model and
+// ignores later ones. The vector build, the scans, and the ranking of one bad
+// query fail on the same output, and each record counts toward a demotion of
+// the provider. An error that is not a provider fault records nothing, so a
+// later provider fault is still recorded. A search on an already-built index
+// is the common path, so without this record a wrong provider would drop
+// every search to text ranking and never record itself.
+func (future *semanticModelFuture) recordFault(err error) {
+	if future == nil || !errors.Is(err, errDegenerateSemanticVector) {
+		return
+	}
+	future.faultOnce.Do(func() { rejectLateOnAcceleratedProvider(err.Error()) })
 }
 
 func newSemanticModelFuture(factory semanticModelFactory) *semanticModelFuture {
@@ -191,8 +207,8 @@ type searchExecution struct {
 	// node builds and binds its generation before its read. A Git node with
 	// no commit has no base to build; the overlay adds its files.
 	vectors bool
-	// opened holds the command's node preparations (openNode). Nil prepares
-	// on every call.
+	// opened records the nodes that the command prepared (openNode), for the
+	// not-indexed check. Nil records nothing.
 	opened *openedNodes
 	// operands give the display paths that headers and file: filters read.
 	// With nil, file: filters read node-relative paths and headers show
@@ -212,4 +228,11 @@ func (e searchExecution) buildsVectors(head string) bool {
 // vector retrieval, committed or not, with or without a commit.
 func (e searchExecution) buildsOverlay(dirty bool) bool {
 	return e.vectors && e.policy.semanticEnabled() && e.model != nil && dirty
+}
+
+// semanticBuildFailed logs a failed vector build that keeps the text index,
+// and records a provider that produced degenerate output, once per command.
+func semanticBuildFailed(model *semanticModelFuture, message string, err error) {
+	slog.Debug(message, "provider", semanticProviderName(), "error", err)
+	model.recordFault(err)
 }

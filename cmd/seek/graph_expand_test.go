@@ -513,7 +513,7 @@ func TestGraphGitProcessCountCold(t *testing.T) {
 				return err
 			}
 			if vectors {
-				// One Git node at a time: the joined route serves one corpus.
+				// The vector run searches one Git node.
 				query = marker + " " + marker
 				search = func() error {
 					_, err := runHybridTestSearch(t, query, []string{f.path("folder/a")}, defaultSearchPolicy(),
@@ -563,7 +563,7 @@ func TestCapturedStateLastsUntilAChange(t *testing.T) {
 	writeFixtureFile(t, filepath.Join(repo, "b.txt"), "b\n")
 	f.graphFile("folder/g.txt", "g")
 	for range 2 {
-		state, err := gitNodeState(t.Context(), gitPlan, *gitPlan.gitPaths)
+		state, err := gitNodeState(t.Context(), gitPlan, gitPlan.behavior.(*gitNode).paths)
 		if err != nil || slices.Contains(state.Files, "b.txt") {
 			t.Fatalf("files=%q err=%v, want the capture", state.Files, err)
 		}
@@ -574,7 +574,7 @@ func TestCapturedStateLastsUntilAChange(t *testing.T) {
 	if !errors.Is(treeChanged(gitPlan), errGitIndexStateChanged) || !errors.Is(treeChanged(folderPlan), errGitIndexStateChanged) {
 		t.Fatal("treeChanged must report the change")
 	}
-	state, err := gitNodeState(t.Context(), gitPlan, *gitPlan.gitPaths)
+	state, err := gitNodeState(t.Context(), gitPlan, gitPlan.behavior.(*gitNode).paths)
 	if err != nil || !slices.Contains(state.Files, "b.txt") {
 		t.Fatalf("files=%q err=%v, want a fresh status", state.Files, err)
 	}

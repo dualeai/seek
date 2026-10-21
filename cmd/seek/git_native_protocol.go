@@ -8,14 +8,15 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"slices"
 	"strings"
 
 	"github.com/sourcegraph/zoekt/index"
 )
 
-// This command protocol is the only reader for committed Git data. Normal
-// full, committed delta, and scoped full indexing all use it with captured
-// full object IDs. There is no go-git or zoekt/gitindex fallback. Git reads
+// This command protocol is the only reader for committed Git data. The full
+// and the delta committed builds both use it with captured full object IDs.
+// There is no go-git or zoekt/gitindex fallback. Git reads
 // the objects; index.Builder writes the resulting documents to staging.
 //
 // Full scans use ls-tree, then one buffered batch-command session. `info`
@@ -71,13 +72,14 @@ func (info gitBlobInfo) nameOnlyDocument() fileContent {
 	return fileContent{name: info.entry.path, skipReason: index.SkipReasonTooLarge}
 }
 
+// gitDiffEntry is one raw diff record. Rename detection is off, so the old and
+// the new side have the same path.
 type gitDiffEntry struct {
 	oldMode string
 	newMode string
 	oldOID  gitObjectID
 	newOID  gitObjectID
-	oldPath string
-	newPath string
+	path    string
 }
 
 func parseGitObjectID(raw []byte) (gitObjectID, error) {
@@ -96,30 +98,6 @@ func validGitObjectID(raw []byte) bool {
 	}
 	for _, c := range raw {
 		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return false
-		}
-	}
-	return true
-}
-
-func gitObjectIDEqualBytes(id gitObjectID, raw []byte) bool {
-	if len(id) != len(raw) {
-		return false
-	}
-	for i := range raw {
-		if id[i] != raw[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func gitBytesEqualString(raw []byte, value string) bool {
-	if len(raw) != len(value) {
-		return false
-	}
-	for i := range raw {
-		if raw[i] != value[i] {
 			return false
 		}
 	}
@@ -147,9 +125,8 @@ func parseGitDecimal(raw []byte) (int64, bool) {
 
 func (id gitObjectID) String() string { return string(id) }
 
-func requireNativeGitVersion(ctx context.Context, repoDir string) error {
-	cmd := newGitCommand(ctx, repoDir, "version")
-	out, err := gitOutput(ctx, cmd, "check Git version")
+func requireNativeGitVersion(ctx context.Context) error {
+	out, err := gitVersion(ctx)
 	if err != nil {
 		return err
 	}
@@ -166,10 +143,9 @@ func requireNativeGitVersion(ctx context.Context, repoDir string) error {
 // boundedGitStderr keeps both ends of Git stderr. Git often puts the cause at
 // the start and cleanup details at the end.
 type boundedGitStderr struct {
-	head      []byte
-	tail      []byte
-	total     int
-	truncated bool
+	head  []byte
+	tail  []byte
+	total int
 }
 
 func (b *boundedGitStderr) Write(p []byte) (int, error) {
@@ -187,12 +163,11 @@ func (b *boundedGitStderr) Write(p []byte) (int, error) {
 			b.tail = append(b.tail[:0], b.tail[len(b.tail)-half:]...)
 		}
 	}
-	b.truncated = b.total > gitStderrMax
 	return n, nil
 }
 
 func (b *boundedGitStderr) String() string {
-	if !b.truncated {
+	if b.total <= gitStderrMax {
 		return strings.TrimSpace(string(append(append([]byte(nil), b.head...), b.tail...)))
 	}
 	var out bytes.Buffer
@@ -218,12 +193,7 @@ func abortNativeGitChild(cmd *exec.Cmd, stdin io.Closer) {
 	if stdin != nil {
 		_ = stdin.Close()
 	}
-	if cmd == nil {
-		return
-	}
-	if cmd.Process != nil {
-		_ = cmd.Process.Kill()
-	}
+	_ = cmd.Process.Kill()
 	_ = cmd.Wait()
 }
 
@@ -253,37 +223,26 @@ func parseNativeGitTreeRecord(record []byte) (gitTreeEntry, error) {
 	}
 	header := record[:tab]
 	path := record[tab+1:]
-	firstSpace := bytes.IndexByte(header, ' ')
-	if firstSpace <= 0 {
+	modeRaw, typeRaw, oidRaw, ok := splitGitHeader(header)
+	if !ok {
 		return gitTreeEntry{}, fmt.Errorf("malformed Git tree header %q", header)
 	}
-	secondRelative := bytes.IndexByte(header[firstSpace+1:], ' ')
-	if secondRelative <= 0 {
-		return gitTreeEntry{}, fmt.Errorf("malformed Git tree header %q", header)
-	}
-	secondSpace := firstSpace + 1 + secondRelative
-	if secondSpace == len(header)-1 || bytes.IndexByte(header[secondSpace+1:], ' ') >= 0 {
-		return gitTreeEntry{}, fmt.Errorf("malformed Git tree header %q", header)
-	}
-	modeRaw := header[:firstSpace]
-	typeRaw := header[firstSpace+1 : secondSpace]
-	oidRaw := header[secondSpace+1:]
 	var mode string
 	wantType := "blob"
-	switch {
-	case gitBytesEqualString(modeRaw, "100644"):
+	switch string(modeRaw) {
+	case "100644":
 		mode = "100644"
-	case gitBytesEqualString(modeRaw, "100755"):
+	case "100755":
 		mode = "100755"
-	case gitBytesEqualString(modeRaw, "120000"):
+	case "120000":
 		mode = "120000"
-	case gitBytesEqualString(modeRaw, "160000"):
+	case "160000":
 		mode = "160000"
 		wantType = "commit"
 	default:
 		return gitTreeEntry{}, fmt.Errorf("unsupported Git tree mode %q", modeRaw)
 	}
-	if !gitBytesEqualString(typeRaw, wantType) {
+	if string(typeRaw) != wantType {
 		return gitTreeEntry{}, fmt.Errorf("git tree mode %s has type %q, want %q", modeRaw, typeRaw, wantType)
 	}
 	oid, err := parseGitObjectID(oidRaw)
@@ -413,32 +372,29 @@ func readNativeGitBatchHeader(reader *bufio.Reader) ([]byte, error) {
 	return header[:len(header)-1], nil
 }
 
+// splitGitHeader splits a Git header "a b c" into its three fields. It reports
+// false when a field is empty or the header does not have exactly two spaces.
+func splitGitHeader(header []byte) (a, b, c []byte, ok bool) {
+	a, rest, first := bytes.Cut(header, []byte{' '})
+	b, c, second := bytes.Cut(rest, []byte{' '})
+	return a, b, c, first && second && len(a) > 0 && len(b) > 0 && len(c) > 0 && bytes.IndexByte(c, ' ') < 0
+}
+
 func parseNativeGitBatchHeader(header []byte, want gitObjectID, wantSize *int64) (int64, error) {
-	if oid, ok := bytes.CutSuffix(header, []byte(" missing")); ok && gitObjectIDEqualBytes(want, oid) {
+	if oid, ok := bytes.CutSuffix(header, []byte(" missing")); ok && string(want) == string(oid) {
 		return 0, errGitBlobMissing
 	}
-	firstSpace := bytes.IndexByte(header, ' ')
-	if firstSpace <= 0 {
+	oidRaw, typeRaw, sizeRaw, ok := splitGitHeader(header)
+	if !ok {
 		return 0, fmt.Errorf("malformed Git cat-file reply %q", header)
 	}
-	secondRelative := bytes.IndexByte(header[firstSpace+1:], ' ')
-	if secondRelative <= 0 {
-		return 0, fmt.Errorf("malformed Git cat-file reply %q", header)
-	}
-	secondSpace := firstSpace + 1 + secondRelative
-	if secondSpace == len(header)-1 || bytes.IndexByte(header[secondSpace+1:], ' ') >= 0 {
-		return 0, fmt.Errorf("malformed Git cat-file reply %q", header)
-	}
-	oidRaw := header[:firstSpace]
-	typeRaw := header[firstSpace+1 : secondSpace]
-	sizeRaw := header[secondSpace+1:]
 	if !validGitObjectID(oidRaw) {
 		return 0, fmt.Errorf("git cat-file reply object is not a full lowercase object ID: %q", oidRaw)
 	}
-	if !gitObjectIDEqualBytes(want, oidRaw) {
+	if string(want) != string(oidRaw) {
 		return 0, fmt.Errorf("git cat-file returned object %s, want %s", oidRaw, want)
 	}
-	if !gitBytesEqualString(typeRaw, "blob") {
+	if string(typeRaw) != "blob" {
 		return 0, fmt.Errorf("git cat-file returned type %q for %s, want blob", typeRaw, want)
 	}
 	size, ok := parseGitDecimal(sizeRaw)
@@ -496,14 +452,7 @@ func readNativeGitBlobs(
 	if len(infos) == 0 {
 		return nil
 	}
-	allNameOnly := true
-	for _, info := range infos {
-		if !info.nameOnly() {
-			allNameOnly = false
-			break
-		}
-	}
-	if allNameOnly {
+	if !slices.ContainsFunc(infos, func(info gitBlobInfo) bool { return !info.nameOnly() }) {
 		for _, info := range infos {
 			if err := consume(info.nameOnlyDocument()); err != nil {
 				return err
@@ -570,14 +519,12 @@ func parseNativeGitDiffHeader(header, path []byte, oidLength int) (gitDiffEntry,
 	default:
 		return gitDiffEntry{}, fmt.Errorf("unsupported Git raw diff status %q", fields[4])
 	}
-	name := string(path)
 	return gitDiffEntry{
 		oldMode: oldMode,
 		newMode: newMode,
 		oldOID:  oldOID,
 		newOID:  newOID,
-		oldPath: name,
-		newPath: name,
+		path:    string(path),
 	}, nil
 }
 
@@ -604,8 +551,8 @@ func readNativeGitNULRecord(reader *bufio.Reader) ([]byte, bool, error) {
 }
 
 // readNativeGitDiff returns raw changes from baseOID to targetOID. Rename
-// detection is off, so a rename is one delete and one add. If maxEntries is
-// nonnegative, one extra entry stops Git and returns errNativeGitDeltaTooLarge.
+// detection is off, so a rename is one delete and one add. One entry more than
+// maxEntries stops Git and returns errNativeGitDeltaTooLarge.
 func readNativeGitDiff(
 	ctx context.Context,
 	repoDir string,
@@ -639,11 +586,7 @@ func readNativeGitDiff(
 		return nil, gitCommandError(ctx, "start git diff-tree", err, &stderr)
 	}
 	reader := bufio.NewReaderSize(stdout, 64*1024)
-	capacity := gitObjectBatchSize
-	if maxEntries >= 0 {
-		capacity = min(maxEntries, gitObjectBatchSize)
-	}
-	entries := make([]gitDiffEntry, 0, capacity)
+	entries := make([]gitDiffEntry, 0, min(maxEntries, gitObjectBatchSize))
 	for {
 		header, ok, err := readNativeGitNULRecord(reader)
 		if err != nil {
@@ -670,7 +613,7 @@ func readNativeGitDiff(
 			return nil, err
 		}
 		entries = append(entries, entry)
-		if maxEntries >= 0 && len(entries) > maxEntries {
+		if len(entries) > maxEntries {
 			abortNativeGitChild(cmd, nil)
 			return nil, errNativeGitDeltaTooLarge
 		}

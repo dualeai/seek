@@ -24,20 +24,14 @@ const gitEntryName = ".git"
 
 // folderCapture is what the graph expansion's walk of a folder node found. The
 // state and the files serve every preparation of the command until a route
-// sees the tree change; the skip set serves every walk of the node.
+// sees the tree change; the skip set serves every walk of the node. The graph
+// expansion warns about the unreadable folders of a kept node only.
 type folderCapture struct {
-	stateHash string
-	selected  []folderCandidate
-	stale     atomic.Bool
+	folderWalk
+	stale atomic.Bool
 	// skipDirs are the directories below the root that hold no content of
 	// this node: Git nodes, failed nodes, and bare repositories.
 	skipDirs map[string]struct{}
-	// dataless counts the cloud-only files, which are searchable by name only.
-	dataless int
-	// unreadable counts the folders that the walk could not read; the graph
-	// expansion warns for a kept node only.
-	unreadable      int
-	firstUnreadable string
 }
 
 // current returns the captured state and files while no route has seen a
@@ -56,43 +50,29 @@ func (c *folderCapture) invalidate() {
 	}
 }
 
-// unreadableFolderWarned holds the first unreadable folder of each warning
-// this command wrote, so a retry that walks the node again warns no more.
-var unreadableFolderWarned sync.Map
-
 // warnUnreadableFolders writes the one unreadable-folder warning of a kept
 // folder node.
-func warnUnreadableFolders(plan corpusPlan) {
+func warnUnreadableFolders(plan node) {
 	if plan.folder == nil || plan.folder.unreadable == 0 {
 		return
 	}
-	if _, warned := unreadableFolderWarned.LoadOrStore(plan.folder.firstUnreadable, struct{}{}); !warned {
-		slog.Warn("Some folders could not be read; their files are not searched",
-			"root", plan.root, "folders", plan.folder.unreadable, "first", plan.folder.firstUnreadable)
-	}
+	slog.Warn("Some folders could not be read; their files are not searched",
+		"root", plan.root, "folders", plan.folder.unreadable, "first", plan.folder.firstUnreadable)
 }
 
 // captureFolderNode walks a folder node once for the graph expansion. It
 // returns the capture and the Git roots below the node.
-func captureFolderNode(ctx context.Context, plan corpusPlan) (*folderCapture, []gitPaths, error) {
+func captureFolderNode(ctx context.Context, plan node) (*folderCapture, []gitPaths, error) {
 	found := &folderBoundaries{skipDirs: make(map[string]struct{})}
 	walk, err := walkFolderNode(ctx, plan, true, found)
 	if err != nil {
 		return nil, nil, err
 	}
-	capture := &folderCapture{
-		stateHash:       walk.stateHash,
-		selected:        walk.selected,
-		skipDirs:        found.skipDirs,
-		dataless:        walk.dataless,
-		unreadable:      walk.unreadable,
-		firstUnreadable: walk.firstUnreadable,
-	}
-	return capture, found.gitRoots, nil
+	return &folderCapture{folderWalk: walk, skipDirs: found.skipDirs}, found.gitRoots, nil
 }
 
 // folderSkipDirs returns the directories that the walk of plan does not enter.
-func folderSkipDirs(plan corpusPlan) map[string]struct{} {
+func folderSkipDirs(plan node) map[string]struct{} {
 	if plan.folder == nil {
 		return nil
 	}
@@ -101,14 +81,14 @@ func folderSkipDirs(plan corpusPlan) map[string]struct{} {
 
 // folderCorpusState walks the node and returns its state and its files,
 // sorted by name.
-func folderCorpusState(ctx context.Context, plan corpusPlan) (string, []folderCandidate, error) {
+func folderCorpusState(ctx context.Context, plan node) (string, []folderCandidate, error) {
 	walk, err := walkFolderNode(ctx, plan, true, nil)
 	return walk.stateHash, walk.selected, err
 }
 
 // folderCorpusFingerprint walks the node and returns its state and its file
 // count, with no file list.
-func folderCorpusFingerprint(ctx context.Context, plan corpusPlan) (string, int, error) {
+func folderCorpusFingerprint(ctx context.Context, plan node) (string, int, error) {
 	walk, err := walkFolderNode(ctx, plan, false, nil)
 	return walk.stateHash, walk.selectedCount, err
 }
@@ -121,7 +101,6 @@ type folderWalk struct {
 	selected        []folderCandidate
 	unreadable      int
 	firstUnreadable string
-	dataless        int
 }
 
 // dirIdentity is the file identity of a directory.
@@ -149,7 +128,7 @@ var fileIsDataless = func(_ string, st *unix.Stat_t) bool {
 // their relative paths, so worker timing never changes it. found is set only
 // for the graph expansion's walk, which records the boundaries; every later
 // walk skips the recorded directories.
-func walkFolderNode(ctx context.Context, plan corpusPlan, collect bool, found *folderBoundaries) (folderWalk, error) {
+func walkFolderNode(ctx context.Context, plan node, collect bool, found *folderBoundaries) (folderWalk, error) {
 	switch plan.rootType {
 	case rootTypeFile:
 		return walkFolderFileRoot(plan, collect)
@@ -181,7 +160,7 @@ func walkFolderNode(ctx context.Context, plan corpusPlan, collect bool, found *f
 }
 
 // walkFolderFileRoot captures a single-file node.
-func walkFolderFileRoot(plan corpusPlan, collect bool) (folderWalk, error) {
+func walkFolderFileRoot(plan node, collect bool) (folderWalk, error) {
 	info, err := os.Lstat(plan.root)
 	if err != nil {
 		return folderWalk{}, fmt.Errorf("read file root: %w", err)
@@ -218,7 +197,7 @@ type folderWalker struct {
 	visited map[dirIdentity]string
 	dirs    []folderDirResult
 
-	unreadable      atomic.Int64
+	unreadable      int
 	firstUnreadable string
 }
 
@@ -234,7 +213,6 @@ type folderDirResult struct {
 	identity   dirIdentity
 	digest     uint64
 	files      int
-	dataless   int
 	candidates []folderCandidate
 }
 
@@ -299,10 +277,7 @@ func (w *folderWalker) work() {
 func (w *folderWalker) claim(id dirIdentity, rel string) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	previous, seen := w.visited[id]
-	switch {
-	case !seen:
-	case previous == "" || strings.HasPrefix(rel, previous+"/") || comparePaths(rel, previous) >= 0:
+	if previous, seen := w.visited[id]; seen && comparePaths(rel, previous) >= 0 {
 		// A loop back to an ancestor, or a larger path to a directory
 		// already reached.
 		return false
@@ -366,24 +341,11 @@ func (w *folderWalker) visit(job folderDirJob) error {
 			}
 			continue
 		}
-		stat, ok := fstatatRegularFile(dirFD, name)
+		candidate, ok := fstatatRegularFile(dirFD, name)
 		if !ok {
 			continue
 		}
-		candidate := folderCandidate{
-			name:     rel,
-			path:     path,
-			mode:     stat.mode,
-			size:     stat.size,
-			mtime:    stat.mtime,
-			ctime:    stat.ctime,
-			dev:      stat.dev,
-			ino:      stat.ino,
-			dataless: stat.dataless,
-		}
-		if candidate.dataless {
-			result.dataless++
-		}
+		candidate.name, candidate.path = rel, path
 		appendFolderCandidateHash(h, candidate)
 		result.files++
 		if w.collect {
@@ -402,7 +364,8 @@ func (w *folderWalker) visit(job folderDirJob) error {
 // its own node.
 func (w *folderWalker) recordUnreadable(path string) {
 	w.mu.Lock()
-	if w.unreadable.Add(1) == 1 || path < w.firstUnreadable {
+	w.unreadable++
+	if w.unreadable == 1 || path < w.firstUnreadable {
 		w.firstUnreadable = path
 	}
 	w.mu.Unlock()
@@ -415,14 +378,14 @@ func (w *folderWalker) recordUnreadable(path string) {
 
 // result combines the directory digests in path order. A directory that lost
 // its identity to a smaller path is dropped with its files.
-func (w *folderWalker) result(plan corpusPlan) folderWalk {
+func (w *folderWalker) result(plan node) folderWalk {
 	dirs := slices.DeleteFunc(w.dirs, func(d folderDirResult) bool {
 		return w.visited[d.identity] != d.rel
 	})
 	slices.SortFunc(dirs, func(a, b folderDirResult) int { return strings.Compare(a.rel, b.rel) })
 	h := newFolderStateHasher(plan)
 	walk := folderWalk{
-		unreadable:      int(w.unreadable.Load()),
+		unreadable:      w.unreadable,
 		firstUnreadable: w.firstUnreadable,
 	}
 	var numBuf [20]byte
@@ -434,7 +397,6 @@ func (w *folderWalker) result(plan corpusPlan) folderWalk {
 		appendFolderFingerprintPart(h, dir.rel)
 		appendFolderFingerprintBytes(h, strconv.AppendUint(numBuf[:0], dir.digest, 10))
 		walk.selectedCount += dir.files
-		walk.dataless += dir.dataless
 		if w.collect {
 			walk.selected = append(walk.selected, dir.candidates...)
 		}
@@ -458,28 +420,18 @@ func openSortedDirectory(dir string) (*os.File, []os.DirEntry, error) {
 	return dirFile, entries, nil
 }
 
-// folderFileStat is the stat of one regular file that the walk keeps.
-type folderFileStat struct {
-	mode     os.FileMode
-	size     int64
-	mtime    int64
-	ctime    int64
-	dev      uint64
-	ino      uint64
-	dataless bool
-}
-
 // fstatatRegularFile stats name in the open directory dirFD, with no symlink
-// follow and no open of the file. It reports false for any other file type.
-func fstatatRegularFile(dirFD int, name string) (folderFileStat, bool) {
+// follow and no open of the file. It returns a candidate with the stat fields
+// set, and reports false for any other file type.
+func fstatatRegularFile(dirFD int, name string) (folderCandidate, bool) {
 	var st unix.Stat_t
 	if err := unix.Fstatat(dirFD, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return folderFileStat{}, false
+		return folderCandidate{}, false
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		return folderFileStat{}, false
+		return folderCandidate{}, false
 	}
-	return folderFileStat{
+	return folderCandidate{
 		mode:     regularFileMode(uint32(st.Mode)),
 		size:     st.Size,
 		mtime:    st.Mtim.Nano(),

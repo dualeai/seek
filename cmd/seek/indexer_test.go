@@ -236,7 +236,7 @@ func TestExtractV2Path(t *testing.T) {
 	}
 }
 
-func TestIndexParallelism_Bounds(t *testing.T) {
+func TestIndexParallelism_IsGOMAXPROCS(t *testing.T) {
 	// Set the Go CPU limit to a known value: the index uses all of it.
 	previous := runtime.GOMAXPROCS(3)
 	t.Cleanup(func() { runtime.GOMAXPROCS(previous) })
@@ -318,14 +318,14 @@ func TestStateFile_OverwriteExisting(t *testing.T) {
 	}
 }
 
-// --- collectStreamFilesForTest tests ---
+// --- streamDirtyFiles tests (through collectStreamFilesForTest) ---
 
-func TestStreamFiles_RegularFiles(t *testing.T) {
+func TestStreamDirtyFiles_RegularFiles(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "a.go"), []byte("package a"), 0o644)
 	_ = os.WriteFile(filepath.Join(dir, "b.go"), []byte("package b"), 0o644)
 
-	results := collectStreamFilesForTest(t.Context(), dir, []string{"a.go", "b.go"}, 2)
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"a.go", "b.go"}, 2)
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(results))
 	}
@@ -340,28 +340,28 @@ func TestStreamFiles_RegularFiles(t *testing.T) {
 	}
 }
 
-func TestStreamFiles_EmptyList(t *testing.T) {
+func TestStreamDirtyFiles_EmptyList(t *testing.T) {
 	dir := t.TempDir()
-	results := collectStreamFilesForTest(t.Context(), dir, nil, 2)
+	results := collectStreamFilesForTest(t, t.Context(), dir, nil, 2)
 	if len(results) != 0 {
 		t.Errorf("expected 0 results, got %d", len(results))
 	}
 }
 
-func TestStreamFiles_NonexistentFile(t *testing.T) {
+func TestStreamDirtyFiles_NonexistentFile(t *testing.T) {
 	dir := t.TempDir()
-	results := collectStreamFilesForTest(t.Context(), dir, []string{"does_not_exist.go"}, 1)
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"does_not_exist.go"}, 1)
 	if len(results) != 0 {
 		t.Errorf("expected 0 results for nonexistent file, got %d", len(results))
 	}
 }
 
-func TestStreamFiles_SkipsDirectories(t *testing.T) {
+func TestStreamDirtyFiles_SkipsDirectories(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.Mkdir(filepath.Join(dir, "subdir"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir, "real.go"), []byte("package real"), 0o644)
 
-	results := collectStreamFilesForTest(t.Context(), dir, []string{"subdir", "real.go"}, 2)
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"subdir", "real.go"}, 2)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result (directory skipped), got %d", len(results))
 	}
@@ -370,13 +370,13 @@ func TestStreamFiles_SkipsDirectories(t *testing.T) {
 	}
 }
 
-func TestStreamFiles_SkipsSymlinks(t *testing.T) {
+func TestStreamDirtyFiles_SkipsSymlinks(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target.go")
 	_ = os.WriteFile(target, []byte("package target"), 0o644)
 	_ = os.Symlink(target, filepath.Join(dir, "link.go"))
 
-	results := collectStreamFilesForTest(t.Context(), dir, []string{"link.go", "target.go"}, 2)
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"link.go", "target.go"}, 2)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result (symlink skipped), got %d", len(results))
 	}
@@ -385,12 +385,12 @@ func TestStreamFiles_SkipsSymlinks(t *testing.T) {
 	}
 }
 
-func TestStreamFiles_NestedPath(t *testing.T) {
+func TestStreamDirtyFiles_NestedPath(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.MkdirAll(filepath.Join(dir, "src", "pkg"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir, "src", "pkg", "main.go"), []byte("package main"), 0o644)
 
-	results := collectStreamFilesForTest(t.Context(), dir, []string{"src/pkg/main.go"}, 1)
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"src/pkg/main.go"}, 1)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -399,11 +399,11 @@ func TestStreamFiles_NestedPath(t *testing.T) {
 	}
 }
 
-func TestStreamFiles_EmptyFile(t *testing.T) {
+func TestStreamDirtyFiles_EmptyFile(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "empty.go"), []byte{}, 0o644)
 
-	results := collectStreamFilesForTest(t.Context(), dir, []string{"empty.go"}, 1)
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"empty.go"}, 1)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -412,11 +412,11 @@ func TestStreamFiles_EmptyFile(t *testing.T) {
 	}
 }
 
-func TestStreamFiles_MixedExistingAndMissing(t *testing.T) {
+func TestStreamDirtyFiles_MixedExistingAndMissing(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "exists.go"), []byte("yes"), 0o644)
 
-	results := collectStreamFilesForTest(t.Context(), dir, []string{"exists.go", "gone.go", "also_gone.go"}, 2)
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"exists.go", "gone.go", "also_gone.go"}, 2)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -425,12 +425,12 @@ func TestStreamFiles_MixedExistingAndMissing(t *testing.T) {
 	}
 }
 
-func TestStreamFiles_PreservesRelativeName(t *testing.T) {
+func TestStreamDirtyFiles_PreservesRelativeName(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.MkdirAll(filepath.Join(dir, "a", "b"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir, "a", "b", "c.go"), []byte("x"), 0o644)
 
-	results := collectStreamFilesForTest(t.Context(), dir, []string{"a/b/c.go"}, 1)
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"a/b/c.go"}, 1)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -440,12 +440,12 @@ func TestStreamFiles_PreservesRelativeName(t *testing.T) {
 	}
 }
 
-func TestStreamFiles_SpacesInPath(t *testing.T) {
+func TestStreamDirtyFiles_SpacesInPath(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.MkdirAll(filepath.Join(dir, "my dir"), 0o755)
 	_ = os.WriteFile(filepath.Join(dir, "my dir", "my file.go"), []byte("hello"), 0o644)
 
-	results := collectStreamFilesForTest(t.Context(), dir, []string{"my dir/my file.go"}, 1)
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"my dir/my file.go"}, 1)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -454,7 +454,7 @@ func TestStreamFiles_SpacesInPath(t *testing.T) {
 	}
 }
 
-func TestStreamFiles_Parallelism1(t *testing.T) {
+func TestStreamDirtyFiles_Parallelism1(t *testing.T) {
 	dir := t.TempDir()
 	for i := 0; i < 10; i++ {
 		_ = os.WriteFile(filepath.Join(dir, filepath.Base(t.Name())+string(rune('a'+i))+".go"), []byte("x"), 0o644)
@@ -465,7 +465,7 @@ func TestStreamFiles_Parallelism1(t *testing.T) {
 		files[i] = filepath.Base(t.Name()) + string(rune('a'+i)) + ".go"
 	}
 
-	results := collectStreamFilesForTest(t.Context(), dir, files, 1)
+	results := collectStreamFilesForTest(t, t.Context(), dir, files, 1)
 	if len(results) != 10 {
 		t.Errorf("expected 10 results with parallelism=1, got %d", len(results))
 	}
@@ -760,7 +760,7 @@ func TestValidateCommittedBuildHead_CommandStartFailurePropagates(t *testing.T) 
 
 // --- large file skip tests ---
 
-func TestStreamFiles_LargeFileNameOnly(t *testing.T) {
+func TestStreamDirtyFiles_LargeFileNameOnly(t *testing.T) {
 	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	dir := t.TempDir()
 	// Create a file just over the limit
@@ -768,7 +768,7 @@ func TestStreamFiles_LargeFileNameOnly(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(dir, "large.go"), large, 0o644)
 	_ = os.WriteFile(filepath.Join(dir, "small.go"), []byte("package small"), 0o644)
 
-	results := collectStreamFilesForTest(t.Context(), dir, []string{"large.go", "small.go"}, 2)
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"large.go", "small.go"}, 2)
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results (large file by name only), got %d", len(results))
 	}
@@ -785,26 +785,26 @@ func TestStreamFiles_LargeFileNameOnly(t *testing.T) {
 	t.Fatal("expected a name-only document for large.go")
 }
 
-func TestStreamFiles_ExactlyMaxSize(t *testing.T) {
+func TestStreamDirtyFiles_ExactlyMaxSize(t *testing.T) {
 	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	dir := t.TempDir()
 	// Exactly at the limit — should NOT be skipped (guard is >)
 	data := make([]byte, testDocumentContentLimit)
 	_ = os.WriteFile(filepath.Join(dir, "exact.go"), data, 0o644)
 
-	results := collectStreamFilesForTest(t.Context(), dir, []string{"exact.go"}, 1)
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"exact.go"}, 1)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result (exactly max size should be included), got %d", len(results))
 	}
 }
 
-func TestStreamFiles_JustOverMaxSize(t *testing.T) {
+func TestStreamDirtyFiles_JustOverMaxSize(t *testing.T) {
 	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	dir := t.TempDir()
 	data := make([]byte, testDocumentContentLimit+1)
 	_ = os.WriteFile(filepath.Join(dir, "over.go"), data, 0o644)
 
-	results := collectStreamFilesForTest(t.Context(), dir, []string{"over.go"}, 1)
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"over.go"}, 1)
 	if len(results) != 1 || results[0].skipReason != index.SkipReasonTooLarge || results[0].content != nil {
 		t.Errorf("expected one name-only TooLarge document just over max size, got %+v", results)
 	}
@@ -1032,9 +1032,9 @@ func TestShardsExist_MixedFiles(t *testing.T) {
 	}
 }
 
-// --- collectStreamFilesForTest concurrency and edge tests ---
+// --- streamDirtyFiles concurrency and edge tests ---
 
-func TestStreamFiles_HighParallelism(t *testing.T) {
+func TestStreamDirtyFiles_HighParallelism(t *testing.T) {
 	dir := t.TempDir()
 	const n = 100
 	files := make([]string, n)
@@ -1044,13 +1044,13 @@ func TestStreamFiles_HighParallelism(t *testing.T) {
 		_ = os.WriteFile(filepath.Join(dir, name), []byte(fmt.Sprintf("package f%d", i)), 0o644)
 	}
 
-	results := collectStreamFilesForTest(t.Context(), dir, files, 16)
+	results := collectStreamFilesForTest(t, t.Context(), dir, files, 16)
 	if len(results) != n {
 		t.Errorf("expected %d results with high parallelism, got %d", n, len(results))
 	}
 }
 
-func TestStreamFiles_PermissionDenied(t *testing.T) {
+func TestStreamDirtyFiles_PermissionDenied(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("test requires non-root user")
 	}
@@ -1062,7 +1062,7 @@ func TestStreamFiles_PermissionDenied(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(dir, "ok.go"), []byte("ok"), 0o644)
 
 	// The unreadable file stays searchable by name.
-	results := collectStreamFilesForTest(t.Context(), dir, []string{"secret.go", "ok.go"}, 2)
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"secret.go", "ok.go"}, 2)
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(results))
 	}
@@ -1082,14 +1082,14 @@ func TestStreamFiles_PermissionDenied(t *testing.T) {
 	}
 }
 
-func TestStreamFiles_BinaryContentNameOnly(t *testing.T) {
+func TestStreamDirtyFiles_BinaryContentNameOnly(t *testing.T) {
 	dir := t.TempDir()
 	// A NUL byte in the first bytes makes the file binary for Zoekt: the reader
 	// sends the name only and keeps no content.
 	binary := []byte{0x00, 0x01, 0xFF, 0xFE, 'h', 'e', 'l', 'l', 'o', 0x00}
 	_ = os.WriteFile(filepath.Join(dir, "bin.dat"), binary, 0o644)
 
-	results := collectStreamFilesForTest(t.Context(), dir, []string{"bin.dat"}, 1)
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"bin.dat"}, 1)
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -1098,14 +1098,14 @@ func TestStreamFiles_BinaryContentNameOnly(t *testing.T) {
 	}
 }
 
-func TestStreamFiles_DuplicateNames(t *testing.T) {
+func TestStreamDirtyFiles_DuplicateNames(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "dup.go"), []byte("content"), 0o644)
 
 	// Same file passed twice. The callers remove duplicates
 	// (TestParseGitStatusV2_Deduplication), so the reader can send the file
 	// once or twice; each copy must hold the full content.
-	results := collectStreamFilesForTest(t.Context(), dir, []string{"dup.go", "dup.go"}, 2)
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"dup.go", "dup.go"}, 2)
 	if len(results) == 0 || len(results) > 2 {
 		t.Fatalf("got %d results, want dup.go once or twice", len(results))
 	}
@@ -1119,8 +1119,9 @@ func TestStreamFiles_DuplicateNames(t *testing.T) {
 // ---------------------------------------------------------------------------
 // State caching scenarios — tests for post-indexing verification logic
 //
-// The decision matrix in runIndexingWithCache (post-indexing verification) determines
-// whether the state file is cached after indexing. These tests verify all branches.
+// The Git build (gitNode.buildLocked, which runIndexingWithCache runs) decides
+// whether it writes the state file after indexing. These tests verify all
+// branches.
 // ---------------------------------------------------------------------------
 
 // TestStateCaching_BothSucceed_StateStable verifies that successful committed
@@ -1589,7 +1590,7 @@ func TestStateCaching_WithUncommittedFiles_BothSucceed(t *testing.T) {
 	}
 
 	// Uncommitted content should be searchable
-	results, err := executeUnscopedShardSearchForTest(ctx, plan.indexDir, "uncommitted")
+	results, err := searchPlannedCorpusForTest(ctx, plan, "uncommitted")
 	if err != nil {
 		t.Fatalf("search failed: %v", err)
 	}
@@ -1628,7 +1629,7 @@ func TestStateCaching_NoUncommittedFiles(t *testing.T) {
 	}
 
 	// Verify search works
-	results, err := executeUnscopedShardSearchForTest(ctx, plan.indexDir, "clean_repo")
+	results, err := searchPlannedCorpusForTest(ctx, plan, "clean_repo")
 	if err != nil {
 		t.Fatalf("search failed: %v", err)
 	}
@@ -1668,10 +1669,10 @@ func TestStateCaching_DoubleCheck_SkipsRedundantIndex(t *testing.T) {
 		t.Fatalf("second indexing failed: %v", err)
 	}
 
-	if results, err := executeUnscopedShardSearchForTest(ctx, plan.indexDir, "double_check_rebuilt"); err != nil || len(results) != 0 {
+	if results, err := searchPlannedCorpusForTest(ctx, plan, "double_check_rebuilt"); err != nil || len(results) != 0 {
 		t.Fatalf("same-state call rebuilt the index: results=%d error=%v", len(results), err)
 	}
-	if results, err := executeUnscopedShardSearchForTest(ctx, plan.indexDir, "double_check_published"); err != nil || len(results) == 0 {
+	if results, err := searchPlannedCorpusForTest(ctx, plan, "double_check_published"); err != nil || len(results) == 0 {
 		t.Fatalf("same-state call lost the published index: results=%d error=%v", len(results), err)
 	}
 }
@@ -1697,7 +1698,7 @@ func TestStateCaching_StaleFallback_DoesNotWriteState(t *testing.T) {
 	// Delete the state file to force re-indexing attempt
 	deleteStateFiles(plan.cacheDir)
 
-	// Hold the BUILD lock to simulate a concurrent builder (the new single-flight
+	// Hold the BUILD lock to simulate a concurrent builder (the single-flight
 	// lock); with shards present, a second build must skip rather than block.
 	lockPath := filepath.Join(plan.cacheDir, buildLockFile)
 	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
@@ -2035,25 +2036,6 @@ func TestRepoStateFingerprint_EmptyFileName(t *testing.T) {
 	}
 }
 
-// TestRepoStateFingerprint_FileOrderMatters verifies that file order affects
-// the fingerprint (i.e., the fingerprint is order-dependent, which is fine
-// because git status output order is deterministic with -z).
-func TestRepoStateFingerprint_FileOrderMatters(t *testing.T) {
-	dir := t.TempDir()
-	_ = os.WriteFile(filepath.Join(dir, "a.go"), []byte("a"), 0o644)
-	_ = os.WriteFile(filepath.Join(dir, "b.go"), []byte("b"), 0o644)
-
-	stateAB := repoState{RawOutput: "raw", Files: []string{"a.go", "b.go"}}
-	stateBA := repoState{RawOutput: "raw", Files: []string{"b.go", "a.go"}}
-
-	fpAB := repoStateFingerprint(dir, stateAB)
-	fpBA := repoStateFingerprint(dir, stateBA)
-
-	if fpAB == fpBA {
-		t.Error("fingerprint should be order-dependent (different file orderings)")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // computeStateHash representative-input tests
 // ---------------------------------------------------------------------------
@@ -2172,9 +2154,9 @@ func TestIntegration_RapidEdits(t *testing.T) {
 	}
 }
 
-// --- streamFiles tests ---
+// --- streamDirtyFiles tests ---
 
-func TestStreamFiles_BasicFlow(t *testing.T) {
+func TestStreamDirtyFiles_BasicFlow(t *testing.T) {
 	dir := t.TempDir()
 	const numFiles = 5
 	files := make([]string, numFiles)
@@ -2186,55 +2168,40 @@ func TestStreamFiles_BasicFlow(t *testing.T) {
 		}
 	}
 
-	ch := streamFiles(t.Context(), dir, files, 4)
-	var got []string
-	for fc := range ch {
-		got = append(got, fc.name)
-	}
+	got := collectStreamFilesForTest(t, t.Context(), dir, files, 4)
 	if len(got) != numFiles {
 		t.Errorf("expected %d files, got %d", numFiles, len(got))
 	}
 }
 
-func TestStreamFiles_OutputChannelUnbuffered(t *testing.T) {
+func TestStreamDirtyFiles_OutputChannelUnbuffered(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package a\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	ch := streamFiles(t.Context(), dir, []string{"a.go"}, 4)
+	ch, check := streamDirtyFilesAsTextIndex(t, t.Context(), dir, []string{"a.go"}, 4)
 	if cap(ch) != 0 {
-		t.Fatalf("streamFiles output must be unbuffered, got cap=%d", cap(ch))
+		t.Fatalf("streamDirtyFiles output must be unbuffered, got cap=%d", cap(ch))
 	}
-	for range ch {
+	for fc := range ch {
+		readSemaphore.Release(fc.weight)
 	}
+	check()
 }
 
-func TestStreamFiles_EmptyFileList(t *testing.T) {
+func TestStreamDirtyFiles_EmptyFileList(t *testing.T) {
 	dir := t.TempDir()
 
-	// nil files
-	ch := streamFiles(t.Context(), dir, nil, 4)
-	count := 0
-	for range ch {
-		count++
+	if got := collectStreamFilesForTest(t, t.Context(), dir, nil, 4); len(got) != 0 {
+		t.Errorf("expected 0 items from nil file list, got %d", len(got))
 	}
-	if count != 0 {
-		t.Errorf("expected 0 items from nil file list, got %d", count)
-	}
-
-	// empty slice
-	ch = streamFiles(t.Context(), dir, []string{}, 4)
-	count = 0
-	for range ch {
-		count++
-	}
-	if count != 0 {
-		t.Errorf("expected 0 items from empty file list, got %d", count)
+	if got := collectStreamFilesForTest(t, t.Context(), dir, []string{}, 4); len(got) != 0 {
+		t.Errorf("expected 0 items from empty file list, got %d", len(got))
 	}
 }
 
-func TestStreamFiles_TooLargeByNameMissingFiltered(t *testing.T) {
+func TestStreamDirtyFiles_TooLargeByNameMissingFiltered(t *testing.T) {
 	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	dir := t.TempDir()
 	// A too-large file is sent by name only; a missing file is filtered.
@@ -2244,9 +2211,8 @@ func TestStreamFiles_TooLargeByNameMissingFiltered(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Also include a missing file
-	ch := streamFiles(t.Context(), dir, []string{name, "nonexistent.go"}, 4)
 	var names []string
-	for document := range ch {
+	for _, document := range collectStreamFilesForTest(t, t.Context(), dir, []string{name, "nonexistent.go"}, 4) {
 		if document.content != nil {
 			t.Errorf("%s has %d content bytes, want none", document.name, len(document.content))
 		}
@@ -2257,7 +2223,7 @@ func TestStreamFiles_TooLargeByNameMissingFiltered(t *testing.T) {
 	}
 }
 
-func TestStreamFiles_ParallelismOne(t *testing.T) {
+func TestStreamDirtyFiles_ParallelismOne(t *testing.T) {
 	dir := t.TempDir()
 	const numFiles = 10
 	files := make([]string, numFiles)
@@ -2269,17 +2235,13 @@ func TestStreamFiles_ParallelismOne(t *testing.T) {
 		}
 	}
 
-	ch := streamFiles(t.Context(), dir, files, 1)
-	var got []string
-	for fc := range ch {
-		got = append(got, fc.name)
-	}
+	got := collectStreamFilesForTest(t, t.Context(), dir, files, 1)
 	if len(got) != numFiles {
 		t.Errorf("expected %d files with parallelism=1, got %d", numFiles, len(got))
 	}
 }
 
-func TestStreamFiles_SingleFileExactlyMaxSize(t *testing.T) {
+func TestStreamDirtyFiles_SingleFileExactlyMaxSize(t *testing.T) {
 	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	dir := t.TempDir()
 	// File exactly at testDocumentContentLimit — should be included
@@ -2291,9 +2253,8 @@ func TestStreamFiles_SingleFileExactlyMaxSize(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ch := streamFiles(t.Context(), dir, []string{"exact.dat"}, 4)
 	count := 0
-	for fc := range ch {
+	for _, fc := range collectStreamFilesForTest(t, t.Context(), dir, []string{"exact.dat"}, 4) {
 		count++
 		if len(fc.content) != testDocumentContentLimit {
 			t.Errorf("expected content of size %d, got %d", testDocumentContentLimit, len(fc.content))
@@ -2304,7 +2265,7 @@ func TestStreamFiles_SingleFileExactlyMaxSize(t *testing.T) {
 	}
 }
 
-func TestStreamFiles_MixedValidAndInvalid(t *testing.T) {
+func TestStreamDirtyFiles_MixedValidAndInvalid(t *testing.T) {
 	dir := t.TempDir()
 
 	// Regular file
@@ -2320,9 +2281,8 @@ func TestStreamFiles_MixedValidAndInvalid(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ch := streamFiles(t.Context(), dir, []string{"regular.go", "link.go", "subdir", "missing.go"}, 4)
 	var got []string
-	for fc := range ch {
+	for _, fc := range collectStreamFilesForTest(t, t.Context(), dir, []string{"regular.go", "link.go", "subdir", "missing.go"}, 4) {
 		got = append(got, fc.name)
 	}
 	// Only regular.go should arrive
@@ -2331,7 +2291,7 @@ func TestStreamFiles_MixedValidAndInvalid(t *testing.T) {
 	}
 }
 
-func TestStreamFiles_HighParallelismFewFiles(t *testing.T) {
+func TestStreamDirtyFiles_HighParallelismFewFiles(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("a"), 0o644); err != nil {
 		t.Fatal(err)
@@ -2340,13 +2300,8 @@ func TestStreamFiles_HighParallelismFewFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ch := streamFiles(t.Context(), dir, []string{"a.go", "b.go"}, 16)
-	count := 0
-	for range ch {
-		count++
-	}
-	if count != 2 {
-		t.Errorf("expected 2 files with high parallelism, got %d", count)
+	if got := collectStreamFilesForTest(t, t.Context(), dir, []string{"a.go", "b.go"}, 16); len(got) != 2 {
+		t.Errorf("expected 2 files with high parallelism, got %d", len(got))
 	}
 }
 
@@ -2391,17 +2346,19 @@ func TestStreamingMemoryBounded(t *testing.T) {
 	}
 
 	tracker := newPeakHeapTracker()
-	for fc := range streamFiles(t.Context(), dir, files, parallelism) {
+	documents, check := streamDirtyFilesAsTextIndex(t, t.Context(), dir, files, parallelism)
+	for fc := range documents {
 		// Consumer owns the readSemaphore Release per fileContent.
 		// In production this happens in indexDocuments after Finish;
 		// here the test just discards, so release immediately.
 		readSemaphore.Release(fc.weight)
 	}
 	heapDelta := tracker.stop()
+	check()
 
 	// Streaming must use at least 33% less memory than the total input.
-	// The old buffered approach would hold all content at once; streaming
-	// should be well under that thanks to backpressure.
+	// A buffered reader would hold all content at once; backpressure keeps
+	// streaming well under that.
 	totalContent := int64(numFiles * fileSize)
 	budget := totalContent * 2 / 3
 	t.Logf("total content: %d MB, peak heap delta: %d MB, budget: %d MB",
@@ -2431,10 +2388,13 @@ func TestStreamingMemoryDoesNotScaleWithInput(t *testing.T) {
 			}
 		}
 		tracker := newPeakHeapTracker()
-		for fc := range streamFiles(t.Context(), dir, files, parallelism) {
+		documents, check := streamDirtyFilesAsTextIndex(t, t.Context(), dir, files, parallelism)
+		for fc := range documents {
 			readSemaphore.Release(fc.weight)
 		}
-		return tracker.stop()
+		peak := tracker.stop()
+		check()
+		return peak
 	}
 
 	const smallCount = 10
@@ -2447,9 +2407,10 @@ func TestStreamingMemoryDoesNotScaleWithInput(t *testing.T) {
 
 	// 5x more input should NOT cause 5x more heap; peak usage should remain
 	// bounded by streaming backpressure rather than total corpus size.
-	// Two conditions (whichever is stricter):
-	//   - scaling: large must stay under 3× small
-	//   - absolute: large must use at least 33% less than total input
+	// The limit is the larger of two bounds, so the test fails only when
+	// large is above both:
+	//   - scaling: 3× small
+	//   - absolute: two thirds of the total input
 	largeTotalContent := int64(largeCount * fileSize)
 	floor := largeTotalContent * 2 / 3
 	limit := max(small*3, floor)
@@ -2483,7 +2444,8 @@ func TestIndexDocuments_WritesSearchableDocuments(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	results, err := executeUnscopedShardSearchForTest(context.Background(), indexDir, "uncommitted_index_marker")
+	plan := node{cacheDir: t.TempDir(), indexDir: indexDir}
+	results, err := searchPlannedCorpusForTest(context.Background(), plan, "uncommitted_index_marker")
 	if err != nil {
 		t.Fatalf("search failed: %v", err)
 	}
@@ -2494,15 +2456,52 @@ func TestIndexDocuments_WritesSearchableDocuments(t *testing.T) {
 
 // --- helpers ---
 
-// collectStreamFilesForTest collects all streamed file contents into a slice.
-// Test-only helper — production code uses streamFiles directly. Releases
-// readSemaphore weight for collected docs so tests don't leak budget.
-func collectStreamFilesForTest(ctx context.Context, repoDir string, files []string, parallelism int) []fileContent {
+// streamDirtyFilesAsTextIndex starts streamDirtyFiles with the failure rule
+// that the text index build gives it (buildUncommittedStage): a file with a
+// read error that may pass is kept by name, and EMFILE or ENFILE stops the
+// read. The caller must drain the channel or cancel ctx, and then call check.
+// check fails the test when the read stopped on an error or kept a file by
+// name after one.
+func streamDirtyFilesAsTextIndex(
+	tb testing.TB,
+	ctx context.Context,
+	repoDir string,
+	files []string,
+	parallelism int,
+) (documents <-chan fileContent, check func()) {
+	tb.Helper()
+	readCtx, cancel := context.WithCancelCause(ctx)
+	tb.Cleanup(func() { cancel(nil) })
+	failure := &dirtyFailure{keep: true, stop: cancel}
+	check = func() {
+		tb.Helper()
+		if readErr, ok := errors.AsType[*folderReadError](context.Cause(readCtx)); ok {
+			tb.Errorf("the read stopped on an error: %v", readErr)
+		}
+		if err := failure.noted(); err != nil {
+			tb.Errorf("the read kept files by name after an error: %v", err)
+		}
+	}
+	return streamDirtyFiles(readCtx, repoDir, files, parallelism, failure), check
+}
+
+// collectStreamFilesForTest reads files with streamDirtyFilesAsTextIndex,
+// collects every document, and releases the readSemaphore weight of each.
+func collectStreamFilesForTest(
+	tb testing.TB,
+	ctx context.Context,
+	repoDir string,
+	files []string,
+	parallelism int,
+) []fileContent {
+	tb.Helper()
+	documents, check := streamDirtyFilesAsTextIndex(tb, ctx, repoDir, files, parallelism)
 	var results []fileContent
-	for fc := range streamFiles(ctx, repoDir, files, parallelism) {
+	for fc := range documents {
 		results = append(results, fc)
 	}
 	releaseFileContentWeights(results)
+	check()
 	return results
 }
 
@@ -2583,4 +2582,36 @@ func getInode(t *testing.T, path string) uint64 {
 		t.Fatalf("fi.Sys() is not *syscall.Stat_t")
 	}
 	return stat.Ino
+}
+
+// TestWriteSharedCacheFileConcurrentWriters writes one record from 800
+// goroutines (16 values, 50 writers each), as processes with a shared lock
+// do: every write succeeds, the record is one writer's whole value, and no
+// temp file stays.
+func TestWriteSharedCacheFileConcurrentWriters(t *testing.T) {
+	dir := t.TempDir()
+	values := make(map[string]bool, 16)
+	var wait sync.WaitGroup
+	errs := make(chan error, 16*50)
+	for index := range 16 {
+		value := strings.Repeat(fmt.Sprint(index%10), 1+index*97)
+		values[value] = true
+		for range 50 {
+			wait.Go(func() { errs <- writeSharedCacheFile(dir, bm25StatsFile, value) })
+		}
+	}
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("a concurrent write failed: %v", err)
+		}
+	}
+	got, err := os.ReadFile(filepath.Join(dir, bm25StatsFile))
+	if err != nil || !values[string(got)] {
+		t.Fatalf("record is not one whole value: %d bytes, err %v", len(got), err)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, bm25StatsFile+sharedTmpInfix+"*")); len(left) != 0 {
+		t.Fatalf("temp files left: %v", left)
+	}
 }

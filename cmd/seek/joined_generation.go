@@ -60,14 +60,9 @@ func joinedKey(source string) string {
 func runJoinedIndexBuilds(lexical, semantic func()) {
 	var builds sync.WaitGroup
 	for _, build := range []func(){lexical, semantic} {
-		if build == nil {
-			continue
+		if build != nil {
+			builds.Go(build)
 		}
-		builds.Add(1)
-		go func() {
-			defer builds.Done()
-			build()
-		}()
 	}
 	builds.Wait()
 }
@@ -108,25 +103,14 @@ func readJoinedGeneration(cacheDir string) (joinedGenerationDescriptor, error) {
 	return descriptor, nil
 }
 
-func writeJoinedGeneration(
-	cacheDir string,
-	indexDir string,
-	state string,
-	source string,
-) error {
-	return writeJoinedGenerations(cacheDir, indexDir, state, source, "")
-}
-
 // writeJoinedGenerations writes the descriptor that binds state to the source
 // and overlay generations; an empty source or overlay binds none.
-func writeJoinedGenerations(
-	cacheDir string,
-	indexDir string,
+func (store corpusStore) writeJoinedGenerations(
 	state string,
 	source string,
 	overlay string,
 ) error {
-	familySHA, err := joinedFamilyDigest(indexDir)
+	familySHA, err := joinedFamilyDigest(store.indexDir)
 	if err != nil {
 		return err
 	}
@@ -145,38 +129,27 @@ func writeJoinedGenerations(
 	if len(content) > joinedGenerationMaxBytes {
 		return fmt.Errorf("joined generation descriptor is too large")
 	}
-	return writeCacheFile(cacheDir, joinedGenerationFile, string(content))
+	return writeCacheFile(store.cacheDir, joinedGenerationFile, string(content))
 }
 
-// joinedGenerationMatches performs the fast activation check for a joined
-// index. It checks the descriptor, the Zoekt family-manifest digest, and the
-// semantic manifest compatibility. It does not open the semantic row or vector
-// data or validate USearch shards. openJoinedSemanticGeneration checks row and
-// vector data before search and checks each graph before its first native use.
-func joinedGenerationMatches(
-	cacheDir string,
-	indexDir string,
-	state string,
-	source string,
-) bool {
-	return joinedGenerationsMatch(cacheDir, indexDir, state, source, "")
-}
-
-// joinedGenerationsMatch also checks the overlay that a dirty Git node binds;
-// an empty source or overlay means that the node binds none.
-func joinedGenerationsMatch(
-	cacheDir string,
-	indexDir string,
+// joinedGenerationsMatch performs the fast activation check for a joined
+// index: the base generation and the overlay that a dirty Git node binds. An
+// empty source or overlay means that the node binds none. It checks the
+// descriptor, the Zoekt family-manifest digest, and the semantic manifest
+// compatibility. It does not open the semantic row or vector data or validate
+// USearch shards. openJoinedSemanticGeneration checks row and vector data
+// before search and checks each graph before its first native use.
+func (store corpusStore) joinedGenerationsMatch(
 	state string,
 	source string,
 	overlay string,
 ) bool {
-	descriptor, err := readJoinedGeneration(cacheDir)
+	descriptor, err := readJoinedGeneration(store.cacheDir)
 	if err != nil || descriptor.State != state ||
 		descriptor.SemanticKey != joinedKey(source) || descriptor.OverlayKey != joinedKey(overlay) {
 		return false
 	}
-	familySHA, err := joinedFamilyDigest(indexDir)
+	familySHA, err := joinedFamilyDigest(store.indexDir)
 	if err != nil || familySHA != descriptor.FamilySHA {
 		return false
 	}
@@ -184,7 +157,7 @@ func joinedGenerationsMatch(
 		if bound == "" {
 			continue
 		}
-		if _, err := readSemanticManifest(semanticGenerationDir(indexDir, bound), bound); err != nil {
+		if _, err := readSemanticManifest(semanticGenerationDir(store.indexDir, bound), bound); err != nil {
 			return false
 		}
 	}
@@ -241,90 +214,50 @@ func validateSemanticGeneration(indexDir, source string) error {
 }
 
 // openJoinedSemanticGeneration opens the source generation after the caller
-// has matched its joined descriptor while holding the strict read lock. This
+// has matched its joined descriptor while it holds the node's read lock. This
 // function does not read or select the descriptor itself. It defers each graph
 // checksum until a native plan first needs that shard. Graph damage clears the
 // descriptor so the next run repairs the index.
-func openJoinedSemanticGeneration(
-	cacheDir string,
-	indexDir string,
+func (store corpusStore) openJoinedSemanticGeneration(
 	source string,
 ) (*semanticGeneration, error) {
-	generation, err := openSemanticGenerationForSearch(semanticGenerationDir(indexDir, source), source)
+	generation, err := openSemanticGenerationForSearch(semanticGenerationDir(store.indexDir, source), source)
 	if err != nil {
-		removeJoinedGeneration(cacheDir)
+		removeJoinedGeneration(store.cacheDir)
 		return nil, err
 	}
 	generation.onUSearchDamage = func() {
-		removeJoinedGeneration(cacheDir)
+		removeJoinedGeneration(store.cacheDir)
 	}
 	return generation, nil
-}
-
-// bindSemanticGeneration binds an already validated semantic generation to
-// the current Zoekt family. The caller must hold the publish lock.
-func bindSemanticGeneration(
-	cacheDir string,
-	indexDir string,
-	state string,
-	source string,
-) error {
-	return bindSemanticGenerations(cacheDir, indexDir, state, source, "")
 }
 
 // bindSemanticGenerations binds the base generation and the overlay (either
 // may be empty) and removes every other generation of the node: a superseded
 // overlay is unreachable once a new one binds. The caller must hold the
 // publish lock.
-func bindSemanticGenerations(
-	cacheDir string,
-	indexDir string,
+func (store corpusStore) bindSemanticGenerations(
 	state string,
 	source string,
 	overlay string,
 ) error {
-	if err := writeJoinedGenerations(cacheDir, indexDir, state, source, overlay); err != nil {
+	if err := store.writeJoinedGenerations(state, source, overlay); err != nil {
 		return fmt.Errorf("activate joined generation: %w", err)
 	}
 	keep := map[string]struct{}{}
 	var live []string
 	for _, bound := range []string{source, overlay} {
 		if bound != "" {
-			dir := semanticGenerationDir(indexDir, bound)
+			dir := semanticGenerationDir(store.indexDir, bound)
 			keep[filepath.Base(dir)] = struct{}{}
 			live = append(live, dir)
 		}
 	}
 	// The windows that only the replaced generations hold go to the unit
 	// store first, so a later build copies them and does not embed them again.
-	archiveSupersededUnits(indexDir, live...)
-	removeSemanticGenerationsExcept(indexDir, keep)
+	archiveSupersededUnits(store.indexDir, live...)
+	removeSemanticGenerationsExcept(store.indexDir, keep)
 	return nil
-}
-
-// semanticPublishTestHook runs before a semantic publish; an error stops the
-// publish as a kill there would. Only tests set it.
-var semanticPublishTestHook func() error
-
-// publishAndBindSemanticGeneration validates a new generation once, then
-// binds it to the current Zoekt family. The caller must hold the publish lock.
-func publishAndBindSemanticGeneration(
-	cacheDir string,
-	indexDir string,
-	state string,
-	source string,
-	stagingDir string,
-	replace bool,
-) error {
-	if semanticPublishTestHook != nil {
-		if err := semanticPublishTestHook(); err != nil {
-			return err
-		}
-	}
-	if err := publishSemanticGeneration(indexDir, stagingDir, source, replace); err != nil {
-		return err
-	}
-	return bindSemanticGeneration(cacheDir, indexDir, state, source)
 }
 
 func removeJoinedGeneration(cacheDir string) {

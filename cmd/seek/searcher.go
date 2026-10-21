@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -46,15 +47,15 @@ var searchOpts = zoekt.SearchOptions{
 }
 
 type searchConfig struct {
+	// opts holds the Zoekt options. It is never nil.
 	opts *zoekt.SearchOptions
-	// bm25 marks a strict search whose hits the command rescores with one
-	// global average file length.
+	// bm25 marks a lexical search (the strict query, or the relaxed rank of
+	// a description) whose hits the command rescores with one global average
+	// file length.
 	bm25              bool
 	afterOnly         bool
 	contextMatchLimit int
 	contextFileLimit  int
-	resultFileLimit   int
-	contextGitCorpus  bool
 	contextDirtyFiles dirtyFileSet
 }
 
@@ -111,7 +112,7 @@ func openShard(path string) (zoekt.Searcher, error) {
 // zoekt.Searcher instances. A one-shot CLI search does not need directory
 // watchers or ready-channel synchronization. Multiple shards load in parallel.
 func loadShards(indexDir string) ([]zoekt.Searcher, error) {
-	paths, err := searchableShardPaths(indexDir)
+	paths, err := familyShardNames(indexDir)
 	if err != nil {
 		return nil, err
 	}
@@ -120,104 +121,44 @@ func loadShards(indexDir string) ([]zoekt.Searcher, error) {
 		// repair, not a query failure to report.
 		return nil, fmt.Errorf("%w: no index shards in %s", errShardUnloadable, indexDir)
 	}
-	return loadShardPaths(indexDir, paths)
+	return loadShardPaths(paths)
 }
 
-func loadShardsOptional(indexDir string) ([]zoekt.Searcher, error) {
-	paths, err := searchableShardPaths(indexDir)
-	if err != nil {
-		return nil, err
-	}
-	if len(paths) == 0 {
-		return nil, nil
-	}
-	return loadShardPaths(indexDir, paths)
-}
-
-// searchableShardPaths lists the non-directory .zoekt entries that a search
-// will try to open.
-//
-// The caller holds the shared publish lock, so this scan cannot interleave
-// with a successful swap. This function needs names only and does not load
-// size metadata.
-func searchableShardPaths(indexDir string) ([]string, error) {
-	return familyShardNames(indexDir)
-}
-
-func loadShardPaths(indexDir string, paths []string) ([]zoekt.Searcher, error) {
-	// Single shard — skip goroutine overhead.
+// loadShardPaths opens the shards at paths, which must not be empty. On an
+// error it closes the shards that it opened.
+func loadShardPaths(paths []string) ([]zoekt.Searcher, error) {
+	// The shards load in parallel to overlap mmap and metadata parsing; one
+	// shard loads with no goroutine. The searchers keep the path order, which
+	// the BM25 rescore reads.
+	searchers := make([]zoekt.Searcher, len(paths))
+	errs := make([]error, len(paths))
 	if len(paths) == 1 {
-		s, err := openShard(paths[0])
+		searchers[0], errs[0] = openShard(paths[0])
+	} else {
+		var wg sync.WaitGroup
+		for index, path := range paths {
+			wg.Go(func() { searchers[index], errs[index] = openShard(path) })
+		}
+		wg.Wait()
+	}
+	for index, err := range errs {
 		if err != nil {
-			// Mark a single-shard load failure as index damage too.
-			return nil, fmt.Errorf("%w: load shard %s: %w", errShardUnloadable, paths[0], err)
+			closeShards(slices.DeleteFunc(searchers, func(s zoekt.Searcher) bool { return s == nil }))
+			return nil, fmt.Errorf("%w: load shard %s: %w", errShardUnloadable, paths[index], err)
 		}
-		return []zoekt.Searcher{s}, nil
-	}
-
-	type shardLoadResult struct {
-		searcher zoekt.Searcher
-		path     string
-		err      error
-	}
-
-	// Multiple shards — load in parallel to overlap mmap + metadata parsing.
-	// The searchers keep the path order, which the BM25 rescore reads.
-	results := make([]shardLoadResult, len(paths))
-	var wg sync.WaitGroup
-	for index, p := range paths {
-		wg.Add(1)
-		go func(index int, path string) {
-			defer wg.Done()
-			s, err := openShard(path)
-			if err != nil {
-				results[index] = shardLoadResult{path: path, err: err}
-				return
-			}
-			results[index] = shardLoadResult{searcher: s, path: path}
-		}(index, p)
-	}
-	wg.Wait()
-
-	searchers := make([]zoekt.Searcher, 0, len(paths))
-	var loadErr error
-	for _, result := range results {
-		if result.err != nil {
-			if loadErr == nil {
-				loadErr = fmt.Errorf("load shard %s: %w", result.path, result.err)
-			}
-			continue
-		}
-		searchers = append(searchers, result.searcher)
-	}
-	if loadErr != nil {
-		for _, s := range searchers {
-			s.Close()
-		}
-		return nil, fmt.Errorf("%w: %w", errShardUnloadable, loadErr)
-	}
-	if len(searchers) == 0 {
-		return nil, fmt.Errorf("%w: no loadable shards in %s", errShardUnloadable, indexDir)
 	}
 	return searchers, nil
 }
 
-// errShardUnloadable marks a shard that exists but cannot be opened: truncated,
-// unreadable, a directory, or a dangling symlink. The caller treats this as
-// index damage, invalidates the family manifest, and retries the search.
+// errShardUnloadable marks index damage: a shard that exists but cannot be
+// opened (truncated, unreadable, a directory, or a dangling symlink), or an
+// index with no shard. openNode removes the family manifest that the read saw
+// (removeDamagedFamilyManifest) and opens the node once more.
 //
-// This repair covers the committed family: dropping the manifest makes
-// needCommitted fire and that family be rebuilt. It does not cover the
-// uncommitted family, whose rebuild is driven by the working tree's own state
-// hash and shard contiguity, none of which notices a present, contiguous,
-// corrupt shard. Such an uncommitted shard can fail until the working tree
-// changes.
+// The repair covers both families: with no manifest, the committed family
+// rebuilds (gitBuildPlan.committed), and the uncommitted family takes no keep
+// and no delta (uncommittedDeltaPossible), so it rebuilds in full.
 var errShardUnloadable = errors.New("index damage")
-
-func parseSearchQueryForms(pattern string) (query.Q, query.Q, error) {
-	raw, strict, _, err := parseQueryHalves(pattern)
-	return raw, strict, err
-}
 
 // parseQueryHalves parses pattern and expands each bare word into a file-name
 // and a content atom, as Zoekt does. halves holds the file-name atoms that the
@@ -346,9 +287,13 @@ func plainQualifiedIdentifier(name string) bool {
 	return true
 }
 
-func executeParsedSearchScopedDirs(
+// searchShards runs userQ within scope on one load of shards. paths are in
+// the order of searchers; the BM25 rescore reads them. With no searcher it
+// returns errShardUnloadable: damage that the caller repairs.
+func searchShards(
 	ctx context.Context,
-	indexDirs []string,
+	searchers []zoekt.Searcher,
+	paths []string,
 	userQ query.Q,
 	scope query.Q,
 	config searchConfig,
@@ -362,44 +307,31 @@ func executeParsedSearchScopedDirs(
 		q = query.NewAnd(q, &query.Type{Type: query.TypeFileName, Child: scope})
 		q = query.Simplify(q)
 	}
-
-	var searchers []zoekt.Searcher
-	var shardPaths []string
-	for _, indexDir := range indexDirs {
-		paths, err := searchableShardPaths(indexDir)
-		var loaded []zoekt.Searcher
-		if err == nil && len(paths) > 0 {
-			loaded, err = loadShardPaths(indexDir, paths)
-		}
-		if err != nil {
-			for _, s := range searchers {
-				s.Close()
-			}
-			return nil, fmt.Errorf("load index: %w", err)
-		}
-		searchers = append(searchers, loaded...)
-		shardPaths = append(shardPaths, paths...)
-	}
 	if len(searchers) == 0 {
 		return nil, fmt.Errorf("%w: no loadable shards", errShardUnloadable)
 	}
-	parts, err := bm25ShardParts(ctx, searchers, shardPaths, q, &config)
+	parts, err := bm25ShardParts(ctx, searchers, paths, q, &config)
 	if err != nil {
-		for _, s := range searchers {
-			s.Close()
-		}
 		return nil, err
 	}
 	return searchLoadedShards(ctx, searchers, q, config, parts)
 }
 
-// bm25ShardParts prepares the rescore of a strict search: it records
+// closeShards closes the searchers of one load. The caller calls it after
+// every search of them returns: Close unmaps the shard.
+func closeShards(searchers []zoekt.Searcher) {
+	for _, s := range searchers {
+		s.Close()
+	}
+}
+
+// bm25ShardParts prepares the rescore of a bm25 search: it records
 // each shard's counts for the command's average, asks Zoekt for its score
 // debug line, and returns the function that rebuilds each hit's parts. Other
 // searches get nil.
 func bm25ShardParts(ctx context.Context, searchers []zoekt.Searcher, paths []string, q query.Q, config *searchConfig) (func(int, []zoekt.FileMatch), error) {
 	command, ok := ctx.Value(bm25CommandKey{}).(*bm25Command)
-	if !ok || !config.bm25 || config.opts == nil || !config.opts.UseBM25Scoring || len(paths) != len(searchers) {
+	if !ok || !config.bm25 || !config.opts.UseBM25Scoring || len(paths) != len(searchers) {
 		return nil, nil
 	}
 	if command.nodes == 1 && len(paths) == 1 {
@@ -407,17 +339,12 @@ func bm25ShardParts(ctx context.Context, searchers []zoekt.Searcher, paths []str
 		// Zoekt's scores are final.
 		return nil, nil
 	}
-	records := map[string]*shardStatsRecord{}
+	// The paths are one node's shards, in its index directory.
+	record := readShardStatsRecord(filepath.Dir(paths[0]))
 	shards := make([]shardLengthStats, len(paths))
 	var group errgroup.Group
 	group.SetLimit(runtime.GOMAXPROCS(0))
 	for index, path := range paths {
-		indexDir := filepath.Dir(path)
-		record, ok := records[indexDir]
-		if !ok {
-			record = readShardStatsRecord(indexDir)
-			records[indexDir] = record
-		}
 		group.Go(func() error {
 			stats, err := record.stats(ctx, path, searchers[index])
 			if err != nil {
@@ -437,21 +364,13 @@ func bm25ShardParts(ctx context.Context, searchers []zoekt.Searcher, paths []str
 		return nil, nil
 	}
 	// The counts replace those of an earlier search of the same index
-	// directories, such as a repaired attempt.
+	// directory, such as a repaired attempt.
 	command.set(paths, shards)
 	averages := make([]float64, len(paths))
 	for index, stats := range shards {
 		averages[index] = stats.average()
 	}
-	for indexDir, record := range records {
-		var live []string
-		for _, path := range paths {
-			if filepath.Dir(path) == indexDir {
-				live = append(live, path)
-			}
-		}
-		record.save(live)
-	}
+	record.save(paths)
 	opts := *config.opts
 	opts.DebugScore = true
 	config.opts = &opts
@@ -477,7 +396,7 @@ func bm25ShardParts(ctx context.Context, searchers []zoekt.Searcher, paths []str
 		if !final {
 			return
 		}
-		if score, ok := bm25Rescore(*file, global); ok {
+		if score, ok := bm25Rescore(file.Debug, global); ok {
 			file.Score = score
 		}
 	}
@@ -503,7 +422,9 @@ func bm25ShardParts(ctx context.Context, searchers []zoekt.Searcher, paths []str
 // Kubernetes, whose shards hold few hits each.
 const bm25FilesPerWorker = 4
 
-// searchLoadedShards closes each searcher after all search workers return.
+// searchLoadedShards searches the loaded shards and returns clones of the
+// hits. It returns only after all its search workers return, and it does not
+// close the searchers: one load can serve several searches.
 //
 // NOTE(zoekt): a query with a `query.Type` other than type:file panics inside
 // index.Searcher.Search (index/matchtree.go:1298, log.Panicf("type %T")).
@@ -516,78 +437,52 @@ func searchLoadedShards(
 	config searchConfig,
 	parts func(int, []zoekt.FileMatch),
 ) ([]zoekt.FileMatch, error) {
-	defer func() {
-		for _, s := range searchers {
-			s.Close()
-		}
-	}()
-
-	// Fast path: single shard avoids intermediate allFiles slice.
-	if len(searchers) == 1 {
-		result, err := searchers[0].Search(ctx, q, config.opts)
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
-		}
+	searchShard := func(i int) ([]zoekt.FileMatch, error) {
+		r, err := searchers[i].Search(ctx, q, config.opts)
 		if err != nil {
 			return nil, fmt.Errorf("search: %w", err)
 		}
+		// The parts read every match, before the display limits drop any.
 		if parts != nil {
-			parts(0, result.Files)
+			parts(i, r.Files)
 		}
-		roundScores(result.Files)
-		return cloneFileMatches(result.Files, config), nil
+		roundScores(r.Files)
+		return r.Files, nil
 	}
-
-	// Multiple shards: fan out across goroutines bounded by NumCPU.
-	// Sequential iteration cost grows linearly with shard count, which
-	// the windowed indexer's rotation can drive into the hundreds for
-	// multi-GiB corpora. Parallel dispatch turns the per-shard query
-	// cost from sum-of-shards into max-of-shards (up to GOMAXPROCS).
-	parallelism := runtime.GOMAXPROCS(0)
-	if parallelism < 1 {
-		parallelism = 1
+	// The shards fan out across GOMAXPROCS goroutines: the windowed
+	// indexer's rotation can drive the shard count into the hundreds for
+	// multi-GiB corpora, and parallel dispatch turns the query cost from the
+	// sum of the shards into their maximum. One shard needs no goroutine.
+	// Every shard search runs to its end, and the first failed shard in
+	// order gives the error.
+	results := make([][]zoekt.FileMatch, len(searchers))
+	errs := make([]error, len(searchers))
+	if len(searchers) == 1 {
+		results[0], errs[0] = searchShard(0)
+	} else {
+		var group errgroup.Group
+		group.SetLimit(runtime.GOMAXPROCS(0))
+		for i := range searchers {
+			group.Go(func() error {
+				results[i], errs[i] = searchShard(i)
+				return nil
+			})
+		}
+		_ = group.Wait()
 	}
-	if parallelism > len(searchers) {
-		parallelism = len(searchers)
-	}
-	type shardResult struct {
-		files []zoekt.FileMatch
-		err   error
-	}
-	results := make([]shardResult, len(searchers))
-	sem := make(chan struct{}, parallelism)
-	var wg sync.WaitGroup
-	for i, s := range searchers {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(i int, s zoekt.Searcher) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			r, err := s.Search(ctx, q, config.opts)
-			if err != nil {
-				results[i] = shardResult{err: err}
-				return
-			}
-			// The parts read every match, before the display limits drop any.
-			if parts != nil {
-				parts(i, r.Files)
-			}
-			roundScores(r.Files)
-			results[i] = shardResult{files: r.Files}
-		}(i, s)
-	}
-	wg.Wait()
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, ctxErr
 	}
-	var allFiles []zoekt.FileMatch
-	for _, r := range results {
-		if r.err != nil {
-			return nil, fmt.Errorf("search: %w", r.err)
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
 		}
-		allFiles = append(allFiles, r.files...)
 	}
-	return cloneFileMatches(allFiles, config), nil
+	files := results[0]
+	if len(results) > 1 {
+		files = slices.Concat(results...)
+	}
+	return cloneFileMatches(files, config), nil
 }
 
 // roundScores rounds each score once, after the parts read the exact value:
@@ -604,59 +499,35 @@ func cloneFileMatches(files []zoekt.FileMatch, config searchConfig) []zoekt.File
 		return nil
 	}
 	contextFiles := displayedContextFiles(files, config)
-	var resultFiles map[int]struct{}
-	if config.resultFileLimit > 0 {
-		if config.resultFileLimit == config.contextFileLimit {
-			resultFiles = contextFiles
-		} else {
-			resultFiles = selectedFileIndexes(files, config, config.resultFileLimit)
-		}
-	}
-	capacity := len(files)
-	if resultFiles != nil {
-		capacity = len(resultFiles)
-	}
-	out := make([]zoekt.FileMatch, 0, capacity)
+	out := make([]zoekt.FileMatch, len(files))
 	for i := range files {
-		if resultFiles != nil {
-			if _, keep := resultFiles[i]; !keep {
-				continue
-			}
-		}
 		_, keepContext := contextFiles[i]
-		out = append(out, cloneFileMatch(
+		out[i] = cloneFileMatch(
 			files[i],
 			config.contextMatchLimit,
 			config.afterOnly,
 			contextFiles == nil || keepContext,
-		))
+		)
 	}
 	return out
 }
 
-// displayedContextFiles returns the files from this corpus that can still be
-// shown after the global file limit. Deduplication and dirty-file suppression
-// are corpus-local, so a global top N file must be in its corpus's top N. A
-// nil map means that all context must be copied.
+// displayedContextFiles returns the indexes of the best contextFileLimit files
+// of this corpus after deduplication and dirty-file suppression: the files that
+// can still show after the global file limit. Both steps are corpus-local, so
+// a global top N file is in its corpus's top N. A nil map means that all
+// context must be copied.
 func displayedContextFiles(files []zoekt.FileMatch, config searchConfig) map[int]struct{} {
-	return selectedFileIndexes(files, config, config.contextFileLimit)
-}
-
-// selectedFileIndexes returns the best valid file indexes for one corpus after
-// deduplication and dirty-file suppression. A nil map means that all input
-// files remain selected.
-func selectedFileIndexes(
-	files []zoekt.FileMatch,
-	config searchConfig,
-	limit int,
-) map[int]struct{} {
+	limit := config.contextFileLimit
 	if limit <= 0 || len(files) <= limit {
 		return nil
 	}
 
 	byPath := make(map[string]dedupEntry, len(files))
 	for i, file := range files {
-		isUncommitted := config.contextGitCorpus && file.Repository == repoUncommitted
+		// Only a Git node has the uncommitted repository; a folder
+		// repository is "folder_" + its ID.
+		isUncommitted := file.Repository == repoUncommitted
 		chooseDedupEntry(byPath, file.FileName, i, isUncommitted)
 	}
 
@@ -714,12 +585,8 @@ func cloneFileMatch(
 		}
 	}
 
-	if len(in.ChunkMatches) > 0 {
-		out.ChunkMatches = make([]zoekt.ChunkMatch, len(in.ChunkMatches))
-		for i := range in.ChunkMatches {
-			out.ChunkMatches[i] = cloneChunkMatch(in.ChunkMatches[i])
-		}
-	}
+	// Seek never asks Zoekt for chunk matches (SearchOptions.ChunkMatches).
+	out.ChunkMatches = nil
 
 	return out
 }
@@ -767,26 +634,6 @@ func cloneLineFragmentMatch(in zoekt.LineFragmentMatch) zoekt.LineFragmentMatch 
 	if in.SymbolInfo != nil {
 		symbol := *in.SymbolInfo
 		out.SymbolInfo = &symbol
-	}
-	return out
-}
-
-func cloneChunkMatch(in zoekt.ChunkMatch) zoekt.ChunkMatch {
-	out := in
-	out.Content = cloneBytes(in.Content)
-	if len(in.Ranges) > 0 {
-		out.Ranges = make([]zoekt.Range, len(in.Ranges))
-		copy(out.Ranges, in.Ranges)
-	}
-	if len(in.SymbolInfo) > 0 {
-		out.SymbolInfo = make([]*zoekt.Symbol, len(in.SymbolInfo))
-		for i, symbol := range in.SymbolInfo {
-			if symbol == nil {
-				continue
-			}
-			copied := *symbol
-			out.SymbolInfo[i] = &copied
-		}
 	}
 	return out
 }

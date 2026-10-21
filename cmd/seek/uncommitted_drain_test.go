@@ -10,10 +10,10 @@ import (
 	"time"
 )
 
-// TestReadUncommittedCandidates_BoundedDrainOnOversize — readUncommitted
-// Candidates must return errDeltaPayloadExceedsWindow and Release
-// every pre-Acquired weight when the candidate set exceeds the window
-// threshold. It covers both guards:
+// TestReadUncommittedCandidates_BoundedDrainOnOversize checks that
+// readUncommittedCandidates returns errDeltaPayloadExceedsWindow and releases
+// every pre-acquired weight when the candidate set reaches the window. It
+// covers both guards:
 //   - pre-flight: no file exists, so only the lstat-sum short-circuit
 //     can return the error; it reads no file.
 //   - mid-drain: each candidate states 1 byte, so the pre-flight sum
@@ -100,22 +100,16 @@ func TestReadUncommittedCandidates_SmallPayloadFitsBudget(t *testing.T) {
 	for i := range payload {
 		payload[i] = byte('z')
 	}
-	candidates := make([]uncommittedCandidate, fileCount)
+	names := make([]string, fileCount)
 	for i := 0; i < fileCount; i++ {
-		name := fmt.Sprintf("tiny%02d.go", i)
-		path := filepath.Join(repoDir, name)
-		if err := os.WriteFile(path, payload, 0o644); err != nil {
+		names[i] = fmt.Sprintf("tiny%02d.go", i)
+		if err := os.WriteFile(filepath.Join(repoDir, names[i]), payload, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		info, _ := os.Lstat(path)
-		_, ino, mtime := fileInfoIdentity(info)
-		candidates[i] = uncommittedCandidate{
-			name:  name,
-			size:  fileSize,
-			mtime: mtime,
-			ino:   ino,
-		}
 	}
+	// The uncommitted build stats the dirty files with
+	// statUncommittedCandidates before it reads them.
+	candidates := statUncommittedCandidates(repoDir, names)
 
 	docs, _, err := readUncommittedCandidates(t.Context(), repoDir, candidates)
 	if err != nil {
@@ -124,8 +118,8 @@ func TestReadUncommittedCandidates_SmallPayloadFitsBudget(t *testing.T) {
 	if len(docs) != fileCount {
 		t.Fatalf("expected %d docs, got %d", fileCount, len(docs))
 	}
-	// Caller's responsibility (mirrors indexUncommitted flow) — release
-	// what we received so the post-test semaphore check passes.
+	// Release the weights as the caller does (tryUncommittedDelta passes
+	// them to indexDeltaDocuments), so the semaphore check below passes.
 	releaseFileContentWeights(docs)
 	if got := availableWeight(readSemaphore); got != testBudget {
 		t.Fatalf("semaphore leak: got=%d want=%d", got, testBudget)

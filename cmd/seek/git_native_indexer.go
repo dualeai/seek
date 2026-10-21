@@ -5,8 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"os/exec"
 	"strconv"
@@ -33,31 +33,14 @@ func captureGitSnapshot(ctx context.Context, repoDir, captured string) (gitSnaps
 		return gitSnapshot{}, false, fmt.Errorf("captured Git commit: %w", err)
 	}
 
-	cmd := newGitCommand(ctx, repoDir, "show", "-s", "--no-patch", "--format=%H%x00%cI", captured+"^{commit}")
-	stdout, err := cmd.StdoutPipe()
+	cmd := newGitCommand(ctx, repoDir, "show", "--no-patch", "--format=%H%x00%cI", captured+"^{commit}")
+	raw, err := gitOutput(ctx, cmd, "git show")
 	if err != nil {
-		return gitSnapshot{}, false, fmt.Errorf("open git show stdout: %w", err)
-	}
-	var stderr boundedGitStderr
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		return gitSnapshot{}, false, gitCommandError(ctx, "start git show", err, &stderr)
-	}
-	raw, readErr := io.ReadAll(io.LimitReader(stdout, 258))
-	if readErr != nil {
-		abortNativeGitChild(cmd, nil)
-		return gitSnapshot{}, false, nativeGitReadError(ctx, "read git show", readErr)
-	}
-	if len(raw) > 257 {
-		abortNativeGitChild(cmd, nil)
-		return gitSnapshot{}, false, fmt.Errorf("git show returned an oversize snapshot record")
-	}
-	if err := waitNativeGitChild(ctx, cmd, "git show", &stderr); err != nil {
 		return gitSnapshot{}, false, err
 	}
 	raw = bytes.TrimSuffix(raw, []byte{'\n'})
-	oidRaw, unixRaw, ok := bytes.Cut(raw, []byte{0})
-	if !ok || len(unixRaw) == 0 || bytes.IndexByte(unixRaw, 0) >= 0 {
+	oidRaw, dateRaw, ok := bytes.Cut(raw, []byte{0})
+	if !ok || len(dateRaw) == 0 || bytes.IndexByte(dateRaw, 0) >= 0 {
 		return gitSnapshot{}, false, fmt.Errorf("malformed git show snapshot record")
 	}
 	got, err := parseGitObjectID(oidRaw)
@@ -67,28 +50,16 @@ func captureGitSnapshot(ctx context.Context, repoDir, captured string) (gitSnaps
 	if got != want {
 		return gitSnapshot{}, false, fmt.Errorf("git show returned commit %s, want %s", got, want)
 	}
-	commitTime, err := time.Parse(time.RFC3339, string(unixRaw))
+	commitTime, err := time.Parse(time.RFC3339, string(dateRaw))
 	if err != nil {
-		return gitSnapshot{}, false, fmt.Errorf("parse Git commit time %q: %w", unixRaw, err)
+		return gitSnapshot{}, false, fmt.Errorf("parse Git commit time %q: %w", dateRaw, err)
 	}
 	return gitSnapshot{commitOID: got, commitTime: commitTime}, true, nil
 }
 
-type nativeGitConfig struct {
-	zoekt map[string]string
-}
-
-func (config nativeGitConfig) zoektValue(name string) string {
-	if value, ok := config.zoekt[name]; ok {
-		return value
-	}
-	for key, value := range config.zoekt {
-		if strings.EqualFold(key, name) {
-			return value
-		}
-	}
-	return ""
-}
+// nativeGitConfig holds the local zoekt.* options. Git prints config names
+// with the section and the option in lowercase, so each key is lowercase.
+type nativeGitConfig map[string]string
 
 func readNativeGitConfig(ctx context.Context, repoDir string) (nativeGitConfig, error) {
 	cmd := newGitCommand(ctx, repoDir, "config", "--null", "--local", "--get-regexp", "^zoekt\\.")
@@ -96,25 +67,25 @@ func readNativeGitConfig(ctx context.Context, repoDir string) (nativeGitConfig, 
 	if err != nil {
 		// Exit 1 with no output means no zoekt.* key.
 		if exitErr, ok := errors.AsType[*exec.ExitError](err); !ok || exitErr.ExitCode() != 1 || len(out) != 0 {
-			return nativeGitConfig{}, err
+			return nil, err
 		}
 	}
 
-	result := nativeGitConfig{zoekt: make(map[string]string)}
+	result := nativeGitConfig{}
 	for _, record := range bytes.Split(out, []byte{0}) {
 		if len(record) == 0 {
 			continue
 		}
 		keyRaw, valueRaw, ok := bytes.Cut(record, []byte{'\n'})
 		if !ok || len(keyRaw) == 0 {
-			return nativeGitConfig{}, fmt.Errorf("malformed git config record")
+			return nil, fmt.Errorf("malformed git config record")
 		}
 		key := string(keyRaw)
 		if strings.HasPrefix(strings.ToLower(key), "zoekt.") {
 			// Git config keys are case-insensitive. Keep RawConfig deterministic by
 			// storing the spelling that Git exposes: lowercase option names.
 			option := strings.ToLower(key[len("zoekt."):])
-			result.zoekt[option] = string(valueRaw)
+			result[option] = string(valueRaw)
 		}
 	}
 	return result, nil
@@ -148,24 +119,21 @@ func nativeGitRepository(ctx context.Context, repoDir string, snapshot gitSnapsh
 // templates. The local [zoekt] section can set one repository name and one
 // opaque web URL explicitly.
 func applyNativeGitConfig(repository *zoekt.Repository, config nativeGitConfig) {
-	if name := config.zoektValue("name"); name != "" && !reservedGitRepositoryName(name) {
+	if name := config["name"]; name != "" && !reservedGitRepositoryName(name) {
 		repository.Name = name
 	}
-	if webURL := config.zoektValue("web-url"); webURL != "" {
+	if webURL := config["web-url"]; webURL != "" {
 		repository.URL = webURL
 	}
 
-	id, _ := strconv.ParseUint(config.zoektValue("repoid"), 10, 32)
+	id, _ := strconv.ParseUint(config["repoid"], 10, 32)
 	repository.ID = uint32(id)
-	repository.TenantID, _ = strconv.Atoi(config.zoektValue("tenantID"))
-	if _, ok := config.zoekt["latestcommitdate"]; ok {
+	repository.TenantID, _ = strconv.Atoi(config["tenantid"])
+	if _, ok := config["latestcommitdate"]; ok {
 		repository.Rank = nativeGitCommitRank(repository.LatestCommitDate)
 	}
-	if len(config.zoekt) > 0 {
-		repository.RawConfig = make(map[string]string, len(config.zoekt))
-		for key, value := range config.zoekt {
-			repository.RawConfig[key] = value
-		}
+	if len(config) > 0 {
+		repository.RawConfig = maps.Clone(config)
 	}
 }
 
@@ -317,7 +285,7 @@ func indexNativeGitFull(
 	parallelism int,
 	missing *[]missingBlob,
 ) error {
-	if err := requireNativeGitVersion(ctx, repoDir); err != nil {
+	if err := requireNativeGitVersion(ctx); err != nil {
 		return err
 	}
 	repository, err := nativeGitRepository(ctx, repoDir, snapshot)

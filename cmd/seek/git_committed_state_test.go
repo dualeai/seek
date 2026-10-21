@@ -126,7 +126,7 @@ func TestPrepareNativeGitDeltaAcceptsLargeFullBase(t *testing.T) {
 	gitRunIn(t, repoDir, "add", "next.go")
 	gitRunIn(t, repoDir, "commit", "-m", "delta above large full base")
 	target := captureHeadForTest(t, repoDir)
-	delta, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.cacheDir, plan.indexDir, target, scan)
+	delta, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, target, scan)
 	if err != nil || !eligible {
 		t.Fatalf("large-base delta: eligible=%t error=%v", eligible, err)
 	}
@@ -238,7 +238,7 @@ exec "$SEEK_TEST_REAL_GIT" "$@"
 		t.Fatalf("target state=%+v ok=%t, want head=%s base_head=%s base_shards=%d ", target, ok, targetHead, baseHead, base.baseShards)
 	}
 	for _, queryText := range []string{"DELTA_STABLE_MARKER", "DELTA_NEW_MARKER"} {
-		matches, err := executeUnscopedShardSearchForTest(t.Context(), plan.indexDir, queryText)
+		matches, err := searchPlannedCorpusForTest(t.Context(), plan, queryText)
 		if err != nil || len(matches) != 1 {
 			t.Fatalf("search %q: matches=%v error=%v", queryText, matches, err)
 		}

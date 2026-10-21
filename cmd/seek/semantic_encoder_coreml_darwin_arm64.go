@@ -9,10 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,12 +47,14 @@ func configureLateOnProvider(options *ort.SessionOptions, _ int, model []byte) e
 	return nil
 }
 
+// lateOnCoreMLProviderOptions are the Core ML options. EnableOnSubgraphs keeps
+// its default: the model has no If, Loop or Scan node, so setting it would
+// change only the cache key.
 func lateOnCoreMLProviderOptions() map[string]string {
 	return map[string]string{
 		"ModelFormat":              "MLProgram",
 		"MLComputeUnits":           "ALL",
 		"RequireStaticInputShapes": "1",
-		"EnableOnSubgraphs":        "0",
 	}
 }
 
@@ -132,12 +135,7 @@ func lateOnCoreMLCacheKey(model []byte, runtimeVersion string, providerOptions m
 	hash.Write([]byte("seek-coreml-cache-v2\x00"))
 	writeSemanticHashField(hash, []byte(runtimeVersion))
 	writeSemanticHashField(hash, []byte(lateOnHostOSBuild()))
-	keys := make([]string, 0, len(providerOptions))
-	for key := range providerOptions {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
+	for _, key := range slices.Sorted(maps.Keys(providerOptions)) {
 		writeSemanticHashField(hash, []byte(key))
 		writeSemanticHashField(hash, []byte(providerOptions[key]))
 	}
@@ -250,7 +248,7 @@ func touchProviderArtifactUse(directory string) {
 // shared encoder.
 
 // lateOnVerdictRecheck records real work that produced unusable output the
-// fixed probe row does not reproduce. The record reads "recheck <count>
+// fixed probe batch does not reproduce. The record reads "recheck <count>
 // <unix-seconds>", where the time is when the count last changed. One is
 // evidence, not proof: normalizeSemanticVector also rejects a vector whose norm
 // cancels exactly, which a healthy provider can produce. The next process
@@ -265,8 +263,9 @@ func touchProviderArtifactUse(directory string) {
 // upgrades Seek keeps the record its previous version wrote.
 const lateOnVerdictRecheck = "recheck"
 
-// lateOnVerdictFaultsBeforeRejection is how many separate batches must fail
-// before this host stops using the accelerated provider.
+// lateOnVerdictFaultsBeforeRejection is how many recorded faults stop this
+// host from using the accelerated provider. A command records at most one
+// (semanticModelFuture.recordFault).
 const lateOnVerdictFaultsBeforeRejection = 2
 
 // lateOnProviderFaultWindow is how long one fault stays on the record. Two
@@ -282,9 +281,10 @@ const lateOnProviderFaultWindow = 7 * 24 * time.Hour
 const lateOnProviderVerdictFile = "provider-verdict"
 
 // lateOnVerdictLocation remembers where the verdict for the provider in use
-// lives. rejectLateOnAcceleratedProvider runs long after selection, on the index
-// build path, and this spares it decoding the model again only to rebuild a path
-// selection already knew. Selection stores it; an empty value means no provider
+// lives. rejectLateOnAcceleratedProvider runs long after selection, after a
+// vector build, scan, or ranking fault (semanticModelFuture.recordFault), and
+// this spares it decoding the model again only to rebuild a path selection
+// already knew. Selection stores it; an empty value means no provider
 // check has run in this process, so there is nothing to reject.
 var lateOnVerdictLocation atomic.Value
 
@@ -309,8 +309,8 @@ func rejectLateOnAcceleratedProvider(reason string) {
 	if !ok || path == "" {
 		return
 	}
-	// One bad batch asks for another measurement. A second one, after a probe
-	// that passed in between, is a provider that agrees on the fixed row and
+	// One fault asks for another measurement. A second one, after a probe
+	// that passed in between, is a provider that agrees on the probe batch and
 	// fails on real work, so demote it for good.
 	record := readLateOnProviderRecord(path)
 	if record.verdict == lateOnVerdictRejected {
@@ -348,9 +348,8 @@ type lateOnProviderRecord struct {
 }
 
 // readLateOnProviderRecord reads and parses the verdict file once, and is the
-// only place that parses it. One reader serves every caller: the file is small,
-// but it grew four separate parsers that differed only in which field they
-// returned, and between them read it about seven times on a cold start.
+// only place that parses it. One reader serves every caller, so each caller
+// reads the same record format.
 //
 // A fault older than lateOnProviderFaultWindow expires, which is what stops one
 // benign cancellation from costing a probe on every search for ever.
@@ -404,7 +403,7 @@ func cachedLateOnProviderVerdict(model []byte) string {
 }
 
 // verifyLateOnAcceleratedProvider reports whether the accelerated session agrees
-// with the CPU provider on one fixed row.
+// with the CPU provider on the fixed probe batch.
 //
 // ONNX Runtime 1.30.0 returns wrong FP16 output from the Core ML MLProgram path
 // on macOS 15 ARM64: https://github.com/microsoft/onnxruntime/issues/32569. The
@@ -419,7 +418,7 @@ func cachedLateOnProviderVerdict(model []byte) string {
 //
 // Agreement does not always write "trusted". A fault already on the record is
 // carried forward with its original timestamp, because a provider that passes
-// this row and fails on real work must still be able to reach a demotion, and
+// this batch and fails on real work must still be able to reach a demotion, and
 // restamping would restart the expiry window on every probe.
 func verifyLateOnAcceleratedProvider(
 	ctx context.Context,
@@ -449,12 +448,12 @@ func verifyLateOnAcceleratedProvider(
 		return true, "", fmt.Errorf("probe the accelerated provider: %w", err)
 	}
 	reference, err := newLateOnStaticSession(model, func(options *ort.SessionOptions) error {
-		// Match the thread count the CPU provider would really use. A single
-		// thread made the reference slower than the provider it judges, and this
-		// runs while the user waits.
+		// The probe is one call while the user waits, so it uses the
+		// interactive thread count. On a single thread, the reference is
+		// slower than the provider it judges.
 		if err := configureLateOnCPUProvider(
 			options,
-			lateOnCPUIntraOpThreads(runtime.GOMAXPROCS(0)),
+			lateOnCPUInteractiveThreads(runtime.GOMAXPROCS(0)),
 		); err != nil {
 			return err
 		}
@@ -497,7 +496,7 @@ func verifyLateOnAcceleratedProvider(
 		reason = "matches the CPU provider"
 		if prior.faults > 0 {
 			// Keep the count. Clearing it here is what would stop a provider
-			// that passes this row and fails real work from ever being demoted.
+			// that passes this batch and fails real work from ever being demoted.
 			// Keep the original timestamp. Restamping it here would restart the
 			// window on every passing probe, so the count would never expire and
 			// this host would probe on every search for ever.

@@ -8,25 +8,24 @@ import (
 	"time"
 )
 
-// TestIndexFolderDocumentsDelta_FallsBackOnOversizePayload — end-to-end
-// verification of the contentBytes guard added to
-// indexFolderDocumentsDelta (folder_indexer.go).
+// TestIndexFolderDocumentsDelta_FallsBackOnOversizePayload checks the payload
+// guard of a folder delta from end to end. The guard is in
+// changedFolderDocumentsFromManifest (folder_indexer.go): it returns
+// errDeltaPayloadExceedsWindow when the changed size reaches the window.
 //
 // Sequence:
-//  1. Build initial corpus (small fixture → cachedState1, manifest1).
-//  2. Mutate every file such that the delta payload would exceed
-//     indexWindowBytes (with the test-local window override).
-//  3. Re-index. Expectation: indexFolderDocumentsDelta returns the
-//     "exceeds window threshold" error → indexFolderDocuments
-//     falls through to streamFolderFiles → indexDocuments full
-//     rebuild → searchable result.
-//  4. Assert: the base shard file is replaced (a delta keeps it and
-//     adds shards; a full rebuild writes a new one), searches still hit
-//     the post-mutation content, and the semaphore returned to baseline.
+//  1. Index 8 files of 64 KiB. This writes the shards and the manifest.
+//  2. Grow every file to 384 KiB, so the delta payload (3 MiB) passes the
+//     2 MiB test window (swapReadSemaphoreForTest sets half the budget).
+//  3. Index again. indexFolderDocumentsDelta returns
+//     errDeltaPayloadExceedsWindow, and indexFolderDocuments then does a full
+//     rebuild through streamFolderFiles and indexDocuments.
+//  4. Check that the base shard file is replaced (a delta keeps it and adds
+//     shards; a full rebuild writes a new one), that a search finds the new
+//     content, and that the read semaphore has its full budget again.
 //
-// Tests the guard at the layer it lives in: real folder corpus
-// pipeline, no mocked changedDocs. Drives the real
-// changedFolderDocumentsSinceCachedState path.
+// The test uses the real folder pipeline with no mocked changedDocs, through
+// changedFolderDocumentsSinceCachedState.
 func TestIndexFolderDocumentsDelta_FallsBackOnOversizePayload(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
@@ -99,7 +98,8 @@ func TestIndexFolderDocumentsDelta_FallsBackOnOversizePayload(t *testing.T) {
 	}
 
 	// Verify the post-mutation content is actually in the new shards.
-	// searchPlannedCorpusParsed uses the production search path.
+	// searchPlannedCorpusForTest uses the production search path
+	// (searchPlannedCorpusParsed).
 	results, err := searchPlannedCorpusForTest(ctx, plan, "MUTATED_BEACON_BAFFA")
 	if err != nil {
 		t.Fatalf("search: %v", err)

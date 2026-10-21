@@ -14,10 +14,11 @@ import (
 // Setup: capture a forward chain of recent commit SHAs ending at the current
 // HEAD, create a scratch clone under b.TempDir(), check out a local benchmark
 // branch at the oldest commit, build a base index, then reset the clone to each
-// next SHA and time the production native refresh. The sampled chain has at
-// most ten advances. If Go's benchmark framework wants more, it resets the
-// loop and replays the chain. Each timed iteration advances by one real commit;
-// it is not a reflog oscillation between distant points.
+// next SHA and time the node refresh that a search runs (gitNode.refresh). The
+// sampled chain has at most ten advances. If Go's benchmark framework wants
+// more, it resets the loop and replays the chain. Each timed iteration
+// advances by one real commit; it is not a reflog oscillation between distant
+// points.
 //
 // SEEK_BENCH_REPO is only used as a read-only source; hard resets happen in the
 // temp clone.
@@ -39,7 +40,7 @@ func BenchmarkLargeRepo_CommittedAdvance(b *testing.B) {
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(b, repoDir)
 
-	if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
+	if _, _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
 		b.Fatalf("cold base index: %v", err)
 	}
 
@@ -47,12 +48,12 @@ func BenchmarkLargeRepo_CommittedAdvance(b *testing.B) {
 	for i := 0; b.Loop(); i++ {
 		b.StopTimer()
 		// chain[0] is one commit ahead of base; advance through the chain.
-		// When b.Loop() exhausts the chain (only on -benchtime=Nx with N >
-		// len(chain)), reset the scratch clone to base and replay.
+		// When b.Loop() runs more rounds than the chain has advances, reset
+		// the scratch clone to base and replay.
 		idx := i % len(chain)
 		if idx == 0 && i > 0 {
 			gitRunIn(b, repoDir, "reset", "--hard", base)
-			if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
+			if _, _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
 				b.Fatalf("chain replay base index: %v", err)
 			}
 		}
@@ -70,7 +71,7 @@ func BenchmarkLargeRepo_CommittedAdvance(b *testing.B) {
 		}
 		b.StartTimer()
 
-		if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
+		if _, _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
 			b.Fatalf("delta advance index (iter %d): %v", i, err)
 		}
 		b.StopTimer()
@@ -83,8 +84,9 @@ func BenchmarkLargeRepo_CommittedAdvance(b *testing.B) {
 }
 
 // BenchmarkLargeRepo_UncommittedRealistic measures rapid editor saves through
-// the full runIndexingWithCache orchestrator. This is the workflow seek has to
-// optimize: an editor saving the same file in a loop.
+// the node refresh that a search runs (gitNode.refresh): git status, the index
+// checks, and the build. This is the workflow seek has to optimize: an editor
+// saving the same file in a loop.
 func BenchmarkLargeRepo_UncommittedRealistic(b *testing.B) {
 	repoDir := cloneBenchRepoAt(b, requireBenchRepo(b), "HEAD")
 	ctx := context.Background()
@@ -99,16 +101,26 @@ func BenchmarkLargeRepo_UncommittedRealistic(b *testing.B) {
 		b.Fatal(err)
 	}
 
+	published := readStateFile(plan.cacheDir)
 	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
-		body := fmt.Appendf(original[:len(original):len(original)], "\n// rapid_edit_marker_%d\n", i)
+		// Saves alternate in size, so a file system with whole-second times
+		// still sees each save.
+		body := fmt.Appendf(original[:len(original):len(original)], "\n// rapid_edit_marker_%09d%s\n", i, strings.Repeat("x", 1+i%2))
 		if err := os.WriteFile(target, body, 0o644); err != nil {
 			b.Fatal(err)
 		}
-		state := mustGitRepoStateIn(b, ctx, repoDir)
-		preState := gitCorpusStateHash(paths, state)
-		if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, preState); err != nil {
+		if _, _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
 			b.Fatalf("reindex iter %d: %v", i, err)
 		}
+		// Each save changes the dirty file's size or mtime, so the refresh
+		// publishes a new state.
+		b.StopTimer()
+		state := readStateFile(plan.cacheDir)
+		if state == "" || state == published {
+			b.Fatalf("iter %d published no new state: %q", i, state)
+		}
+		published = state
+		b.StartTimer()
 	}
 }

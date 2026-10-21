@@ -35,6 +35,8 @@ jobs:
             name: macos-15-arm64
           - os: macos-15-intel                      # macOS x86_64 (Sequoia)
             name: macos-15-amd64
+          - os: xcode-27                            # macOS arm64 (27, preview image)
+            name: macos-27-arm64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:

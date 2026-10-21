@@ -14,11 +14,11 @@ import (
 )
 
 // ===========================================================================
-// NORMAL CASES — expected workflows not yet covered
+// NORMAL CASES — common workflows
 // ===========================================================================
 
 // TestIntegration_DetachedHEAD verifies seek works in detached HEAD state,
-// which changes the branch.oid header format.
+// where git status prints "# branch.head (detached)".
 func TestIntegration_DetachedHEAD(t *testing.T) {
 	requireTools(t)
 
@@ -363,9 +363,9 @@ func TestStateFile_PartialWrite(t *testing.T) {
 	}
 }
 
-// TestStreamFiles_FIFOSkipped verifies that FIFO (named pipe) files
+// TestStreamDirtyFiles_FIFOSkipped verifies that FIFO (named pipe) files
 // are skipped without blocking or error.
-func TestStreamFiles_FIFOSkipped(t *testing.T) {
+func TestStreamDirtyFiles_FIFOSkipped(t *testing.T) {
 	dir := t.TempDir()
 
 	// Create a regular file alongside
@@ -374,9 +374,9 @@ func TestStreamFiles_FIFOSkipped(t *testing.T) {
 	}
 
 	// Create a FIFO — collectStreamFilesForTest should not block on it.
-	// Lstat returns ModeNamedPipe which is not ModeDir or ModeSymlink,
-	// so it passes the type check. But ReadFile on a FIFO blocks.
-	// This test documents whether the current code handles this.
+	// Lstat returns ModeNamedPipe, so the reader skips it before any open:
+	// only a regular file passes. A plain open of a FIFO with no writer
+	// blocks.
 	fifoPath := filepath.Join(dir, "fifo")
 	cmd := exec.Command("mkfifo", fifoPath)
 	if err := cmd.Run(); err != nil {
@@ -386,7 +386,7 @@ func TestStreamFiles_FIFOSkipped(t *testing.T) {
 	// Use a timeout to detect if collectStreamFilesForTest blocks on FIFO
 	done := make(chan []fileContent, 1)
 	go func() {
-		done <- collectStreamFilesForTest(t.Context(), dir, []string{"regular.go", "fifo"}, 2)
+		done <- collectStreamFilesForTest(t, t.Context(), dir, []string{"regular.go", "fifo"}, 2)
 	}()
 
 	select {
@@ -406,9 +406,9 @@ func TestStreamFiles_FIFOSkipped(t *testing.T) {
 	}
 }
 
-// TestStreamFiles_HardlinkContent verifies hardlinked files
+// TestStreamDirtyFiles_HardlinkContent verifies hardlinked files
 // are read correctly (content matches, different paths).
-func TestStreamFiles_HardlinkContent(t *testing.T) {
+func TestStreamDirtyFiles_HardlinkContent(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "source.go")
 	link := filepath.Join(dir, "hardlink.go")
@@ -420,7 +420,7 @@ func TestStreamFiles_HardlinkContent(t *testing.T) {
 		t.Skipf("hardlinks not supported: %v", err)
 	}
 
-	results := collectStreamFilesForTest(t.Context(), dir, []string{"source.go", "hardlink.go"}, 2)
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"source.go", "hardlink.go"}, 2)
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results for hardlinked files, got %d", len(results))
 	}
@@ -431,9 +431,10 @@ func TestStreamFiles_HardlinkContent(t *testing.T) {
 	}
 }
 
-// TestRepoStateFingerprint_HardlinkSameInode verifies that hardlinked files
-// have the same inode in the fingerprint (expected behavior — they ARE the
-// same file at the filesystem level).
+// TestRepoStateFingerprint_HardlinkSameInode fingerprints two hard links to
+// one file. The links share an inode, but each path name goes into the
+// fingerprint: each link alone gives its own fingerprint, and the two links
+// together give a third.
 func TestRepoStateFingerprint_HardlinkSameInode(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "a.go")
@@ -596,9 +597,10 @@ func TestIntegration_MergeConflictState(t *testing.T) {
 	}
 }
 
-// TestIntegration_SubmoduleDirtySkipped verifies that a dirty submodule
-// (which appears as a directory in git status) is skipped by
-// collectStreamFilesForTest without error.
+// TestIntegration_SubmoduleDirtySkipped verifies that a submodule with an
+// untracked file does not stop a search of the host repository. Git status
+// (--ignore-submodules=dirty) does not list the submodule, so the host's
+// dirty-file reader never meets it.
 func TestIntegration_SubmoduleDirtySkipped(t *testing.T) {
 	requireTools(t)
 
@@ -700,7 +702,7 @@ func TestRepoStateFingerprint_ManyDeletedFiles(t *testing.T) {
 	if fp != repoStateFingerprint(dir, state) {
 		t.Fatal("expected many-deleted-files fingerprint to be deterministic")
 	}
-	// Should be fast (< 100ms for 1000 Lstats on non-existent files)
+	// Should be fast (< 500ms for 1000 Lstats on non-existent files)
 	if elapsed > 500*time.Millisecond {
 		t.Errorf("fingerprinting 1000 deleted files took %v (expected < 500ms)", elapsed)
 	}
@@ -720,9 +722,9 @@ func TestComputeStateHash_CollisionResistance(t *testing.T) {
 	}
 }
 
-// TestStreamFiles_HighConcurrency verifies that reading many
+// TestStreamDirtyFiles_HighConcurrency verifies that reading many
 // files with high parallelism doesn't miss or duplicate results.
-func TestStreamFiles_HighConcurrency(t *testing.T) {
+func TestStreamDirtyFiles_HighConcurrency(t *testing.T) {
 	dir := t.TempDir()
 	const numFiles = 500
 	for i := range numFiles {
@@ -737,7 +739,7 @@ func TestStreamFiles_HighConcurrency(t *testing.T) {
 		files[i] = fmt.Sprintf("file_%03d.go", i)
 	}
 
-	results := collectStreamFilesForTest(t.Context(), dir, files, 16)
+	results := collectStreamFilesForTest(t, t.Context(), dir, files, 16)
 	if len(results) != numFiles {
 		t.Errorf("expected %d results, got %d", numFiles, len(results))
 	}
@@ -752,10 +754,10 @@ func TestStreamFiles_HighConcurrency(t *testing.T) {
 	}
 }
 
-// TestStreamFiles_RacyDeletion simulates files being deleted
-// between git status and collectStreamFilesForTest (TOCTOU). Some files
+// TestStreamDirtyFiles_RacyDeletion simulates files being deleted
+// between git status and the dirty-file read (TOCTOU). Some files
 // should be read, deleted ones should be silently skipped.
-func TestStreamFiles_RacyDeletion(t *testing.T) {
+func TestStreamDirtyFiles_RacyDeletion(t *testing.T) {
 	dir := t.TempDir()
 	const numFiles = 100
 	fileNames := make([]string, numFiles)
@@ -777,7 +779,7 @@ func TestStreamFiles_RacyDeletion(t *testing.T) {
 		}
 	}()
 
-	results := collectStreamFilesForTest(t.Context(), dir, fileNames, 4)
+	results := collectStreamFilesForTest(t, t.Context(), dir, fileNames, 4)
 	wg.Wait()
 
 	// Should not panic; should have between 50 and 100 results depending on timing
@@ -813,7 +815,7 @@ func TestAcquireBuildLock_ContextCancellation(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, acquired, err := acquireBuildLock(ctx, dir, indexDir)
+	_, acquired, err := corpusStore{cacheDir: dir, indexDir: indexDir}.acquireBuildLock(ctx)
 	elapsed := time.Since(start)
 
 	if acquired {
@@ -822,7 +824,7 @@ func TestAcquireBuildLock_ContextCancellation(t *testing.T) {
 	if err == nil {
 		t.Error("expected error on timeout")
 	}
-	// Should respect the 200ms context timeout, not wait the full 60s
+	// Should respect the 200ms context timeout: the wait itself has no limit.
 	if elapsed > 2*time.Second {
 		t.Errorf("took %v to timeout, expected ~200ms", elapsed)
 	}

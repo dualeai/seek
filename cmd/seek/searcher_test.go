@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -102,7 +103,6 @@ func TestCloneFileMatchesCopiesContextOnlyForPossibleDisplayedFiles(t *testing.T
 	full := cloneFileMatches(input, defaultSearchConfig())
 	config := defaultSearchConfig()
 	config.contextFileLimit = 2
-	config.contextGitCorpus = true
 	config.contextDirtyFiles = dirtyFileSet{"dirty.go": {}}
 	selected := cloneFileMatches(input, config)
 
@@ -117,7 +117,7 @@ func TestCloneFileMatchesCopiesContextOnlyForPossibleDisplayedFiles(t *testing.T
 		}
 	}
 
-	plan := corpusPlan{id: corpusID("repo"), kind: corpusKindGit}
+	plan := node{id: corpusID("repo"), kind: corpusKindGit}
 	dirty := dirtyFilesByCorpus{plan.id: config.contextDirtyFiles}
 	want := formatCorpusResultsWithContext(wrapCorpusResults(plan, full), dirty, 2, 0, hideCorpusContext, plainPalette)
 	got := formatCorpusResultsWithContext(wrapCorpusResults(plan, selected), dirty, 2, 0, hideCorpusContext, plainPalette)
@@ -129,24 +129,6 @@ func TestCloneFileMatchesCopiesContextOnlyForPossibleDisplayedFiles(t *testing.T
 	if selected[2].LineMatches[0].Before[0] == 'X' {
 		t.Fatal("selected file context aliases shard memory")
 	}
-
-	config.resultFileLimit = 2
-	retained := cloneFileMatches(input, config)
-	if len(retained) != 2 || retained[0].FileName != "b.go" || retained[1].FileName != "c.go" {
-		t.Fatalf("retained files=%v, want b.go and c.go", fileMatchNames(retained))
-	}
-	if len(retained[0].LineMatches[0].Before) == 0 ||
-		len(retained[1].LineMatches[0].After) == 0 {
-		t.Fatal("retained files lost display context")
-	}
-}
-
-func fileMatchNames(files []zoekt.FileMatch) []string {
-	names := make([]string, len(files))
-	for i := range files {
-		names[i] = files[i].FileName
-	}
-	return names
 }
 
 func TestDisplayedContextFilesUsesFormatterTieOrder(t *testing.T) {
@@ -179,8 +161,8 @@ func TestPerCorpusContextLimitPreservesGlobalTopFiles(t *testing.T) {
 			}},
 		}
 	}
-	planA := corpusPlan{id: corpusID("a"), kind: corpusKindFolder, displayRoot: "/a"}
-	planB := corpusPlan{id: corpusID("b"), kind: corpusKindFolder, displayRoot: "/b"}
+	planA := node{id: corpusID("a"), kind: corpusKindFolder, displayRoot: "/a"}
+	planB := node{id: corpusID("b"), kind: corpusKindFolder, displayRoot: "/b"}
 	filesA := []zoekt.FileMatch{file("first.go", 100), file("second.go", 99), file("third.go", 98)}
 	filesB := []zoekt.FileMatch{file("other.go", 1)}
 
@@ -201,7 +183,10 @@ func TestPerCorpusContextLimitPreservesGlobalTopFiles(t *testing.T) {
 	}
 }
 
-func TestExecuteParsedSearch_ContextModes(t *testing.T) {
+// TestSearchPlannedCorpusParsed_ContextModes reads one node through the
+// production node read and checks that each search config gives its context
+// lines.
+func TestSearchPlannedCorpusParsed_ContextModes(t *testing.T) {
 	requireTools(t)
 
 	var content strings.Builder
@@ -229,6 +214,7 @@ func TestExecuteParsedSearch_ContextModes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	plan := node{cacheDir: t.TempDir(), indexDir: indexDir}
 
 	cases := []struct {
 		name       string
@@ -243,7 +229,7 @@ func TestExecuteParsedSearch_ContextModes(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			files, err := executeParsedShardSearchForTest(t.Context(), indexDir, q, tc.config)
+			files, err := searchPlannedCorpusParsed(t.Context(), plan, q, tc.config)
 			if err != nil {
 				t.Fatalf("search: %v", err)
 			}
@@ -261,10 +247,16 @@ func TestExecuteParsedSearch_ContextModes(t *testing.T) {
 	}
 }
 
-func TestExecuteParsedSearchScopedDirs_ContextFileSelectionAfterShardMerge(t *testing.T) {
+// TestSearchPlannedCorpusParsed_ContextFileSelectionAfterShardMerge puts a
+// committed and an uncommitted shard in one index directory, as a Git node
+// does, and reads the node. With a context file limit of 1, only the best
+// file after the merge of the two shards keeps its context lines, in each
+// shard order.
+func TestSearchPlannedCorpusParsed_ContextFileSelectionAfterShardMerge(t *testing.T) {
 	requireTools(t)
 
 	const content = "package p\n// before\n// TWO_SHARD_CONTEXT_MARKER\n// after\n"
+	// indexShard writes the one shard of repository into indexDir.
 	indexShard := func(indexDir, repository string, names ...string) {
 		t.Helper()
 		docs := make(chan fileContent, len(names))
@@ -279,46 +271,49 @@ func TestExecuteParsedSearchScopedDirs_ContextFileSelectionAfterShardMerge(t *te
 		if !indexedAny {
 			t.Fatalf("expected %s shard", repository)
 		}
-		shards, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
-		if err != nil {
-			t.Fatalf("list %s shards: %v", repository, err)
-		}
-		if len(shards) != 1 {
-			t.Fatalf("%s shards=%d, want 1", repository, len(shards))
-		}
 	}
-
-	committedDir := t.TempDir()
-	uncommittedDir := t.TempDir()
-	indexShard(committedDir, "repo", "a.go", "z.go")
-	indexShard(uncommittedDir, repoUncommitted, "a.go")
 
 	q, err := parseSearchQuery("TWO_SHARD_CONTEXT_MARKER")
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan := corpusPlan{id: corpusID("repo"), kind: corpusKindGit}
 
+	// The node lists its shards by file name, and a shard name starts with
+	// its repository name: "repo" sorts before "uncommitted", and "zrepo"
+	// after it.
 	orders := []struct {
-		name string
-		dirs []string
+		name      string
+		committed string
 	}{
-		{name: "committed first", dirs: []string{committedDir, uncommittedDir}},
-		{name: "uncommitted first", dirs: []string{uncommittedDir, committedDir}},
+		{name: "committed first", committed: "repo"},
+		{name: "uncommitted first", committed: "zrepo"},
 	}
 	for _, order := range orders {
 		t.Run(order.name, func(t *testing.T) {
+			plan := node{id: corpusID("repo"), kind: corpusKindGit, cacheDir: t.TempDir(), indexDir: t.TempDir()}
+			indexShard(plan.indexDir, order.committed, "a.go", "z.go")
+			indexShard(plan.indexDir, repoUncommitted, "a.go")
+			shards, err := familyShardNames(plan.indexDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(shards) != 2 {
+				t.Fatalf("shards=%v, want one committed and one uncommitted shard", shards)
+			}
+			if first := filepath.Base(shards[0]); strings.HasPrefix(first, repoUncommitted) != (order.committed == "zrepo") {
+				t.Fatalf("first shard %s, want the %s", first, order.name)
+			}
+
 			config := explicitSearchConfig(1, false)
 			config.contextFileLimit = 1
-			config.contextGitCorpus = true
-			selected, err := executeParsedSearchScopedDirs(t.Context(), order.dirs, q, nil, config)
+			selected, err := searchPlannedCorpusParsed(t.Context(), plan, q, config)
 			if err != nil {
 				t.Fatalf("selective search: %v", err)
 			}
 
 			fullConfig := config
 			fullConfig.contextFileLimit = 0
-			full, err := executeParsedSearchScopedDirs(t.Context(), order.dirs, q, nil, fullConfig)
+			full, err := searchPlannedCorpusParsed(t.Context(), plan, q, fullConfig)
 			if err != nil {
 				t.Fatalf("full search: %v", err)
 			}
@@ -344,9 +339,9 @@ func TestExecuteParsedSearchScopedDirs_ContextFileSelectionAfterShardMerge(t *te
 			}
 
 			wantContext := map[resultKey]bool{
-				{name: "a.go", repository: "repo"}:          false,
+				{name: "a.go", repository: order.committed}: false,
 				{name: "a.go", repository: repoUncommitted}: true,
-				{name: "z.go", repository: "repo"}:          false,
+				{name: "z.go", repository: order.committed}: false,
 			}
 			if !maps.Equal(withContext, wantContext) {
 				t.Fatalf("files with context=%v, want %v", withContext, wantContext)
@@ -361,7 +356,7 @@ func TestExecuteParsedSearchScopedDirs_ContextFileSelectionAfterShardMerge(t *te
 			if got != want {
 				t.Fatalf("selective context changed merged-shard output:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 			}
-			for _, text := range []string{"a.go", "[uncommitted]", "… 1 more files (showing 1 of 2)"} {
+			for _, text := range []string{"a.go", "[uncommitted]", "… 1 more file (showing 1 of 2)"} {
 				if !strings.Contains(got, text) {
 					t.Fatalf("output does not contain %q:\n%s", text, got)
 				}
@@ -370,7 +365,10 @@ func TestExecuteParsedSearchScopedDirs_ContextFileSelectionAfterShardMerge(t *te
 	}
 }
 
-func TestLoadShards_FailsClosedOnPartialCorruptShard(t *testing.T) {
+// TestNodeRead_FailsClosedOnPartialCorruptShard reads a node whose index
+// holds a good shard and a corrupt one: the read returns index damage, which
+// the caller repairs, and no partial result.
+func TestNodeRead_FailsClosedOnPartialCorruptShard(t *testing.T) {
 	requireTools(t)
 
 	indexDir := t.TempDir()
@@ -391,48 +389,20 @@ func TestLoadShards_FailsClosedOnPartialCorruptShard(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	results, err := executeUnscopedShardSearchForTest(context.Background(), indexDir, "load_shards_marker")
+	q, err := parseSearchQuery("load_shards_marker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := node{cacheDir: t.TempDir(), indexDir: indexDir}
+	results, err := searchPlannedCorpusParsed(context.Background(), plan, q, defaultSearchConfig())
 	if err == nil {
 		t.Fatal("expected corrupt shard to fail closed")
 	}
 	if len(results) != 0 {
 		t.Fatalf("corrupt shard search should not return partial results: %#v", results)
 	}
-	if !strings.Contains(err.Error(), "load shard") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestExecuteParsedSearchScopedDirs_IgnoresEmptyOptionalDir(t *testing.T) {
-	requireTools(t)
-
-	indexDir := t.TempDir()
-	docs := make(chan fileContent, 1)
-	docs <- fileContent{name: "good.go", content: []byte("package good\n// optional_empty_dir_marker\n")}
-	close(docs)
-
-	indexedAny, err := indexDocuments(context.Background(), indexDir, "test", t.TempDir(), docs, 1)
-	if err != nil {
-		t.Fatalf("indexDocuments: %v", err)
-	}
-	if !indexedAny {
-		t.Fatal("expected a valid shard")
-	}
-	q, err := parseSearchQuery("optional_empty_dir_marker")
-	if err != nil {
-		t.Fatal(err)
-	}
-	results, err := executeParsedSearchScopedDirs(
-		context.Background(),
-		[]string{indexDir, t.TempDir()},
-		q,
-		nil,
-		defaultSearchConfig(),
-	)
-	if err != nil {
-		t.Fatalf("search with empty optional dir: %v", err)
-	}
-	if len(results) != 1 || results[0].FileName != "good.go" {
-		t.Fatalf("expected result from non-empty shard dir only, got %#v", results)
+	var damage *shardDamage
+	if !errors.As(err, &damage) || !errors.Is(err, errShardUnloadable) || !strings.Contains(err.Error(), "load shard") {
+		t.Fatalf("error=%v, want shard damage that names the shard load", err)
 	}
 }

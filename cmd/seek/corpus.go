@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -28,12 +27,12 @@ const (
 	rootTypeDirectory rootType = "directory"
 	rootTypeFile      rootType = "file"
 
-	// v3 bumped when the published-family manifest landed: a corpus built by an
-	// older binary has no .family-v1, and treating that absence as damage would
-	// rebuild every corpus on every machine at once. Rotating the id instead
-	// means a manifest-writing binary only ever meets corpora it built, and it
-	// also stops two binary versions sharing one corpus directory — the version
-	// skew that would otherwise republish without a manifest on every other run.
+	// v3 marks the corpora that have the published-family manifest. A corpus
+	// that an older binary built has no .family-v1, and to treat that as
+	// damage would rebuild every corpus on every machine at once. With a new
+	// ID, a binary that writes the manifest meets only corpora that it built.
+	// Two binary versions also do not share one corpus directory, so one of
+	// them does not publish with no manifest on every other run.
 	seekIndexGeneration = "v3"
 	// Bump once per release when a state-hash formula changes, so a new
 	// binary never reads a state file that an old one wrote.
@@ -48,7 +47,17 @@ var zoektCompatibilityVersion = fmt.Sprintf(
 	index.FeatureVersion,
 )
 
-type corpusPlan struct {
+// corpusStore is the on-disk place of one corpus: cacheDir holds the state
+// files and locks; indexDir holds the published shards.
+type corpusStore struct {
+	cacheDir string
+	indexDir string
+}
+
+// node is one node of the search graph: a folder root or a Git work tree, with
+// its cache place and its per-command captures. kind is the data tag; behavior
+// does the kind's work.
+type node struct {
 	id          corpusID
 	kind        corpusKind
 	rootType    rootType
@@ -59,16 +68,17 @@ type corpusPlan struct {
 	// as the fallback header (displayHeader). Formatter-only — never part of
 	// the corpus ID.
 	selectedFiles []string
-	cacheDir      string
-	indexDir      string
+	corpusStore
 	// scope is the search-time filter for a scoped Git search. Both scoped
 	// and unscoped searches of one repo resolve to the SAME combined
 	// whole-repo index (cacheDir/indexDir); scope just restricts which loaded
-	// docs match. The filter adds no BM25 term (executeParsedSearchScopedDirs),
+	// docs match. The filter adds no BM25 term (searchShards),
 	// so each matched doc gets the score of the unscoped search, and a scoped
 	// result set equals the unscoped result set intersected with it.
-	scope    query.Q
-	gitPaths *gitPaths
+	scope query.Q
+	// behavior is the kind's work (nodeKind); nil when the node only names a
+	// cache place, as for the error of a failed Git node (gitNodeError).
+	behavior nodeKind
 	// folder is the graph expansion's capture of a folder node: its walk
 	// fingerprint and the directories below its root that hold other nodes.
 	// nil for a Git node and for a file root.
@@ -103,7 +113,7 @@ func (c *capturedGitState) invalidate() {
 
 // treeChanged drops the node captures of plan, so every later preparation
 // reads the tree again, and reports the change.
-func treeChanged(plan corpusPlan) error {
+func treeChanged(plan node) error {
 	plan.gitState.invalidate()
 	plan.folder.invalidate()
 	return errGitIndexStateChanged
@@ -144,15 +154,16 @@ type corpusIndexState uint8
 const (
 	corpusSearchable corpusIndexState = iota
 	corpusKnownEmpty
-	// corpusStale is a node whose build failed: its prior index stays
-	// searchable with a warning, and it holds no captured state, so the
-	// search reads its text index only.
+	// corpusStale is a node whose build failed (with a warning) or that a
+	// peer builds: its prior index stays searchable. That index does not hold
+	// the captured state, so the search reads its text index only. A Git
+	// node keeps the dirty files of its capture.
 	corpusStale
 )
 
 // planCorpora resolves the path operands and expands the graph from them.
 // The caller gives "." when the user gave no path.
-func planCorpora(ctx context.Context, operands []string) ([]corpusPlan, error) {
+func planCorpora(ctx context.Context, operands []string) ([]node, error) {
 	seeds, err := resolveOperands(ctx, operands)
 	if err != nil {
 		return nil, err
@@ -179,27 +190,27 @@ func planCorpora(ctx context.Context, operands []string) ([]corpusPlan, error) {
 // corpus models the working tree, not the .git layout. The identity is the
 // file identity (dev:ino) of the worktree and of the common directory, never a
 // path: the typed letter case or a symlink in the path does not change it.
-func buildGitCorpusPlan(repoDir, commonDir string, extraIDParts ...string) (corpusPlan, error) {
+func buildGitCorpusPlan(repoDir, commonDir string) (node, error) {
 	root := canonicalCorpusPath(repoDir)
 	commonID, err := filesystemIdentity(canonicalCorpusPath(commonDir))
 	if err != nil {
-		return corpusPlan{}, fmt.Errorf("stat git common dir: %w", err)
+		return node{}, fmt.Errorf("stat git common dir: %w", err)
 	}
-	idParts := []string{"git_common_dir", commonID, "git_committed_backend", "native-v1"}
-	idParts = append(idParts, extraIDParts...)
-	return newCorpusPlan(corpusKindGit, rootTypeWorktree, root, "git", idParts...)
+	return newCorpusPlan(corpusKindGit, rootTypeWorktree, root, "git",
+		"git_common_dir", commonID, "git_committed_backend", "native-v1")
 }
 
 // planFolderCorpus plans a folder node: a directory or a single file.
-func planFolderCorpus(root string, info os.FileInfo) (corpusPlan, error) {
+func planFolderCorpus(root string, info os.FileInfo) (node, error) {
 	rt := rootTypeFile
 	if info.IsDir() {
 		rt = rootTypeDirectory
 	}
 	plan, err := newCorpusPlan(corpusKindFolder, rt, root, "folder")
 	if err != nil {
-		return corpusPlan{}, err
+		return node{}, err
 	}
+	plan.behavior = &folderNode{}
 	if rt == rootTypeFile {
 		// A single-file corpus indexes the file under its basename. Render
 		// results relative to the parent dir so the header reads as the file
@@ -211,16 +222,16 @@ func planFolderCorpus(root string, info os.FileInfo) (corpusPlan, error) {
 	return plan, nil
 }
 
-func newCorpusPlan(kind corpusKind, rt rootType, root, statSubject string, extraIDParts ...string) (corpusPlan, error) {
+func newCorpusPlan(kind corpusKind, rt rootType, root, statSubject string, extraIDParts ...string) (node, error) {
 	cacheRoot, err := seekUserCacheRoot()
 	if err != nil {
-		return corpusPlan{}, err
+		return node{}, err
 	}
 
 	root = canonicalCorpusPath(root)
 	rootID, err := filesystemIdentity(root)
 	if err != nil {
-		return corpusPlan{}, fmt.Errorf("stat %s root: %w", statSubject, err)
+		return node{}, fmt.Errorf("stat %s root: %w", statSubject, err)
 	}
 
 	// The root identity (dev:ino) names the corpus; the root path is for
@@ -238,7 +249,7 @@ func newCorpusPlan(kind corpusKind, rt rootType, root, statSubject string, extra
 	idParts = append(idParts, extraIDParts...)
 	id := newCorpusID(idParts...)
 	cacheDir := filepath.Join(cacheRoot, "corpora", string(id))
-	return corpusPlan{
+	return node{
 		id:          id,
 		kind:        kind,
 		rootType:    rt,
@@ -251,24 +262,23 @@ func newCorpusPlan(kind corpusKind, rt rootType, root, statSubject string, extra
 
 // planGitCorpus plans a Git node. operands are the paths that the search
 // covers; none, or the work-tree root, covers the whole node.
-func planGitCorpus(paths gitPaths, operands []string) (corpusPlan, error) {
+func planGitCorpus(paths gitPaths, operands []string) (node, error) {
 	plan, err := buildGitCorpusPlan(paths.RepoDir, paths.CommonDir)
 	if err != nil {
-		return corpusPlan{}, err
+		return node{}, err
 	}
-	plan.gitPaths = &paths
+	plan.behavior = &gitNode{paths: paths}
 	if len(operands) == 0 {
 		return plan, nil
 	}
 	// A scoped search reads the combined whole-repo index; the scope applies
 	// at search time.
-	plan.scope, err = buildCurrentGitScope(plan.root, operands)
-	if err != nil {
-		return corpusPlan{}, err
-	}
 	spec, err := buildGitScopeSpec(plan.root, operands)
 	if err != nil {
-		return corpusPlan{}, err
+		return node{}, err
+	}
+	if plan.scope, err = spec.query(); err != nil {
+		return node{}, err
 	}
 	plan.selectedFiles = spec.files
 	return plan, nil
@@ -292,18 +302,6 @@ func relWithin(root, path string) (string, bool) {
 		return rel, false
 	}
 	return rel, true
-}
-
-func sortedKeys(values map[string]struct{}) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(values))
-	for value := range values {
-		out = append(out, value)
-	}
-	sort.Strings(out)
-	return out
 }
 
 func seekUserCacheRoot() (string, error) {
@@ -333,7 +331,7 @@ func filesystemIdentity(path string) (string, error) {
 
 func canonicalCorpusPath(path string) string {
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		return filepath.Clean(resolved)
+		return resolved // EvalSymlinks returns a clean path.
 	}
 	if abs, err := filepath.Abs(path); err == nil {
 		return filepath.Clean(abs)
@@ -343,9 +341,9 @@ func canonicalCorpusPath(path string) string {
 
 // realCaseWithin rewrites the portion of path below root to the actual
 // on-disk directory-entry names. On case- or normalization-insensitive
-// filesystems (macOS, Windows) an operand may be typed with different case
+// filesystems (the macOS default) an operand may be typed with different case
 // or Unicode normalization than Git stored; the Git scope
-// (buildCurrentGitScope) matches names byte for byte, so without this a
+// (gitScopeSpec.query) matches names byte for byte, so without this a
 // tracked file would be silently missed. Matching is by os.SameFile (device+inode),
 // robust to both case and NFC/NFD. Components are corrected top-down so a
 // wrong-case parent is fixed before its children are read. Best-effort: any

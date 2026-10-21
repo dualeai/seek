@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 
@@ -29,12 +30,12 @@ type externalGitRoot struct {
 	operands []string
 	// state and children are the node capture: its git status, and the
 	// nested repositories that git status and git ls-files listed. They are
-	// set when captured is true. A failed node has no plan.
+	// set when captured is true. A node that the expansion did not capture
+	// failed, and has no plan.
 	state    repoState
 	children []string
 	emitted  map[string]struct{}
 	captured bool
-	failed   bool
 }
 
 // externalRoot is a folder seed: a directory or a single file.
@@ -162,7 +163,7 @@ func resolveOperands(ctx context.Context, operands []string) (plannedExternalOpe
 			// Correct the operand to its real on-disk byte name before it
 			// drives the byte-exact Git scope. On case- or normalization-
 			// insensitive filesystems os.Stat accepts a mistyped name, but
-			// the Git scope query (buildCurrentGitScope) is exact, so the
+			// the Git scope query (gitScopeSpec.query) is exact, so the
 			// wrong-case name would silently match nothing.
 			ro.canonical = realCaseWithin(repoRoot, canonical, listings)
 			pathsByRepo[repoRoot] = append(pathsByRepo[repoRoot], ro.canonical)
@@ -172,7 +173,7 @@ func resolveOperands(ctx context.Context, operands []string) (plannedExternalOpe
 
 	// Classify each in-repo operand. Visible paths use the scoped Git corpus;
 	// ignored paths use a folder or file corpus so their content stays visible.
-	vis := make(map[string]visibility)
+	inGit := make(map[string]bool)
 	failedRepos := make(map[string]bool)
 	for repoRoot, paths := range pathsByRepo {
 		decided, err := classifyVisibility(ctx, repoRoot, paths)
@@ -187,9 +188,7 @@ func resolveOperands(ctx context.Context, operands []string) (plannedExternalOpe
 			failedRepos[repoRoot] = true
 			continue
 		}
-		for path, v := range decided {
-			vis[path] = v
-		}
+		maps.Copy(inGit, decided)
 	}
 
 	// Group the seeds. Files and directories use the same visibility rule.
@@ -198,10 +197,7 @@ func resolveOperands(ctx context.Context, operands []string) (plannedExternalOpe
 		if ro.repo != nil && failedRepos[canonicalCorpusPath(ro.repo.RepoDir)] {
 			continue
 		}
-		// Comma-ok rather than `vis[...] == visGit`: visGit is the zero
-		// value, so a missing key (should be impossible — classifyVisibility
-		// returns every input) must NOT silently route to the Git corpus.
-		if v, ok := vis[ro.canonical]; ro.repo != nil && ok && v == visGit {
+		if ro.repo != nil && inGit[ro.canonical] {
 			repoRoot := canonicalCorpusPath(ro.repo.RepoDir)
 			i, found := gitIndex[repoRoot]
 			if !found {
@@ -228,34 +224,12 @@ func resolveOperands(ctx context.Context, operands []string) (plannedExternalOpe
 // driver list once.
 func operandRepo(ctx context.Context, probe string) (gitPaths, bool, error) {
 	for dir := probe; ; {
-		boundary, status := detectGitBoundary(dir)
-		switch status {
-		case boundaryConfirmed:
-			return boundary.toGitPaths(), true, nil
-		case ambiguous:
-			if paths, ok, err := classifyGitDir(ctx, dir); ok || err != nil {
-				return paths, ok, err
-			}
+		if paths, ok, err := classifyGitDir(ctx, dir); ok || err != nil {
+			return paths, ok, err
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
 			return gitPaths{}, false, nil
-		}
-		dir = parent
-	}
-}
-
-// findGitBoundaryUp walks from dir to the file-system root and returns the
-// first confirmed or ambiguous Git boundary, or notBoundary when none exists.
-func findGitBoundaryUp(dir string) (gitBoundary, detectStatus) {
-	for {
-		boundary, status := detectGitBoundary(dir)
-		if status != notBoundary {
-			return boundary, status
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return gitBoundary{}, notBoundary
 		}
 		dir = parent
 	}

@@ -215,11 +215,12 @@ func TestIndexDocuments_StressNoLeakUnderRace(t *testing.T) {
 		}
 	}
 
-	fileCh := streamFiles(t.Context(), dir, files, 8)
+	fileCh, check := streamDirtyFilesAsTextIndex(t, t.Context(), dir, files, 8)
 	indexDir := t.TempDir()
 	if _, err := indexDocuments(t.Context(), indexDir, "stress_repo", dir, fileCh, 8); err != nil {
 		t.Fatalf("indexDocuments: %v", err)
 	}
+	check()
 	if got := availableWeight(readSemaphore); got != testBudget {
 		t.Fatalf("semaphore leak: got=%d want=%d", got, testBudget)
 	}
@@ -246,22 +247,15 @@ func TestReader_ContextCancelled_NoLeak(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already done before any worker starts
 
-	out := make(chan fileContent)
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		readFilesToChannel(ctx, dir, files, 4, out, nil)
-	}()
 	// Drain whatever races through (a few may have Acquired before
 	// cancel propagated). Release those weights so the accounting
-	// balances. By the time the outer wg.Wait returns, all
-	// readFilesToChannel inner workers have exited and their deferred
-	// Releases have fired — no settle delay needed.
-	for fc := range out {
+	// balances. The channel closes after every worker exits, so their
+	// deferred Releases have fired when the loop ends.
+	documents, check := streamDirtyFilesAsTextIndex(t, ctx, dir, files, 4)
+	for fc := range documents {
 		readSemaphore.Release(fc.weight)
 	}
-	wg.Wait()
+	check()
 }
 
 // TestReader_OpenFails_NoLeak — a file that passes Lstat but fails
@@ -286,15 +280,17 @@ func TestReader_OpenFails_NoLeak(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
 
-	out := make(chan fileContent, 1)
-	// readFilesToChannel closes out before returning.
-	readFilesToChannel(t.Context(), dir, []string{name}, 1, out, nil)
+	documents, check := streamDirtyFilesAsTextIndex(t, t.Context(), dir, []string{name}, 1)
+	var got []fileContent
+	for fc := range documents {
+		got = append(got, fc)
+	}
+	check()
 	// The unreadable file stays searchable by name: one document with no
 	// content and no weight.
-	for fc := range out {
-		if fc.name != name || len(fc.content) != 0 || fc.weight != 0 || fc.skipReason != seekNoBytesReason {
-			t.Fatalf("want a name-only document for the unreadable file, got %+v", fc)
-		}
+	if len(got) != 1 || got[0].name != name || len(got[0].content) != 0 || got[0].weight != 0 ||
+		got[0].skipReason != seekNoBytesReason {
+		t.Fatalf("documents=%+v, want one name-only document for the unreadable file", got)
 	}
 	// withReadSemLock's done() asserts the semaphore returned to baseline.
 }
@@ -316,16 +312,16 @@ func TestReader_SymlinkRejected_NoLeak(t *testing.T) {
 		t.Skipf("symlink unsupported on this fs: %v", err)
 	}
 
-	out := make(chan fileContent, 1)
-	// readFilesToChannel closes out before returning.
-	readFilesToChannel(t.Context(), dir, []string{"link.go"}, 1, out, nil)
-	for fc := range out {
-		t.Fatalf("expected symlink to be skipped, got %+v", fc)
+	documents, check := streamDirtyFilesAsTextIndex(t, t.Context(), dir, []string{"link.go"}, 1)
+	for fc := range documents {
+		t.Errorf("expected symlink to be skipped, got %+v", fc)
+		readSemaphore.Release(fc.weight)
 	}
+	check()
 }
 
 // TestReader_BackPressureQueuesAcquires — focused unit on
-// readFilesToChannel's contract: when concurrent in-flight bytes
+// streamDirtyFiles's contract: when concurrent in-flight bytes
 // exceed the budget, the reader pool queues Acquires correctly and
 // every file eventually delivered through the channel pipeline. The
 // CONSUMER here is a fake fan-out pool that Releases per-doc — NOT
@@ -334,7 +330,7 @@ func TestReader_SymlinkRejected_NoLeak(t *testing.T) {
 //
 // For full reader → production consumer coverage under back-pressure,
 // see TestEnsureFolderCorpusFresh_ManySmallFilesOverBudget (E2E) and
-// TestIndexDocuments_StallsHoldingMoreThanBudget (consumer-only).
+// TestIndexDocuments_RotatesBeyondTheBudget (consumer-only).
 //
 // Uses a TEST-LOCAL semaphore (swapReadSemaphoreForTest) with a
 // small budget so we can force queueing without writing hundreds of
@@ -379,8 +375,7 @@ func TestReader_BackPressureQueuesAcquires(t *testing.T) {
 		}
 	}
 
-	out := make(chan fileContent)
-	go readFilesToChannel(t.Context(), dir, files, parallelism, out, nil)
+	out, check := streamDirtyFilesAsTextIndex(t, t.Context(), dir, files, parallelism)
 
 	var indexed, concurrent, maxConcurrent int32
 	var wg sync.WaitGroup
@@ -404,6 +399,7 @@ func TestReader_BackPressureQueuesAcquires(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	check()
 
 	if got := atomic.LoadInt32(&indexed); got != numFiles {
 		t.Fatalf("saturation: expected %d files indexed, got %d", numFiles, got)
@@ -498,9 +494,9 @@ func setupPressureTest(t *testing.T, budget int64) func() {
 }
 
 // TestFolderReader_FileGrew_NoLeak — when readFolderFile detects the
-// file grew past its cap mid-read, it returns an error. The
-// readOneFolderFileStreaming caller must release the semaphore weight
-// it Acquired for the pre-read size (readWeight).
+// file grew past its cap mid-read, it returns an error. streamFolderFiles
+// must release the semaphore weight it Acquired for the pre-read size
+// (readWeight). The error is lasting, so it does not stop the read.
 func TestFolderReader_FileGrew_NoLeak(t *testing.T) {
 	done := withReadSemLock(t)
 	defer done()
@@ -529,14 +525,17 @@ func TestFolderReader_FileGrew_NoLeak(t *testing.T) {
 		ino:   ino,
 	}
 
-	out := make(chan fileContent, 1)
-	readOneFolderFileStreaming(t.Context(), c, out, nil)
-	close(out)
+	// The folder build gives streamFolderFiles the cancel of its read context.
+	readCtx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
 	// The read fails, so the file stays searchable by name only, with no
 	// content and no read weight.
 	var docs []fileContent
-	for fc := range out {
+	for fc := range streamFolderFiles(readCtx, []folderCandidate{c}, 1, cancel) {
 		docs = append(docs, fc)
+	}
+	if cause := context.Cause(readCtx); cause != nil {
+		t.Fatalf("the read stopped: %v", cause)
 	}
 	if len(docs) != 1 || docs[0].name != "grew.go" || len(docs[0].content) != 0 || docs[0].weight != 0 {
 		t.Fatalf("docs=%+v, want one name-only document with no weight", docs)

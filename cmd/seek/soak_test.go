@@ -20,8 +20,10 @@ import (
 // stats every 5 seconds.
 //
 // Asserts:
-//   - HeapAlloc peak stays bounded (< 1.5 GiB worst case),
-//   - forward progress: loop iteration counter advances every 30s,
+//   - the HeapAlloc peak stays at or below 1500 MiB (a leak guard),
+//   - forward progress: the iteration counter advances at least once in
+//     each 2 minutes (progressDeadline),
+//   - at least one iteration completes,
 //   - readSemaphore returns to its starting balance at the end.
 //
 // Run path:
@@ -106,6 +108,9 @@ func TestSoak_LargeFolderForFiveMinutes(t *testing.T) {
 	}
 
 end:
+	// A leak guard, not a resource limit (low resource use is no goal of
+	// Seek): a leak grows the heap with each iteration and passes the
+	// ceiling; a large working set stays below it.
 	const heapCeiling = 1500 * 1024 * 1024
 	if peakHeap > heapCeiling {
 		t.Errorf("peak HeapAlloc %d MiB > ceiling %d MiB", peakHeap/1024/1024, heapCeiling/1024/1024)

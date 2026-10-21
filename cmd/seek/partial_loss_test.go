@@ -15,10 +15,12 @@ package main
 // flip keeps both count and size constant while hiding a live document. Only
 // a marker set proves what a user would actually get back.
 //
-// Isolation. Every test here calls planGitTestCorpus / planFolderTestCorpus,
-// which call setTestUserCache, which t.Setenv HOME, XDG_CACHE_HOME and an
-// empty SEEK_CACHE_DIR. Each test therefore owns a private cache root, and
-// t.Setenv forbids t.Parallel, so rows never race for a corpus.
+// Isolation. Every in-process test here calls planGitTestCorpus /
+// planFolderTestCorpus, which call setTestUserCache, which t.Setenv HOME,
+// XDG_CACHE_HOME and an empty SEEK_CACHE_DIR. The process-level test gives
+// each CLI process its own SEEK_CACHE_DIR. Each test therefore owns a private
+// cache root, and t.Setenv forbids t.Parallel, so rows never race for a
+// corpus.
 
 import (
 	"bytes"
@@ -49,7 +51,7 @@ type plMarker struct {
 type plCorpus struct {
 	repoDir string
 	paths   gitPaths
-	plan    corpusPlan
+	plan    node
 
 	live []plMarker // must be findable, exactly once, at their own path
 	dead []plMarker // tombstoned; must never come back
@@ -565,6 +567,43 @@ func partialLossRows() []plRow {
 			},
 		},
 		{
+			// A delta family that lost its last shard must not stay current:
+			// the first shard tombstones the edited file, so the rest of the
+			// family hides that file with no warning.
+			name:       "uncommitted_trailing_shard_deleted",
+			ownFixture: true,
+			damage: func(t *testing.T, ctx context.Context, c *plCorpus) {
+				write := func(name, body string) {
+					t.Helper()
+					if err := os.WriteFile(filepath.Join(c.repoDir, name), []byte(body), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				write("dirty_a.go", "package main\n// PL_UNC_A\n")
+				write("dirty_b.go", "package main\n// PL_UNC_OLD\n")
+				if files, err := c.seekOnce(ctx, "PL_UNC_A"); err != nil || len(files) == 0 {
+					t.Fatalf("dirty files must be indexed before the edit: %v %v", files, err)
+				}
+				// A second edit makes a delta: a new shard with dirty_b.go and
+				// a tombstone of dirty_b.go in the first shard.
+				write("dirty_b.go", "package main\n// PL_UNC_NEW_EDIT\n")
+				if files, err := c.seekOnce(ctx, "PL_UNC_NEW_EDIT"); err != nil || len(files) == 0 {
+					t.Fatalf("the edit must be indexed before the damage: %v %v", files, err)
+				}
+				shards := repositoryShardFiles(c.plan.indexDir, repoUncommitted)
+				if len(shards) < 2 {
+					t.Fatalf("two edits must make a delta family, got %v", shards)
+				}
+				last := shards[len(shards)-1]
+				if b, err := os.ReadFile(last); err != nil || !bytes.Contains(b, []byte("PL_UNC_NEW_EDIT")) {
+					t.Fatalf("the last uncommitted shard must hold the edit (err %v)", err)
+				}
+				c.live = append(c.live, plMarker{"PL_UNC_A", "dirty_a.go"}, plMarker{"PL_UNC_NEW_EDIT", "dirty_b.go"})
+				c.dead = append(c.dead, plMarker{"PL_UNC_OLD", "dirty_b.go"})
+				plRemove(t, last)
+			},
+		},
+		{
 			// Keep the existing state-file recovery path covered.
 			name: "sidecars_cleared_only",
 			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
@@ -846,7 +885,7 @@ func TestPartialLoss_RouterContractOnRealProcess(t *testing.T) {
 		if !strings.Contains(r.stdout, "PL_CLI_STACK") {
 			t.Fatalf("%s: stdout must carry the restored match, got %q", run, r.stdout)
 		}
-		if strings.Contains(r.stdout, "Index was incomplete") {
+		if strings.Contains(r.stdout, "Index damage detected") {
 			t.Fatalf("%s: the repair notice must never reach stdout — the router "+
 				"pipes it, stdout=%q", run, r.stdout)
 		}

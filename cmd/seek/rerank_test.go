@@ -82,8 +82,8 @@ func TestPlanRerankQuery(t *testing.T) {
 	if plan.modelQuery != "Handle shell completion" {
 		t.Fatalf("model query=%q", plan.modelQuery)
 	}
-	if plan.semanticFilter != nil {
-		t.Fatal("plain query entered the semantic filter path")
+	if len(plan.filters) != 0 {
+		t.Fatal("plain query has a filter")
 	}
 	or, ok := plan.relaxedQ.(*query.Or)
 	if !ok || len(or.Children) != 3 {
@@ -123,77 +123,102 @@ func TestPlanRerankQueryAcceptsPlainProgrammingName(t *testing.T) {
 	}
 }
 
+// TestPlanRerankQueryAcceptsFileAndLanguageFilters plans descriptions with
+// positive and negative file: and lang: filters. The model reads only the
+// description. The node's semantic row selection (nodeRowSelection) applies
+// the kept filters with Zoekt to an indexed folder.
 func TestPlanRerankQueryAcceptsFileAndLanguageFilters(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	folder := t.TempDir()
+	for _, path := range []string{"cmd/seek/main.go", "internal/main.go", "docs/my file.go", "docs/other.go", "cmd/seek/main_test.go"} {
+		writeFileAt(t, folder, path, "package sample\n// request parser\n")
+	}
+	writeFileAt(t, folder, "cmd/seek/main.py", "# request parser\nprint('parse')\n")
+	plans, err := planCorpora(t.Context(), []string{folder})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%d err=%v, want one folder node", len(plans), err)
+	}
 	tests := []struct {
-		name           string
-		pattern        string
-		wantModel      string
-		allowPath      string
-		allowLanguage  string
-		rejectPath     string
-		rejectLanguage string
+		name       string
+		pattern    string
+		wantModel  string
+		allowPath  string
+		rejectPath string
 	}{
 		{
-			name:      "language",
-			pattern:   "find request parser lang:go",
-			wantModel: "find request parser",
-			allowPath: "cmd/seek/main.go", allowLanguage: "Go",
-			rejectPath: "cmd/seek/main.py", rejectLanguage: "Python",
+			name:       "language",
+			pattern:    "find request parser lang:go",
+			wantModel:  "find request parser",
+			allowPath:  "cmd/seek/main.go",
+			rejectPath: "cmd/seek/main.py",
 		},
 		{
-			name:      "file",
-			pattern:   `find request parser file:^cmd/seek/`,
-			wantModel: "find request parser",
-			allowPath: "cmd/seek/main.go", allowLanguage: "Go",
-			rejectPath: "internal/main.go", rejectLanguage: "Go",
+			name:       "file",
+			pattern:    `find request parser file:^cmd/seek/`,
+			wantModel:  "find request parser",
+			allowPath:  "cmd/seek/main.go",
+			rejectPath: "internal/main.go",
 		},
 		{
-			name:      "quoted file",
-			pattern:   `find request parser file:"my file"`,
-			wantModel: "find request parser",
-			allowPath: "docs/my file.go", allowLanguage: "Go",
-			rejectPath: "docs/other.go", rejectLanguage: "Go",
+			name:       "quoted file",
+			pattern:    `find request parser file:"my file"`,
+			wantModel:  "find request parser",
+			allowPath:  "docs/my file.go",
+			rejectPath: "docs/other.go",
 		},
 		{
-			name:      "negative file",
-			pattern:   `find request parser -file:_test\.go$`,
-			wantModel: "find request parser",
-			allowPath: "cmd/seek/main.go", allowLanguage: "Go",
-			rejectPath: "cmd/seek/main_test.go", rejectLanguage: "Go",
+			name:       "negative file",
+			pattern:    `find request parser -file:_test\.go$`,
+			wantModel:  "find request parser",
+			allowPath:  "cmd/seek/main.go",
+			rejectPath: "cmd/seek/main_test.go",
 		},
 		{
-			name:      "combined and reordered",
-			pattern:   `lang:go find file:^cmd/ request -file:_test\.go$ parser`,
-			wantModel: "find request parser",
-			allowPath: "cmd/seek/main.go", allowLanguage: "Go",
-			rejectPath: "cmd/seek/main_test.go", rejectLanguage: "Go",
+			name:       "combined and reordered",
+			pattern:    `lang:go find file:^cmd/ request -file:_test\.go$ parser`,
+			wantModel:  "find request parser",
+			allowPath:  "cmd/seek/main.go",
+			rejectPath: "cmd/seek/main_test.go",
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			raw, _, err := parseSearchQueryForms(test.pattern)
+			qp, err := planQuery(test.pattern, defaultSearchPolicy())
 			if err != nil {
 				t.Fatal(err)
 			}
-			plan, ok := planRerankQuery(raw)
-			if !ok || plan.semanticFilter == nil {
-				t.Fatalf("filtered query is not eligible: %#v", plan)
+			if qp.model == nil || len(qp.model.filters) == 0 {
+				t.Fatalf("filtered query is not eligible: %#v", qp.model)
 			}
-			if plan.modelQuery != test.wantModel {
-				t.Fatalf("model query=%q, want %q", plan.modelQuery, test.wantModel)
+			if qp.model.modelQuery != test.wantModel {
+				t.Fatalf("model query=%q, want %q", qp.model.modelQuery, test.wantModel)
 			}
-			freshRaw, _, err := parseSearchQueryForms(test.pattern)
+			freshRaw, _, _, err := parseQueryHalves(test.pattern)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !reflect.DeepEqual(raw, freshRaw) {
-				t.Fatalf("planning mutated the strict query:\nbefore=%#v\nafter=%#v", freshRaw, raw)
+			if !reflect.DeepEqual(qp.raw, freshRaw) {
+				t.Fatalf("planning mutated the strict query:\nbefore=%#v\nafter=%#v", freshRaw, qp.raw)
 			}
-			if !plan.semanticFilter.matches(test.allowPath, test.allowLanguage) {
-				t.Fatalf("filter rejected %q (%s)", test.allowPath, test.allowLanguage)
+			var selected map[string]struct{}
+			err = openNode(t.Context(), plans[0], testLexicalSearchExecution(), func(node openedNode) error {
+				read, readCtx, err := openNodeRead(t.Context(), node.plan)
+				if err != nil {
+					return err
+				}
+				defer read.close()
+				selected, err = nodeRowSelection(readCtx, read, qp, node.dirty)
+				return err
+			})
+			if err != nil {
+				t.Fatal(err)
 			}
-			if plan.semanticFilter.matches(test.rejectPath, test.rejectLanguage) {
-				t.Fatalf("filter accepted %q (%s)", test.rejectPath, test.rejectLanguage)
+			if _, ok := selected[test.allowPath]; !ok {
+				t.Fatalf("filters rejected %q: selected=%v", test.allowPath, selected)
+			}
+			if _, ok := selected[test.rejectPath]; ok {
+				t.Fatalf("filters accepted %q: selected=%v", test.rejectPath, selected)
 			}
 		})
 	}
@@ -212,7 +237,7 @@ func TestPlanRerankQueryUsesZoektNormalizedTree(t *testing.T) {
 				t.Fatal(err)
 			}
 			plan, ok := planRerankQuery(raw)
-			if !ok || plan.semanticFilter == nil || plan.modelQuery != "alpha beta" {
+			if !ok || len(plan.filters) == 0 || plan.modelQuery != "alpha beta" {
 				t.Fatalf("normalized query plan=%#v eligible=%t", plan, ok)
 			}
 		})
@@ -268,9 +293,10 @@ func TestPlanRerankQueryRejectsSyntax(t *testing.T) {
 }
 
 // TestPlanRerankQueryKeepsZoektFiltersOutOfModelText plans descriptions with
-// filters that the compiled semantic plan does not read: the model reads only
-// the description, and the per-node Zoekt mask, not this plan, applies the
-// filters to semantic retrieval (TestCLIFilterMasksSemanticRetrieval,
+// filters other than a positive lang: or file: (a negated language, sym:,
+// content:, repo:, and an or group): the model reads only the description,
+// and the plan keeps each filter for the per-node Zoekt mask,
+// which applies it to semantic retrieval (TestCLIFilterMasksSemanticRetrieval,
 // TestPassThroughAtomMasksSemantic).
 func TestPlanRerankQueryKeepsZoektFiltersOutOfModelText(t *testing.T) {
 	for _, pattern := range []string{
@@ -298,12 +324,17 @@ func TestPlanRerankQueryAcceptsRegexAndCaseAtoms(t *testing.T) {
 		"regex:alpha.*beta extra": "alpha.*beta extra",
 		"case:yes Alpha beta":     "Alpha beta",
 		`"two words" more`:        "two words more",
+		// Zoekt removes capture groups; the model text keeps the typed ones.
+		"Foo() bar":     "Foo() bar",
+		"call a::b() x": "call a::b() x",
+		"a(bx|cy)d bar": "a(bx|cy)d bar",
+		"(ab)+ bar":     "(ab)+ bar",
+		"x(yz)? bar":    "x(yz)? bar",
 	} {
 		t.Run(pattern, func(t *testing.T) {
 			plan := planFor(t, pattern)
-			if plan.modelQuery != model || !plan.semanticRetrievable() {
-				t.Fatalf("model=%q vectors=%t, want %q with vectors",
-					plan.modelQuery, plan.semanticRetrievable(), model)
+			if plan.modelQuery != model {
+				t.Fatalf("model=%q, want %q", plan.modelQuery, model)
 			}
 		})
 	}
@@ -318,13 +349,13 @@ func TestRerankModelSearchConfigClearsDisplayLimitsAndAddsInternalContext(t *tes
 		afterOnly:         true,
 		contextMatchLimit: 2,
 		contextFileLimit:  7,
-		resultFileLimit:   9,
 	}
 	got := rerankModelSearchConfig(config)
-	if got.opts.NumContextLines != searchContextLines || got.afterOnly {
+	// The model reads three lines of context on each side of a match.
+	if got.opts.NumContextLines != 3 || got.afterOnly {
 		t.Fatalf("internal context config=%+v", got)
 	}
-	if got.contextMatchLimit != 0 || got.contextFileLimit != 0 || got.resultFileLimit != 0 {
+	if got.contextMatchLimit != 0 || got.contextFileLimit != 0 {
 		t.Fatalf("internal limits=%+v, want none: the display applies them after the rank", got)
 	}
 	if config.opts.NumContextLines != 1 || !config.afterOnly || config.contextMatchLimit != 2 {
@@ -570,7 +601,7 @@ func TestRankCorpusResultsForDisplayHonorsOverride(t *testing.T) {
 	}
 }
 
-func TestRunRerankK01FallbackContracts(t *testing.T) {
+func TestRunRerankFallbackContracts(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
 	t.Chdir(t.TempDir())

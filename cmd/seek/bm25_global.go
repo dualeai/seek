@@ -131,11 +131,7 @@ func shardsAverage(shards []shardLengthStats) (float64, bool) {
 func (command *bm25Command) average() (float64, bool) {
 	command.mu.Lock()
 	defer command.mu.Unlock()
-	shards := make([]shardLengthStats, 0, len(command.shards))
-	for _, stats := range command.shards {
-		shards = append(shards, stats)
-	}
-	return shardsAverage(shards)
+	return shardsAverage(slices.Collect(maps.Values(command.shards)))
 }
 
 // shardStatsRecord reads and extends the per-node record of shard counts.
@@ -216,12 +212,13 @@ func openShardWithoutTombstones(path string) (zoekt.Searcher, error) {
 	if err != nil {
 		return nil, err
 	}
-	fd, err := unix.Dup(int(file.Fd()))
+	// The copy is close-on-exec in the same call, so a Git or ctags child
+	// that another goroutine starts never holds it.
+	fd, err := unix.FcntlInt(file.Fd(), unix.F_DUPFD_CLOEXEC, 0)
 	_ = file.Close()
 	if err != nil {
 		return nil, err
 	}
-	unix.CloseOnExec(fd)
 	renamed := os.NewFile(uintptr(fd), path+".seek-no-tombstones")
 	indexFile, err := index.NewIndexFile(renamed)
 	if err != nil {
@@ -251,9 +248,7 @@ func (record *shardStatsRecord) save(live []string) {
 	}
 	data, err := json.Marshal(kept)
 	if err == nil {
-		err = writeCacheFile(filepath.Dir(record.path), filepath.Base(record.path), string(data))
-		// The first record format keyed counts by size only.
-		_ = os.Remove(filepath.Join(filepath.Dir(record.path), ".bm25-v1"))
+		err = writeSharedCacheFile(filepath.Dir(record.path), filepath.Base(record.path), string(data))
 	}
 	if err != nil {
 		slog.Debug("Failed to write the BM25 shard record", "path", record.path, "error", err)
@@ -565,21 +560,6 @@ func bm25Fit(frequencies map[string]int, lowPriority bool, want int, printed, sc
 	return values, true
 }
 
-// bm25SharedPathSuffix returns the longest end of path components that a and
-// b share.
-func bm25SharedPathSuffix(a, b string) string {
-	i, j := len(a), len(b)
-	for i > 0 && j > 0 && a[i-1] == b[j-1] {
-		i--
-		j--
-	}
-	for i < len(a) && ((i > 0 && a[i-1] != '/') || (j > 0 && b[j-1] != '/')) {
-		i++
-		j++
-	}
-	return a[i:]
-}
-
 // bm25Query is what the rebuild reads from a strict query: the atoms whose
 // candidates Zoekt counts (index/eval.go gatherMatches, which reads no atom
 // under a Not or a type:file), each with Zoekt's term key
@@ -657,10 +637,11 @@ func compileBM25Query(q query.Q) bm25Query {
 			bq.multiLine = bq.multiLine || strings.Contains(pattern, "\n")
 			return
 		}
+		atom := bm25NameAtom{substring: pattern, caseSensitive: caseSensitive}
 		if !caseSensitive {
-			pattern = strings.ToLower(pattern)
+			atom.substring = strings.ToLower(pattern)
 		}
-		bq.names = append(bq.names, bm25NameAtom{substring: pattern, caseSensitive: caseSensitive})
+		bq.names = append(bq.names, atom)
 	}
 	var walk func(q query.Q)
 	walk = func(q query.Q) {
@@ -680,11 +661,7 @@ func compileBM25Query(q query.Q) bm25Query {
 			// size, are symbol regexp candidates (index/matchtree.go).
 			switch atom := typed.Expr.(type) {
 			case *query.Substring:
-				if utf8.RuneCountInString(atom.Pattern) < bm25NgramSize {
-					addRegexp(grafanaregexp.QuoteMeta(atom.Pattern), false, atom.CaseSensitive)
-				} else {
-					addText(atom.Pattern, false, atom.CaseSensitive)
-				}
+				addText(atom.Pattern, false, atom.CaseSensitive)
 			case *query.Regexp:
 				addRegexp(atom.RegexpString(), false, atom.CaseSensitive)
 			}
@@ -717,75 +694,37 @@ type bm25Leaf struct {
 }
 
 // bm25RegexpSubstrings returns the substrings that Zoekt searches in place of
-// r, when they equal r (index/eval.go regexpToMatchTreeRecursive).
+// r, when its match tree equals r (index/eval.go regexpToMatchTreeRecursive):
+// a literal of bm25NgramSize or more runes, or an alternation of such
+// regexps, under captures, x+ and x{1,n}. Any other form, a concatenation of
+// two or more parts included, gives a tree that Zoekt marks as not equal.
 func bm25RegexpSubstrings(r *syntax.Regexp) ([]bm25Leaf, bool) {
-	if r == nil {
-		return nil, false
-	}
-	leaves, equal, brute := bm25RegexpTree(r)
-	return leaves, equal && !brute && len(leaves) > 0
-}
-
-// bm25RegexpTree follows regexpToMatchTreeRecursive: the substring leaves of
-// the tree, whether the tree equals r, and whether it is a brute-force tree.
-func bm25RegexpTree(r *syntax.Regexp) (leaves []bm25Leaf, equal bool, brute bool) {
 	switch r.Op {
 	case syntax.OpLiteral:
 		if len(r.Rune) >= bm25NgramSize {
-			return []bm25Leaf{{text: string(r.Rune), caseSensitive: r.Flags&syntax.FoldCase == 0}}, true, false
+			return []bm25Leaf{{text: string(r.Rune), caseSensitive: r.Flags&syntax.FoldCase == 0}}, true
 		}
 	case syntax.OpCapture, syntax.OpPlus:
-		return bm25RegexpTree(r.Sub[0])
+		return bm25RegexpSubstrings(r.Sub[0])
 	case syntax.OpRepeat:
 		if r.Min == 1 {
-			return bm25RegexpTree(r.Sub[0])
-		}
-		if r.Min > 1 {
-			leaves, _, brute := bm25RegexpTree(r.Sub[0])
-			return leaves, false, brute
+			return bm25RegexpSubstrings(r.Sub[0])
 		}
 	case syntax.OpConcat, syntax.OpAlternate:
-		type subtree struct {
-			leaves []bm25Leaf
-			brute  bool
+		if r.Op == syntax.OpConcat && len(r.Sub) != 1 {
+			return nil, false
 		}
-		equal = true
-		subtrees := make([]subtree, 0, len(r.Sub))
+		var leaves []bm25Leaf
 		for _, sub := range r.Sub {
-			subLeaves, subEqual, subBrute := bm25RegexpTree(sub)
-			equal = equal && subEqual
-			subtrees = append(subtrees, subtree{subLeaves, subBrute})
+			subLeaves, ok := bm25RegexpSubstrings(sub)
+			if !ok {
+				return nil, false
+			}
+			leaves = append(leaves, subLeaves...)
 		}
-		if r.Op == syntax.OpConcat {
-			if len(subtrees) > 1 {
-				equal = false
-			}
-			var kept []subtree
-			for _, sub := range subtrees {
-				if !sub.brute {
-					kept = append(kept, sub)
-				}
-			}
-			switch len(kept) {
-			case 0:
-				return nil, equal, true
-			case 1:
-				return kept[0].leaves, equal, false
-			}
-			for _, sub := range kept {
-				leaves = append(leaves, sub.leaves...)
-			}
-			return leaves, equal, false
-		}
-		for _, sub := range subtrees {
-			if sub.brute {
-				return nil, equal, true
-			}
-			leaves = append(leaves, sub.leaves...)
-		}
-		return leaves, equal, false
+		return leaves, len(leaves) > 0
 	}
-	return nil, false, true
+	return nil, false
 }
 
 // contentKey returns Zoekt's term key of a content candidate with text, and
@@ -912,7 +851,7 @@ func (atom bm25NameAtom) candidates(name string) ([]bm25Candidate, bool) {
 		if !bm25ASCII(name) {
 			// Lowercasing can change the byte length of a rune, so the
 			// offsets of the lowered name are not the name's: fold case in a
-			// regexp.
+			// regexp. Only a non-ASCII name pays for the compile.
 			folded, err := grafanaregexp.Compile("(?i)" + grafanaregexp.QuoteMeta(atom.substring))
 			if err != nil {
 				return nil, false
@@ -944,16 +883,6 @@ func bm25ASCII(name string) bool {
 	return true
 }
 
-// matches returns the term keys of the atom's matches in name.
-func (atom bm25NameAtom) matches(name string) []string {
-	found, _ := atom.candidates(name)
-	keys := make([]string, len(found))
-	for index, candidate := range found {
-		keys[index] = candidate.key
-	}
-	return keys
-}
-
 // lineFrequencies returns the splits of one matched line into term
 // frequencies. A match on a symbol counts five, and Zoekt does not mark it on
 // the fragment, so the line's own BM25 score (line length over 100,
@@ -980,6 +909,7 @@ func (bq bm25Query) lineFrequencies(line zoekt.LineMatch, pieceKeys map[uint32]s
 	if len(counts) == 0 {
 		return nil, false
 	}
+	// A sized slice: this runs for every matched line.
 	terms := make([]string, 0, len(counts))
 	for term := range counts {
 		terms = append(terms, term)
@@ -1155,10 +1085,10 @@ func solveBM25LengthRatio(frequencies []int, score float64) (float64, bool) {
 	return (low + high) / 2, true
 }
 
-// bm25Rescore returns the score of a hit under the global average, and false
-// for a hit with no parts (Zoekt's score stays).
-func bm25Rescore(file zoekt.FileMatch, average float64) (float64, bool) {
-	encoded, ok := strings.CutPrefix(file.Debug, bm25PartsPrefix)
+// bm25Rescore returns the score of a hit under the global average from the
+// hit's Debug field, and false for a hit with no parts (Zoekt's score stays).
+func bm25Rescore(debug string, average float64) (float64, bool) {
+	encoded, ok := strings.CutPrefix(debug, bm25PartsPrefix)
 	if !ok {
 		return 0, false
 	}
@@ -1180,26 +1110,30 @@ func bm25Rescore(file zoekt.FileMatch, average float64) (float64, bool) {
 	return bm25Score(length/average, frequencies), true
 }
 
-// logInPlace logs the in-place rescore of a one-node command.
-func (command *bm25Command) logInPlace() {
-	if command.final.Load() {
-		average, _ := command.average()
-		kept := command.kept.Load()
-		slog.Debug("Rescored strict hits with the global average", "hits", command.rebuilt.Load()+kept, "kept", kept, "average", average, "in_place", true)
+// rescoreAverage returns the global average for a rescore of the strict hits,
+// and false when no rescore is due: the command has counts of fewer than two
+// shards, or a one-node command rescored its hits in place. It logs the
+// in-place rescore.
+func (command *bm25Command) rescoreAverage() (float64, bool) {
+	average, ok := command.average()
+	if !command.final.Load() {
+		return average, ok
 	}
+	kept := command.kept.Load()
+	slog.Debug("Rescored strict hits with the global average", "hits", command.rebuilt.Load()+kept, "kept", kept, "average", average, "in_place", true)
+	return 0, false
 }
 
 // rescoreStrictResults gives each strict result its score under the global
 // average, before the merge orders them.
 func rescoreStrictResults(results []corpusSearchResult, command *bm25Command) {
-	average, ok := command.average()
-	if !ok || command.final.Load() {
-		command.logInPlace()
+	average, ok := command.rescoreAverage()
+	if !ok {
 		return
 	}
 	kept := 0
 	for index := range results {
-		if score, ok := bm25Rescore(results[index].file, average); ok {
+		if score, ok := bm25Rescore(results[index].file.Debug, average); ok {
 			results[index].file.Score = score
 		} else {
 			kept++
@@ -1210,16 +1144,15 @@ func rescoreStrictResults(results []corpusSearchResult, command *bm25Command) {
 
 // rescoreStrictHits does the same for the strict hits of a description.
 func rescoreStrictHits(hits nodeHits, command *bm25Command) {
-	average, ok := command.average()
-	if !ok || command.final.Load() {
-		command.logInPlace()
+	average, ok := command.rescoreAverage()
+	if !ok {
 		return
 	}
 	kept := 0
 	for index := range hits {
 		switch {
 		case hits[index].strict:
-			if score, ok := bm25Rescore(hits[index].display.file, average); ok {
+			if score, ok := bm25Rescore(hits[index].display.file.Debug, average); ok {
 				hits[index].score = float32(score)
 				hits[index].display.file.Score = score
 			} else {
@@ -1228,7 +1161,7 @@ func rescoreStrictHits(hits nodeHits, command *bm25Command) {
 		case hits[index].lexical:
 			// A relaxed hit of a description: its lexical rank takes the
 			// same average.
-			if score, ok := bm25Rescore(zoekt.FileMatch{Debug: hits[index].lexicalParts}, average); ok {
+			if score, ok := bm25Rescore(hits[index].lexicalParts, average); ok {
 				hits[index].score = float32(score)
 			} else {
 				kept++

@@ -20,7 +20,7 @@ const (
 // querySyntax is one row of the query support table. The table covers every
 // spelling that the pinned Zoekt parser accepts, and the Seek-only forms.
 type querySyntax struct {
-	// id is the row ID in the README table (T01-T41).
+	// id is the row ID (T01-T41).
 	id       string
 	spelling string
 	role     queryRole
@@ -29,23 +29,24 @@ type querySyntax struct {
 	example string
 }
 
-// querySupport is the one support table of descriptive search. The planner
-// gives every row its role from Zoekt's parsed tree (TestQuerySupportRowsRoute).
+// querySupport is the support table of descriptive search, kept as test data:
+// the planner gives every row its role from Zoekt's parsed tree
+// (TestQuerySupportRowsRoute).
 var querySupport = []querySyntax{
 	{"T01", "bare word", roleDescription, "Matches the file name or the content.", "parse"},
 	{"T02", "bare regular expression token", roleDescription, "The model reads the token text; the lexical half keeps the regular expression.", "parsed?"},
 	{"T03", "regex:", roleDescription, "The same atom as a bare token.", "regex:request"},
 	{"T04", "quoted phrase", roleDescription, "The model reads the phrase; the lexical half keeps Zoekt's meaning, a regular expression of the quoted text.", `"request line"`},
 	{"T05", "quoted word", roleDescription, "The same atom as the bare word.", `"request"`},
-	{"T06", "content: (c:)", roleFilter, "Content only, applied by Zoekt.", "content:method"},
-	{"T07", "-content: (-c:)", roleFilter, "Content without the term, applied by Zoekt.", "-content:malformed"},
+	{"T06", "content: (c:)", roleFilter, "Content only, applied by Zoekt; the semantic mask applies it too.", "content:method"},
+	{"T07", "-content: (-c:)", roleFilter, "Content without the term, applied by Zoekt; the semantic mask applies it too.", "-content:malformed"},
 	{"T08", "file: (f:)", roleFilter, "Path filter; the semantic mask applies it too.", "file:server"},
 	{"T09", "-file: (-f:)", roleFilter, "Negated path filter; the semantic mask applies it too.", "-file:_test.go"},
 	{"T10", "lang:", roleFilter, "Language filter; the semantic mask applies it too.", "lang:go"},
 	{"T11", "lang: with an unknown language", roleFilter, "Zoekt pass-through: matches nothing.", "lang:nosuchlanguage"},
-	{"T12", "-lang:", roleFilter, "Files in other languages, applied by Zoekt.", "-lang:go"},
-	{"T13", "sym:", roleFilter, "Files with a matching ctags symbol, applied by Zoekt.", "sym:ParseRequest"},
-	{"T14", "-sym:", roleFilter, "Files without the symbol, applied by Zoekt.", "-sym:ParseRequest"},
+	{"T12", "-lang:", roleFilter, "Files in other languages, applied by Zoekt; the semantic mask applies it too.", "-lang:go"},
+	{"T13", "sym:", roleFilter, "Files with a matching ctags symbol, applied by Zoekt; the semantic mask applies it too.", "sym:ParseRequest"},
+	{"T14", "-sym:", roleFilter, "Files without the symbol, applied by Zoekt; the semantic mask applies it too.", "-sym:ParseRequest"},
 	{"T15", "case:yes, case:no, case:auto", roleModifier, "Parse directive: sets the case sensitivity of the atoms and leaves the tree. A negated -case: makes Zoekt's per-shard searcher panic (an upstream bug).", "case:yes"},
 	{"T16", "smart case (a capital letter)", roleDescription, "A description word that matches its case.", "Parse"},
 	{"T17", "type:file, type:filename (t:file, t:filename)", roleModifier, "Output mode: the search prints file names only. With a negated -type:, Zoekt fails the search of each node; Seek warns and skips the node.", "type:file"},
@@ -58,9 +59,9 @@ var querySupport = []querySyntax{
 	{"T24", "meta.<field>:", roleFilter, "Zoekt pass-through: Seek sets no repository metadata.", "meta.owner:x"},
 	{"T25", "or between filters", roleFilter, "Either filter. An or binds the whole query unless it is in parentheses; an or between descriptions keeps strict ranking.", "(file:server or file:tools)"},
 	{"T26", "and, not, OR", roleDescription, "Plain words, not operators: only a lowercase or is an operator.", "and"},
-	{"T27", "-word", roleFilter, "Files without the term, applied by Zoekt.", "-malformed"},
+	{"T27", "-word", roleFilter, "Files without the term, applied by Zoekt; the semantic mask applies it too.", "-malformed"},
 	{"T28", "parentheses", roleModifier, "Grouping; Zoekt flattens it.", "(alpha beta)"},
-	{"T29", "-( ... )", roleFilter, "Files that match none of the group, applied by Zoekt.", "-(file:test or lang:python)"},
+	{"T29", "-( ... )", roleFilter, "Files that match none of the group, applied by Zoekt; the semantic mask applies it too.", "-(file:test or lang:python)"},
 	{"T30", "backslash escape", roleDescription, "A literal character in a word.", `foo\.bar`},
 	{"T31", "C++, X[], X(), a::b() programming names", roleDescription, "When Zoekt rejects the query, Seek quotes each programming name and parses the query again; filters keep their meaning, and the model reads the name.", "C++"},
 	{"T32", "unknown prefix (l:go, ext:go)", roleDescription, "Not a Zoekt prefix: a plain word.", "l:go"},

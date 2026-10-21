@@ -5,11 +5,14 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
+	"time"
 )
 
 // TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable checks that a built
-// corpus with a stored state remains searchable on a warm call.
+// corpus with a stored state remains searchable on a warm call, and that the
+// warm call returns before it takes a build slot.
 func TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable(t *testing.T) {
 	if testing.Short() {
 		t.Skip("invokes Zoekt indexer + ctags subprocess")
@@ -31,13 +34,35 @@ func TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable(t *testing.T) {
 	if cached := readStateFile(plan.cacheDir); cached == "" {
 		t.Fatal("cold call did not write the state file; cache-gate test would be invalid")
 	}
-	state, err := ensureFolderCorpusFresh(ctx, plan)
+	// With every build slot held, only the warm return before the slot can
+	// answer.
+	release := holdEveryBuildSlot(t)
+	warmCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	state, err := ensureFolderCorpusFresh(warmCtx, plan)
+	cancel()
+	release()
 	if err != nil {
 		t.Fatalf("second call: %v", err)
 	}
 	if state != corpusSearchable {
 		t.Fatalf("warm call state = %v, want corpusSearchable", state)
 	}
+}
+
+// holdEveryBuildSlot takes the whole build window, so a build waits for a
+// slot; release frees it.
+func holdEveryBuildSlot(t *testing.T) (release func()) {
+	t.Helper()
+	// A slot that another test kept fails here, not at the suite timeout.
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if err := buildWindows.Acquire(ctx, buildWindowBytes); err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	release = func() { once.Do(func() { buildWindows.Release(buildWindowBytes) }) }
+	t.Cleanup(release)
+	return release
 }
 
 // TestFolderCorpusState_HighFanout_NoStallNoDrop checks that the parallel
@@ -130,6 +155,9 @@ func TestWalkDirectory_GitContentNotInStateHash(t *testing.T) {
 // End-to-end smoke: cumulative cold + warm path.
 // ---------------------------------------------------------------------
 
+// TestEnsureFolderCorpusFresh_ColdThenWarm_SearchableBoth builds a folder of
+// 25 files cold, then calls again warm: both calls give corpusSearchable, and
+// the warm call returns before it takes a build slot.
 func TestEnsureFolderCorpusFresh_ColdThenWarm_SearchableBoth(t *testing.T) {
 	if testing.Short() {
 		t.Skip("invokes Zoekt indexer + ctags subprocess")
@@ -156,7 +184,13 @@ func TestEnsureFolderCorpusFresh_ColdThenWarm_SearchableBoth(t *testing.T) {
 	if cold != corpusSearchable {
 		t.Fatalf("cold state = %v, want corpusSearchable", cold)
 	}
-	warm, err := ensureFolderCorpusFresh(ctx, plan)
+	// With every build slot held, only the warm return before the slot can
+	// answer.
+	release := holdEveryBuildSlot(t)
+	warmCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	warm, err := ensureFolderCorpusFresh(warmCtx, plan)
+	cancel()
+	release()
 	if err != nil {
 		t.Fatalf("warm: %v", err)
 	}

@@ -242,7 +242,7 @@ func (b *nativeGitBatch) read(infos []gitBlobInfo, consume func(fileContent) err
 // close ends the session. It writes the missing-blob warning once per
 // repository and command.
 func (b *nativeGitBatch) close() error {
-	if b == nil || b.finished {
+	if b.finished {
 		return nil
 	}
 	b.finished = true

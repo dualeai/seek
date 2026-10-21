@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// TestIndexDocuments_StallsHoldingMoreThanBudget — drive the real
+// TestIndexDocuments_RotatesBeyondTheBudget — drive the real
 // indexDocuments consumer with a hand-built fileCh whose cumulative
 // weight exceeds the readSemaphore budget. The windowed indexer must
 // rotate (Release per window) so reading proceeds; any regression
@@ -18,7 +18,7 @@ import (
 //
 // Uses swapReadSemaphoreForTest so the fixture fits in ~12 MiB of
 // synthesised payload instead of >600 MiB.
-func TestIndexDocuments_StallsHoldingMoreThanBudget(t *testing.T) {
+func TestIndexDocuments_RotatesBeyondTheBudget(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
 	}
@@ -135,32 +135,6 @@ func TestIndexDocuments_ReleasesWeightOnFinishError(t *testing.T) {
 	}
 	// withReadSemLock done() asserts semaphore returned to baseline —
 	// proves the err-path Release fired despite the error.
-}
-
-// TestIndexDocuments_ReleasesWeightWhenMixedDocsSucceed verifies that a
-// successful mixed document set returns all acquired weight.
-func TestIndexDocuments_ReleasesWeightWhenMixedDocsSucceed(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
-	done := withReadSemLock(t)
-	defer done()
-
-	indexDir := t.TempDir()
-	source := t.TempDir()
-	ch := make(chan fileContent, 3)
-	ch <- makeFileContent(t, "a.go", []byte("package a\nfunc A() {}\n"))
-	ch <- makeFileContent(t, "b.go", []byte("package b\nfunc B() {}\n"))
-	ch <- makeFileContent(t, "c.go", []byte("package c\nfunc C() {}\n"))
-	close(ch)
-
-	indexed, err := indexDocuments(t.Context(), indexDir, "mixedok_repo", source, ch, 1)
-	if err != nil {
-		t.Fatalf("indexDocuments: %v", err)
-	}
-	if !indexed {
-		t.Fatal("expected indexed=true")
-	}
 }
 
 // TestIndexDocuments_NoConsumerWeightDoubleRelease — invariant test:

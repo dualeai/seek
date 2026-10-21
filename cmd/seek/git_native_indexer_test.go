@@ -154,7 +154,7 @@ func TestNativeGitSHA256FullAndDelta(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	delta, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.cacheDir, plan.indexDir, target, scan)
+	delta, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, target, scan)
 	if err != nil || !eligible {
 		t.Fatalf("prepare SHA-256 delta: eligible=%t error=%v", eligible, err)
 	}
@@ -267,10 +267,10 @@ func TestNativeGitRepositoryConfigDoesNotRequireOrigin(t *testing.T) {
 
 func TestNativeGitRepositoryKeepsExplicitWebURLOpaque(t *testing.T) {
 	repository := zoekt.Repository{Name: "fallback"}
-	applyNativeGitConfig(&repository, nativeGitConfig{zoekt: map[string]string{
+	applyNativeGitConfig(&repository, nativeGitConfig{
 		"web-url":      "custom+transport://example.test/repo?view=raw",
 		"web-url-type": "github",
-	}})
+	})
 	if repository.Name != "fallback" || repository.URL != "custom+transport://example.test/repo?view=raw" ||
 		repository.CommitURLTemplate != "" || repository.FileURLTemplate != "" || repository.LineFragmentTemplate != "" {
 		t.Fatalf("provider-neutral metadata=%+v", repository)
@@ -280,7 +280,7 @@ func TestNativeGitRepositoryKeepsExplicitWebURLOpaque(t *testing.T) {
 func TestNativeGitRepositoryRejectsDirtyShardNames(t *testing.T) {
 	for _, name := range []string{"uncommitted", "Uncommitted", "uncommitted_v17", "UNCOMMITTED_vcustom"} {
 		repository := zoekt.Repository{Name: "safe-fallback"}
-		applyNativeGitConfig(&repository, nativeGitConfig{zoekt: map[string]string{"name": name}})
+		applyNativeGitConfig(&repository, nativeGitConfig{"name": name})
 		if repository.Name != "safe-fallback" {
 			t.Fatalf("configured name %q replaced safe fallback with %q", name, repository.Name)
 		}

@@ -9,7 +9,8 @@
 The benchmark always builds and validates a joined Zoekt and semantic index.
 It retains its work directory and evidence. Report-only mode still runs all
 samples and correctness checks; it disables performance gates and their minimum
-sample count.
+sample count. Every sample must use the semantic provider that Seek reports in
+the priming run. The CPU floors gate the CPU provider only.
 """
 
 from __future__ import annotations
@@ -48,9 +49,9 @@ BENCH_EPILOG = """environment:
   SEEK_BENCH_CPUS                  expected effective Go CPU count
   SEEK_BENCH_MODEL_P50_SECONDS     model p50 limit
   SEEK_BENCH_P95_SECONDS           cold joined-index p95 limit
-  SEEK_BENCH_MEAN_CPU_PERCENT      normalized mean CPU floor
-  SEEK_BENCH_MEDIAN_CPU_PERCENT    normalized median CPU floor
-  SEEK_BENCH_WINDOW_CPU_PERCENT    lowest five-second CPU floor
+  SEEK_BENCH_MEAN_CPU_PERCENT      normalized mean CPU floor (CPU provider only)
+  SEEK_BENCH_MEDIAN_CPU_PERCENT    normalized median CPU floor (CPU provider only)
+  SEEK_BENCH_WINDOW_CPU_PERCENT    lowest five-second CPU floor (CPU provider only)
 
 scheduler columns in results/runs.tsv:
   max_in_flight     highest number of concurrent model calls
@@ -254,6 +255,18 @@ def swap_used_kib() -> int:
         values = read_meminfo()
         return values.get("SwapTotal", 0) - values.get("SwapFree", 0)
     return 0
+
+
+def semantic_provider(log: str) -> str:
+    """Return the provider that Seek's calibration line names, or "unknown".
+
+    Seek logs "unset" before it builds an encoder and "selecting:<name>" while
+    it builds one. Neither names a settled provider, so both give "unknown".
+    """
+    match = re.search(r"Calibrating semantic inference concurrency.*provider=(\S+)", log)
+    if not match or match.group(1) == "unset" or match.group(1).startswith("selecting:"):
+        return "unknown"
+    return match.group(1)
 
 
 def gpu_percent() -> float:
@@ -572,6 +585,13 @@ def main() -> int:
     if match is None:
         stop("Seek did not report its effective CPU count", 1)
     effective_cpus = positive_int("effective CPU count", match.group(1))
+    provider = semantic_provider(prime_log)
+    if provider == "unknown":
+        stop("Seek did not report its semantic provider", 1)
+    # An accelerated provider (Core ML) can run the model on the GPU or the
+    # Neural Engine, so a faster run can use less CPU. The CPU floors gate the
+    # CPU provider only; the time and swap limits gate every provider.
+    cpu_floors_apply = provider == "cpu"
     expected_cpus = os.environ.get("SEEK_BENCH_CPUS")
     if (
         expected_cpus is not None
@@ -686,7 +706,14 @@ def main() -> int:
         if (run_dir / "command.stdout").stat().st_size == 0:
             stop(f"sample {sample} returned no search result; see {run_dir}", 1)
 
-        log_lines = (run_dir / "command.stderr").read_text().splitlines()
+        sample_log = (run_dir / "command.stderr").read_text()
+        if semantic_provider(sample_log) != provider:
+            stop(
+                f"sample {sample} used provider {semantic_provider(sample_log)}, "
+                f"the prime run {provider}; see {run_dir}",
+                1,
+            )
+        log_lines = sample_log.splitlines()
         build_lines = [line for line in log_lines if 'msg="Built semantic index"' in line]
         if len(build_lines) != 1:
             stop(
@@ -864,6 +891,7 @@ def main() -> int:
 - Samples: {samples}
 - Fixed model samples: {model_samples}
 - Effective CPUs: {effective_cpus}
+- Semantic provider: {provider} (CPU floors {"enforced" if gate and cpu_floors_apply else "reported only"})
 - Query: {bench_query}
 - Fixed model-pass p50: {model_p50:.3f} s (limit {model_p50_limit:g} s)
 - Nearest-rank p95: {p95:.3f} s (limit {p95_limit:g} s)
@@ -882,7 +910,8 @@ Median and window values use changes in each live process CPU clock. Sampling ca
 omit the last part of a short child process. It can make CPU use lower, but it
 cannot make CPU use higher. The check excludes the first and last five seconds.
 The denominator is Seek's logged Go CPU limit. GPU and memory samples give
-context. They do not waive a CPU failure.
+context. With the CPU provider they do not waive a CPU failure. An accelerated
+provider can run the model off the CPU, so its CPU values are reported only.
 """
     (results_dir / "summary.md").write_text(summary)
     print(summary, end="")
@@ -897,15 +926,15 @@ context. They do not waive a CPU failure.
         )
     if p95 > p95_limit:
         failures.append(f"p95 gate failed: {p95:.3f} s > {p95_limit:g} s")
-    if mean_cpu < mean_cpu_floor:
+    if cpu_floors_apply and mean_cpu < mean_cpu_floor:
         failures.append(
             f"mean CPU gate failed: {mean_cpu:.3f}% < {mean_cpu_floor:g}%"
         )
-    if not math.isfinite(median_cpu) or median_cpu < median_cpu_floor:
+    if cpu_floors_apply and (not math.isfinite(median_cpu) or median_cpu < median_cpu_floor):
         failures.append(
             f"median CPU gate failed: {median_cpu:.3f}% < {median_cpu_floor:g}%"
         )
-    if not math.isfinite(min_window) or min_window < window_cpu_floor:
+    if cpu_floors_apply and (not math.isfinite(min_window) or min_window < window_cpu_floor):
         failures.append(
             f"five-second CPU window gate failed: {min_window:.3f}% < {window_cpu_floor:g}%"
         )

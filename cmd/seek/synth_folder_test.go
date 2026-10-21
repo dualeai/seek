@@ -17,7 +17,7 @@ import (
 // Internal invariants check: a production folder-plan regression
 // (e.g. root mismatch, cacheDir == indexDir collision) would otherwise
 // be invisible to callers that treat the plan as an opaque token.
-func planSynthCorpus(t *testing.T, root string) corpusPlan {
+func planSynthCorpus(t *testing.T, root string) node {
 	t.Helper()
 	info, err := os.Lstat(root)
 	if err != nil {
@@ -63,7 +63,7 @@ var synthFolderWords = []string{
 //     Callers check read weight, window rotation, and cancellation. None of
 //     them searches the generated words; the beacon tests search a separate
 //     file. The small vocabulary has few distinct trigrams, so Zoekt indexes
-//     the full content at a low cost; random printable ASCII made the callers
+//     the full content at a low cost; random printable ASCII makes the callers
 //     about 8 times slower under -race.
 //
 // Caller owns the returned path via t.TempDir(); no cleanup required.

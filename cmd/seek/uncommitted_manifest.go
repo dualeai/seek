@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"os"
@@ -62,44 +61,15 @@ func readUncommittedManifest(cacheDir, expectedState string) (uncommittedManifes
 	return manifest, manifest.Version == uncommittedManifestVersion && manifest.State == expectedState
 }
 
-// writeUncommittedManifest persists entries (sorted by name) bound to state.
-// Atomic via tmp+rename like the folder manifest.
+// writeUncommittedManifest writes entries bound to state. It does not sort
+// them: the caller gives them sorted by name, as statUncommittedCandidates
+// returns them, because the next diff merges two sorted lists.
 func writeUncommittedManifest(cacheDir, state string, entries []uncommittedManifestEntry) error {
-	sorted := make([]uncommittedManifestEntry, len(entries))
-	copy(sorted, entries)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
-
-	manifest := uncommittedManifest{
-		Version: uncommittedManifestVersion,
-		State:   state,
-		Files:   sorted,
-	}
-	path := filepath.Join(cacheDir, uncommittedManifestFileName)
-	tmp := path + ".tmp"
-	// Stream via json.Encoder + bufio.Writer instead of json.Marshal +
-	// WriteFile so peak transient allocation stays bounded for large
-	// dirty diffs. Matches writeFolderManifest pattern.
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	data, err := json.Marshal(uncommittedManifest{Version: uncommittedManifestVersion, State: state, Files: entries})
 	if err != nil {
 		return err
 	}
-	// On Rename success the tmp path is consumed; the Remove below is a
-	// no-op. On Rename failure (ENOSPC, EBUSY, etc.) we'd otherwise leave a
-	// `.tmp` orphan that future readers might trip over.
-	defer func() { _ = os.Remove(tmp) }()
-	bw := bufio.NewWriter(f)
-	if err := json.NewEncoder(bw).Encode(manifest); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := bw.Flush(); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return writeCacheFile(cacheDir, uncommittedManifestFileName, string(data))
 }
 
 func deleteUncommittedManifest(cacheDir string) {
@@ -119,11 +89,6 @@ type uncommittedCandidate struct {
 	// gone marks a path whose Lstat found no file (ENOENT, ENOTDIR). Any
 	// other Lstat error leaves a zero stat that the reader reads.
 	gone bool
-}
-
-// missing reports a candidate with no file to read.
-func (c uncommittedCandidate) missing() bool {
-	return c.gone
 }
 
 // uncommittedManifestEntries returns the manifest view of the candidates. A
@@ -165,7 +130,7 @@ func statUncommittedCandidates(repoDir string, files []string) []uncommittedCand
 			continue
 		}
 		if stat.Mode&syscall.S_IFMT != syscall.S_IFREG {
-			// Non-regular files are skipped by streamFiles too; mirror the
+			// Non-regular files are skipped by streamDirtyFiles too; mirror the
 			// exclusion here so they never appear in the manifest.
 			continue
 		}
@@ -202,7 +167,7 @@ func diffUncommittedAgainstManifest(
 		case c.name == o.Name:
 			if !uncommittedEntryMatches(o, c) {
 				changedPaths = append(changedPaths, c.name)
-				if !c.missing() {
+				if !c.gone {
 					toRead = append(toRead, c)
 				}
 			}
@@ -211,7 +176,7 @@ func diffUncommittedAgainstManifest(
 		case c.name < o.Name:
 			// A new path with no file (a tracked file deleted) holds
 			// nothing to read or tombstone.
-			if !c.missing() {
+			if !c.gone {
 				changedPaths = append(changedPaths, c.name)
 				toRead = append(toRead, c)
 			}
@@ -222,7 +187,7 @@ func diffUncommittedAgainstManifest(
 		}
 	}
 	for ; i < len(candidates); i++ {
-		if !candidates[i].missing() {
+		if !candidates[i].gone {
 			changedPaths = append(changedPaths, candidates[i].name)
 			toRead = append(toRead, candidates[i])
 		}

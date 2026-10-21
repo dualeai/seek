@@ -51,6 +51,7 @@ func TestJoinedGenerationDescriptorBindsBothIndexParts(t *testing.T) {
 	root := t.TempDir()
 	cacheDir := filepath.Join(root, "cache")
 	indexDir := filepath.Join(root, "index")
+	store := corpusStore{cacheDir: cacheDir, indexDir: indexDir}
 	for _, dir := range []string{cacheDir, indexDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
@@ -100,14 +101,14 @@ func TestJoinedGenerationDescriptorBindsBothIndexParts(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifestPath := filepath.Join(semanticDir, semanticManifestFile)
-	if !joinedGenerationMatches(cacheDir, indexDir, state, source) {
+	if !store.joinedGenerationsMatch(state, source, "") {
 		t.Fatal("the descriptor did not activate its lexical and semantic data")
 	}
 
 	if err := os.WriteFile(filepath.Join(indexDir, familyManifestFile), []byte("changed\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if joinedGenerationMatches(cacheDir, indexDir, state, source) {
+	if store.joinedGenerationsMatch(state, source, "") {
 		t.Fatal("a changed lexical family kept the joined generation active")
 	}
 	if err := os.WriteFile(filepath.Join(indexDir, familyManifestFile), family, 0o600); err != nil {
@@ -120,7 +121,7 @@ func TestJoinedGenerationDescriptorBindsBothIndexParts(t *testing.T) {
 	if err := os.WriteFile(manifestPath, []byte("damaged\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if joinedGenerationMatches(cacheDir, indexDir, state, source) {
+	if store.joinedGenerationsMatch(state, source, "") {
 		t.Fatal("a damaged semantic manifest kept the joined generation active")
 	}
 	if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
@@ -129,7 +130,7 @@ func TestJoinedGenerationDescriptorBindsBothIndexParts(t *testing.T) {
 	if err := os.Truncate(filepath.Join(semanticDir, semanticRowsFile), 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openJoinedSemanticGeneration(cacheDir, indexDir, source); err == nil {
+	if _, err := store.openJoinedSemanticGeneration(source); err == nil {
 		t.Fatal("a damaged semantic artifact opened")
 	}
 	if _, err := os.Stat(filepath.Join(cacheDir, joinedGenerationFile)); !os.IsNotExist(err) {
@@ -141,6 +142,7 @@ func TestJoinedGenerationInvalidatesDescriptorOnLazyGraphDamage(t *testing.T) {
 	root := t.TempDir()
 	cacheDir := filepath.Join(root, "cache")
 	indexDir := filepath.Join(root, "index")
+	store := corpusStore{cacheDir: cacheDir, indexDir: indexDir}
 	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +167,7 @@ func TestJoinedGenerationInvalidatesDescriptorOnLazyGraphDamage(t *testing.T) {
 	if err := os.WriteFile(graphPath, []byte("damaged"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	generation, err := openJoinedSemanticGeneration(cacheDir, indexDir, source)
+	generation, err := store.openJoinedSemanticGeneration(source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,6 +235,7 @@ func TestJoinedGenerationBindsTheOverlay(t *testing.T) {
 	root := t.TempDir()
 	cacheDir := filepath.Join(root, "cache")
 	indexDir := filepath.Join(root, "index")
+	store := corpusStore{cacheDir: cacheDir, indexDir: indexDir}
 	for _, dir := range []string{cacheDir, indexDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
@@ -249,22 +252,22 @@ func TestJoinedGenerationBindsTheOverlay(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := writeJoinedGenerations(cacheDir, indexDir, state, base, overlay); err != nil {
+	if err := store.writeJoinedGenerations(state, base, overlay); err != nil {
 		t.Fatal(err)
 	}
-	if !joinedGenerationsMatch(cacheDir, indexDir, state, base, overlay) {
+	if !store.joinedGenerationsMatch(state, base, overlay) {
 		t.Fatal("base and overlay binding does not match")
 	}
-	if joinedGenerationsMatch(cacheDir, indexDir, state, base, "") || joinedGenerationMatches(cacheDir, indexDir, state, base) {
+	if store.joinedGenerationsMatch(state, base, "") {
 		t.Fatal("a base-only read matched a binding with an overlay")
 	}
-	if joinedGenerationsMatch(cacheDir, indexDir, state, base, semanticOverlaySource("other-state")) {
+	if store.joinedGenerationsMatch(state, base, semanticOverlaySource("other-state")) {
 		t.Fatal("another state's overlay matched")
 	}
-	if err := writeJoinedGenerations(cacheDir, indexDir, state, "", overlay); err != nil {
+	if err := store.writeJoinedGenerations(state, "", overlay); err != nil {
 		t.Fatal(err)
 	}
-	if !joinedGenerationsMatch(cacheDir, indexDir, state, "", overlay) {
+	if !store.joinedGenerationsMatch(state, "", overlay) {
 		t.Fatal("an overlay-only binding does not match")
 	}
 }
@@ -307,4 +310,14 @@ func TestOldOverlayWithAGraph(t *testing.T) {
 	if len(generation.rows) != len(units) || len(generation.usearch) != 0 {
 		t.Fatalf("rows=%d usearch=%d, want %d rows and no shard", len(generation.rows), len(generation.usearch), len(units))
 	}
+}
+
+// writeJoinedGeneration binds state to source with no overlay.
+func writeJoinedGeneration(
+	cacheDir string,
+	indexDir string,
+	state string,
+	source string,
+) error {
+	return corpusStore{cacheDir: cacheDir, indexDir: indexDir}.writeJoinedGenerations(state, source, "")
 }

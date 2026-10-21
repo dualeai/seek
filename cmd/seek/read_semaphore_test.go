@@ -86,8 +86,13 @@ func TestReader_OversizeCandidate_NoSemaphoreTouch(t *testing.T) {
 		path: "/nonexistent/huge",
 		size: maxInFlightBytes + 1,
 	}
-	readOneFolderFileStreaming(ctx, c, out, nil)
+	readCtx, fail := context.WithCancelCause(ctx)
+	defer fail(nil)
+	readOneFolderFileStreaming(readCtx, c, out, fail)
 	close(out)
+	if cause := context.Cause(readCtx); cause != nil {
+		t.Fatalf("the reader reported a failure: %v", cause)
+	}
 	sent := 0
 	for document := range out {
 		sent++
@@ -117,8 +122,13 @@ func TestReader_AboveBudgetCandidate_ClampsWeight(t *testing.T) {
 	out := make(chan fileContent, 1)
 	c := folderCandidate{name: "huge", path: "/nonexistent/huge", size: readBudgetBytes + 1}
 	start := time.Now()
-	readOneFolderFileStreaming(ctx, c, out, nil)
+	readCtx, fail := context.WithCancelCause(ctx)
+	defer fail(nil)
+	readOneFolderFileStreaming(readCtx, c, out, fail)
 	close(out)
+	if cause := context.Cause(readCtx); cause != nil && ctx.Err() == nil {
+		t.Fatalf("the reader reported a failure: %v", cause)
+	}
 	if ctx.Err() != nil {
 		t.Fatalf("reader waited %v for a weight above the budget", time.Since(start))
 	}
@@ -147,8 +157,13 @@ func TestReader_BinaryPrefixSendsNameOnly(t *testing.T) {
 	}
 	before := availableWeight(readSemaphore)
 	out := make(chan fileContent, 1)
-	readOneFolderFileStreaming(t.Context(), folderCandidate{name: "model.bin", path: path, size: 64 << 20}, out, nil)
+	readCtx, fail := context.WithCancelCause(t.Context())
+	defer fail(nil)
+	readOneFolderFileStreaming(readCtx, folderCandidate{name: "model.bin", path: path, size: 64 << 20}, out, fail)
 	close(out)
+	if cause := context.Cause(readCtx); cause != nil {
+		t.Fatalf("the reader reported a failure: %v", cause)
+	}
 	var got []fileContent
 	for document := range out {
 		got = append(got, document)

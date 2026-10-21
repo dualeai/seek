@@ -64,7 +64,7 @@ func TestPlanGitCorpus_WalkAndRevParseShareID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	discovered, err := planGitCorpus(b.toGitPaths(), nil)
+	discovered, err := planGitCorpus(b, nil)
 	if err != nil {
 		t.Fatalf("planGitCorpus: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestPlanCorpora_CurrentGitDefaultDiscoversVisibleNestedGit(t *testing.T) {
 		t.Fatalf("expected parent Git plan plus visible nested Git plan, got %d: %#v", len(plans), plans)
 	}
 
-	var parentPlan, childPlan *corpusPlan
+	var parentPlan, childPlan *node
 	for i := range plans {
 		switch plans[i].root {
 		case canonicalCorpusPath(currentRepo):
@@ -526,7 +526,7 @@ func TestPlanCorpora_GitDirectoryOperandDiscoversVisibleNestedGit(t *testing.T) 
 		t.Fatalf("expected parent Git plan plus visible nested Git plan, got %d: %#v", len(plans), plans)
 	}
 
-	var parentPlan, childPlan *corpusPlan
+	var parentPlan, childPlan *node
 	for i := range plans {
 		switch plans[i].root {
 		case canonicalCorpusPath(currentRepo):
@@ -574,7 +574,7 @@ func TestPlanCorpora_GitDirectoryOperandDiscoversSubmoduleGitlink(t *testing.T) 
 		t.Fatalf("planCorpora: %v", err)
 	}
 
-	var childPlan *corpusPlan
+	var childPlan *node
 	for i := range plans {
 		if plans[i].root == canonicalCorpusPath(submoduleRoot) {
 			childPlan = &plans[i]
@@ -608,7 +608,7 @@ func TestPlanCorpora_ParentFolderAndNestedGitSubdirBroadenChildGitPlan(t *testin
 		t.Fatalf("expected parent folder plus child Git plan, got %d: %#v", len(plans), plans)
 	}
 
-	var folderPlan, gitPlan *corpusPlan
+	var folderPlan, gitPlan *node
 	for i := range plans {
 		switch plans[i].kind {
 		case corpusKindFolder:
@@ -663,7 +663,7 @@ func TestPlanCorpora_BroadenedChildGitDiscoversGrandchildOutsideOriginalScope(t 
 		t.Fatalf("planCorpora: %v", err)
 	}
 
-	var childPlan, grandchildPlan *corpusPlan
+	var childPlan, grandchildPlan *node
 	for i := range plans {
 		switch plans[i].root {
 		case canonicalCorpusPath(childRepo):

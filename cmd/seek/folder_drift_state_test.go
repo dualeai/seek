@@ -75,11 +75,12 @@ func TestFolderDrift_NextBuildIndexesTheDrift(t *testing.T) {
 	if readStateFile(plan.cacheDir) == "" {
 		t.Fatal("the next build left no state")
 	}
-	// The corpus answers for the file that arrived during the build.
+	// The corpus answers for the file that arrived during the build. The
+	// search reads the node under its read lock, as a search does.
 	if _, err := ensureFolderCorpusFreshWithExecution(ctx, plan, newExecution(&hybridTestScorer{})); err != nil {
 		t.Fatalf("warm build: %v", err)
 	}
-	files, err := executeParsedShardSearchForTest(ctx, plan.indexDir, &query.Substring{Pattern: "arrived during the build"}, defaultSearchConfig())
+	files, err := searchPlannedCorpusParsed(ctx, plan, &query.Substring{Pattern: "arrived during the build"}, defaultSearchConfig())
 	if err != nil || len(files) != 1 || files[0].FileName != "late.go" {
 		t.Fatalf("files=%v err=%v, want late.go indexed by the next build", files, err)
 	}

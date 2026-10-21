@@ -26,15 +26,15 @@ const zoektNotIndexedMarker = "NOT-INDEXED: "
 // seek keeps by name carry seekNoBytesReason, which the warning words in
 // seek's own terms.
 //
-// The check searches the index that this command opened for each plan (the
-// opened-node memo). A successful search opens every plan.
+// The check searches only the nodes that this command opened (openedNodes). A
+// search with no failed node opens every plan.
 //
 // NOTE: folder and Git scopes get no such warning. Repositories with many
 // binary files (images, archives) would print it on every search. Review this
 // if users miss skipped content in those scopes.
 func warnUnindexedFileOperands(
 	ctx context.Context,
-	plans []corpusPlan,
+	plans []node,
 	opened *openedNodes,
 	operands []string,
 	results []corpusSearchResult,
@@ -74,20 +74,19 @@ func warnUnindexedFileOperands(
 		if len(names) == 0 {
 			continue
 		}
-		if searched, ok := opened.plan(plan.id); ok {
-			checks = append(checks, markerCheck{plan: searched, dirty: dirty, names: names, paths: pending})
+		if opened.has(plan.id) {
+			checks = append(checks, markerCheck{plan: plan, dirty: dirty, names: names, paths: pending})
 		}
 	}
 
 	// Each check opens its corpus's shards again. Run them in parallel, then
 	// warn in plan order.
-	markerQuery := &query.Substring{Pattern: zoektNotIndexedMarker, Content: true, CaseSensitive: true}
 	reasons := make([][]string, len(checks))
 	var group errgroup.Group
 	group.SetLimit(runtime.GOMAXPROCS(0))
 	for i, check := range checks {
 		group.Go(func() error {
-			reasons[i] = check.reasons(ctx, markerQuery)
+			reasons[i] = check.reasons(ctx)
 			return nil
 		})
 	}
@@ -101,10 +100,10 @@ func warnUnindexedFileOperands(
 	}
 }
 
-// markerCheck holds the exact-file operands of one prepared corpus that have no
+// markerCheck holds the exact-file operands of one opened corpus that have no
 // content match: their corpus names and their paths.
 type markerCheck struct {
-	plan  corpusPlan
+	plan  node
 	dirty dirtyFileSet
 	names []string
 	paths []string
@@ -112,7 +111,8 @@ type markerCheck struct {
 
 // reasons searches the corpus for Zoekt's marker and returns, for each name,
 // Zoekt's stored reason, or "" when the file's content is searchable.
-func (check markerCheck) reasons(ctx context.Context, markerQuery query.Q) []string {
+func (check markerCheck) reasons(ctx context.Context) []string {
+	markerQuery := &query.Substring{Pattern: zoektNotIndexedMarker, Content: true, CaseSensitive: true}
 	matches, err := searchPlannedCorpusParsed(ctx, check.plan, markerQuery, defaultSearchConfig())
 	if err != nil {
 		slog.Debug("Skipped the not-indexed check", "root", check.plan.root, "error", err)
@@ -121,7 +121,7 @@ func (check markerCheck) reasons(ctx context.Context, markerQuery query.Q) []str
 	found := wrapCorpusResults(check.plan, matches)
 	reasons := make([]string, len(check.names))
 	for i, name := range check.names {
-		reasons[i], _ = unindexedReason(found, name, check.dirty.contains(name), check.paths[i])
+		reasons[i] = unindexedReason(found, name, check.dirty.contains(name), check.paths[i])
 		if reasons[i] == zoektNotIndexedMarker+"contains too many trigrams" {
 			// Seek's no-bytes reason (seekNoBytesReason), in its own words.
 			reasons[i] = zoektNotIndexedMarker + "its content is not on disk or cannot be read"
@@ -182,7 +182,7 @@ func hasContentMatch(file zoekt.FileMatch) bool {
 }
 
 // corpusFileName returns the corpus-relative name of path when plan indexes it.
-func corpusFileName(plan corpusPlan, path string) (string, bool) {
+func corpusFileName(plan node, path string) (string, bool) {
 	if plan.rootType == rootTypeFile {
 		// The root has the on-disk letter case; the typed path can differ.
 		return filepath.Base(plan.root), plan.root == path || sameFile(plan.root, path)
@@ -200,10 +200,10 @@ func corpusFileName(plan corpusPlan, path string) (string, bool) {
 }
 
 // unindexedReason returns Zoekt's stored reason when the current copy of the
-// document for name holds only the not-indexed marker. A real file can hold
-// the marker text: then its stored line has a newline or the same bytes as the
-// file on disk, and it does not count.
-func unindexedReason(results []corpusSearchResult, name string, dirty bool, path string) (string, bool) {
+// document for name holds only the not-indexed marker, and "" otherwise. A real
+// file can hold the marker text: then its stored line has a newline or the same
+// bytes as the file on disk, and it does not count.
+func unindexedReason(results []corpusSearchResult, name string, dirty bool, path string) string {
 	for _, result := range results {
 		file := result.file
 		if file.FileName != name || !currentCopy(file, dirty) {
@@ -213,9 +213,9 @@ func unindexedReason(results []corpusSearchResult, name string, dirty bool, path
 		if !ok || fileHoldsExactly(path, line) {
 			continue
 		}
-		return string(line), true
+		return string(line)
 	}
-	return "", false
+	return ""
 }
 
 // fileHoldsExactly reports whether the file on disk has exactly these bytes.

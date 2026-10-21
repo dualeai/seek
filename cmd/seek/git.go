@@ -104,14 +104,10 @@ func gitHeadTreeish(ctx context.Context, dir string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// parseGitStatusV2 parses git status --porcelain=v2 --branch --no-renames -z output.
-// With -z, ALL records (headers and entries) are NUL-terminated.
-func parseGitStatusV2(raw string) repoState {
-	return parseGitStatusV2Skipping(raw, nil)
-}
-
-// parseGitStatusV2Skipping parses like parseGitStatusV2 and drops the
-// untracked entries below the bareRepos directories from Files and RawOutput.
+// parseGitStatusV2Skipping parses git status --porcelain=v2 --branch
+// --no-renames -z output. With -z, ALL records (headers and entries) are
+// NUL-terminated. It drops the untracked entries below the bareRepos
+// directories from Files and RawOutput.
 func parseGitStatusV2Skipping(raw string, bareRepos []string) repoState {
 	state := repoState{HeadSHA: "no-head"}
 
@@ -201,14 +197,7 @@ const gitlinkMode = "160000"
 // entry. The work-tree mode tells whether a changed gitlink is still a
 // repository: a gitlink replaced by a file is content of the parent.
 func v2Field(entry string, n int) string {
-	for range n {
-		space := strings.IndexByte(entry, ' ')
-		if space < 0 {
-			return ""
-		}
-		entry = entry[space+1:]
-	}
-	field, _, _ := strings.Cut(entry, " ")
+	field, _, _ := strings.Cut(extractV2Path(entry, n), " ")
 	return field
 }
 
@@ -228,11 +217,12 @@ func gitVersionOutputAtLeast(out []byte, major, minor int) bool {
 	return maj > major || (maj == major && min >= minor)
 }
 
-// extractV2Path extracts the path from a porcelain v2 entry by skipping
-// the given number of space-separated fields.
+// extractV2Path returns the rest of a porcelain v2 entry after skipFields
+// space-separated fields, or "" when no field follows them. When skipFields
+// counts every field before the path, the rest is the path, spaces included.
 func extractV2Path(entry string, skipFields int) string {
 	idx := 0
-	for i := 0; i < skipFields; i++ {
+	for range skipFields {
 		space := strings.IndexByte(entry[idx:], ' ')
 		if space < 0 {
 			return ""

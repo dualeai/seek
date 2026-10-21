@@ -56,7 +56,13 @@ func BenchmarkCLIProcess(b *testing.B) {
 
 	const queryText = "parse request handler"
 	lexicalArgs := []string{"--lexical-only", queryText, fixture}
-	ineligibleArgs := []string{"content:parse request handler", fixture}
+	// RerankIneligibleWarm times a strict search in the cache that holds
+	// vectors: a content: filter and one description word plan no model
+	// route (support table row T34), so the command starts no model.
+	ineligibleArgs := []string{"content:parse handler", fixture}
+	if plan, err := planQuery(ineligibleArgs[0], defaultSearchPolicy()); err != nil || plan.model != nil {
+		b.Fatalf("%q plans a model route: model=%t err=%v", ineligibleArgs[0], plan.model != nil, err)
+	}
 	eligibleArgs := []string{queryText, fixture}
 	eligibleDisplayContextZeroArgs := []string{"-C", "0", queryText, fixture}
 	// The relaxed lexical query starts with one content candidate. Semantic
@@ -270,7 +276,7 @@ func BenchmarkSemanticModelPass100k(b *testing.B) {
 		len(vectors) != semanticModelBatchRows {
 		b.Fatalf("warm semantic model: vectors=%d error=%v", len(vectors), err)
 	}
-	callCPUs := semanticModelCallCPUs(b.Context(), embedder)
+	callCPUs := embedder.SemanticCallCPUs(b.Context())
 	b.ResetTimer()
 	b.StartTimer()
 
@@ -324,8 +330,8 @@ func BenchmarkLateOnDocumentTokenization_FullBatchTruncated(b *testing.B) {
 func benchmarkLateOnDocumentTokenization(b *testing.B, documentCount int) {
 	tokenizer, punctuation := openLateOnTestTokenizer(b)
 	documents := lateOnBenchmarkTruncatedDocuments(documentCount)
-	serialized, _, _, _ := serializeLateOnDocumentWithMatch(documents[0])
-	encoded, _, err := tokenizer.encode(lateOnDocumentPrefix+serialized, true, true)
+	// A limit far above one model row gives the document's full token count.
+	encoded, err := encodeLateOnDocument(tokenizer, documents[0], 1<<20)
 	if err != nil {
 		b.Fatal(err)
 	}

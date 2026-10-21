@@ -16,9 +16,6 @@ func TestDetectGitBoundary_DirForm(t *testing.T) {
 	if status != boundaryConfirmed {
 		t.Fatalf("status=%v, want boundaryConfirmed", status)
 	}
-	if b.Mode != rootTypeDirectory {
-		t.Errorf("Mode=%v, want rootTypeDirectory", b.Mode)
-	}
 	if b.RepoDir != root {
 		t.Errorf("RepoDir=%q, want %q", b.RepoDir, root)
 	}
@@ -121,9 +118,6 @@ func TestDetectGitBoundary_WorktreeRelative(t *testing.T) {
 	b, status := detectGitBoundary(worktree)
 	if status != boundaryConfirmed {
 		t.Fatalf("status=%v, want boundaryConfirmed", status)
-	}
-	if b.Mode != rootTypeWorktree {
-		t.Errorf("Mode=%v, want rootTypeWorktree", b.Mode)
 	}
 	if b.CommonDir != realGitDir {
 		t.Errorf("CommonDir=%q, want %q", b.CommonDir, realGitDir)
@@ -374,19 +368,6 @@ func TestDetectGitBoundary_LongGitdirLineConfirmed(t *testing.T) {
 	}
 	if _, status := detectGitBoundary(worktree); status != boundaryConfirmed {
 		t.Fatalf("status=%v, want boundaryConfirmed", status)
-	}
-}
-
-func TestGitBoundary_ToGitPaths(t *testing.T) {
-	root := t.TempDir()
-	writeGitTriadAt(t, filepath.Join(root, ".git"))
-	b, status := detectGitBoundary(root)
-	if status != boundaryConfirmed {
-		t.Fatalf("status=%v", status)
-	}
-	p := b.toGitPaths()
-	if p.RepoDir != b.RepoDir || p.CommonDir != b.CommonDir {
-		t.Errorf("toGitPaths()=%+v, want the boundary paths %+v", p, b)
 	}
 }
 

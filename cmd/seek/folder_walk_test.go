@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"maps"
 	"math/rand/v2"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -399,7 +400,8 @@ func TestFolderUnreadableFileInWarmFolderByName(t *testing.T) {
 
 // TestFolderUnreadableTwoFoldersWarnOnce seeds outer and outer/z with an
 // unreadable folder under each of outer/a and outer/z: only the kept node
-// (outer) warns, once, whatever the name order.
+// (outer) warns, once, whatever the name order. Each of three searches gives
+// exactly one warning.
 func TestFolderUnreadableTwoFoldersWarnOnce(t *testing.T) {
 	requireTools(t)
 	if os.Geteuid() == 0 {
@@ -419,7 +421,6 @@ func TestFolderUnreadableTwoFoldersWarnOnce(t *testing.T) {
 	}
 	setTestUserCache(t)
 	for run := range 3 {
-		unreadableFolderWarned.Clear()
 		logs := captureTestLogs(t, slog.LevelWarn)
 		graphSearch(t, marker, f.path("outer"), f.path("outer/z"))
 		var warnings int
@@ -475,5 +476,122 @@ func TestSFDatalessFlag(t *testing.T) {
 	}
 	if statDatalessFlags(0) {
 		t.Fatal("no flag is not dataless")
+	}
+}
+
+// TestFolderFileReplacedByFIFOAfterWalkDoesNotBlock replaces a walked file
+// with a FIFO just before the build opens it. The open does not block on the
+// FIFO, the build reads the file as removed, and the search finds the other
+// file. The query lists file names, so a FIFO indexed as an empty file shows.
+func TestFolderFileReplacedByFIFOAfterWalkDoesNotBlock(t *testing.T) {
+	const marker = "zqfifomarker"
+	const query = "type:file txt"
+	f := newGraphFixture(t)
+	f.graphFile("folder/a.txt", marker)
+	f.graphFile("folder/b.txt", marker)
+	setTestUserCache(t)
+	fifo := f.path("folder/a.txt")
+	saved := folderOpenFile
+	var replaced bool
+	folderOpenFile = func(path string) (*os.File, error) {
+		if filepath.Base(path) == "a.txt" && !replaced {
+			replaced = true
+			if err := os.Remove(path); err != nil {
+				return nil, err
+			}
+			if err := unix.Mkfifo(path, 0o644); err != nil {
+				return nil, err
+			}
+		}
+		return saved(path)
+	}
+	t.Cleanup(func() { folderOpenFile = saved })
+	type result struct {
+		out string
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, err := captureStdout(t, func() error { return run(t.Context(), query, []string{f.path("folder")}) })
+		done <- result{out, err}
+	}()
+	select {
+	case got := <-done:
+		if got.err != nil || !replaced || !strings.Contains(got.out, "b.txt") || strings.Contains(got.out, "a.txt") {
+			t.Fatalf("replaced=%t err=%v output:\n%s", replaced, got.err, got.out)
+		}
+	case <-time.After(10 * time.Second):
+		// Open the FIFO for writing so that the blocked open returns.
+		if writer, err := os.OpenFile(fifo, os.O_WRONLY|unix.O_NONBLOCK, 0); err == nil {
+			_ = writer.Close()
+		}
+		<-done
+		t.Fatal("the build blocked on the FIFO")
+	}
+}
+
+// TestFolderFileReplacedAfterWalkReadsAsRemoved replaces a walked file just
+// before the build opens it: with a socket, with a symlink, or with a file in
+// place of its directory. The open fails before any fstat; the build reads
+// the file as removed and the search finds the other file. The query lists
+// file names, so a file indexed by name only shows.
+func TestFolderFileReplacedAfterWalkReadsAsRemoved(t *testing.T) {
+	const marker = "zqreplacedmarker"
+	const query = "type:file txt"
+	for _, test := range []struct {
+		name    string
+		target  string
+		replace func(t *testing.T, folder string) error
+	}{
+		{name: "socket", target: "a.txt", replace: func(t *testing.T, folder string) error {
+			if err := os.Remove(filepath.Join(folder, "a.txt")); err != nil {
+				return err
+			}
+			// A relative name keeps the socket path below the 104-byte limit.
+			listener, err := net.Listen("unix", "a.txt")
+			if err == nil {
+				t.Cleanup(func() { _ = listener.Close() })
+			}
+			return err
+		}},
+		{name: "symlink", target: "a.txt", replace: func(_ *testing.T, folder string) error {
+			path := filepath.Join(folder, "a.txt")
+			if err := os.Remove(path); err != nil {
+				return err
+			}
+			return os.Symlink(filepath.Join(folder, "b.txt"), path)
+		}},
+		{name: "directory replaced by a file", target: "c.txt", replace: func(t *testing.T, folder string) error {
+			if err := os.RemoveAll(filepath.Join(folder, "sub")); err != nil {
+				return err
+			}
+			return os.WriteFile(filepath.Join(folder, "sub"), []byte("not a directory"), 0o644)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newGraphFixture(t)
+			f.graphFile("folder/a.txt", marker)
+			f.graphFile("folder/b.txt", marker)
+			f.graphFile("folder/sub/c.txt", marker)
+			setTestUserCache(t)
+			folder := f.path("folder")
+			t.Chdir(folder)
+			saved := folderOpenFile
+			var replaced bool
+			folderOpenFile = func(path string) (*os.File, error) {
+				if filepath.Base(path) == test.target && !replaced {
+					replaced = true
+					if err := test.replace(t, folder); err != nil {
+						return nil, err
+					}
+				}
+				return saved(path)
+			}
+			t.Cleanup(func() { folderOpenFile = saved })
+			out, err := captureStdout(t, func() error { return run(t.Context(), query, []string{folder}) })
+			if err != nil || !replaced || !strings.Contains(out, "b.txt") || strings.Contains(out, test.target) {
+				t.Fatalf("replaced=%t err=%v output:\n%s", replaced, err, out)
+			}
+		})
 	}
 }

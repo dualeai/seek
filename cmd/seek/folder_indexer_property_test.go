@@ -107,21 +107,19 @@ func FuzzReadOneFolderFileStreaming_Sizes(f *testing.F) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		dev, ino, mtime := fileInfoIdentity(info)
-		c := folderCandidate{
-			name:  "fuzz.bin",
-			path:  p,
-			mode:  info.Mode(),
-			size:  size,
-			mtime: mtime,
-			dev:   dev,
-			ino:   ino,
-		}
+		// The walk makes candidates with newFolderCandidate, and the build
+		// gives the reader a failure function.
+		c := newFolderCandidate("fuzz.bin", p, info)
 		out := make(chan fileContent, 1)
-		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		timeoutCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
-		readOneFolderFileStreaming(ctx, c, out, nil)
+		ctx, fail := context.WithCancelCause(timeoutCtx)
+		defer fail(nil)
+		readOneFolderFileStreaming(ctx, c, out, fail)
 		close(out)
+		if cause := context.Cause(ctx); cause != nil {
+			t.Fatalf("the read reported a failure: %v", cause)
+		}
 		sent := 0
 		// Every fuzzed size is far below the 100 MiB read-weight clamp, so a
 		// document that keeps its content weighs its size.

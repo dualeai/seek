@@ -126,8 +126,9 @@ func TestPartialCloneMissingBlobCounted(t *testing.T) {
 	}
 }
 
-// TestCountedSkipReasonsMatchZoekt indexes one document per counted reason:
-// Zoekt writes each explanation that countedSkipReasons names.
+// TestCountedSkipReasonsMatchZoekt indexes one document per counted reason
+// and reads the node: Zoekt writes each explanation that countedSkipReasons
+// names.
 func TestCountedSkipReasonsMatchZoekt(t *testing.T) {
 	requireTools(t)
 	reasons := []index.SkipReason{index.SkipReasonTooLarge, index.SkipReasonBinary, seekNoBytesReason}
@@ -140,7 +141,9 @@ func TestCountedSkipReasonsMatchZoekt(t *testing.T) {
 	if indexed, err := indexDocuments(t.Context(), indexDir, "reasons", t.TempDir(), input, 1); err != nil || !indexed {
 		t.Fatalf("indexed=%t err=%v", indexed, err)
 	}
-	files, err := executeParsedShardSearchForTest(t.Context(), indexDir, &query.Substring{Pattern: zoektNotIndexedMarker, Content: true, CaseSensitive: true}, defaultSearchConfig())
+	plan := node{cacheDir: t.TempDir(), indexDir: indexDir}
+	marker := &query.Substring{Pattern: zoektNotIndexedMarker, Content: true, CaseSensitive: true}
+	files, err := searchPlannedCorpusParsed(t.Context(), plan, marker, defaultSearchConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

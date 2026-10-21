@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -150,7 +151,7 @@ func TestGC_ThrottleGate_SkipsWhenStampFresh(t *testing.T) {
 		t.Fatalf("write stamp: %v", err)
 	}
 
-	runGC(context.Background(), gcOptions{}, defaultGCInterval)
+	runGC(context.Background(), gcOptions{})
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("stale corpus removed despite fresh stamp: %v", err)
@@ -163,7 +164,7 @@ func TestGC_ThrottleGate_RunsWhenStampMissing(t *testing.T) {
 	t.Setenv(envCacheBudget, "1")
 	dir := seedCorpus(t, root, fakeCorpusHash(2), time.Now().Add(-30*24*time.Hour))
 
-	runGC(context.Background(), gcOptions{}, defaultGCInterval)
+	runGC(context.Background(), gcOptions{})
 
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("stale corpus should be evicted: err=%v", err)
@@ -188,7 +189,7 @@ func TestGC_ThrottleGate_RunsWhenStampOld(t *testing.T) {
 		t.Fatalf("chtimes stamp: %v", err)
 	}
 
-	runGC(context.Background(), gcOptions{}, defaultGCInterval)
+	runGC(context.Background(), gcOptions{})
 
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("stale corpus should be evicted with old stamp: err=%v", err)
@@ -212,7 +213,7 @@ func TestGC_GlobalLockContention_SkipsWhenHeld(t *testing.T) {
 		t.Fatalf("hold gc.lock: %v", err)
 	}
 
-	runGC(context.Background(), gcOptions{}, defaultGCInterval)
+	runGC(context.Background(), gcOptions{})
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("stale corpus should survive when gc.lock contended: %v", err)
@@ -229,7 +230,7 @@ func TestGC_EvictsLRUOverBudget(t *testing.T) {
 	old := seedCorpus(t, root, fakeCorpusHash(5), time.Now().Add(-2*24*time.Hour))
 	recent := seedCorpus(t, root, fakeCorpusHash(6), time.Now().Add(-1*time.Hour))
 
-	runGC(context.Background(), gcOptions{}, defaultGCInterval)
+	runGC(context.Background(), gcOptions{})
 
 	if _, err := os.Stat(old); !os.IsNotExist(err) {
 		t.Fatalf("least recently used corpus should be evicted: err=%v", err)
@@ -245,7 +246,7 @@ func TestGC_KeepsOldCorpusWithinBudget(t *testing.T) {
 	root := cacheRootForTest(t)
 	dir := seedCorpus(t, root, fakeCorpusHash(6), time.Now().Add(-90*24*time.Hour))
 
-	runGC(context.Background(), gcOptions{}, defaultGCInterval)
+	runGC(context.Background(), gcOptions{})
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("an old corpus within the budget should be kept: %v", err)
@@ -263,7 +264,7 @@ func TestGC_CrashRecovery_DrainsTrash(t *testing.T) {
 		t.Fatalf("seed trash marker: %v", err)
 	}
 
-	runGC(context.Background(), gcOptions{}, defaultGCInterval)
+	runGC(context.Background(), gcOptions{})
 
 	if _, err := os.Stat(trashEntry); !os.IsNotExist(err) {
 		t.Fatalf("trash should be drained: err=%v", err)
@@ -326,7 +327,7 @@ func TestGC_BackwardCompat_NoUsedFile_UsesDirMtime(t *testing.T) {
 		t.Fatalf("plan rows = %q, want one row with AGE 15d (dir mtime)", rows)
 	}
 
-	runGC(context.Background(), gcOptions{}, defaultGCInterval)
+	runGC(context.Background(), gcOptions{})
 
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("corpus without .used should fall back to dir mtime and evict: err=%v", err)
@@ -351,7 +352,7 @@ func TestGC_PerCorpusActive_SkipsLockedCorpus(t *testing.T) {
 		t.Fatalf("hold corpus lock: %v", err)
 	}
 
-	runGC(context.Background(), gcOptions{}, defaultGCInterval)
+	runGC(context.Background(), gcOptions{})
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("locked corpus should not be evicted: %v", err)
@@ -527,8 +528,8 @@ func TestGCCmd_All_EvictsEverything(t *testing.T) {
 	requireRow(t, out, freshHash, "evicted")
 }
 
-// TestGCCmd_All_BypassesThrottle covers the audit fix: `seek gc --all`
-// (without --force) must wipe even when .last-gc is fresh.
+// TestGCCmd_All_BypassesThrottle checks that `seek gc --all` (without
+// --force) evicts every corpus even when .last-gc is fresh.
 func TestGCCmd_All_BypassesThrottle(t *testing.T) {
 	root := cacheRootForTest(t)
 	hash := fakeCorpusHash(20)
@@ -544,8 +545,8 @@ func TestGCCmd_All_BypassesThrottle(t *testing.T) {
 }
 
 // TestGCCmd_Force_PrintsLiveTable confirms the manual `seek gc --force` path
-// streams a banner + header + summary to stdout. Prevents regression to the
-// pre-fix silent behavior where users saw nothing.
+// streams a banner + header + summary to stdout, and a row for the evicted
+// corpus.
 func TestGCCmd_Force_PrintsLiveTable(t *testing.T) {
 	root := cacheRootForTest(t)
 	// Over the budget, so GC evicts every corpus that no search holds.
@@ -596,9 +597,9 @@ func TestGCCmd_LiveTable_ShowsLockedAction(t *testing.T) {
 
 // TestGCCmd_LiveTable_NoCorpora confirms a fresh cache with zero corpora
 // still prints the banner and a friendly "no corpora" line — not silence —
-// AND still stamps .last-gc. The live path ignores printGCTableBanner's
-// return and falls through to touchStamp; a regression that early-returned
-// like the dry-run caller would skip the stamp and re-run GC every search.
+// AND still stamps .last-gc. After the banner the live path goes on to
+// touchStamp; an early return, as in the dry-run caller (reportGCPlan), would
+// skip the stamp and run GC again at every search.
 func TestGCCmd_LiveTable_NoCorpora(t *testing.T) {
 	root := cacheRootForTest(t)
 	out := runGCCapture(t, "--force")
@@ -629,9 +630,8 @@ func TestGCCmd_OpportunisticPath_StaysSilent(t *testing.T) {
 }
 
 // TestGCCmd_LockContention_PrintsSkipMessage confirms the manual `seek gc
-// --force` path surfaces gc.lock contention to the user (instead of
-// returning silently — pre-fix UX bug where the user could not tell whether
-// the command did anything).
+// --force` path tells the user that another gc holds gc.lock, so a skipped
+// run does not return in silence.
 func TestGCCmd_LockContention_PrintsSkipMessage(t *testing.T) {
 	root := cacheRootForTest(t)
 	seedCorpus(t, root, fakeCorpusHash(60), time.Now().Add(-30*24*time.Hour))
@@ -652,13 +652,13 @@ func TestGCCmd_LockContention_PrintsSkipMessage(t *testing.T) {
 	}
 }
 
-// TestGCCmd_CtxCanceled_SummaryUsesProcessedCount confirms a pre-canceled
+// TestGCCmd_CtxCanceled_SummaryUsesRenderedCount confirms a pre-canceled
 // context breaks the loop before any eviction or sizing. Asserts both the
 // observable side effect (all stale corpus dirs survive on disk — the
 // strong behavior contract) and that the summary line does not claim work
-// that did not happen (regression guard for the pre-fix bug where the
-// summary used `len(entries)` instead of processedCount).
-func TestGCCmd_CtxCanceled_SummaryUsesProcessedCount(t *testing.T) {
+// that did not happen: it counts the rendered rows (gcTableStats.rendered),
+// not len(entries), and with no row it is omitted.
+func TestGCCmd_CtxCanceled_SummaryUsesRenderedCount(t *testing.T) {
 	root := cacheRootForTest(t)
 	// Over the budget, so an uncanceled run evicts every corpus.
 	t.Setenv(envCacheBudget, "1")
@@ -686,7 +686,7 @@ func TestGCCmd_CtxCanceled_SummaryUsesProcessedCount(t *testing.T) {
 		t.Fatalf("summary must not name unprocessed corpora; got:\n%s", out)
 	}
 	if strings.Contains(out, "0 corpora") {
-		t.Fatalf("summary line should be omitted when processedCount==0; got:\n%s", out)
+		t.Fatalf("summary line should be omitted when no row is rendered; got:\n%s", out)
 	}
 }
 
@@ -768,7 +768,7 @@ func TestRace_ConcurrentGCInvocations(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runGC(context.Background(), gcOptions{skipThrottle: true}, defaultGCInterval)
+			runGC(context.Background(), gcOptions{skipThrottle: true})
 		}()
 	}
 	wg.Wait()
@@ -808,7 +808,7 @@ func TestRace_GCDuringIndexing(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runGC(context.Background(), gcOptions{skipThrottle: true}, defaultGCInterval)
+		runGC(context.Background(), gcOptions{skipThrottle: true})
 	}()
 	wg.Wait()
 
@@ -1013,7 +1013,7 @@ func TestGC_FormatRoot(t *testing.T) {
 
 // TestGC_FireOpportunisticGC_FastReturn confirms the orchestration doesn't
 // wait the full timeout when the GC function returns quickly. If someone
-// removes the gcDone select arm, the caller would block until the deadline
+// removes the done select arm, the caller would block until the deadline
 // fires every time.
 func TestGC_FireOpportunisticGC_FastReturn(t *testing.T) {
 	var called atomic.Int32
@@ -1094,7 +1094,7 @@ func TestGC_RunGC_CtxCanceledBreaksLoop(t *testing.T) {
 	cancel() // pre-canceled
 
 	start := time.Now()
-	runGC(ctx, gcOptions{skipThrottle: true}, defaultGCInterval)
+	runGC(ctx, gcOptions{skipThrottle: true})
 	elapsed := time.Since(start)
 
 	// Pre-canceled ctx → loop's first ctx.Err() check trips immediately.
@@ -1227,7 +1227,7 @@ func TestGC_RunGC_CtxCanceledEmptyCorpora(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	// Must complete without panic; nothing to evict.
-	runGC(ctx, gcOptions{skipThrottle: true}, defaultGCInterval)
+	runGC(ctx, gcOptions{skipThrottle: true})
 }
 
 // TestGC_RunGC_CtxCancelMidLoop — context canceled WHILE the eviction
@@ -1250,14 +1250,14 @@ func TestGC_RunGC_CtxCancelMidLoop(t *testing.T) {
 
 	// Cancel deterministically on the FIRST observed eviction instead of
 	// racing a wall-clock timer. A fixed delay is consumed by GC setup on a
-	// loaded runner (lock, drainTrash, enumerate, sort), so it can evict
+	// loaded runner (lock, drainTrash, enumerate), so it can evict
 	// nothing before firing. Polling real progress (corpora count dropping
 	// below the seeded total) guarantees the partial-completion property at
 	// any machine speed — the tight spin observes the drop within microseconds,
 	// long before the ~100 filesystem renames a full sweep would take.
 	done := make(chan struct{})
 	go func() {
-		runGC(ctx, gcOptions{skipThrottle: true}, defaultGCInterval)
+		runGC(ctx, gcOptions{skipThrottle: true})
 		close(done)
 	}()
 poll:
@@ -1340,11 +1340,11 @@ func TestGC_IsCorpusHashName_AcceptsProductionHash(t *testing.T) {
 	}
 }
 
-// TestGC_Integration_PrepareAndSearchTouchesUsed wires the GC marker through
-// the real production path. The unit-level TestGC_TouchUsed_UpdatesMtime
-// calls touchUsed directly — it would still pass if someone deleted the
-// touchUsed(plan.cacheDir) call sites in prepareAndSearchCorpus. This test
-// fails in that scenario.
+// TestGC_Integration_PrepareAndSearchTouchesUsed checks that a warm search
+// marks its corpus as used. The first search builds, and the build also
+// touches .used, so the test ages .used and searches again: that search
+// builds nothing, and only the touch of the search path (strictNode) can
+// make .used fresh.
 func TestGC_Integration_PrepareAndSearchTouchesUsed(t *testing.T) {
 	requireTools(t)
 	resetNFSCheck(t)
@@ -1356,14 +1356,21 @@ func TestGC_Integration_PrepareAndSearchTouchesUsed(t *testing.T) {
 	if _, err := runSeekInPlannedGitCorpus(ctx, "integration_used_marker", paths, plan); err != nil {
 		t.Fatalf("runSeekInPlannedGitCorpus: %v", err)
 	}
-
 	usedPath := filepath.Join(plan.cacheDir, usedFile)
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	if err := os.Chtimes(usedPath, old, old); err != nil {
+		t.Fatalf("age .used after the build: %v", err)
+	}
+	if files, err := runSeekInPlannedGitCorpus(ctx, "integration_used_marker", paths, plan); err != nil || len(files) != 1 {
+		t.Fatalf("warm search: files=%v err=%v", files, err)
+	}
+
 	st, err := os.Stat(usedPath)
 	if err != nil {
 		t.Fatalf(".used should exist after successful search via prepareAndSearchCorpus: %v", err)
 	}
 	if time.Since(st.ModTime()) > time.Minute {
-		t.Fatalf(".used mtime stale (%v ago)", time.Since(st.ModTime()))
+		t.Fatalf("the warm search did not touch .used (%v ago)", time.Since(st.ModTime()))
 	}
 }
 
@@ -1453,7 +1460,7 @@ func TestRace_TrashDrainConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runGC(context.Background(), gcOptions{skipThrottle: true}, defaultGCInterval)
+			runGC(context.Background(), gcOptions{skipThrottle: true})
 		}()
 	}
 	wg.Wait()
@@ -1549,14 +1556,24 @@ func TestSweepAgedProviderArtifacts(t *testing.T) {
 	sweepAgedProviderArtifacts(t.Context(), nil, t.TempDir(), time.Now())
 }
 
+// TestGCDryRunReportsProviderArtifacts runs seek gc --dry-run. The plan lists
+// the aged compiled model with its count and not the fresh one, and it removes
+// nothing. A cache with no compiled model due prints no compiled-model section.
 func TestGCDryRunReportsProviderArtifacts(t *testing.T) {
 	cacheRoot := t.TempDir()
+	t.Setenv("SEEK_CACHE_DIR", cacheRoot)
 	aged := plantProviderArtifact(t, cacheRoot, "ffffffffffffffffffffffffffffffff", 30*24*time.Hour)
 	fresh := plantProviderArtifact(t, cacheRoot, "11111111111111111111111111111111", 0)
-	var out bytes.Buffer
-	reportProviderArtifactPlan(t.Context(), &out, cacheRoot, time.Now().Add(-14*24*time.Hour))
-	plan := out.String()
-	if !strings.Contains(plan, aged) {
+	dryRun := func() string {
+		t.Helper()
+		return captureStdoutGC(t, func() {
+			if err := runGCCommandCmd(t.Context(), gcCmdOptions{dryRun: true, sort: "name"}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	plan := dryRun()
+	if !strings.Contains(plan, "compiled model files to remove: 1 (") || !strings.Contains(plan, aged) {
 		t.Fatalf("the plan omits a compiled model the sweep would remove:\n%s", plan)
 	}
 	if strings.Contains(plan, fresh) {
@@ -1566,30 +1583,45 @@ func TestGCDryRunReportsProviderArtifacts(t *testing.T) {
 	if _, err := os.Stat(aged); err != nil {
 		t.Fatalf("the plan removed a compiled model: %v", err)
 	}
-	// A cache with nothing due prints nothing.
-	var empty bytes.Buffer
-	reportProviderArtifactPlan(t.Context(), &empty, t.TempDir(), time.Now())
-	if empty.Len() != 0 {
-		t.Fatalf("an empty plan printed %q", empty.String())
+	// A cache with nothing due prints no compiled-model section.
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	if empty := dryRun(); strings.Contains(empty, "compiled model files") {
+		t.Fatalf("an empty plan printed a compiled-model section:\n%s", empty)
 	}
 }
 
-func TestRunGCCollectsCompiledProviderModels(t *testing.T) {
-	// The helper is tested directly elsewhere; this proves runGC actually calls
-	// it, so removing the call site cannot pass unnoticed.
+func TestRunGCCollectsCompiledModelsAndRuntimes(t *testing.T) {
+	// The helpers are tested directly elsewhere; this proves runGC calls both
+	// sweeps with the 14-day bound, so removing a call site cannot pass
+	// unnoticed.
 	cacheRoot := t.TempDir()
 	t.Setenv("SEEK_CACHE_DIR", cacheRoot)
 	aged := plantProviderArtifact(t, cacheRoot, "22222222222222222222222222222222", 30*24*time.Hour)
+	recentModel := plantProviderArtifact(t, cacheRoot, "23232323232323232323232323232323", 24*time.Hour)
+	runtime := plantRuntime(t, cacheRoot, "0.0.1", 30*24*time.Hour)
+	recent := plantRuntime(t, cacheRoot, "0.0.2", 24*time.Hour)
 	var out bytes.Buffer
 	runGC(t.Context(), gcOptions{
 		skipThrottle: true,
 		writer:       &out,
-	}, defaultGCInterval)
+	})
 	if _, err := os.Stat(aged); !os.IsNotExist(err) {
 		t.Fatalf("runGC did not collect an aged compiled model: %v", err)
 	}
 	if !strings.Contains(out.String(), "compiled model files removed: 1 (") {
 		t.Fatalf("the collection did not report the reclaim:\n%s", out.String())
+	}
+	if _, err := os.Stat(runtime); !os.IsNotExist(err) {
+		t.Fatalf("runGC did not remove another version's old runtime: %v", err)
+	}
+	if !strings.Contains(out.String(), "retired runtimes removed: 1 (") {
+		t.Fatalf("the collection did not report the removed runtime:\n%s", out.String())
+	}
+	if _, err := os.Stat(recent); err != nil {
+		t.Fatalf("runGC removed a recent runtime: %v", err)
+	}
+	if _, err := os.Stat(recentModel); err != nil {
+		t.Fatalf("runGC removed a recent compiled model: %v", err)
 	}
 }
 
@@ -1608,12 +1640,15 @@ func TestSweepSkipsAModelAnotherSearchJustUsed(t *testing.T) {
 	}
 }
 
-func TestGCDryRunCommandListsCompiledProviderModels(t *testing.T) {
-	// reportProviderArtifactPlan is tested directly elsewhere; this proves the
-	// dry-run command calls it and removes nothing.
+func TestGCDryRunListsCompiledModelsAndRuntimes(t *testing.T) {
+	// The plans are tested directly elsewhere; this proves the dry-run command
+	// calls both with the 14-day bound and removes nothing.
 	cacheRoot := t.TempDir()
 	t.Setenv("SEEK_CACHE_DIR", cacheRoot)
 	aged := plantProviderArtifact(t, cacheRoot, "44444444444444444444444444444444", 30*24*time.Hour)
+	recentModel := plantProviderArtifact(t, cacheRoot, "45454545454545454545454545454545", 24*time.Hour)
+	runtime := plantRuntime(t, cacheRoot, "0.0.1", 30*24*time.Hour)
+	recent := plantRuntime(t, cacheRoot, "0.0.2", 24*time.Hour)
 	stdout := captureStdoutGC(t, func() {
 		if err := runGCCommandCmd(t.Context(), gcCmdOptions{dryRun: true, sort: "name"}); err != nil {
 			t.Fatal(err)
@@ -1625,10 +1660,104 @@ func TestGCDryRunCommandListsCompiledProviderModels(t *testing.T) {
 	if _, err := os.Stat(aged); err != nil {
 		t.Fatalf("the dry run removed a compiled model: %v", err)
 	}
+	if !strings.Contains(stdout, runtime) {
+		t.Fatalf("the dry run did not list a runtime it would remove:\n%s", stdout)
+	}
+	if _, err := os.Stat(runtime); err != nil {
+		t.Fatalf("the dry run removed a runtime: %v", err)
+	}
+	if strings.Contains(stdout, recent) || strings.Contains(stdout, recentModel) {
+		t.Fatalf("the dry run lists a recent runtime or compiled model:\n%s", stdout)
+	}
+}
+
+// TestGCAllRemovesEveryOtherRuntime plans and runs gc --all: a runtime of
+// another version that is one day old goes too.
+func TestGCAllRemovesEveryOtherRuntime(t *testing.T) {
+	cacheRoot := t.TempDir()
+	t.Setenv("SEEK_CACHE_DIR", cacheRoot)
+	recent := plantRuntime(t, cacheRoot, "0.0.2", 24*time.Hour)
+	stdout := captureStdoutGC(t, func() {
+		if err := runGCCommandCmd(t.Context(), gcCmdOptions{dryRun: true, all: true, sort: "name"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(stdout, recent) {
+		t.Fatalf("the --all dry run does not list a recent runtime:\n%s", stdout)
+	}
+	runGC(t.Context(), gcOptions{skipThrottle: true, evictAll: true})
+	if _, err := os.Stat(recent); !os.IsNotExist(err) {
+		t.Fatalf("gc --all kept a recent runtime of another version: %v", err)
+	}
+}
+
+// TestRetireRuntimesRenamesBeforeTheRemoval makes the removal fail part way.
+// The runtime path must be gone, and the renamed leftover waits for the next
+// sweep.
+func TestRetireRuntimesRenamesBeforeTheRemoval(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root removes a read-only directory")
+	}
+	cacheRoot := t.TempDir()
+	runtime := plantRuntime(t, cacheRoot, "0.0.1", 30*24*time.Hour)
+	locked := filepath.Join(runtime, "locked")
+	writeFixtureFile(t, filepath.Join(locked, "lib"), "x")
+	if err := os.Chmod(locked, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	leftover := filepath.Join(filepath.Dir(runtime), providerArtifactDiscardPrefix+filepath.Base(runtime))
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(leftover, "locked"), 0o700) })
+	stamp := time.Now().Add(-30 * 24 * time.Hour)
+	if err := os.Chtimes(runtime, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	sweepRetiredRuntimes(t.Context(), nil, cacheRoot, time.Now().Add(-providerArtifactMaxAge))
+	if _, err := os.Stat(runtime); !os.IsNotExist(err) {
+		t.Fatalf("a half-removed runtime stays at its path: %v", err)
+	}
+	if _, err := os.Stat(leftover); err != nil {
+		t.Fatalf("no renamed leftover: %v", err)
+	}
+}
+
+// TestRetireRuntimesSkipsARuntimeUsedAfterTheList lists an old runtime, then
+// uses it before the removal step. The step reads the age again and keeps it.
+func TestRetireRuntimesSkipsARuntimeUsedAfterTheList(t *testing.T) {
+	cacheRoot := t.TempDir()
+	runtime := plantRuntime(t, cacheRoot, "0.0.1", 30*24*time.Hour)
+	before := time.Now().Add(-providerArtifactMaxAge)
+	due := retiredRuntimes(cacheRoot, before)
+	if !slices.Contains(due, runtime) {
+		t.Fatalf("due=%v, want %s", due, runtime)
+	}
+	touchRuntimeUse(runtime)
+	var report bytes.Buffer
+	retireRuntimes(t.Context(), &report, cacheRoot, before, due)
+	if _, err := os.Stat(runtime); err != nil {
+		t.Fatalf("the sweep removed a runtime used after the list: %v", err)
+	}
+	if report.Len() > 0 {
+		t.Fatalf("report=%q, want no removed runtime", report.String())
+	}
+}
+
+// plantRuntime creates a runtime directory of another Seek version under
+// cacheRoot, ages it, and returns it.
+func plantRuntime(tb testing.TB, cacheRoot, version string, age time.Duration) string {
+	tb.Helper()
+	dir := filepath.Join(cacheRoot, rerankerDir, version, "runtime")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		tb.Fatal(err)
+	}
+	stamp := time.Now().Add(-age)
+	if err := os.Chtimes(dir, stamp, stamp); err != nil {
+		tb.Fatal(err)
+	}
+	return dir
 }
 
 // plantProviderArtifact creates a compiled model directory under cacheRoot and
-// backdates it, which five collector tests need. It returns the directory.
+// backdates it by age when age is positive. It returns the directory.
 func plantProviderArtifact(tb testing.TB, cacheRoot, key string, age time.Duration) string {
 	tb.Helper()
 	dir := filepath.Join(cacheRoot, "reranker", "coreml", "mlprogram-static", key)
@@ -1642,4 +1771,200 @@ func plantProviderArtifact(tb testing.TB, cacheRoot, key string, age time.Durati
 		}
 	}
 	return dir
+}
+
+// TestOrphanManifestTmpNames checks the temp names that the orphan sweep
+// removes: the fixed .tmp name of the family manifest, and the temp files of
+// writeSharedCacheFile (.bm25-v2, .size). The records and .state stay.
+func TestOrphanManifestTmpNames(t *testing.T) {
+	for name, want := range map[string]bool{
+		familyManifestFile + ".tmp":           true,
+		bm25StatsFile + sharedTmpInfix + "1":  true,
+		corpusSizeFile + sharedTmpInfix + "2": true,
+		bm25StatsFile:                         false,
+		corpusSizeFile:                        false,
+		stateFile:                             false,
+	} {
+		if got := isOrphanManifestTmpName(name); got != want {
+			t.Errorf("isOrphanManifestTmpName(%q) = %t, want %t", name, got, want)
+		}
+	}
+}
+
+// TestSweepCorpusOrphansRemovesOldSharedTmpFiles runs the orphan sweep on a
+// corpus that holds the temp files of killed writers: the files older than one
+// hour go; a fresh temp file and the records stay.
+func TestSweepCorpusOrphansRemovesOldSharedTmpFiles(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	old := now.Add(-2 * time.Hour)
+	write := func(name string, at time.Time) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, at, at); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	gone := []string{write(bm25StatsFile+sharedTmpInfix+"1", old), write(corpusSizeFile+sharedTmpInfix+"2", old)}
+	kept := []string{write(bm25StatsFile+sharedTmpInfix+"3", now), write(bm25StatsFile, old), write(corpusSizeFile, old)}
+	sweepCorpusOrphans(corpusDirEntry{name: "c", path: dir}, now)
+	for _, path := range gone {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("%s stays after the sweep: %v", filepath.Base(path), err)
+		}
+	}
+	for _, path := range kept {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("the sweep removed %s: %v", filepath.Base(path), err)
+		}
+	}
+}
+
+// TestSweepRetiredRuntimesKeepsThisBinarysRuntimes plans and runs the runtime
+// sweep. The sweep removes old runtimes of other versions, the old flat layout,
+// and a cut sweep's leftover. Each runtime counts by its own age. It keeps this
+// binary's runtimes, other provider caches, and recent or used runtimes. The
+// plan lists each runtime that the sweep removes. An emptied or old empty
+// version directory goes; a new empty one stays.
+func TestSweepRetiredRuntimesKeepsThisBinarysRuntimes(t *testing.T) {
+	bundle, err := lateOnRuntimeForPlatform()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	now := time.Now()
+	old := now.Add(-30 * 24 * time.Hour)
+	// dir makes root/parts with a file and ages every directory of the path.
+	dir := func(at time.Time, parts ...string) string {
+		t.Helper()
+		path := filepath.Join(append([]string{root}, parts...)...)
+		writeFixtureFile(t, filepath.Join(path, "lib"), "x")
+		for p := path; p != root; p = filepath.Dir(p) {
+			if err := os.Chtimes(p, at, at); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return path
+	}
+	// touched marks a directory as used now, as touchRuntimeUse does.
+	touched := func(path string) string {
+		t.Helper()
+		if err := os.Chtimes(path, now, now); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	kept := []string{
+		dir(old, rerankerDir, bundle.version, bundle.sha256),
+		dir(old, "semantic", "usearch", semanticUSearchAssetKey()),
+		dir(old, rerankerDir, "coreml", "mlprogram-static", "key"),
+		dir(now, rerankerDir, "0.0.2", "recent"),
+		touched(dir(old, rerankerDir, "0.0.4", "used")),
+		dir(old, rerankerDir, "otherprovider", "key"),
+	}
+	stale := dir(old, rerankerDir, "0.0.5", "stale")
+	touched(filepath.Dir(stale))
+	gone := []string{
+		stale,
+		dir(old, rerankerDir, "0.0.1", "retired"),
+		dir(old, rerankerDir, "ort-0.0.0-flat-layout"),
+		dir(old, rerankerDir, bundle.version, "retired-sha"),
+		dir(old, "semantic", "usearch", "retired"),
+		dir(now, "semantic", "usearch", providerArtifactDiscardPrefix+"cut"),
+		dir(now, rerankerDir, providerArtifactDiscardPrefix+"ort-0.0.0-cut"),
+	}
+	// An old empty version directory is no runtime, but it goes. A new one
+	// can be an install in progress, so it stays.
+	empty := filepath.Join(root, rerankerDir, "0.0.7")
+	newEmpty := filepath.Join(root, rerankerDir, "0.0.8")
+	for _, path := range []string{empty, newEmpty} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chtimes(empty, old, old); err != nil {
+		t.Fatal(err)
+	}
+	kept = append(kept, newEmpty)
+	var report bytes.Buffer
+	// The plan is the output of seek gc --dry-run on this cache.
+	t.Setenv("SEEK_CACHE_DIR", root)
+	plan := captureStdoutGC(t, func() {
+		if err := runGCCommandCmd(t.Context(), gcCmdOptions{dryRun: true, sort: "name"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	// Each runtime holds one byte, so the bytes show the size measure too.
+	if !strings.Contains(plan, "retired runtimes to remove: 7 (7B)") {
+		t.Errorf("plan=%q, want 7 runtimes (7B) to remove", plan)
+	}
+	for _, path := range gone {
+		if !strings.Contains(plan, path) {
+			t.Errorf("the plan does not list %s", path)
+		}
+	}
+	sweepRetiredRuntimes(t.Context(), &report, root, now.Add(-providerArtifactMaxAge))
+	for _, path := range kept {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("the sweep removed %s: %v", path, err)
+		}
+	}
+	for _, path := range gone {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("%s stays after the sweep: %v", path, err)
+		}
+	}
+	if !strings.Contains(report.String(), "retired runtimes removed: 7 (7B)") {
+		t.Errorf("report=%q, want 7 removed runtimes (7B)", report.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, rerankerDir, "0.0.1")); !os.IsNotExist(err) {
+		t.Errorf("the emptied version directory stays: %v", err)
+	}
+	if _, err := os.Stat(empty); !os.IsNotExist(err) {
+		t.Errorf("the old empty version directory stays: %v", err)
+	}
+}
+
+// TestRuntimeUseTouchesItsDirectory ages the installed ONNX Runtime and USearch
+// directories, then uses each runtime again. Each use must move its
+// directory's time to now. sweepRetiredRuntimes reads that time.
+func TestRuntimeUseTouchesItsDirectory(t *testing.T) {
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	bundle, err := lateOnRuntimeForPlatform()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name    string
+		install func() (string, error)
+	}{
+		{"onnx runtime", func() (string, error) { path, _, err := ensureLateOnRuntime(bundle); return path, err }},
+		{"usearch", extractSemanticUSearchRuntime},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path, err := test.install()
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := filepath.Dir(path)
+			old := time.Now().Add(-30 * 24 * time.Hour)
+			if err := os.Chtimes(dir, old, old); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := test.install(); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Stat(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if time.Since(info.ModTime()) > time.Hour {
+				t.Fatalf("directory time after a use: %v, want now", info.ModTime())
+			}
+		})
+	}
 }

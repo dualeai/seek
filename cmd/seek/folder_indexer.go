@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -78,7 +77,7 @@ func folderFamilyUsable(indexDir string) bool {
 // the publish lock. A semantic failure leaves the Zoekt family searchable.
 func ensureFolderCorpusFreshWithExecution(
 	ctx context.Context,
-	plan corpusPlan,
+	plan node,
 	execution searchExecution,
 ) (corpusIndexState, error) {
 	// A folder corpus has no commit, so the head test does not apply.
@@ -122,12 +121,7 @@ func ensureFolderCorpusFreshWithExecution(
 			if selectedCount == 0 {
 				return corpusKnownEmpty, nil
 			}
-			if hasShards && (!semanticRequired || joinedGenerationMatches(
-				plan.cacheDir,
-				plan.indexDir,
-				stateHash,
-				stateHash,
-			)) {
+			if hasShards && (!semanticRequired || plan.joinedGenerationsMatch(stateHash, stateHash, "")) {
 				return corpusSearchable, nil
 			}
 		}
@@ -142,22 +136,16 @@ func ensureFolderCorpusFreshWithExecution(
 		return corpusSearchable, err
 	}
 	defer release()
-	buildFd, acquired, err := acquireBuildLock(ctx, plan.cacheDir, plan.indexDir)
+	unlock, acquired, err := plan.lockBuild(ctx)
 	if err != nil {
 		return corpusSearchable, folderCorpusError(plan, err)
 	}
 	if !acquired {
-		// Another builder active and a usable index exists — serve current.
-		slog.Debug("Another process is indexing; serving current index")
-		return corpusSearchable, nil
+		// A peer builds and shards exist: serve the last complete index
+		// (corpusStale).
+		return corpusStale, nil
 	}
-	defer releaseLock(buildFd)
-	defer func() {
-		_ = os.Remove(filepath.Join(plan.cacheDir, stateTmpFile))
-	}()
-
-	// Repair a crash that left a half-published swap before trusting state.
-	recoverIncompleteSwap(plan.cacheDir, plan.indexDir)
+	defer unlock()
 
 	if !stateReady {
 		var err error
@@ -177,12 +165,7 @@ func ensureFolderCorpusFreshWithExecution(
 		// gate as the warm path — presence alone would accept one survivor of
 		// a torn family.
 		if (hasShards || folderFamilyUsable(plan.indexDir)) &&
-			(!semanticRequired || joinedGenerationMatches(
-				plan.cacheDir,
-				plan.indexDir,
-				stateHash,
-				stateHash,
-			)) {
+			(!semanticRequired || plan.joinedGenerationsMatch(stateHash, stateHash, "")) {
 			return corpusSearchable, nil
 		}
 	} else if latestState != cachedState {
@@ -208,12 +191,7 @@ func ensureFolderCorpusFreshWithExecution(
 		if selectedCount == 0 {
 			return corpusKnownEmpty, nil
 		}
-		if hasShards && (!semanticRequired || joinedGenerationMatches(
-			plan.cacheDir,
-			plan.indexDir,
-			stateHash,
-			stateHash,
-		)) {
+		if hasShards && (!semanticRequired || plan.joinedGenerationsMatch(stateHash, stateHash, "")) {
 			return corpusSearchable, nil
 		}
 	}
@@ -226,8 +204,18 @@ func ensureFolderCorpusFreshWithExecution(
 	if scErr != nil {
 		return corpusSearchable, folderCorpusError(plan, scErr)
 	}
-	intact := sc.matchesManifest(plan.indexDir)
-	if sc.hasShard() && !intact {
+	in := folderBuildInputs{
+		stateHash:    stateHash,
+		currentState: readStateFile(plan.cacheDir),
+		hasShard:     sc.hasShard(familyAll),
+		intact:       sc.matchesManifest(plan.indexDir),
+		vectors:      semanticRequired,
+	}
+	if in.vectors {
+		in.semanticPresent = semanticGenerationPresent(plan.indexDir, stateHash)
+	}
+	build := decideFolderBuild(in)
+	if build.tornWarn {
 		slog.Warn("Folder shard family does not match its manifest; rebuilding it in full",
 			"index_dir", plan.indexDir)
 	}
@@ -236,70 +224,60 @@ func ensureFolderCorpusFreshWithExecution(
 	// cannot have changed it. Keeping .state in that case keeps the delta base:
 	// .state alone decides whether the next build can be a delta, so deleting
 	// it turns every interrupted build into a full rebuild of a family that is
-	// still correct on disk.
+	// still correct on disk (build.keepState).
 	//
-	// This reuses the manifest result already in `intact` rather than calling
-	// familyComplete, which would read the manifest file a second time.
-	publishedFamilyUsable := sc.hasShard() && intact
 	// dropStateUnlessPublished clears the cached state only when no usable
 	// family survives. Every caller below sits before the publish.
 	dropStateUnlessPublished := func() {
-		if !publishedFamilyUsable {
+		if !build.keepState {
 			deleteStateFiles(plan.cacheDir)
 		}
 	}
-	currentState := readStateFile(plan.cacheDir)
-	needLexical := currentState != stateHash || !sc.hasShard() || !intact
-	isDelta := needLexical && currentState != "" && publishedFamilyUsable
 	semanticSource := stateHash
-	semanticPresent := semanticRequired && semanticGenerationPresent(plan.indexDir, semanticSource)
-	needSemantic := semanticRequired && !semanticPresent
 
 	// Build in a temporary directory, then publish under the lock. A delta build
 	// needs the prior shards, so seed them with hardlinks; a full build ignores
 	// them.
 	var buildDir string
-	if needLexical || needSemantic {
+	if build.lexical || build.semantic {
 		buildDir, err = newBuildDir(plan.indexDir)
 		if err != nil {
 			return corpusSearchable, folderCorpusError(plan, err)
 		}
 		defer discardBuildDir(buildDir)
 	}
-	if isDelta {
+	if build.delta {
 		if err := seedFamilyFiles(buildDir, sc.paths(familyAll)); err != nil {
 			return corpusSearchable, folderCorpusError(plan, err)
 		}
 	}
-	bp := plan
-	bp.indexDir = buildDir // Shards go here; folder state stays in plan.cacheDir.
-
-	indexedAny := !needLexical && selectedCount > 0
+	indexedAny := !build.lexical && selectedCount > 0
 	semanticBuilt := false
 	semanticStaging := filepath.Join(buildDir, "semantic")
 	var lexicalErr, semanticErr error
-	if (needLexical || needSemantic) && selectedCount > 0 {
+	if (build.lexical || build.semantic) && selectedCount > 0 {
 		if err := checkCtagsCached(); err != nil {
 			dropStateUnlessPublished()
 			return corpusSearchable, folderCorpusError(plan, err)
 		}
 	}
 	var lexicalBuild func()
-	if needLexical && selectedCount > 0 {
+	if build.lexical && selectedCount > 0 {
 		lexicalBuild = func() {
 			indexedAny, lexicalErr = indexFolderDocuments(
 				ctx,
-				bp,
+				plan,
+				buildDir,
 				repoName,
 				selected,
 				execution.resources.cpuLimit(),
-				isDelta,
-				currentState,
+				build.delta,
+				in.currentState,
 			)
 		}
 	}
 	var semanticBuild func()
-	if needSemantic && selectedCount > 0 {
+	if build.semantic && selectedCount > 0 {
 		semanticBuild = func() {
 			semanticErr = runSemanticBuild(ctx, execution.model, func(embedder semanticModel) error {
 				_, err := buildSemanticFolderGeneration(
@@ -328,14 +306,7 @@ func ensureFolderCorpusFreshWithExecution(
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return corpusSearchable, ctxErr
 		}
-		slog.Debug(
-			"Semantic folder index build failed; keeping lexical search",
-			"provider", semanticProviderName(),
-			"error", semanticErr,
-		)
-		if errors.Is(semanticErr, errDegenerateSemanticVector) {
-			rejectLateOnAcceleratedProvider(semanticErr.Error())
-		}
+		semanticBuildFailed(execution.model, "Semantic folder index build failed; keeping lexical search", semanticErr)
 	}
 
 	// The index holds the bytes each file had when the build read it, under the
@@ -349,13 +320,11 @@ func ensureFolderCorpusFreshWithExecution(
 		}
 		var activationErr error
 		if semanticBuilt {
-			activationErr = publishAndBindSemanticGeneration(
-				plan.cacheDir, plan.indexDir, stateHash, semanticSource, semanticStaging, false,
-			)
-		} else if semanticPresent {
-			activationErr = bindSemanticGeneration(
-				plan.cacheDir, plan.indexDir, stateHash, semanticSource,
-			)
+			// Validate the new generation once, then bind it.
+			activationErr = publishSemanticGeneration(plan.indexDir, semanticStaging, semanticSource, false)
+		}
+		if activationErr == nil && (semanticBuilt || in.semanticPresent) {
+			activationErr = plan.bindSemanticGenerations(stateHash, semanticSource, "")
 		}
 		if activationErr != nil {
 			semanticErr = activationErr
@@ -367,10 +336,10 @@ func ensureFolderCorpusFreshWithExecution(
 		}
 	}
 
-	if needLexical {
+	if build.lexical {
 		// Publish the shard family and state while readers are excluded by the
 		// publish lock. The joined descriptor is the last activation record.
-		if err := publishGeneration(ctx, plan.cacheDir, plan.indexDir, buildDir, familyAll, func() error {
+		if err := plan.publishGeneration(ctx, buildDir, familyAll, func() error {
 			if err := writeStateFile(plan.cacheDir, stateHash); err != nil {
 				return err
 			}
@@ -382,12 +351,7 @@ func ensureFolderCorpusFreshWithExecution(
 			}
 			return corpusSearchable, folderCorpusError(plan, err)
 		}
-	} else if semanticRequired && (needSemantic || !joinedGenerationMatches(
-		plan.cacheDir,
-		plan.indexDir,
-		stateHash,
-		semanticSource,
-	)) {
+	} else if semanticRequired && (build.semantic || !plan.joinedGenerationsMatch(stateHash, semanticSource, "")) {
 		pub, publishErr := acquirePublishLock(ctx, plan.cacheDir)
 		if publishErr != nil {
 			if errors.Is(publishErr, errCorpusEvicted) {
@@ -401,7 +365,7 @@ func ensureFolderCorpusFreshWithExecution(
 		releaseLock(pub)
 	}
 
-	if semanticErr != nil && !needLexical {
+	if semanticErr != nil && !build.lexical {
 		return corpusSearchable, nil
 	}
 
@@ -412,7 +376,7 @@ func ensureFolderCorpusFreshWithExecution(
 			slog.Debug("Failed to write folder manifest", "error", err)
 		}
 	}
-	if selectedCount == 0 || !indexedAny {
+	if !indexedAny {
 		return corpusKnownEmpty, nil
 	}
 	return corpusSearchable, nil
@@ -439,10 +403,7 @@ func (e *folderCorpusContextError) Unwrap() error {
 	return e.cause
 }
 
-func folderCorpusError(plan corpusPlan, err error) error {
-	if err == nil {
-		return nil
-	}
+func folderCorpusError(plan node, err error) error {
 	return &folderCorpusContextError{
 		root:     plan.root,
 		cacheDir: plan.cacheDir,
@@ -451,13 +412,14 @@ func folderCorpusError(plan corpusPlan, err error) error {
 	}
 }
 
-// indexFolderDocuments indexes selected into plan.indexDir: a delta on the
-// prior shards when tryDelta holds and the family has at most
-// maxFolderDeltaShards shards, else a full build. A read error that may pass
-// fails the build with a folderReadError.
+// indexFolderDocuments indexes selected into dir, the build directory: a
+// delta on the prior shards that dir holds when tryDelta holds and the family
+// has at most maxFolderDeltaShards shards, else a full build. A read error
+// that may pass fails the build with a folderReadError.
 func indexFolderDocuments(
 	ctx context.Context,
-	plan corpusPlan,
+	plan node,
+	dir string,
 	repoName string,
 	selected []folderCandidate,
 	parallelism int,
@@ -465,10 +427,9 @@ func indexFolderDocuments(
 	cachedState string,
 ) (bool, error) {
 	if tryDelta {
-		cleanEmptyShards(ctx, plan.indexDir, repoName)
-		shardCount := repositoryShardCount(plan.indexDir, repoName)
+		shardCount := repositoryShardCount(dir, repoName)
 		if shardCount > 0 && shardCount <= maxFolderDeltaShards {
-			indexedAny, err := indexFolderDocumentsDelta(ctx, plan, repoName, selected, cachedState)
+			indexedAny, err := indexFolderDocumentsDelta(ctx, plan, dir, repoName, selected, cachedState)
 			if err == nil {
 				return indexedAny, nil
 			}
@@ -486,7 +447,7 @@ func indexFolderDocuments(
 	readCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	fileCh := streamFolderFiles(readCtx, selected, parallelism, cancel)
-	indexed, err := indexDocuments(readCtx, plan.indexDir, repoName, plan.root, fileCh, parallelism)
+	indexed, err := indexDocuments(readCtx, dir, repoName, plan.root, fileCh, parallelism)
 	if readErr, ok := errors.AsType[*folderReadError](context.Cause(readCtx)); ok {
 		return false, readErr
 	}
@@ -495,12 +456,13 @@ func indexFolderDocuments(
 
 func indexFolderDocumentsDelta(
 	ctx context.Context,
-	plan corpusPlan,
+	plan node,
+	dir string,
 	repoName string,
 	selected []folderCandidate,
 	cachedState string,
 ) (bool, error) {
-	changedDocs, changedPaths, err := changedFolderDocumentsSinceCachedState(ctx, plan, repoName, selected, cachedState)
+	changedDocs, changedPaths, err := changedFolderDocumentsSinceCachedState(ctx, plan, dir, repoName, selected, cachedState)
 	if err != nil {
 		return false, err
 	}
@@ -514,12 +476,13 @@ func indexFolderDocumentsDelta(
 	// it reads the file that brings the changed size to the build's window,
 	// so the payload fits the single-builder bulk-Release contract of
 	// indexDeltaDocuments.
-	return indexDeltaDocuments(plan.indexDir, repoName, plan.root, changedDocs, folderDeltaShardMax, changedPaths)
+	return indexDeltaDocuments(dir, repoName, plan.root, changedDocs, folderDeltaShardMax, changedPaths)
 }
 
 func changedFolderDocumentsSinceCachedState(
 	ctx context.Context,
-	plan corpusPlan,
+	plan node,
+	dir string,
 	repoName string,
 	selected []folderCandidate,
 	cachedState string,
@@ -528,7 +491,7 @@ func changedFolderDocumentsSinceCachedState(
 		return changedFolderDocumentsFromManifest(selected, manifest, indexWindow(ctx))
 	}
 
-	oldChecksums, err := enumerateIndexedFolderChecksums(ctx, plan.indexDir, repoName)
+	oldChecksums, err := enumerateIndexedFolderChecksums(ctx, dir, repoName)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -658,18 +621,14 @@ func writeFolderManifest(cacheDir, state string, selected []folderCandidate) err
 	}
 	path := filepath.Join(cacheDir, folderManifestFileName)
 	tmp := path + ".tmp"
-	// Stream entries so the full encoded manifest is not held in memory.
+	// The encoder writes the encoded manifest to the file in one write. The
+	// rename publishes only a complete file.
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = os.Remove(tmp) }()
-	bw := bufio.NewWriter(f)
-	if err := json.NewEncoder(bw).Encode(manifest); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := bw.Flush(); err != nil {
+	if err := json.NewEncoder(f).Encode(manifest); err != nil {
 		_ = f.Close()
 		return err
 	}
@@ -784,7 +743,7 @@ func fileInfoIdentity(info os.FileInfo) (uint64, uint64, int64) {
 	return 0, 0, info.ModTime().UnixNano()
 }
 
-func newFolderStateHasher(plan corpusPlan) *xxhash.Digest {
+func newFolderStateHasher(plan node) *xxhash.Digest {
 	h := xxhash.New()
 	_, _ = h.WriteString(stateVersion)
 
@@ -896,70 +855,42 @@ func streamFolderFiles(
 	return out
 }
 
-// readOneFolderFileStreaming acquires readSemaphore weight for one candidate.
-// A successful send transfers release ownership to the consumer. On all other
-// paths, this function releases the weight. A cloud-only file, a file whose
-// content does not fit the index, an unreadable file, and a file that starts
-// with binary content (readContent) are sent by name only, with no weight. A
-// read error that may pass calls fail and sends nothing.
+// readOneFolderFileStreaming reads one candidate (readFolderDocument) and
+// sends its document. A file whose content the index reads (indexedBytes)
+// takes readSemaphore weight before the read. A document with content keeps
+// the weight, and a successful send transfers its release to the consumer. A
+// name-only document carries no weight: the reader releases it before the
+// send. A read error that may pass calls fail and sends nothing.
 func readOneFolderFileStreaming(
 	ctx context.Context,
 	candidate folderCandidate,
 	out chan<- fileContent,
 	fail context.CancelCauseFunc,
 ) {
-	size := candidate.size
-	if candidate.dataless {
-		// A cloud-only file is indexed by name, with no content.
-		sendNameOnly(ctx, out, candidate.name, seekNoBytesReason)
-		return
-	}
-	if !documentContentFits(size) {
-		sendNameOnly(ctx, out, candidate.name, index.SkipReasonTooLarge)
-		return
-	}
-	weight := readWeight(size)
-	if err := readSemaphore.Acquire(ctx, weight); err != nil {
-		return // ctx cancelled.
-	}
-	released := false
-	defer func() {
-		if !released {
-			readSemaphore.Release(weight)
+	weight := readWeight(candidate.indexedBytes())
+	if weight > 0 {
+		if err := readSemaphore.Acquire(ctx, weight); err != nil {
+			return // ctx cancelled.
 		}
-	}()
-
-	content, binary, err := readFolderFile(candidate)
-	if errors.Is(err, fs.ErrNotExist) {
+	}
+	doc, err := readFolderDocument(candidate)
+	if err == nil && doc.skipReason == index.SkipReasonNone {
+		doc.weight = weight
+	} else {
+		readSemaphore.Release(weight)
+	}
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
 		// Removed after the walk: the next search's delta drops it.
 		return
-	}
-	if err != nil && !folderReadIsLasting(err) {
-		if fail != nil {
-			fail(&folderReadError{path: candidate.path, err: err})
-		}
-		return
-	}
-	if err != nil {
-		// An unreadable file (permissions, a path too long to open) stays
-		// searchable by name.
-		slog.Debug("Indexing an unreadable folder file by name only", "path", candidate.path, "error", err)
-		select {
-		case out <- fileContent{name: candidate.name, skipReason: seekNoBytesReason}:
-		case <-ctx.Done():
-		}
-		return
-	}
-	if binary {
-		// No content to hold: the deferred release returns the weight.
-		sendNameOnly(ctx, out, candidate.name, index.SkipReasonBinary)
+	case err != nil:
+		fail(err)
 		return
 	}
 	select {
-	case out <- fileContent{name: candidate.name, content: content, weight: weight}:
-		released = true
+	case out <- doc:
 	case <-ctx.Done():
-		return
+		readSemaphore.Release(doc.weight)
 	}
 }
 
@@ -994,7 +925,7 @@ func readFolderDocument(candidate folderCandidate) (fileContent, error) {
 
 // folderOpenFile opens a folder file for reading; tests replace it to inject
 // read errors.
-var folderOpenFile = os.Open
+var folderOpenFile = openWorkTreeFile
 
 var errFolderFileGrew = errors.New("file grew beyond max size")
 
@@ -1010,19 +941,17 @@ func (e *folderReadError) Unwrap() error { return e.err }
 
 // folderReadIsLasting reports a read error that the next search would see
 // again: the file stays searchable by name. Permissions heal through a ctime
-// change, which the state hash sees.
+// change, which the state hash sees. ELOOP comes from the Lstat of the dirty
+// reader when a directory of the path is a symlink loop.
 func folderReadIsLasting(err error) bool {
 	return errors.Is(err, fs.ErrPermission) || errors.Is(err, errFolderFileGrew) ||
-		errors.Is(err, syscall.ENAMETOOLONG) || errors.Is(err, syscall.ELOOP) ||
-		errors.Is(err, syscall.EISDIR)
+		errors.Is(err, syscall.ENAMETOOLONG) || errors.Is(err, syscall.ELOOP)
 }
 
 // readFolderFile reads one candidate. binary is true, with no content, when the
-// file starts with binary content (readContent); the rest is not read.
+// file starts with binary content (readContent); the rest is not read. The
+// caller first checks that the size fits the index (documentContentFits).
 func readFolderFile(candidate folderCandidate) (content []byte, binary bool, err error) {
-	if !documentContentFits(candidate.size) {
-		return nil, false, fmt.Errorf("file exceeds max size")
-	}
 	file, err := folderOpenFile(candidate.path)
 	if err != nil {
 		return nil, false, err
@@ -1048,6 +977,6 @@ func readFolderFile(candidate folderCandidate) (content []byte, binary bool, err
 	return content, false, nil
 }
 
-func folderRepoName(plan corpusPlan) string {
+func folderRepoName(plan node) string {
 	return "folder_" + string(plan.id)
 }

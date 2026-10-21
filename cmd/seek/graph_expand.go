@@ -17,9 +17,9 @@ import (
 )
 
 // The graph expansion turns the resolved operands into the final nodes of a
-// search before any index build or route decision. A node is a corpus plan: a
-// folder root or a Git work tree. The expansion runs once per search, in
-// parallel, and finds each node once, keyed by the file identity of its root.
+// search before any index build or route decision. A node is a folder root or
+// a Git work tree. The expansion runs once per search, in parallel, and finds
+// each node once, keyed by the file identity of its root.
 // Each edge kind follows one rule:
 //
 //   - Folder -> Folder: the walk descends into each subdirectory. A folder
@@ -50,19 +50,19 @@ type graphExpansion struct {
 	slots   chan struct{}
 	mu      sync.Mutex
 	git     map[string]*externalGitRoot // by root identity
-	folders map[corpusID]*corpusPlan
+	folders map[corpusID]*node
 }
 
 // expandGraph returns the nodes of a search: the seed nodes and every node
 // below them, sorted by root. A failed node, a seed too, is one warning.
-func expandGraph(ctx context.Context, seeds plannedExternalOperands) ([]corpusPlan, error) {
+func expandGraph(ctx context.Context, seeds plannedExternalOperands) ([]node, error) {
 	group, gctx := errgroup.WithContext(ctx)
 	x := &graphExpansion{
 		ctx:     gctx,
 		group:   group,
 		slots:   make(chan struct{}, indexParallelism()),
 		git:     make(map[string]*externalGitRoot),
-		folders: make(map[corpusID]*corpusPlan),
+		folders: make(map[corpusID]*node),
 	}
 	for _, root := range seeds.gitRoots {
 		x.addGitNode(root.paths, root.operands)
@@ -127,30 +127,30 @@ func (x *graphExpansion) addGitNode(paths gitPaths, operands []string) {
 		return
 	}
 	x.mu.Lock()
-	node, found := x.git[key]
+	gitRoot, found := x.git[key]
 	if !found {
-		node = &externalGitRoot{paths: paths}
-		x.git[key] = node
+		gitRoot = &externalGitRoot{paths: paths}
+		x.git[key] = gitRoot
 	}
-	nodeRoot := canonicalCorpusPath(node.paths.RepoDir)
+	nodeRoot := canonicalCorpusPath(gitRoot.paths.RepoDir)
 	widened := false
 	for _, operand := range operands {
 		if rel, ok := relWithin(root, operand); ok {
 			operand = filepath.Join(nodeRoot, rel)
 		}
-		if !slices.ContainsFunc(node.operands, func(covering string) bool { return pathWithin(covering, operand) }) {
-			node.operands = append(node.operands, operand)
+		if !slices.ContainsFunc(gitRoot.operands, func(covering string) bool { return pathWithin(covering, operand) }) {
+			gitRoot.operands = append(gitRoot.operands, operand)
 			widened = true
 		}
 	}
 	// Only a wider scope can hold a child that is not added yet.
 	var children []string
 	if widened {
-		children = node.childrenInScope()
+		children = gitRoot.childrenInScope()
 	}
 	x.mu.Unlock()
 	if !found {
-		x.run(func() error { return x.expandGitNode(node) })
+		x.run(func() error { return x.expandGitNode(gitRoot) })
 	}
 	for _, child := range children {
 		x.addGitChild(nodeRoot, child)
@@ -166,8 +166,6 @@ func (x *graphExpansion) expandGitNode(node *externalGitRoot) error {
 		node.state = state
 		node.children = children
 		node.captured = true
-	} else {
-		node.failed = true
 	}
 	inScope := node.childrenInScope()
 	x.mu.Unlock()
@@ -229,9 +227,11 @@ func (x *graphExpansion) addFolderNode(root externalRoot) {
 		x.folders[plan.id] = &plan
 	}
 	x.mu.Unlock()
-	if found || plan.rootType != rootTypeDirectory {
+	if found {
 		return
 	}
+	// A file root is captured too: its read binds the vectors through the
+	// capture's state.
 	x.run(func() error {
 		capture, gitRoots, err := captureFolderNode(x.ctx, plan)
 		if err != nil {
@@ -252,22 +252,23 @@ func (x *graphExpansion) addFolderNode(root externalRoot) {
 	})
 }
 
-// plans builds one corpus plan per node. A folder seed that another folder
+// plans builds one node per root. A folder seed that another folder
 // seed's walk reaches is part of that node, so it is dropped.
-func (x *graphExpansion) plans() ([]corpusPlan, error) {
-	plans := make([]corpusPlan, 0, len(x.git)+len(x.folders))
-	for _, node := range x.git {
-		if node.failed {
+func (x *graphExpansion) plans() ([]node, error) {
+	plans := make([]node, 0, len(x.git)+len(x.folders))
+	for _, root := range x.git {
+		if !root.captured {
+			// The node failed: its capture gave one warning.
 			continue
 		}
-		plan, err := planGitCorpus(node.paths, node.operands)
+		plan, err := planGitCorpus(root.paths, root.operands)
 		if err != nil {
-			if err := x.nodeError(node.paths.RepoDir, err); err != nil {
+			if err := x.nodeError(root.paths.RepoDir, err); err != nil {
 				return nil, err
 			}
 			continue
 		}
-		plan.gitState = &capturedGitState{state: node.state}
+		plan.gitState = &capturedGitState{state: root.state}
 		plans = append(plans, plan)
 	}
 	for _, plan := range x.folders {
@@ -289,7 +290,7 @@ func (x *graphExpansion) plans() ([]corpusPlan, error) {
 // folderNodeCovered reports whether the walk of another folder node reaches
 // the root of plan: the root is below that node and below none of the
 // directories that its walk did not enter.
-func folderNodeCovered(plan corpusPlan, folders map[corpusID]*corpusPlan) bool {
+func folderNodeCovered(plan node, folders map[corpusID]*node) bool {
 	for _, other := range folders {
 		if other.id == plan.id || other.folder == nil || !pathWithin(other.root, plan.root) {
 			continue
@@ -373,10 +374,10 @@ func captureGitNode(ctx context.Context, paths gitPaths) (repoState, []string, e
 // of a Git node. It returns false and no error for a stray `.git` entry: dir
 // is plain content. An error means Git cannot use the `.git` entry.
 func classifyGitDir(ctx context.Context, dir string) (gitPaths, bool, error) {
-	boundary, status := detectGitBoundary(dir)
+	paths, status := detectGitBoundary(dir)
 	switch status {
 	case boundaryConfirmed:
-		return boundary.toGitPaths(), true, nil
+		return paths, true, nil
 	case notBoundary:
 		return gitPaths{}, false, nil
 	}
@@ -484,7 +485,7 @@ func foreignGitDir(dir string) (string, bool) {
 // dir, and holding more than its `.git` entry. A store of Git directories, or a
 // Git directory kept inside dir, is no other work tree.
 func ownsWorkTree(owner, dir string) bool {
-	if sameFile(owner, dir) || pathWithin(realOrClean(dir), realOrClean(owner)) {
+	if sameFile(owner, dir) || pathWithin(canonicalCorpusPath(dir), canonicalCorpusPath(owner)) {
 		return false
 	}
 	entries, err := os.ReadDir(owner)
@@ -502,17 +503,14 @@ func ownsWorkTree(owner, dir string) bool {
 // worktreeAdminOwner returns the `.git` file that the back-reference of a
 // linked worktree's admin directory names, when that file exists.
 func worktreeAdminOwner(admin string) (string, bool) {
-	line, err := readFirstLineNoFollow(filepath.Join(admin, "gitdir"))
-	if err != nil || line == "" || strings.ContainsRune(line, 0) {
+	owner, ok := readGitPathFile(admin, "gitdir")
+	if !ok {
 		return "", false
 	}
-	if !filepath.IsAbs(line) {
-		line = filepath.Join(admin, line)
-	}
-	if _, err := os.Stat(line); err != nil {
+	if _, err := os.Stat(owner); err != nil {
 		return "", false
 	}
-	return line, true
+	return owner, true
 }
 
 // sameFile reports whether a and b, after symlinks, name the same file.

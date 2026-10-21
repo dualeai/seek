@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -129,17 +128,12 @@ func TestLongLine_MatchDeepStaysVisible(t *testing.T) {
 	fm := zoekt.FileMatch{FileName: "min.js", Language: "JavaScript", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch(line, 1, frag(2000, 6))}}
 	out := fmtOneFile(fm, plainPalette)
-	if !strings.Contains(out, "NEEDLE") {
-		t.Fatalf("match dropped by windowing, got:\n%q", out)
-	}
-	if !strings.Contains(out, "…+") {
-		t.Fatalf("expected truncation markers, got:\n%q", out)
-	}
-	// Window keeps ~matchCtxBytes on each side of a 6-byte match; the bound is
-	// tied to the const so it actually catches a too-wide window (a loose
-	// `> 2000` would pass for any window ≥ 512 and test nothing).
-	if maxBody := 2*matchCtxBytes + 256; len(out) > maxBody {
-		t.Fatalf("windowed output should be ≤ %d bytes, got %d", maxBody, len(out))
+	// Worked out by hand: the window keeps 512 source bytes on each side of the
+	// match, so 2000-512 bytes drop at each end of the 4006-byte line.
+	want := "## min.js (JavaScript)\n1 …+1488 bytes " + strings.Repeat("x", 512) + "NEEDLE" +
+		strings.Repeat("y", 512) + " …+1488 bytes\n"
+	if out != want {
+		t.Fatalf("windowed output=%q, want %q", out, want)
 	}
 }
 
@@ -196,11 +190,11 @@ func TestLongLine_ContextLineCapped(t *testing.T) {
 	if strings.Contains(out, big) {
 		t.Fatalf("long context line should be capped, got %d bytes", len(out))
 	}
-	// 2000 source bytes, all ASCII → cut at maxLineBytes (no rune backup), so the
-	// marker reports exactly 2000-maxLineBytes dropped. Tied to the const.
-	wantMarker := fmt.Sprintf("…+%d bytes", 2000-maxLineBytes)
-	if !strings.Contains(out, wantMarker) {
-		t.Fatalf("expected context cap marker %q, got:\n%q", wantMarker, out)
+	// 2000 source bytes, all ASCII → cut at the 1024-byte line cap (no rune
+	// backup), so the marker reports exactly 976 bytes dropped.
+	wantLine := "\n4 " + strings.Repeat("z", 1024) + " …+976 bytes\n"
+	if !strings.Contains(out, wantLine) {
+		t.Fatalf("expected the capped context line %q, got:\n%q", wantLine, out)
 	}
 }
 
@@ -252,7 +246,7 @@ func TestNotices_FileLimit(t *testing.T) {
 			LineMatches: []zoekt.LineMatch{lineMatch("x\n", 1)}})
 	}
 	out := formatGitCorpusResultsForTest(files, nil, 2, 0)
-	if !strings.Contains(out, "… 1 more files (showing 2 of 3)") {
+	if !strings.Contains(out, "… 1 more file (showing 2 of 3)") {
 		t.Fatalf("expected file-limit notice, got:\n%q", out)
 	}
 }
@@ -261,7 +255,7 @@ func TestNotices_PerFileMatchLimit(t *testing.T) {
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("m1\n", 1), lineMatch("m2\n", 2), lineMatch("m3\n", 3)}}
 	out := formatGitCorpusResultsForTest([]zoekt.FileMatch{fm}, nil, 0, 2)
-	if !strings.Contains(out, "… 1 more matches in this file") {
+	if !strings.Contains(out, "… 1 more match in this file") {
 		t.Fatalf("expected per-file match notice, got:\n%q", out)
 	}
 }
@@ -362,15 +356,15 @@ func TestColor_UnsortedFragmentsNoSpanLoss(t *testing.T) {
 	}
 }
 
-func TestColor_UnsortedFragmentsMultipleSwaps(t *testing.T) {
-	// Three fragments delivered fully reversed (offsets 8,3,1) so the inline
-	// insertion sort must back up more than one position — a single-swap-only
-	// sort would leave them out of order and drop/merge a span.
+func TestColor_UnsortedFragmentsManyOutOfOrder(t *testing.T) {
+	// Three fragments arrive fully reversed (offsets 8, 3, 1), so the sort
+	// must move a span by more than one position. A sort that swaps only once
+	// would leave them out of order and drop or merge a span.
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("ABCDEFGHIJ\n", 1, frag(8, 1), frag(3, 1), frag(1, 1))}}
 	out := fmtOneFile(fm, ansiPalette)
 	if n := strings.Count(out, ansiPalette.match); n != 3 {
-		t.Fatalf("expected 3 spans after multi-swap sort, got %d in:\n%q", n, out)
+		t.Fatalf("expected 3 spans from out-of-order fragments, got %d in:\n%q", n, out)
 	}
 	for _, ch := range []string{"B", "D", "I"} { // offsets 1, 3, 8
 		if !strings.Contains(out, ansiPalette.match+ch+ansiPalette.reset) {

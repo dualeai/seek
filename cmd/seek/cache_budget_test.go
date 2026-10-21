@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -45,7 +46,7 @@ func TestCacheBudgetNeverLeavesLessThanFloor(t *testing.T) {
 // root that does not exist yet: the volume of its nearest ancestor decides.
 func TestCacheBudgetDefaultBeforeFirstSearch(t *testing.T) {
 	t.Setenv(envCacheBudget, "")
-	budget, err := cacheBudgetBytes(filepath.Join(t.TempDir(), "not", "yet"), 0)
+	budget, _, err := cacheBudget(filepath.Join(t.TempDir(), "not", "yet"), func() int64 { return 0 })
 	if err != nil || budget <= 0 {
 		t.Fatalf("budget=%d err=%v, want a positive default", budget, err)
 	}
@@ -87,7 +88,7 @@ func TestCacheBudgetStopsBeforeBuild(t *testing.T) {
 		t.Fatalf("exit code %d, want 2", code)
 	}
 	message := formatCLIError(err)
-	for _, want := range []string{"needs about", "cache budget of " + humanBytes(1<<10), envCacheBudget} {
+	for _, want := range []string{"needs about", "cache budget of 1KB", "SEEK_CACHE_BUDGET"} {
 		if !strings.Contains(message, want) {
 			t.Fatalf("message %q lacks %q", message, want)
 		}
@@ -295,7 +296,7 @@ func TestOpportunisticGCKeepsCorporaOfTheCommand(t *testing.T) {
 		t.Fatalf("plans=%d err=%v", len(plans), err)
 	}
 	t.Setenv(envCacheBudget, "1")
-	runGC(t.Context(), gcOptions{skipThrottle: true}, 0)
+	runGC(t.Context(), gcOptions{skipThrottle: true})
 	if _, err := os.Stat(plans[0].cacheDir); err != nil {
 		t.Fatalf("the GC evicted the corpus of this command: %v", err)
 	}
@@ -401,7 +402,7 @@ func TestCacheBudgetCountsVectorRatio(t *testing.T) {
 // larger override.
 func TestCacheBudgetMessageWhenFloorBinds(t *testing.T) {
 	floor := formatCLIError(&cacheBudgetError{planned: 6 << 20, growth: 4 << 10, budget: 4 << 20, freeBound: true})
-	for _, want := range []string{"(" + humanBytes(4<<10) + " new)", "nearly full", envCacheBudget} {
+	for _, want := range []string{"(4KB new)", "nearly full", "SEEK_CACHE_BUDGET"} {
 		if !strings.Contains(floor, want) {
 			t.Errorf("message %q lacks %q", floor, want)
 		}
@@ -410,7 +411,7 @@ func TestCacheBudgetMessageWhenFloorBinds(t *testing.T) {
 		t.Errorf("message %q suggests a larger override although the floor binds", floor)
 	}
 	plain := formatCLIError(&cacheBudgetError{planned: 6 << 20, growth: 6 << 20, budget: 4 << 20})
-	if !strings.Contains(plain, "for example "+envCacheBudget+"=") {
+	if !strings.Contains(plain, "for example SEEK_CACHE_BUDGET=") {
 		t.Errorf("message %q lacks the override example", plain)
 	}
 }
@@ -798,9 +799,9 @@ func TestDirtyReadErrorKeepsTheLiveFamily(t *testing.T) {
 }
 
 // TestDirtyReadErrorPrintsNoStaleText reverts one dirty file, deletes an
-// untracked one, and makes the read of a third fail: the build applies the
-// revert and the delete, so no search prints text that no file holds, and a
-// newly dirty file whose read fails is counted by name.
+// untracked one, and makes the reads of two newly dirty files fail: the build
+// applies the revert and the delete, so no search prints text that no file
+// holds, and the notice counts the two failed files by name.
 func TestDirtyReadErrorPrintsNoStaleText(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -999,5 +1000,199 @@ func TestEMFILEInAFullRebuildKeepsTheLiveFamily(t *testing.T) {
 	}
 	if got := search(); !slices.Equal(got, want) {
 		t.Fatalf("after EMFILE %v, want the dirty files by content", got)
+	}
+}
+
+// TestCacheBudgetEstimatesAnOrphanBranch warms a repository, then moves it to
+// an orphan branch: the commit range from the old head to no commit has no
+// tree, so the estimate must count it with no Git error.
+func TestCacheBudgetEstimatesAnOrphanBranch(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	root := t.TempDir()
+	budgetFolder(t, root)
+	gitInitCommitAll(t, root)
+	if _, err := runHybridTestSearch(t, "alpha beta", []string{root}, lexicalOnlySearchPolicy(), nil); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, root, "checkout", "-q", "--orphan", "fresh")
+	plans, err := planCorpora(t.Context(), []string{root})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%d err=%v", len(plans), err)
+	}
+	for _, vectors := range []bool{false, true} {
+		if _, rebuild, err := plannedNodeBytes(t.Context(), plans[0], vectors, false); err != nil || !rebuild {
+			t.Fatalf("vectors=%t: rebuild=%t err=%v, want a rebuild with no error", vectors, rebuild, err)
+		}
+	}
+}
+
+// TestCacheBudgetCountsOnlyVectorsForACurrentTextIndex warms a dirty
+// repository with a text search: its text index is current, so a first
+// description adds the vectors of the commit and of the dirty file, and no
+// text index bytes.
+func TestCacheBudgetCountsOnlyVectorsForACurrentTextIndex(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	root := t.TempDir()
+	budgetFolder(t, root)
+	gitInitCommitAll(t, root)
+	writeFileAt(t, root, "strict.go", "package sample\n// alpha beta dirty\n")
+	if _, err := runHybridTestSearch(t, "alpha beta", []string{root}, lexicalOnlySearchPolicy(), nil); err != nil {
+		t.Fatal(err)
+	}
+	plans, err := planCorpora(t.Context(), []string{root})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%d err=%v", len(plans), err)
+	}
+	bytes, rebuild, err := plannedNodeBytes(t.Context(), plans[0], true, false)
+	if err != nil || !rebuild {
+		t.Fatalf("rebuild=%t err=%v", rebuild, err)
+	}
+	// The commit holds the 109,749 bytes of budgetFolder: strict.go (29),
+	// f00.go to f09.go (2,443 each), f10.go to f39.go (2,843 each). The dirty
+	// strict.go holds 35 bytes. At 14.4 vector bytes per content byte, their
+	// vectors are 1,580,385 and 504 bytes.
+	const want = 1_580_385 + 504
+	if got := bytes - corpusDirSize(plans[0].cacheDir); got != want {
+		t.Fatalf("added bytes %d, want %d (vectors of the commit and of the dirty file only)", got, want)
+	}
+}
+
+// TestCacheBudgetCountsVectorsBehindTheTextIndex builds the vectors of a
+// folder and of a Git node, adds a file (in a commit for Git), and runs a text
+// search: the text index holds the file, the vectors do not. The next
+// description must count the vectors of the new file: exactly for Git, and at
+// least that for the folder.
+func TestCacheBudgetCountsVectorsBehindTheTextIndex(t *testing.T) {
+	requireTools(t)
+	for _, kind := range []string{"folder", "git"} {
+		t.Run(kind, func(t *testing.T) {
+			setTestUserCache(t)
+			root := t.TempDir()
+			budgetFolder(t, root)
+			budgetGitKind(t, root, kind)
+			if _, err := runHybridTestSearch(t, "alpha beta", []string{root}, defaultSearchPolicy(), budgetModel); err != nil {
+				t.Fatal(err)
+			}
+			added := "package sample\n// alpha " + strings.Repeat("vectorless words ", 9000) + "\n"
+			writeFileAt(t, root, "added.go", added)
+			if kind == "git" {
+				gitRunIn(t, root, "add", "added.go")
+				gitRunIn(t, root, "commit", "-q", "-m", "add")
+			}
+			if _, err := runHybridTestSearch(t, "alpha beta", []string{root}, lexicalOnlySearchPolicy(), nil); err != nil {
+				t.Fatal(err)
+			}
+			plans, err := planCorpora(t.Context(), []string{root})
+			if err != nil || len(plans) != 1 {
+				t.Fatalf("plans=%d err=%v", len(plans), err)
+			}
+			bytes, rebuild, err := plannedNodeBytes(t.Context(), plans[0], true, false)
+			if err != nil || !rebuild {
+				t.Fatalf("rebuild=%t err=%v", rebuild, err)
+			}
+			// added.go holds 153,025 bytes. At 14.4 vector bytes per content
+			// byte, its vectors are 2,203,560 bytes.
+			const want = 2_203_560
+			got := bytes - corpusDirSize(plans[0].cacheDir)
+			// Git counts the commit range from the vectors' commit: the new
+			// file alone. The folder counts all content (its vectors hold an
+			// older state).
+			if kind == "git" && got != want {
+				t.Fatalf("added bytes %d, want %d (the vectors of the new file)", got, want)
+			}
+			if got < want {
+				t.Fatalf("added bytes %d, want at least %d (the vectors of the new file)", got, want)
+			}
+		})
+	}
+}
+
+// TestCacheBudgetCountsTheChangedFilesOfABoundFolder builds a folder's vectors,
+// edits one file, and estimates the next description: the vectors hold the
+// published state, so the build adds the text and vectors of the edited file
+// only.
+func TestCacheBudgetCountsTheChangedFilesOfABoundFolder(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	root := t.TempDir()
+	budgetFolder(t, root)
+	if _, err := runHybridTestSearch(t, "alpha beta", []string{root}, defaultSearchPolicy(), budgetModel); err != nil {
+		t.Fatal(err)
+	}
+	const edit = "package sample\n// alpha beta edited\n"
+	writeFileAt(t, root, "strict.go", edit)
+	plans, err := planCorpora(t.Context(), []string{root})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%d err=%v", len(plans), err)
+	}
+	bytes, rebuild, err := plannedNodeBytes(t.Context(), plans[0], true, false)
+	if err != nil || !rebuild {
+		t.Fatalf("rebuild=%t err=%v", rebuild, err)
+	}
+	// The edit holds 36 bytes: 99 text index bytes at 2.76 per content byte,
+	// and 518 vector bytes at 14.4 per content byte.
+	const want = 99 + 518
+	if got := bytes - corpusDirSize(plans[0].cacheDir); got != want {
+		t.Fatalf("added bytes %d, want %d (the text and vectors of the edited file)", got, want)
+	}
+}
+
+// TestCacheBudgetCountsACommitAfterTheVectors builds a repository's text and
+// vectors, then commits a file: the text index and the vectors hold the old
+// commit, so the next description adds the text and vectors of the commit
+// range, the new file alone. The estimate runs one git diff-tree: the vector
+// figure reuses the text figure.
+func TestCacheBudgetCountsACommitAfterTheVectors(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	root := t.TempDir()
+	budgetFolder(t, root)
+	gitInitCommitAll(t, root)
+	if _, err := runHybridTestSearch(t, "alpha beta", []string{root}, defaultSearchPolicy(), budgetModel); err != nil {
+		t.Fatal(err)
+	}
+	added := "package sample\n// alpha " + strings.Repeat("committed words ", 900) + "\n"
+	writeFileAt(t, root, "added.go", added)
+	gitRunIn(t, root, "add", "added.go")
+	gitRunIn(t, root, "commit", "-q", "-m", "add")
+	plans, err := planCorpora(t.Context(), []string{root})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%d err=%v", len(plans), err)
+	}
+	bytes, rebuild, err := plannedNodeBytes(t.Context(), plans[0], true, false)
+	if err != nil || !rebuild {
+		t.Fatalf("rebuild=%t err=%v", rebuild, err)
+	}
+	// added.go holds 14,425 bytes: 39,813 text index bytes at 2.76 per
+	// content byte, and 207,720 vector bytes at 14.4 per content byte.
+	const want = 39_813 + 207_720
+	if got := bytes - corpusDirSize(plans[0].cacheDir); got != want {
+		t.Fatalf("added bytes %d, want %d (the text and vectors of the new file)", got, want)
+	}
+	// The vectors hold the text index's commit, so the estimate reuses the
+	// text figure: one git diff-tree for the commit range.
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shimDir := t.TempDir()
+	calls := filepath.Join(shimDir, "calls")
+	shim := "#!/bin/sh\n" + gitShimSubcommand + `echo "$subcommand" >> "$SEEK_TEST_GIT_CALLS"
+exec "$SEEK_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(filepath.Join(shimDir, "git"), []byte(shim), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SEEK_TEST_REAL_GIT", realGit)
+	t.Setenv("SEEK_TEST_GIT_CALLS", calls)
+	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if _, _, err := plannedNodeBytes(t.Context(), plans[0], true, false); err != nil {
+		t.Fatal(err)
+	}
+	logged, _ := os.ReadFile(calls)
+	if got := strings.Count(string(logged), "diff-tree\n"); got != 1 {
+		t.Fatalf("diff-tree calls=%d, want 1 (the vector figure reuses the text figure): %q", got, logged)
 	}
 }

@@ -8,17 +8,17 @@ import (
 	"time"
 )
 
-// TestIndexDeltaDocuments_LargeBatchHoldsBudget — documents the
-// single-process behaviour: indexDeltaDocuments still holds all
-// pre-Acquired weight until Finish(). With one process and no
-// concurrent reader, this is correct (not a deadlock) but it does
-// pin RSS to the slice's full byte count. The bound is enforced by
-// the windowed-fallback guard in tryUncommittedDelta (indexer.go) —
-// large dirty payloads route to the windowed indexDocuments instead.
+// TestIndexDeltaDocuments_LargeBatchHoldsBudget checks a large delta in one
+// process: indexDeltaDocuments holds all pre-acquired weight until Finish.
+// With no concurrent reader, this is correct (not a deadlock), but memory
+// holds the full payload. The delta guards bound the payload:
+// readUncommittedCandidates (indexer.go) and changedFolderDocumentsFromManifest
+// (folder_indexer.go) send a payload that reaches the window to the windowed
+// indexDocuments.
 //
-// Asserts: (a) delta completes in bounded time, (b) the semaphore
-// returns to baseline after Finish, (c) peak NumGoroutine stays
-// modest (no leaked workers).
+// The test indexes 12 documents of 512 KiB with an 8 MiB budget. It checks
+// that (a) the delta completes within the 30 s guard deadline, (b) the
+// semaphore has its full budget after Finish, and (c) no goroutine leaks.
 func TestIndexDeltaDocuments_LargeBatchHoldsBudget(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
@@ -65,12 +65,11 @@ func TestIndexDeltaDocuments_LargeBatchHoldsBudget(t *testing.T) {
 	}
 }
 
-// TestIndexDeltaDocuments_BlocksConcurrentReader — indexDeltaDocuments
-// uses single-builder bulk-Release-after-Finish. A concurrent Acquire
-// requesting weight beyond the remaining budget must wait until the
-// terminal Finish releases the held weight. The hard ordering assertion
-// at the bottom (acquireDone NOT Before deltaReturned) catches a
-// regression that flipped to streaming Release.
+// TestIndexDeltaDocuments_BlocksConcurrentReader checks that
+// indexDeltaDocuments releases all weight in bulk after the Finish of its one
+// builder. A concurrent Acquire for more weight than remains must wait until
+// that release. The select at the end fails when the Acquire completes while
+// the delta still runs, so it catches a change to a release per document.
 func TestIndexDeltaDocuments_BlocksConcurrentReader(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
@@ -116,10 +115,9 @@ func TestIndexDeltaDocuments_BlocksConcurrentReader(t *testing.T) {
 	// after indexDeltaDocuments returns its weight via the bulk-Release
 	// after Finish.
 	//
-	// Use channels to establish happens-before instead of time.Now()
-	// ordering — otherwise a scheduling-delay race could let the
-	// goroutine record acquireDone BEFORE the main goroutine records
-	// deltaReturned even if Release fired during Finish.
+	// The channels acquireDone and deltaDone give the order of the two
+	// events. Time stamps cannot: after a correct release after Finish, the
+	// Acquire can complete before indexDeltaDocuments returns.
 	goroutineStarted := make(chan struct{})
 	go func() {
 		close(goroutineStarted)
@@ -194,7 +192,7 @@ func TestIndexDeltaDocuments_BlocksConcurrentReader(t *testing.T) {
 // TestIndexDeltaDocuments_ReleasesOnNewBuilderError — when NewBuilder
 // fails before any Add, every pre-Acquired weight in the input slice
 // must still be Released exactly once via the early-return path in
-// indexDeltaDocuments.
+// indexDeltaDocumentsWithRepository.
 func TestIndexDeltaDocuments_ReleasesOnNewBuilderError(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)

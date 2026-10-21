@@ -182,8 +182,10 @@ func nodeMissingBlobRecords(cacheDir, head string, semantic bool) map[string]mis
 	if record, ok := readMissingBlobRecord(cacheDir, lexicalMissingBlobsFile); ok {
 		records[lexicalMissingBlobsFile] = record
 	}
-	if record, ok := readMissingBlobRecord(cacheDir, semanticMissingBlobsFile); ok && semantic &&
-		(record.head == head || record.head == "") {
+	if !semantic {
+		return records
+	}
+	if record, ok := readMissingBlobRecord(cacheDir, semanticMissingBlobsFile); ok && (record.head == head || record.head == "") {
 		records[semanticMissingBlobsFile] = record
 	}
 	return records

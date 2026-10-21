@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -10,21 +9,12 @@ import (
 	"syscall"
 )
 
-// gitBoundary describes a confirmed git repository boundary. The fields give
-// the walker and planner enough data to construct a corpusPlan without a
-// subprocess.
-type gitBoundary struct {
-	RepoDir   string   // working tree root
-	CommonDir string   // shared .git common dir; the .git directory for normal repos
-	Mode      rootType // rootTypeDirectory for normal repos, rootTypeWorktree for file-form .git
-}
-
 // detectStatus is the three-state result of detectGitBoundary.
 //
-// boundaryConfirmed: definitive evidence of a git repo (HEAD + objects + refs all present).
+// boundaryConfirmed: definitive evidence of a git repo (HEAD + objects +
+// refs all present).
 // notBoundary: definitive evidence there is no boundary here.
-// ambiguous: insufficient evidence; callers ask Git (operandRepo,
-// classifyGitDir).
+// ambiguous: insufficient evidence; the caller, classifyGitDir, asks Git.
 type detectStatus int
 
 const (
@@ -41,7 +31,8 @@ const (
 const maxGitFileBytes = 64 << 10
 
 // detectGitBoundary classifies a directory as a git-repo boundary using
-// only filesystem syscalls (no subprocess). Walker-safe.
+// only filesystem syscalls (no subprocess). Walker-safe. A confirmed boundary
+// comes with the Git paths of its node: absDir and the common Git directory.
 //
 // Algorithm:
 //
@@ -49,41 +40,37 @@ const maxGitFileBytes = 64 << 10
 //	    -> ambiguous: Git follows a symlinked .git, so Git decides.
 //	L2a: .git is a directory -> validate <gitDir>/HEAD (regular file) AND
 //	     <gitDir>/objects/ (dir) AND <gitDir>/refs/ (dir). All three present
-//	     -> boundaryConfirmed (rootTypeDirectory). Missing any, or a
-//	     <gitDir>/commondir file -> ambiguous.
+//	     -> boundaryConfirmed, with <dir>/.git as the common directory.
+//	     Missing any, or a <gitDir>/commondir file -> ambiguous.
 //	L2b: .git is a regular file -> detectGitFileBoundary.
-func detectGitBoundary(absDir string) (gitBoundary, detectStatus) {
+func detectGitBoundary(absDir string) (gitPaths, detectStatus) {
 	gitPath := filepath.Join(absDir, ".git")
 	fi, err := os.Lstat(gitPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Most directories have no `.git`: one syscall decides.
-			return gitBoundary{}, notBoundary
+			return gitPaths{}, notBoundary
 		}
 		// Permission denied, I/O error, etc. — cannot prove negative.
-		return gitBoundary{}, ambiguous
+		return gitPaths{}, ambiguous
 	}
 	mode := fi.Mode()
 	switch {
 	case mode&os.ModeSymlink != 0:
-		return gitBoundary{}, ambiguous
+		return gitPaths{}, ambiguous
 	case mode.IsDir():
-		if !hasGitTriad(gitPath) {
-			return gitBoundary{}, ambiguous
+		if !hasGitTriad(gitPath, gitPath) {
+			return gitPaths{}, ambiguous
 		}
 		if _, err := os.Lstat(filepath.Join(gitPath, "commondir")); err == nil {
 			// The objects and refs live elsewhere: Git decides.
-			return gitBoundary{}, ambiguous
+			return gitPaths{}, ambiguous
 		}
-		return gitBoundary{
-			RepoDir:   absDir,
-			CommonDir: gitPath,
-			Mode:      rootTypeDirectory,
-		}, boundaryConfirmed
+		return gitPaths{RepoDir: absDir, CommonDir: gitPath}, boundaryConfirmed
 	case mode.IsRegular():
 		return detectGitFileBoundary(absDir, gitPath)
 	default:
-		return gitBoundary{}, notBoundary
+		return gitPaths{}, notBoundary
 	}
 }
 
@@ -92,27 +79,27 @@ func detectGitBoundary(absDir string) (gitBoundary, detectStatus) {
 // file, a submodule Git directory whose core.worktree names absDir, or an
 // in-tree Git directory, each with the full triad. Any other target is
 // ambiguous, so Git decides.
-func detectGitFileBoundary(absDir, gitFile string) (gitBoundary, detectStatus) {
+func detectGitFileBoundary(absDir, gitFile string) (gitPaths, detectStatus) {
 	resolved, err := parseGitFilePointer(gitFile, absDir)
 	if err != nil {
-		return gitBoundary{}, ambiguous
+		return gitPaths{}, ambiguous
 	}
 	resolvedReal, err := filepath.EvalSymlinks(resolved)
 	if err != nil {
-		return gitBoundary{}, ambiguous
+		return gitPaths{}, ambiguous
 	}
 	commonDir := readCommonDir(resolved)
 	if commonDir != resolved {
-		if !hasLinkedWorktreeBackref(resolvedReal, commonDir, gitFile) || !hasGitWorktreeTriad(resolvedReal, commonDir) {
-			return gitBoundary{}, ambiguous
+		if !hasLinkedWorktreeBackref(resolvedReal, commonDir, gitFile) || !hasGitTriad(resolvedReal, commonDir) {
+			return gitPaths{}, ambiguous
 		}
-		return gitBoundary{RepoDir: absDir, CommonDir: commonDir, Mode: rootTypeWorktree}, boundaryConfirmed
+		return gitPaths{RepoDir: absDir, CommonDir: commonDir}, boundaryConfirmed
 	}
-	inTree := pathWithin(realOrClean(absDir), resolvedReal)
-	if (!inTree && !moduleWorktreeIs(resolvedReal, absDir)) || !hasGitTriad(resolvedReal) {
-		return gitBoundary{}, ambiguous
+	inTree := pathWithin(canonicalCorpusPath(absDir), resolvedReal)
+	if (!inTree && !moduleWorktreeIs(resolvedReal, absDir)) || !hasGitTriad(resolvedReal, resolvedReal) {
+		return gitPaths{}, ambiguous
 	}
-	return gitBoundary{RepoDir: absDir, CommonDir: resolved, Mode: rootTypeWorktree}, boundaryConfirmed
+	return gitPaths{RepoDir: absDir, CommonDir: resolved}, boundaryConfirmed
 }
 
 // moduleWorktreeIs reports a Git directory whose core.worktree names dir. Git
@@ -133,18 +120,12 @@ func moduleWorktreeIs(gitDir, dir string) bool {
 // readCoreWorktree reads core.worktree from a Git config file. It reads only
 // the plain form that Git writes; any other form gives false, and Git decides.
 func readCoreWorktree(path string) (string, bool) {
-	f, err := openNoFollow(path)
+	text, err := readGitFileNoFollow(path)
 	if err != nil {
 		return "", false
 	}
-	defer func() { _ = f.Close() }()
-	var buf [maxGitFileBytes]byte
-	n, err := io.ReadFull(f, buf[:])
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		return "", false
-	}
 	inCore := false
-	for line := range strings.Lines(string(buf[:n])) {
+	for line := range strings.Lines(text) {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "[") {
 			inCore = strings.EqualFold(line, "[core]")
@@ -163,27 +144,12 @@ func readCoreWorktree(path string) (string, bool) {
 	return "", false
 }
 
-// hasGitTriad verifies the structural minimum git uses internally to
-// recognize a repo: HEAD regular file + objects/ dir + refs/ dir. All three
-// are required. Matches `git rev-parse`'s internal sanity check. Uses
-// Lstat (does NOT follow) for all three: refusing symlinked entries
-// prevents attacker-controlled redirection to readable files/dirs outside
-// the repo subtree.
-func hasGitTriad(gitDir string) bool {
-	head, err := os.Lstat(filepath.Join(gitDir, "HEAD"))
-	if err != nil || !head.Mode().IsRegular() {
-		return false
-	}
-	for _, sub := range []string{"objects", "refs"} {
-		fi, err := os.Lstat(filepath.Join(gitDir, sub))
-		if err != nil || !fi.IsDir() {
-			return false
-		}
-	}
-	return true
-}
-
-func hasGitWorktreeTriad(gitDir, commonDir string) bool {
+// hasGitTriad verifies the structural minimum Git uses to recognize a
+// repository: a HEAD regular file and a refs directory in gitDir, and an
+// objects directory in commonDir (gitDir itself for a normal repository).
+// It uses Lstat for each entry: a symlinked entry cannot redirect the check
+// to files outside the repository.
+func hasGitTriad(gitDir, commonDir string) bool {
 	head, err := os.Lstat(filepath.Join(gitDir, "HEAD"))
 	if err != nil || !head.Mode().IsRegular() {
 		return false
@@ -193,10 +159,7 @@ func hasGitWorktreeTriad(gitDir, commonDir string) bool {
 		return false
 	}
 	objects, err := os.Lstat(filepath.Join(commonDir, "objects"))
-	if err != nil || !objects.IsDir() {
-		return false
-	}
-	return true
+	return err == nil && objects.IsDir()
 }
 
 // detectBareRepoAt reports whether absDir is a bare git repository
@@ -254,17 +217,10 @@ func parseGitFilePointer(gitFile, parentDir string) (string, error) {
 	return filepath.Clean(ptr), nil
 }
 
-// readFirstLineNoFollow opens `path` with O_NOFOLLOW (defense against
-// a TOCTOU Lstat→Open symlink swap on `.git`-name entries) and reads
-// at most maxGitFileBytes into a fixed stack buffer, so a pathological
-// multi-GB file cannot OOM seek. Returns the first line trimmed of
-// trailing \r\n + whitespace. Empty string is returned on any read
-// error so callers can branch: parseGitFilePointer treats it as
-// fatal; readCommonDir treats it as "no commondir file, use gitDir".
-//
-// NUL-byte rejection is NOT done here — parseGitFilePointer surfaces
-// it as a specific error while readCommonDir silently degrades.
-func readFirstLineNoFollow(path string) (string, error) {
+// readGitFileNoFollow opens path with O_NOFOLLOW (defense against a TOCTOU
+// Lstat→Open symlink swap on `.git`-name entries) and reads at most
+// maxGitFileBytes, so a pathological multi-GB file cannot OOM seek.
+func readGitFileNoFollow(path string) (string, error) {
 	f, err := openNoFollow(path)
 	if err != nil {
 		return "", err
@@ -275,27 +231,50 @@ func readFirstLineNoFollow(path string) (string, error) {
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		return "", err
 	}
-	line := buf[:n]
-	if end := bytes.IndexByte(line, '\n'); end >= 0 {
-		line = line[:end]
+	return string(buf[:n]), nil
+}
+
+// readFirstLineNoFollow reads path (readGitFileNoFollow) and returns its
+// first line trimmed of trailing \r\n + whitespace. Empty string is returned
+// on any read error so callers can branch: parseGitFilePointer treats it as
+// fatal; readGitPathFile treats it as no path.
+//
+// NUL-byte rejection is NOT done here — parseGitFilePointer surfaces
+// it as a specific error while readGitPathFile silently degrades.
+func readFirstLineNoFollow(path string) (string, error) {
+	text, err := readGitFileNoFollow(path)
+	if err != nil {
+		return "", err
 	}
-	return strings.TrimRight(string(line), "\r\n \t"), nil
+	line, _, _ := strings.Cut(text, "\n")
+	return strings.TrimRight(line, "\r\n \t"), nil
+}
+
+// readGitPathFile reads the path that the Git metadata file dir/name holds on
+// its first line; a relative path is joined to dir. It reports false when the
+// file cannot be read, or when the line is empty or holds a NUL byte.
+func readGitPathFile(dir, name string) (string, bool) {
+	line, err := readFirstLineNoFollow(filepath.Join(dir, name))
+	if err != nil || line == "" || strings.ContainsRune(line, 0) {
+		return "", false
+	}
+	if !filepath.IsAbs(line) {
+		line = filepath.Join(dir, line)
+	}
+	return line, true
 }
 
 // hasLinkedWorktreeBackref reports a linked worktree whose private Git
 // directory names gitFile in its gitdir back-reference. The compare is by file
 // identity, so the typed letter case or a symlink in the path does not matter.
 func hasLinkedWorktreeBackref(gitDirReal, commonDir, gitFile string) bool {
-	worktreesDir := filepath.Join(realOrClean(commonDir), "worktrees")
+	worktreesDir := filepath.Join(canonicalCorpusPath(commonDir), "worktrees")
 	if gitDirReal == worktreesDir || !pathWithin(worktreesDir, gitDirReal) {
 		return false
 	}
-	line, err := readFirstLineNoFollow(filepath.Join(gitDirReal, "gitdir"))
-	if err != nil || line == "" || strings.ContainsRune(line, 0) {
+	line, ok := readGitPathFile(gitDirReal, "gitdir")
+	if !ok {
 		return false
-	}
-	if !filepath.IsAbs(line) {
-		line = filepath.Join(gitDirReal, line)
 	}
 	backref, err := os.Stat(line)
 	if err != nil {
@@ -305,30 +284,13 @@ func hasLinkedWorktreeBackref(gitDirReal, commonDir, gitFile string) bool {
 	return err == nil && os.SameFile(backref, self)
 }
 
-func realOrClean(path string) string {
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		return filepath.Clean(resolved)
-	}
-	return filepath.Clean(path)
-}
-
 // readCommonDir reads <gitDir>/commondir (a single short line containing
 // a path) and returns the resolved common directory. Returns gitDir
 // unchanged if commondir is absent or unreadable. This is the common case for
 // a normal repository, where the resolved .git directory is the common dir.
 func readCommonDir(gitDir string) string {
-	line, err := readFirstLineNoFollow(filepath.Join(gitDir, "commondir"))
-	if err != nil || line == "" || strings.ContainsRune(line, 0) {
-		return gitDir
+	if commonDir, ok := readGitPathFile(gitDir, "commondir"); ok {
+		return filepath.Clean(commonDir)
 	}
-	if !filepath.IsAbs(line) {
-		line = filepath.Join(gitDir, line)
-	}
-	return filepath.Clean(line)
-}
-
-// toGitPaths returns the Git paths of a confirmed boundary without a
-// subprocess.
-func (b gitBoundary) toGitPaths() gitPaths {
-	return gitPaths{RepoDir: b.RepoDir, CommonDir: b.CommonDir}
+	return gitDir
 }

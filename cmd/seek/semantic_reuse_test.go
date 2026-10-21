@@ -11,8 +11,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	ctags "github.com/sourcegraph/go-ctags"
 )
 
 // reuseSearch runs one descriptive search with a fresh test scorer and
@@ -176,16 +174,12 @@ func TestRowsIntegrityCheckedOnceAtBind(t *testing.T) {
 
 // TestFileReuseRowsMatchFreshRows builds a generation for one file, then asks
 // the reuse index for the same content under another root with the same
-// path tail: the copied rows equal the rows that a fresh extraction gives,
-// so file reuse changes no stored byte.
+// path tail. A second build, with no reuse index, stores that file under the
+// new path. The copied rows equal the rows of that fresh build, so file reuse
+// changes no stored byte.
 func TestFileReuseRowsMatchFreshRows(t *testing.T) {
 	requireTools(t)
 	content := longSemanticFunction(6_000)
-	indexDir := t.TempDir()
-	dir := filepath.Join(indexDir, semanticGenerationPrefix+"source")
-	documents := make(chan fileContent, 1)
-	documents <- makeFileContent(t, "one/x/src/pkg/long.go", content)
-	close(documents)
 	embedder := semanticBuildTestEmbedder{embed: func(_ context.Context, units []semanticUnit) ([]semanticUnitEmbedding, error) {
 		embeddings := make([]semanticUnitEmbedding, len(units))
 		for index := range embeddings {
@@ -193,13 +187,25 @@ func TestFileReuseRowsMatchFreshRows(t *testing.T) {
 		}
 		return embeddings, nil
 	}}
-	if _, err := buildSemanticGeneration(t.Context(), dir, "source", embedder, searchResources{},
-		func(context.Context) (<-chan fileContent, func() error) {
-			return documents, func() error { return nil }
-		},
-		nil); err != nil {
-		t.Fatal(err)
+	// build stores content at path in a generation of indexDir, with no
+	// reuse index.
+	build := func(indexDir, path string) string {
+		t.Helper()
+		dir := filepath.Join(indexDir, semanticGenerationPrefix+"source")
+		documents := make(chan fileContent, 1)
+		documents <- makeFileContent(t, path, content)
+		close(documents)
+		if _, err := buildSemanticGeneration(t.Context(), dir, "source", embedder, searchResources{},
+			func(context.Context) (<-chan fileContent, func() error) {
+				return documents, func() error { return nil }
+			},
+			nil); err != nil {
+			t.Fatal(err)
+		}
+		return dir
 	}
+	indexDir := t.TempDir()
+	build(indexDir, "one/x/src/pkg/long.go")
 	reuse := loadSemanticReuse(indexDir, filepath.Join(indexDir, "staging"), "")
 	defer reuse.Close()
 	const path = "two/x/src/pkg/long.go"
@@ -207,32 +213,18 @@ func TestFileReuseRowsMatchFreshRows(t *testing.T) {
 	if !ok {
 		t.Fatal("the reuse index has no rows for the same tail and content")
 	}
-	if err := checkCtagsCached(); err != nil {
-		t.Fatal(err)
-	}
-	parser, err := ctags.New(ctags.Options{Bin: os.Getenv("CTAGS_COMMAND")})
+	fresh, err := openSemanticGenerationRows(build(t.TempDir(), path), "source")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer parser.Close()
-	entries, parseErr := parser.Parse(path, content)
-	tokenizer, err := lateOnTokenizers.take(t.Context())
-	if err != nil {
-		t.Fatal(err)
+	defer func() { _ = fresh.Close() }()
+	if len(copied) < 2 || len(copied) != len(fresh.rows) {
+		t.Fatalf("copied %d rows, fresh %d, want the same count above 1", len(copied), len(fresh.rows))
 	}
-	defer lateOnTokenizers.release(tokenizer)
-	fresh, err := windowSemanticUnits(t.Context(), tokenizer,
-		extractEligibleSemanticUnits(path, content, entries, parseErr, "Go"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(copied) != len(fresh) {
-		t.Fatalf("copied %d rows, fresh %d", len(copied), len(fresh))
-	}
-	for index := range fresh {
-		got, want := copied[index], fresh[index]
-		got.reuse, got.row, want.text, want.modelInput, want.row = nil, 0, nil, nil, 0
-		got.text = nil
+	for index := range fresh.rows {
+		got, want := copied[index], fresh.rows[index]
+		got.reuse, got.row, got.text, got.modelInput = nil, 0, nil, nil
+		want.reuse, want.row, want.text, want.modelInput = nil, 0, nil, nil
 		if fmt.Sprintf("%+v", got) != fmt.Sprintf("%+v", want) {
 			t.Fatalf("row %d:\ncopied %+v\nfresh  %+v", index, got, want)
 		}
@@ -282,7 +274,7 @@ func TestCacheBudgetEvictsUnusedUnits(t *testing.T) {
 	old := time.Now().Add(-time.Hour)
 	_ = os.Chtimes(filepath.Join(dir, "00000000000000000001-1"+semanticUnitsSegmentExt), old, old)
 	t.Setenv(envCacheBudget, strconv.Itoa(seededCorpusBytes*3/2))
-	runGC(t.Context(), gcOptions{skipThrottle: true}, 0)
+	runGC(t.Context(), gcOptions{skipThrottle: true})
 	if _, err := os.Stat(filepath.Join(dir, "00000000000000000001-1"+semanticUnitsSegmentExt)); !os.IsNotExist(err) {
 		t.Fatalf("the unit segment survived: %v", err)
 	}

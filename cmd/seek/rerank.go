@@ -33,12 +33,7 @@ type rerankQueryPlan struct {
 	relaxedQ   query.Q
 	// filters are the filter children of the description: Zoekt evaluates them
 	// on each node for the semantic row mask (nodeRowSelection).
-	filters        []query.Q
-	semanticFilter *semanticFilterPlan
-	// semanticUnfiltered marks a filter that compileSemanticFilterPlan cannot
-	// compile into semanticFilter. The search pipeline reads neither field:
-	// the per-node Zoekt mask applies every filter.
-	semanticUnfiltered bool
+	filters []query.Q
 }
 
 type rerankDocument struct {
@@ -60,9 +55,9 @@ type searchRunConfig struct {
 // planRerankQuery plans the model routes from Zoekt's parsed tree, after
 // Zoekt's own simplification, so a route never depends on how the query was
 // spelled. Description atoms feed the model; filters stay with Zoekt;
-// modifiers change no route (querySupport). It needs two description atoms and
-// returns false for an or between descriptions and for a query that matches
-// nothing.
+// modifiers change no route (querySupport in query_support_table_test.go). It
+// needs two description atoms and returns false for an or between descriptions
+// and for a query that matches nothing.
 func planRerankQuery(raw query.Q) (rerankQueryPlan, bool) {
 	tree := query.Simplify(raw)
 	// type:file is an output mode: plan its child.
@@ -106,23 +101,7 @@ func planRerankQuery(raw query.Q) (rerankQueryPlan, bool) {
 		relaxedQ:   query.Simplify(query.NewAnd(relaxedChildren...)),
 		filters:    filters,
 	}
-	if len(filters) > 0 {
-		semanticFilter, err := compileSemanticFilterPlan(filters)
-		if err != nil {
-			// compileSemanticFilterPlan takes language and file-name filters
-			// only. Zoekt applies every filter, in lexical retrieval and in the
-			// per-node semantic row mask.
-			plan.semanticUnfiltered = true
-		}
-		plan.semanticFilter = semanticFilter
-	}
 	return plan, true
-}
-
-// semanticRetrievable reports whether compileSemanticFilterPlan compiled
-// every filter of the plan.
-func (plan rerankQueryPlan) semanticRetrievable() bool {
-	return !plan.semanticUnfiltered
 }
 
 // rerankDescriptionAtom returns a description atom as the content-only node
@@ -192,7 +171,10 @@ func hasWordCharacter(text string) bool {
 
 // regexpModelText renders a parsed regular expression close to how it was
 // typed, for the model to read: Go's printer adds flag groups such as
-// (?-s:...) that no user wrote.
+// (?-s:...) that no user wrote. Zoekt removes capture groups, so the
+// renderer puts back the parentheses that the tree needs: an empty group in a
+// sequence (Foo() or a::b()), an alternation in a sequence, and a repeat of
+// more than one character.
 func regexpModelText(re *syntax.Regexp) string {
 	switch re.Op {
 	case syntax.OpLiteral:
@@ -208,24 +190,45 @@ func regexpModelText(re *syntax.Regexp) string {
 	case syntax.OpCapture:
 		return "(" + regexpModelText(re.Sub[0]) + ")"
 	case syntax.OpStar:
-		return regexpModelText(re.Sub[0]) + "*"
+		return regexpModelRepeated(re.Sub[0]) + "*"
 	case syntax.OpPlus:
-		return regexpModelText(re.Sub[0]) + "+"
+		return regexpModelRepeated(re.Sub[0]) + "+"
 	case syntax.OpQuest:
-		return regexpModelText(re.Sub[0]) + "?"
-	case syntax.OpConcat, syntax.OpAlternate:
+		return regexpModelRepeated(re.Sub[0]) + "?"
+	case syntax.OpConcat:
+		parts := make([]string, len(re.Sub))
+		for i, sub := range re.Sub {
+			switch sub.Op {
+			case syntax.OpEmptyMatch:
+				parts[i] = "()"
+			case syntax.OpAlternate:
+				parts[i] = "(" + regexpModelText(sub) + ")"
+			default:
+				parts[i] = regexpModelText(sub)
+			}
+		}
+		return strings.Join(parts, "")
+	case syntax.OpAlternate:
 		parts := make([]string, len(re.Sub))
 		for i, sub := range re.Sub {
 			parts[i] = regexpModelText(sub)
 		}
-		separator := ""
-		if re.Op == syntax.OpAlternate {
-			separator = "|"
-		}
-		return strings.Join(parts, separator)
+		return strings.Join(parts, "|")
 	default:
 		return re.String()
 	}
+}
+
+// regexpModelRepeated renders the operand of a repeat, in parentheses when it
+// is more than one character.
+func regexpModelRepeated(sub *syntax.Regexp) string {
+	text := regexpModelText(sub)
+	switch {
+	case sub.Op == syntax.OpConcat, sub.Op == syntax.OpAlternate,
+		sub.Op == syntax.OpLiteral && len(sub.Rune) > 1:
+		return "(" + text + ")"
+	}
+	return text
 }
 
 // rerankFilter reports a node that Zoekt applies as a filter of the
@@ -262,10 +265,7 @@ func rerankFilter(node query.Q) bool {
 // model input. The original config must be applied again before display.
 func rerankModelSearchConfig(config searchConfig) searchConfig {
 	out := config
-	opts := searchOpts
-	if config.opts != nil {
-		opts = *config.opts
-	}
+	opts := *config.opts
 	if opts.NumContextLines < searchContextLines {
 		opts.NumContextLines = searchContextLines
 	}
@@ -275,7 +275,6 @@ func rerankModelSearchConfig(config searchConfig) searchConfig {
 	// final top -n, so the model reads every strict file with its context.
 	out.contextFileLimit = 0
 	out.contextMatchLimit = 0
-	out.resultFileLimit = 0
 	return out
 }
 
@@ -291,14 +290,7 @@ func newRerankDocument(result corpusSearchResult) rerankDocument {
 		return document
 	}
 
-	best := &result.file.LineMatches[0]
-	for i := 1; i < len(result.file.LineMatches); i++ {
-		candidate := &result.file.LineMatches[i]
-		if candidate.Score > best.Score ||
-			(candidate.Score == best.Score && candidate.LineNumber < best.LineNumber) {
-			best = candidate
-		}
-	}
+	best := &result.file.LineMatches[bestLineMatch(result.file.LineMatches)]
 
 	before := strings.ToValidUTF8(
 		string(trimRerankContext(best.Before, searchContextLines, true)),
@@ -331,6 +323,19 @@ func newRerankDocument(result corpusSearchResult) rerankDocument {
 		break
 	}
 	return document
+}
+
+// bestLineMatch is the index of the highest-scoring match, with the lowest
+// line number on a tie, or -1 with no match.
+func bestLineMatch(matches []zoekt.LineMatch) int {
+	best := -1
+	for index, match := range matches {
+		if best < 0 || match.Score > matches[best].Score ||
+			(match.Score == matches[best].Score && match.LineNumber < matches[best].LineNumber) {
+			best = index
+		}
+	}
+	return best
 }
 
 func rerankLineMatchSpan(
@@ -461,10 +466,7 @@ func applyRerankDisplayConfig(
 	results []corpusSearchResult,
 	config searchConfig,
 ) []corpusSearchResult {
-	contextLines := 0
-	if config.opts != nil {
-		contextLines = config.opts.NumContextLines
-	}
+	contextLines := config.opts.NumContextLines
 	out := make([]corpusSearchResult, len(results))
 	for i, result := range results {
 		out[i] = result

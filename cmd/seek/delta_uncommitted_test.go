@@ -12,6 +12,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/sourcegraph/zoekt"
+	"github.com/sourcegraph/zoekt/query"
 )
 
 // dirtyAndIndex rewrites the working-tree file at relPath with content and
@@ -20,7 +23,7 @@ import (
 // edits. The mtime is forced into the future to defeat filesystems that
 // collapse two writes within the same nanosecond, which would otherwise hide
 // the modification from statUncommittedCandidates.
-func dirtyAndIndex(t *testing.T, ctx context.Context, paths gitPaths, plan corpusPlan, relPath, content string) int {
+func dirtyAndIndex(t *testing.T, ctx context.Context, paths gitPaths, plan node, relPath, content string) int {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(paths.RepoDir, relPath), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -42,8 +45,8 @@ func TestDeltaUncommitted_RapidEditsKeepLatestOnly(t *testing.T) {
 
 	const cycles = 10
 	// Shard count snapshots after each cycle. Used to distinguish delta-path
-	// behaviour (monotonic growth +1 per cycle, modulo empty-shard cleanup)
-	// from a hypothetical silent fallback to full rebuild (would stay at 1).
+	// behaviour (monotonic growth +1 per cycle) from a hypothetical silent
+	// fallback to full rebuild (would stay at 1).
 	shardSeries := make([]int, 0, cycles)
 	for i := range cycles {
 		marker := fmt.Sprintf("dirty_edit_%d", i)
@@ -419,6 +422,66 @@ func TestDeltaUncommitted_DeletedDirtyFileTombstoned(t *testing.T) {
 	}
 	if r, _ := searchPlannedCorpusForTest(ctx, plan, "second_dirty_marker_v2"); len(r) == 0 {
 		t.Fatal("edited dirty file content should be findable")
+	}
+}
+
+// TestDeltaUncommitted_RemovalOnlyLeavesNoEmptyShard edits one dirty file, so
+// a delta shard holds it alone, then removes that file with no other change.
+// The removed file must leave the results, the other dirty file must stay, and
+// each uncommitted shard must hold a live document.
+func TestDeltaUncommitted_RemovalOnlyLeavesNoEmptyShard(t *testing.T) {
+	requireTools(t)
+
+	dir := initGitRepo(t, "app.go", "package main\n// committed_base\n")
+	ctx := context.Background()
+	paths, plan := planGitTestCorpus(t, dir)
+	reindexGit(t, ctx, paths, plan)
+
+	if err := os.WriteFile(filepath.Join(dir, "keep.go"), []byte("package main\n// keep_dirty_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "gone.go"), []byte("package main\n// gone_first_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	if shards := dirtyAndIndex(t, ctx, paths, plan, "gone.go", "package main\n// gone_second_marker\n"); shards < 2 {
+		t.Fatalf("uncommitted shards=%d, want a delta shard for the edit", shards)
+	}
+
+	if err := os.Remove(filepath.Join(dir, "gone.go")); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+
+	for _, marker := range []string{"gone_first_marker", "gone_second_marker"} {
+		results, err := searchPlannedCorpusForTest(ctx, plan, marker)
+		if err != nil {
+			t.Fatalf("search %s: %v", marker, err)
+		}
+		if len(results) != 0 {
+			t.Fatalf("removed file still matches %s: %d files", marker, len(results))
+		}
+	}
+	if results, err := searchPlannedCorpusForTest(ctx, plan, "keep_dirty_marker"); err != nil || len(results) == 0 {
+		t.Fatalf("the other dirty file must stay findable: results=%d err=%v", len(results), err)
+	}
+	shards := repositoryShardFiles(plan.indexDir, repoUncommitted)
+	if len(shards) == 0 {
+		t.Fatal("no uncommitted shard holds the other dirty file")
+	}
+	for _, shard := range shards {
+		searcher, err := openShard(shard)
+		if err != nil {
+			t.Fatalf("open %s: %v", filepath.Base(shard), err)
+		}
+		result, err := searcher.Search(ctx, &query.Const{Value: true}, &zoekt.SearchOptions{})
+		searcher.Close()
+		if err != nil {
+			t.Fatalf("search %s: %v", filepath.Base(shard), err)
+		}
+		if len(result.Files) == 0 {
+			t.Errorf("uncommitted shard %s holds no live document", filepath.Base(shard))
+		}
 	}
 }
 

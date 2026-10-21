@@ -14,9 +14,10 @@ func testContentID(seed byte) semanticContentID {
 	return id
 }
 
-// TestMergeHitsIgnoresInputOrder merges the same hits in shuffled node orders:
-// the output is the same each time. Full ties have different content, since
-// equal content collapses.
+// TestMergeHitsIgnoresInputOrder merges the hits of four nodes 20 times, with
+// the nodes and the hits of each node shuffled: the output is the same each
+// time and keeps all 24 hits. Full ties have different content, since equal
+// content collapses.
 func TestMergeHitsIgnoresInputOrder(t *testing.T) {
 	var nodes []nodeHits
 	for node := range 4 {
@@ -32,7 +33,7 @@ func TestMergeHitsIgnoresInputOrder(t *testing.T) {
 		}
 		nodes = append(nodes, hits)
 	}
-	want := mergeNodeHits(nodes...)
+	want := mergeNodeHits(slices.Concat(nodes...))
 	random := rand.New(rand.NewPCG(3, 4))
 	for range 20 {
 		shuffled := slices.Clone(nodes)
@@ -42,7 +43,7 @@ func TestMergeHitsIgnoresInputOrder(t *testing.T) {
 			random.Shuffle(len(inner), func(i, j int) { inner[i], inner[j] = inner[j], inner[i] })
 			shuffled[index] = inner
 		}
-		if got := mergeNodeHits(shuffled...); !reflect.DeepEqual(got, want) {
+		if got := mergeNodeHits(slices.Concat(shuffled...)); !reflect.DeepEqual(got, want) {
 			t.Fatalf("merge depends on input order:\ngot  %+v\nwant %+v", got, want)
 		}
 	}

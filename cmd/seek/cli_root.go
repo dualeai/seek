@@ -3,7 +3,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -12,8 +11,8 @@ import (
 	"github.com/spf13/pflag"
 )
 
-// cliFlags holds the parsed values for the root command. Bound to
-// rootCmd flags via pflag's Var/BoolVarP/IntVarP helpers.
+// cliFlags holds the parsed values for the root command. newRootCmd binds
+// them to the command's flags with pflag's BoolVar/BoolVarP/IntVarP helpers.
 type cliFlags struct {
 	verbose      bool
 	lexicalOnly  bool
@@ -88,8 +87,9 @@ func lookupExactFlag(flags *pflag.FlagSet, token string) *pflag.Flag {
 }
 
 // newRootCmd builds the seek root command with shared flags, examples,
-// and the search RunE callback. Subcommands attach via AddCommand.
-func newRootCmd() *cobra.Command {
+// and the search RunE callback. A descriptive search loads its model with
+// newModel. Subcommands attach via AddCommand.
+func newRootCmd(newModel semanticModelFactory) *cobra.Command {
 	flags := &cliFlags{search: defaultSearchConfig()}
 	cmd := &cobra.Command{
 		Use:   "seek [flags] <query> [path...]",
@@ -107,8 +107,6 @@ A result that the model adds must pass its score threshold; files that contain
 every query word stay. With no result, Seek prints nothing and exits with code
 1. This does not prove absence.
 
-The README "Support table" lists each query form and what Seek does with it.
-
 The first search of a large folder can take tens of seconds and use several GiB
 while Seek builds text and meaning-based indexes. Use --lexical-only to skip
 the meaning-based index and all model work.`,
@@ -119,7 +117,7 @@ the meaning-based index and all model work.`,
   seek 'request auth flow'    search a description with the local model`,
 		Args: rootArgsValidator,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
-			configureCLILogging(os.Stderr, flags.verbose)
+			slog.SetDefault(newCLILogger(os.Stderr, flags.verbose))
 			// Report a bad provider pin here, at the default log level. Left to
 			// the encoder, it would surface as one more reason to keep lexical
 			// search, which the fallback path hides behind --verbose.
@@ -131,10 +129,8 @@ the meaning-based index and all model work.`,
 			if flags.lexicalOnly || !commandUsesSemanticModel(cmd) {
 				return nil
 			}
-			if _, err := lateOnForcedProvider(); err != nil {
-				return err
-			}
-			return nil
+			_, err := lateOnForcedProvider()
+			return err
 		},
 		PreRunE: func(cmd *cobra.Command, args []string) error {
 			if flags.limit < 0 {
@@ -146,10 +142,7 @@ the meaning-based index and all model work.`,
 			if strings.TrimSpace(args[0]) == "" {
 				return fmt.Errorf("query is empty")
 			}
-			if err := selectSearchConfig(cmd, flags); err != nil {
-				return err
-			}
-			return nil
+			return selectSearchConfig(cmd, flags)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			policy := defaultSearchPolicy()
@@ -163,7 +156,7 @@ the meaning-based index and all model work.`,
 				flags.limit,
 				flags.maxMatches,
 				flags.search,
-				defaultSearchRunConfig(policy),
+				newSearchRunConfig(policy, newModel),
 			)
 		},
 		SilenceErrors: true,
@@ -177,7 +170,8 @@ the meaning-based index and all model work.`,
 	cmd.Flags().IntVarP(&flags.afterContext, "after-context", "A", 0, "lines to display after each match")
 	cmd.Flags().IntVarP(&flags.context, "context", "C", 0, "lines to display before and after each match")
 
-	// Version output keeps current format: `seek <ver>` with no doubling.
+	// The template adds the "seek " prefix, so the version drops it: the
+	// output is `seek <ver>`, not `seek seek <ver>`.
 	cmd.Version = strings.TrimPrefix(versionString(), "seek ")
 	cmd.SetVersionTemplate("seek {{.Version}}\n")
 
@@ -200,19 +194,14 @@ the meaning-based index and all model work.`,
 	return cmd
 }
 
-// defaultSearchRunConfig returns the run config of policy. Only a policy with
-// semantic search gets the model factory.
-func defaultSearchRunConfig(policy searchPolicy) searchRunConfig {
+// newSearchRunConfig returns the run config of policy. Only a policy with
+// semantic search gets the model factory newModel.
+func newSearchRunConfig(policy searchPolicy, newModel semanticModelFactory) searchRunConfig {
 	config := searchRunConfig{policy: policy}
-	if !policy.semanticEnabled() {
-		return config
+	if policy.semanticEnabled() {
+		config.newModel = newModel
 	}
-	config.newModel = newLateOnSemanticModel
 	return config
-}
-
-func configureCLILogging(w io.Writer, verbose bool) {
-	slog.SetDefault(newCLILogger(w, verbose))
 }
 
 // selectSearchConfig sets flags.search from --after-context or --context, or

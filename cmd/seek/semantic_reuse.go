@@ -112,9 +112,6 @@ func loadSemanticReuse(indexDir, staging, lineage string, extra ...string) *sema
 	started := time.Now()
 	cacheRoot, rootErr := seekUserCacheRoot()
 	dirs := semanticGenerationDirsIn(indexDir, staging)
-	if lineage != "" {
-		_ = writeCacheFile(filepath.Dir(indexDir), semanticLineageFile, lineage)
-	}
 	if len(dirs) == 0 && lineage != "" && rootErr == nil {
 		corpora, _ := filepath.Glob(filepath.Join(cacheRoot, corporaDir, "*", "index"))
 		for _, other := range corpora {
@@ -243,7 +240,8 @@ func (index *semanticReuseIndex) Close() {
 	closeSemanticUnits(index.units)
 }
 
-// semanticGenerationDirsIn lists the published generations of indexDir.
+// semanticGenerationDirsIn lists the published generations of indexDir,
+// except skip.
 func semanticGenerationDirsIn(indexDir, skip string) []string {
 	entries, err := os.ReadDir(indexDir)
 	if err != nil {

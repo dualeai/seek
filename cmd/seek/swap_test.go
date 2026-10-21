@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -173,8 +177,8 @@ func TestTempSwap_RecoversFolderIncompleteSwap(t *testing.T) {
 
 // TestTempSwap_ReaderExcludedFromTornWindow deterministically proves the publish
 // EX lock excludes a concurrent reader from the torn window (live committed
-// family deleted, replacements not yet renamed in). The afterDeleteBeforeRename
-// hook holds the swap mid-tear while a reader tries to search; the reader must
+// family deleted, replacements not yet renamed in). afterDeleteBeforeRenameHook
+// holds the swap mid-tear while a reader tries to search; the reader must
 // block on LOCK_SH and observe the full new generation, never the torn set.
 func TestTempSwap_ReaderExcludedFromTornWindow(t *testing.T) {
 	requireTools(t)
@@ -213,8 +217,158 @@ func TestTempSwap_ReaderExcludedFromTornWindow(t *testing.T) {
 		t.Fatalf("delta build: %v", err)
 	}
 
-	got := <-readerDone
+	var got int
+	select {
+	case got = <-readerDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("no swap ran the hook, so no reader was started")
+	}
 	if got <= 0 {
 		t.Fatalf("reader observed torn/empty committed set during swap (got %d) — SH exclusion failed", got)
+	}
+}
+
+// TestPublishStepFailureServesTheTornFamily fails one rename of a publish
+// after the live family is deleted: the hook removes the last shard of the
+// build. It runs for each node kind. The search serves the shards that the
+// swap renamed, with a warning, and .swapping names the torn family; the
+// edited file is in neither copy. The next search repairs.
+func TestPublishStepFailureServesTheTornFamily(t *testing.T) {
+	requireTools(t)
+	for _, test := range []struct {
+		kind  string
+		fam   shardFamily
+		label string
+	}{
+		{"git", familyCommitted, "committed"},
+		{"folder", familyAll, "all"},
+	} {
+		t.Run(test.kind, func(t *testing.T) {
+			setTestUserCache(t)
+			swapShardMaxForTest(t, 4096)
+			root := t.TempDir()
+			write := func(index int, marker string) {
+				writeFileAt(t, root, fmt.Sprintf("f%d.txt", index), marker+"\n"+strings.Repeat(fmt.Sprintf("fill %d of the torn swap fixture\n", index), 128))
+			}
+			for index := range 4 {
+				write(index, "zqtorn")
+			}
+			if test.kind == "git" {
+				gitInitCommitAll(t, root)
+			}
+			search := func() string {
+				t.Helper()
+				out, err := captureStdout(t, func() error { return run(t.Context(), "zqtorn", []string{root}) })
+				if err != nil {
+					t.Fatalf("search: %v", err)
+				}
+				return out
+			}
+			search()
+			// Edit the last file, so that its new copy is in the last shard.
+			write(3, "zqtorn zqtornedit")
+			if test.kind == "git" {
+				gitRunIn(t, root, "commit", "-q", "-am", "edit")
+			}
+			plans, err := planCorpora(t.Context(), []string{root})
+			if err != nil || len(plans) != 1 {
+				t.Fatalf("plans=%d err=%v", len(plans), err)
+			}
+			plan := plans[0]
+			var removed int
+			afterDeleteBeforeRenameHook = func() {
+				dirs, _ := filepath.Glob(filepath.Join(plan.indexDir, buildDirPrefix+"*"))
+				for _, dir := range dirs {
+					shards, err := familyShardFiles(dir, test.fam)
+					if err != nil || len(shards) < 2 {
+						t.Errorf("build %s: shards=%v err=%v, want 2 or more", dir, shards, err)
+						continue
+					}
+					if err := os.Remove(shards[len(shards)-1]); err != nil {
+						t.Error(err)
+						continue
+					}
+					removed++
+				}
+			}
+			t.Cleanup(func() { afterDeleteBeforeRenameHook = nil })
+			logs := captureTestLogs(t, slog.LevelWarn)
+			out := search()
+			afterDeleteBeforeRenameHook = nil
+			if removed != 1 {
+				t.Fatalf("the hook removed %d shards, want 1", removed)
+			}
+			warned := false
+			for _, record := range logs.Records() {
+				warned = warned || record.Message == "Index update failed; using the existing index"
+			}
+			if !warned || !strings.Contains(out, "f0.txt") || strings.Contains(out, "f3.txt") {
+				t.Fatalf("want the torn family with a warning and no edited file: warned=%t output:\n%s", warned, out)
+			}
+			if label := readCacheFile(plan.cacheDir, swappingMarkerFile); label != test.label {
+				t.Fatalf(".swapping=%q, want %q", label, test.label)
+			}
+			out = search()
+			for index := range 4 {
+				if !strings.Contains(out, fmt.Sprintf("f%d.txt", index)) {
+					t.Fatalf("the repair must find f%d.txt:\n%s", index, out)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(plan.cacheDir, swappingMarkerFile)); !os.IsNotExist(err) {
+				t.Fatalf(".swapping stays after the repair: %v", err)
+			}
+		})
+	}
+}
+
+// TestRecoverIncompleteSwapCleansTornFamily makes a torn family by hand, as a
+// crash during a publish leaves it, and runs the swap repair. The repair
+// removes the shards and sidecars of the family that .swapping names, the
+// family manifest and the state files, and keeps the delta base record. A
+// full rebuild cannot show this: the next publish removes every live member
+// of the family anyway.
+func TestRecoverIncompleteSwapCleansTornFamily(t *testing.T) {
+	for _, test := range []struct {
+		label           string
+		uncommittedGone bool
+	}{
+		{"committed", false},
+		{"all", true},
+	} {
+		t.Run(test.label, func(t *testing.T) {
+			cacheDir := t.TempDir()
+			indexDir := filepath.Join(cacheDir, "index")
+			committed := []string{"repo_v16.00000.zoekt", "repo_v16.00000.zoekt.meta", "repo_v16.00002.zoekt"}
+			uncommitted := "uncommitted_v16.00000.zoekt"
+			for _, name := range append(slices.Clone(committed), uncommitted, familyManifestFile) {
+				writeFixtureFile(t, filepath.Join(indexDir, name), "x")
+			}
+			state := []string{stateFile, headFile, emptyFile, swappingMarkerFile}
+			for _, name := range append(slices.Clone(state), committedGitStateFile) {
+				writeFixtureFile(t, filepath.Join(cacheDir, name), "x")
+			}
+			writeFixtureFile(t, filepath.Join(cacheDir, swappingMarkerFile), test.label)
+			corpusStore{cacheDir: cacheDir, indexDir: indexDir}.recoverIncompleteSwap()
+			exists := func(path string) bool {
+				_, err := os.Stat(path)
+				return err == nil
+			}
+			for _, name := range append(slices.Clone(committed), familyManifestFile) {
+				if exists(filepath.Join(indexDir, name)) {
+					t.Errorf("%s stays after the repair", name)
+				}
+			}
+			for _, name := range state {
+				if exists(filepath.Join(cacheDir, name)) {
+					t.Errorf("%s stays after the repair", name)
+				}
+			}
+			if got := exists(filepath.Join(indexDir, uncommitted)); got == test.uncommittedGone {
+				t.Errorf("uncommitted shard exists=%t, want %t", got, !test.uncommittedGone)
+			}
+			if !exists(filepath.Join(cacheDir, committedGitStateFile)) {
+				t.Error("the repair removed the delta base record")
+			}
+		})
 	}
 }

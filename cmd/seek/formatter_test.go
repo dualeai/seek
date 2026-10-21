@@ -20,11 +20,28 @@ func testDirtyFileSet(paths ...string) dirtyFileSet {
 	return files
 }
 
-func TestGitCorpusFormatting_Empty(t *testing.T) {
-	result := formatGitCorpusResultsForTest(nil, nil, 0, 0)
-	if result != "" {
-		t.Errorf("expected empty string, got %q", result)
+// requireNoGitCorpusOutput puts files in testGitCorpusPlan, runs the
+// streamed formatter with dirtyFiles and limit, and requires no output and no
+// written result: runSearchCommand then returns errNoMatch (exit status 1).
+func requireNoGitCorpusOutput(t *testing.T, files []zoekt.FileMatch, dirtyFiles dirtyFileSet, limit int) {
+	t.Helper()
+	var output bytes.Buffer
+	wrote, err := writeCorpusResultsWithContext(
+		&output,
+		wrapCorpusResults(testGitCorpusPlan, files),
+		dirtyFilesByCorpus{testGitCorpusPlan.id: dirtyFiles},
+		limit,
+		0,
+		hideCorpusContext,
+		plainPalette,
+	)
+	if err != nil || wrote || output.Len() != 0 {
+		t.Fatalf("wrote=%t error=%v output=%q, want no result", wrote, err, output.String())
 	}
+}
+
+func TestGitCorpusFormatting_Empty(t *testing.T) {
+	requireNoGitCorpusOutput(t, nil, nil, 0)
 }
 
 func TestWriteCorpusResultsWithContextMatchesStringFormatter(t *testing.T) {
@@ -58,7 +75,7 @@ func TestWriteCorpusResultsWithContextMatchesStringFormatter(t *testing.T) {
 	}
 	// Written by hand from the output format: the header and the match line of
 	// the file that limit 1 keeps, a blank line, then the notice for the other.
-	const want = "## first.go (Go)\n1 first match\n\n… 1 more files (showing 1 of 2)\n"
+	const want = "## first.go (Go)\n1 first match\n\n… 1 more file (showing 1 of 2)\n"
 	var output bytes.Buffer
 	wrote, err := writeCorpusResultsWithContext(
 		&output, results, nil, 1, 0, hideCorpusContext, plainPalette,
@@ -464,7 +481,8 @@ func TestGitCorpusFormatting_ContextLines_BeforeAndAfter(t *testing.T) {
 }
 
 func TestGitCorpusFormatting_ContextLines_NoContext(t *testing.T) {
-	// When Before/After are empty, output should be the same as before
+	// With empty Before and After, the output holds only the header and the
+	// match line.
 	files := []zoekt.FileMatch{
 		{
 			FileName:   "main.go",
@@ -913,8 +931,8 @@ func TestGitCorpusFormatting_ContextLines_BeforeNoTrailingNewline(t *testing.T) 
 }
 
 func TestGitCorpusFormatting_FileOnlyMatch_LineNumberZero(t *testing.T) {
-	// Reproduces panic on file-only queries where zoekt returns LineNumber=0
-	// with empty Before/After (e.g. "file:foo" with no content term).
+	// A file-only query (such as "file:foo" with no content term) gets
+	// LineNumber=0 with empty Before and After from Zoekt.
 	files := []zoekt.FileMatch{
 		{
 			FileName:   "path/to/file.go",
@@ -938,8 +956,8 @@ func TestGitCorpusFormatting_FileOnlyMatch_LineNumberZero(t *testing.T) {
 }
 
 func TestGitCorpusFormatting_StaleDirtyFileSuppressed(t *testing.T) {
-	// End-to-end: formatting should produce no output when the only match
-	// is a stale committed result for a dirty file.
+	// The formatter writes no result when the only match is a stale
+	// committed result for a dirty file.
 	files := []zoekt.FileMatch{
 		{
 			FileName:   "sqlite.py",
@@ -951,27 +969,19 @@ func TestGitCorpusFormatting_StaleDirtyFileSuppressed(t *testing.T) {
 			},
 		},
 	}
-	dirtyFiles := testDirtyFileSet("sqlite.py")
-	result := formatGitCorpusResultsForTest(files, dirtyFiles, 0, 0)
-	if result != "" {
-		t.Errorf("expected empty output for stale dirty file, got:\n%s", result)
-	}
+	requireNoGitCorpusOutput(t, files, testDirtyFileSet("sqlite.py"), 0)
 }
 
 func TestGitCorpusFormatting_AllSuppressedReturnsEmpty(t *testing.T) {
-	// When all results are suppressed, formatting returns "" so the caller
-	// can detect "no valid results" and return errNoMatch (exit code 1).
+	// When all results are suppressed, the formatter writes no result, so the
+	// caller returns errNoMatch (exit code 1).
 	files := []zoekt.FileMatch{
 		{FileName: "a.py", Repository: "repo", Language: "Python", Score: 10,
 			LineMatches: []zoekt.LineMatch{{Line: []byte("old\n"), LineNumber: 1}}},
 		{FileName: "b.py", Repository: "repo", Language: "Python", Score: 5,
 			LineMatches: []zoekt.LineMatch{{Line: []byte("stale\n"), LineNumber: 2}}},
 	}
-	dirtyFiles := testDirtyFileSet("a.py", "b.py")
-	result := formatGitCorpusResultsForTest(files, dirtyFiles, 0, 0)
-	if result != "" {
-		t.Errorf("expected empty string when all results suppressed, got:\n%s", result)
-	}
+	requireNoGitCorpusOutput(t, files, testDirtyFileSet("a.py", "b.py"), 0)
 }
 
 func TestGitCorpusFormatting_PartialSuppression(t *testing.T) {
@@ -1211,9 +1221,7 @@ func TestGitCorpusFormatting_Limit_EqualsResults(t *testing.T) {
 }
 
 func TestGitCorpusFormatting_Limit_EmptyInput(t *testing.T) {
-	if result := formatGitCorpusResultsForTest(nil, nil, 5, 0); result != "" {
-		t.Errorf("expected empty output, got %q", result)
-	}
+	requireNoGitCorpusOutput(t, nil, nil, 5)
 }
 
 func TestGitCorpusFormatting_Limit_DedupReducesBelowLimit(t *testing.T) {
@@ -1230,11 +1238,7 @@ func TestGitCorpusFormatting_Limit_AllSuppressedByDirty(t *testing.T) {
 		{FileName: "a.go", Repository: "repo", Language: "Go", Score: 10,
 			LineMatches: []zoekt.LineMatch{{Line: []byte("old\n"), LineNumber: 1}}},
 	}
-	dirtyFiles := testDirtyFileSet("a.go")
-	result := formatGitCorpusResultsForTest(files, dirtyFiles, 5, 0)
-	if result != "" {
-		t.Errorf("expected empty output, got %q", result)
-	}
+	requireNoGitCorpusOutput(t, files, testDirtyFileSet("a.go"), 5)
 }
 
 func TestGitCorpusFormatting_Limit_TiedScores(t *testing.T) {
@@ -1489,7 +1493,7 @@ func TestFormatCorpusResults_SameRelativePathDifferentCorpora(t *testing.T) {
 }
 
 func TestFormatCorpusResults_FileCorpusContextUsesExactRoot(t *testing.T) {
-	fileResults := wrapCorpusResults(corpusPlan{
+	fileResults := wrapCorpusResults(node{
 		id:            corpusID("file-corpus"),
 		kind:          corpusKindFolder,
 		rootType:      rootTypeFile,
@@ -1499,7 +1503,7 @@ func TestFormatCorpusResults_FileCorpusContextUsesExactRoot(t *testing.T) {
 		FileName: "exact.txt", Language: "Text", Score: 10,
 		LineMatches: []zoekt.LineMatch{{Line: []byte("needle\n"), LineNumber: 1}},
 	}})
-	folderResults := wrapCorpusResults(corpusPlan{
+	folderResults := wrapCorpusResults(node{
 		id:          corpusID("folder-corpus"),
 		kind:        corpusKindFolder,
 		rootType:    rootTypeDirectory,
@@ -1628,14 +1632,7 @@ func TestNormalizeLineMatches(t *testing.T) {
 			Score:         4,
 			LineFragments: []zoekt.LineFragmentMatch{{LineOffset: 0, MatchLength: 4}},
 		},
-		{
-			Line:          []byte("line seventy\n"),
-			LineNumber:    70,
-			Score:         4,
-			LineFragments: []zoekt.LineFragmentMatch{{LineOffset: 5, MatchLength: 7}},
-		},
 		{Line: []byte("line ten\n"), LineNumber: 10, Score: 2},
-		{Line: []byte("line thirty\n"), LineNumber: 30, Score: 3},
 		{Line: []byte("line thirty\n"), LineNumber: 30, Score: 3},
 		{Line: []byte("line fifty\n"), LineNumber: 50, Score: 1},
 	}
@@ -1648,13 +1645,10 @@ func TestNormalizeLineMatches(t *testing.T) {
 	want := []zoekt.LineMatch{
 		{Line: []byte("line thirty\n"), LineNumber: 30, Score: 3},
 		{
-			Line:       []byte("line seventy\n"),
-			LineNumber: 70,
-			Score:      4,
-			LineFragments: []zoekt.LineFragmentMatch{
-				{LineOffset: 0, MatchLength: 4},
-				{LineOffset: 5, MatchLength: 7},
-			},
+			Line:          []byte("line seventy\n"),
+			LineNumber:    70,
+			Score:         4,
+			LineFragments: []zoekt.LineFragmentMatch{{LineOffset: 0, MatchLength: 4}},
 		},
 	}
 

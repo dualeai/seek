@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 	"unsafe"
@@ -52,15 +53,9 @@ func (segment *semanticUnitSegment) record(index int) []byte {
 
 // find returns the record of key, by binary search on the mapped file.
 func (segment *semanticUnitSegment) find(key semanticRowKey) ([]byte, bool) {
-	low, high := 0, segment.records
-	for low < high {
-		middle := int(uint(low+high) >> 1)
-		if bytes.Compare(segment.record(middle)[:32], key[:]) < 0 {
-			low = middle + 1
-		} else {
-			high = middle
-		}
-	}
+	low := sort.Search(segment.records, func(index int) bool {
+		return bytes.Compare(segment.record(index)[:32], key[:]) >= 0
+	})
 	if low < segment.records && bytes.Equal(segment.record(low)[:32], key[:]) {
 		return segment.record(low), true
 	}

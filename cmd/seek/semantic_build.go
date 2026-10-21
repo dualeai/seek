@@ -15,7 +15,6 @@ import (
 	"unsafe"
 
 	ctags "github.com/sourcegraph/go-ctags"
-	"github.com/sourcegraph/zoekt/index"
 )
 
 type semanticSourceDocument struct {
@@ -37,32 +36,31 @@ type semanticBuildBatch struct {
 
 // semanticBuildOwner keeps one source file admitted until every model batch
 // that reads a view of its bytes has finished tokenization and inference.
+// refs starts at 1 for the extraction loop, which calls retain only before
+// seal. The call that sets refs to 0 releases the weight.
 type semanticBuildOwner struct {
-	weight    int64
-	remaining atomic.Int64
-	sealed    atomic.Bool
-	released  atomic.Bool
+	weight int64
+	refs   atomic.Int64
+}
+
+func newSemanticBuildOwner(weight int64) *semanticBuildOwner {
+	owner := &semanticBuildOwner{weight: weight}
+	owner.refs.Store(1)
+	return owner
 }
 
 func (owner *semanticBuildOwner) retain() {
-	owner.remaining.Add(1)
+	owner.refs.Add(1)
 }
 
 func (owner *semanticBuildOwner) done() {
-	owner.remaining.Add(-1)
-	owner.releaseIfDone()
+	if owner.refs.Add(-1) == 0 && owner.weight > 0 {
+		readSemaphore.Release(owner.weight)
+	}
 }
 
 func (owner *semanticBuildOwner) seal() {
-	owner.sealed.Store(true)
-	owner.releaseIfDone()
-}
-
-func (owner *semanticBuildOwner) releaseIfDone() {
-	if owner.weight > 0 && owner.sealed.Load() && owner.remaining.Load() == 0 &&
-		owner.released.CompareAndSwap(false, true) {
-		readSemaphore.Release(owner.weight)
-	}
+	owner.done()
 }
 
 type semanticEncodedBatch struct {
@@ -72,7 +70,7 @@ type semanticEncodedBatch struct {
 }
 
 // semanticCopiedRow is a row whose vectors the build copies from a live
-// generation (semanticReuseIndex).
+// generation or the unit store (semanticReuseIndex).
 type semanticCopiedRow struct {
 	row uint64
 	ref semanticReuseRef
@@ -91,6 +89,23 @@ type semanticCoarseBatch struct {
 }
 
 type semanticDocumentSource func(context.Context) (<-chan fileContent, func() error)
+
+// folderReadSource gives a document source that streams files with stream.
+// stream gets a read context and its cancel function. When a
+// *folderReadError ends the read context, the finish function returns it.
+func folderReadSource(stream func(context.Context, context.CancelCauseFunc) <-chan fileContent) semanticDocumentSource {
+	return func(streamCtx context.Context) (<-chan fileContent, func() error) {
+		readCtx, cancel := context.WithCancelCause(streamCtx)
+		documents := stream(readCtx, cancel)
+		return documents, func() error {
+			defer cancel(nil)
+			if readErr, ok := errors.AsType[*folderReadError](context.Cause(readCtx)); ok {
+				return readErr
+			}
+			return nil
+		}
+	}
+}
 
 func runSemanticBuild(
 	ctx context.Context,
@@ -266,19 +281,8 @@ func (controller *semanticConcurrencyController) evaluate(
 		memoryLimit := limit + int(available/controller.growthCost)
 		next = min(next, memoryLimit)
 	}
-	if next < limit {
-		controller.limit = next
-		controller.previousLimit = controller.limit
-		controller.resetWindow(now, available)
-		return
-	}
-	added := next - limit
-	if added > 0 {
-		controller.previousLimit = limit
-		controller.limit = next
-	} else {
-		controller.previousLimit = limit
-	}
+	controller.previousLimit = min(limit, next)
+	controller.limit = next
 	controller.resetWindow(now, available)
 }
 
@@ -321,7 +325,7 @@ func buildSemanticGitGeneration(
 	resources searchResources,
 	missing *[]missingBlob,
 ) (semanticManifest, error) {
-	if err := requireNativeGitVersion(ctx, repoDir); err != nil {
+	if err := requireNativeGitVersion(ctx); err != nil {
 		return semanticManifest{}, err
 	}
 	reuse := loadSemanticReuse(indexDir, dir, lineage)
@@ -361,17 +365,9 @@ func buildSemanticFolderGeneration(
 		source,
 		embedder,
 		resources,
-		func(streamCtx context.Context) (<-chan fileContent, func() error) {
-			readCtx, cancel := context.WithCancelCause(streamCtx)
-			documents := streamFolderFiles(readCtx, selected, resources.cpuLimit(), cancel)
-			return documents, func() error {
-				defer cancel(nil)
-				if readErr, ok := errors.AsType[*folderReadError](context.Cause(readCtx)); ok {
-					return readErr
-				}
-				return nil
-			}
-		},
+		folderReadSource(func(readCtx context.Context, cancel context.CancelCauseFunc) <-chan fileContent {
+			return streamFolderFiles(readCtx, selected, resources.cpuLimit(), cancel)
+		}),
 		reuse,
 	)
 }
@@ -396,9 +392,7 @@ func buildSemanticGeneration(
 		return semanticManifest{}, err
 	}
 	workerCount := resources.cpuLimit()
-	indexOptions := indexBuildOptions("", workerCount)
-	indexOptions.SetDefaults()
-	parsers := make([]semanticTagParser, workerCount)
+	parsers := make([]ctags.Parser, workerCount)
 	for index := range parsers {
 		parser, err := ctags.New(ctags.Options{Bin: os.Getenv("CTAGS_COMMAND")})
 		if err != nil {
@@ -437,24 +431,11 @@ func buildSemanticGeneration(
 
 	var extractWait sync.WaitGroup
 	for worker, parser := range parsers {
-		tokenizer := tokenizers[worker]
-		extractWait.Add(1)
-		go func(parser semanticTagParser) {
-			defer extractWait.Done()
-			checker := &index.DocChecker{}
+		extractWait.Go(func() {
 			extractSemanticDocuments(
-				buildCtx,
-				parser,
-				checker,
-				indexOptions,
-				tokenizer,
-				reuse,
-				resources,
-				jobs,
-				extracted,
-				cancel,
+				buildCtx, parser, tokenizers[worker], reuse, resources, jobs, extracted, cancel,
 			)
-		}(parser)
+		})
 	}
 	go func() {
 		extractWait.Wait()
@@ -469,7 +450,7 @@ func buildSemanticGeneration(
 		batches,
 		encoded,
 		cancel,
-		resources.withModelCallCost(semanticModelCallCPUs(buildCtx, embedder)),
+		resources.withModelCallCost(embedder.SemanticCallCPUs(buildCtx)),
 	)
 	// An overlay gets no USearch graph: its search scores every row with the
 	// exact fine vectors, and the graph would be half the cost of a save.
@@ -567,7 +548,7 @@ func buildSemanticGeneration(
 			}
 			// A copied row needs no model call; the file's bytes stay held
 			// only while a model batch reads a view of them.
-			owner := &semanticBuildOwner{weight: ready.weight}
+			owner := newSemanticBuildOwner(ready.weight)
 			retained := false
 			for _, unit := range ready.units {
 				if failed {
@@ -730,9 +711,7 @@ func dispatchSemanticDocuments(
 
 func extractSemanticDocuments(
 	ctx context.Context,
-	parser semanticTagParser,
-	checker *index.DocChecker,
-	indexOptions index.Options,
+	parser ctags.Parser,
 	tokenizer *lateOnTokenizer,
 	reuse *semanticReuseIndex,
 	resources searchResources,
@@ -758,10 +737,7 @@ func extractSemanticDocuments(
 			// and content copies its rows with no parse and no tokenization.
 			if units, reused = reuse.fileRows(document.name, contentID); !reused {
 				entries, parseErr := parser.Parse(document.name, document.content)
-				fileLanguage := semanticDocumentLanguage(checker, indexOptions, document)
-				units = extractSemanticUnitsWithID(
-					document.name, document.content, contentID, entries, parseErr, fileLanguage,
-				)
+				units = extractSemanticUnitsWithID(document.name, document.content, contentID, entries, parseErr)
 				if len(units) > 0 {
 					units, packErr = windowSemanticUnits(ctx, tokenizer, units)
 				}
@@ -790,34 +766,6 @@ func extractSemanticDocuments(
 	}
 }
 
-// semanticDocumentLanguage follows Zoekt's document checks before language
-// detection so lang: filters use the same whole-file value. The caller must
-// supply its worker-local DocChecker and the lexical build's index options.
-// One case differs: when guardWrappedShards makes a document name-only after
-// the lexical build, Zoekt stores a language from the name only, while the
-// semantic rows keep the language of the content.
-func semanticDocumentLanguage(
-	checker *index.DocChecker,
-	options index.Options,
-	document fileContent,
-) string {
-	indexed := index.Document{
-		Name:       document.name,
-		Content:    document.content,
-		SkipReason: document.skipReason,
-	}
-	if indexed.SkipReason == index.SkipReasonNone {
-		allowLarge := options.IgnoreSizeMax(indexed.Name)
-		if len(indexed.Content) > options.SizeMax && !allowLarge {
-			indexed.SkipReason = index.SkipReasonTooLarge
-		} else if checker != nil {
-			indexed.SkipReason = checker.Check(indexed.Content, options.TrigramMax, allowLarge)
-		}
-	}
-	index.DetermineLanguageIfUnknown(&indexed)
-	return indexed.Language
-}
-
 func encodeSemanticBatches(
 	ctx context.Context,
 	embedder semanticModel,
@@ -834,6 +782,7 @@ func encodeSemanticBatches(
 	controller := newSemanticConcurrencyController(resources.currentTime(), initialAvailable)
 	slog.Debug(
 		"Calibrating semantic inference concurrency",
+		"provider", semanticProviderName(),
 		"cpu_limit", resources.cpuLimit(),
 		"cpu_per_call", resources.callCPUs,
 		"call_limit", resources.callLimit(),
@@ -906,56 +855,38 @@ func encodeSemanticBatches(
 		}
 	}
 
-	for input != nil || active > 0 {
-		limit := controller.activeLimit(resources.callLimit())
-		if input != nil && active < limit {
-			select {
-			case batch, ok := <-input:
-				if !ok {
-					input = nil
-					controller.noteInputClosed()
-					continue
-				}
-				start(batch)
-				continue
-			default:
-			}
-			inputEmptyPolls++
-			controller.noteStarved()
-			if active == 0 {
-				batch, ok := <-input
-				if !ok {
-					input = nil
-					controller.noteInputClosed()
-					continue
-				}
-				start(batch)
-				continue
-			}
-			select {
-			case batch, ok := <-input:
-				if !ok {
-					input = nil
-					controller.noteInputClosed()
-					continue
-				}
-				start(batch)
-			case result := <-completed:
-				finish(result)
-			}
-			continue
-		}
-		if active > 0 {
-			finish(<-completed)
-			continue
-		}
-		batch, ok := <-input
+	receive := func(batch semanticBuildBatch, ok bool) {
 		if !ok {
 			input = nil
 			controller.noteInputClosed()
-			continue
+			return
 		}
 		start(batch)
+	}
+	for input != nil || active > 0 {
+		limit := controller.activeLimit(resources.callLimit())
+		// Both cases have a call in flight: the loop condition covers a
+		// closed input, and activeLimit is at least 1.
+		if input == nil || active >= limit {
+			finish(<-completed)
+			continue
+		}
+		select {
+		case batch, ok := <-input:
+			receive(batch, ok)
+			continue
+		default:
+		}
+		inputEmptyPolls++
+		controller.noteStarved()
+		// With no call in flight, nothing sends on completed, so this select
+		// waits for input.
+		select {
+		case batch, ok := <-input:
+			receive(batch, ok)
+		case result := <-completed:
+			finish(result)
+		}
 	}
 	cpuLimit := resources.cpuLimit()
 	callLimit := resources.callLimit()
@@ -974,12 +905,12 @@ func encodeSemanticBatches(
 
 // collectSemanticBatches writes each row's fine and coarse vectors at the
 // row's offset: rows that the model embedded, out of order, and rows copied
-// from a live generation. It sends the coarse vectors of each complete
-// 128-row block to the USearch stream after its writes succeed. Both paths
-// store the coarse vectors as SNORM16 and send their decoded values, so a
-// copied row gives the same bytes as an embedded one. On the first collector
-// error, it keeps that error, cancels shared build work, and drains both
-// inputs until their producers close them.
+// from a live generation or the unit store. It sends the coarse vectors of
+// each complete 128-row block to the USearch stream after its writes succeed.
+// Both paths store the coarse vectors as SNORM16 and send their decoded
+// values, so a copied row gives the same bytes as an embedded one. On the
+// first collector error, it keeps that error, cancels shared build work, and
+// drains both inputs until their producers close them.
 func collectSemanticBatches(
 	encoded <-chan semanticEncodedBatch,
 	copied <-chan []semanticCopiedRow,
@@ -1006,10 +937,6 @@ func collectSemanticBatches(
 			if !ok {
 				encoded = nil
 				continue
-			}
-			for index := range batch.units {
-				batch.units[index].text = nil
-				batch.units[index].modelInput = nil
 			}
 			if output.err != nil {
 				continue
@@ -1121,9 +1048,6 @@ func (w *semanticRowWriter) writeRuns(
 	encode func(i int, fine, coarse []byte) (semanticCoarseSNORM16Vectors, error),
 	coarseReady chan<- semanticCoarseBatch,
 ) error {
-	if w == nil {
-		return fmt.Errorf("semantic vector files are unavailable")
-	}
 	const fineBytes, coarseBytes = semanticFineVectorBytesPerUnit, semanticCoarseVectorBytesPerUnit
 	if need := count * (fineBytes + coarseBytes); cap(w.buffer) < need {
 		w.buffer = make([]byte, need)
@@ -1214,13 +1138,10 @@ func (w *semanticRowWriter) finish(ok bool, coarseReady chan<- semanticCoarseBat
 	if ok {
 		if uint64(len(w.seen)) != w.rows {
 			err = fmt.Errorf("semantic build wrote %d of %d rows", w.rows, len(w.seen))
-		} else if len(w.blocks) > 1 {
-			err = fmt.Errorf("semantic build left %d coarse blocks short", len(w.blocks))
 		}
+		// When every row from 0 was written once, every full block was sent.
+		// Only the last block can remain, and it is short.
 		for sequence, block := range w.blocks {
-			if err == nil && (sequence+1)*semanticModelBatchRows < w.rows {
-				err = fmt.Errorf("semantic coarse block %d is short", sequence)
-			}
 			if err == nil && coarseReady != nil {
 				coarseReady <- semanticCoarseBatch{sequence: int(sequence), coarse: block.coarse[:block.count]}
 			}
@@ -1276,17 +1197,9 @@ func buildSemanticOverlayGeneration(
 		source,
 		embedder,
 		resources,
-		func(streamCtx context.Context) (<-chan fileContent, func() error) {
-			readCtx, cancel := context.WithCancelCause(streamCtx)
-			documents := streamDirtyFiles(readCtx, repoDir, files, resources.cpuLimit(), &dirtyFailure{stop: cancel})
-			return documents, func() error {
-				defer cancel(nil)
-				if readErr, ok := errors.AsType[*folderReadError](context.Cause(readCtx)); ok {
-					return readErr
-				}
-				return nil
-			}
-		},
+		folderReadSource(func(readCtx context.Context, cancel context.CancelCauseFunc) <-chan fileContent {
+			return streamDirtyFiles(readCtx, repoDir, files, resources.cpuLimit(), &dirtyFailure{stop: cancel})
+		}),
 		reuse,
 	)
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -20,8 +21,8 @@ import (
 func TestSearchNodesRunsAPhysicalCorpusOnce(t *testing.T) {
 	defer goroutineLeakGuard(t, defaultLeakTimeout)()
 	var calls atomic.Int32
-	plans := []corpusPlan{{id: "dup"}, {id: "dup"}, {id: "other"}}
-	results, _, err := searchNodes(t.Context(), plans, func(_ context.Context, plan corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
+	plans := []node{{id: "dup"}, {id: "dup"}, {id: "other"}}
+	results, _, err := searchNodes(t.Context(), plans, func(_ context.Context, plan node) ([]corpusSearchResult, dirtyFileSet, error) {
 		calls.Add(1)
 		return []corpusSearchResult{{corpusID: plan.id}}, nil, nil
 	})
@@ -35,8 +36,8 @@ func TestSearchNodesRunsAPhysicalCorpusOnce(t *testing.T) {
 func TestSearchNodesSkipsAFailedNodeWithOneWarning(t *testing.T) {
 	defer goroutineLeakGuard(t, defaultLeakTimeout)()
 	logs := captureTestLogs(t, slog.LevelWarn)
-	plans := []corpusPlan{{id: "a", displayRoot: "/a"}, {id: "b", displayRoot: "/b"}, {id: "c", displayRoot: "/c"}}
-	results, _, err := searchNodes(t.Context(), plans, func(_ context.Context, plan corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
+	plans := []node{{id: "a", displayRoot: "/a"}, {id: "b", displayRoot: "/b"}, {id: "c", displayRoot: "/c"}}
+	results, _, err := searchNodes(t.Context(), plans, func(_ context.Context, plan node) ([]corpusSearchResult, dirtyFileSet, error) {
 		if plan.id == "b" {
 			return nil, nil, &nodeOpenError{err: errors.New("git status failed: fatal: bad object")}
 		}
@@ -57,7 +58,7 @@ func TestSearchNodesStopsOnASearchError(t *testing.T) {
 	defer goroutineLeakGuard(t, defaultLeakTimeout)()
 	logs := captureTestLogs(t, slog.LevelWarn)
 	want := errors.New("search: got nil (sub)query")
-	_, _, err := searchNodes(t.Context(), []corpusPlan{{id: "a"}, {id: "b", displayRoot: "/b"}}, func(ctx context.Context, plan corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
+	_, _, err := searchNodes(t.Context(), []node{{id: "a"}, {id: "b", displayRoot: "/b"}}, func(ctx context.Context, plan node) ([]corpusSearchResult, dirtyFileSet, error) {
 		if plan.id == "a" {
 			return nil, nil, want
 		}
@@ -80,12 +81,12 @@ func TestSearchNodesCancellationIsSilent(t *testing.T) {
 	defer goroutineLeakGuard(t, defaultLeakTimeout)()
 	logs := captureTestLogs(t, slog.LevelWarn)
 	ctx, cancel := context.WithCancel(t.Context())
-	plans := make([]corpusPlan, 8)
+	plans := make([]node, 8)
 	for index := range plans {
-		plans[index] = corpusPlan{id: corpusID(fmt.Sprintf("p%d", index)), displayRoot: fmt.Sprintf("/p%d", index)}
+		plans[index] = node{id: corpusID(fmt.Sprintf("p%d", index)), displayRoot: fmt.Sprintf("/p%d", index)}
 	}
 	var started atomic.Int32
-	_, _, err := searchNodes(ctx, plans, func(nodeCtx context.Context, plan corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
+	_, _, err := searchNodes(ctx, plans, func(nodeCtx context.Context, plan node) ([]corpusSearchResult, dirtyFileSet, error) {
 		if started.Add(1) == 3 {
 			cancel()
 		}
@@ -102,7 +103,7 @@ func TestSearchNodesCancellationIsSilent(t *testing.T) {
 
 // TestSearchNodesEmptyPlans searches no node: no call, no result, no error.
 func TestSearchNodesEmptyPlans(t *testing.T) {
-	results, dirty, err := searchNodes(t.Context(), nil, func(context.Context, corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
+	results, dirty, err := searchNodes(t.Context(), nil, func(context.Context, node) ([]corpusSearchResult, dirtyFileSet, error) {
 		t.Fatal("no node to search")
 		return nil, nil, nil
 	})
@@ -111,37 +112,39 @@ func TestSearchNodesEmptyPlans(t *testing.T) {
 	}
 }
 
-// TestBuildSlotsFromReadBudget pins the build slot rule over host memory
-// sizes: the slot limit and the window for one node and for all slots, and the
-// deadlock proof (2 windows per build + 2 maximum-weight documents <= budget,
-// a window of at least one such document) for every build count.
+// TestBuildSlotsFromReadBudget pins the build slot rule over read budgets: the
+// slot limit and the window for one node and for all slots, and the deadlock
+// proof (2 windows per build + 2 maximum-weight documents <= budget, a window
+// of at least one such document) for every build count. The budgets are
+// literal: 600 MiB is the smallest budget, and the others are a quarter of
+// 8, 64 and 256 GiB hosts.
 func TestBuildSlotsFromReadBudget(t *testing.T) {
 	const mib = 1 << 20
 	for _, tc := range []struct {
-		gib                  int64
+		budgetMiB            int64
 		slots                int
 		oneNodeWindowMiB     int64
 		allSlotsWindowMinMiB int64
 	}{
-		{gib: 2, slots: 2, oneNodeWindowMiB: 200, allSlotsWindowMinMiB: 100},
-		{gib: 8, slots: 9, oneNodeWindowMiB: 924, allSlotsWindowMinMiB: 100},
-		{gib: 64, slots: 80, oneNodeWindowMiB: 8092, allSlotsWindowMinMiB: 100},
-		{gib: 256, slots: 326, oneNodeWindowMiB: 32668, allSlotsWindowMinMiB: 100},
+		{budgetMiB: 600, slots: 2, oneNodeWindowMiB: 200, allSlotsWindowMinMiB: 100},
+		{budgetMiB: 2 << 10, slots: 9, oneNodeWindowMiB: 924, allSlotsWindowMinMiB: 100},
+		{budgetMiB: 16 << 10, slots: 80, oneNodeWindowMiB: 8092, allSlotsWindowMinMiB: 100},
+		{budgetMiB: 64 << 10, slots: 326, oneNodeWindowMiB: 32668, allSlotsWindowMinMiB: 100},
 	} {
-		budget := max(int64(maxInFlightBytes), tc.gib<<30/4)
+		budget := tc.budgetMiB * mib
 		if got := buildSlotLimit(budget); got != tc.slots {
-			t.Fatalf("%d GiB: slots=%d, want %d", tc.gib, got, tc.slots)
+			t.Fatalf("%d MiB: slots=%d, want %d", tc.budgetMiB, got, tc.slots)
 		}
 		if got := indexWindowFor(budget, 1) / mib; got != tc.oneNodeWindowMiB {
-			t.Fatalf("%d GiB: one-node window=%d MiB, want %d", tc.gib, got, tc.oneNodeWindowMiB)
+			t.Fatalf("%d MiB: one-node window=%d MiB, want %d", tc.budgetMiB, got, tc.oneNodeWindowMiB)
 		}
 		if got := indexWindowFor(budget, 10*tc.slots); got != indexWindowFor(budget, tc.slots) || got/mib < tc.allSlotsWindowMinMiB {
-			t.Fatalf("%d GiB: window beyond the slots=%d MiB", tc.gib, got/mib)
+			t.Fatalf("%d MiB: window beyond the slots=%d MiB", tc.budgetMiB, got/mib)
 		}
 		for builds := 1; builds <= tc.slots; builds++ {
 			window := indexWindowFor(budget, builds)
 			if window < maxReadWeightBytes || 2*int64(builds)*window+2*maxReadWeightBytes > budget {
-				t.Fatalf("%d GiB, %d builds: window=%d breaks the proof for budget %d", tc.gib, builds, window, budget)
+				t.Fatalf("%d MiB, %d builds: window=%d breaks the proof for budget %d", tc.budgetMiB, builds, window, budget)
 			}
 		}
 	}
@@ -153,7 +156,7 @@ func TestBuildSlotsFromReadBudget(t *testing.T) {
 func TestCommandWindowFollowsTheGraph(t *testing.T) {
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
-	// A fixed 2 GiB read budget (the 8 GiB host row of
+	// A fixed 2 GiB read budget (the 2048 MiB row of
 	// TestBuildSlotsFromReadBudget) gives windows computed by hand: 9 slots
 	// share (2048 - 200) MiB, two windows for each build.
 	oldBudget := readBudgetBytes
@@ -251,9 +254,9 @@ func TestRunSizesTheWindowFromTheGraph(t *testing.T) {
 // whose files each fill a shard of their own, with 4 large documents per
 // window, more readers than that per build, and the indexWindowFor budget: the
 // builds finish and give all weight back. Builds share no large-document
-// token: with shared tokens, a consumer that waited for a token kept its
-// document while the token holders waited for readers that the read budget
-// blocked, and the builds could hang under load.
+// token: with shared tokens, a consumer that waits for a token keeps its
+// document while the token holders wait for readers that the read budget
+// blocks, so the builds can hang under load.
 func TestBuildsWithFewLargeDocumentTokensFinish(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
@@ -275,7 +278,7 @@ func TestBuildsWithFewLargeDocumentTokensFinish(t *testing.T) {
 	defer func() { shardMax, largeDocumentParallelism = oldShardMax, oldTokens }()
 	defer goroutineLeakGuard(t, 60*time.Second)()
 
-	plans := make([]corpusPlan, nodes)
+	plans := make([]node, nodes)
 	for index := range plans {
 		plans[index] = planSynthCorpus(t, writeRandomFolder(t, 20*doc, doc))
 	}
@@ -285,37 +288,13 @@ func TestBuildsWithFewLargeDocumentTokensFinish(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
-	if _, _, err := searchNodes(ctx, plans, func(nodeCtx context.Context, plan corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
+	if _, _, err := searchNodes(ctx, plans, func(nodeCtx context.Context, plan node) ([]corpusSearchResult, dirtyFileSet, error) {
 		return prepareAndSearchCorpus(nodeCtx, plan, nil, userQ, defaultSearchConfig())
 	}); err != nil {
 		t.Fatalf("the builds did not finish: %v", err)
 	}
 	if got := availableWeight(readSemaphore); got != 2*nodes*window+2*doc {
 		t.Fatalf("weight leak: %d", got)
-	}
-}
-
-// TestOpenedNodesKeepsLexicalAfterAFailedUpgrade fails an upgrade to vectors:
-// the caller gets the error, and a later route that needs no vectors still
-// reads the good preparation.
-func TestOpenedNodesKeepsLexicalAfterAFailedUpgrade(t *testing.T) {
-	nodes := &openedNodes{}
-	plan := corpusPlan{id: "n"}
-	good := func() (openedNode, error) { return openedNode{plan: plan}, nil }
-	bad := func() (openedNode, error) {
-		return openedNode{}, &nodeOpenError{err: errors.New("vector build lock busy")}
-	}
-	if _, err := nodes.open(t.Context(), plan, false, good); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := nodes.open(t.Context(), plan, true, bad); err == nil {
-		t.Fatal("the failed upgrade returned no error")
-	}
-	if _, err := nodes.open(t.Context(), plan, false, func() (openedNode, error) {
-		t.Fatal("a third preparation ran")
-		return openedNode{}, nil
-	}); err != nil {
-		t.Fatalf("the lexical route lost its preparation: %v", err)
 	}
 }
 
@@ -336,21 +315,7 @@ func TestSearchesTakeNoBuildSlot(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	holdAll := func() {
-		// A slot that another test kept fails here, not at the suite timeout.
-		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-		defer cancel()
-		if err := buildWindows.Acquire(ctx, buildWindowBytes); err != nil {
-			t.Fatal(err)
-		}
-	}
-	holdAll()
-	held := true
-	defer func() {
-		if held {
-			buildWindows.Release(buildWindowBytes)
-		}
-	}()
+	release := holdEveryBuildSlot(t)
 	for _, warm := range []string{f.path("warm"), warmRepo} {
 		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 		out, err := captureStdout(t, func() error { return run(ctx, marker, []string{warm}) })
@@ -371,13 +336,11 @@ func TestSearchesTakeNoBuildSlot(t *testing.T) {
 			t.Fatalf("a cold build of %s ran with no free slot: %v", cold, err)
 		case <-time.After(500 * time.Millisecond):
 		}
-		buildWindows.Release(buildWindowBytes)
-		held = false
+		release()
 		if err := <-done; err != nil {
 			t.Fatalf("the cold build of %s failed after a slot was free: %v", cold, err)
 		}
-		holdAll()
-		held = true
+		release = holdEveryBuildSlot(t)
 	}
 }
 
@@ -429,11 +392,11 @@ func TestBuildSlotsLimitConcurrentBuilds(t *testing.T) {
 // node's results reach the merged list.
 func TestSearchNodesCollectsEveryNode(t *testing.T) {
 	defer goroutineLeakGuard(t, defaultLeakTimeout)()
-	plans := make([]corpusPlan, 3*buildSlotLimit(readBudgetBytes)+1)
+	plans := make([]node, 3*buildSlotLimit(readBudgetBytes)+1)
 	for index := range plans {
-		plans[index] = corpusPlan{id: corpusID(fmt.Sprintf("plan-%03d", index))}
+		plans[index] = node{id: corpusID(fmt.Sprintf("plan-%03d", index))}
 	}
-	results, _, err := searchNodes(t.Context(), plans, func(_ context.Context, plan corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
+	results, _, err := searchNodes(t.Context(), plans, func(_ context.Context, plan node) ([]corpusSearchResult, dirtyFileSet, error) {
 		return []corpusSearchResult{{corpusID: plan.id}}, nil, nil
 	})
 	if err != nil || len(results) != len(plans) {
@@ -442,8 +405,8 @@ func TestSearchNodesCollectsEveryNode(t *testing.T) {
 }
 
 // TestSearchNodesRealIndexingAcrossRotatingWindows builds four folder nodes
-// at once whose content crosses the window: each rotates, and the read budget
-// gets all its weight back.
+// at once whose content crosses the window: at least two builds overlap, each
+// node has at least two shards, and the read budget gets all its weight back.
 func TestSearchNodesRealIndexingAcrossRotatingWindows(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
@@ -463,7 +426,7 @@ func TestSearchNodesRealIndexingAcrossRotatingWindows(t *testing.T) {
 	defer restoreWindow()
 	defer goroutineLeakGuard(t, 120*time.Second)()
 
-	plans := make([]corpusPlan, 4)
+	plans := make([]node, 4)
 	for index := range plans {
 		plans[index] = planSynthCorpus(t, writeRandomFolder(t, perCorpusBytes, fileSize))
 	}
@@ -490,7 +453,7 @@ func TestSearchNodesRealIndexingAcrossRotatingWindows(t *testing.T) {
 			}
 		}
 	}()
-	_, _, err = searchNodes(ctx, plans, func(nodeCtx context.Context, plan corpusPlan) ([]corpusSearchResult, dirtyFileSet, error) {
+	_, _, err = searchNodes(ctx, plans, func(nodeCtx context.Context, plan node) ([]corpusSearchResult, dirtyFileSet, error) {
 		return prepareAndSearchCorpus(nodeCtx, plan, nil, userQ, defaultSearchConfig())
 	})
 	close(stop)
@@ -512,7 +475,7 @@ func TestSearchNodesRealIndexingAcrossRotatingWindows(t *testing.T) {
 }
 
 // TestPipelinePreparesEachNodeOnce runs a description over two nodes: the
-// strict and the relaxed pass read one preparation per node.
+// command prepares each node once (2 preparations).
 func TestPipelinePreparesEachNodeOnce(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -622,9 +585,8 @@ func TestCancelDuringGraphSearch(t *testing.T) {
 
 // TestPartialFailureContract searches a folder with an unreadable subfolder, a
 // nested repository with a bad HEAD, one with a corrupt index, and one whose
-// build cannot read its content: the readable content returns,
-// each failure warns once, also when the description route reads the nodes
-// twice, and the exit is 0.
+// build cannot read its content, on the strict and the description route: the
+// readable content returns, each failure warns once, and the exit is 0.
 func TestPartialFailureContract(t *testing.T) {
 	requireTools(t)
 	if os.Geteuid() == 0 {
@@ -728,9 +690,11 @@ func TestOneFailedNodeWarnsOnce(t *testing.T) {
 	}
 }
 
-// TestPersistentShardDamageFailsOnce damages an uncommitted shard so that the
-// repair cannot fix it, then runs a description over that node and a folder:
-// the node fails once in the command, with no preparation per pass.
+// TestPersistentShardDamageFailsOnce damages an uncommitted shard and holds
+// the node's build lock, as a peer builder would, so that the repair cannot
+// rebuild it. A description over that node and a folder fails the node once:
+// 3 preparations (the repo and its repair, the folder once), one damage
+// notice, and one skipped node.
 func TestPersistentShardDamageFailsOnce(t *testing.T) {
 	requireTools(t)
 	const words = "zqpersistent damage"
@@ -780,6 +744,16 @@ func TestPersistentShardDamageFailsOnce(t *testing.T) {
 	if damaged == 0 {
 		t.Fatal("no uncommitted shard to damage, so the test proves nothing")
 	}
+	// The repair rebuilds a family that fails its manifest. A peer that
+	// holds the build lock keeps the damage for this command.
+	holder, err := os.OpenFile(filepath.Join(plan.cacheDir, buildLockFile), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockFileExclusive(holder); err != nil {
+		t.Fatalf("hold the build lock: %v", err)
+	}
+	defer releaseLock(holder)
 	logs := captureTestLogs(t, slog.LevelWarn)
 	before := nodePreparations.Load()
 	out, err := runHybridTestSearch(t, words, operands, defaultSearchPolicy(), newModel)
@@ -801,6 +775,155 @@ func TestPersistentShardDamageFailsOnce(t *testing.T) {
 	}
 	if skipped != 1 || damage != 1 {
 		t.Fatalf("warnings=%v, want one damage notice and one skipped node", logs.Records())
+	}
+}
+
+// TestCommittedShardDamageRepairsOnce damages the committed shards of a clean
+// repository with bytes of the same size. The family manifest holds names and
+// sizes only, so the warm path trusts it; the read fails, the repair removes
+// the manifest and rebuilds, and the second read finds the file. The command
+// has two preparations and one damage notice.
+func TestCommittedShardDamageRepairsOnce(t *testing.T) {
+	requireTools(t)
+	f := newGraphFixture(t)
+	repo := f.graphRepo("repo", "a.txt", "zqrepair committed")
+	setTestUserCache(t)
+	if _, err := captureStdout(t, func() error { return run(t.Context(), "zqrepair", []string{repo}) }); err != nil {
+		t.Fatal(err)
+	}
+	plans, err := planCorpora(t.Context(), []string{repo})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%d err=%v", len(plans), err)
+	}
+	names, err := familyShardNames(plans[0].indexDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	damaged := 0
+	for _, name := range names {
+		if isUncommittedShard(filepath.Base(name)) {
+			continue
+		}
+		info, err := os.Stat(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(name, bytes.Repeat([]byte{0xff}, int(info.Size())), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		damaged++
+	}
+	if damaged == 0 {
+		t.Fatal("no committed shard to damage, so the test proves nothing")
+	}
+	logs := captureTestLogs(t, slog.LevelWarn)
+	before := nodePreparations.Load()
+	out, err := captureStdout(t, func() error { return run(t.Context(), "zqrepair", []string{repo}) })
+	if err != nil || !strings.Contains(out, "a.txt") {
+		t.Fatalf("the repair must find the file: err=%v output:\n%s", err, out)
+	}
+	// The first preparation, then the one of the repair.
+	if got := nodePreparations.Load() - before; got != 2 {
+		t.Fatalf("preparations=%d, want 2", got)
+	}
+	damage := 0
+	for _, record := range logs.Records() {
+		if strings.Contains(record.Message, "Index damage detected") {
+			damage++
+		}
+	}
+	if damage != 1 {
+		t.Fatalf("damage notices=%d, want 1: %v", damage, logs.Records())
+	}
+}
+
+// TestDescriptionSearchWhileAPeerBuilds holds the build lock of a Git node
+// and a folder node, as a peer builder would, and searches after an edit of
+// each. Each node serves its last complete index (corpusStale), so the
+// description reads its text index only: one preparation per node, no failed
+// node, and the old files found.
+func TestDescriptionSearchWhileAPeerBuilds(t *testing.T) {
+	requireTools(t)
+	f := newGraphFixture(t)
+	repo := f.GitRepo("repo", "a.txt", "committed\n")
+	writeFixtureFile(t, filepath.Join(repo, "b.txt"), "zqpeer alpha beta\n")
+	f.graphFile("plain/c.txt", "zqpeer alpha beta")
+	setTestUserCache(t)
+	operands := []string{repo, f.path("plain")}
+	newModel := func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil }
+	out, err := runHybridTestSearch(t, "zqpeer alpha", operands, defaultSearchPolicy(), newModel)
+	if err != nil || !strings.Contains(out, "b.txt") || !strings.Contains(out, "c.txt") {
+		t.Fatalf("the first search must build both nodes: err=%v output:\n%s", err, out)
+	}
+	plans, err := planCorpora(t.Context(), operands)
+	if err != nil || len(plans) != 2 {
+		t.Fatalf("plans=%d err=%v", len(plans), err)
+	}
+	for _, plan := range plans {
+		// In one process a second open file description conflicts, as a
+		// peer process does.
+		holder, err := os.OpenFile(filepath.Join(plan.cacheDir, buildLockFile), os.O_CREATE|os.O_RDWR, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := lockFileExclusive(holder); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { releaseLock(holder) })
+	}
+	writeFixtureFile(t, filepath.Join(repo, "b.txt"), "zqpeer alpha beta edited\n")
+	f.graphFile("plain/c.txt", "zqpeer alpha beta edited")
+	logs := captureTestLogs(t, slog.LevelWarn)
+	before := nodePreparations.Load()
+	out, err = runHybridTestSearch(t, "zqpeer alpha", operands, defaultSearchPolicy(), newModel)
+	if err != nil || !strings.Contains(out, "c.txt") || !strings.Contains(out, "b.txt") || strings.Contains(out, "edited") {
+		t.Fatalf("want both nodes' old text indexes: err=%v output:\n%s", err, out)
+	}
+	if got := nodePreparations.Load() - before; got != 2 {
+		t.Fatalf("preparations=%d, want 1 per node", got)
+	}
+	for _, record := range logs.Records() {
+		if strings.Contains(record.Message, "Skipped a search node") {
+			t.Fatalf("a node failed: %v", logs.Records())
+		}
+	}
+}
+
+// TestDescriptionReadRetriesAfterADirtyFileChanges edits a dirty file after
+// the build read it and before the vectors bind. The read sees that the work
+// tree no longer holds the published state, prepares the node again, and
+// finds the new text.
+func TestDescriptionReadRetriesAfterADirtyFileChanges(t *testing.T) {
+	requireTools(t)
+	f := newGraphFixture(t)
+	repo := f.GitRepo("repo", "a.txt", "committed\n")
+	writeFixtureFile(t, filepath.Join(repo, "a.txt"), "zqretry alpha\n")
+	writeFixtureFile(t, filepath.Join(repo, "b.txt"), "zqretry old\n")
+	setTestUserCache(t)
+	var hookCalls atomic.Int32
+	var editErr error
+	// The hook runs under the publish lock after .state and before the
+	// vectors bind, so both readers of b.txt in the build (the text index
+	// and the overlay) have read the old bytes.
+	semanticPublishTestHook = func() error {
+		if hookCalls.Add(1) == 1 {
+			editErr = os.WriteFile(filepath.Join(repo, "b.txt"), []byte("zqretry fresh\n"), 0o644)
+		}
+		return nil
+	}
+	t.Cleanup(func() { semanticPublishTestHook = nil })
+	before := nodePreparations.Load()
+	out, err := runHybridTestSearch(t, "zqretry fresh", []string{repo}, defaultSearchPolicy(),
+		func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil })
+	if err != nil || editErr != nil || hookCalls.Load() == 0 {
+		t.Fatalf("err=%v edit=%v hook calls=%d", err, editErr, hookCalls.Load())
+	}
+	// The first preparation, then the one after the read saw the change.
+	if got := nodePreparations.Load() - before; got != 2 {
+		t.Fatalf("preparations=%d, want 2", got)
+	}
+	if !strings.Contains(out, "b.txt") || !strings.Contains(out, "zqretry fresh") {
+		t.Fatalf("output lacks the edited file:\n%s", out)
 	}
 }
 
@@ -896,5 +1019,47 @@ func TestBuildsUseTheCommandWindow(t *testing.T) {
 	search(repo)
 	if shards := repositoryShardCount(plans[0].indexDir, repoUncommitted); shards != 2 {
 		t.Fatalf("the uncommitted family has %d shards after the change, want the base and one delta", shards)
+	}
+}
+
+// TestPeerBuildPrintsNoStaleTextOfAnEditedFile commits a file, builds, and
+// edits it while a peer holds the build lock. The node serves its last
+// complete index, which holds only the old committed copy: neither route may
+// print that old text.
+func TestPeerBuildPrintsNoStaleTextOfAnEditedFile(t *testing.T) {
+	requireTools(t)
+	f := newGraphFixture(t)
+	repo := f.GitRepo("repo", "a.txt", "zqstaleedit alpha beta\n")
+	setTestUserCache(t)
+	newModel := func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil }
+	if _, err := runHybridTestSearch(t, "zqstaleedit alpha", []string{repo}, defaultSearchPolicy(), newModel); err != nil {
+		t.Fatal(err)
+	}
+	plans, err := planCorpora(t.Context(), []string{repo})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%d err=%v", len(plans), err)
+	}
+	holder, err := os.OpenFile(filepath.Join(plans[0].cacheDir, buildLockFile), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { releaseLock(holder) })
+	if err := lockFileExclusive(holder); err != nil {
+		t.Fatal(err)
+	}
+	writeFixtureFile(t, filepath.Join(repo, "a.txt"), "edited while a peer builds\n")
+	for _, test := range []struct {
+		name, query string
+		newModel    semanticModelFactory
+	}{
+		{"strict", "zqstaleedit", nil},
+		{"description", "zqstaleedit alpha", newModel},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			out, err := runHybridTestSearch(t, test.query, []string{repo}, defaultSearchPolicy(), test.newModel)
+			if strings.Contains(out, "zqstaleedit") || err != nil && !errors.Is(err, errNoMatch) {
+				t.Fatalf("want no old text of the edited file: err=%v output:\n%s", err, out)
+			}
+		})
 	}
 }

@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -31,7 +30,8 @@ const (
 	defaultGCInterval = 24 * time.Hour
 	gcRunTimeout      = 5 * time.Second
 	// providerArtifactMaxAge collects compiled accelerator models that no
-	// search used for this long. The cache budget does not cover them.
+	// search used for this long, and the runtimes of other Seek versions
+	// whose directories are this old. The cache budget does not cover them.
 	providerArtifactMaxAge = 14 * 24 * time.Hour
 
 	envGCInterval = "SEEK_GC_INTERVAL"
@@ -39,10 +39,6 @@ const (
 	gcLocalCacheHint = "Set SEEK_CACHE_DIR to a local directory. " +
 		"On Linux, you can instead unset SEEK_CACHE_DIR and set XDG_CACHE_HOME."
 )
-
-type gcConfig struct {
-	interval time.Duration
-}
 
 type corpusDirEntry struct {
 	name   corpusID
@@ -59,10 +55,10 @@ type gcAction uint8
 const (
 	actionKept    gcAction = iota // not planned for eviction, or TOCTOU re-bump under lock
 	actionEvicted                 // rename to .trash + RemoveAll succeeded
-	actionLocked                  // corpus .lock held by active indexer/searcher
+	actionLocked                  // corpus .lock or .build.lock held by active indexer/searcher
 	actionGone                    // corpus dir vanished mid-flight
 	actionTrashed                 // renamed to .trash but RemoveAll failed; drainTrash will finish
-	actionFailed                  // open-lock or rename error
+	actionFailed                  // open-lock, build-lock check, or rename error
 )
 
 // gcRowResult is what evictCorpus returns. action drives the ACTION column;
@@ -119,8 +115,8 @@ func shortErr(err error) string {
 //   - writer, when non-nil, makes runGC stream a per-corpus table to it
 //     (manual path). Nil = silent (opportunistic path after every run).
 //   - sortKey orders the streamed table (`seek gc --sort`). Only consulted
-//     when writer is non-nil; the zero value keeps the historical hash
-//     order, so the opportunistic path is unaffected.
+//     when writer is non-nil; the zero value keeps the hash order, so the
+//     opportunistic path is unaffected.
 type gcOptions struct {
 	skipThrottle bool
 	evictAll     bool
@@ -130,9 +126,9 @@ type gcOptions struct {
 
 // fireOpportunisticGC runs runFn in a goroutine bounded by timeout, blocking
 // the caller only until the goroutine finishes or the deadline fires —
-// whichever comes first. Extracted from main() so the orchestration
-// (goroutine spawn, select-on-timeout, context cleanup) is unit-testable
-// instead of buried behind os.Exit.
+// whichever comes first. It is a function of its own, not inline in main(),
+// so unit tests can check the goroutine, the timeout select, and the context
+// cleanup: main() ends with os.Exit, which a test cannot run.
 func fireOpportunisticGC(runFn func(context.Context), timeout time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -156,8 +152,7 @@ func runOpportunisticGC(ctx context.Context) {
 			slog.Warn("gc panic", "error", r)
 		}
 	}()
-	cfg := gcConfigFromEnv()
-	runGC(ctx, gcOptions{}, cfg.interval)
+	runGC(ctx, gcOptions{})
 }
 
 // runGC is the shared GC body. Two callers:
@@ -180,9 +175,9 @@ func runOpportunisticGC(ctx context.Context) {
 //     interleaved sweep → measure (streaming only) → evict pass per
 //     entry, rows streaming incrementally.
 //  8. evict the unit-store segments of the planned corpora, then sweep aged
-//     compiled accelerator models
+//     compiled accelerator models and the old runtimes of other versions
 //  9. stamp .last-gc to throttle the next opportunistic run
-func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
+func runGC(ctx context.Context, opts gcOptions) {
 	cacheRoot, err := seekUserCacheRoot()
 	if err != nil {
 		slog.Debug("gc skipped: cannot resolve cache root", "error", err)
@@ -192,7 +187,7 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 	// Throttle gate FIRST — on the warm path this exits after a single
 	// stat() on .last-gc and skips the MkdirAll + Statfs that would
 	// otherwise fire on every seek invocation.
-	if !opts.skipThrottle && !shouldRunGC(cacheRoot, interval) {
+	if !opts.skipThrottle && !shouldRunGC(cacheRoot, gcIntervalFromEnv()) {
 		// Opportunistic path (writer nil) silently no-ops; manual
 		// `seek gc` callers (writer != nil) get a one-line hint so
 		// they know that nothing ran and how to force a run.
@@ -237,9 +232,8 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 		return
 	}
 
-	// TODO(gc-undo): if/when we expose `seek gc undo`, trashed entries
-	// should outlive a single GC run (TTL-gated drain). Today they are
-	// drained eagerly, matching pre-table behavior.
+	// Every run empties the trash, so an entry that an earlier run could not
+	// remove goes now.
 	drainTrash(trashPath)
 
 	entries, err := enumerateCorpusDirs(corporaPath)
@@ -312,14 +306,128 @@ func runGC(ctx context.Context, opts gcOptions, interval time.Duration) {
 		stats.summary(opts.writer, "evicted")
 	}
 
-	// Compiled accelerator models come last. Corpus eviction reclaims more and is
-	// the collection's main job, so it takes the time budget first.
+	// Compiled accelerator models and old runtimes come last. Corpus eviction
+	// reclaims more and is the collection's main job, so it takes the time
+	// budget first.
 	sweepAgedProviderArtifacts(ctx, opts.writer, cacheRoot, time.Now().Add(-providerArtifactAge(opts.evictAll)))
+	sweepRetiredRuntimes(ctx, opts.writer, cacheRoot, time.Now().Add(-providerArtifactAge(opts.evictAll)))
 
 	// Stamp updated last and even on partial failures — prevents retry
 	// storms when persistent errors would otherwise re-run GC every
 	// invocation.
 	touchStamp(cacheRoot)
+}
+
+// sweepRetiredRuntimes removes the native runtimes of other Seek versions:
+// ONNX Runtime under reranker/<version>/<sha256> (or the older flat
+// reranker/ort-<version>-<platform>-<hash> layout) and USearch under
+// semantic/usearch/<key>. The runtimes of this binary stay. A runtime goes
+// when its directory is older than the age bound (retiredRuntimes); its next
+// use installs it again. Each runtime is renamed aside first, so no process
+// finds it half removed.
+func sweepRetiredRuntimes(ctx context.Context, writer io.Writer, cacheRoot string, before time.Time) {
+	retireRuntimes(ctx, writer, cacheRoot, before, retiredRuntimes(cacheRoot, before))
+}
+
+// retireRuntimes removes the listed runtimes and prints a count. It reads each
+// age again, because a process can use a runtime after the list. A version
+// directory goes with its last runtime, and an old empty one goes too.
+func retireRuntimes(ctx context.Context, writer io.Writer, cacheRoot string, before time.Time, due []string) {
+	rerankerRoot := filepath.Join(cacheRoot, rerankerDir)
+	aged := func(path string) bool {
+		info, err := os.Stat(path)
+		return err == nil && info.ModTime().Before(before)
+	}
+	// The removal gives the version directory a new time, so a later age test
+	// would keep it: remove it now. Remove fails on a version directory that
+	// still holds a runtime.
+	removeVersionDir := func(path string) {
+		if parent := filepath.Dir(path); filepath.Dir(parent) == rerankerRoot {
+			_ = os.Remove(parent)
+		}
+	}
+	if !discardAgedDirs(ctx, writer, "retired runtimes", due, aged, removeVersionDir) {
+		return
+	}
+	// An old empty version directory is the leftover of a cut sweep.
+	entries, _ := os.ReadDir(rerankerRoot)
+	for _, entry := range entries {
+		if isRuntimeVersionDir(entry) && runtimeAged(entry, before) {
+			_ = os.Remove(filepath.Join(rerankerRoot, entry.Name()))
+		}
+	}
+}
+
+// retiredRuntimes lists the runtime directories of other Seek versions that
+// are older than the age bound, and the leftovers of a cut sweep. The age of
+// a directory is its modification time: its install, or for versions that
+// touch it (touchRuntimeUse), its last use. With no runtime bundle of its
+// own, it lists no ONNX Runtime.
+func retiredRuntimes(cacheRoot string, before time.Time) []string {
+	usearchRoot := filepath.Join(cacheRoot, "semantic", "usearch")
+	due := agedRuntimeDirs(usearchRoot, filepath.Join(usearchRoot, semanticUSearchAssetKey()), before)
+	bundle, err := lateOnRuntimeForPlatform()
+	if err != nil {
+		return due
+	}
+	rerankerRoot := filepath.Join(cacheRoot, rerankerDir)
+	current := filepath.Join(rerankerRoot, bundle.version, bundle.sha256)
+	entries, _ := os.ReadDir(rerankerRoot)
+	for _, entry := range entries {
+		// Take only runtime names: reranker/coreml and other provider
+		// caches keep their own rules.
+		name := strings.TrimPrefix(entry.Name(), providerArtifactDiscardPrefix)
+		path := filepath.Join(rerankerRoot, entry.Name())
+		switch {
+		case !entry.IsDir():
+		case strings.HasPrefix(name, "ort-"):
+			// The older flat layout holds the library itself.
+			if runtimeAged(entry, before) {
+				due = append(due, path)
+			}
+		case isRuntimeVersionDir(entry):
+			// reranker/<version>/<sha256>: each runtime by its own age.
+			due = append(due, agedRuntimeDirs(path, current, before)...)
+		}
+	}
+	return due
+}
+
+// agedRuntimeDirs lists the directories in root, other than keep, that are
+// older than the age bound or a cut sweep's leftover.
+func agedRuntimeDirs(root, keep string, before time.Time) []string {
+	entries, _ := os.ReadDir(root)
+	var due []string
+	for _, entry := range entries {
+		path := filepath.Join(root, entry.Name())
+		if entry.IsDir() && path != keep && runtimeAged(entry, before) {
+			due = append(due, path)
+		}
+	}
+	return due
+}
+
+// isRuntimeVersionDir reports a reranker/<version> directory: its name starts
+// with a digit.
+func isRuntimeVersionDir(entry os.DirEntry) bool {
+	return entry.IsDir() && entry.Name()[0] >= '0' && entry.Name()[0] <= '9'
+}
+
+// runtimeAged reports a runtime directory older than the age bound (before),
+// or one that a cut sweep renamed aside.
+func runtimeAged(entry os.DirEntry, before time.Time) bool {
+	if strings.HasPrefix(entry.Name(), providerArtifactDiscardPrefix) {
+		return true
+	}
+	info, err := entry.Info()
+	return err == nil && info.ModTime().Before(before)
+}
+
+// touchRuntimeUse marks a runtime directory as used now, the age that
+// sweepRetiredRuntimes reads.
+func touchRuntimeUse(dir string) {
+	now := time.Now()
+	_ = os.Chtimes(dir, now, now)
 }
 
 // touchStamp updates the .last-gc modification time. If the file does not yet
@@ -348,8 +456,8 @@ func warnNFSOnce(cacheRoot string) {
 	slog.Debug("gc skipped: cache on network filesystem", "cache_root", cacheRoot)
 }
 
-// providerArtifactAge is the age after which GC collects a compiled model:
-// zero with --all.
+// providerArtifactAge is the age after which GC collects a compiled model or
+// another version's runtime: zero with --all.
 func providerArtifactAge(all bool) time.Duration {
 	if all {
 		return 0
@@ -357,16 +465,16 @@ func providerArtifactAge(all bool) time.Duration {
 	return providerArtifactMaxAge
 }
 
-func gcConfigFromEnv() gcConfig {
-	cfg := gcConfig{interval: defaultGCInterval}
+// gcIntervalFromEnv returns the interval of SEEK_GC_INTERVAL, or
+// defaultGCInterval when the variable is not set or not valid.
+func gcIntervalFromEnv() time.Duration {
 	if v := os.Getenv(envGCInterval); v != "" {
 		if d, err := parseGCDuration(v); err == nil && d >= 0 {
-			cfg.interval = d
-		} else {
-			slog.Debug("invalid SEEK_GC_INTERVAL, using default", "value", v)
+			return d
 		}
+		slog.Debug("invalid SEEK_GC_INTERVAL, using default", "value", v)
 	}
-	return cfg
+	return defaultGCInterval
 }
 
 // parseGCDuration extends time.ParseDuration with a `d` (days) suffix.
@@ -393,29 +501,23 @@ func shouldRunGC(cacheRoot string, interval time.Duration) bool {
 	return time.Since(st.ModTime()) >= interval
 }
 
-// sweepOrphanManifestTmps removes old temporary manifest files from a corpus
-// cache or index directory. Each manifest writer writes a temporary file and
-// renames it. A forced stop can leave the temporary file. Readers use only the
-// canonical names.
-//
-// Restrict cleanup to known names so it cannot remove an unrelated file.
 // buildTmpMaxAge is the age past which a leftover temp build dir is considered
 // orphaned (its builder crashed). A live builder writes shards continuously, so
 // its temp dir's mtime stays fresh well within this bound even for a large cold
 // build.
 const buildTmpMaxAge = time.Hour
 
-// providerArtifactDiscardPrefix marks a compiled model that is being removed.
-// Removing one in place is not atomic, and a truncated removal would update the
-// directory's own modification time, which would hide it from the age test for
-// good while leaving a broken compiled model where the provider expects a whole
-// one. Renaming first makes the leftover self-identifying, so a later sweep
-// removes it whatever its age, the way drainTrash retries a partly evicted
-// corpus.
+// providerArtifactDiscardPrefix marks a compiled model or runtime that is being
+// removed. Removing one in place is not atomic, and a truncated removal would
+// update the directory's own modification time, which would hide it from the
+// age test for good while leaving a broken compiled model or runtime where Seek
+// expects a whole one. Renaming first makes the leftover self-identifying, so a
+// later sweep removes it whatever its age, the way drainTrash retries a partly
+// evicted corpus.
 const providerArtifactDiscardPrefix = ".discarding-"
 
-// sweepAgedProviderArtifacts removes compiled accelerator models that nothing has
-// rebuilt recently. Their cache key carries the operating system build, so every
+// sweepAgedProviderArtifacts removes compiled accelerator models that no search
+// used recently. Their cache key carries the operating system build, so every
 // system update strands the previous directory, and each one holds tens of
 // megabytes.
 //
@@ -429,79 +531,26 @@ const providerArtifactDiscardPrefix = ".discarding-"
 //
 // Callers reach this only from runGC. The dry-run path returns before runGC, so
 // this never runs for a plan.
-func sweepAgedProviderArtifacts(
-	ctx context.Context,
-	writer io.Writer,
-	cacheRoot string,
-	before time.Time,
-) {
-	removed := 0
-	var reclaimed int64
-	for _, due := range agedProviderArtifacts(ctx, cacheRoot, before) {
-		if ctx.Err() != nil {
-			return
-		}
-		path := due.path()
-		if due.leftover {
-			// A previous sweep was cut short. Finish it whatever the age.
-			size := corpusDirSize(path)
-			if discardProviderArtifact(path, path) {
-				removed++
-				reclaimed += size
-			}
-			continue
-		}
-		// Re-read the access marker under the rename. Enumeration and removal are
-		// not one step, and a search that started in between is using this model.
-		if info, err := os.Stat(filepath.Join(path, providerArtifactUsedFile)); err == nil &&
-			!info.ModTime().Before(before) {
-			continue
-		}
-		// Measure before the rename; afterwards the directory is gone.
-		size := corpusDirSize(path)
-		discarded := filepath.Join(due.parent, providerArtifactDiscardPrefix+due.name)
-		if err := os.Rename(path, discarded); err != nil {
-			slog.Debug("gc cannot retire a compiled provider model", "path", path, "error", err)
-			continue
-		}
-		if discardProviderArtifact(discarded, path) {
-			removed++
-			reclaimed += size
-		}
+func sweepAgedProviderArtifacts(ctx context.Context, writer io.Writer, cacheRoot string, before time.Time) {
+	// Read the access marker again before the rename. The list and the removal
+	// are not one step, and a search that started in between uses the model.
+	unused := func(path string) bool {
+		info, err := os.Stat(filepath.Join(path, providerArtifactUsedFile))
+		return err != nil || info.ModTime().Before(before)
 	}
-	if removed > 0 && writer != nil {
-		_, _ = fmt.Fprintf(
-			writer,
-			"compiled model files removed: %d (%s)\n",
-			removed,
-			humanBytes(reclaimed),
-		)
-	}
-}
-
-// dueProviderArtifact is one compiled model a collection would remove. It keeps
-// the parts the sweep needs, so the sweep does not rebuild them from a joined
-// path and cannot disagree with the enumeration about what a leftover is.
-type dueProviderArtifact struct {
-	parent   string
-	name     string
-	leftover bool
-}
-
-func (due dueProviderArtifact) path() string {
-	return filepath.Join(due.parent, due.name)
+	discardAgedDirs(ctx, writer, "compiled model files", agedProviderArtifacts(ctx, cacheRoot, before), unused, nil)
 }
 
 // agedProviderArtifacts lists the compiled models a collection would remove, so
 // the live sweep and `--dry-run` agree on what is due. An entry a previous sweep
 // left marked is always due, whatever its age.
-func agedProviderArtifacts(ctx context.Context, cacheRoot string, before time.Time) []dueProviderArtifact {
+func agedProviderArtifacts(ctx context.Context, cacheRoot string, before time.Time) []string {
 	root := filepath.Join(cacheRoot, rerankerDir, "coreml")
 	formats, err := os.ReadDir(root)
 	if err != nil {
 		return nil
 	}
-	var due []dueProviderArtifact
+	var due []string
 	for _, format := range formats {
 		if ctx.Err() != nil {
 			return due
@@ -518,16 +567,10 @@ func agedProviderArtifacts(ctx context.Context, cacheRoot string, before time.Ti
 			if ctx.Err() != nil {
 				return due
 			}
-			if !key.IsDir() {
-				continue
-			}
-			entry := dueProviderArtifact{
-				parent:   formatPath,
-				name:     key.Name(),
-				leftover: strings.HasPrefix(key.Name(), providerArtifactDiscardPrefix),
-			}
-			if entry.leftover || providerArtifactIsAged(entry.path(), key, before) {
-				due = append(due, entry)
+			path := filepath.Join(formatPath, key.Name())
+			if key.IsDir() && (strings.HasPrefix(key.Name(), providerArtifactDiscardPrefix) ||
+				providerArtifactIsAged(path, key, before)) {
+				due = append(due, path)
 			}
 		}
 	}
@@ -546,15 +589,55 @@ func providerArtifactIsAged(path string, key os.DirEntry, before time.Time) bool
 	return err == nil && info.ModTime().Before(before)
 }
 
-// discardProviderArtifact removes a renamed compiled model and reports whether it
-// went. A failure leaves the marked directory for the next sweep, so it never
-// fails the collection.
-func discardProviderArtifact(discarded, original string) bool {
-	if err := os.RemoveAll(discarded); err != nil {
-		slog.Debug("gc cannot remove a compiled provider model", "path", original, "error", err)
-		return false
+// discardAgedDirs removes the due directories and prints their count under
+// label to writer; a nil writer stays silent. It renames each directory aside
+// first, so no process finds it half removed. A directory that a cut sweep
+// renamed aside goes whatever its age. Any other directory goes only when aged
+// still reports it, because a process can use it after the list. A removal
+// that fails leaves the marked directory for the next sweep. When after is not
+// nil, it runs on each path after the removal attempt. discardAgedDirs returns
+// false when ctx ends first, and then prints nothing.
+func discardAgedDirs(
+	ctx context.Context,
+	writer io.Writer,
+	label string,
+	due []string,
+	aged func(path string) bool,
+	after func(path string),
+) bool {
+	removed := 0
+	var reclaimed int64
+	for _, path := range due {
+		if ctx.Err() != nil {
+			return false
+		}
+		discarded := path
+		if name := filepath.Base(path); !strings.HasPrefix(name, providerArtifactDiscardPrefix) {
+			if !aged(path) {
+				continue
+			}
+			discarded = filepath.Join(filepath.Dir(path), providerArtifactDiscardPrefix+name)
+			if err := os.Rename(path, discarded); err != nil {
+				slog.Debug("gc cannot retire a directory", "path", path, "error", err)
+				continue
+			}
+		}
+		// The rename moves the directory and keeps its size.
+		size := corpusDirSize(discarded)
+		if err := os.RemoveAll(discarded); err != nil {
+			slog.Debug("gc cannot remove a retired directory", "path", path, "error", err)
+		} else {
+			slog.Debug("gc removed a retired directory", "path", path)
+			removed++
+			reclaimed += size
+		}
+		if after != nil {
+			after(path)
+		}
 	}
-	slog.Debug("gc removed a compiled provider model", "path", original)
+	if removed > 0 && writer != nil {
+		_, _ = fmt.Fprintf(writer, "%s removed: %d (%s)\n", label, removed, humanBytes(reclaimed))
+	}
 	return true
 }
 
@@ -578,6 +661,14 @@ func sweepOrphanBuildDirs(indexDir string, before time.Time) {
 	}
 }
 
+// sweepOrphanManifestTmps removes old temporary files from a corpus cache or
+// index directory: the .tmp files of the manifests and the temp files of
+// writeSharedCacheFile. Each writer writes a temporary file and renames it. A
+// forced stop can leave the temporary file. Readers use only the canonical
+// names.
+//
+// Restrict cleanup to known names (isOrphanManifestTmpName) so it cannot
+// remove an unrelated file.
 func sweepOrphanManifestTmps(cacheDir string, before time.Time) {
 	entries, err := os.ReadDir(cacheDir)
 	if err != nil {
@@ -609,12 +700,17 @@ func isOrphanManifestTmpName(name string) bool {
 		familyManifestFile + ".tmp":
 		return true
 	}
+	for _, record := range []string{bm25StatsFile, corpusSizeFile} {
+		if strings.HasPrefix(name, record+sharedTmpInfix) {
+			return true
+		}
+	}
 	return false
 }
 
-// enumerateCorpusDirs returns the cache's corpora hash-sorted, so the
-// streamed live table matches dry-run ordering and opportunistic-path
-// eviction has a deterministic sweep order.
+// enumerateCorpusDirs returns the cache's corpora hash-sorted (os.ReadDir
+// sorts by name), so the streamed live table matches dry-run ordering and
+// opportunistic-path eviction has a deterministic sweep order.
 func enumerateCorpusDirs(corporaPath string) ([]corpusDirEntry, error) {
 	entries, err := os.ReadDir(corporaPath)
 	if err != nil {
@@ -648,7 +744,6 @@ func enumerateCorpusDirs(corporaPath string) ([]corpusDirEntry, error) {
 		}
 		out = append(out, corpusDirEntry{name: corpusID(name), path: path, usedAt: used})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
 	return out, nil
 }
 
@@ -656,16 +751,7 @@ func enumerateCorpusDirs(corporaPath string) ([]corpusDirEntry, error) {
 // (corpusHashHexLen chars, lowercase hex). Looser checks would risk picking
 // up arbitrary user dirs colocated under corpora/.
 func isCorpusHashName(name string) bool {
-	if len(name) != corpusHashHexLen {
-		return false
-	}
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return false
-		}
-	}
-	return true
+	return len(name) == corpusHashHexLen && strings.Trim(name, "0123456789abcdef") == ""
 }
 
 func readUsedAt(cacheDir string) (time.Time, bool) {
@@ -677,11 +763,11 @@ func readUsedAt(cacheDir string) (time.Time, bool) {
 }
 
 // sweepCorpusOrphans removes crash leftovers inside one corpus dir:
-//   - orphan .tmp manifest files (folder + uncommitted) older than 1 hour.
-//     SIGKILL between os.WriteFile and os.Rename in writeFolderManifest /
-//     writeUncommittedManifest can leave these behind; no live process ever
-//     reads them again. Best-effort — errors are silent because the user
-//     does not need to act.
+//   - orphan .tmp manifest files (folder, uncommitted, family) and the
+//     temp files of writeSharedCacheFile (.bm25-v2, .size) older than 1
+//     hour. SIGKILL between the write and the rename can leave these
+//     behind; no live process ever reads them again. Best-effort — errors
+//     are silent because the user does not need to act.
 //   - stale .build-* temp index dirs, only when no build holds the build
 //     lock, so a genuinely-stalled-but-live builder (mtime older than the
 //     bound) is not pulled out from under itself. Same guard evictCorpus
@@ -708,12 +794,13 @@ func evictIfPlanned(e corpusDirEntry, trashDir string, evict map[corpusID]bool) 
 
 // evictCorpus performs a two-phase delete under a non-blocking per-corpus
 // lock. Returns a gcRowResult describing the outcome:
-//   - actionLocked: corpus .lock held by another seek
+//   - actionLocked: corpus .lock or .build.lock held by another seek
 //   - actionKept:   .used was bumped between enumeration and lock (TOCTOU close)
 //   - actionGone:   corpus dir vanished mid-flight (concurrent process)
 //   - actionEvicted: rename + RemoveAll both succeeded
 //   - actionTrashed: rename succeeded, RemoveAll failed; drainTrash finishes
-//   - actionFailed:  open-lock or rename returned a non-ENOENT error
+//   - actionFailed:  open-lock, build-lock check, or rename returned a
+//     non-ENOENT error
 func evictCorpus(e corpusDirEntry, trashDir string, cutoff time.Time) gcRowResult {
 	lockPath := filepath.Join(e.path, lockFile)
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
@@ -731,8 +818,8 @@ func evictCorpus(e corpusDirEntry, trashDir string, cutoff time.Time) gcRowResul
 	}
 
 	// A temp-swap build holds the build lock, not the publish/read lock above.
-	// Skip eviction while a build is in progress so it
-	// is not pulled out from under the builder mid-build.
+	// Skip eviction while a build is in progress, so the builder keeps its
+	// corpus directory.
 	bf, ok, bErr := tryBuildLock(e.path)
 	if bErr != nil {
 		return gcRowResult{action: actionFailed, err: fmt.Errorf("try build lock: %w", bErr)}
@@ -833,13 +920,15 @@ func drainTrash(trashDir string) {
 	}
 }
 
-// touchUsed updates <cacheDir>/.used. It logs errors at Debug level and skips
-// caches on network filesystems.
+// nfsCheckOnce and nfsCached hold whether the cache root is on a network
+// filesystem. touchUsed checks it once per process.
 var (
 	nfsCheckOnce sync.Once
 	nfsCached    bool
 )
 
+// touchUsed updates <cacheDir>/.used. It logs errors at Debug level and skips
+// caches on network filesystems.
 func touchUsed(cacheDir string) {
 	nfsCheckOnce.Do(func() {
 		if root, err := seekUserCacheRoot(); err == nil {
@@ -854,8 +943,9 @@ func touchUsed(cacheDir string) {
 	if err := os.Chtimes(p, now, now); err == nil {
 		return
 	}
-	// File missing (or chtimes failed): create via atomic tmp+rename so
-	// concurrent touches don't trample each other.
+	// File missing (or chtimes failed): create it via tmp+rename. Two
+	// touches can share the tmp file, so one rename can fail; the other
+	// touch makes the marker.
 	if err := writeCacheFile(cacheDir, usedFile, ""); err != nil {
 		slog.Debug("touch used failed", "cache_dir", cacheDir, "error", err)
 	}

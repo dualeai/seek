@@ -45,14 +45,8 @@ type countingSemanticScorer struct {
 	scoreMask    []bool
 }
 
-func (scorer *countingSemanticScorer) Scores(
-	ctx context.Context,
-	query string,
-	documents []rerankDocument,
-) ([]float32, error) {
-	return scoreWithTestSemanticEmbedder(ctx, scorer, query, documents)
-}
-
+// scoreWithTestSemanticEmbedder prepares query and scores documents with it,
+// as the search pipeline does through the model future.
 func scoreWithTestSemanticEmbedder(
 	ctx context.Context,
 	embedder semanticModel,
