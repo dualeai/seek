@@ -46,12 +46,14 @@ const (
 // cacheBudgetError stops a search whose new generations do not fit the cache
 // budget, before any build. growth is the part that the search adds to the
 // corpora it uses; freeBound reports a budget that the 5 % free-space floor
-// sets.
+// sets; textFits reports that the same search with no vectors passes this
+// check (--lexical-only).
 type cacheBudgetError struct {
 	planned   int64
 	growth    int64
 	budget    int64
 	freeBound bool
+	textFits  bool
 }
 
 func (e *cacheBudgetError) Error() string {
@@ -211,7 +213,10 @@ func checkCacheBudget(ctx context.Context, plans []node, vectors bool) error {
 	for _, plan := range plans {
 		published += publishedCorpusBytes(plan.cacheDir)
 	}
-	return &cacheBudgetError{planned: planned, growth: max(0, planned-published), budget: budget, freeBound: freeBound}
+	// A text search runs the same check with no vectors, and none when its
+	// index is current.
+	textFits := vectors && checkCacheBudget(ctx, plans, false) == nil
+	return &cacheBudgetError{planned: planned, growth: max(0, planned-published), budget: budget, freeBound: freeBound, textFits: textFits}
 }
 
 // corporaBytes is the ledger total of every corpus plus the unit-store
@@ -316,7 +321,7 @@ func (*folderNode) estimate(ctx context.Context, plan node, vectors, probe bool)
 	}
 	// decideFolderBuild uses the same rule. The manifest is read only when
 	// the search wants vectors.
-	present := vectors && semanticManifestPresent(plan.indexDir, state)
+	present := vectors && semanticManifestPresent(plan.indexDir, plan.folderSemanticSource(state))
 	vectorsMissing := vectorGenerationNeeded(vectors, present, false)
 	if published == state && !vectorsMissing {
 		return publishedCorpusBytes(plan.cacheDir), false, nil
@@ -329,7 +334,7 @@ func (*folderNode) estimate(ctx context.Context, plan node, vectors, probe bool)
 	delta, err := folderContentBytes(ctx, changed, probe)
 	bytes = publishedCorpusBytes(plan.cacheDir) + int64(float64(delta)*zoektIndexRatio)
 	switch {
-	case vectorsMissing && semanticManifestPresent(plan.indexDir, published):
+	case vectorsMissing && semanticManifestPresent(plan.indexDir, plan.folderSemanticSource(published)):
 		// The vectors hold the published state: the build adds the
 		// changed files.
 		bytes += semanticBytes(delta)
@@ -586,8 +591,9 @@ func committedContentBytes(ctx context.Context, paths gitPaths, head string, pro
 	return committedBlobBytes(ctx, paths, blobs, probe)
 }
 
-// committedDeltaBytes sums the blobs that a commit range adds or changes,
-// from one git diff-tree and their sizes.
+// committedDeltaBytes sums the regular-file blobs that a commit range adds or
+// changes. One git diff-tree lists them, and committedBlobBytes reads their
+// sizes.
 func committedDeltaBytes(ctx context.Context, paths gitPaths, from, to string, probe bool) (int64, error) {
 	// A move to no commit (an orphan branch) has no tree and adds no
 	// content. The from side is always a commit: the build records a
@@ -702,7 +708,8 @@ func committedBlobBytes(ctx context.Context, paths gitPaths, blobs []gitSizedBlo
 // enforceCacheBudget runs after a search. It records the ledger size of the
 // corpora that the search used, then evicts the least recently used corpora
 // that it did not use until the cache fits the budget. It has no time limit:
-// the budget is the only disk limit.
+// the budget is the only disk limit. It does nothing when the search published
+// nothing, or when the cache is on a network or FUSE file system (as gc).
 func enforceCacheBudget(plans []node) {
 	cacheRoot, err := seekUserCacheRoot()
 	if err != nil || isOnNFS(cacheRoot) {
@@ -781,17 +788,19 @@ func ledgerStale(dir string) bool {
 var processStarted = time.Now().Truncate(2 * time.Second)
 
 // usedByARunningCommand reports a corpus whose last use falls between the
-// start of this command and now: a .used time in the future proves nothing.
+// start of this command and now, with the same 2-second step: a .used time
+// further in the future proves nothing.
 func usedByARunningCommand(usedAt time.Time) bool {
 	return !usedAt.Before(processStarted) && !usedAt.After(time.Now().Add(2*time.Second))
 }
 
-// planCorpusEviction returns the corpora to evict: every corpus with all, or
-// else the least recently used corpora that keep is not holding and that no
-// command used since this one started, until the total ledger size fits the
-// budget. Corpus directories of other layout versions reach the LRU end first
-// unless an older binary still uses them. record writes measured sizes into
-// the ledger; a dry run passes false.
+// planCorpusEviction returns the corpora and the unit-store segments to evict:
+// all of them with all, or else, until the total size fits the budget, the
+// oldest unit-store segments first, then the least recently used corpora that
+// keep is not holding and that no command used since this one started. Corpus
+// directories of other layout versions reach the LRU end first unless an
+// older binary still uses them. record writes measured sizes into the ledger;
+// a dry run passes false.
 func planCorpusEviction(
 	cacheRoot string,
 	entries []corpusDirEntry,

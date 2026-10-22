@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,27 +10,36 @@ import (
 )
 
 // TestIndexFolderDocumentsDelta_FallsBackOnOversizePayload checks the payload
-// guard of a folder delta from end to end. The guard is in
-// changedFolderDocumentsFromManifest (folder_indexer.go): it returns
+// guard of a folder delta from end to end, with the manifest of the first
+// pass (changedFolderDocumentsFromManifest) and with no manifest
+// (changedFolderDocuments, which reads every file): each returns
 // errDeltaPayloadExceedsWindow when the changed size reaches the window.
 //
 // Sequence:
-//  1. Index 8 files of 64 KiB. This writes the shards and the manifest.
+//  1. Index 8 files of 64 KiB. This writes the shards and the manifest; the
+//     second case then removes the manifest.
 //  2. Grow every file to 384 KiB, so the delta payload (3 MiB) passes the
 //     2 MiB test window (swapReadSemaphoreForTest sets half the budget).
 //  3. Index again. indexFolderDocumentsDelta returns
 //     errDeltaPayloadExceedsWindow, and indexFolderDocuments then does a full
-//     rebuild through streamFolderFiles and indexDocuments.
+//     rebuild through streamFolderFilesWithMarkers and indexDocuments.
 //  4. Check that the base shard file is replaced (a delta keeps it and adds
 //     shards; a full rebuild writes a new one), that a search finds the new
 //     content, and that the read semaphore has its full budget again.
 //
-// The test uses the real folder pipeline with no mocked changedDocs, through
-// changedFolderDocumentsSinceCachedState.
+// The test uses the real folder pipeline and mocks no changed documents.
 func TestIndexFolderDocumentsDelta_FallsBackOnOversizePayload(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
 	}
+	for _, dropManifest := range []bool{false, true} {
+		t.Run(fmt.Sprintf("drop manifest %t", dropManifest), func(t *testing.T) {
+			checkOversizePayloadFallsBack(t, dropManifest)
+		})
+	}
+}
+
+func checkOversizePayloadFallsBack(t *testing.T, dropManifest bool) {
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
@@ -67,6 +77,11 @@ func TestIndexFolderDocumentsDelta_FallsBackOnOversizePayload(t *testing.T) {
 		t.Fatalf("semaphore leak after initial index: got=%d want=%d", got, testBudget)
 	}
 	baseBefore := firstShardInfo(t, plan.indexDir)
+	if dropManifest {
+		if err := os.Remove(filepath.Join(plan.cacheDir, folderManifestFileName)); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	// Mutate every file with content size > window/fileCount each. Total
 	// = fileCount * 384 KiB = 3 MiB > 2 MiB window → guard trips.
@@ -84,7 +99,7 @@ func TestIndexFolderDocumentsDelta_FallsBackOnOversizePayload(t *testing.T) {
 	}
 
 	// Second pass — delta would exceed window; guard trips; fallback to
-	// full rebuild via streamFolderFiles → windowed indexDocuments.
+	// full rebuild via streamFolderFilesWithMarkers → windowed indexDocuments.
 	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 		t.Fatalf("post-mutation ensureFolderCorpusFresh: %v", err)
 	}
@@ -106,5 +121,46 @@ func TestIndexFolderDocumentsDelta_FallsBackOnOversizePayload(t *testing.T) {
 	}
 	if len(results) == 0 {
 		t.Fatal("post-mutation marker not found; full-rebuild fallback did not produce searchable shards")
+	}
+}
+
+// TestSeedFolderDeltaLinksOrFallsBack seeds a delta from a live family. When
+// every file links, the delta runs on the links. When one link fails (a shard
+// that went away), the delta does not run and the build directory is empty
+// again, so the full build starts from no seed.
+func TestSeedFolderDeltaLinksOrFallsBack(t *testing.T) {
+	live := t.TempDir()
+	shard := filepath.Join(live, "folder_x_v16.00000.zoekt")
+	meta := shard + ".meta"
+	for _, name := range []string{shard, meta} {
+		if err := os.WriteFile(name, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	listed := func(dir string) []string {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		return names
+	}
+	linked := t.TempDir()
+	if !seedFolderDelta(linked, "folder_x", []string{shard, meta}) {
+		t.Fatal("the delta did not run with every seed linked")
+	}
+	if got := listed(linked); len(got) != 2 {
+		t.Fatalf("seeds %v, want the shard and its record", got)
+	}
+	failed := t.TempDir()
+	missing := filepath.Join(live, "folder_x_v16.00001.zoekt")
+	if seedFolderDelta(failed, "folder_x", []string{shard, meta, missing}) {
+		t.Fatal("the delta ran with a seed that did not link")
+	}
+	if got := listed(failed); len(got) != 0 {
+		t.Fatalf("the failed seed left %v", got)
 	}
 }

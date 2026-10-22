@@ -69,19 +69,20 @@ type node struct {
 	// the corpus ID.
 	selectedFiles []string
 	corpusStore
-	// scope is the search-time filter for a scoped Git search. Both scoped
-	// and unscoped searches of one repo resolve to the SAME combined
-	// whole-repo index (cacheDir/indexDir); scope just restricts which loaded
-	// docs match. The filter adds no BM25 term (searchShards),
-	// so each matched doc gets the score of the unscoped search, and a scoped
-	// result set equals the unscoped result set intersected with it.
+	// scope is the search-time filter for a scoped Git search. A scoped and an
+	// unscoped search of one repo read the same combined whole-repo index
+	// (cacheDir/indexDir); scope only limits which loaded documents match. The
+	// filter adds no BM25 term (searchShards), so each matched document gets
+	// the score of the unscoped search, and a scoped result set equals the
+	// unscoped result set intersected with it.
 	scope query.Q
 	// behavior is the kind's work (nodeKind); nil when the node only names a
 	// cache place, as for the error of a failed Git node (gitNodeError).
 	behavior nodeKind
 	// folder is the graph expansion's capture of a folder node: its walk
 	// fingerprint and the directories below its root that hold other nodes.
-	// nil for a Git node and for a file root.
+	// nil for a Git node. A file root has a capture too: its read binds the
+	// vectors through the capture's state.
 	folder *folderCapture
 	// gitState is the graph expansion's git status of a Git node. Every index
 	// preparation of the command uses it instead of a second status, until a
@@ -135,6 +136,8 @@ type corpusSearchResult struct {
 	// header is the display path (applyHeaders); empty keeps the node-relative
 	// form.
 	header string
+	// modelBase is the model path base of the node (modelPathBase).
+	modelBase string
 }
 
 // corpusCopy is one collapsed copy: the formatter prints its header, the same
@@ -339,15 +342,15 @@ func canonicalCorpusPath(path string) string {
 	return filepath.Clean(path)
 }
 
-// realCaseWithin rewrites the portion of path below root to the actual
-// on-disk directory-entry names. On case- or normalization-insensitive
-// filesystems (the macOS default) an operand may be typed with different case
-// or Unicode normalization than Git stored; the Git scope
-// (gitScopeSpec.query) matches names byte for byte, so without this a
-// tracked file would be silently missed. Matching is by os.SameFile (device+inode),
-// robust to both case and NFC/NFD. Components are corrected top-down so a
-// wrong-case parent is fixed before its children are read. Best-effort: any
-// stat/read error leaves that component as typed. listings holds the
+// realCaseWithin rewrites the part of path below root to the directory-entry
+// names on disk. On a case- or normalization-insensitive file system (the
+// macOS default), an operand can have a different case or Unicode
+// normalization than Git stored. The Git scope (gitScopeSpec.query) compares
+// names byte for byte, so without this rewrite the search would miss a
+// tracked file and give no error. os.SameFile (device and inode) finds the
+// entry, so case and NFC/NFD both match. It corrects the components from the
+// top down, so a parent has its real name before Seek reads its children. A
+// stat or read error leaves that component as typed. listings holds the
 // directories already read, so many operands in one directory read it once.
 func realCaseWithin(root, path string, listings dirListings) string {
 	rel, ok := relWithin(root, path)

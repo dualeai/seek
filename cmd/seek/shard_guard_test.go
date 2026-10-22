@@ -53,7 +53,7 @@ func guardShardReport(t *testing.T, dir string) (int, map[string][]string) {
 // of its own, and a shard file above guardShardFormatLimit counts as wrapped.
 // A random-word shard takes about 2.8 MiB plus 3.9 bytes per content byte: the
 // 1.25 MiB fits.txt makes about 7.7 MiB and fits, and the 2.5 MiB wraps.txt
-// makes about 12.7 MiB and wraps.
+// makes about 12.6 MiB and wraps.
 const (
 	// Below deltaShardMin (1 MiB), so a delta Builder uses it as its shard
 	// target too (deltaShardMax).

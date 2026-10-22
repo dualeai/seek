@@ -92,9 +92,14 @@ func writeMissingBlobRecord(cacheDir, name string, record missingBlobRecord) err
 // writePendingMissingBlobRecord writes, before a publish, the union of the
 // blobs of the live data and of the new build. A stop before the exact record
 // then leaves a record that names every name-only file of either, with a
-// store that forces a check.
+// store that forces a check. A damaged live record (no head) stays as it is:
+// it cannot name its blobs, but it makes the next search rebuild the data, a
+// mark that the union would lose.
 func writePendingMissingBlobRecord(cacheDir, name, head string, blobs []missingBlob) error {
 	if old, ok := readMissingBlobRecord(cacheDir, name); ok {
+		if old.head == "" {
+			return nil
+		}
 		blobs = append(slices.Clone(blobs), old.blobs...)
 	}
 	return writeMissingBlobRecord(cacheDir, name, missingBlobRecord{
@@ -107,7 +112,8 @@ func writePendingMissingBlobRecord(cacheDir, name, head string, blobs []missingB
 // gitObjectStoreFingerprint returns the counts of `git count-objects -v` and
 // a fingerprint of each alternate object directory, whose objects Git does not
 // count. An object that arrives, loose or in a pack, changes them; a repack
-// changes them too, and costs one check.
+// changes them too, and costs one check. An alternate that Seek cannot read
+// gives unknownObjectStore.
 func gitObjectStoreFingerprint(ctx context.Context, repoDir string) (string, error) {
 	out, err := gitOutput(ctx, newGitCommand(ctx, repoDir, "count-objects", "-v"), "git count-objects")
 	if err != nil {

@@ -328,7 +328,7 @@ func buildSemanticGitGeneration(
 	if err := requireNativeGitVersion(ctx); err != nil {
 		return semanticManifest{}, err
 	}
-	reuse := loadSemanticReuse(indexDir, dir, lineage)
+	reuse := loadSemanticReuse(indexDir, dir, lineage, "", nil)
 	defer reuse.Close()
 	return buildSemanticGeneration(
 		ctx,
@@ -344,20 +344,28 @@ func buildSemanticGitGeneration(
 	)
 }
 
-// buildSemanticFolderGeneration embeds the selected files of a folder node.
-// indexDir holds the node's previous generations, whose rows the build copies.
+// buildSemanticFolderGeneration embeds the selected files of a folder node
+// whose model path base is base. indexDir holds the node's previous
+// generations, whose rows the build copies; a node with none copies the rows
+// of the corpora of its lineage (the folders that hold it or that it holds).
 // A read error that may pass fails the build, so the next search reads the
 // file again.
 func buildSemanticFolderGeneration(
 	ctx context.Context,
 	selected []folderCandidate,
 	indexDir string,
+	lineage string,
+	base string,
 	dir string,
 	source string,
 	embedder semanticModel,
 	resources searchResources,
 ) (semanticManifest, error) {
-	reuse := loadSemanticReuse(indexDir, dir, "")
+	names := make([]string, len(selected))
+	for index, candidate := range selected {
+		names[index] = candidate.name
+	}
+	reuse := loadSemanticReuse(indexDir, dir, lineage, base, names)
 	defer reuse.Close()
 	return buildSemanticGeneration(
 		ctx,
@@ -366,7 +374,7 @@ func buildSemanticFolderGeneration(
 		embedder,
 		resources,
 		folderReadSource(func(readCtx context.Context, cancel context.CancelCauseFunc) <-chan fileContent {
-			return streamFolderFiles(readCtx, selected, resources.cpuLimit(), cancel)
+			return streamFolderFilesInOrder(readCtx, selected, resources.cpuLimit(), cancel)
 		}),
 		reuse,
 	)
@@ -454,11 +462,18 @@ func buildSemanticGeneration(
 	)
 	// An overlay gets no USearch graph: its search scores every row with the
 	// exact fine vectors, and the graph would be half the cost of a save.
+	// The planner cuts the rows into graph shards as the files come in order.
 	var coarseReady chan semanticCoarseBatch
+	var shardPlans chan semanticUSearchShardPlan
+	var planner *semanticUSearchShardPlanner
 	usearchBuilt := make(chan semanticUSearchBuildResult, 1)
 	if semanticSourceHasGraph(source) {
 		coarseReady = make(chan semanticCoarseBatch)
-		go buildSemanticUSearchStream(buildCtx, dir, coarseReady, cancel, resources, usearchBuilt)
+		shardPlans = make(chan semanticUSearchShardPlan)
+		planner = newSemanticUSearchShardPlanner(resources.cpuLimit())
+		go buildSemanticUSearchStream(
+			buildCtx, dir, coarseReady, shardPlans, reuse.usearchShards(), cancel, resources, usearchBuilt,
+		)
 	} else {
 		usearchBuilt <- semanticUSearchBuildResult{}
 	}
@@ -505,6 +520,24 @@ func buildSemanticGeneration(
 		}
 		pendingCopy = nil
 	}
+	sendPlans := func(plans []semanticUSearchShardPlan, err error) {
+		if err != nil {
+			failed = true
+			if extractionErr == nil {
+				extractionErr = err
+				cancel()
+			}
+			return
+		}
+		for _, plan := range plans {
+			select {
+			case shardPlans <- plan:
+			case <-buildCtx.Done():
+				failed = true
+				return
+			}
+		}
+	}
 
 	for result := range extracted {
 		if result.err != nil {
@@ -539,6 +572,9 @@ func buildSemanticGeneration(
 				stored := ready.units[index]
 				stored.text, stored.modelInput, stored.reuse = nil, nil, nil
 				rows = append(rows, stored)
+			}
+			if planner != nil && !failed {
+				sendPlans(planner.addFile(rows[len(rows)-len(ready.units):]))
 			}
 			if len(ready.units) == 0 {
 				if ready.weight > 0 {
@@ -597,6 +633,12 @@ func buildSemanticGeneration(
 	} else {
 		releaseSemanticBuildBatch(pendingBatch)
 	}
+	if planner != nil {
+		if !failed {
+			sendPlans(planner.finish(), nil)
+		}
+		close(shardPlans)
+	}
 	close(batches)
 	close(copied)
 	output := <-collected
@@ -635,14 +677,20 @@ func buildSemanticGeneration(
 	if failed || nextFile != dispatched {
 		return semanticManifest{}, fmt.Errorf("semantic extraction stopped before all files completed")
 	}
+	var shardRows uint64
+	if planner != nil && len(rows) > 0 {
+		shardRows = planner.shardRows()
+	}
 	writeStarted := time.Now()
 	manifest, err := writeSemanticGenerationFromParts(
 		ctx,
 		dir,
 		source,
+		reuse.modelBase(),
 		rows,
 		output.vectorsArtifact,
 		output.coarseArtifact,
+		shardRows,
 		usearchOutput.shards,
 	)
 	if err == nil {
@@ -650,6 +698,9 @@ func buildSemanticGeneration(
 			"Built semantic index",
 			"files", dispatched,
 			"rows", len(rows),
+			"graph_shards_built", usearchOutput.built,
+			"graph_shards_reused", usearchOutput.reused,
+			"graph_shard_rows", shardRows,
 			"elapsed_to_extraction_drain", elapsedToExtractionDrain,
 			"elapsed_to_model_and_usearch", elapsedToModelAndUSearch,
 			"write", time.Since(writeStarted),
@@ -739,7 +790,7 @@ func extractSemanticDocuments(
 				entries, parseErr := parser.Parse(document.name, document.content)
 				units = extractSemanticUnitsWithID(document.name, document.content, contentID, entries, parseErr)
 				if len(units) > 0 {
-					units, packErr = windowSemanticUnits(ctx, tokenizer, units)
+					units, packErr = windowSemanticUnits(ctx, tokenizer, units, reuse.modelBase())
 				}
 				if packErr != nil {
 					cancel()
@@ -1189,7 +1240,7 @@ func buildSemanticOverlayGeneration(
 	if base != "" {
 		extra = append(extra, base)
 	}
-	reuse := loadSemanticReuse(indexDir, dir, lineage, extra...)
+	reuse := loadSemanticReuse(indexDir, dir, lineage, "", nil, extra...)
 	defer reuse.Close()
 	return buildSemanticGeneration(
 		ctx,

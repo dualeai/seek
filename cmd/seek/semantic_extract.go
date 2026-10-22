@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	ctags "github.com/sourcegraph/go-ctags"
+	"github.com/sourcegraph/zoekt/index"
 )
 
 const (
@@ -18,7 +19,10 @@ const (
 	// split then cuts each unit into 128-token model inputs. It is a format
 	// value, not a worker setting.
 	semanticUnitMaxBytes = 16 << 10
-	semanticExtractorID  = "ctags-gaps-v6-windows"
+	// semanticExtractorID names the extraction rule, eligibility included
+	// (semanticContentIsEligible). The generation key and the manifest check
+	// read it, so a generation of another rule is built again.
+	semanticExtractorID = "ctags-gaps-v7-windows-zoekt-text-zoekt-language-half-format"
 )
 
 type semanticUnitKind uint8
@@ -50,6 +54,9 @@ type semanticUnit struct {
 	end          uint64
 	kind         semanticUnitKind
 	parserResult semanticParserResult
+	// pathCut is transient: the window header of the row ends inside its
+	// path line, so the key holds only a prefix of the model path tail.
+	pathCut bool
 	// language describes this extracted unit in model and result documents.
 	language string
 	symbol   string
@@ -68,9 +75,8 @@ type semanticUnit struct {
 }
 
 type semanticAnchor struct {
-	offset   int
-	language string
-	symbol   string
+	offset int
+	symbol string
 }
 
 // extractSemanticUnitsWithID extracts content whose SHA-256 the caller has
@@ -79,7 +85,7 @@ type semanticAnchor struct {
 // parts of at most semanticUnitMaxBytes. Valid ctags starts create symbol
 // units, and the bytes before the first start create a gap unit. A parser
 // failure, invalid UTF-8, or a file without valid symbols creates fallback
-// units.
+// units. Every unit takes the file's language (semanticFileLanguage).
 func extractSemanticUnitsWithID(
 	path string,
 	content []byte,
@@ -88,6 +94,7 @@ func extractSemanticUnitsWithID(
 	parseErr error,
 ) []semanticUnit {
 	var idBuffer []byte
+	language := semanticFileLanguage(path, content)
 	parserResult := semanticParserCTags
 	switch {
 	case !utf8.Valid(content):
@@ -109,30 +116,25 @@ func extractSemanticUnitsWithID(
 		if symbol == "" {
 			continue
 		}
-		anchors = append(anchors, semanticAnchor{
-			offset:   lineStarts[entry.Line-1],
-			language: entry.Language,
-			symbol:   symbol,
-		})
+		anchors = append(anchors, semanticAnchor{offset: lineStarts[entry.Line-1], symbol: symbol})
 	}
 	slices.SortFunc(anchors, func(a, b semanticAnchor) int {
-		return cmp.Or(cmp.Compare(a.offset, b.offset), strings.Compare(a.symbol, b.symbol),
-			strings.Compare(a.language, b.language))
+		return cmp.Or(cmp.Compare(a.offset, b.offset), strings.Compare(a.symbol, b.symbol))
 	})
-	// The first anchor of each offset, by symbol then language, starts the unit.
+	// The first anchor of each offset, by symbol, starts the unit.
 	anchors = slices.CompactFunc(anchors, func(a, b semanticAnchor) bool { return a.offset == b.offset })
 	if len(anchors) == 0 {
 		if parserResult == semanticParserCTags {
 			parserResult = semanticParserNoSymbols
 		}
 		return appendSemanticSpan(nil, path, content, contentID, 0, len(content),
-			semanticUnitFallback, parserResult, "", "", &idBuffer)
+			semanticUnitFallback, parserResult, language, "", &idBuffer)
 	}
 
 	units := make([]semanticUnit, 0, len(anchors)+1)
 	if anchors[0].offset > 0 {
 		units = appendSemanticSpan(units, path, content, contentID, 0,
-			anchors[0].offset, semanticUnitGap, parserResult, "", "", &idBuffer)
+			anchors[0].offset, semanticUnitGap, parserResult, language, "", &idBuffer)
 	}
 	for i, current := range anchors {
 		end := len(content)
@@ -144,20 +146,43 @@ func extractSemanticUnitsWithID(
 		}
 		units = appendSemanticSpan(units, path, content, contentID,
 			current.offset, end, semanticUnitSymbol, parserResult,
-			current.language, current.symbol, &idBuffer)
+			language, current.symbol, &idBuffer)
 	}
 	return units
 }
 
-func semanticContentIsEligible(content []byte) bool {
-	return len(content) > 0 && !semanticContentIsBinary(content)
+// semanticFileLanguage names the language of a file as Zoekt names it in the
+// shard (index.DetermineLanguageIfUnknown), so a vector hit, its model input
+// and a strict hit of the same file all name one language. ctags names some
+// languages in its own way ("Sh" for "Shell").
+func semanticFileLanguage(path string, content []byte) string {
+	document := index.Document{Name: path, Content: content}
+	index.DetermineLanguageIfUnknown(&document)
+	return document.Language
 }
 
-// semanticContentIsBinary matches the standard source-index boundary for the
-// semantic branch. A NUL byte cannot occur in normal text source and avoids
-// sending binary payloads through ctags, tokenization, and the model.
-func semanticContentIsBinary(content []byte) bool {
-	return bytes.IndexByte(content, 0) >= 0
+// semanticContentIsEligible reports whether content gets semantic rows: only
+// when Zoekt keeps the content with the options of indexBuildOptions (SizeMax
+// and TrigramMax at documentContentLimit). Zoekt's own check decides. It keeps
+// a file of 1 or 2 bytes, or a file with a NUL byte, by name only
+// (index.SkipReasonTooSmall, index.SkipReasonBinary). A semantic hit shows the
+// text that Zoekt keeps (readSemanticEvidence), so such a file gets no rows. An
+// empty file has no text to describe.
+//
+// A file of more than half the shard format gets no rows either: Zoekt stores
+// its content and at least one posting byte for each position, so its shard
+// passes the format (2.01 bytes of shard for each byte of the most repetitive
+// content), and the shard guard keeps it by name only (guardWrappedShards).
+// A smaller file can still pass the format (6.6 bytes for each byte of random
+// text); its rows then give no hit.
+func semanticContentIsEligible(content []byte) bool {
+	if len(content) == 0 || !documentContentFits(int64(len(content))) || 2*int64(len(content)) > shardFormatLimit {
+		return false
+	}
+	// With TrigramMax at the content limit, the check does not count
+	// trigrams, so its zero value allocates nothing.
+	var checker index.DocChecker
+	return checker.Check(content, int(documentContentLimit), false) == index.SkipReasonNone
 }
 
 func semanticSymbolMetadata(entry *ctags.Entry) string {
@@ -221,8 +246,9 @@ func appendSemanticSpan(
 			parserResult: parserResult,
 			language:     language,
 			symbol:       symbol,
-			// The caller owns content until it finishes encoding this unit. Keeping
-			// a view avoids a second full-file allocation during index builds.
+			// The caller owns content until it finishes encoding this unit.
+			// Keeping a view avoids a second full-file allocation during index
+			// builds.
 			text: content[start:partEnd],
 		}
 		unit.id, *idBuffer = makeSemanticUnitIDBuffered(unit, *idBuffer)

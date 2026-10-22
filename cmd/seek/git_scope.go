@@ -22,12 +22,13 @@ type gitScopeSpec struct {
 	rootIncluded bool
 }
 
-// maxRegexpFileOperands bounds how many individual file operands are expanded
-// into anchored filename regexps. Each anchored regexp distills to a filename
-// trigram lookup (index-assisted), far cheaper than FileNameSet's O(numDocs)
-// per-shard scan over a whole-repo combined index. Above this many operands the
-// Or of that many regexp match-trees costs more than one FileNameSet map, so we
-// fall back to the set. A var (not const) so tests can force either path.
+// maxRegexpFileOperands is the largest number of file operands that become
+// anchored file-name regexps. Zoekt finds each such regexp through the
+// file-name trigram index, while a FileNameSet tests the name of every
+// document of each shard of the whole-repository index. Above this count, the
+// Or of that many regexp match trees costs more than one FileNameSet map, so
+// the scope uses the set. It is a var, not a const, so tests can force either
+// path.
 var maxRegexpFileOperands = 64
 
 // query is the search-time filter of spec; nil covers the whole work tree.

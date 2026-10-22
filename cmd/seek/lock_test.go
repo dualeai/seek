@@ -162,11 +162,11 @@ func TestAcquireReadLock_SharedConcurrent(t *testing.T) {
 	a, b := open(), open()
 	defer releaseLock(a)
 	defer releaseLock(b)
-	if err := acquireReadLock(context.Background(), indexDir, a); err != nil {
+	if err := acquireReadLock(context.Background(), a); err != nil {
 		t.Fatalf("first read lock: %v", err)
 	}
 	// A second shared read lock must also succeed concurrently.
-	if err := acquireReadLock(context.Background(), indexDir, b); err != nil {
+	if err := acquireReadLock(context.Background(), b); err != nil {
 		t.Fatalf("second concurrent read lock: %v", err)
 	}
 }
@@ -198,13 +198,13 @@ func TestAcquireReadLock_WaitsForPublishUntilCancel(t *testing.T) {
 	defer func() { _ = reader.Close() }()
 	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
 	defer cancel()
-	if err := acquireReadLock(ctx, indexDir, reader); !errors.Is(err, context.DeadlineExceeded) {
+	if err := acquireReadLock(ctx, reader); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("read under a wedged publish: %v, want the context's end", err)
 	}
 	// Once the publish ends, the same wait gets the lock, however long the
 	// publish took: a wait deadline would fail here.
 	done := make(chan error, 1)
-	go func() { done <- acquireReadLock(t.Context(), indexDir, reader) }()
+	go func() { done <- acquireReadLock(t.Context(), reader) }()
 	time.Sleep(lockWaitProof)
 	releaseLock(holder)
 	if err := <-done; err != nil {
@@ -313,8 +313,8 @@ func TestColdSearchWaitsForAnotherProcessBuild(t *testing.T) {
 }
 
 // TestAcquireBuildLock_TouchesUsedAtStart proves that a build bumps the
-// corpus .used at start so a concurrent gc cannot evict it in the window between
-// the build releasing the lock and the search re-opening the corpus.
+// corpus .used at start so a concurrent gc cannot evict it in the window
+// between the build releasing the lock and the search re-opening the corpus.
 func TestAcquireBuildLock_TouchesUsedAtStart(t *testing.T) {
 	dir := t.TempDir()
 	indexDir := filepath.Join(dir, "index")
@@ -341,7 +341,7 @@ func TestAcquireBuildLock_TouchesUsedAtStart(t *testing.T) {
 func TestPollLockRetriesOnlyAHeldLock(t *testing.T) {
 	for _, held := range []error{syscall.EWOULDBLOCK, syscall.EAGAIN, syscall.EINTR} {
 		calls := 0
-		err := pollLock(t.Context(), "/cache/.lock", func() error {
+		err := pollLock(t.Context(), "/cache/.lock", "", func() error {
 			if calls++; calls == 1 {
 				return held
 			}
@@ -353,7 +353,7 @@ func TestPollLockRetriesOnlyAHeldLock(t *testing.T) {
 	}
 	for _, lasting := range []error{syscall.ENOLCK, syscall.EIO} {
 		calls := 0
-		err := pollLock(t.Context(), "/cache/.lock", func() error {
+		err := pollLock(t.Context(), "/cache/.lock", "", func() error {
 			calls++
 			return lasting
 		}, time.Millisecond, time.Millisecond)

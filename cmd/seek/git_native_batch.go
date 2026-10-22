@@ -154,7 +154,8 @@ func (b *nativeGitBatch) check(entries []gitTreeEntry) ([]gitBlobInfo, error) {
 }
 
 // read passes one document per info to consume, in order: the content, or the
-// name only for a missing, oversize, or binary blob.
+// name only for a missing, oversize, or binary blob. The read weight of a
+// document goes to consume when it returns nil; read releases it on an error.
 func (b *nativeGitBatch) read(infos []gitBlobInfo, consume func(fileContent) error) error {
 	b.ids = b.ids[:0]
 	for i := range infos {

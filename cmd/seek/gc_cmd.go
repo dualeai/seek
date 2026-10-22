@@ -20,14 +20,13 @@ type gcCmdOptions struct {
 	sort   string
 }
 
-// runGCCommandCmd implements `seek gc`. Flags are parsed by Cobra and
-// passed in via opts. Flag validation and setup failures (cache root,
-// enumeration) return an error and exit non-zero; failures inside the
-// live sweep itself are logged + swallowed by runGC.
+// runGCCommandCmd implements `seek gc` with the flags that Cobra parsed
+// (opts). Flag validation and setup failures (cache root, enumeration, the
+// dry-run plan) return an error and exit non-zero. runGC logs the failures
+// inside the live sweep and does not return them.
 func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
-	// Validate flags before the throttle / NFS / enumeration work so an
-	// invalid --sort errors loudly even on runs that would otherwise
-	// silently no-op.
+	// Validate flags before the throttle, NFS, and enumeration work, so an
+	// invalid --sort fails even on a run that would otherwise do nothing.
 	sortKey, err := parseGCSortKey(opts.sort)
 	if err != nil {
 		return err
@@ -40,8 +39,8 @@ func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 
 	corporaPath := filepath.Join(cacheRoot, corporaDir)
 	if opts.dryRun {
-		// An absent cache is an empty plan. Do not create it only to report that
-		// it contains no corpora.
+		// An absent cache is an empty plan. Do not create it only to report
+		// that it contains no corpora.
 		entries, err := enumerateCorpusDirs(corporaPath)
 		if err != nil {
 			return fmt.Errorf("enumerate corpora: %w", err)
@@ -93,9 +92,9 @@ func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 // `seek gc --force`. Widths align with the format string in renderGCRow.
 const gcTableHeader = "  CORPUS      ROOT                                                  AGE     SIZE    ACTION"
 
-// gcTableStats accumulates the counters behind the table summary line,
-// shared by the dry-run and live paths so the two summaries cannot drift —
-// they deliberately differ only in the verb ("evictable" vs "evicted").
+// gcTableStats holds the counters of the table summary line. The dry-run and
+// live paths share it, so their summaries differ only in the verb
+// ("evictable" or "evicted").
 type gcTableStats struct {
 	totalBytes int64
 	evictBytes int64
@@ -115,8 +114,8 @@ type gcSortKey uint8
 
 const (
 	sortByName gcSortKey = iota // corpus hash — deterministic
-	sortByAge                   // oldest .used first — matches eviction priority
-	sortBySize                  // largest first — "what is eating my disk"
+	sortByAge                   // oldest .used first, the eviction order
+	sortBySize                  // largest first
 )
 
 // gcSortValues is the single source for the --sort accepted values: the
@@ -236,21 +235,20 @@ func emitGCRow(w io.Writer, stats *gcTableStats, r gcRow, now time.Time, res gcR
 }
 
 // reportGCPlan prints the dry-run table. No filesystem mutation. Display
-// path is recovered from each corpus's first zoekt shard
-// (Repository.Source) — see readCorpusDisplayInfo. Empty / crashed corpora
-// without shards display as "[empty]"; corpora whose source root has been
-// deleted on disk show as "[gone] <path>".
+// path is recovered from a committed zoekt shard of each corpus, else from an
+// uncommitted one (Repository.Source) — see readCorpusDisplayInfo. Empty /
+// crashed corpora without shards display as "[empty]"; corpora whose source
+// root has been deleted on disk show as "[gone] <path>".
 //
-// Vocab is past tense (`kept`/`evicted`) — same words as the live path
-// (`seek gc --force`), interpreted as "what would happen". The live path
-// (runGC streaming) uses the same renderGCRow + column layout, so dry-run
-// and live output stay byte-aligned across columns.
+// The rows use the words of the live path (`seek gc --force`), `kept` and
+// `evicted`, for what would happen. The live path (runGC) uses the same
+// renderGCRow and columns, so the dry-run and live output line up.
 //
-// Per-row cost is dominated by corpusDirSize (filepath.WalkDir subtree walk
-// per corpus) plus readCorpusDisplayInfo (one zoekt shard metadata read). At
-// ~700 corpora a cold sorted view takes ~1s; the default name order streams
-// rows, so latency is amortized. A bounded errgroup over the per-row work
-// remains the fix if sorted views grow too slow.
+// Most of the time of a row is corpusDirSize (a filepath.WalkDir walk of the
+// corpus) and readCorpusDisplayInfo (one Zoekt shard metadata read). The rows
+// are measured one after another: at about 700 corpora, a cold sorted view
+// takes about 1 s, and the default name order prints each row as soon as it
+// is measured.
 //
 // The summary counts the rows actually rendered — both branches stop early
 // on ctx cancellation, and the summary must describe what was measured.
@@ -315,9 +313,9 @@ func formatRoot(info corpusDisplayInfo, width int) string {
 }
 
 // sanitizeCell strips control characters from a table cell — stripRune's
-// policy (C0 controls, DEL, bidi controls) plus tab, which would break
-// column alignment. Clean strings (the overwhelming common case) are
-// returned without allocation.
+// policy (C0 and C1 controls, DEL, bidi controls, line and paragraph
+// separators) plus tab, which would break column alignment. A clean string
+// (the usual case) returns with no allocation.
 func sanitizeCell(s string) string {
 	clean := true
 	for _, r := range s {
@@ -352,7 +350,7 @@ func humanDuration(d time.Duration) string {
 	switch {
 	case d < 0:
 		// Future .used (clock skew, cp -p restore, NTP step): render as
-		// fresh, not as a negative raw-second blob.
+		// fresh, not as a negative number of seconds.
 		return "0s"
 	case d >= 24*time.Hour:
 		return fmt.Sprintf("%dd", int(d/(24*time.Hour)))
@@ -408,7 +406,7 @@ func corpusDirSize(path string) int64 {
 		}
 		if d.IsDir() {
 			// Skip in-progress temp build dirs so the SIZE column reports the
-			// honest steady-state footprint, not a transient 2x during a build.
+			// size between builds, not the temporary extra size of a build.
 			if strings.HasPrefix(d.Name(), buildDirPrefix) {
 				return fs.SkipDir
 			}
@@ -436,8 +434,9 @@ func reportDirPlan(w io.Writer, label string, due []string, footer string) {
 	if len(due) == 0 {
 		return
 	}
-	// Measure once per entry. corpusDirSize walks the whole subtree, and that walk
-	// dominates the cost of a plan, so the total and the rows must share it.
+	// Measure once per entry. corpusDirSize walks the whole subtree, and that
+	// walk is most of the cost of a plan, so the total and the rows must share
+	// it.
 	sizes := make([]int64, len(due))
 	var total int64
 	for i, path := range due {

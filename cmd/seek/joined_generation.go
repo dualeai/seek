@@ -20,9 +20,9 @@ const (
 )
 
 // joinedGenerationDescriptor binds a Zoekt state to its base semantic
-// generation (the commit of a Git node, the state of a folder) and, for a
-// dirty Git node, to the overlay of its dirty files. A Git node with no commit
-// has an overlay and no base.
+// generation (the commit of a Git node, the folderSemanticSource of a folder)
+// and, for a dirty Git node, to the overlay of its dirty files. A Git node
+// with no commit has an overlay and no base.
 type joinedGenerationDescriptor struct {
 	Format      uint32 `json:"format"`
 	State       string `json:"state"`
@@ -132,13 +132,13 @@ func (store corpusStore) writeJoinedGenerations(
 	return writeCacheFile(store.cacheDir, joinedGenerationFile, string(content))
 }
 
-// joinedGenerationsMatch performs the fast activation check for a joined
-// index: the base generation and the overlay that a dirty Git node binds. An
-// empty source or overlay means that the node binds none. It checks the
-// descriptor, the Zoekt family-manifest digest, and the semantic manifest
-// compatibility. It does not open the semantic row or vector data or validate
-// USearch shards. openJoinedSemanticGeneration checks row and vector data
-// before search and checks each graph before its first native use.
+// joinedGenerationsMatch is the fast activation check for a joined index: the
+// base generation and the overlay that a dirty Git node binds. An empty source
+// or overlay means that the node binds none. It checks the descriptor, the
+// Zoekt family-manifest digest, and the manifest of each bound generation with
+// its USearch shard list. It does not open the row, vector, or USearch shard
+// files. The open for search (openSemanticGenerationForSearch) checks the row
+// and vector data, and checks each graph before its first native use.
 func (store corpusStore) joinedGenerationsMatch(
 	state string,
 	source string,
@@ -213,11 +213,13 @@ func validateSemanticGeneration(indexDir, source string) error {
 	return generation.Close()
 }
 
-// openJoinedSemanticGeneration opens the source generation after the caller
-// has matched its joined descriptor while it holds the node's read lock. This
-// function does not read or select the descriptor itself. It defers each graph
-// checksum until a native plan first needs that shard. Graph damage clears the
-// descriptor so the next run repairs the index.
+// openJoinedSemanticGeneration opens the source generation. The caller holds
+// the node's read lock and has matched the joined descriptor; this function
+// does not read or select the descriptor itself. It defers each graph checksum
+// until a native plan first needs that shard. An open error or graph damage
+// clears the descriptor. On graph damage the node read also removes the
+// generations (removeDamagedVectors), because the next bind would serve the
+// same graph file.
 func (store corpusStore) openJoinedSemanticGeneration(
 	source string,
 ) (*semanticGeneration, error) {
@@ -257,6 +259,11 @@ func (store corpusStore) bindSemanticGenerations(
 	// store first, so a later build copies them and does not embed them again.
 	archiveSupersededUnits(store.indexDir, live...)
 	removeSemanticGenerationsExcept(store.indexDir, keep)
+	// The removal changed the ctime of each graph file that the new
+	// generation links: record the checks again, so searches trust them.
+	for _, dir := range live {
+		refreshSemanticUSearchChecks(dir)
+	}
 	return nil
 }
 

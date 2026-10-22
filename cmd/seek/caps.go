@@ -37,23 +37,25 @@ const (
 
 // readBudgetBytes is the global readSemaphore capacity for accounted document
 // content across all corpus readers and builders; workers do not own separate
-// quotas. Readers acquire weight, and consumers release it after the
-// Builder.Finish that stops retaining the document. Seek's objective is the
-// shortest time, so the budget grows with the host: a quarter of its physical
-// memory, and at least maxInFlightBytes. Zoekt needs several times the content
-// it builds, so the rest of memory is left for the builds. Other allocations
-// are not covered, so this value does not bound process RSS.
+// quotas. Readers acquire weight. A consumer releases it when it no longer
+// needs the document: a Zoekt build after Builder.Add for a normal document of
+// a full build, else after Finish; a vector build after the last model batch
+// that reads the file (semanticBuildOwner). Seek's objective is the shortest
+// time, so the budget grows with the host: a quarter of its physical memory,
+// and at least maxInFlightBytes. Zoekt needs several times the content it
+// builds, so the rest of memory is left for the builds. Other allocations are
+// not covered, so this value does not bound process RSS.
 var readBudgetBytes = max(int64(maxInFlightBytes), hostPhysicalMemory()/4)
 
-// indexWindowBytes is the document-weight rotation point for
-// indexDocumentsWithRepository and the payload limit for native Git delta
-// admission when no command set a window (indexWindow). A consumer rotates
-// when its pending weight reaches or passes this point, so one document can
-// take it past the point. The formula keeps headroom beyond N rotation points:
-// N*window + 2*doc is within readBudgetBytes. This is not an exact bound on
-// pending weight or process memory. It is a variable so tests can shrink it
-// through swapIndexWindowBytesForTest; production callers treat it as
-// read-only.
+// indexWindowBytes is the content rotation point of a large-document window in
+// indexDocumentsWithRepository and the payload limit of a delta when no
+// command set a window (indexWindow). A consumer rotates when its pending
+// content reaches or passes this point, so one document can take it past the
+// point. The formula keeps two maximum-weight documents free beside the two
+// windows of each build slot: 2*slots*window + 2*maxReadWeightBytes is within
+// readBudgetBytes. This is not an exact bound on pending weight or process
+// memory. It is a variable so tests can shrink it through
+// swapIndexWindowBytesForTest; production callers treat it as read-only.
 var indexWindowBytes = indexWindowFor(readBudgetBytes, buildSlotLimit(readBudgetBytes))
 
 // buildSlotLimit is the most node builds that run at the same time: the most
@@ -85,8 +87,9 @@ func withIndexWindow(ctx context.Context, nodes int) context.Context {
 	return context.WithValue(ctx, indexWindowKey{}, indexWindowFor(readBudgetBytes, nodes))
 }
 
-// indexWindow is the rotation point of a build under ctx: the window of its
-// command, or indexWindowBytes outside a command.
+// indexWindow is the window of a build under ctx: the window of its command,
+// or indexWindowBytes outside a command. A large-document window rotates at
+// it, a delta payload must stay below it, and a build slot takes two of it.
 func indexWindow(ctx context.Context) int64 {
 	if window, ok := ctx.Value(indexWindowKey{}).(int64); ok {
 		return window
@@ -113,13 +116,13 @@ func documentContentFits(size int64) bool {
 }
 
 // These casts underflow at compile time if an invariant is false, for the
-// smallest budget with all its build slots. One document window is the minimum
-// that keeps indexing useful. A maximum-weight document must fit in the
-// in-flight budget to prevent a permanent Acquire wait on a non-cancellable
-// context (golang/go#59002). The final check keeps two rotation points per
-// slot and two maximum-weight documents within that budget. A larger budget
-// or fewer builds give a larger window by the same rule, so the proof holds
-// (TestBuildSlotsFromReadBudget).
+// smallest budget with all its build slots. That budget must have at least one
+// build slot. One document window is the minimum that keeps indexing useful.
+// A maximum-weight document must fit in the in-flight budget to prevent a
+// permanent Acquire wait on a non-cancellable context (golang/go#59002). The
+// final check keeps two rotation points per slot and two maximum-weight
+// documents within that budget. A larger budget or fewer builds give a larger
+// window by the same rule, so the proof holds (TestBuildSlotsFromReadBudget).
 const (
 	_ = uint(minBudgetBuildSlots - 1)
 	_ = uint(defaultIndexWindowBytes - maxReadWeightBytes)
@@ -127,8 +130,10 @@ const (
 	_ = uint(maxInFlightBytes - (2*minBudgetBuildSlots*defaultIndexWindowBytes + 2*maxReadWeightBytes))
 )
 
-// errDeltaPayloadExceedsWindow fires when a delta (working-tree dirty set OR
-// folder-manifest changed set) reaches the build's window (indexWindow). Both
-// sites route through a windowed full rebuild via indexDocuments rather than
-// holding the whole payload in indexDeltaDocuments's single terminal Finish.
+// errDeltaPayloadExceedsWindow reports that the files to read of a delta (the
+// changed dirty files of a Git node, or the changed files of a folder) reach
+// the build's window (indexWindow). Both callers then build in full with
+// indexDocuments, which releases the weight of a normal document after
+// Builder.Add, instead of holding the whole payload until the one Finish of
+// indexDeltaDocuments.
 var errDeltaPayloadExceedsWindow = errors.New("delta payload exceeds window threshold")

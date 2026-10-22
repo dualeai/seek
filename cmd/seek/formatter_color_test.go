@@ -80,8 +80,9 @@ func TestColor_MultibyteAroundMatchNotSplit(t *testing.T) {
 }
 
 // TestColor_AnsiPaletteCodes pins the literal escape sequences. Without this,
-// the behavioral color tests (which reference ansiPalette.* by name) would still
-// pass if the palette were set to wrong/empty codes — this is their oracle.
+// the behavioral color tests (which reference ansiPalette.* by name) would
+// still pass if the palette were set to wrong/empty codes — this is their
+// oracle.
 func TestColor_AnsiPaletteCodes(t *testing.T) {
 	want := palette{file: "\x1b[36m", lineNo: "\x1b[2m", match: "\x1b[1;31m", reset: "\x1b[0m"}
 	if ansiPalette != want {
@@ -154,7 +155,7 @@ func TestLongLine_MatchAtStartNoHeadMarker(t *testing.T) {
 	fm := zoekt.FileMatch{FileName: "min.js", Language: "JavaScript", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch(line, 1, frag(0, 4))}}
 	out := fmtOneFile(fm, plainPalette)
-	// Match at offset 0 → windowStart clamps to 0 → no leading "…+N bytes ".
+	// Match at offset 0 → winStart clamps to 0 → no leading "…+N bytes ".
 	body := strings.SplitN(out, "\n", 2)[1]
 	if strings.HasPrefix(strings.TrimPrefix(body, "1 "), "…+") {
 		t.Fatalf("unexpected head marker for start-anchored match, got:\n%q", out)
@@ -264,18 +265,21 @@ func TestNotices_NoneWhenNothingDropped(t *testing.T) {
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("only\n", 1)}}
 	out := formatGitCorpusResultsForTest([]zoekt.FileMatch{fm}, 5, 5)
-	if strings.Contains(out, "more files") || strings.Contains(out, "more matches") {
+	// "more file" and "more match" also find the singular notices of one
+	// dropped file or match.
+	if strings.Contains(out, "more file") || strings.Contains(out, "more match") {
 		t.Fatalf("no notice expected when nothing dropped, got:\n%q", out)
 	}
 }
 
 func TestLongLine_WindowCutLandsOnRuneBoundary(t *testing.T) {
-	// Place a 4-byte emoji so the computed window start (matchStart-matchCtxBytes)
-	// lands MID-rune. Without backupToRuneBoundary the window would slice the
-	// emoji and emit broken UTF-8.
+	// Place a 4-byte emoji so the computed window start
+	// (matchStart-matchCtxBytes) lands MID-rune. Without backupToRuneBoundary
+	// the window would slice the emoji and emit broken UTF-8.
 	const emoji = "🎉" // U+1F389, 4 bytes
 	matchStart := matchCtxBytes + 100
-	pre := strings.Repeat("a", matchCtxBytes-2) // emoji begins 2 bytes before winStart
+	winStart := matchStart - matchCtxBytes
+	pre := strings.Repeat("a", winStart-2) // emoji begins 2 bytes before winStart
 	gap := strings.Repeat("b", matchStart-len(pre)-len(emoji))
 	line := pre + emoji + gap + "MATCH" + strings.Repeat("c", matchCtxBytes+200) + "\n"
 	if len(line) <= maxLineBytes {
@@ -296,7 +300,8 @@ func TestLongLine_WindowCutLandsOnRuneBoundary(t *testing.T) {
 }
 
 func TestSanitize_DisplayRootControlBytesStripped(t *testing.T) {
-	// A control byte in the corpus root must not leak through the absolute path.
+	// A control byte in the corpus root must not leak through the absolute
+	// path.
 	results := []corpusSearchResult{{
 		corpusID: corpusID("c"), kind: corpusKindFolder, displayRoot: "/tmp/ev\x1bil",
 		file: zoekt.FileMatch{FileName: "f.txt", Language: "Text", Score: 1,
@@ -375,7 +380,8 @@ func TestColor_UnsortedFragmentsManyOutOfOrder(t *testing.T) {
 
 func TestColor_OverlappingFragmentsCoalesce(t *testing.T) {
 	// Overlapping (not merely adjacent) spans [0,5) and [2,7) must merge into a
-	// single [0,7) run — catches a merge that uses sp.start instead of max(end).
+	// single [0,7) run — catches a merge that uses sp.start instead of
+	// max(end).
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("0123456789\n", 1, frag(0, 5), frag(2, 5))}}
 	out := fmtOneFile(fm, ansiPalette)
@@ -388,9 +394,9 @@ func TestColor_OverlappingFragmentsCoalesce(t *testing.T) {
 }
 
 func TestColor_ManyFragmentsSpillToHeap(t *testing.T) {
-	// >16 fragments on one line forces the stack-backed [16]span buffer to spill
-	// to a heap-grown slice; all spans must still render. Exercises the spill
-	// path that the [16] capacity bound otherwise leaves untested.
+	// >16 fragments on one line forces the stack-backed [16]span buffer to
+	// spill to a heap-grown slice; all spans must still render. Exercises the
+	// spill path that the [16] capacity bound otherwise leaves untested.
 	const count = 20
 	line := strings.Repeat("x ", count) + "\n" // "x" at every even offset 0,2,4,…
 	frags := make([]zoekt.LineFragmentMatch, count)

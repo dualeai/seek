@@ -491,9 +491,10 @@ func TestGraphGitProcessCount(t *testing.T) {
 	}
 }
 
-// TestGraphGitProcessCountCold counts Git processes on a cold search of the
-// same graph, with and without vectors: one status and one index listing per
-// Git node; the cold build runs no second status.
+// TestGraphGitProcessCountCold counts Git processes on a cold search of a
+// folder with two repositories, with and without vectors (the vector run
+// searches one of them): one status and one index listing per Git node; the
+// cold build runs no second status.
 func TestGraphGitProcessCountCold(t *testing.T) {
 	requireTools(t)
 	const marker = "zqgraphcoldprocessmarker"
@@ -719,9 +720,10 @@ func logsMention(records []slog.Record, text string) bool {
 	return false
 }
 
-// TestBareRepoMarksAcceptSymbolicHead checks the two bare-repository tests
-// with a HEAD symlink, as old Git writes it: inside refs/ it marks a bare
-// repository; elsewhere it does not.
+// TestBareRepoMarksAcceptSymbolicHead checks the two bare-repository checks
+// with a HEAD symlink, as old Git writes it: detectBareRepoAt accepts a link
+// into refs/ and refuses one elsewhere; gitListingMarks reads only the entry
+// types, so it marks both as bare.
 func TestBareRepoMarksAcceptSymbolicHead(t *testing.T) {
 	for _, row := range []struct {
 		target string

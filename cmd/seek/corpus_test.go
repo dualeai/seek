@@ -49,9 +49,10 @@ func TestResolveOperands_PathReadErrorsPreserveOperand(t *testing.T) {
 	}
 }
 
-// TestPlanGitCorpus_WalkAndRevParseShareID — the walk finds a repository
-// through detectGitBoundary (the typed path) and an operand through git
-// rev-parse (the real path). Both must give one corpus ID.
+// TestPlanGitCorpus_WalkAndRevParseShareID plans one repository twice: from
+// detectGitBoundary, as the walk finds it (the typed path), and from git
+// rev-parse, as an operand resolves (the real path). Both plans must have one
+// corpus ID.
 func TestPlanGitCorpus_WalkAndRevParseShareID(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)

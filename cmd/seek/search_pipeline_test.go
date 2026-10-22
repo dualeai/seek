@@ -84,7 +84,8 @@ func TestDuplicateCollapseRepresentative(t *testing.T) {
 
 // TestAcceptanceIsPerFile scores the same relevant file inside a pool of 128
 // and of 4,096 candidates: the verdict for that file is the same, because
-// each model-added file is accepted on its own score.
+// each model-added file is accepted on its own score. A strict file is
+// accepted with a score of 0.
 func TestAcceptanceIsPerFile(t *testing.T) {
 	const tauFile = 0.6
 	verdict := func(poolSize int) bool {
@@ -115,8 +116,9 @@ func TestAcceptanceIsPerFile(t *testing.T) {
 
 // TestCandidateFilesKeepsNameOnlyOutOfTheModel puts strict, relaxed, semantic
 // and name-only hits through the candidate set: strict and semantic files are
-// scored with no count; a relaxed-only file is not (it cannot pass tau_file);
-// a name-only file enters only as a strict match and never gets a model score.
+// scored with no limit on their count; a relaxed-only file is not (it cannot
+// pass tau_file); a name-only file enters only as a strict match and never
+// gets a model score.
 func TestCandidateFilesKeepsNameOnlyOutOfTheModel(t *testing.T) {
 	hits := nodeHits{
 		{path: "strict.go", strict: true},

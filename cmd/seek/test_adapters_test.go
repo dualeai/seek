@@ -19,8 +19,8 @@ import (
 var testGitCorpusPlan = node{id: "test-git", kind: corpusKindGit}
 
 // run is a test adapter for runSearchCommand. It searches pathOperands with
-// no file or match limit, the default search config, and the default run
-// config.
+// no file or match limit, the default search config, and the zero run config:
+// lexical only, with no model.
 func run(ctx context.Context, pattern string, pathOperands []string) error {
 	return runSearchCommand(
 		ctx,

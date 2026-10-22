@@ -38,7 +38,8 @@ func initEmptyGitRepo(tb testing.TB) string {
 	tb.Helper()
 	dir := initEmptyGitRepoNoRemote(tb)
 	// Keep a common remote fixture for tests that inspect Git status or config.
-	// The committed indexer does not use it for identity or link policy.
+	// The committed indexer reads no remote, so the remote gives no identity
+	// or URL.
 	gitRunIn(tb, dir, "remote", "add", "origin", "https://github.com/test/repo.git")
 	return dir
 }
@@ -147,7 +148,7 @@ func planGitTestCorpus(tb testing.TB, repoDir string) (gitPaths, node) {
 	}
 	plan, err := planGitCorpus(paths, nil)
 	if err != nil {
-		tb.Fatalf("planCurrentGitCorpus: %v", err)
+		tb.Fatalf("planGitCorpus: %v", err)
 	}
 	if err := os.MkdirAll(plan.cacheDir, 0o755); err != nil {
 		tb.Fatalf("mkdir cache dir: %v", err)
@@ -540,17 +541,19 @@ func TestNativeGitMissingObjectKeepsPublishedFamily(t *testing.T) {
 			}
 			gitRunIn(t, repoDir, "add", ".")
 			gitRunIn(t, repoDir, "commit", "-m", "target with required object")
-			// A metadata change makes admission select native full before it
-			// reads the target tree. The tree case also fails after Git emits and
-			// Seek stages the valid root file.
-			gitRunIn(t, repoDir, "config", "zoekt.web-url", "https://example.test/native-object-test")
+			// With no committed state, admission selects native full before
+			// it reads the target tree. The tree case also fails after Git
+			// emits and Seek stages the valid root file.
+			if err := os.Remove(filepath.Join(plan.cacheDir, committedGitStateFile)); err != nil {
+				t.Fatal(err)
+			}
 			state := mustGitRepoStateIn(t, t.Context(), repoDir)
 			target := captureHeadForTest(t, paths.RepoDir)
 			oid := gitOutputIn(t, repoDir, "rev-parse", tc.objectSpec)
 			restore := hideLooseGitObject(t, paths.CommonDir, oid)
 			if tc.name == "tree" {
 				stagedDir := t.TempDir()
-				stagedErr := indexNativeGitFull(t.Context(), paths.RepoDir, stagedDir, target, 1, nil)
+				_, stagedErr := indexNativeGitFull(t.Context(), paths.RepoDir, stagedDir, target, 1, nil)
 				if stagedErr == nil || !shardsExist(stagedDir) {
 					t.Fatalf("late tree failure: error=%v shards=%t", stagedErr, shardsExist(stagedDir))
 				}
@@ -2234,24 +2237,6 @@ func TestRun_EmptyNativeGitSnapshotsDoNotRequireCtags(t *testing.T) {
 			},
 		},
 		{
-			name: "ignored_only",
-			setup: func(t *testing.T) string {
-				dir := initEmptyGitRepo(t)
-				if err := os.MkdirAll(filepath.Join(dir, ".sourcegraph"), 0o755); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(filepath.Join(dir, ".sourcegraph", "ignore"), []byte(".sourcegraph/ignore\nignored.go\n"), 0o644); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(filepath.Join(dir, "ignored.go"), []byte("package ignored\n"), 0o644); err != nil {
-					t.Fatal(err)
-				}
-				gitRun(t, dir, "add", ".")
-				gitRun(t, dir, "commit", "-m", "ignored only")
-				return dir
-			},
-		},
-		{
 			name: "gitlink_only",
 			setup: func(t *testing.T) string {
 				dir := initEmptyGitRepo(t)
@@ -2312,24 +2297,6 @@ func TestRun_EmptyCommittedFamilyWithDirtyShardUsesWarmPath(t *testing.T) {
 		name  string
 		setup func(*testing.T) string
 	}{
-		{
-			name: "ignored_only",
-			setup: func(t *testing.T) string {
-				dir := initEmptyGitRepo(t)
-				if err := os.MkdirAll(filepath.Join(dir, ".sourcegraph"), 0o755); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(filepath.Join(dir, ".sourcegraph", "ignore"), []byte(".sourcegraph/ignore\nignored.go\n"), 0o644); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(filepath.Join(dir, "ignored.go"), []byte("package ignored\n"), 0o644); err != nil {
-					t.Fatal(err)
-				}
-				gitRun(t, dir, "add", ".")
-				gitRun(t, dir, "commit", "-m", "ignored only")
-				return dir
-			},
-		},
 		{
 			name: "gitlink_only",
 			setup: func(t *testing.T) string {
@@ -2461,6 +2428,9 @@ func TestRun_GitRepoNamedUncommittedWithoutRemoteLabelsOnlyDirtyResultUncommitte
 	}
 }
 
+// TestRun_ReservedZoektNameKeepsCommittedFamily sets zoekt.name to the dirty
+// repository name. Seek reads no zoekt.* config, so the committed file keeps
+// its committed label.
 func TestRun_ReservedZoektNameKeepsCommittedFamily(t *testing.T) {
 	requireTools(t)
 	dir := initGitRepo(t, "committed.go", "package committed\n// reserved_name_committed_marker\n")
@@ -2506,7 +2476,7 @@ func TestRun_FirstNativeFailureDoesNotOpenLegacyGeneration(t *testing.T) {
 		t.Fatal("native Git identity did not rotate the cache")
 	}
 	snapshot := captureHeadForTest(t, paths.RepoDir)
-	if err := indexNativeGitFull(t.Context(), paths.RepoDir, legacyPlan.indexDir, snapshot, 1, nil); err != nil {
+	if _, err := indexNativeGitFull(t.Context(), paths.RepoDir, legacyPlan.indexDir, snapshot, 1, nil); err != nil {
 		t.Fatalf("build legacy-generation decoy: %v", err)
 	}
 	if matches, err := searchPlannedCorpusForTest(t.Context(), legacyPlan, "LEGACY_GENERATION_DECOY"); err != nil || len(matches) != 1 {
@@ -2569,7 +2539,7 @@ func TestRun_GitColdCacheNoShardSurfacesCommittedIndexerFailure(t *testing.T) {
 	_, err := captureStdout(t, func() error {
 		return run(context.Background(), "git_no_usable_shard_committed_marker", nil)
 	})
-	// The failed build skips the node with one warning that names the
+	// The failed build skips the node with a warning that names the
 	// indexer's cause; the search has no result.
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("err=%v, want no match", err)
@@ -2613,7 +2583,7 @@ func TestRun_GitWarmCachePreservesIndexWhenStatusFails(t *testing.T) {
 	_, err = captureStdout(t, func() error {
 		return run(context.Background(), "git_status_failure_marker", nil)
 	})
-	// The node fails with one warning that gives Git's text.
+	// The node fails with a warning that gives Git's text.
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("err=%v, want no match", err)
 	}
@@ -3123,7 +3093,8 @@ func TestIntegration_MultipleFiles_EditOne(t *testing.T) {
 	}
 }
 
-// verifies the full seek pipeline inside a git worktree
+// TestIntegration_Worktree_CommittedContent searches a linked worktree through
+// run and checks that its committed content has a result.
 func TestIntegration_Worktree_CommittedContent(t *testing.T) {
 	requireTools(t)
 
@@ -3140,7 +3111,8 @@ func TestIntegration_Worktree_CommittedContent(t *testing.T) {
 	}
 }
 
-// verifies that an uncommitted edit inside a git worktree is visible without committing
+// TestIntegration_Worktree_DirtyFile changes a committed file in a linked
+// worktree and checks that a search finds the uncommitted content.
 func TestIntegration_Worktree_DirtyFile(t *testing.T) {
 	requireTools(t)
 
@@ -3189,17 +3161,18 @@ func TestIntegration_Worktree_NestedUntrackedFileWithStatusConfig(t *testing.T) 
 	}
 }
 
-// TestRun_NestedRepoVenvNotLeakedToParent checks a repeated parent-folder
-// search that contains a nested Git repository. The parent folder must keep the
-// repository boundary on both scans. Git ignore rules must keep .venv content
-// out of the nested corpus.
+// TestRun_NestedRepoVenvNotLeakedToParent searches a parent folder twice. The
+// folder holds a nested Git repository whose .gitignore ignores .venv. The
+// first search builds the cache; the parent then changes, so the second search
+// scans the folder again. The second search must keep the repository boundary:
+// the .venv file of the nested repository has no result.
 func TestRun_NestedRepoVenvNotLeakedToParent(t *testing.T) {
 	parent := t.TempDir()
 	nested := filepath.Join(parent, "nested-repo")
 	if err := os.MkdirAll(nested, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Real git init + commit so the boundary detector confirms.
+	// A real Git repository, so that detectGitBoundary confirms the boundary.
 	gitRunIn(t, nested, "init", "-q")
 	gitRunIn(t, nested, "config", "user.email", "test@example.com")
 	gitRunIn(t, nested, "config", "user.name", "test")
@@ -3302,7 +3275,8 @@ func TestRun_CaseMismatchedFileOperandStillFound(t *testing.T) {
 	requireTools(t)
 
 	repo := initGitRepo(t, "readme.md", "MARKER_CASE_FIX\n")
-	// On a case-sensitive filesystem, the other letter case is a different path.
+	// On a case-sensitive filesystem, the other letter case is a different
+	// path.
 	if _, err := os.Stat(filepath.Join(repo, "README.md")); err != nil {
 		t.Skip("case-sensitive filesystem; mistyped operand cannot resolve")
 	}
@@ -3320,9 +3294,10 @@ func TestRun_CaseMismatchedFileOperandStillFound(t *testing.T) {
 	}
 }
 
-// Run-level twin for the untracked-NEW (`??`) visibility branch: a never-
-// committed file passed as an operand must be searched via the git dirty
-// layer (distinct from the modified-tracked ` M` branch covered elsewhere).
+// TestRun_CurrentGitUntrackedFileOperandSearchesContent passes an untracked
+// file (Git status `??`) as an operand: Seek searches it through the Git dirty
+// layer and tags it [uncommitted]. A modified tracked file (` M`) is the case
+// of TestRun_CurrentGitExactDirtyFileOperandUsesGitDirtyLayer.
 func TestRun_CurrentGitUntrackedFileOperandSearchesContent(t *testing.T) {
 	requireTools(t)
 
@@ -3366,9 +3341,9 @@ func TestRun_LeadingColonIgnoredFileOperandSearchesContent(t *testing.T) {
 	}
 }
 
-// Run-level twin for the composed symlink→ignored path: a symlink resolving
-// to a gitignored in-worktree file must fall back to a folder corpus and
-// still surface the target's content.
+// TestRun_SymlinkToIgnoredFileSearchesContent passes a symlink to an ignored
+// file of the worktree as an operand: Seek searches the target through a
+// folder corpus and finds its content.
 func TestRun_SymlinkToIgnoredFileSearchesContent(t *testing.T) {
 	requireTools(t)
 
@@ -3498,10 +3473,12 @@ func resultFileBasenames(out string) map[string]bool {
 	return set
 }
 
-// TestScoped_EqualsUnscopedIntersectScope checks that a scoped result set equals
-// the unscoped result set limited to that scope. It covers committed, modified,
-// deleted, untracked, and renamed files, plus a matching sibling outside the
-// scope.
+// TestScoped_EqualsUnscopedIntersectScope checks that a scoped result set is
+// the unscoped result set limited to that scope. For six query forms (a word,
+// content:, lang:, file:, type:file, and sym:), it compares the scoped and the
+// unscoped result files with expected lists. The fixture holds committed,
+// modified, deleted, untracked, and renamed files, plus a matching sibling
+// outside the scope.
 func TestScoped_EqualsUnscopedIntersectScope(t *testing.T) {
 	requireTools(t)
 
@@ -3511,7 +3488,7 @@ func TestScoped_EqualsUnscopedIntersectScope(t *testing.T) {
 	writeTrackedFile(t, repo, filepath.Join("sub", "also.go"), "package sub\n// QTERM also\n")
 	writeTrackedFile(t, repo, filepath.Join("sub", "gone.go"), "package sub\n// QTERM gone\n")
 	writeTrackedFile(t, repo, filepath.Join("sub", "old.go"), "package sub\n// QTERM old\n")
-	// committed, out-of-scope sibling that ALSO matches (scope-leak discriminator)
+	// committed, out-of-scope sibling that also matches: it shows a scope leak
 	writeTrackedFile(t, repo, filepath.Join("other", "sib.go"), "package other\n// QTERM sibling\n")
 
 	// Working-tree mutations (uncommitted): modify keep.go (still matches),
@@ -3657,7 +3634,7 @@ func TestScoped_RankingEqualsUnscopedIntersectScope(t *testing.T) {
 	writeTrackedFile(t, repo, filepath.Join("sub", "many.go"), "package sub\n// RANKQ RANKQ RANKQ RANKQ\n")
 	writeTrackedFile(t, repo, filepath.Join("sub", "few.go"), "package sub\n"+strings.Repeat("// filler line\n", 40)+"// RANKQ\n")
 	writeTrackedFile(t, repo, filepath.Join("sub", "mid.go"), "package sub\n// RANKQ RANKQ\n")
-	// Out-of-scope file that also matches (would perturb order if scope leaked).
+	// Out-of-scope file that also matches: a scope leak changes the order.
 	writeTrackedFile(t, repo, filepath.Join("other", "sib.go"), "package other\n// RANKQ RANKQ RANKQ\n")
 
 	setTestUserCache(t)
@@ -3735,8 +3712,10 @@ func TestScoped_FileOperandRegexpEqualsFileNameSet(t *testing.T) {
 	}
 }
 
-// Concurrent scoped + unscoped searches of one repo from a cold cache must
-// converge on the single combined index without racing or minting duplicates.
+// TestRace_ConcurrentScopedUnscopedSameRepo runs four scoped and four unscoped
+// searches of one repository at the same time from a cold cache. Each search
+// must succeed, the cache must hold one corpus (the combined index), and a
+// later search must find the marker in it.
 func TestRace_ConcurrentScopedUnscopedSameRepo(t *testing.T) {
 	requireTools(t)
 

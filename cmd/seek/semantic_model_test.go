@@ -192,8 +192,8 @@ func TestSemanticModelFutureCloseWaitsForStartedQuery(t *testing.T) {
 				future := newSemanticModelFuture(func(context.Context) (semanticModel, error) {
 					return scorer, nil
 				})
-				// Close right after startQuery: it must already see the query as
-				// started and wait for it.
+				// Close right after startQuery: it must already see the query
+				// as started and wait for it.
 				future.startQuery(ctx, "find request handler")
 				closed := make(chan error, 1)
 				go func() { closed <- future.Close() }()

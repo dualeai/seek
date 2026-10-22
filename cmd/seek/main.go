@@ -45,19 +45,26 @@ func versionString() string {
 }
 
 // TODO: github.com/rs/xid v1.6.0, which zoekt/index imports, runs ioreg at
-// package init on macOS. Every seek process pays about 20 ms before main.
+// package init on macOS, so every seek process waits about 20 ms (one ioreg
+// run) before main.
 // Upstream issue https://github.com/rs/xid/issues/120; the fix
 // (https://github.com/rs/xid/pull/121) is on master but in no release yet.
 // Upgrade rs/xid when a release after v1.6.0 has it.
 func main() {
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	waits := newLockWaits()
+	ctx = withLockWaits(ctx, waits)
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(signals)
+	go watchInterrupts(signals, cancel, waits)
 
-	// Pre-scan the effective arguments for -v / --verbose so flag-time errors are
-	// formatted under the verbose contract too. PersistentPreRunE only
-	// fires AFTER pflag parses successfully, so without this pre-scan a
-	// `seek -v --unknown foo` would print plain `seek: <err>` instead of
-	// the structured slog ERROR record the user asked for.
+	// Scan the effective arguments for -v and --verbose before Cobra parses
+	// them, so a flag error also follows the verbose contract.
+	// PersistentPreRunE runs only after pflag parses the flags, so without this
+	// scan `seek -v --unknown foo` would print only the plain `seek: <err>`
+	// line, without the structured slog ERROR record that the user asked for.
 	root := newRootCmd(newLateOnSemanticModel)
 	args := splicePassthroughSeparator(os.Args[1:], root.Flags())
 	verbose := hasVerboseArg(args)
@@ -65,9 +72,10 @@ func main() {
 	root.SetArgs(args)
 	err := root.ExecuteContext(ctx)
 
-	// Help, completion, and explicit GC calls do not start automatic GC. A GC
-	// command already owns cache maintenance, and its dry-run form must remain
-	// read-only. Search calls run automatic GC after their output is flushed.
+	// Help, version, completion, and explicit GC calls do not start automatic
+	// GC. A GC command already owns cache maintenance, and its dry-run form
+	// must remain read-only. Search calls run automatic GC after their output
+	// is flushed.
 	if shouldRunOpportunisticGC(args) {
 		fireOpportunisticGC(runOpportunisticGC, gcRunTimeout)
 	}
@@ -155,9 +163,10 @@ func cloneStringSlice(values []string) []string {
 }
 
 // runSearchCommand runs one search: it plans the query, expands the path
-// operands into the node graph, prepares and searches every node, ranks a
-// description query with the model, and writes the results. It returns
-// errNoMatch when it writes no result.
+// operands into the node graph, prepares and searches every node, ranks with
+// the model a query that gives the model text, and writes the results. When
+// it writes no result it returns errNoMatch, or the user's interrupt after an
+// interrupt ended a lock wait (noMatchOrInterrupted).
 func runSearchCommand(
 	ctx context.Context,
 	pattern string,
@@ -243,7 +252,7 @@ func runSearchCommand(
 			return err
 		}
 		rescoreStrictHits(hits, bm25)
-		accepted, err := rankDescription(ctx, hits, plan, execution)
+		accepted, err := rankModelQuery(ctx, hits, plan, execution)
 		if err != nil {
 			return err
 		}
@@ -252,7 +261,7 @@ func runSearchCommand(
 
 	warnUnindexedFileOperands(ctx, plans, execution.opened, pathOperands, allResults, dirtyByCorpus)
 	if len(allResults) == 0 {
-		return errNoMatch
+		return noMatchOrInterrupted(ctx)
 	}
 	if namesOnlyQuery(plan.raw) {
 		keepFileNamesOnly(allResults)
@@ -292,7 +301,7 @@ func runSearchCommand(
 		return fmt.Errorf("write search results: %w", err)
 	}
 	if !wrote {
-		return errNoMatch
+		return noMatchOrInterrupted(ctx)
 	}
 	return nil
 }
@@ -356,6 +365,7 @@ func wrapCorpusResults(plan node, files []zoekt.FileMatch) []corpusSearchResult 
 			displayRoot: plan.displayRoot,
 			displayName: displayName,
 			file:        file,
+			modelBase:   plan.modelPathBase(),
 		}
 	}
 	return results
@@ -395,7 +405,8 @@ func (g *gitNode) refresh(
 // captured commit and the overlay of the dirty files. An update failure is
 // returned when no shards exist; with published shards, the function warns and
 // leaves the prior generation searchable (corpusStale). A peer's build also
-// gives corpusStale, with no warning.
+// gives corpusStale, with no warning. A node that .empty marks as empty for the
+// captured state gives corpusKnownEmpty.
 func (g *gitNode) refreshState(
 	ctx context.Context,
 	plan node,
@@ -432,9 +443,10 @@ func (g *gitNode) refreshState(
 	hasShards := scErr == nil && sc.familyComplete(plan.indexDir) &&
 		plan.committedSnapshotReady(state, sc)
 	clearCommitted := state.HeadSHA == "no-head" && sc.hasMember(familyCommitted)
-	// A leftover .swapping marker means a prior publish was interrupted and the
-	// shards may be torn; force the build path so recoverIncompleteSwap runs even
-	// when state otherwise looks current.
+	// A leftover .swapping marker means that a publish was interrupted, or did
+	// not move the live family back, and the shards may be torn: force the
+	// build path so recoverIncompleteSwap runs even when the state looks
+	// current.
 	swapPending := readCacheFile(plan.cacheDir, swappingMarkerFile) != ""
 	needBuild := currentState != cachedState || !hasShards || swapPending || clearCommitted || !joinedReady ||
 		missingBlobCheckDue(ctx, paths.RepoDir, plan.cacheDir, state.HeadSHA, semanticRequired)
@@ -488,6 +500,21 @@ func (g *gitNode) refreshState(
 	return corpusSearchable, nil
 }
 
+// watchInterrupts cancels the command on SIGTERM and on SIGINT, with one
+// exception: the first SIGINT while a node waits for a lock ends the waits
+// only (lockWaits), so the nodes that are ready print. A later SIGINT cancels
+// the command. It returns when signals closes.
+func watchInterrupts(signals <-chan os.Signal, cancel context.CancelFunc, waits *lockWaits) {
+	waitsEnded := false
+	for sig := range signals {
+		if sig == syscall.SIGINT && !waitsEnded && waits.endRunning() {
+			waitsEnded = true
+			continue
+		}
+		cancel()
+	}
+}
+
 func normalizeCommittedTreeish(headSHA string) string {
 	if headSHA == "" || headSHA == "no-head" {
 		return "no-head"
@@ -518,8 +545,8 @@ func searchPlannedCorpusParsed(
 	userQ query.Q,
 	config searchConfig,
 ) ([]zoekt.FileMatch, error) {
-	// Hold the shared publish lock while listing, opening, and searching shards.
-	// A publisher cannot replace the shard family during that work.
+	// Hold the shared publish lock while the read lists, opens, and searches
+	// the shards: a publisher cannot replace the shard family during that work.
 	read, ctx, err := openNodeRead(ctx, plan, dirty)
 	if err != nil {
 		return nil, err

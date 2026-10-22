@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -57,11 +58,11 @@ func testSemanticUnitEmbedding(vector semanticVector) semanticUnitEmbedding {
 	return embedding
 }
 
-func testSemanticFineVectors(embeddings []semanticUnitEmbedding) []semanticFineSNORM16Vectors {
-	vectors := make([]semanticFineSNORM16Vectors, len(embeddings))
+func testSemanticFineVectors(embeddings []semanticUnitEmbedding) []semanticFineF16Vectors {
+	vectors := make([]semanticFineF16Vectors, len(embeddings))
 	for row := range embeddings {
 		for centroid := range embeddings[row].fine {
-			stored, err := encodeSemanticSNORM16Vector(&embeddings[row].fine[centroid])
+			stored, err := encodeSemanticF16Vector(&embeddings[row].fine[centroid])
 			if err != nil {
 				panic(err)
 			}
@@ -71,7 +72,7 @@ func testSemanticFineVectors(embeddings []semanticUnitEmbedding) []semanticFineS
 	return vectors
 }
 
-func testSemanticStoredFineVectors(vector semanticVector) semanticFineSNORM16Vectors {
+func testSemanticStoredFineVectors(vector semanticVector) semanticFineF16Vectors {
 	return testSemanticFineVectors([]semanticUnitEmbedding{testSemanticUnitEmbedding(vector)})[0]
 }
 
@@ -146,61 +147,71 @@ func writeTestSemanticGeneration(
 
 	// An overlay holds no USearch graph, as the build makes it.
 	var shards []semanticUSearchShard
-	if semanticSourceHasGraph(source) {
+	var shardRows uint64
+	if semanticSourceHasGraph(source) && len(units) > 0 {
 		var err error
 		if shards, err = writeTestUSearchShard(dir, len(units)); err != nil {
 			return semanticManifest{}, err
 		}
+		shardRows = semanticUSearchMaxShardRows
 	}
 	return writeSemanticGenerationFromParts(
 		buildCtx,
 		dir,
 		source,
+		"",
 		units,
 		output.vectorsArtifact,
 		output.coarseArtifact,
+		shardRows,
 		shards,
 	)
 }
 
+// writeTestUSearchShard writes placeholder graph files of at most
+// semanticUSearchMaxShardRows rows each, with an ID of their name and rows.
 func writeTestUSearchShard(dir string, rows int) ([]semanticUSearchShard, error) {
-	if rows == 0 {
-		return nil, nil
+	var shards []semanticUSearchShard
+	for start := 0; start < rows; start += semanticUSearchMaxShardRows {
+		count := min(semanticUSearchMaxShardRows, rows-start)
+		name := semanticUSearchShardName(len(shards))
+		path := filepath.Join(dir, name)
+		content := []byte("test-usearch-v1")
+		content = append(content, byte(count))
+		if err := os.WriteFile(path, content, 0o600); err != nil {
+			return nil, err
+		}
+		artifact, err := inspectSemanticArtifact(path)
+		if err != nil {
+			return nil, err
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return nil, err
+		}
+		id := sha256.Sum256(fmt.Appendf(nil, "%s %d %d", name, start, count))
+		shards = append(shards, semanticUSearchShard{
+			Check:            semanticRowsCheckOf(info),
+			Name:             name,
+			Start:            uint64(start),
+			Rows:             uint64(count),
+			ID:               hex.EncodeToString(id[:]),
+			semanticArtifact: artifact,
+		})
 	}
-	name := semanticUSearchShardName(0)
-	path := filepath.Join(dir, name)
-	content := []byte("test-usearch-v1")
-	content = append(content, byte(rows))
-	if err := os.WriteFile(path, content, 0o600); err != nil {
-		return nil, err
-	}
-	artifact, err := inspectSemanticArtifact(path)
-	if err != nil {
-		return nil, err
-	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	return []semanticUSearchShard{{
-		Check:            semanticRowsCheckOf(info),
-		Name:             name,
-		Start:            0,
-		Rows:             uint64(rows),
-		semanticArtifact: artifact,
-	}}, nil
+	return shards, nil
 }
 
 func TestSemanticGenerationRoundTrip(t *testing.T) {
 	units, embeddings := testSemanticRowsAndVectors(t)
-	embeddings[0] = testSemanticSNORM16GoldenEmbedding()
+	embeddings[0] = testSemanticGoldenEmbedding()
 	dir := filepath.Join(t.TempDir(), ".build-semantic")
 	manifest, err := writeTestSemanticGeneration(t.Context(), dir, "head-1", units, embeddings)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if manifest.Format != 6 || manifest.Rows != 1 || manifest.Dimensions != 48 ||
-		manifest.VectorCodec != "snorm16-le-rne-s32767-v1" ||
+		manifest.VectorCodec != "f16-le-rne-v1" ||
 		manifest.VectorStride != 1_920 {
 		t.Fatalf("manifest=%+v", manifest)
 	}
@@ -216,14 +227,14 @@ func TestSemanticGenerationRoundTrip(t *testing.T) {
 	if !reflect.DeepEqual(got.rows, wantRows) {
 		t.Fatalf("rows changed:\nwant=%+v\ngot=%+v", wantRows, got.rows)
 	}
-	// The golden codes: -0.5, 0.5 and sqrt(0.5) times 32767, rounded half to
-	// even, then 1 and -1 at full scale (TestSemanticSNORM16LittleEndianGolden).
-	wantVectors := make([]semanticFineSNORM16Vectors, 1)
-	wantVectors[0][0][0], wantVectors[0][0][1], wantVectors[0][0][2] = -16_384, 16_384, 23_170
+	// The golden binary16 codes of -0.5, 0.5, sqrt(0.5), 1, and -1
+	// (TestSemanticF16LittleEndianGolden).
+	wantVectors := make([]semanticFineF16Vectors, 1)
+	wantVectors[0][0][0], wantVectors[0][0][1], wantVectors[0][0][2] = 0xb800, 0x3800, 0x39a8
 	for centroid := 1; centroid < 19; centroid++ {
-		wantVectors[0][centroid][centroid] = 32_767
+		wantVectors[0][centroid][centroid] = semanticF16One
 	}
-	wantVectors[0][19][47] = -32_767
+	wantVectors[0][19][47] = 0xbc00
 	if !reflect.DeepEqual(got.vectors, wantVectors) {
 		t.Fatalf("vectors changed: want=%v got=%v", wantVectors, got.vectors)
 	}
@@ -366,12 +377,12 @@ func writeSemanticOpenBenchmarkGeneration(
 			b.Fatal(err)
 		}
 		shards[shardIndex] = semanticUSearchShard{
-			Name: name, Start: uint64(start), Rows: uint64(rows), semanticArtifact: artifact,
+			Name: name, Start: uint64(start), Rows: uint64(rows), ID: artifact.SHA256, semanticArtifact: artifact,
 		}
 	}
 	if _, err := writeSemanticGenerationFromParts(
-		b.Context(), dir, source, units, semanticSizedArtifact{Bytes: vectorBytes},
-		semanticSizedArtifact{Bytes: coarseBytes}, shards,
+		b.Context(), dir, source, "", units, semanticSizedArtifact{Bytes: vectorBytes},
+		semanticSizedArtifact{Bytes: coarseBytes}, shardRows, shards,
 	); err != nil {
 		b.Fatal(err)
 	}
@@ -472,6 +483,9 @@ func TestSemanticManifestRejectsWrongVectorContract(t *testing.T) {
 		change func(*semanticManifest)
 	}{
 		{name: "codec", change: func(value *semanticManifest) { value.VectorCodec = "f32-le-v1" }},
+		// A generation with 16-bit fixed-point fine vectors has the same stride
+		// and length; only its codec tag tells it apart.
+		{name: "SNORM16 codec", change: func(value *semanticManifest) { value.VectorCodec = "snorm16-le-rne-s32767-v1" }},
 		{name: "stride", change: func(value *semanticManifest) { value.VectorStride++ }},
 		{name: "bytes", change: func(value *semanticManifest) { value.VectorsFile.Bytes++ }},
 		{name: "representation", change: func(value *semanticManifest) { value.Representation = "anchored-spherical-f32-v1" }},
@@ -634,13 +648,15 @@ func TestOpenSemanticGenerationKeepsExactDataAfterUSearchDamage(t *testing.T) {
 	}
 }
 
-func TestMappedSemanticSNORM16RejectsAccessedDamage(t *testing.T) {
+func TestMappedSemanticF16RejectsAccessedDamage(t *testing.T) {
 	units, embeddings := testSemanticRowsAndVectors(t)
 	tests := []struct {
 		name   string
 		damage []byte
 	}{
-		{name: "reserved code", damage: []byte{0x00, 0x80}},
+		{name: "NaN code", damage: []byte{0x00, 0x7e}},
+		{name: "infinite code", damage: []byte{0x00, 0x7c}},
+		{name: "norm above tolerance", damage: []byte{0x00, 0x3c}},
 		{name: "zero norm", damage: make([]byte, semanticEmbeddingDimensions*2)},
 	}
 	for _, test := range tests {
@@ -704,10 +720,12 @@ func testLargeSemanticManifest(t *testing.T, rows uint64) semanticManifest {
 	manifest.RowsFile.SHA256 = strings.Repeat("0", sha256.Size*2)
 	manifest.VectorsFile.Bytes, _ = checkedSemanticVectorBytes(rows)
 	manifest.CoarseFile.Bytes, _ = checkedSemanticCoarseBytes(rows)
-	for start := uint64(0); start < rows; start += semanticUSearchUnitsPerShard {
+	manifest.USearchShardRows = semanticUSearchMaxShardRows
+	for start := uint64(0); start < rows; start += semanticUSearchMaxShardRows {
 		manifest.USearchFiles = append(manifest.USearchFiles, semanticUSearchShard{
 			Name: semanticUSearchShardName(len(manifest.USearchFiles)), Start: start,
-			Rows:             min(semanticUSearchUnitsPerShard, rows-start),
+			Rows:             min(semanticUSearchMaxShardRows, rows-start),
+			ID:               strings.Repeat("0", sha256.Size*2),
 			semanticArtifact: semanticArtifact{Bytes: 1, SHA256: strings.Repeat("0", sha256.Size*2)},
 		})
 	}
@@ -734,7 +752,7 @@ func TestSemanticGenerationOfTenMillionRowsBinds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validateSemanticUSearchShardMetadata(got.Rows, got.USearchFiles, true); err != nil {
+	if err := validateSemanticUSearchShardMetadata(got.Rows, got.USearchShardRows, got.USearchFiles, true); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -764,7 +782,7 @@ func TestWriteSemanticGenerationHonorsCancellation(t *testing.T) {
 	cancel()
 	dir := t.TempDir()
 	_, err := writeSemanticGenerationFromParts(
-		ctx, dir, "head", nil, semanticSizedArtifact{}, semanticSizedArtifact{}, nil,
+		ctx, dir, "head", "", nil, semanticSizedArtifact{}, semanticSizedArtifact{}, 0, nil,
 	)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error=%v, want cancellation", err)
@@ -777,16 +795,15 @@ func TestWriteSemanticGenerationHonorsCancellation(t *testing.T) {
 // TestExactSemanticSearchStableOrder keeps the rows that reach the floor, a
 // row exactly at the floor included, best first; a lower row breaks a tie.
 func TestExactSemanticSearchStableOrder(t *testing.T) {
-	vectors := make([]semanticFineSNORM16Vectors, 4)
+	vectors := make([]semanticFineF16Vectors, 4)
 	vectors[0] = testSemanticStoredFineVectors(semanticVector{0: 1})
 	vectors[1] = testSemanticStoredFineVectors(semanticVector{0: 0.5, 1: float32(math.Sqrt(0.75))})
 	vectors[2] = testSemanticStoredFineVectors(semanticVector{0: 1})
 	vectors[3] = testSemanticStoredFineVectors(semanticVector{0: -1})
 	query := semanticVector{}
 	query[0] = 1
-	// 0.5 is stored as 16,384 (0.5 times 32767, rounded half to even), so
-	// its score is 16,384/32,767.
-	half := float32(16_384.0 / 32_767)
+	// binary16 stores 0.5 exactly, so row 1 scores 0.5.
+	half := float32(0.5)
 	hits, err := exactSemanticSearch(t.Context(), vectors, testSemanticQuery(query), half)
 	if err != nil {
 		t.Fatal(err)
@@ -798,7 +815,7 @@ func TestExactSemanticSearchStableOrder(t *testing.T) {
 }
 
 func TestExactSemanticSearchParallelMatchesSerialExpected(t *testing.T) {
-	vectors := make([]semanticFineSNORM16Vectors, 600)
+	vectors := make([]semanticFineF16Vectors, 600)
 	defaultVector := semanticVector{2: 1}
 	for row := range vectors {
 		vectors[row] = testSemanticStoredFineVectors(defaultVector)
@@ -809,9 +826,8 @@ func TestExactSemanticSearchParallelMatchesSerialExpected(t *testing.T) {
 	third := semanticVector{0: 0.5, 1: float32(math.Sqrt(0.75))}
 	vectors[599] = testSemanticStoredFineVectors(third)
 	query := testSemanticQuery(best)
-	// 0.5 is stored as 16,384 (0.5 times 32767, rounded half to even), so
-	// its score is 16,384/32,767.
-	half := float32(16_384.0 / 32_767)
+	// binary16 stores 0.5 exactly, so row 599 scores 0.5.
+	half := float32(0.5)
 	want := []semanticHit{
 		{row: 17, score: 1},
 		{row: 300, score: 1},
@@ -841,15 +857,15 @@ func TestExactSemanticSearchParallelMatchesSerialExpected(t *testing.T) {
 func TestExactSemanticSearchCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := exactSemanticSearch(ctx, make([]semanticFineSNORM16Vectors, 10_000), nil, noSemanticFloor)
+	_, err := exactSemanticSearch(ctx, make([]semanticFineF16Vectors, 10_000), nil, noSemanticFloor)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error=%v, want cancellation", err)
 	}
 }
 
 func TestExactSemanticSearchRejectsInvalidMappedVector(t *testing.T) {
-	vectors := []semanticFineSNORM16Vectors{testSemanticStoredFineVectors(semanticVector{0: 1})}
-	vectors[0][3][0] = math.MinInt16
+	vectors := []semanticFineF16Vectors{testSemanticStoredFineVectors(semanticVector{0: 1})}
+	vectors[0][3][0] = 0x7e00
 	query := semanticVector{}
 	query[0] = 1
 	if _, err := exactSemanticSearch(t.Context(), vectors, testSemanticQuery(query), noSemanticFloor); err == nil {
@@ -865,11 +881,11 @@ var semanticExactBenchmarkHits []semanticHit
 // query preparation.
 func BenchmarkExactSemanticRange(b *testing.B) {
 	const rowCount = 328
-	vectors := make([]semanticFineSNORM16Vectors, rowCount)
+	vectors := make([]semanticFineF16Vectors, rowCount)
 	for row := range vectors {
 		for centroid := range vectors[row] {
 			vector := semanticUSearchTestVector(row*semanticFineCentroidsPerUnit + centroid + 1)
-			stored, err := encodeSemanticSNORM16Vector(&vector)
+			stored, err := encodeSemanticF16Vector(&vector)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -882,7 +898,7 @@ func BenchmarkExactSemanticRange(b *testing.B) {
 			for token := range query {
 				query[token] = semanticUSearchTestVector(token*31 + 11)
 			}
-			scaled, err := prepareSemanticSNORM16Query(query)
+			packed, err := prepareSemanticFineQuery(query)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -891,7 +907,7 @@ func BenchmarkExactSemanticRange(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
-				hits, err := exactSemanticRange(ctx, vectors, scaled, nil, 0, len(vectors), floor)
+				hits, err := exactSemanticRange(ctx, vectors, &packed, nil, 0, len(vectors), floor)
 				if err != nil {
 					b.Fatal(err)
 				}

@@ -7,10 +7,14 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sourcegraph/zoekt"
+	"github.com/sourcegraph/zoekt/query"
 )
 
 func TestExplicitSearchConfigCopiesDefaults(t *testing.T) {
@@ -248,8 +252,9 @@ func TestSearchPlannedCorpusParsed_ContextModes(t *testing.T) {
 
 // TestSearchPlannedCorpusParsed_ContextFileSelectionAfterShardMerge puts a
 // committed and an uncommitted shard in one index directory, as a Git node
-// does, and reads the node. With a context file limit of 1, only the best
-// file after the merge of the two shards keeps its context lines, in each
+// does, and reads the node. The read hides the committed copy of a.go,
+// because the uncommitted copy wins. With a context file limit of 1, only the
+// best file after the merge of the two shards keeps its context lines, in each
 // shard order.
 func TestSearchPlannedCorpusParsed_ContextFileSelectionAfterShardMerge(t *testing.T) {
 	requireTools(t)
@@ -316,8 +321,8 @@ func TestSearchPlannedCorpusParsed_ContextFileSelectionAfterShardMerge(t *testin
 			if err != nil {
 				t.Fatalf("full search: %v", err)
 			}
-			if len(selected) != 3 || len(full) != 3 {
-				t.Fatalf("result counts selective=%d full=%d, want 3 each", len(selected), len(full))
+			if len(selected) != 2 || len(full) != 2 {
+				t.Fatalf("result counts selective=%d full=%d, want 2 each", len(selected), len(full))
 			}
 
 			type resultKey struct {
@@ -338,7 +343,6 @@ func TestSearchPlannedCorpusParsed_ContextFileSelectionAfterShardMerge(t *testin
 			}
 
 			wantContext := map[resultKey]bool{
-				{name: "a.go", repository: order.committed}: false,
 				{name: "a.go", repository: repoUncommitted}: true,
 				{name: "z.go", repository: order.committed}: false,
 			}
@@ -403,5 +407,193 @@ func TestNodeRead_FailsClosedOnPartialCorruptShard(t *testing.T) {
 	var damage *shardDamage
 	if !errors.As(err, &damage) || !errors.Is(err, errShardUnloadable) || !strings.Contains(err.Error(), "load shard") {
 		t.Fatalf("error=%v, want shard damage that names the shard load", err)
+	}
+}
+
+// TestSearchLoadedShardsRecoversAShardPanic checks the two panic classes of a
+// shard search: a corrupt-shard panic is index damage that the node read
+// repairs, and any other panic is a plain error. The other shard still runs.
+func TestSearchLoadedShardsRecoversAShardPanic(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		value  any
+		damage bool
+	}{
+		{"corrupt shard", fmt.Errorf(`corrupt shard "a.zoekt" while searching repository "r", document 3: %w`, errors.New("reading content")), true},
+		{"query type", "type *query.Type", false},
+		{"runtime error", recoveredRuntimeError(), true},
+		{"error string", fmt.Errorf("index out of range [9] with length 2"), false},
+		{"negated case", "type *query.caseQ", false},
+		{"corrupt index", "corrupt index: subrepo 127 beyond [[]]", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var healthyRan atomic.Bool
+			healthy := &cancellationTestShard{search: func(context.Context) (*zoekt.SearchResult, error) {
+				healthyRan.Store(true)
+				return &zoekt.SearchResult{Files: []zoekt.FileMatch{{FileName: "ok.go"}}}, nil
+			}}
+			broken := &cancellationTestShard{search: func(context.Context) (*zoekt.SearchResult, error) {
+				panic(test.value)
+			}}
+			files, err := searchLoadedShards(t.Context(), []zoekt.Searcher{healthy, broken}, &query.Const{Value: true}, defaultSearchConfig(), nil)
+			if err == nil || len(files) != 0 || strings.Contains(err.Error(), "shard search panicked") == test.damage {
+				t.Fatalf("files=%v err=%v, want no files and the shard panic", files, err)
+			}
+			if got := errors.Is(err, errShardUnloadable); got != test.damage {
+				t.Fatalf("index damage=%v, want %v (err=%v)", got, test.damage, err)
+			}
+			if !healthyRan.Load() {
+				t.Fatal("the healthy shard did not run")
+			}
+		})
+	}
+}
+
+// recoveredRuntimeError returns the value of a real Go runtime panic.
+func recoveredRuntimeError() (value any) {
+	defer func() { value = recover() }()
+	var values []int
+	index := 9
+	_ = values[index]
+	return nil
+}
+
+// TestZoektShardCallsReturnPanicsAsErrors checks the reads that call a Zoekt
+// shard outside searchLoadedShards: the BM25 counts (a List, then a listing)
+// and the current-copy listing of an uncommitted shard. A shard whose calls
+// panic with a runtime error gives index damage, not a crash.
+func TestZoektShardCallsReturnPanicsAsErrors(t *testing.T) {
+	broken := &cancellationTestShard{search: func(context.Context) (*zoekt.SearchResult, error) {
+		panic(recoveredRuntimeError())
+	}}
+	// broken.List panics with a nil dereference: its embedded Searcher is nil.
+	path := filepath.Join(t.TempDir(), "index", repoUncommitted+"_v16.00000.zoekt")
+	writeFixtureFile(t, path, "shard bytes\n")
+	record := readShardStatsRecord(filepath.Dir(path))
+	if _, err := record.stats(t.Context(), path, broken); !errors.Is(err, errShardUnloadable) {
+		t.Fatalf("BM25 counts: err=%v, want index damage", err)
+	}
+	committed := filepath.Join(filepath.Dir(path), "git-0_v16.00000.zoekt")
+	if _, err := currentCopies(t.Context(), []zoekt.Searcher{nil, broken}, []string{committed, path}, nil); !errors.Is(err, errShardUnloadable) {
+		t.Fatalf("current-copy listing: err=%v, want index damage", err)
+	}
+}
+
+// TestCurrentCopiesSkipsTheListingWithNoCommittedShard checks that a node with
+// only uncommitted shards gets no clause and lists no shard: no committed copy
+// exists to hide.
+func TestCurrentCopiesSkipsTheListingWithNoCommittedShard(t *testing.T) {
+	listed := &cancellationTestShard{search: func(context.Context) (*zoekt.SearchResult, error) {
+		t.Error("the listing ran with no committed shard")
+		return &zoekt.SearchResult{}, nil
+	}}
+	path := filepath.Join(t.TempDir(), repoUncommitted+"_v16.00000.zoekt")
+	clause, err := currentCopies(t.Context(), []zoekt.Searcher{listed}, []string{path}, dirtyFileSet{"a.go": {}})
+	if err != nil || clause != nil {
+		t.Fatalf("clause=%v err=%v, want no clause", clause, err)
+	}
+}
+
+// TestNullShardMetadataIsNoCrash writes "null" into the .meta file of each
+// shard of a Git node: Zoekt then gives a nil repository record with no
+// error. The metadata reads drop it, so the next search, the committed head
+// check and gc's display read do not stop the process.
+func TestNullShardMetadataIsNoCrash(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	repo := initGitRepo(t, "a.go", "package a\n// zqnullmeta\n")
+	t.Chdir(repo)
+	if _, err := runHybridTestSearch(t, "zqnullmeta", nil, lexicalOnlySearchPolicy(), nil); err != nil {
+		t.Fatal(err)
+	}
+	cache, err := seekUserCacheRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shards, _ := filepath.Glob(filepath.Join(cache, "corpora", "*", "index", "*.zoekt"))
+	if len(shards) == 0 {
+		t.Fatal("no shard")
+	}
+	for _, shard := range shards {
+		writeFixtureFile(t, shard+".meta", "null")
+		repos, err := zoektReadMetadata(shard)
+		if slices.Contains(repos, nil) {
+			t.Fatalf("zoektReadMetadata(%s) = %v, %v: a nil record", shard, repos, err)
+		}
+		readCorpusDisplayInfo(filepath.Dir(filepath.Dir(shard)))
+	}
+	_, _ = runHybridTestSearch(t, "zqnullmeta", nil, lexicalOnlySearchPolicy(), nil)
+}
+
+// TestDeltaBuilderWithNullShardMetadataIsNoCrash seeds an index, writes
+// "null" into the .meta file of its shard, and runs a delta on it. Zoekt's
+// delta Builder reads the records of the old shards through the shard-call
+// guard: the delta fails as index damage, and the process keeps running.
+func TestDeltaBuilderWithNullShardMetadataIsNoCrash(t *testing.T) {
+	requireTools(t)
+	indexDir := t.TempDir()
+	source := t.TempDir()
+	seed := make(chan fileContent, 1)
+	seed <- makeFileContent(t, "seed.go", []byte("package seed\nfunc Seed() {}\n"))
+	close(seed)
+	if _, err := indexDocuments(t.Context(), indexDir, "null_meta_repo", source, seed, 1); err != nil {
+		t.Fatal(err)
+	}
+	shards, _ := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
+	if len(shards) == 0 {
+		t.Fatal("no shard")
+	}
+	for _, shard := range shards {
+		writeFixtureFile(t, shard+".meta", "null")
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("the delta panicked: %v", recovered)
+		}
+	}()
+	changed := []fileContent{makeFileContent(t, "seed.go", []byte("package seed\nfunc Changed() {}\n"))}
+	if _, err := indexDeltaDocuments(indexDir, "null_meta_repo", source, changed, 1, []string{"seed.go"}); !errors.Is(err, errShardUnloadable) {
+		t.Fatalf("a delta on a shard with a null record gave %v, want index damage", err)
+	}
+	// The failed Finish leaves no temporary shard in the live directory.
+	if temps, _ := filepath.Glob(filepath.Join(indexDir, "*.tmp")); len(temps) != 0 {
+		t.Fatalf("the failed delta left %v", temps)
+	}
+}
+
+// TestFullBuildLaterWindowWithNullRecordIsNoCrash runs a full build whose
+// large document opens a second window, a delta Builder, and writes "null"
+// into the .meta file of the first window's shard before the input ends. The
+// second window's Finish reads that record through the shard-call guard: the
+// build fails as index damage, and the process keeps running.
+func TestFullBuildLaterWindowWithNullRecordIsNoCrash(t *testing.T) {
+	requireTools(t)
+	oldShardMax := shardMax
+	shardMax = 1024
+	t.Cleanup(func() { shardMax = oldShardMax })
+	indexDir := t.TempDir()
+	source := t.TempDir()
+	files := make(chan fileContent)
+	go func() {
+		// The channel closes after the write, so the last Finish reads it.
+		defer close(files)
+		files <- makeFileContent(t, "small.go", []byte("package small\nfunc Small() {}\n"))
+		files <- makeFileContent(t, "large.txt", []byte(strings.Repeat("large text line\n", 200)))
+		shard := filepath.Join(indexDir, "window_repo_v16.00000.zoekt")
+		for range 500 {
+			if _, err := os.Stat(shard); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		writeFixtureFile(t, shard+".meta", "null")
+	}()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("the full build panicked: %v", recovered)
+		}
+	}()
+	if _, err := indexDocuments(t.Context(), indexDir, "window_repo", source, files, 2); !errors.Is(err, errShardUnloadable) {
+		t.Fatalf("the build gave %v, want index damage", err)
 	}
 }

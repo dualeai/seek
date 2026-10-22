@@ -28,10 +28,6 @@ require (
 	github.com/dustin/go-humanize v1.1.0 // indirect
 	github.com/go-enry/go-enry/v2 v2.9.6 // indirect
 	github.com/go-enry/go-oniguruma v1.2.1 // indirect
-	// Hold at v0.2.3: v1.0.0 removes glob.Glob, which zoekt/ignore uses.
-	// After `make upgrade`, run `go get github.com/gobwas/glob@v0.2.3`.
-	// Remove this hold when zoekt requires gobwas/glob v1.
-	github.com/gobwas/glob v0.2.3 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.3.4 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/mschoch/smat v0.2.0 // indirect

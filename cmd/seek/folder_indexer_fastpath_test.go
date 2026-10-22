@@ -49,8 +49,8 @@ func TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable(t *testing.T) {
 	}
 }
 
-// holdEveryBuildSlot takes the whole build window, so a build waits for a
-// slot; release frees it.
+// holdEveryBuildSlot takes all of buildWindowBytes from buildWindows, so a
+// build waits for a slot; release frees it.
 func holdEveryBuildSlot(t *testing.T) (release func()) {
 	t.Helper()
 	// A slot that another test kept fails here, not at the suite timeout.
@@ -196,5 +196,52 @@ func TestEnsureFolderCorpusFresh_ColdThenWarm_SearchableBoth(t *testing.T) {
 	}
 	if warm != corpusSearchable {
 		t.Fatalf("warm state = %v, want corpusSearchable", warm)
+	}
+}
+
+// TestWarmFolderVectorSearchTakesNoBuildSlot runs a warm folder search that
+// reads vectors while every build slot is held: the fast path finds the bound
+// generation of the folder's semantic source with no build lock, so the
+// search ends.
+func TestWarmFolderVectorSearchTakesNoBuildSlot(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	folder := t.TempDir()
+	writeFileAt(t, folder, "a.go", "package a\n// alpha beta handler\n")
+	model := func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil }
+	if _, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(), model); err != nil {
+		t.Fatal(err)
+	}
+	release := holdEveryBuildSlot(t)
+	done := make(chan error, 1)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		_, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(), model)
+		done <- err
+	}()
+	// A search that outlives a failed test still holds os.Stdout: wait for it,
+	// after t.Context ends it, so the next test does not race on os.Stdout.
+	t.Cleanup(func() {
+		select {
+		case <-finished:
+		case <-time.After(30 * time.Second):
+		}
+	})
+	select {
+	case err := <-done:
+		release()
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		release()
+		// When the test returns, t.Context ends a search that still waits.
+		select {
+		case err := <-done:
+			t.Fatalf("the warm vector search waited for a build slot (after release: %v)", err)
+		case <-time.After(30 * time.Second):
+			t.Fatal("the warm vector search did not end, also after the release")
+		}
 	}
 }

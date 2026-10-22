@@ -22,9 +22,10 @@ import (
 // Full scans use ls-tree, then one buffered batch-command session. `info`
 // gets blob sizes before `contents` asks for approved bodies. This keeps
 // oversize bodies out of the content stream. Each protocol window handles at
-// most gitObjectBatchSize objects. Delta work can use separate sessions for
-// ignore, size, and content phases. A malformed or short reply, a write error,
-// or a failed child rejects the staged build.
+// most gitObjectBatchSize objects. A delta uses one session to size the new
+// blobs and read the old ones, and a second session to read the new bodies. A
+// malformed or short reply, a write error, or a failed child rejects the
+// staged build.
 const (
 	gitObjectBatchSize = 8192
 	gitBatchHeaderMax  = 512
@@ -333,28 +334,6 @@ func readNativeGitTree(
 	return readNativeGitTreeRecords(ctx, repoDir, args, consume)
 }
 
-func readNativeGitRootIgnoreEntry(ctx context.Context, repoDir string, snapshot gitSnapshot) (*gitTreeEntry, error) {
-	args := []string{"ls-tree", "-z", "--full-tree", "--no-abbrev", snapshot.commitOID.String(), "--", ".sourcegraph/ignore"}
-	var entries []gitTreeEntry
-	err := readNativeGitTreeRecords(ctx, repoDir, args, func(chunk []gitTreeEntry) error {
-		entries = append(entries, chunk...)
-		if len(entries) > 1 {
-			return fmt.Errorf("git tree returned more than one root ignore entry")
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	if len(entries) == 0 {
-		return nil, nil
-	}
-	if entries[0].path != ".sourcegraph/ignore" || entries[0].mode == "160000" {
-		return nil, fmt.Errorf("root .sourcegraph/ignore is not a blob")
-	}
-	return &entries[0], nil
-}
-
 func readNativeGitBatchHeader(reader *bufio.Reader) ([]byte, error) {
 	header, err := reader.ReadSlice('\n')
 	if errors.Is(err, bufio.ErrBufferFull) || len(header) > gitBatchHeaderMax+1 {
@@ -407,41 +386,11 @@ func parseNativeGitBatchHeader(header []byte, want gitObjectID, wantSize *int64)
 	return size, nil
 }
 
-func checkNativeGitBlobs(
-	ctx context.Context,
-	repoDir string,
-	entries []gitTreeEntry,
-	consume func([]gitBlobInfo) error,
-) error {
-	if len(entries) == 0 {
-		return nil
-	}
-	batch, err := startNativeGitBatch(ctx, repoDir)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if !batch.finished {
-			batch.abort(nil)
-		}
-	}()
-	for start := 0; start < len(entries); start += gitObjectBatchSize {
-		end := min(start+gitObjectBatchSize, len(entries))
-		infos, err := batch.check(entries[start:end])
-		if err != nil {
-			return err
-		}
-		if err := consume(infos); err != nil {
-			return err
-		}
-	}
-	return batch.close()
-}
-
 // readNativeGitBlobs emits entries in input order and does not request the
 // bodies of name-only blobs (oversize or missing). For each other document, it
 // acquires readSemaphore weight before it calls consume. A successful call
-// transfers release ownership to the consumer. This function releases the
+// transfers release ownership to the consumer. A binary blob goes to consume
+// by name only, with its weight already released. This function releases the
 // current weight if reading or consuming fails.
 func readNativeGitBlobs(
 	ctx context.Context,

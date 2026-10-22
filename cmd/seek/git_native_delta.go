@@ -3,11 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os/exec"
 	"reflect"
 
 	"github.com/sourcegraph/zoekt"
-	"github.com/sourcegraph/zoekt/ignore"
 	"github.com/sourcegraph/zoekt/index"
 )
 
@@ -18,6 +18,11 @@ type nativeGitDelta struct {
 	changedPaths []string
 	targetInfos  []gitBlobInfo
 	nextState    committedGitState
+	// baseLiveBytes and oldBytes are the live bytes of the base and the bytes
+	// of the old blobs that the delta tombstones. indexNativeGitDelta sets the
+	// live bytes of nextState from them and the new blobs that it reads.
+	baseLiveBytes int64
+	oldBytes      int64
 }
 
 func nativeGitBlobMode(mode string) bool {
@@ -56,6 +61,9 @@ func nativeGitDeltaShardLimitExceeded(current, base int) bool {
 	return base < 1 || current < base || current-base > maxCommittedDeltaShards
 }
 
+// nativeGitDeltaStaticMetadataEqual reports whether the base keeps the static
+// metadata of target. A base with other metadata, for example zoekt.* Git
+// config values in its shards, needs one native full build.
 func nativeGitDeltaStaticMetadataEqual(existing, target *zoekt.Repository) bool {
 	return existing.TenantID == target.TenantID &&
 		existing.ID == target.ID &&
@@ -72,9 +80,10 @@ func nativeGitDeltaStaticMetadataEqual(existing, target *zoekt.Repository) bool 
 // prepareNativeGitDelta checks whether target can extend the published
 // committed family. eligible=false with no error selects native full indexing;
 // an error stops the build. It selects full indexing for an incomplete or
-// incompatible base, too many shards or paths, changed ignore rules, a missing
-// base commit, or a delta payload that reaches the build's index window. No
-// other committed-data backend is a fallback.
+// incompatible base, no usable Ctags, too many shards or paths, a missing base
+// commit, a delta payload that reaches the build's index window, or tombstoned
+// content that reaches both the live content and one shard
+// (deltaNeedsCompaction). No other committed-data backend is a fallback.
 func prepareNativeGitDelta(
 	ctx context.Context,
 	repoDir string,
@@ -96,14 +105,16 @@ func prepareNativeGitDelta(
 		return nil, false, nil
 	}
 
-	repository, err := nativeGitRepository(ctx, repoDir, target)
-	if err != nil {
-		return nil, false, err
-	}
+	repository := nativeGitRepository(repoDir, target)
 	opts := indexBuildOptions(indexDir, 1)
 	opts.RepositoryDescription = repository
 	opts.SetDefaults()
-	existing, _, ok, err := opts.FindRepositoryMetadata()
+	var existing *zoekt.Repository
+	var ok bool
+	err := zoektShardCall(func() (err error) {
+		existing, _, ok, err = opts.FindRepositoryMetadata()
+		return err
+	})
 	if err != nil || !ok || existing == nil {
 		return nil, false, nil
 	}
@@ -127,7 +138,11 @@ func prepareNativeGitDelta(
 	baseRepository := repository
 	baseRepository.Branches = existing.Branches
 	baseOptions.RepositoryDescription = baseRepository
-	if state, _ := baseOptions.IndexState(); state != index.IndexStateEqual {
+	var state index.IndexState
+	if zoektShardCall(func() error {
+		state, _ = baseOptions.IndexState()
+		return nil
+	}) != nil || state != index.IndexStateEqual {
 		return nil, false, nil
 	}
 	baseExists, err := nativeGitCommitExists(ctx, repoDir, baseOID)
@@ -138,10 +153,6 @@ func prepareNativeGitDelta(
 		return nil, false, nil
 	}
 
-	matcher, err := readNativeGitIgnore(ctx, repoDir, target)
-	if err != nil {
-		return nil, false, err
-	}
 	diff, err := readNativeGitDiff(ctx, repoDir, baseOID, target.commitOID, maxNativeGitDeltaPaths)
 	if errors.Is(err, errNativeGitDeltaTooLarge) {
 		return nil, false, nil
@@ -149,17 +160,11 @@ func prepareNativeGitDelta(
 	if err != nil {
 		return nil, false, err
 	}
-	for _, entry := range diff {
-		if entry.path == ".sourcegraph/ignore" {
-			return nil, false, nil
-		}
-	}
-
-	targetInfos, err := scanNativeGitDeltaChanges(ctx, repoDir, matcher, diff)
+	targetInfos, oldBytes, err := scanNativeGitDeltaChanges(ctx, repoDir, diff)
 	if err != nil {
 		return nil, false, err
 	}
-	var payloadBytes int64
+	var payloadBytes, newBytes int64
 	for _, info := range targetInfos {
 		if !info.oversize {
 			payloadBytes += info.size
@@ -167,60 +172,114 @@ func prepareNativeGitDelta(
 				return nil, false, nil
 			}
 		}
+		if !info.nameOnly() {
+			newBytes += info.size
+		}
+	}
+	tombstoned := committedState.deadBytes + oldBytes
+	liveBytes := max(committedState.liveBytes-oldBytes+newBytes, 0)
+	if deltaNeedsCompaction(tombstoned, liveBytes) {
+		return nil, false, nil
 	}
 
 	changedPaths := make([]string, 0, len(diff))
 	for _, entry := range diff {
-		if nativeGitBlobMode(entry.oldMode) && !matcher.Match(entry.path) {
+		if nativeGitBlobMode(entry.oldMode) {
 			changedPaths = append(changedPaths, entry.path)
 		}
 	}
 	return &nativeGitDelta{
-		repository:   repository,
-		changedPaths: changedPaths,
-		targetInfos:  targetInfos,
+		repository:    repository,
+		changedPaths:  changedPaths,
+		targetInfos:   targetInfos,
+		baseLiveBytes: committedState.liveBytes,
+		oldBytes:      oldBytes,
 		nextState: committedGitState{
 			head:       target.commitOID,
 			baseHead:   committedState.baseHead,
 			baseShards: committedState.baseShards,
+			liveBytes:  liveBytes,
+			deadBytes:  tombstoned,
 		},
 	}, true, nil
 }
 
-// scanNativeGitDeltaChanges checks the new blobs named by diff-tree and returns
-// those that the ignore rules keep, so delta admission never enumerates the
-// unchanged target tree.
+// scanNativeGitDeltaChanges checks the new blobs named by diff-tree, so delta
+// admission never enumerates the unchanged target tree. The same batch session
+// also reads the old blobs of the changed paths, with no other Git process,
+// and returns the bytes that their shard documents held (heldContentBytes),
+// which the delta tombstones (deltaNeedsCompaction). So an old binary blob
+// counts as its marker, not its size: a commit that changes only a binary
+// asset stays a delta. The read streams each old blob once, as the delta reads
+// each new one.
 func scanNativeGitDeltaChanges(
 	ctx context.Context,
 	repoDir string,
-	matcher *ignore.Matcher,
 	diff []gitDiffEntry,
-) ([]gitBlobInfo, error) {
-	entries := make([]gitTreeEntry, 0, len(diff))
+) ([]gitBlobInfo, int64, error) {
+	entries := make([]gitTreeEntry, 0, 2*len(diff))
 	for _, entry := range diff {
 		if nativeGitBlobMode(entry.newMode) {
 			entries = append(entries, gitTreeEntry{mode: entry.newMode, oid: entry.newOID, path: entry.path})
 		}
 	}
-	targetInfos := make([]gitBlobInfo, 0, len(entries))
-	err := checkNativeGitBlobs(ctx, repoDir, entries, func(infos []gitBlobInfo) error {
-		for _, info := range infos {
-			if !matcher.Match(info.entry.path) {
+	newEntries := len(entries)
+	for _, entry := range diff {
+		if nativeGitBlobMode(entry.oldMode) {
+			entries = append(entries, gitTreeEntry{mode: entry.oldMode, oid: entry.oldOID, path: entry.path})
+		}
+	}
+	if len(entries) == 0 {
+		return nil, 0, nil
+	}
+	batch, err := startNativeGitBatch(ctx, repoDir)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer func() {
+		if !batch.finished {
+			batch.abort(nil)
+		}
+	}()
+	targetInfos := make([]gitBlobInfo, 0, newEntries)
+	oldInfos := make([]gitBlobInfo, 0, len(entries)-newEntries)
+	for start := 0; start < len(entries); start += gitObjectBatchSize {
+		end := min(start+gitObjectBatchSize, len(entries))
+		infos, err := batch.check(entries[start:end])
+		if err != nil {
+			return nil, 0, err
+		}
+		for i, info := range infos {
+			if start+i < newEntries {
 				targetInfos = append(targetInfos, info)
+			} else {
+				oldInfos = append(oldInfos, info)
 			}
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
-	return targetInfos, nil
+	var oldBytes int64
+	for start := 0; start < len(oldInfos); start += gitObjectBatchSize {
+		end := min(start+gitObjectBatchSize, len(oldInfos))
+		err := batch.read(oldInfos[start:end], func(document fileContent) error {
+			oldBytes += heldContentBytes(document)
+			readSemaphore.Release(document.weight)
+			return nil
+		})
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	if err := batch.close(); err != nil {
+		return nil, 0, err
+	}
+	return targetInfos, oldBytes, nil
 }
 
 // indexNativeGitDelta hard-links the verified committed seed into buildDir and
 // writes one delta there, with up to parallelism shard jobs at the same time.
 // buildDir is staging owned by the caller; this function does not change or
-// publish the live family.
+// publish the live family. A seed link error or a Builder error wraps
+// errNativeDeltaFallback; a blob read error does not.
 func indexNativeGitDelta(
 	ctx context.Context,
 	repoDir string,
@@ -230,11 +289,13 @@ func indexNativeGitDelta(
 	parallelism int,
 ) error {
 	if err := seedFamilyFiles(buildDir, seedPaths); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errNativeDeltaFallback, err)
 	}
 	documents := make([]fileContent, 0, len(delta.targetInfos))
+	var heldBytes int64
 	err := readNativeGitBlobs(ctx, repoDir, delta.targetInfos, func(document fileContent) error {
 		document.branches = []string{"HEAD"}
+		heldBytes += heldContentBytes(document)
 		documents = append(documents, document)
 		return nil
 	})
@@ -242,6 +303,21 @@ func indexNativeGitDelta(
 		releaseFileContentWeights(documents)
 		return err
 	}
-	_, err = indexDeltaDocumentsWithRepository(buildDir, delta.repository, documents, parallelism, delta.changedPaths)
-	return err
+	// The admission counted the new blobs by size: the reads give the bytes
+	// that their shard documents hold, a marker for a binary blob.
+	delta.nextState.liveBytes = max(delta.baseLiveBytes-delta.oldBytes+heldBytes, 0)
+	if _, err := indexDeltaDocumentsWithRepository(buildDir, delta.repository, documents, parallelism, delta.changedPaths); err != nil {
+		return fmt.Errorf("%w: %w", errNativeDeltaFallback, err)
+	}
+	return nil
 }
+
+// errNativeDeltaFallback marks a delta error after which buildCommittedGitStage
+// builds the family in full, as the folder delta does (seedFolderDelta): a
+// seed link error (a full build links no seed) and an error of the delta's
+// Zoekt Builder, such as a damaged base shard record that only its Finish
+// reads (a full build reads no base shard). An error that the full build gets
+// again, such as a ctags failure or a full disk, then costs each search the
+// delta and the failed full build until it ends: 463-556 ms against
+// 94-137 ms with no fallback, on a repository of 2,000 or 20,000 files.
+var errNativeDeltaFallback = errors.New("native Git delta failed")

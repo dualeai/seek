@@ -73,8 +73,8 @@ func (h zoektWarningHandler) Handle(ctx context.Context, r slog.Record) error {
 			return nil
 		}
 		if promoted := h.promoted.Add(1); promoted > maxPromotedDamageNotices {
-			// Report at most one notice per affected file up to the limit, then
-			// report one summary.
+			// Promote the first maxPromotedDamageNotices notices, then write
+			// one summary and drop the rest.
 			if promoted == maxPromotedDamageNotices+1 {
 				sum := slog.NewRecord(r.Time, slog.LevelWarn,
 					"Further index-damage notices suppressed; the index is incomplete", 0)
@@ -120,14 +120,19 @@ func formatCLIError(err error) string {
 	if budgetErr, ok := errors.AsType[*cacheBudgetError](err); ok {
 		message := fmt.Sprintf("seek: this search needs about %s of index cache (%s new), more than the cache budget of %s\n",
 			humanBytes(budgetErr.planned), humanBytes(budgetErr.growth), humanBytes(budgetErr.budget))
+		// A text search builds no meaning-based index: name it when it fits.
+		textOnly := ""
+		if budgetErr.textFits {
+			textOnly = "; or use --lexical-only, which builds no meaning-based index"
+		}
 		if budgetErr.freeBound {
 			// Seek keeps 5 % of the volume free; the override replaces that
 			// floor, so the hint names the disk first.
 			return message + fmt.Sprintf("hint: the cache volume is nearly full and Seek keeps 5 %% of it free; "+
-				"free disk space, or set %s (it replaces that floor)", envCacheBudget)
+				"free disk space, or set %s (it replaces that floor)%s", envCacheBudget, textOnly)
 		}
-		return message + fmt.Sprintf("hint: set %s to a larger size, for example %s=%s",
-			envCacheBudget, envCacheBudget, budgetSuggestion(budgetErr.planned))
+		return message + fmt.Sprintf("hint: set %s to a larger size, for example %s=%s%s",
+			envCacheBudget, envCacheBudget, budgetSuggestion(budgetErr.planned), textOnly)
 	}
 	if queryErr, ok := errors.AsType[*querySyntaxError](err); ok {
 		return fmt.Sprintf("seek: invalid query %q: %v", queryErr.query, queryErr.cause)
@@ -159,10 +164,10 @@ func ctagsUserMessage(err *ctagsUnavailableError) (problem, hint string) {
 }
 
 // reportStaleIndexWarning owns warnings for update failures when a prior index
-// remains usable. Dirty files kept by name after a read error get one warning
-// with their count, the first path, and the cause. Ctags discovery errors get
-// an actionable normal message. Debug output keeps the full typed error and
-// its corpus context.
+// remains usable. A cancellation writes only a debug line. Dirty files kept by
+// name after a read error get one warning with their count, the first path,
+// and the cause. Ctags discovery errors get an actionable normal message.
+// Debug output keeps the full typed error and its corpus context.
 func reportStaleIndexWarning(err error) {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		slog.Debug("Index update stopped after cancellation", "error", err)

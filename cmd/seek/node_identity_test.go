@@ -98,9 +98,9 @@ func planIDOf(t *testing.T, operand string) corpusID {
 }
 
 // TestOperandCaseInRepoThatGitClassifies types an operand in another letter
-// case inside a repository whose `.git` Git decides (a separate Git
-// directory). The operand stays a Git scope: the Git-ignored file is not
-// shown.
+// case inside a repository whose `.git` is a file that names a separate Git
+// directory, so only Git can classify the path. The operand stays a Git
+// scope: the Git-ignored file is not shown.
 func TestOperandCaseInRepoThatGitClassifies(t *testing.T) {
 	requireTools(t)
 	const marker = "zqoperandcasemarker"

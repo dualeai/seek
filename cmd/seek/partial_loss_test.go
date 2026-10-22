@@ -465,7 +465,8 @@ func partialLossRows() []plRow {
 		},
 		{
 			// A shard replaced by a link to another shard can return only a
-			// subset of the documents. The manifest must reject the replacement.
+			// subset of the documents. The manifest must reject the
+			// replacement.
 			name: "shard_symlinked_to_sibling",
 			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
 				victim := shardCarrying(t, c.plan.indexDir, "PL_MARK_1")
@@ -529,8 +530,8 @@ func partialLossRows() []plRow {
 			},
 		},
 		{
-			// An uncommitted shard must not make a missing committed family look
-			// complete.
+			// An uncommitted shard must not make a missing committed family
+			// look complete.
 			name:       "committed_family_lost_with_dirty_file_present",
 			ownFixture: true,
 			damage: func(t *testing.T, ctx context.Context, c *plCorpus) {
@@ -694,19 +695,12 @@ func TestPartialLoss_GitCommittedFamily(t *testing.T) {
 // Folder corpus parity
 // ---------------------------------------------------------------------------
 
-// TestPartialLoss_FolderFamily applies the same check to a folder corpus.
-// Folder shards rotate on indexWindowBytes rather than commits. The test holds
-// testReadSemMu while it changes and restores that package state.
+// TestPartialLoss_FolderFamily applies the same check to a folder corpus. A
+// small shardMax gives the folder family several shards.
 func TestPartialLoss_FolderFamily(t *testing.T) {
 	requireTools(t)
 	ctx := context.Background()
-
-	testReadSemMu.Lock()
-	restoreWindow := swapIndexWindowBytesForTest(4 * 1024)
-	defer func() {
-		restoreWindow()
-		testReadSemMu.Unlock()
-	}()
+	swapShardMaxForTest(t, 4*1024)
 
 	root := t.TempDir()
 	var markers []plMarker
@@ -751,7 +745,7 @@ func TestPartialLoss_FolderFamily(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(shards) < 2 {
-		t.Fatalf("fixture must be multi-shard, got %d (indexWindowBytes swap failed?)", len(shards))
+		t.Fatalf("fixture must be multi-shard, got %d (shardMax swap failed?)", len(shards))
 	}
 	sort.Strings(shards)
 	plRemove(t, shards[len(shards)-1])

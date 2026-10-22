@@ -110,7 +110,10 @@ func statOperand(operand string) (string, os.FileInfo, error) {
 
 // resolveOperands resolves each explicit operand to its canonical path, its
 // owning Git worktree, and its Git visibility, then groups the operands into
-// the seeds of the graph expansion: Git roots and folder roots.
+// the seeds of the graph expansion: Git roots and folder roots. An operand that
+// exists but that Seek cannot read, or whose repository Git cannot use or
+// classify, is a node failure with one warning. Any other stat error, and an
+// operand inside a Git directory, is an error.
 func resolveOperands(ctx context.Context, operands []string) (plannedExternalOperands, error) {
 	var result plannedExternalOperands
 
@@ -220,8 +223,8 @@ func resolveOperands(ctx context.Context, operands []string) (plannedExternalOpe
 // boundary needs no subprocess; a stray entry names no repository, so the walk
 // goes on to the parent; an entry that points to another work tree's Git
 // directory, or that Git refuses, is a node failure and never a folder. Git
-// runs in the boundary directory, so every operand of one repository reads its
-// driver list once.
+// runs in the boundary directory, so all operands of one repository share one
+// read of its filter drivers (readRepoGitConfig).
 func operandRepo(ctx context.Context, probe string) (gitPaths, bool, error) {
 	for dir := probe; ; {
 		if paths, ok, err := classifyGitDir(ctx, dir); ok || err != nil {

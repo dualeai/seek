@@ -91,7 +91,11 @@ func guardWrappedShards(opts index.Options, firstShard int, isolated, later []in
 	}
 
 	opts.IsDelta = true
-	builder, err := index.NewBuilder(opts)
+	var builder *index.Builder
+	err := zoektShardCall(func() (err error) {
+		builder, err = index.NewBuilder(opts)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("create shard-guard builder: %w", err)
 	}
@@ -113,7 +117,7 @@ func guardWrappedShards(opts index.Options, firstShard int, isolated, later []in
 	for _, doc := range later {
 		add(doc)
 	}
-	finishErr := builder.Finish()
+	finishErr := zoektShardCall(builder.Finish)
 	if addErr != nil {
 		return fmt.Errorf("add guarded document: %w", addErr)
 	}

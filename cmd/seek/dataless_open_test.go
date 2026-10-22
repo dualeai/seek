@@ -70,19 +70,3 @@ func TestOnDiskPathOfFileReadsTheDirectory(t *testing.T) {
 		t.Fatalf("onDiskPath=%q, want %q", got, want)
 	}
 }
-
-// TestNamesFromEntriesOnThisVolume reads the stored name from the metadata on
-// the APFS temporary volume of a macOS host.
-func TestNamesFromEntriesOnThisVolume(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("macOS only")
-	}
-	path := filepath.Join(t.TempDir(), "Stored.txt")
-	writeFixtureFile(t, path, "x\n")
-	if !namesFromEntries(path) {
-		t.Skip("the temporary directory is not on APFS or HFS+")
-	}
-	if name, ok := storedName(filepath.Join(filepath.Dir(path), "STORED.TXT")); !ok || name != "Stored.txt" {
-		t.Fatalf("storedName=%q ok=%t, want Stored.txt", name, ok)
-	}
-}

@@ -14,10 +14,16 @@ Seek changes the source ONNX model to fixed batch and sequence shapes and
 converts its floating-point weights to FP16. The conversion source is
 `cicd/lateon-static-fp16.py`.
 
-## USearch 2.26.2
+## USearch 2.26.5
 
-- Source: <https://github.com/unum-cloud/USearch/tree/f91fe5bc000222aa1af6e91daf78c2bb20b0c90e>
+- Source: <https://github.com/unum-cloud/USearch/tree/7a4abfb2033935498256044e01bc0049ec80d76c>
 - Included resources: native C libraries for the four release targets
+- License: Apache License 2.0
+
+## NumKong 7.8.4
+
+- Source: <https://github.com/ashvardanian/NumKong/tree/d3c21404b995b9b7e125bbcfc0374606ca09aac4>
+- Included resources: native C libraries for the four release targets (release assets of <https://github.com/ashvardanian/NumKong/releases/tag/v7.8.4>)
 - License: Apache License 2.0
 
 The full Apache-2.0 terms are in Seek's `LICENSE` file.

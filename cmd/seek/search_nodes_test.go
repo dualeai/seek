@@ -404,10 +404,10 @@ func TestSearchNodesCollectsEveryNode(t *testing.T) {
 	}
 }
 
-// TestSearchNodesRealIndexingAcrossRotatingWindows builds four folder nodes
-// at once whose content crosses the window: at least two builds overlap, each
-// node has at least two shards, and the read budget gets all its weight back.
-func TestSearchNodesRealIndexingAcrossRotatingWindows(t *testing.T) {
+// TestSearchNodesRealIndexingBeyondTheWindow builds four folder nodes at once
+// whose content is larger than the window: at least two builds overlap, each
+// node publishes its shards, and the read budget gets all its weight back.
+func TestSearchNodesRealIndexingBeyondTheWindow(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
 	}
@@ -465,12 +465,12 @@ func TestSearchNodesRealIndexingAcrossRotatingWindows(t *testing.T) {
 		t.Fatalf("peak builds=%d, want the four builds to overlap", peak.Load())
 	}
 	for index, plan := range plans {
-		if shards := repositoryShardCount(plan.indexDir, folderRepoName(plan)); shards < 2 {
-			t.Fatalf("plan %d: shards=%d, want at least 2 after window rotation", index, shards)
+		if shards := repositoryShardCount(plan.indexDir, folderRepoName(plan)); shards < 1 {
+			t.Fatalf("plan %d: no shard", index)
 		}
 	}
 	if got := availableWeight(readSemaphore); got != testBudget {
-		t.Fatalf("semaphore leak after the rotating-window builds: got=%d want=%d", got, testBudget)
+		t.Fatalf("semaphore leak after the builds: got=%d want=%d", got, testBudget)
 	}
 }
 
@@ -585,7 +585,7 @@ func TestCancelDuringGraphSearch(t *testing.T) {
 
 // TestPartialFailureContract searches a folder with an unreadable subfolder, a
 // nested repository with a bad HEAD, one with a corrupt index, and one whose
-// build cannot read its content, on the strict and the description route: the
+// build cannot read its content, with a one-word and a two-word query: the
 // readable content returns, each failure warns once, and the exit is 0.
 func TestPartialFailureContract(t *testing.T) {
 	requireTools(t)
@@ -950,10 +950,11 @@ func TestInterruptedChildIsACancellation(t *testing.T) {
 
 // TestBuildsUseTheCommandWindow shrinks the window outside a command to
 // 32 KiB, then runs one-node commands, whose window is the whole budget: the
-// full build writes one window, and 80 KiB deltas stay deltas at the folder,
-// the committed Git, and the uncommitted Git admission. A build that
-// read the global window would rotate and fall back to full rebuilds. A delta
-// adds one shard to the family; a full rebuild in one window writes one shard.
+// full build writes one shard, and 80 KiB deltas stay deltas at the folder,
+// the committed Git, and the uncommitted Git admission. A build that read the
+// global window would refuse each 80 KiB delta as larger than the window and
+// rebuild in full. A delta adds one shard to the family; a full rebuild of
+// this content writes one shard.
 func TestBuildsUseTheCommandWindow(t *testing.T) {
 	requireTools(t)
 	testReadSemMu.Lock()

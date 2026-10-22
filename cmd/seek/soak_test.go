@@ -13,20 +13,19 @@ import (
 	"time"
 )
 
-// TestSoak_LargeFolderForFiveMinutes — long-running smoke test gated
-// behind the `soak` build tag and the SEEK_SOAK=1 env var. Synthesises
-// a 4 GiB sparse folder (1024 files × 4 MiB each) and runs
-// ensureFolderCorpusFresh in a loop for 5 minutes, sampling memory
-// stats every 5 seconds.
+// TestSoak_LargeFolderForFiveMinutes is a long test that runs only with the
+// soak build tag and SEEK_SOAK=1. It makes a 4 GiB sparse folder (1024 files
+// of 4 MiB) and runs ensureFolderCorpusFresh in a loop for 5 minutes. It
+// reads the memory statistics every 5 seconds.
 //
-// Asserts:
+// It asserts:
 //   - the HeapAlloc peak stays at or below 1500 MiB (a leak guard),
-//   - forward progress: the iteration counter advances at least once in
-//     each 2 minutes (progressDeadline),
+//   - the iteration count increases at least once in each 2 minutes
+//     (progressDeadline),
 //   - at least one iteration completes,
-//   - readSemaphore returns to its starting balance at the end.
+//   - readSemaphore has its start weight again at the end.
 //
-// Run path:
+// Run it with:
 //
 //	SEEK_SOAK=1 go test -tags=soak ./cmd/seek -run TestSoak_LargeFolderForFiveMinutes -timeout=15m
 func TestSoak_LargeFolderForFiveMinutes(t *testing.T) {
@@ -52,9 +51,9 @@ func TestSoak_LargeFolderForFiveMinutes(t *testing.T) {
 
 	const soakDuration = 5 * time.Minute
 	const sampleInterval = 5 * time.Second
-	// First cold-index of 4 GiB sparse takes minutes (ctags subprocess
-	// per shard); subsequent iterations hit the cached fast path. 2 min
-	// deadline accommodates the cold pass without masking a real wedge.
+	// The first build of the 4 GiB sparse folder is slow (one ctags process
+	// per shard); the later iterations find the index current. The 2 minute
+	// deadline lets the first build finish and still finds a loop that stops.
 	const progressDeadline = 2 * time.Minute
 
 	ctx, cancel := context.WithTimeout(t.Context(), soakDuration+1*time.Minute)

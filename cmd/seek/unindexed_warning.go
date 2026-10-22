@@ -20,11 +20,12 @@ import (
 const zoektNotIndexedMarker = "NOT-INDEXED: "
 
 // warnUnindexedFileOperands warns for each file named as an exact path operand
-// that has no content match and no searchable content. Zoekt decides which
-// documents it skips and stores that decision in the index; seek only reads it
-// back, so a new Zoekt skip reason needs no change here. The documents that
-// seek keeps by name carry seekNoBytesReason, which the warning words in
-// seek's own terms.
+// that has no content match and no searchable content. The index stores the
+// reason of each document kept by name only, whether Zoekt or a seek reader
+// chose it; this check only reads it back, so a new Zoekt skip reason needs no
+// change here. The documents that seek keeps by name because it has none of
+// their bytes carry seekNoBytesReason, which the warning words in seek's own
+// terms.
 //
 // The check searches only the nodes that this command opened (openedNodes). A
 // search with no failed node opens every plan.
@@ -112,7 +113,8 @@ type markerCheck struct {
 
 // reasons searches the current copies of the corpus for Zoekt's marker and
 // returns, for each name, Zoekt's stored reason, or "" when the file's content
-// is searchable.
+// is searchable. When the search fails, it returns nil and no file gets a
+// warning.
 func (check markerCheck) reasons(ctx context.Context) []string {
 	markerQuery := &query.Substring{Pattern: zoektNotIndexedMarker, Content: true, CaseSensitive: true}
 	matches, err := searchPlannedCorpusParsed(ctx, check.plan, check.dirty, markerQuery, defaultSearchConfig())

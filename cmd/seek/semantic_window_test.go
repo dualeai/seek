@@ -88,7 +88,7 @@ func TestLongUnitEmbedsEveryWindow(t *testing.T) {
 
 // TestWindowsRepeatTheHeaderAndKeepTheirUnit splits one unit: every window
 // starts with the same path and language header, and keeps the unit's kind
-// and symbol: a window holds one unit only.
+// and symbol: a window holds one unit only. Each window ID matches its span.
 func TestWindowsRepeatTheHeaderAndKeepTheirUnit(t *testing.T) {
 	content := longSemanticFunction(6_000)
 	units := extractSemanticUnits("pkg/long.go", content, []*ctags.Entry{
@@ -99,7 +99,7 @@ func TestWindowsRepeatTheHeaderAndKeepTheirUnit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lateOnTokenizers.release(tokenizer)
-	rows, err := windowSemanticUnits(t.Context(), tokenizer, units)
+	rows, err := windowSemanticUnits(t.Context(), tokenizer, units, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func TestWindowsEndAtWordStartsAndKeepRunes(t *testing.T) {
 			units := extractSemanticUnits("pkg/long.go", content, []*ctags.Entry{
 				{Name: "Long", Kind: "function", Language: "Go", Line: 2},
 			}, nil)
-			rows, err := windowSemanticUnits(t.Context(), tokenizer, units)
+			rows, err := windowSemanticUnits(t.Context(), tokenizer, units, "")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -212,7 +212,7 @@ func TestWindowsStayInsideTheirUnit(t *testing.T) {
 		{Name: "Long", Kind: "function", Language: "Go", Line: 2},
 		{Name: "Short", Kind: "function", Language: "Go", Line: strings.Count(string(content), "\n")},
 	}, nil)
-	rows, err := windowSemanticUnits(t.Context(), tokenizer, units)
+	rows, err := windowSemanticUnits(t.Context(), tokenizer, units, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,7 +249,7 @@ func TestWindowHeaderKeepsAQuarter(t *testing.T) {
 	defer lateOnTokenizers.release(tokenizer)
 	unit := extractSemanticUnits("pkg/long.go", longSemanticFunction(4_000), nil, nil)[0]
 	unit.symbol = strings.Repeat("verylongsymbolname ", 100)
-	rows, err := windowSemanticUnits(t.Context(), tokenizer, []semanticUnit{unit})
+	rows, err := windowSemanticUnits(t.Context(), tokenizer, []semanticUnit{unit}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,6 +331,183 @@ func TestEmbedUsesTheWindowModelInput(t *testing.T) {
 	for index, id := range input {
 		if ids[index] != int64(id) {
 			t.Fatalf("input id %d is %d, want %d", index, ids[index], id)
+		}
+	}
+}
+
+// TestWindowHeaderMatchesScorerDocument checks that the final scorer reads
+// the lines that the window header of a file's rows holds, for a folder node
+// (model path base, absolute) and for a Git node (none): the vectors and the
+// final score then describe the same model input. The folder header names the
+// last 4 parts of the absolute path.
+func TestWindowHeaderMatchesScorerDocument(t *testing.T) {
+	unit := semanticUnit{path: "notes/c.go", language: "Go", symbol: "func Handle"}
+	for _, base := range []string{"/Users/someone/Dev", ""} {
+		document := rerankDocument{Path: unit.path, Language: unit.language, Symbol: unit.symbol, Text: "body", modelBase: base}
+		serialized, metadataEnd, _, _ := serializeLateOnDocumentWithMatch(document)
+		if header := semanticWindowHeader(unit, base); serialized[:metadataEnd] != header {
+			t.Fatalf("base %q: the scorer reads %q, the window header is %q", base, serialized[:metadataEnd], header)
+		}
+	}
+	if header := semanticWindowHeader(unit, "/Users/someone/Dev"); !strings.HasPrefix(header, "path: someone/Dev/notes/c.go\n") {
+		t.Fatalf("folder header %q, want the last 4 parts of the absolute path", header)
+	}
+}
+
+// TestScorerDocumentsNameTheModelPathBase searches a folder with a strict hit
+// and a vector-only hit, and a Git repository: every document that the final
+// scorer reads names the base that the rows' windows name, the folder's
+// absolute path, and none for the Git node.
+func TestScorerDocumentsNameTheModelPathBase(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	folder := t.TempDir()
+	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
+	writeFileAt(t, folder, "semantic.go", "package sample\n// SEMANTIC_TARGET dispatches a request\n")
+	repo := initGitRepo(t, "strict.go", "package sample\n// alpha beta\n")
+	for operand, want := range map[string]string{
+		folder: filepath.ToSlash(canonicalCorpusPath(folder)),
+		repo:   "",
+	} {
+		scorer := &hybridTestScorer{}
+		if _, err := runHybridTestSearch(t, "alpha beta", []string{operand}, defaultSearchPolicy(),
+			func(context.Context) (semanticModel, error) { return scorer, nil }); err != nil {
+			t.Fatal(err)
+		}
+		scorer.mu.Lock()
+		documents := slices.Clone(scorer.documents)
+		scorer.mu.Unlock()
+		paths := map[string]bool{}
+		for _, document := range documents {
+			paths[document.Path] = true
+			if document.modelBase != want {
+				t.Fatalf("%s: the scorer document of %s names base %q, want %q", operand, document.Path, document.modelBase, want)
+			}
+		}
+		if operand == folder && (!paths["strict.go"] || !paths["semantic.go"]) {
+			t.Fatalf("the scorer read %v, want the strict and the vector hit", paths)
+		}
+	}
+}
+
+// TestWindowHeaderMarksACutPath windows units whose header passes the token
+// share of the metadata in the path line or after it, and a unit whose header
+// fits: only a cut inside the path line marks the windows.
+func TestWindowHeaderMarksACutPath(t *testing.T) {
+	tokenizer, err := lateOnTokenizers.take(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lateOnTokenizers.release(tokenizer)
+	long := "kubernetes_cluster_autoscaler_cloudprovider_integration/aws_elastic_kubernetes_service_managed_nodegroup_provider/autoscaling_group_instance_template_cache/one.go"
+	for _, row := range []struct {
+		path, symbol string
+		want         bool
+	}{
+		{path: long, want: true},
+		{path: "pkg/a.go", symbol: strings.Repeat("very_long_symbol_name_", 20), want: false},
+		{path: "pkg/a.go", symbol: "Run", want: false},
+	} {
+		unit := semanticUnit{path: row.path, language: "Go", symbol: row.symbol, text: []byte("package x\n\nfunc Run() int {\n\treturn 1\n}\n")}
+		windows, err := semanticUnitWindows(tokenizer, unit, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, window := range windows {
+			if window.pathCut != row.want {
+				t.Fatalf("path %.30s, symbol %.20s: pathCut %v, want %v", row.path, row.symbol, window.pathCut, row.want)
+			}
+		}
+	}
+}
+
+// TestEqualPathLineKeysAreMarkedCut windows the same content under a name and
+// under that name with ".orig", for names of 1 to 80 bytes below a long
+// folder, so the path line crosses the header's token share. When the two
+// keys are equal, the header did not hold the whole path line, and both rows
+// must mark the cut; the boundary is a line that fills the share up to its
+// newline. Each row marks the cut exactly when its path line through the
+// newline passes the share. The lengths must give equal keys and uncut names.
+func TestEqualPathLineKeysAreMarkedCut(t *testing.T) {
+	tokenizer, err := lateOnTokenizers.take(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lateOnTokenizers.release(tokenizer)
+	key := func(path string) (semanticRowKey, bool) {
+		t.Helper()
+		unit := semanticUnit{path: path, language: "Go", text: []byte("package x\n\nfunc Run() int {\n\treturn 1\n}\n")}
+		windows, err := semanticUnitWindows(tokenizer, unit, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return makeSemanticRowKey(windows[0].input), windows[0].pathCut
+	}
+	// lineTokens counts the header tokens of the path line through its
+	// newline, which the pre-tokenizer splits from the next line: the line is
+	// whole when they fit the header's share of the content tokens.
+	lineTokens := func(name string) (int, int) {
+		t.Helper()
+		ids, _, err := tokenizer.encode(lateOnDocumentPrefix+"path: "+name+"\n", true, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prefixEnd := slices.Index(ids, lateOnDocumentPrefixID) + 1
+		return len(ids) - 1 - prefixEnd, (lateOnSequenceLength - prefixEnd - 1) / 4
+	}
+	equal, uncut := 0, 0
+	for length := 1; length <= 80; length++ {
+		name := "cluster_autoscaler_cloud/elastic_service_nodegroup/instance_template/" + strings.Repeat("ab", length/2) + strings.Repeat("c", length%2) + ".go"
+		first, firstCut := key(name)
+		second, secondCut := key(name + ".orig")
+		if tokens, share := lineTokens(name); firstCut != (tokens > share) {
+			t.Fatalf("%d bytes: path line of %d tokens for a share of %d, cut %v", length, tokens, share, firstCut)
+		}
+		switch {
+		case first == second:
+			equal++
+			if !firstCut || !secondCut {
+				t.Fatalf("%d bytes: equal keys, cut %v and %v, want both cut", length, firstCut, secondCut)
+			}
+		case !firstCut:
+			uncut++
+		}
+	}
+	if equal == 0 || uncut == 0 {
+		t.Fatalf("names with equal keys %d, uncut names %d: the lengths do not cross the share", equal, uncut)
+	}
+}
+
+// TestFoldedTailsAreNotPlain windows pairs of tails that the tokenizer gives
+// one key, as the reuse rule expects (semanticPlainTail): NFC maps the Kelvin
+// sign to "K", and [MASK] strips the white space before it. In each pair, one
+// tail is not plain.
+func TestFoldedTailsAreNotPlain(t *testing.T) {
+	tokenizer, err := lateOnTokenizers.take(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lateOnTokenizers.release(tokenizer)
+	key := func(path, language, text string) semanticRowKey {
+		t.Helper()
+		windows, err := semanticUnitWindows(tokenizer, semanticUnit{path: path, language: language, text: []byte(text)}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return makeSemanticRowKey(windows[0].input)
+	}
+	for _, pair := range []struct{ first, second, language, text string }{
+		{first: "dir/K.go", second: "dir/\u212a.go", language: "Go", text: "package x\n"},
+		{first: "dir/x[MASK].go", second: "dir/x [MASK].go", language: "Go", text: "package x\n"},
+		// With no language line, a text that starts with [MASK] strips the
+		// newline and the spaces that end the path line.
+		{first: "dir/notes", second: "dir/notes ", text: "[MASK] x"},
+	} {
+		if key(pair.first, pair.language, pair.text) != key(pair.second, pair.language, pair.text) {
+			t.Fatalf("%q and %q: keys differ, want one key", pair.first, pair.second)
+		}
+		if semanticPlainTail(pair.first) && semanticPlainTail(pair.second) {
+			t.Fatalf("%q and %q share a key, but both are plain", pair.first, pair.second)
 		}
 	}
 }

@@ -128,7 +128,7 @@ func TestCollectSemanticBatchesWritesRowsAtOffsets(t *testing.T) {
 	}
 	for row, dimension := range map[int]int{0: 0, 127: 0, 128: 2, 129: 3, 130: 1} {
 		at := row*semanticFineVectorBytesPerUnit + dimension*2
-		if code := int16(binary.LittleEndian.Uint16(fine[at:])); code != semanticSNORM16Scale {
+		if code := binary.LittleEndian.Uint16(fine[at:]); code != semanticF16One {
 			t.Errorf("row %d dimension %d holds %d", row, dimension, code)
 		}
 	}
@@ -907,7 +907,7 @@ func TestBuildSemanticFolderGenerationFailsOnTransientRead(t *testing.T) {
 		return embeddings, nil
 	}}
 	dir := filepath.Join(t.TempDir(), "semantic")
-	_, err := buildSemanticFolderGeneration(t.Context(), selected, t.TempDir(), dir, "source", embedder, liveSearchResources())
+	_, err := buildSemanticFolderGeneration(t.Context(), selected, t.TempDir(), "", "", dir, "source", embedder, liveSearchResources())
 	if !errors.Is(err, syscall.EMFILE) {
 		t.Fatalf("err=%v, want EMFILE", err)
 	}

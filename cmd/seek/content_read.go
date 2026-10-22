@@ -15,10 +15,10 @@ import (
 const binaryProbeBytes = 8000
 
 // readContent reads a document of size bytes from r. When the first
-// binaryProbeBytes hold a NUL byte, it returns binary=true and no content, and
-// it stops reading there. consumed is the number of bytes read from r. Like
-// io.ReadFull, it returns io.EOF or io.ErrUnexpectedEOF with the bytes read
-// when r ends early.
+// binaryProbeBytes hold a NUL byte, it returns binary=true, no content, and a
+// nil error, and it stops reading there. consumed is the number of bytes read
+// from r. Like io.ReadFull, it returns io.EOF or io.ErrUnexpectedEOF with the
+// bytes read when r ends early.
 func readContent(r io.Reader, size int64) (content []byte, binary bool, consumed int64, err error) {
 	head := make([]byte, min(size, binaryProbeBytes))
 	n, err := io.ReadFull(r, head)

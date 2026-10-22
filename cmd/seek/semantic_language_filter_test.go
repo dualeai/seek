@@ -14,10 +14,10 @@ import (
 
 // languageFilterFixture writes files that only vectors find for a description
 // with no word in them: each holds SEMANTIC_TARGET, which the test model maps
-// to the query vector, and the word zqlangmark, which a one-word text search
-// finds. The tree has a Git node (committed Go, Python and an extensionless
-// Python script, and untracked Go and Python files in its dirty overlay) and
-// a folder node (Go and Python). It returns the tree root.
+// to the query vector, and the word zqlangmark, which Zoekt finds as text. The
+// tree has a Git node (committed Go, Python and an extensionless Python
+// script, and untracked Go and Python files in its dirty overlay) and a folder
+// node (Go and Python). It returns the tree root.
 func languageFilterFixture(t *testing.T) string {
 	t.Helper()
 	f := newGraphFixture(t)
@@ -50,8 +50,9 @@ func headerPaths(output string) []string {
 
 // TestLanguageFilterKeepsTheVectorHitsOfThatLanguage runs descriptions whose
 // words no file holds, so every result comes from vector search, with
-// language filters. The files that a one-word text search keeps under the
-// same filter are the oracle: the vector results must be exactly those files,
+// language filters. The oracle is the lexical-only search "zqlangmark
+// <filter>", which runs no model: every file holds zqlangmark, so its hits are
+// the files that the filter keeps. The vector results must be exactly those files,
 // in the Git node's committed rows, its dirty overlay, and the folder node.
 // The filter also keeps the model from scoring a file of another language.
 // The cases are lang:go, lang:python, lang:Python, -lang:go, and lang:go with
@@ -74,7 +75,7 @@ func TestLanguageFilterKeepsTheVectorHitsOfThatLanguage(t *testing.T) {
 	}
 	for index, test := range cases {
 		t.Run(test.filter, func(t *testing.T) {
-			lexical, _, err := describe(t, "zqlangmark "+test.filter, tree)
+			lexical, err := runHybridTestSearch(t, "zqlangmark "+test.filter, []string{tree}, lexicalOnlySearchPolicy(), nil)
 			if err != nil {
 				t.Fatalf("text oracle: %v", err)
 			}

@@ -157,9 +157,9 @@ func TestDeltaCommitted_HeadRewindFallsBackCleanly(t *testing.T) {
 		t.Fatalf("expected delta accumulation across 5 commits, got %d shard(s) — delta path may have silently fallen back", shardsBefore)
 	}
 
-	// Hard reset to base — the prior indexed commits still exist in the
-	// repository's reflog, so native delta admission can compare them. After
-	// reset, 4 commits' worth of content should disappear from the index.
+	// Hard reset to step 0 (HEAD~4). The prior indexed commits still exist in
+	// the repository's reflog, so native delta admission can compare them.
+	// After the reset, the content of 4 commits must leave the index.
 	gitRun(t, dir, "reset", "--hard", "HEAD~4")
 	reindexGit(t, ctx, paths, plan)
 
@@ -306,7 +306,8 @@ func TestDeltaCommitted_SubmoduleHostStaysSearchable(t *testing.T) {
 	requireTools(t)
 
 	// The native committed reader skips gitlinks. The host repository's delta
-	// path must remain searchable after a submodule and a later commit are added.
+	// path must remain searchable after a submodule and a later commit are
+	// added.
 	dir := initGitRepo(t, "app.go", "package main\n// submodule_delta_marker\n")
 	subSrc := initEmptyGitRepo(t)
 	if err := os.WriteFile(filepath.Join(subSrc, "sub.go"), []byte("package sub\n"), 0o644); err != nil {

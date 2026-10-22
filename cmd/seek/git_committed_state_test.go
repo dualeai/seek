@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestCommittedGitStateEncodingAndDamage(t *testing.T) {
@@ -16,8 +18,10 @@ func TestCommittedGitStateEncodingAndDamage(t *testing.T) {
 		head:       gitObjectID(nativeTestOID),
 		baseHead:   gitObjectID(nativeTestOID),
 		baseShards: 153,
+		liveBytes:  4096,
+		deadBytes:  512,
 	}
-	wantRaw := "v1\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\nbase_shards 153\n"
+	wantRaw := "v2\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\nbase_shards 153\nlive_bytes 4096\ndead_bytes 512\n"
 
 	if err := writeCommittedGitState(cacheDir, want); err != nil {
 		t.Fatal(err)
@@ -42,11 +46,15 @@ func TestCommittedGitStateEncodingAndDamage(t *testing.T) {
 	for _, raw := range []string{
 		"",
 		"v2\nhead " + nativeTestOID + "\n",
-		"v1\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\nbase_shards 1",
-		"v1\nhead bad\nbase_head " + nativeTestOID + "\nbase_shards 1\n",
-		"v1\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\nbase_shards -1\n",
+		// A record of another version, and one with no byte counts.
+		"v1\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\nbase_shards 1\nlive_bytes 1\ndead_bytes 0\n",
+		"v2\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\nbase_shards 1\n",
+		"v2\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\nbase_shards 1\nlive_bytes -1\ndead_bytes 0\n",
+		"v2\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\nbase_shards 1",
+		"v2\nhead bad\nbase_head " + nativeTestOID + "\nbase_shards 1\n",
+		"v2\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\nbase_shards -1\n",
 		// Work-total lines (candidates, indexed_bytes) make another format.
-		"v1\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\ncandidates 1\nindexed_bytes 1\nbase_shards 1\n",
+		"v2\nhead " + nativeTestOID + "\nbase_head " + nativeTestOID + "\ncandidates 1\nindexed_bytes 1\nbase_shards 1\n",
 	} {
 		if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
 			t.Fatal(err)
@@ -198,8 +206,8 @@ func TestCommittedGitDeltaRunsNoRecursiveLsTree(t *testing.T) {
 	gitRunIn(t, repoDir, "add", "-A")
 	gitRunIn(t, repoDir, "commit", "-m", "changed objects")
 
-	// Delta admission needs one non-recursive ls-tree call for the root ignore
-	// file. Reject only the recursive full-tree command. This checks the process
+	// The shim rejects only a recursive ls-tree, the full-tree command, and
+	// passes every other Git call to the real Git. This checks the process
 	// boundary without copying the delta accounting algorithm into the test.
 	realGit, err := exec.LookPath("git")
 	if err != nil {
@@ -241,6 +249,66 @@ exec "$SEEK_TEST_REAL_GIT" "$@"
 		matches, err := searchPlannedCorpusForTest(t.Context(), plan, queryText)
 		if err != nil || len(matches) != 1 {
 			t.Fatalf("search %q: matches=%v error=%v", queryText, matches, err)
+		}
+	}
+}
+
+// TestWarmSearchReadsNoCommittedState replaces the committed state of a built
+// node with a FIFO. A warm search that opened it for reading would wait for a
+// writer, so the search must end with no read of it: only a committed build
+// reads the state, to admit a delta.
+func TestWarmSearchReadsNoCommittedState(t *testing.T) {
+	requireTools(t)
+	dir := initGitRepo(t, "warm.go", "package warm\n// warm_state_marker\n")
+	setTestUserCache(t)
+	t.Chdir(dir)
+	search := func() (string, error) {
+		return captureStdout(t, func() error {
+			return run(context.Background(), "warm_state_marker", nil)
+		})
+	}
+	if out, err := search(); err != nil {
+		t.Fatalf("cold search: %v\n%s", err, out)
+	}
+	paths, err := resolveGitPaths(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := planGitCorpus(paths, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(plan.cacheDir, committedGitStateFile)
+	if err := os.Remove(statePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(statePath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := search()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("warm search: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		// Each read of the FIFO waits for a writer, and the search can read it
+		// more than once. A non-blocking open for writing ends each blocked
+		// read, and it fails at once when no read waits, so the test ends.
+		for {
+			if writer, err := os.OpenFile(statePath, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+				_ = writer.Close()
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("the warm search opened the committed state (error=%v)", err)
+			case <-time.After(50 * time.Millisecond):
+			}
 		}
 	}
 }

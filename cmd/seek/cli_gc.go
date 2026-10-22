@@ -32,9 +32,8 @@ deleted, with sizes. Use --force to run cleanup even if it ran recently. Use
 			}
 			return nil
 		},
-		// gc takes no positional args. Without this, shells default to
-		// file completion after `seek gc <TAB>`, which is meaningless
-		// and confusing — gc only takes --flags.
+		// gc takes no positional arguments. Without this, shells complete
+		// file names after `seek gc <TAB>`.
 		ValidArgsFunction: cobra.NoFileCompletions,
 		SilenceErrors:     true,
 		SilenceUsage:      true,
@@ -46,8 +45,9 @@ deleted, with sizes. Use --force to run cleanup even if it ran recently. Use
 	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false, "show what would be deleted")
 	cmd.Flags().BoolVar(&opts.all, "all", false, "delete every index not in use, every compiled model, and other versions' runtimes")
 	cmd.Flags().StringVar(&opts.sort, "sort", "name", "sort by name, age, or size")
-	// Registration can only fail if the flag above is missing — programmer
-	// error, not a runtime condition.
+	// Registration fails only when the flag is missing or already has a
+	// completion function. Both are programming errors, not run-time
+	// conditions.
 	_ = cmd.RegisterFlagCompletionFunc("sort",
 		cobra.FixedCompletions(gcSortValues, cobra.ShellCompDirectiveNoFileComp))
 	return cmd

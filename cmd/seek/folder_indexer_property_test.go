@@ -14,12 +14,12 @@ import (
 	"github.com/sourcegraph/zoekt/index"
 )
 
-// TestEnsureFolderCorpusFresh_RandomDistribution — quick-check that
-// arbitrary file-size distributions (within caps) drive the streaming
-// pipeline to completion without leaking weight.
+// TestEnsureFolderCorpusFresh_RandomDistribution checks with testing/quick that
+// a build of random file sizes (each at most a quarter of the test budget)
+// completes and gives back all readSemaphore weight.
 //
 // Sparse files limit fixture I/O. A small test-local readSemaphore budget lets
-// modest payloads exercise back pressure.
+// small payloads put back pressure on the readers.
 func TestEnsureFolderCorpusFresh_RandomDistribution(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
@@ -35,10 +35,11 @@ func TestEnsureFolderCorpusFresh_RandomDistribution(t *testing.T) {
 	defer restore()
 
 	// Keep each file within testBudget so semaphore.Acquire can succeed. A
-	// quarter-budget limit lets up to four readers hold weight at the same time.
+	// quarter-budget limit lets up to four readers hold weight at the same
+	// time.
 	const perFileCap = testBudget / 4
-	// Total corpus cap = a multiple of testBudget so rotation fires
-	// multiple times across the run. Kept modest (8×) because each iteration
+	// Total corpus cap = a multiple of testBudget so the reads pass the budget
+	// several times across the run. Kept modest (8×) because each iteration
 	// does a real zoekt index build; under -race + coverage this test is the
 	// suite's slowest, so larger volumes risk the package test timeout.
 	const totalCap = 8 * testBudget
@@ -154,10 +155,10 @@ func FuzzReadOneFolderFileStreaming_Sizes(f *testing.F) {
 	})
 }
 
-// TestEnsureFolderCorpusFresh_SingleFileAroundReadWeightCap — boundary
-// cases: one file at maxReadWeightBytes and one byte above it, next to a
-// near-empty file. The production semaphore (NOT swapped) must admit the
-// first and clamp the second, with no hang and no leaked weight.
+// TestEnsureFolderCorpusFresh_SingleFileAroundReadWeightCap builds a folder
+// with one file of maxReadWeightBytes, and then of one byte more, next to a
+// 16-byte file. The production semaphore (not swapped) must admit the first
+// size and clamp the weight of the second, with no hang and no leaked weight.
 func TestEnsureFolderCorpusFresh_SingleFileAroundReadWeightCap(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)

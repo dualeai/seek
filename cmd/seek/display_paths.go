@@ -104,8 +104,8 @@ func applyHeaders(results []corpusSearchResult, operands displayOperands) {
 				continue
 			}
 			// The header and the node path share the path below the
-			// operand: a highlight there moves to its place in the header;
-			// one in a part that the header drops goes.
+			// operand: a highlight there moves to its place in the header,
+			// and a highlight in a part that the header drops is removed.
 			var fragments []zoekt.LineFragmentMatch
 			if name := result.file.FileName; string(line.Line) == name {
 				shared := sharedPathSuffix(headerLine, name)
@@ -186,8 +186,8 @@ func nodeHeaderQuery(ctx context.Context, read *nodeRead, qp queryPlan, operands
 	}
 	if len(operands) == 0 || operands.headersArePaths(plan.displayRoot) {
 		// The headers are the index paths: Zoekt matches each explicit
-		// file: atom and adds its file-name term, the rule that the header
-		// sets below follow through the rebuild.
+		// file: atom on them and adds its file-name term. The header sets
+		// below keep that term (the atom-or-not-atom clause).
 		return qp, nil
 	}
 	opts := searchOpts

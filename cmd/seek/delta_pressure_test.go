@@ -129,11 +129,10 @@ func TestIndexDeltaDocuments_BlocksConcurrentReader(t *testing.T) {
 		acquireDone <- nil
 	}()
 	<-goroutineStarted
-	// Ensure the Acquire is actively pending (semaphore exhausted by
-	// pre-Acquired delta weight + the new 2 MiB request) before
-	// indexDeltaDocuments runs. Otherwise the goroutine could be
-	// scheduled AFTER delta finishes, succeed instantly, and
-	// false-pass the timing assertion.
+	// Wait until the Acquire waits in the queue before indexDeltaDocuments
+	// runs: with a waiter, TryAcquire fails, so availableWeight reads 0.
+	// Otherwise the goroutine could run after the delta finishes, succeed at
+	// once, and pass the order check falsely.
 	waitUntilSemaphoreBelow(t, readSemaphore, 1, 5*time.Second)
 
 	deltaDone := make(chan error, 1)
@@ -189,10 +188,10 @@ func TestIndexDeltaDocuments_BlocksConcurrentReader(t *testing.T) {
 	// this test should move to an explicit early-unblock assertion.
 }
 
-// TestIndexDeltaDocuments_ReleasesOnNewBuilderError — when NewBuilder
-// fails before any Add, every pre-Acquired weight in the input slice
-// must still be Released exactly once via the early-return path in
-// indexDeltaDocumentsWithRepository.
+// TestIndexDeltaDocuments_ReleasesOnNewBuilderError gives indexDeltaDocuments
+// a regular file as indexDir, so NewBuilder fails before any Add. The early
+// return of indexDeltaDocumentsWithRepository must release each pre-acquired
+// weight once; withReadSemLock checks the weight at the end.
 func TestIndexDeltaDocuments_ReleasesOnNewBuilderError(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)

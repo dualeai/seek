@@ -26,9 +26,9 @@ import (
 )
 
 // Zoekt scores BM25 per shard with that shard's average file length
-// (index/score.go:356-370, k = 1.2, b = 0.75), so the strict order depends on
-// how the shards and the nodes split the files. Seek rescores every strict hit
-// with one average over all the shards that a command searches.
+// (index/score.go scoreFileBM25, k = 1.2, b = 0.75), so the strict order
+// depends on how the shards and the nodes split the files. Seek rescores every
+// strict hit with one average over all the shards that a command searches.
 // TODO(https://github.com/sourcegraph/zoekt/issues/1186): drop this rescore
 // once Zoekt lets the caller supply the average file length.
 //
@@ -81,7 +81,8 @@ type bm25Command struct {
 	shards map[string]shardLengthStats
 	nodes  int
 	final  atomic.Bool
-	// rebuilt and kept count the hits of the in-place rescore.
+	// rebuilt and kept count the strict hits whose BM25 parts the search
+	// rebuilt or kept; only the log of an in-place rescore reads them.
 	rebuilt atomic.Int64
 	kept    atomic.Int64
 }
@@ -168,7 +169,7 @@ func (record *shardStatsRecord) stats(ctx context.Context, path string, searcher
 	if ok && cached.Size == stats.Size && cached.MtimeNS == stats.MtimeNS && cached.Ino == stats.Ino {
 		return cached, nil
 	}
-	list, err := searcher.List(ctx, &query.Const{Value: true}, nil)
+	list, err := zoektList(ctx, searcher, &query.Const{Value: true}, nil)
 	if err != nil {
 		return shardLengthStats{}, err
 	}
@@ -190,7 +191,7 @@ func (record *shardStatsRecord) stats(ctx context.Context, path string, searcher
 	}
 	opts := searchOpts
 	opts.NumContextLines = 0
-	names, err := searcher.Search(ctx, &query.Type{Type: query.TypeFileName, Child: &query.Const{Value: true}}, &opts)
+	names, err := zoektSearch(ctx, searcher, &query.Type{Type: query.TypeFileName, Child: &query.Const{Value: true}}, &opts)
 	if err != nil {
 		return shardLengthStats{}, err
 	}
@@ -224,7 +225,7 @@ func openShardWithoutTombstones(path string) (zoekt.Searcher, error) {
 	if err != nil {
 		return nil, err
 	}
-	searcher, err := index.NewSearcher(indexFile)
+	searcher, err := zoektOpen(indexFile)
 	if err != nil {
 		indexFile.Close()
 		return nil, err
@@ -232,8 +233,8 @@ func openShardWithoutTombstones(path string) (zoekt.Searcher, error) {
 	return searcher, nil
 }
 
-// save writes the record when it gained shards; a failure costs one listing on
-// the next search.
+// save writes the record when it gained shards, with only the live shards; a
+// failure costs one listing on the next search.
 func (record *shardStatsRecord) save(live []string) {
 	record.mu.Lock()
 	defer record.mu.Unlock()
@@ -308,7 +309,7 @@ func bm25Parts(file *zoekt.FileMatch, bq bm25Query, average float64) bool {
 		base[key] += delta
 	}
 	nameLine := false
-	// options holds the splits of each line that two or more reach.
+	// options holds the splits of each line that has two or more.
 	var options [][][]bm25Piece
 	for _, line := range file.LineMatches {
 		if line.FileName {
@@ -727,8 +728,9 @@ func bm25RegexpSubstrings(r *syntax.Regexp) ([]bm25Leaf, bool) {
 	return nil, false
 }
 
-// contentKey returns Zoekt's term key of a content candidate with text, and
-// false when no atom, or a substring and a regexp atom, can make it.
+// contentKey returns Zoekt's term key of a content candidate with text. It
+// gives false when no atom can make the candidate, or when both a substring
+// atom and a regexp atom can.
 func (bq bm25Query) contentKey(text string) (string, bool) {
 	lowered := strings.ToLower(text)
 	_, substring := bq.substrings[lowered]
@@ -888,7 +890,8 @@ func bm25ASCII(name string) bool {
 // the fragment, so the line's own BM25 score (line length over 100,
 // index/score.go scoreLineBM25) decides how many matches of each term were on
 // a symbol. Two or more splits can reach the line score; bm25Parts keeps the
-// one that the file's length ratio fits.
+// one that the file's length ratio fits. A line of two or more terms that
+// needs more than 1<<14 search steps gives false: the hit keeps Zoekt's score.
 func (bq bm25Query) lineFrequencies(line zoekt.LineMatch, pieceKeys map[uint32]string) ([][]bm25Piece, bool) {
 	ratio := float64(len(line.Line)) / 100
 	counts := map[string]int{}
@@ -1142,7 +1145,7 @@ func rescoreStrictResults(results []corpusSearchResult, command *bm25Command) {
 	slog.Debug("Rescored strict hits with the global average", "hits", len(results), "kept", kept, "average", average)
 }
 
-// rescoreStrictHits does the same for the strict hits of a description.
+// rescoreStrictHits does the same for the strict hits of a model query.
 func rescoreStrictHits(hits nodeHits, command *bm25Command) {
 	average, ok := command.rescoreAverage()
 	if !ok {
@@ -1159,7 +1162,7 @@ func rescoreStrictHits(hits nodeHits, command *bm25Command) {
 				kept++
 			}
 		case hits[index].lexical:
-			// A relaxed hit of a description: its lexical rank takes the
+			// A relaxed hit of a model query: its lexical rank takes the
 			// same average.
 			if score, ok := bm25Rescore(hits[index].lexicalParts, average); ok {
 				hits[index].score = float32(score)

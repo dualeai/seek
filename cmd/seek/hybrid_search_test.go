@@ -4,17 +4,22 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	ctags "github.com/sourcegraph/go-ctags"
 )
 
 type hybridTestScorer struct {
@@ -69,11 +74,11 @@ func (scorer *hybridTestScorer) EmbedSemanticUnits(
 	}
 	vectors := make([]semanticUnitEmbedding, len(units))
 	for index, unit := range units {
-		vector := semanticVector{1: 1}
+		var vector semanticVector
 		if scorer.vectorForUnit != nil {
 			vector = scorer.vectorForUnit(unit)
-		} else if bytes.Contains(unit.text, []byte("SEMANTIC_TARGET")) {
-			vector = semanticVector{0: 1}
+		} else {
+			vector = hybridTestUnitVector(unit)
 		}
 		for centroid := range semanticCoarseCentroidsPerUnit {
 			vectors[index].coarse[centroid] = vector
@@ -83,6 +88,42 @@ func (scorer *hybridTestScorer) EmbedSemanticUnits(
 		}
 	}
 	return vectors, nil
+}
+
+// hybridTestUnitVector puts a SEMANTIC_TARGET unit near the query axis 0 and
+// any other unit near axis 1. Small offsets on four more axes, chosen from the
+// unit text, keep the vectors of units with different text distinct, also
+// after USearch's int8 cast: USearch's graph can leave keys with one shared
+// vector unreachable (https://github.com/unum-cloud/USearch/issues/815).
+// Units with equal text keep equal vectors, as with the real model. The
+// offsets keep a target's cosine with the query above 0.99.
+func hybridTestUnitVector(unit semanticUnit) semanticVector {
+	axis := 1
+	if bytes.Contains(unit.text, []byte("SEMANTIC_TARGET")) {
+		axis = 0
+	}
+	first := sha256.Sum256(unit.text)
+	sum := first[:]
+	// Four offset axes keep the vectors distinct also after USearch's int8
+	// cast, which merges small offsets on few axes.
+	var vector semanticVector
+	vector[axis] = 1
+	for index, offsets := 0, 0; offsets < 4; index += 3 {
+		if index+3 > len(sum) {
+			next := sha256.Sum256(sum)
+			sum, index = next[:], 0
+		}
+		offsetAxis := 2 + int(sum[index])%(semanticEmbeddingDimensions-2)
+		if vector[offsetAxis] != 0 {
+			continue
+		}
+		vector[offsetAxis] = 0.02 + 0.04*float32(binary.LittleEndian.Uint16(sum[index+1:index+3]))/65535
+		offsets++
+	}
+	if err := normalizeSemanticVector(&vector); err != nil {
+		panic(err)
+	}
+	return vector
 }
 
 func (scorer *hybridTestScorer) PrepareSemanticQuery(
@@ -135,62 +176,184 @@ func (scorer *hybridTestScorer) Close() error {
 
 func (*hybridTestScorer) SemanticCallCPUs(context.Context) int { return 1 }
 
-func TestMaterializeSemanticCandidatesChecksCommittedBytes(t *testing.T) {
+// TestSemanticEvidenceReadsTheShardCopy reads the text of semantic hits from
+// a Git node's shards. A hit shows the line where its unit starts, its context
+// and no literal fragment, with Zoekt's language in the result and in the
+// model document. A row that does not match its shard copy and a row with no
+// document are index damage. A file that Zoekt keeps by name only gives no
+// hit.
+func TestSemanticEvidenceReadsTheShardCopy(t *testing.T) {
 	requireTools(t)
-	const content = "package sample\n\nfunc ServeRequest() {\n\t// checked semantic evidence\n}\n"
-	repo := initGitRepo(t, "app.go", content)
-	paths, plan := planGitTestCorpus(t, repo)
-	state := mustGitRepoStateIn(t, context.Background(), repo)
-	units := extractSemanticUnits("app.go", []byte(content), nil, nil)
-	if len(units) != 1 {
-		t.Fatalf("unit count=%d, want 1", len(units))
-	}
-	units[0].row = 0
-	units[0].text = nil
-	generation := &semanticGeneration{rows: units}
-	selected, err := semanticHitFiles(
-		generation,
-		[]semanticHit{{row: 0, score: 0.75}},
-	)
-	if err != nil {
+	const script = "#!/bin/sh\n# checked semantic evidence\nserve_request() {\n\techo served\n}\n"
+	repo := initGitRepo(t, "serve.sh", script)
+	writeFileAt(t, repo, "tiny.txt", "x\n")
+	gitRunIn(t, repo, "add", ".")
+	gitRunIn(t, repo, "commit", "-q", "-m", "tiny")
+	_, plan := planGitTestCorpus(t, repo)
+	if err := openNode(t.Context(), plan, testLexicalSearchExecution(), func(openedNode) error { return nil }); err != nil {
 		t.Fatal(err)
+	}
+	units := extractSemanticUnits("serve.sh", []byte(script),
+		[]*ctags.Entry{{Name: "serve_request", Kind: "function", Line: 3, Language: "Sh"}}, nil)
+	if len(units) != 2 || units[1].language != "Shell" {
+		t.Fatalf("units=%+v, want a gap unit and the function unit, in Zoekt's Shell", units)
+	}
+	candidate := func(unit semanticUnit) semanticFileCandidate {
+		unit.text = nil
+		return semanticFileCandidate{unit: unit, proxyScore: 0.75}
+	}
+	evidence := func(candidates ...semanticFileCandidate) ([]semanticFileCandidate, error) {
+		read, readCtx, err := openNodeRead(t.Context(), plan, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer read.close()
+		return readSemanticEvidence(readCtx, read, openedNode{plan: plan, repair: &nodeRepair{}}, candidates, 2)
 	}
 
-	candidates, err := materializeSemanticCandidates(
-		t.Context(),
-		plan,
-		paths,
-		state.HeadSHA,
-		selected,
-		2,
-	)
+	read, err := evidence(candidate(units[1]))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(candidates) != 1 || candidates[0].document.Text != content {
-		t.Fatalf("materialized candidate=%+v", candidates)
+	if len(read) != 1 {
+		t.Fatalf("evidence=%+v, want one hit", read)
 	}
-	match := candidates[0].result.file.LineMatches[0]
+	if document := read[0].document; document.Text != "serve_request() {\n\techo served\n}\n" ||
+		document.Language != "Shell" || document.Symbol != "function serve_request" {
+		t.Fatalf("model document=%+v, want the unit text with Zoekt's language", document)
+	}
+	file := read[0].result.file
+	if file.Language != "Shell" || file.Score != 0.75 || len(file.LineMatches) != 1 {
+		t.Fatalf("result=%+v, want one line with Zoekt's language and the proxy score", file)
+	}
+	match := file.LineMatches[0]
 	if len(match.LineFragments) != 0 {
 		t.Fatal("semantic evidence must not claim a literal match")
 	}
-	if !bytes.Equal(match.Line, []byte("package sample\n")) || match.LineNumber != 1 {
-		t.Fatalf("semantic evidence line=%q number=%d", match.Line, match.LineNumber)
+	if string(match.Line) != "serve_request() {\n" || match.LineNumber != 3 ||
+		string(match.Before) != "#!/bin/sh\n# checked semantic evidence\n" ||
+		string(match.After) != "\techo served\n}\n" {
+		t.Fatalf("line=%q number=%d before=%q after=%q", match.Line, match.LineNumber, match.Before, match.After)
 	}
 
-	broken := &semanticGeneration{rows: append([]semanticUnit(nil), generation.rows...)}
-	broken.rows[0].contentID = semanticContentID(sha256.Sum256([]byte("different")))
-	brokenSelected, err := semanticHitFiles(
-		broken,
-		[]semanticHit{{row: 0, score: 1}},
-	)
+	broken := candidate(units[1])
+	broken.unit.contentID = semanticContentID(sha256.Sum256([]byte("different")))
+	if _, err := evidence(broken); !errors.Is(err, errShardUnloadable) {
+		t.Fatalf("a wrong content ID gave err=%v, want index damage", err)
+	}
+	moved := candidate(units[1])
+	moved.unit.start++
+	if _, err := evidence(moved); !errors.Is(err, errShardUnloadable) {
+		t.Fatalf("a wrong unit identity gave err=%v, want index damage", err)
+	}
+	gone := candidate(units[0])
+	gone.unit.path = "gone.sh"
+	if _, err := evidence(gone); !errors.Is(err, errShardUnloadable) {
+		t.Fatalf("rows with no document gave err=%v, want index damage", err)
+	}
+	tiny := extractSemanticUnits("tiny.txt", []byte("x\n"), nil, nil)
+	read, err = evidence(candidate(tiny[0]), candidate(units[0]))
+	if err != nil || len(read) != 1 || read[0].unit.path != "serve.sh" {
+		t.Fatalf("evidence=%+v err=%v, want only serve.sh: Zoekt keeps tiny.txt by name", read, err)
+	}
+}
+
+// TestVectorHitPrintsZoektLanguage finds a shell function by its vector only.
+// The embedded unit, the header and the model document all name Zoekt's
+// language (Shell), as for a strict hit, not the ctags name (Sh).
+func TestVectorHitPrintsZoektLanguage(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+	folder := t.TempDir()
+	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
+	writeFileAt(t, folder, "serve.sh", "#!/bin/sh\nserve_request() {\n\t# SEMANTIC_TARGET dispatches a request\n\techo served\n}\n")
+	var mu sync.Mutex
+	var unitLanguages []string
+	scorer := &hybridTestScorer{vectorForUnit: func(unit semanticUnit) semanticVector {
+		if bytes.Contains(unit.text, []byte("SEMANTIC_TARGET")) {
+			mu.Lock()
+			unitLanguages = append(unitLanguages, unit.language)
+			mu.Unlock()
+		}
+		return hybridTestUnitVector(unit)
+	}}
+	output, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(),
+		func(context.Context) (semanticModel, error) { return scorer, nil })
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := materializeSemanticCandidates(
-		t.Context(), plan, paths, state.HeadSHA, brokenSelected, 0,
-	); err == nil {
-		t.Fatal("wrong content ID must reject semantic evidence")
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(unitLanguages, []string{"Shell"}) {
+		t.Fatalf("unit languages=%v, want the one unit of Shell", unitLanguages)
+	}
+	if !strings.Contains(output, "## "+filepath.Join(folder, "serve.sh")+" (Shell)\n") {
+		t.Fatalf("the vector hit does not print Zoekt's language:\n%s", output)
+	}
+	scorer.mu.Lock()
+	defer scorer.mu.Unlock()
+	for _, document := range scorer.documents {
+		if document.Path == "serve.sh" && document.Language != "Shell" {
+			t.Fatalf("model document language=%q, want Shell", document.Language)
+		}
+	}
+}
+
+// topPathScorer is the hybrid test model, but it gives the document of the
+// file top the score of a SEMANTIC_TARGET document.
+type topPathScorer struct {
+	*hybridTestScorer
+	top string
+}
+
+func (scorer topPathScorer) ScoresWithSemanticQuery(
+	ctx context.Context,
+	query *semanticQueryEmbedding,
+	documents []rerankDocument,
+) ([]float32, error) {
+	scores, err := scorer.hybridTestScorer.ScoresWithSemanticQuery(ctx, query, documents)
+	if err != nil {
+		return nil, err
+	}
+	for index, document := range documents {
+		if document.Path == scorer.top {
+			scores[index] = 100
+		}
+	}
+	return scores, nil
+}
+
+// TestTinyFileGetsNoVectorHit gives a 2-byte file the query vector and the
+// top model score. Zoekt keeps the file by name only, so it gets no rows and
+// prints no vector hit.
+func TestTinyFileGetsNoVectorHit(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+	folder := t.TempDir()
+	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
+	writeFileAt(t, folder, "semantic.go", "package sample\n// SEMANTIC_TARGET dispatches a request\n")
+	writeFileAt(t, folder, "tiny.txt", "x\n")
+	scorer := &hybridTestScorer{vectorForUnit: func(unit semanticUnit) semanticVector {
+		if unit.path == "tiny.txt" {
+			return hybridTestUnitVector(semanticUnit{text: []byte("SEMANTIC_TARGET tiny")})
+		}
+		return hybridTestUnitVector(unit)
+	}}
+	model := topPathScorer{hybridTestScorer: scorer, top: "tiny.txt"}
+	output, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(),
+		func(context.Context) (semanticModel, error) { return model, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output, filepath.Join(folder, "semantic.go")) || strings.Contains(output, "tiny.txt") {
+		t.Fatalf("want the semantic file and no tiny file:\n%s", output)
+	}
+	scorer.mu.Lock()
+	defer scorer.mu.Unlock()
+	if slices.Contains(scorer.embeddedPaths, "tiny.txt") {
+		t.Fatalf("embedded %v, want no row of tiny.txt", scorer.embeddedPaths)
 	}
 }
 
@@ -288,7 +451,7 @@ func TestRunDefaultFolderJoinedSearchAddsSemanticOnlyFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !plan.joinedGenerationsMatch(state, state, "") {
+	if !plan.joinedGenerationsMatch(state, plan.folderSemanticSource(state), "") {
 		t.Fatal("default folder search did not keep a joined generation")
 	}
 }
@@ -378,7 +541,7 @@ func TestRunDefaultFilteredNativeFailureRecoversExactly(t *testing.T) {
 	writeFileAt(t, folder, "blocked/meaning.go", "package sample\n// SEMANTIC_TARGET SEMANTIC_PATH_LEAK\n")
 	plan := planFolderTestCorpus(t, folder)
 
-	// A re-rank eligible seed builds the generation; a one-word query does not.
+	// The seed query gives the model text, so it builds the generation.
 	if _, err := runHybridTestSearch(
 		t,
 		"seed alpha beta",
@@ -392,8 +555,8 @@ func TestRunDefaultFilteredNativeFailureRecoversExactly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	semanticDir := semanticGenerationDir(plan.indexDir, state)
-	generation, err := openSemanticGenerationForSearch(semanticDir, state)
+	semanticDir := semanticGenerationDir(plan.indexDir, plan.folderSemanticSource(state))
+	generation, err := openSemanticGenerationForSearch(semanticDir, plan.folderSemanticSource(state))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,7 +573,7 @@ func TestRunDefaultFilteredNativeFailureRecoversExactly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	manifest, err := readSemanticManifest(semanticDir, state)
+	manifest, err := readSemanticManifest(semanticDir, plan.folderSemanticSource(state))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,7 +606,7 @@ func TestRunDefaultFilteredNativeFailureRecoversExactly(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if !plan.joinedGenerationsMatch(state, state, "") {
+	if !plan.joinedGenerationsMatch(state, plan.folderSemanticSource(state), "") {
 		t.Fatal("fault fixture did not keep the joined generation eligible")
 	}
 
@@ -519,10 +682,10 @@ func TestRunDefaultJoinedSearchReturnsOneSemanticOnlyFile(t *testing.T) {
 	}
 }
 
-// TestRunDefaultExactQuerySkipsJoinedIndex checks that a one-word or exact
-// query, which is not re-rank eligible, builds no vector generation and starts
-// no model, and that a warm search gives the same lexical answer.
-func TestRunDefaultExactQuerySkipsJoinedIndex(t *testing.T) {
+// TestRunDefaultNegationQuerySkipsJoinedIndex checks that a query of
+// negations only, which gives the model no text, builds no vector generation
+// and starts no model, and that a warm search gives the same lexical answer.
+func TestRunDefaultNegationQuerySkipsJoinedIndex(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
 	writeFileAt(t, folder, "app.go", "package sample\n// alpha\n")
@@ -534,24 +697,24 @@ func TestRunDefaultExactQuerySkipsJoinedIndex(t *testing.T) {
 		factoryCalls.Add(1)
 		return scorer, nil
 	}
-	output, err := runHybridTestSearch(t, "alpha", []string{folder}, defaultSearchPolicy(), newModel)
+	output, err := runHybridTestSearch(t, "-file:missing", []string{folder}, defaultSearchPolicy(), newModel)
 	if err != nil || !strings.Contains(output, "## "+filepath.Join(folder, "app.go")) {
-		t.Fatalf("exact search: error=%v output=%q", err, output)
+		t.Fatalf("negation search: error=%v output=%q", err, output)
 	}
 	state, _, err := folderCorpusFingerprint(t.Context(), plan)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.joinedGenerationsMatch(state, state, "") {
-		t.Fatal("an exact query built a joined index that no route can read")
+	if plan.joinedGenerationsMatch(state, plan.folderSemanticSource(state), "") {
+		t.Fatal("a negation query built a joined index that no route can read")
 	}
 	if got := scorer.embedCalls.Load(); got != 0 {
-		t.Fatalf("an exact query embedded %d times", got)
+		t.Fatalf("a negation query embedded %d times", got)
 	}
 	firstEmbedCalls := scorer.embedCalls.Load()
-	warmOutput, err := runHybridTestSearch(t, "alpha", []string{folder}, defaultSearchPolicy(), newModel)
+	warmOutput, err := runHybridTestSearch(t, "-file:missing", []string{folder}, defaultSearchPolicy(), newModel)
 	if err != nil || warmOutput != output {
-		t.Fatalf("warm exact search: error=%v output=%q, want %q", err, warmOutput, output)
+		t.Fatalf("warm negation search: error=%v output=%q, want %q", err, warmOutput, output)
 	}
 	if factoryCalls.Load() != 0 || scorer.embedCalls.Load() != firstEmbedCalls {
 		t.Fatalf(
@@ -571,8 +734,8 @@ func TestRunDefaultRepairsDamagedSemanticGeneration(t *testing.T) {
 
 	run := func(scorer *hybridTestScorer) string {
 		t.Helper()
-		// A multi-word description is re-rank eligible, so it builds the
-		// generation this test then damages and repairs.
+		// The query gives the model text, so it builds the generation that
+		// this test then damages and repairs.
 		output, err := runHybridTestSearch(t, "alpha sample package", []string{folder}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
 			return scorer, nil
 		})
@@ -589,13 +752,13 @@ func TestRunDefaultRepairsDamagedSemanticGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifestPath := filepath.Join(
-		semanticGenerationDir(plan.indexDir, state),
+		semanticGenerationDir(plan.indexDir, plan.folderSemanticSource(state)),
 		semanticManifestFile,
 	)
 	if err := os.WriteFile(manifestPath, []byte("damaged\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if plan.joinedGenerationsMatch(state, state, "") {
+	if plan.joinedGenerationsMatch(state, plan.folderSemanticSource(state), "") {
 		t.Fatal("damaged semantic data stayed active")
 	}
 
@@ -606,8 +769,8 @@ func TestRunDefaultRepairsDamagedSemanticGeneration(t *testing.T) {
 	if repair.embedCalls.Load() == 0 {
 		t.Fatal("repair did not rebuild semantic data")
 	}
-	requireSearchableGeneration(t, plan, state)
-	if !plan.joinedGenerationsMatch(state, state, "") {
+	requireSearchableGeneration(t, plan, plan.folderSemanticSource(state))
+	if !plan.joinedGenerationsMatch(state, plan.folderSemanticSource(state), "") {
 		t.Fatal("repair did not activate the joined generation")
 	}
 }
@@ -688,10 +851,10 @@ func TestRunDefaultSemanticBuildFailureKeepsLexicalSearchAndCanRepair(t *testing
 		t.Fatal(err)
 	}
 	if repairScorer.embedCalls.Load() == 0 ||
-		!plan.joinedGenerationsMatch(state, state, "") {
+		!plan.joinedGenerationsMatch(state, plan.folderSemanticSource(state), "") {
 		t.Fatal("a later healthy run did not repair the joined index")
 	}
-	requireSearchableGeneration(t, plan, state)
+	requireSearchableGeneration(t, plan, plan.folderSemanticSource(state))
 }
 
 // requireSearchableGeneration opens the generation of source as a search
@@ -721,9 +884,8 @@ func TestRunDefaultSemanticQueryFailureUsesLexicalOutput(t *testing.T) {
 	writeFileAt(t, folder, "relaxed.go", "package sample\n// alpha\n")
 	planFolderTestCorpus(t, folder)
 
-	if _, err := runHybridTestSearch(t, "alpha", []string{folder}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
-		return &hybridTestScorer{}, nil
-	}); err != nil {
+	// The text index is warm; the failing search builds the vectors.
+	if _, err := runHybridTestSearch(t, "alpha", []string{folder}, lexicalOnlySearchPolicy(), nil); err != nil {
 		t.Fatal(err)
 	}
 	lexicalOutput, err := runHybridTestSearch(t, "alpha beta", []string{folder}, lexicalOnlySearchPolicy(), nil)
@@ -879,7 +1041,7 @@ func TestDefaultFolderBuildPublishesAndUpdatesJoinedGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !plan.joinedGenerationsMatch(firstState, firstState, "") {
+	if !plan.joinedGenerationsMatch(firstState, plan.folderSemanticSource(firstState), "") {
 		t.Fatal("default folder build did not activate a joined generation")
 	}
 
@@ -894,7 +1056,7 @@ func TestDefaultFolderBuildPublishesAndUpdatesJoinedGeneration(t *testing.T) {
 	if secondState == firstState {
 		t.Fatal("folder state did not change")
 	}
-	if !plan.joinedGenerationsMatch(secondState, secondState, "") {
+	if !plan.joinedGenerationsMatch(secondState, plan.folderSemanticSource(secondState), "") {
 		t.Fatal("updated folder build did not activate a joined generation")
 	}
 	semanticDirs := semanticGenerationDirs(t, plan.indexDir)
@@ -933,11 +1095,11 @@ func TestLexicalOnlyFolderBuildStartsNoModelAndWritesNoSemanticData(t *testing.T
 	}
 }
 
-// TestRunDefaultFolderJoinedSearchFindsGuardedFileByMeaning forces the shard
-// guard on one large file. Its text index keeps only the name, but the
-// meaning-based index reads the file itself and has no shard format limit, so a
-// descriptive search must still show the file's semantic evidence.
-func TestRunDefaultFolderJoinedSearchFindsGuardedFileByMeaning(t *testing.T) {
+// TestRunDefaultFolderJoinedSearchKeepsGuardedFileByName forces the shard
+// guard on one large file. Zoekt keeps only its name, and a vector hit shows
+// the text that Zoekt keeps, so the description search prints no vector hit of
+// the file. The name-only notice counts it, as for a strict search.
+func TestRunDefaultFolderJoinedSearchKeepsGuardedFileByName(t *testing.T) {
 	requireTools(t)
 	if testing.Short() {
 		t.Skip("indexes a 3 MiB file")
@@ -970,8 +1132,8 @@ func TestRunDefaultFolderJoinedSearchFindsGuardedFileByMeaning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output, "## "+filepath.Join(folder, "guarded.go")) || !strings.Contains(output, "SEMANTIC_TARGET") {
-		t.Fatalf("joined output omitted the guarded file's semantic evidence:\n%s", output)
+	if strings.Contains(output, "guarded.go") || !strings.Contains(output, nameOnlyNoticeLine(1)) {
+		t.Fatalf("want no vector hit of the guarded file and the name-only notice:\n%s", output)
 	}
 
 	// The text index holds only the name: the exact term has no match there.
@@ -1005,5 +1167,149 @@ func TestEditDuringSearchShowsInTheNextSearch(t *testing.T) {
 	output, err = runHybridTestSearch(t, "alpha beta", nil, defaultSearchPolicy(), newModel)
 	if err != nil || !strings.Contains(output, "ZQEDITEDDURINGSEARCH") {
 		t.Fatalf("the next search does not show the edit: err=%v\n%s", err, output)
+	}
+}
+
+// TestFolderFileSavedDuringTheBuildIsATreeChange saves a folder file between
+// the two reads of one build: Zoekt indexes the old bytes and the vectors the
+// new ones. The search sees a tree change, not index damage: it reads the
+// node again and shows the vector hit with the new text, with no damage
+// warning.
+func TestFolderFileSavedDuringTheBuildIsATreeChange(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+	logs := captureTestLogs(t, slog.LevelDebug)
+	folder := t.TempDir()
+	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
+	before := "package sample\n// SEMANTIC_TARGET dispatches a request\n"
+	after := "package sample\n// SEMANTIC_TARGET dispatches a requesT\n"
+	writeFileAt(t, folder, "semantic.go", before)
+	target := filepath.Join(folder, "semantic.go")
+	snapshot := filepath.Join(t.TempDir(), "snapshot.go")
+	writeFixtureFile(t, snapshot, before)
+	var opens atomic.Int32
+	realOpen := folderOpenFile
+	folderOpenFile = func(path string) (*os.File, error) {
+		if filepath.Base(path) == "semantic.go" && opens.Add(1) == 1 {
+			// The first read gets the old bytes; the save lands before the
+			// second read.
+			file, err := realOpen(snapshot)
+			if err == nil {
+				writeFixtureFile(t, target, after)
+			}
+			return file, err
+		}
+		return realOpen(path)
+	}
+	t.Cleanup(func() { folderOpenFile = realOpen })
+	output, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(),
+		func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output, "semantic.go") || !strings.Contains(output, "requesT") {
+		for _, record := range logs.Records() {
+			t.Logf("log %s: %s", record.Level, record.Message)
+		}
+		t.Fatalf("want the vector hit with the new text (opens=%d):\n%s", opens.Load(), output)
+	}
+	for _, record := range logs.Records() {
+		if strings.Contains(record.Message, "Index damage") {
+			t.Fatalf("a save during the build was taken for damage: %s", record.Message)
+		}
+	}
+}
+
+// TestFolderFileWrittenDuringEveryBuildKeepsTheNode writes a folder file
+// between the two reads of every build, as a log or an autosave does. The
+// retry cannot tell that edit from damage, so the file gives no vector hit,
+// and the node keeps its strict hit with no damage warning and no skip.
+func TestFolderFileWrittenDuringEveryBuildKeepsTheNode(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+	logs := captureTestLogs(t, slog.LevelWarn)
+	folder := t.TempDir()
+	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
+	writeFileAt(t, folder, "semantic.go", "package sample\n// SEMANTIC_TARGET version 0\n")
+	target := filepath.Join(folder, "semantic.go")
+	var opens atomic.Int32
+	realOpen := folderOpenFile
+	folderOpenFile = func(path string) (*os.File, error) {
+		if filepath.Base(path) != "semantic.go" {
+			return realOpen(path)
+		}
+		// Each read gets the bytes of the moment, then the file changes.
+		file, err := realOpen(path)
+		if err == nil {
+			snapshot := filepath.Join(t.TempDir(), "snapshot.go")
+			content, readErr := io.ReadAll(file)
+			_ = file.Close()
+			if readErr != nil {
+				return nil, readErr
+			}
+			writeFixtureFile(t, snapshot, string(content))
+			writeFixtureFile(t, target, fmt.Sprintf("package sample\n// SEMANTIC_TARGET version %d\n", opens.Add(1)))
+			return realOpen(snapshot)
+		}
+		return nil, err
+	}
+	t.Cleanup(func() { folderOpenFile = realOpen })
+	output, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(),
+		func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil })
+	if err != nil {
+		t.Fatalf("err=%v output:\n%s", err, output)
+	}
+	if !strings.Contains(output, "strict.go") {
+		t.Fatalf("the node lost its strict hit:\n%s", output)
+	}
+	if strings.Contains(output, "semantic.go") {
+		t.Fatalf("the file written during every build gave a vector hit:\n%s", output)
+	}
+	for _, record := range logs.Records() {
+		if strings.Contains(record.Message, "Index damage") || strings.Contains(record.Message, "Skipped a search node") {
+			t.Fatalf("a file written during every build gave %q", record.Message)
+		}
+	}
+}
+
+// TestGitDirtyFileWrittenDuringEveryBuildKeepsTheNode writes a dirty file of a
+// Git node after each read of it, as a log or an autosave does. Each read of
+// the node then finds a new state, also on the retry. The node keeps its
+// strict hit with no skip: the retry serves the text with no vectors.
+func TestGitDirtyFileWrittenDuringEveryBuildKeepsTheNode(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	repo := initGitRepo(t, "strict.go", "package sample\n// alpha beta\n")
+	writeFileAt(t, repo, "semantic.go", "package sample\n// SEMANTIC_TARGET committed\n")
+	gitRunIn(t, repo, "add", ".")
+	gitRunIn(t, repo, "commit", "-q", "-m", "semantic")
+	writeFileAt(t, repo, "semantic.go", "package sample\n// SEMANTIC_TARGET version 0\n")
+	t.Chdir(repo)
+	logs := captureTestLogs(t, slog.LevelWarn)
+	var opens atomic.Int32
+	realOpen := dirtyOpenFile
+	dirtyOpenFile = func(path string) (*os.File, error) {
+		file, err := realOpen(path)
+		if err == nil && filepath.Base(path) == "semantic.go" {
+			writeFileAt(t, repo, "semantic.go",
+				fmt.Sprintf("package sample\n// SEMANTIC_TARGET version %d%s\n", opens.Add(1), strings.Repeat("!", int(opens.Load()))))
+		}
+		return file, err
+	}
+	t.Cleanup(func() { dirtyOpenFile = realOpen })
+	output, err := runHybridTestSearch(t, "alpha beta", nil, defaultSearchPolicy(),
+		func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil })
+	if err != nil {
+		t.Fatalf("err=%v output:\n%s", err, output)
+	}
+	if opens.Load() < 2 || !strings.Contains(output, "strict.go") {
+		t.Fatalf("the node lost its strict hit (opens=%d):\n%s", opens.Load(), output)
+	}
+	for _, record := range logs.Records() {
+		if strings.Contains(record.Message, "Index damage") || strings.Contains(record.Message, "Skipped a search node") {
+			t.Fatalf("a dirty file written during every build gave %q", record.Message)
+		}
 	}
 }

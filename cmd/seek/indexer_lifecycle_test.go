@@ -45,8 +45,8 @@ func withReadSemLock(t *testing.T) func() {
 	}
 }
 
-// TestIndexDocuments_ReleaseAccounting_Success — happy path: every
-// Acquired byte is Released after Finish.
+// TestIndexDocuments_ReleaseAccounting_Success indexes three documents with
+// no error: every acquired byte is released when indexDocuments returns.
 func TestIndexDocuments_ReleaseAccounting_Success(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
@@ -320,26 +320,25 @@ func TestReader_SymlinkRejected_NoLeak(t *testing.T) {
 	check()
 }
 
-// TestReader_BackPressureQueuesAcquires — focused unit on
-// streamDirtyFiles's contract: when concurrent in-flight bytes
-// exceed the budget, the reader pool queues Acquires correctly and
-// every file eventually delivered through the channel pipeline. The
-// CONSUMER here is a fake fan-out pool that Releases per-doc — NOT
-// the production indexDocuments consumer (which Releases per shard
-// window). Don't confuse this for an end-to-end semaphore test.
+// TestReader_BackPressureQueuesAcquires tests the contract of
+// streamDirtyFiles: when the bytes in flight pass the budget, the readers
+// queue their Acquires, and every file still reaches the channel. The
+// consumer here is a test pool that releases the weight of each document.
+// It is not the production consumer indexDocuments, which releases the
+// weight of a normal document when Builder.Add returns, so this is not an
+// end-to-end semaphore test.
 //
-// For full reader → production consumer coverage under back-pressure,
-// see TestEnsureFolderCorpusFresh_ManySmallFilesOverBudget (E2E) and
-// TestIndexDocuments_RotatesBeyondTheBudget (consumer-only).
+// TestEnsureFolderCorpusFresh_ManySmallFilesOverBudget (end to end) and
+// TestIndexDocuments_ReadsBeyondTheBudget (consumer only) cover the
+// production reader and consumer under back-pressure.
 //
-// Uses a TEST-LOCAL semaphore (swapReadSemaphoreForTest) with a
-// small budget so we can force queueing without writing hundreds of
-// MiB to disk. Spawns parallel consumers — a single sleeping
-// consumer would serialize the downstream and make the peak counter
-// meaningless (workers all block on unbuffered send, peak=1 always).
+// A test semaphore with a small budget (swapReadSemaphoreForTest) forces
+// the queue without writing hundreds of MiB to disk. The consumers run in
+// parallel: with one sleeping consumer, every worker blocks on the
+// unbuffered send, and the peak is always 1.
 //
-// All bounds derive from `testBudget` and `fileSize` so the
-// assertions remain self-consistent if these constants are tuned.
+// All bounds derive from `testBudget` and `fileSize`, so the assertions
+// stay consistent when these constants change.
 func TestReader_BackPressureQueuesAcquires(t *testing.T) {
 	if testing.Short() {
 		t.Skip("saturation test writes ~64 MiB to disk; skipped in -short")
@@ -425,11 +424,9 @@ func TestReader_BackPressureQueuesAcquires(t *testing.T) {
 // concurrently with this reassignment would be a data race. Tests
 // that use this helper are serialized by the lock by convention.
 //
-// Also shrinks indexWindowBytes proportionally so shard window rotation
-// in indexDocuments triggers at the new (smaller) budget. Without
-// this, rotation would not fire until defaultIndexWindowBytes of weight
-// accumulated and tests using small synthesised budgets would still
-// deadlock.
+// Also shrinks indexWindowBytes proportionally, so the large-document
+// windows, the delta payload limits, and the build slots fit the new
+// (smaller) budget.
 func swapReadSemaphoreForTest(budget int64) func() {
 	mustHoldTestReadSemMu()
 	old := readSemaphore
@@ -459,10 +456,9 @@ func mustHoldTestReadSemMu() {
 	}
 }
 
-// swapIndexWindowBytesForTest sets the windowed-indexer rotation
-// threshold for the duration of a test. Pair with swapReadSemaphoreForTest
-// so the invariant indexWindowBytes + maxReadWeightBytes <=
-// semaphore budget still holds in the test scope.
+// swapIndexWindowBytesForTest sets the index window (indexWindowBytes) for
+// the duration of a test. swapReadSemaphoreForTest calls it with half of
+// the test budget.
 //
 // Caller MUST hold testReadSemMu for the entire swap → action → restore
 // sequence.
@@ -493,10 +489,12 @@ func setupPressureTest(t *testing.T, budget int64) func() {
 	}
 }
 
-// TestFolderReader_FileGrew_NoLeak — when readFolderFile detects the
-// file grew past its cap mid-read, it returns an error. streamFolderFiles
-// must release the semaphore weight it Acquired for the pre-read size
-// (readWeight). The error is lasting, so it does not stop the read.
+// TestFolderReader_FileGrew_NoLeak — when readFolderFile detects that the
+// file grew past its walk size during the read, it returns
+// errFolderFileGrew. streamFolderFilesWithMarkers must release the semaphore
+// weight it Acquired for the pre-read size (readWeight). The error is
+// lasting (folderReadIsLasting), so it does not stop the read, and the file
+// stays searchable by name only.
 func TestFolderReader_FileGrew_NoLeak(t *testing.T) {
 	done := withReadSemLock(t)
 	defer done()
@@ -504,7 +502,7 @@ func TestFolderReader_FileGrew_NoLeak(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "grew.go")
 	// Write more bytes than the candidate claims, so readFolderFile's
-	// post-read extra-byte check trips the "file grew beyond max size"
+	// post-read extra-byte check trips the "file grew beyond its stat size"
 	// branch.
 	const claimedSize = 16
 	if err := os.WriteFile(path, []byte("package grew_more_than_claimed\n"), 0o644); err != nil {
@@ -525,13 +523,14 @@ func TestFolderReader_FileGrew_NoLeak(t *testing.T) {
 		ino:   ino,
 	}
 
-	// The folder build gives streamFolderFiles the cancel of its read context.
+	// The folder build gives streamFolderFilesWithMarkers the cancel of its
+	// read context.
 	readCtx, cancel := context.WithCancelCause(t.Context())
 	defer cancel(nil)
 	// The read fails, so the file stays searchable by name only, with no
 	// content and no read weight.
 	var docs []fileContent
-	for fc := range streamFolderFiles(readCtx, []folderCandidate{c}, 1, cancel) {
+	for fc := range streamFolderFilesWithMarkers(readCtx, []folderCandidate{c}, 1, cancel, nil) {
 		docs = append(docs, fc)
 	}
 	if cause := context.Cause(readCtx); cause != nil {
@@ -542,8 +541,7 @@ func TestFolderReader_FileGrew_NoLeak(t *testing.T) {
 	}
 }
 
-// testFileName returns a short per-test filename. Kept local to this
-// file to avoid leaking helpers into the wider test surface.
+// testFileName returns a short per-test filename.
 func testFileName(prefix string, i int) string {
 	return prefix + "_" + strconv.Itoa(i) + ".go"
 }

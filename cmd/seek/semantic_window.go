@@ -13,11 +13,13 @@ import (
 // unit's header (semanticWindowHeader), and its row keeps the byte span of its
 // own body tokens, so the final model scores the window that the vector found:
 // a unit's score is its best window. A window ends at a line or word start
-// when one is in its second half.
+// when one is in its second half. base is the model path base of the units'
+// node (modelPathBase).
 func windowSemanticUnits(
 	ctx context.Context,
 	tokenizer *lateOnTokenizer,
 	units []semanticUnit,
+	base string,
 ) ([]semanticUnit, error) {
 	rows := make([]semanticUnit, 0, len(units))
 	var idBuffer []byte
@@ -25,7 +27,7 @@ func windowSemanticUnits(
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		windows, err := semanticUnitWindows(tokenizer, unit)
+		windows, err := semanticUnitWindows(tokenizer, unit, base)
 		if err != nil {
 			return nil, err
 		}
@@ -35,6 +37,7 @@ func windowSemanticUnits(
 			row.end = unit.start + uint64(window.end)
 			row.text = unit.text[window.start:window.end]
 			row.modelInput = window.input
+			row.pathCut = window.pathCut
 			row.key = makeSemanticRowKey(window.input)
 			if len(windows) > 1 {
 				row.id, idBuffer = makeSemanticUnitIDBuffered(row, idBuffer)
@@ -49,12 +52,14 @@ type semanticWindow struct {
 	start int
 	end   int
 	input []int
+	// pathCut marks a header that ends inside the path line.
+	pathCut bool
 }
 
 // semanticUnitWindows tokenizes one unit after its header and cuts the body
 // tokens into windows that each fit one model input with the header.
-func semanticUnitWindows(tokenizer *lateOnTokenizer, unit semanticUnit) ([]semanticWindow, error) {
-	header := semanticWindowHeader(unit)
+func semanticUnitWindows(tokenizer *lateOnTokenizer, unit semanticUnit, base string) ([]semanticWindow, error) {
+	header := semanticWindowHeader(unit, base)
 	text, rawOffset := sanitizedSemanticText(unit.text)
 	bodyAt := len(lateOnDocumentPrefix) + len(header)
 	ids, spans, err := tokenizer.encode(lateOnDocumentPrefix+header+text, true, true)
@@ -84,6 +89,14 @@ func semanticUnitWindows(tokenizer *lateOnTokenizer, unit semanticUnit) ([]seman
 	room := contentBudget - metadataTokens - semanticWindowSpareTokens
 	if room <= 0 {
 		return nil, fmt.Errorf("semantic window of %q has no room for content", unit.path)
+	}
+	// The header keeps its first metadataTokens tokens: when the first token
+	// it drops starts at or before the newline that ends the path line, the
+	// key does not hold the whole line, so a longer tail can share it.
+	pathCut := false
+	if kept := prefixEnd + metadataTokens; unit.path != "" && kept < bodyStart {
+		pathLine := sanitizeLateOnTokenizerInput("path: " + rerankPathTail(semanticModelPath(base, unit.path)))
+		pathCut = spans[kept].Start <= len(lateOnDocumentPrefix)+len(pathLine)
 	}
 	prefix := make([]int, 0, prefixEnd+metadataTokens)
 	prefix = append(prefix, ids[:prefixEnd]...)
@@ -129,7 +142,7 @@ func semanticUnitWindows(tokenizer *lateOnTokenizer, unit semanticUnit) ([]seman
 		input = append(input, body[first:last]...)
 		input = append(input, lateOnSEPTokenID)
 		if end > start || len(windows) == 0 {
-			windows = append(windows, semanticWindow{start: start, end: max(end, start), input: input})
+			windows = append(windows, semanticWindow{start: start, end: max(end, start), input: input, pathCut: pathCut})
 		}
 		if last == first {
 			break
@@ -164,13 +177,14 @@ func isSemanticSpace(b byte) bool {
 }
 
 // semanticWindowHeader is the metadata that the model reads before each
-// window: the node-relative path tail, the unit language, and its symbol. It
-// is the final scorer's document header, so the vector and the final score
-// read the same window text.
-func semanticWindowHeader(unit semanticUnit) string {
+// window: the tail of the unit's model path (semanticModelPath with base),
+// Zoekt's language of the file (semanticFileLanguage), and the unit's symbol.
+// The final scorer's document of a semantic hit has the same lines, as a
+// strict hit does (checkedSemanticCandidate).
+func semanticWindowHeader(unit semanticUnit, base string) string {
 	var header strings.Builder
 	if unit.path != "" {
-		fmt.Fprintf(&header, "path: %s\n", rerankPathTail(unit.path))
+		fmt.Fprintf(&header, "path: %s\n", rerankPathTail(semanticModelPath(base, unit.path)))
 	}
 	if unit.language != "" {
 		fmt.Fprintf(&header, "language: %s\n", unit.language)

@@ -41,10 +41,10 @@ type semanticModel interface {
 	EmbedSemanticUnits(context.Context, []semanticUnit) ([]semanticUnitEmbedding, error)
 	PrepareSemanticQuery(context.Context, string) (*semanticQueryEmbedding, error)
 	ScoresWithSemanticQuery(context.Context, *semanticQueryEmbedding, []rerankDocument) ([]float32, error)
-	// SemanticCallCPUs returns the estimated CPU reservation for one inference
-	// call. Zero bypasses the shared CPU gate; it does not mean zero physical CPU
-	// use. The call can initialize the provider. A later model call reports any
-	// initialization error.
+	// SemanticCallCPUs returns the estimated CPU reservation for one
+	// inference call. Zero bypasses the shared CPU gate; it does not mean zero
+	// physical CPU use. The call can initialize the provider. A later model
+	// call reports any initialization error.
 	SemanticCallCPUs(context.Context) int
 	Close() error
 }
@@ -207,7 +207,7 @@ type searchExecution struct {
 	// node builds and binds its generation before its read. A Git node with
 	// no commit has no base to build; the overlay adds its files.
 	vectors bool
-	// opened records the nodes that the command prepared (openNode), for the
+	// opened records the nodes that the command opened (openNode), for the
 	// not-indexed check. Nil records nothing.
 	opened *openedNodes
 	// operands give the display paths that headers and file: filters read.
@@ -218,7 +218,8 @@ type searchExecution struct {
 
 // buildsVectors reports whether a node with the commit head builds and binds a
 // vector generation: the model stages run, the policy allows semantic search,
-// a model exists, and the node has a commit (an empty folder head counts).
+// a model exists, and head is not "no-head". A folder node passes an empty
+// head.
 func (e searchExecution) buildsVectors(head string) bool {
 	return e.vectors && e.policy.semanticEnabled() && e.model != nil && head != "no-head"
 }

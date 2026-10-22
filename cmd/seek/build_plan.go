@@ -10,7 +10,7 @@ type gitBuildInputs struct {
 	familyIntact    bool   // the whole family matches .family-v1
 	committedIntact bool   // the committed family matches .family-v1
 	committedMember bool   // the committed family has a member
-	committedReady  bool   // the committed family holds the commit (committedSnapshotReady)
+	committedReady  bool   // committedSnapshotReady: the family holds head
 	vectors         bool   // the search builds the base generation
 	overlay         bool   // the search builds the overlay generation
 	semanticOn      bool   // the policy allows vectors at all
@@ -18,9 +18,9 @@ type gitBuildInputs struct {
 	arrival         missingBlobArrival
 	// Read only when gitBuildCurrent is false, so a warm build opens no
 	// generation and reads the shard metadata once (committedReady).
-	publishedHead  string // the commit of the published shards; with a commit only
-	basePresent    bool   // the base generation of head exists; with vectors only
-	overlayPresent bool   // the overlay of preState exists; with an overlay only
+	publishedHead  string // the published shards' commit; with a commit only
+	basePresent    bool   // head's base generation exists; with vectors only
+	overlayPresent bool   // preState's overlay exists; with an overlay only
 }
 
 // gitBuildPlan is what the Git build does.
@@ -29,7 +29,7 @@ type gitBuildPlan struct {
 	clearCommitted bool // drop the committed family of a node with no commit
 	semantic       bool // build the base generation
 	overlay        bool // build the overlay generation
-	dropJoined     bool // remove the joined descriptor first, under the publish lock
+	dropJoined     bool // the publish first drops the joined descriptor
 	baseBound      bool // the live base serves with no build
 	overlayBound   bool // the live overlay serves with no build
 }

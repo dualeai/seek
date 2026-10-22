@@ -208,7 +208,8 @@ func TestFileNameLineShowsTheHeader(t *testing.T) {
 }
 
 // TestHeadersArePathsForTypedSubpaths types operands as their paths below the
-// node root: the headers are the node paths, so file: needs no listing.
+// node root: the headers are the node paths, so file: needs no listing. From a
+// cwd below the root, "." changes the headers.
 func TestHeadersArePathsForTypedSubpaths(t *testing.T) {
 	root := t.TempDir()
 	for _, dir := range []string{"sub", "pkg"} {

@@ -30,7 +30,8 @@ type folderCapture struct {
 	folderWalk
 	stale atomic.Bool
 	// skipDirs are the directories below the root that hold no content of
-	// this node: Git nodes, failed nodes, and bare repositories.
+	// this node: Git nodes, failed nodes, bare repositories, and directories
+	// that the walk could not read (recordUnreadable).
 	skipDirs map[string]struct{}
 }
 

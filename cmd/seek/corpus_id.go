@@ -17,11 +17,11 @@ const (
 )
 
 // hashParts terminates each part with a 0x00 byte before hashing, which makes
-// the serialization injective ONLY while every part is NUL-free and structural
-// labels are non-empty. All current inputs satisfy this (POSIX path components
-// cannot contain 0x00; labels are fixed literals), so distinct part lists
-// cannot collide. Do not feed parts that may contain 0x00 or be empty in a
-// label position, or collisions become constructible.
+// the serialization injective ONLY while every part is NUL-free; an empty part
+// is safe. All current inputs satisfy this (a POSIX path cannot contain 0x00,
+// a file identity is "dev:ino" in digits, and labels and versions are fixed
+// literals), so distinct part lists cannot collide. Do not feed a part that
+// may contain 0x00, or collisions become constructible.
 func hashParts(parts ...string) string {
 	h := sha256.New()
 	for _, part := range parts {

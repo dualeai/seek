@@ -37,8 +37,9 @@ import (
 //   - Mount point: crossed.
 //
 // A `.git` entry that Git cannot use (unreadable, dubious owner, corrupt, or a
-// broken `gitdir:` line) makes its directory a failed node: one warning, and
-// no other node indexes its files. A stray `.git` entry that names no
+// broken `gitdir:` line), or one that names the Git directory of another work
+// tree (foreignGitDir), makes its directory a failed node: one warning, and no
+// other node indexes its files. A stray `.git` entry that names no
 // repository (strayGitEntry) is not a boundary. No walk indexes a `.git`
 // entry.
 
@@ -235,8 +236,8 @@ func (x *graphExpansion) addFolderNode(root externalRoot) {
 	x.run(func() error {
 		capture, gitRoots, err := captureFolderNode(x.ctx, plan)
 		if err != nil {
-			// A folder that cannot be listed fails its node; the plan goes,
-			// and the other nodes answer.
+			// A root that cannot be read fails its node: the expansion drops
+			// the plan, and the search goes on with the other nodes.
 			x.mu.Lock()
 			delete(x.folders, plan.id)
 			x.mu.Unlock()
@@ -372,7 +373,9 @@ func captureGitNode(ctx context.Context, paths gitPaths) (repoState, []string, e
 
 // classifyGitDir decides whether dir, which holds a `.git` entry, is the root
 // of a Git node. It returns false and no error for a stray `.git` entry: dir
-// is plain content. An error means Git cannot use the `.git` entry.
+// is plain content. An error means that Git cannot use the `.git` entry for
+// dir, or that the entry names the Git directory of another work tree
+// (foreignGitDir).
 func classifyGitDir(ctx context.Context, dir string) (gitPaths, bool, error) {
 	paths, status := detectGitBoundary(dir)
 	switch status {

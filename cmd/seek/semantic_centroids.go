@@ -9,10 +9,11 @@ import (
 
 const (
 	// These values define the stored representation. Each unit puts four
-	// once-refined centroids in USearch and stores 20 direct centroids for exact
-	// scoring. A change requires new representation and USearch layout IDs. A
-	// coarse-count change must remain a power of two for the bitmap-filter key
-	// shift in semantic_usearch_cgo.go.
+	// once-refined centroids in USearch and stores 20 direct centroids for
+	// exact scoring. semanticRepresentationCompatibility and
+	// semanticUSearchLayout include them, so a change cannot reuse an old
+	// generation. The coarse count must stay a power of two for the key shift
+	// of the bitmap filter (semanticUSearchCentroidShift).
 	semanticCoarseCentroidsPerUnit = 4
 	semanticFineCentroidsPerUnit   = 20
 	semanticCoarseRefinementPasses = 1
@@ -29,9 +30,11 @@ type semanticUnitEmbedding struct {
 
 // semanticCoarseSet keeps only the graph vectors after each fine-vector batch
 // is on disk. The USearch stream builds each set from full 128-row batches and
-// at most one short last batch.
+// at most one short last batch. Row 0 of the set is the row at offset in its
+// first batch, because a shard starts at a file boundary.
 type semanticCoarseSet struct {
 	batches [][]semanticCoarseVectors
+	offset  int
 	rows    int
 }
 
@@ -40,11 +43,11 @@ func (set semanticCoarseSet) Len() int {
 }
 
 func (set semanticCoarseSet) At(row int) (*semanticCoarseVectors, bool) {
-	if row < 0 || row >= set.rows {
+	if row < 0 || row >= set.rows || set.offset < 0 {
 		return nil, false
 	}
-	batch := row / semanticModelBatchRows
-	offset := row % semanticModelBatchRows
+	batch := (set.offset + row) / semanticModelBatchRows
+	offset := (set.offset + row) % semanticModelBatchRows
 	if batch >= len(set.batches) || offset >= len(set.batches[batch]) {
 		return nil, false
 	}
@@ -115,7 +118,8 @@ func (workspace *semanticCentroidWorkspace) loadTokens(
 
 // selectCentroids keeps the first scoreable token as a fixed anchor. It selects
 // the other centroids by farthest-first traversal. Stable token order resolves
-// every tie.
+// every tie. With fewer tokens than centroids, the selected centroids repeat
+// in order to fill destination.
 func (workspace *semanticCentroidWorkspace) selectCentroids(
 	tokens []semanticVector,
 	destination []semanticVector,
@@ -153,7 +157,11 @@ func (workspace *semanticCentroidWorkspace) selectCentroids(
 	return nil
 }
 
-// refineCentroids keeps centroid zero anchored to the first scoreable token.
+// refineCentroids runs refinements passes on centroids. In each pass, every
+// token after the first joins the most similar of the other centroids, and
+// each centroid with members becomes the normalized mean of its members. A
+// centroid with no members keeps its value. Centroid zero stays anchored to
+// the first scoreable token.
 func (workspace *semanticCentroidWorkspace) refineCentroids(
 	tokens []semanticVector,
 	centroids []semanticVector,
@@ -238,9 +246,9 @@ func normalizeSemanticVector(vector *semanticVector) error {
 	scale64 := 1 / math.Sqrt(squaredNorm)
 	scale32 := float32(scale64)
 	if !math.IsInf(float64(scale32), 0) {
-		// Keep the established float32 operation for normal model output. This
-		// preserves its bytes while the float64 path handles a scale that cannot
-		// fit in float32.
+		// Keep the established float32 operation for normal model output.
+		// This preserves its bytes while the float64 path handles a scale that
+		// cannot fit in float32.
 		for dimension := range vector {
 			vector[dimension] *= scale32
 		}

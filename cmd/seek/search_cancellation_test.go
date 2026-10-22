@@ -88,9 +88,9 @@ func TestRunSearchCommandLexicalModelCancellation(t *testing.T) {
 						return model, nil
 					},
 				})
-				// The output shows the route: a cancelled command prints nothing and
-				// returns the cancellation; an ordinary model failure falls back to
-				// the strict lexical result.
+				// The output shows the route: a cancelled command prints
+				// nothing and returns the cancellation; an ordinary model
+				// failure falls back to the strict lexical result.
 				if cancelled {
 					if !errors.Is(err, context.Canceled) || output != "" {
 						t.Errorf("cancelled command: output=%q error=%v, want no output and cancellation", output, err)

@@ -501,7 +501,8 @@ func (s *lateOnModel) scoreDocumentBatch(
 // of one candidate set. The first call builds the first encoder, and its kind
 // sets the session's CPU threads (newLateOnRowEncoder). A query gets many
 // threads for one call at a time. An index build gets few threads for many
-// calls at the same time. So a warm description search makes one session.
+// calls at the same time. So a warm search that uses the model makes one
+// session.
 // The CLI starts the query before any vector build. So when a command also
 // builds vectors on the CPU provider, a build call gets a second CPU session
 // with the build's thread count. That session takes about 90 ms to make. If
@@ -735,6 +736,11 @@ func packLateOnRows(
 	return inputIDs, attention, masks
 }
 
+// lateOnMaxSimPrepared gives the MaxSim score of each document: for each kept
+// query token, the largest dot product with a kept document token, summed in
+// query token order as a float32. NumKong's exact batched float32 dot products
+// give the dot products of a block of documents and every kept query token in
+// one call. They sum each dot product in float64.
 func lateOnMaxSimPrepared(
 	query []float32,
 	queryMask []bool,
@@ -747,47 +753,66 @@ func lateOnMaxSimPrepared(
 		len(documents) != len(documentMasks)*queryRowBytes {
 		return nil, fmt.Errorf("invalid prepared LateOn tensor size")
 	}
+	var kept []float32
+	for queryToken, keepQuery := range queryMask {
+		if keepQuery {
+			kept = append(kept, query[queryToken*semanticEmbeddingDimensions:(queryToken+1)*semanticEmbeddingDimensions]...)
+		}
+	}
+	tokens := len(kept) / semanticEmbeddingDimensions
+	var packed semanticNumKongPack
+	if tokens > 0 {
+		backend, err := semanticNumKongBackend()
+		if err != nil {
+			return nil, err
+		}
+		packed = packSemanticF32Query(backend, kept)
+	}
+	// One kernel call scores lateOnMaxSimBlockDocuments documents, so its dot
+	// products stay in the CPU cache.
+	const lateOnMaxSimBlockDocuments = 8
+	products := make([]float64, min(lateOnMaxSimBlockDocuments, len(documentMasks))*lateOnSequenceLength*tokens)
 	scores := make([]float32, len(documentMasks))
-	for document, mask := range documentMasks {
-		if len(mask) != lateOnSequenceLength {
-			return nil, fmt.Errorf("invalid prepared LateOn mask size")
+	for first := 0; first < len(documentMasks); first += lateOnMaxSimBlockDocuments {
+		count := min(lateOnMaxSimBlockDocuments, len(documentMasks)-first)
+		if tokens > 0 {
+			semanticNumKongDotsF32(documents[first*queryRowBytes:(first+count)*queryRowBytes], &packed, products)
 		}
-		if !lateOnRowHasUsableToken(documents, document, mask) {
-			return nil, fmt.Errorf(
-				"%w: LateOn document %d has no usable token vector",
-				errDegenerateSemanticVector,
-				document,
-			)
-		}
-		var sum float32
-		for queryToken, keepQuery := range queryMask {
-			if !keepQuery {
-				continue
+		for offset := range count {
+			document := first + offset
+			mask := documentMasks[document]
+			if len(mask) != lateOnSequenceLength {
+				return nil, fmt.Errorf("invalid prepared LateOn mask size")
 			}
-			maximum := float32(math.Inf(-1))
-			queryOffset := queryToken * semanticEmbeddingDimensions
-			for documentToken, keepDocument := range mask {
-				if !keepDocument {
-					continue
-				}
-				documentOffset := (document*lateOnSequenceLength + documentToken) * semanticEmbeddingDimensions
-				var dot float32
-				for dimension := range semanticEmbeddingDimensions {
-					dot += query[queryOffset+dimension] * documents[documentOffset+dimension]
-				}
-				if dot > maximum {
-					maximum = dot
-				}
+			if !lateOnRowHasUsableToken(documents, document, mask) {
+				return nil, fmt.Errorf(
+					"%w: LateOn document %d has no usable token vector",
+					errDegenerateSemanticVector,
+					document,
+				)
 			}
-			if math.IsInf(float64(maximum), -1) {
-				return nil, fmt.Errorf("LateOn document has no scoreable token")
+			lines := products[offset*lateOnSequenceLength*tokens : (offset+1)*lateOnSequenceLength*tokens]
+			var sum float32
+			for queryToken := range tokens {
+				maximum := math.Inf(-1)
+				for documentToken, keepDocument := range mask {
+					if !keepDocument {
+						continue
+					}
+					if dot := lines[documentToken*tokens+queryToken]; dot > maximum {
+						maximum = dot
+					}
+				}
+				if math.IsInf(maximum, -1) {
+					return nil, fmt.Errorf("LateOn document has no scoreable token")
+				}
+				sum += float32(maximum)
 			}
-			sum += maximum
+			if math.IsNaN(float64(sum)) || math.IsInf(float64(sum), 0) {
+				return nil, fmt.Errorf("LateOn score is not finite")
+			}
+			scores[document] = sum
 		}
-		if math.IsNaN(float64(sum)) || math.IsInf(float64(sum), 0) {
-			return nil, fmt.Errorf("LateOn score is not finite")
-		}
-		scores[document] = sum
 	}
 	return scores, nil
 }
@@ -810,8 +835,8 @@ func lateOnRowHasUsableToken(documents []float32, document int, mask []bool) boo
 			if math.IsNaN(value) || math.IsInf(value, 0) {
 				// Keep looking. A later token can still carry the row. In the
 				// scoring loop of lateOnMaxSimPrepared, a NaN or -Inf dot
-				// product never wins the maximum, and a +Inf one makes the score
-				// not finite, which fails the call.
+				// product never wins the maximum, and a +Inf one makes the
+				// score not finite, which fails the call.
 				finite = false
 				break
 			}
@@ -877,8 +902,9 @@ func sanitizeLateOnDocumentInput(
 // truncateLateOnDocumentTokens packs one annotated document into limit tokens.
 // The byte offsets refer to the prefixed serialized text. It keeps the model
 // prefix and separator, uses at most one quarter of the content slots for
-// metadata, and centers the remaining evidence on the match. An invalid
-// annotated layout uses head truncation.
+// metadata, and centers the remaining evidence on the match. When no token
+// overlaps the match, it keeps the start of the body. An invalid annotated
+// layout uses head truncation.
 func truncateLateOnDocumentTokens(
 	ids []int,
 	spans []lateOnTokenSpan,

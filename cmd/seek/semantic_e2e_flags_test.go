@@ -19,7 +19,8 @@ import (
 )
 
 // e2eFlagQuery is a description of two words that no fixture file or file
-// name holds, so every result of it comes from vector search.
+// name holds, so every result of it comes from vector search, unless a test
+// writes a text file that holds both words.
 const e2eFlagQuery = "zqalpha zqbeta"
 
 var (
@@ -118,7 +119,7 @@ func e2eFlagModel(scorer semanticModel, calls *atomic.Int32) semanticModelFactor
 
 // e2eFlagRunRoot runs the root command with args, as main does: the splice,
 // Cobra's flag parse, PersistentPreRunE, PreRunE, and RunE. A non-nil newModel
-// replaces the bundled model of a description search; nil keeps it.
+// replaces the bundled model of the search; nil keeps it.
 func e2eFlagRunRoot(t *testing.T, newModel semanticModelFactory, args ...string) (string, error) {
 	t.Helper()
 	logger := slog.Default()
@@ -408,12 +409,12 @@ func e2eFlagRankFixture(t *testing.T) []string {
 
 // TestE2EFlagLimitKeepsTheTopOfTheModelOrder runs the root command with -n on
 // files that only vectors find. The files are in a folder node, and in a Git
-// node's committed rows and dirty overlay. Each -n prints the first n files of the
-// fused order worked out by hand (e2eFlagRankFixture), and a footer counts
-// the other accepted files. The
-// model scores the same files under every -n: -n limits only the display. A
-// file that the model rejects, a file outside the radius, a deleted file,
-// and the committed copy of a modified file never print.
+// node's committed rows and dirty overlay. Each -n prints the first n files
+// of the fused order worked out by hand (e2eFlagRankFixture), and a footer
+// counts the other accepted files. The model scores the same files under
+// every -n: -n limits only the display. A file that the model rejects, a
+// file outside the radius, a deleted file, and the committed copy of a
+// modified file never print.
 func TestE2EFlagLimitKeepsTheTopOfTheModelOrder(t *testing.T) {
 	requireTools(t)
 	order := e2eFlagRankFixture(t)
@@ -553,9 +554,10 @@ func TestE2EFlagMaxMatchesKeepsEachVectorHit(t *testing.T) {
 
 // TestE2EFlagRootGivesLimitAndMaxMatchesToTheSearch checks that the root
 // command gives -n to the file limit and -m to the match limit of a one-word
-// text search. Each of three files has three matches, ten lines apart, so no
-// context line holds a match.
-// The expected counts and footers come from the fixture by hand.
+// search with the bundled model. Each of three files holds the word three
+// times, ten lines apart, so each file is a strict hit and no context line
+// holds a match. The expected counts and footers come from the fixture by
+// hand.
 func TestE2EFlagRootGivesLimitAndMaxMatchesToTheSearch(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
@@ -612,9 +614,9 @@ func TestE2EFlagRootGivesLimitAndMaxMatchesToTheSearch(t *testing.T) {
 // e2eFlagTargetTree writes a tree with vector targets. One is in a folder
 // node (tree/loose/folder.go), and one in a Git node's committed rows
 // (tree/repo/committed.go). Two are in its dirty overlay: an untracked file
-// and a modified file. The target files hold no description word. text holds the
-// content of tree/repo/text.go, or no file when it is empty. It returns the
-// tree.
+// and a modified file. The target files hold no description word. text holds
+// the content of tree/repo/text.go, or no file when it is empty. It returns
+// the tree.
 func e2eFlagTargetTree(t *testing.T, text string) string {
 	t.Helper()
 	f := newGraphFixture(t)
@@ -644,14 +646,14 @@ func e2eFlagSemanticCachePaths(t *testing.T) []string {
 }
 
 // TestE2EFlagLexicalOnlyPrintsNoVectorResult runs the root command with
-// --lexical-only, with its own RunE. The vector targets are in a folder node,
-// and in a Git node's committed rows and dirty overlay. The test also needs
-// one text hit: a file with both description words. The default search prints
-// the text file and the vector targets. --lexical-only prints only the text
-// file, the one file that holds every word. On a cold cache, it writes no
-// meaning-based data and does not install the bundled model. With vectors on
-// disk, it adds no such cache path. When only vectors match, --lexical-only
-// finds nothing.
+// --lexical-only, which gives RunE the lexical-only search policy. The vector
+// targets are in a folder node, and in a Git node's committed rows and dirty
+// overlay. The test also needs one text hit: a file with both description
+// words. The default search prints the text file and the vector targets.
+// --lexical-only prints only the text file, the one file that holds every
+// word. On a cold cache, it writes no meaning-based data and does not install
+// the bundled model. With vectors on disk, it adds no such cache path. When
+// only vectors match, --lexical-only finds nothing.
 func TestE2EFlagLexicalOnlyPrintsNoVectorResult(t *testing.T) {
 	requireTools(t)
 	e2eFlagTargetTree(t, "package p\n// "+e2eFlagQuery+" text\n")
@@ -824,14 +826,14 @@ func TestE2EFlagNoVectorResultExitsOneWithNoOutput(t *testing.T) {
 
 // TestE2EFlagPathOperandsScopeVectorHits runs a description from inside a Git
 // repository with path operands. The operands are a subdirectory of the
-// repository (the scope of T39), exact files, and an external folder outside
-// the Git worktree. They are also an exact file there, Git and folder
-// operands together, symlinked operands, and an operand given twice. Each
-// target file holds the word zqopmark. A one-word text search with the same
-// operands is the oracle. The vector results must be the oracle's files and
-// the hand-made set. The model scores only those files, so it never scores a
-// file that the scope drops. The Git node has committed, modified, untracked,
-// deleted, and changed-away files.
+// repository (the path-operand scope, row T39 of querySupport), exact files,
+// and an external folder outside the Git worktree. They are also an exact
+// file there, Git and folder operands together, symlinked operands, and an
+// operand given twice. Each target file holds the word zqopmark. A one-word
+// text search with the same operands is the oracle. The vector results must
+// be the oracle's files and the hand-made set. The model scores only those
+// files, so it never scores a file that the scope drops. The Git node has
+// committed, modified, untracked, deleted, and changed-away files.
 //
 // An exact file outside Git is a folder node of one file. The README says
 // that every searched folder adds files by meaning. An exact file in Git

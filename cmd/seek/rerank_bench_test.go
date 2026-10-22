@@ -57,9 +57,10 @@ func BenchmarkCLIProcess(b *testing.B) {
 	const queryText = "parse request handler"
 	lexicalArgs := []string{"--lexical-only", queryText, fixture}
 	// RerankIneligibleWarm times a strict search in the cache that holds
-	// vectors: a content: filter and one description word plan no model
-	// route (support table row T34), so the command starts no model.
-	ineligibleArgs := []string{"content:parse handler", fixture}
+	// vectors: a query of punctuation only gives the model no text (support
+	// table rows T36 and T41), so the command starts no model. It matches the
+	// "()" of every fixture function.
+	ineligibleArgs := []string{`\(\)`, fixture}
 	if plan, err := planQuery(ineligibleArgs[0], defaultSearchPolicy()); err != nil || plan.model != nil {
 		b.Fatalf("%q plans a model route: model=%t err=%v", ineligibleArgs[0], plan.model != nil, err)
 	}
@@ -124,10 +125,10 @@ func BenchmarkCLIProcess(b *testing.B) {
 	b.Run("RerankEligibleFirstUse", func(b *testing.B) {
 		for b.Loop() {
 			b.StopTimer()
-			// Remove the extracted run time, which is what "first use" measures.
-			// Keep reranker/coreml: it holds the compiled Core ML model and the
-			// provider verdict, and rebuilding both on every iteration would
-			// measure the Core ML compiler rather than Seek.
+			// Remove the extracted run time, which is what "first use"
+			// measures. Keep reranker/coreml: it holds the compiled Core ML
+			// model and the provider verdict, and rebuilding both on every
+			// iteration would measure the Core ML compiler rather than Seek.
 			entries, err := os.ReadDir(filepath.Join(semanticCache, "reranker"))
 			if err != nil && !os.IsNotExist(err) {
 				b.Fatal(err)
@@ -147,10 +148,10 @@ func BenchmarkCLIProcess(b *testing.B) {
 	b.Run("RerankEligibleProviderCheck", func(b *testing.B) {
 		// RerankEligibleFirstUse deliberately keeps the compiled Core ML model,
 		// and the provider verdict lives in the same directory, so that case
-		// never runs the provider check. Remove the verdict alone to measure the
-		// check itself: a second session on the reference provider and one batch
-		// through each. Without this the only cost this feature adds has no
-		// benchmark at all.
+		// never runs the provider check. Remove the verdict alone to measure
+		// the check itself: a second session on the reference provider and one
+		// batch through each. Without this the only cost this feature adds has
+		// no benchmark at all.
 		for b.Loop() {
 			b.StopTimer()
 			removeProviderVerdicts(b, semanticCache)
@@ -504,9 +505,9 @@ func runSeekBenchmarkCommand(
 	return output.Bytes(), err
 }
 
-// removeProviderVerdicts deletes every recorded provider verdict under the cache,
-// keeping the compiled models beside them. The next run therefore repeats the
-// provider check without repeating the Core ML compile.
+// removeProviderVerdicts deletes every recorded provider verdict under the
+// cache, keeping the compiled models beside them. The next run therefore
+// repeats the provider check without repeating the Core ML compile.
 func removeProviderVerdicts(b *testing.B, cacheDir string) {
 	b.Helper()
 	root := filepath.Join(cacheDir, "reranker", "coreml")

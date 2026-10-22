@@ -31,8 +31,10 @@ const (
 const maxGitFileBytes = 64 << 10
 
 // detectGitBoundary classifies a directory as a git-repo boundary using
-// only filesystem syscalls (no subprocess). Walker-safe. A confirmed boundary
-// comes with the Git paths of its node: absDir and the common Git directory.
+// only filesystem syscalls (no subprocess), so the graph walk can call it for
+// each directory that holds a `.git` entry (classifyGitDir). A confirmed
+// boundary comes with the Git paths of its node: absDir and the common Git
+// directory.
 //
 // Algorithm:
 //
@@ -43,6 +45,7 @@ const maxGitFileBytes = 64 << 10
 //	     -> boundaryConfirmed, with <dir>/.git as the common directory.
 //	     Missing any, or a <gitDir>/commondir file -> ambiguous.
 //	L2b: .git is a regular file -> detectGitFileBoundary.
+//	L2c: .git is any other file type -> notBoundary.
 func detectGitBoundary(absDir string) (gitPaths, detectStatus) {
 	gitPath := filepath.Join(absDir, ".git")
 	fi, err := os.Lstat(gitPath)
@@ -51,7 +54,8 @@ func detectGitBoundary(absDir string) (gitPaths, detectStatus) {
 			// Most directories have no `.git`: one syscall decides.
 			return gitPaths{}, notBoundary
 		}
-		// Permission denied, I/O error, etc. — cannot prove negative.
+		// Permission denied, an I/O error, and so on: Seek cannot prove that
+		// there is no `.git`.
 		return gitPaths{}, ambiguous
 	}
 	mode := fi.Mode()
@@ -144,9 +148,9 @@ func readCoreWorktree(path string) (string, bool) {
 	return "", false
 }
 
-// hasGitTriad verifies the structural minimum Git uses to recognize a
-// repository: a HEAD regular file and a refs directory in gitDir, and an
-// objects directory in commonDir (gitDir itself for a normal repository).
+// hasGitTriad verifies the minimum structure of a repository: a HEAD regular
+// file and a refs directory in gitDir, and an objects directory in commonDir
+// (gitDir itself for a normal repository).
 // It uses Lstat for each entry: a symlinked entry cannot redirect the check
 // to files outside the repository.
 func hasGitTriad(gitDir, commonDir string) bool {
@@ -165,7 +169,8 @@ func hasGitTriad(gitDir, commonDir string) bool {
 // detectBareRepoAt reports whether absDir is a bare git repository
 // (HEAD + objects/ + refs/ at the directory itself, no `.git` child). The
 // operand check and the Git status parse use it; the folder walk reads the
-// same marks from the directory listing it already has (gitListingMarks).
+// same entries from the directory listing it already has (gitListingMarks),
+// with no check of the HEAD content.
 func detectBareRepoAt(absDir string) bool {
 	if _, err := os.Lstat(filepath.Join(absDir, ".git")); err == nil {
 		return false
@@ -180,21 +185,22 @@ func detectBareRepoAt(absDir string) bool {
 	return validGitHead(filepath.Join(absDir, "HEAD"))
 }
 
-// openNoFollow opens path read-only without following a terminal symlink.
-// Defense-in-depth for the TOCTOU window between Lstat (which classified
-// the entry as a regular file) and the subsequent Open (which would
-// otherwise follow if an attacker swapped the entry into a symlink).
+// openNoFollow opens path read-only without following a terminal symlink. It
+// is a second guard for the time between the Lstat that found a regular file
+// and the open: when the entry became a symlink in that time, the open fails
+// instead of following it.
 func openNoFollow(path string) (*os.File, error) {
 	return os.OpenFile(path, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
 }
 
 // parseGitFilePointer reads a worktree-form `.git` file and returns the
-// resolved absolute gitdir. Bounded to one maxGitFileBytes read, so a
-// pathological multi-GB `.git` file cannot OOM seek.
+// resolved absolute gitdir. It reads at most maxGitFileBytes, so a `.git` file
+// of many GB cannot use up the memory of seek.
 //
-// Spec: a single line of the form `gitdir: <path>\n`. Path may be relative
-// (resolved against the directory holding the `.git` file) or absolute.
-// Tolerate `\r\n` line endings and trailing whitespace.
+// The file holds one line of the form `gitdir: <path>\n`. The path can be
+// relative to the directory that holds the `.git` file, or absolute. A `\r\n`
+// line end and spaces around the path are accepted. A missing prefix, an
+// empty path, or a NUL byte in the path is an error.
 func parseGitFilePointer(gitFile, parentDir string) (string, error) {
 	line, err := readFirstLineNoFollow(gitFile)
 	if err != nil {
@@ -217,9 +223,9 @@ func parseGitFilePointer(gitFile, parentDir string) (string, error) {
 	return filepath.Clean(ptr), nil
 }
 
-// readGitFileNoFollow opens path with O_NOFOLLOW (defense against a TOCTOU
-// Lstat→Open symlink swap on `.git`-name entries) and reads at most
-// maxGitFileBytes, so a pathological multi-GB file cannot OOM seek.
+// readGitFileNoFollow opens path with O_NOFOLLOW (openNoFollow) and returns
+// at most its first maxGitFileBytes, with no error for a longer file, so a
+// file of many GB cannot use up the memory of seek.
 func readGitFileNoFollow(path string) (string, error) {
 	f, err := openNoFollow(path)
 	if err != nil {
@@ -235,12 +241,12 @@ func readGitFileNoFollow(path string) (string, error) {
 }
 
 // readFirstLineNoFollow reads path (readGitFileNoFollow) and returns its
-// first line trimmed of trailing \r\n + whitespace. Empty string is returned
-// on any read error so callers can branch: parseGitFilePointer treats it as
-// fatal; readGitPathFile treats it as no path.
+// first line with no trailing \r, \n, space, or tab. On a read error it returns
+// an empty string and the error: parseGitFilePointer returns the error, and
+// readGitPathFile reports no path.
 //
-// NUL-byte rejection is NOT done here — parseGitFilePointer surfaces
-// it as a specific error while readGitPathFile silently degrades.
+// NUL-byte rejection is NOT done here: parseGitFilePointer returns a specific
+// error for it, and readGitPathFile reports no path.
 func readFirstLineNoFollow(path string) (string, error) {
 	text, err := readGitFileNoFollow(path)
 	if err != nil {
@@ -265,8 +271,9 @@ func readGitPathFile(dir, name string) (string, bool) {
 }
 
 // hasLinkedWorktreeBackref reports a linked worktree whose private Git
-// directory names gitFile in its gitdir back-reference. The compare is by file
-// identity, so the typed letter case or a symlink in the path does not matter.
+// directory, below <commonDir>/worktrees, names gitFile in its gitdir
+// back-reference. The compare is by file identity, so the typed letter case or
+// a symlink in the path does not matter.
 func hasLinkedWorktreeBackref(gitDirReal, commonDir, gitFile string) bool {
 	worktreesDir := filepath.Join(canonicalCorpusPath(commonDir), "worktrees")
 	if gitDirReal == worktreesDir || !pathWithin(worktreesDir, gitDirReal) {
@@ -286,8 +293,9 @@ func hasLinkedWorktreeBackref(gitDirReal, commonDir, gitFile string) bool {
 
 // readCommonDir reads <gitDir>/commondir (a single short line containing
 // a path) and returns the resolved common directory. Returns gitDir
-// unchanged if commondir is absent or unreadable. This is the common case for
-// a normal repository, where the resolved .git directory is the common dir.
+// unchanged if commondir is absent, unreadable, empty, or holds a NUL byte.
+// An absent commondir is the common case for a normal repository, where the
+// resolved .git directory is the common dir.
 func readCommonDir(gitDir string) string {
 	if commonDir, ok := readGitPathFile(gitDir, "commondir"); ok {
 		return filepath.Clean(commonDir)

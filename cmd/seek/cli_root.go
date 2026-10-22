@@ -23,19 +23,18 @@ type cliFlags struct {
 	search       searchConfig
 }
 
-// splicePassthroughSeparator preserves Zoekt-style single-dash queries
-// (`-file:test`, `-lang:go`) under pflag parsing. Scan
-// args left-to-right; the first arg starting with a SINGLE dash that
-// isn't a known flag (or `-` / `--`) triggers an injection of `--`
-// before it so pflag treats it plus everything after as positional.
+// splicePassthroughSeparator keeps Zoekt-style single-dash queries
+// (`-file:test`, `-lang:go`) positional under pflag parsing. It scans args in
+// order and stops at `--`, at `-`, or at the first argument that does not
+// start with a dash. The first single-dash token that is not a known flag
+// gets `--` before it, so pflag reads it and every later argument as
+// positional.
 //
-// `--xxxx` unknown tokens are NOT spliced — pflag will surface the
-// "unknown flag" error and Cobra's did-you-mean suggestion. That keeps
-// typo detection working for the long-form (`--verbos` → "did you
-// mean --verbose?").
+// An unknown `--name` token gets no `--`: pflag reports "unknown flag", and
+// suggestFlagError adds the did-you-mean hint (`--verbos` gives "did you mean
+// --verbose?").
 //
-// `seek gc` is special: arguments after the subcommand are all flags
-// or none. If args[0] == "gc", splice nothing.
+// `seek gc` takes only flags, so when args[0] is "gc" nothing is spliced.
 func splicePassthroughSeparator(args []string, flags *pflag.FlagSet) []string {
 	if len(args) == 0 || args[0] == "gc" {
 		return args
@@ -60,10 +59,9 @@ func splicePassthroughSeparator(args []string, flags *pflag.FlagSet) []string {
 			}
 			continue
 		}
-		// Long-form unknown (`--foo`) → let pflag surface the
-		// "unknown flag" error + did-you-mean suggestion. Single-dash
-		// unknown (`-file:test`) → splice `--` so pflag treats the
-		// rest as positional.
+		// An unknown long form (`--foo`) goes to pflag, which reports
+		// "unknown flag". An unknown single-dash token (`-file:test`)
+		// gets `--` before it, so pflag reads the rest as positional.
 		if strings.HasPrefix(arg, "--") {
 			return args
 		}
@@ -87,8 +85,8 @@ func lookupExactFlag(flags *pflag.FlagSet, token string) *pflag.Flag {
 }
 
 // newRootCmd builds the seek root command with shared flags, examples,
-// and the search RunE callback. A descriptive search loads its model with
-// newModel. Subcommands attach via AddCommand.
+// and the search RunE callback. A search that gives the model text loads its
+// model with newModel. Subcommands attach via AddCommand.
 func newRootCmd(newModel semanticModelFactory) *cobra.Command {
 	flags := &cliFlags{search: defaultSearchConfig()}
 	cmd := &cobra.Command{
@@ -96,12 +94,10 @@ func newRootCmd(newModel semanticModelFactory) *cobra.Command {
 		Short: "Ranked local code search with exact and descriptive queries",
 		Long: `Seek searches the current folder, the same as ".", or the selected files
 and folders, with each Git repository below them in Git's own view.
-Descriptions of two or more words use the bundled local model to find and rank
-code by meaning.
+A query also uses the bundled local model to find and rank code by meaning.
 
-Results are ranked, not exhaustive. Text search counts every match. With -n 0,
-Seek displays every returned file. Use an exhaustive search for counts,
-renames, and absence checks.
+Results are ranked, not exhaustive. With -n 0, Seek displays every returned
+file. Use an exhaustive search for counts, renames, and absence checks.
 
 A result that the model adds must pass its score threshold; files that contain
 every query word stay. With no result, Seek prints nothing and exits with code
@@ -110,8 +106,8 @@ every query word stay. With no result, Seek prints nothing and exits with code
 The first search of a large folder can take tens of seconds and use several GiB
 while Seek builds text and meaning-based indexes. Use --lexical-only to skip
 the meaning-based index and all model work.`,
-		Example: `  seek 'sym:Foo'              find definitions named Foo (ctags)
-  seek 'lang:go func main'    rank Go files for this description
+		Example: `  seek 'sym:Foo'              find definitions whose name contains Foo
+  seek 'lang:go func main'    rank Go files for these words
   seek 'file:cmd -file:test'  paths matching cmd, excluding tests
   seek 'TODO' ./src           search a specific subtree
   seek 'request auth flow'    search a description with the local model`,
@@ -122,10 +118,9 @@ the meaning-based index and all model work.`,
 			// the encoder, it would surface as one more reason to keep lexical
 			// search, which the fallback path hides behind --verbose.
 			//
-			// Only for commands that can use the model. Stopping `gc`,
-			// `completion` or a --lexical-only search over a setting none of them
-			// reads would turn a typo into an outage on paths that do no model
-			// work.
+			// Only for commands that can use the model: `gc`, `completion` and
+			// a --lexical-only search do not read the setting, so a typo in it
+			// must not stop them.
 			if flags.lexicalOnly || !commandUsesSemanticModel(cmd) {
 				return nil
 			}
@@ -175,9 +170,9 @@ the meaning-based index and all model work.`,
 	cmd.Version = strings.TrimPrefix(versionString(), "seek ")
 	cmd.SetVersionTemplate("seek {{.Version}}\n")
 
-	// Force Cobra to materialize the --help / --version flags now so
-	// the description overrides below stick. Cobra otherwise adds them
-	// lazily during Execute, by which point newRootCmd has returned.
+	// Make Cobra add the --help and --version flags now, so the Usage
+	// changes below apply. Cobra otherwise adds them during Execute, after
+	// newRootCmd has returned.
 	cmd.InitDefaultHelpFlag()
 	cmd.InitDefaultVersionFlag()
 	if f := cmd.Flags().Lookup("version"); f != nil {
@@ -241,10 +236,10 @@ func rootArgsValidator(_ *cobra.Command, args []string) error {
 	return nil
 }
 
-// suggestFlagError appends a Levenshtein-based did-you-mean hint when a
-// user mistypes a flag. SilenceErrors=true is in effect on the parent
-// command, so Cobra's built-in suggestion line is suppressed; this hook
-// folds the suggestion into the error message that the CLI presenter surfaces.
+// suggestFlagError adds a did-you-mean hint, by Levenshtein distance, to the
+// error of an unknown flag. Cobra suggests only command names and pflag
+// suggests nothing, so this hook puts the hint in the error message that the
+// CLI presenter shows.
 func suggestFlagError(cmd *cobra.Command, err error) error {
 	if err == nil {
 		return nil
@@ -321,8 +316,8 @@ func levenshtein(a, b string) int {
 	return prev[len(b)]
 }
 
-// commandUsesSemanticModel reports whether this command can load the model. Only
-// the root search command does; every subcommand is management or output.
+// commandUsesSemanticModel reports whether this command can load the model.
+// Only the root search command does; every subcommand is management or output.
 func commandUsesSemanticModel(cmd *cobra.Command) bool {
 	return cmd != nil && !cmd.HasParent()
 }

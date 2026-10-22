@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -261,23 +262,15 @@ func TestPlainDescriptionFallbackRejectsMalformedSyntax(t *testing.T) {
 	}
 }
 
+// TestPlanRerankQueryRejectsSyntax plans queries that give the model no text:
+// one that matches nothing, one of a result type other than files, negations
+// only, and punctuation only. They keep strict ranking.
 func TestPlanRerankQueryRejectsSyntax(t *testing.T) {
 	tests := []string{
-		"single",
-		`"two words"`,
-		"file:go alpha",
-		"content:alpha beta",
-		"alpha or beta",
-		"alpha -beta",
-		"sym:Alpha beta",
 		"alpha beta lang:definitely-not-a-language",
 		"type:repo alpha beta",
-		"alpha ^",
-		"alpha beta (gamma or file:x)",
-		"(alpha or beta) gamma",
-		`alpha \d+`,
-		"alpha [^a-z]",
-		`alpha \b`,
+		"-file:test",
+		"^",
 	}
 	for _, pattern := range tests {
 		t.Run(pattern, func(t *testing.T) {
@@ -287,6 +280,38 @@ func TestPlanRerankQueryRejectsSyntax(t *testing.T) {
 			}
 			if plan, ok := planRerankQuery(raw); ok {
 				t.Fatalf("query must be ineligible: %#v", plan)
+			}
+		})
+	}
+}
+
+// TestPlanRerankQueryEveryShapeUsesTheModel plans one word, a phrase, an
+// identifier, filters, an or of descriptions and punctuation: each gives the
+// model its description atoms in query order, and a query of filters only
+// gives it the text of its positive patterns.
+func TestPlanRerankQueryEveryShapeUsesTheModel(t *testing.T) {
+	for pattern, model := range map[string]string{
+		"single":                       "single",
+		`"two words"`:                  "two words",
+		"ParseRequest":                 "ParseRequest",
+		"file:go alpha":                "alpha",
+		"content:alpha beta":           "beta",
+		"alpha or beta":                "alpha beta",
+		"alpha -beta":                  "alpha",
+		"sym:Alpha beta":               "beta",
+		"alpha ^":                      "alpha",
+		"alpha beta (gamma or file:x)": "alpha beta gamma",
+		"(alpha or beta) gamma":        "alpha beta gamma",
+		`alpha \d+`:                    "alpha",
+		"alpha [^a-z]":                 "alpha",
+		`alpha \b`:                     "alpha",
+		"sym:ParseRequest":             "ParseRequest",
+		"file:cmd -file:test":          "cmd",
+		"lang:go":                      "Go",
+	} {
+		t.Run(pattern, func(t *testing.T) {
+			if plan := planFor(t, pattern); plan.modelQuery != model {
+				t.Fatalf("model text %q, want %q", plan.modelQuery, model)
 			}
 		})
 	}
@@ -665,9 +690,9 @@ func TestRunRerankFallbackContracts(t *testing.T) {
 			return nil, errors.New("must not start")
 		},
 	})
-	// An exact phrase cannot reach a vector, so nothing builds one and the
-	// model factory stays unused. The output must not change.
-	wantIndexCalls := 0
+	// An exact phrase uses the model too: a model that cannot start leaves
+	// the strict output.
+	wantIndexCalls := 1
 	if err != nil || protected != protectedBaseline || factoryCalls != wantIndexCalls {
 		t.Fatalf("protected path: error=%v calls=%d\nwant=%q\ngot=%q", err, factoryCalls, protectedBaseline, protected)
 	}
@@ -753,7 +778,11 @@ func TestRunRerankDoesNotStartScorerWhenCorpusPlanningFails(t *testing.T) {
 	}
 }
 
-func TestRunRerankUnsupportedQueriesStayByteIdentical(t *testing.T) {
+// TestRunRerankFailingModelKeepsStrictOutputForEveryShape searches one word,
+// a phrase, filters, an or and a negation with a model that cannot start:
+// each shape asks for the model once and prints the strict output byte for
+// byte. A query of negations only gives the model no text, so it never asks.
+func TestRunRerankFailingModelKeepsStrictOutputForEveryShape(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
 	t.Chdir(t.TempDir())
@@ -761,13 +790,14 @@ func TestRunRerankUnsupportedQueriesStayByteIdentical(t *testing.T) {
 	writeFileAt(t, folder, "strict.go", "package sample\nfunc Alpha() {}\n// alpha beta gamma\n")
 	writeFileAt(t, folder, "relaxed.go", "package sample\n// alpha only\n")
 
-	for _, pattern := range []string{
-		"alpha",
-		`"alpha beta"`,
-		"file:strict alpha",
-		"content:alpha beta",
-		"alpha or beta",
-		"alpha -missing",
+	for pattern, wantIndexCalls := range map[string]int{
+		"alpha":              1,
+		`"alpha beta"`:       1,
+		"file:strict alpha":  1,
+		"content:alpha beta": 1,
+		"alpha or beta":      1,
+		"alpha -missing":     1,
+		"-file:missing":      0,
 	} {
 		t.Run(pattern, func(t *testing.T) {
 			baseline, baselineErr := captureStdout(t, func() error {
@@ -793,15 +823,11 @@ func TestRunRerankUnsupportedQueriesStayByteIdentical(t *testing.T) {
 					},
 				)
 			})
-			// A protected query cannot reach a vector, so the corpus builds
-			// none for it and the model factory is never called. The output
-			// stays byte-identical, which is what this test protects.
-			wantIndexCalls := 0
 			if baseline != got || factoryCalls != wantIndexCalls ||
 				(baselineErr == nil) != (gotErr == nil) ||
 				(baselineErr != nil && baselineErr.Error() != gotErr.Error()) {
 				t.Fatalf(
-					"protected query changed: calls=%d baseline=%q/%v got=%q/%v",
+					"a failing model changed the output: calls=%d baseline=%q/%v got=%q/%v",
 					factoryCalls,
 					baseline,
 					baselineErr,
@@ -994,5 +1020,51 @@ func rerankTestResult(name string, score float64) corpusSearchResult {
 				Score:      score,
 			}},
 		},
+	}
+}
+
+// TestPlanRerankQueryFilterTextOutlivesItsMask plans filters whose
+// punctuation makes the mask true or narrower: the model still reads the text
+// of the filter's positive patterns.
+func TestPlanRerankQueryFilterTextOutlivesItsMask(t *testing.T) {
+	for _, row := range []struct {
+		pattern, model, filters string
+	}{
+		{pattern: `lang:go or \d+`, model: "Go", filters: "[]"},
+		{pattern: `\d+ or lang:go`, model: "Go", filters: "[]"},
+		{pattern: `lang:go (lang:python or \d+)`, model: "Go Python", filters: "[lang:Go]"},
+	} {
+		plan := planFor(t, row.pattern)
+		if plan.modelQuery != row.model || fmt.Sprint(plan.filters) != row.filters {
+			t.Fatalf("%s: model text %q, mask %v; want %q, %s", row.pattern, plan.modelQuery, plan.filters, row.model, row.filters)
+		}
+	}
+}
+
+// TestPlanRerankQueryOrMaskKeepsOnlyFilters plans queries with a punctuation
+// atom or a nested type:file next to their filters: the model text and the
+// semantic mask are those of the same query with neither, and so is relaxed
+// retrieval, except that it keeps the punctuation of a filter.
+func TestPlanRerankQueryOrMaskKeepsOnlyFilters(t *testing.T) {
+	for _, row := range []struct {
+		pattern, same           string
+		relaxedKeepsPunctuation bool
+	}{
+		{pattern: `(alpha \d+ lang:go) or (lang:python beta)`, same: "(alpha lang:go) or (lang:python beta)"},
+		{pattern: "(type:file alpha lang:go) or (lang:python beta)", same: "(alpha lang:go) or (lang:python beta)"},
+		{pattern: "((type:file alpha) lang:go) or (lang:python beta)", same: "(alpha lang:go) or (lang:python beta)"},
+		{pattern: "lang:go (type:file alpha)", same: "type:file lang:go alpha"},
+		{pattern: `(\d+ lang:go) or lang:python`, same: "lang:go or lang:python", relaxedKeepsPunctuation: true},
+	} {
+		got, want := planFor(t, row.pattern), planFor(t, row.same)
+		if got.modelQuery != want.modelQuery {
+			t.Fatalf("%s: model text %q, want %q", row.pattern, got.modelQuery, want.modelQuery)
+		}
+		if fmt.Sprint(got.filters) != fmt.Sprint(want.filters) {
+			t.Fatalf("%s: mask %s, want %s", row.pattern, got.filters, want.filters)
+		}
+		if equal := got.relaxedQ.String() == want.relaxedQ.String(); equal == row.relaxedKeepsPunctuation {
+			t.Fatalf("%s: relaxed %s, %s: %s", row.pattern, got.relaxedQ, row.same, want.relaxedQ)
+		}
 	}
 }

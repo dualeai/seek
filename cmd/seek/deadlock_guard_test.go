@@ -26,9 +26,9 @@ const defaultLeakTimeout = 10 * time.Second
 // any leak via t.Errorf (not Fatal — let the test continue to drain).
 //
 // If the deadline fires before cleanup, the watchdog dumps every
-// goroutine stack to os.Stderr and panics. Panic-not-Fatal because
-// `time.AfterFunc` fires in a separate goroutine; t.Fatal would not
-// stop the wedged goroutines.
+// goroutine stack to os.Stderr and panics. It panics, not t.Fatal,
+// because `time.AfterFunc` runs in a separate goroutine, and t.Fatal
+// from there would not stop the blocked goroutines.
 func goroutineLeakGuard(t *testing.T, d time.Duration) func() {
 	t.Helper()
 	prevProcs := runtime.GOMAXPROCS(2)
@@ -60,16 +60,14 @@ func goroutineLeakGuard(t *testing.T, d time.Duration) func() {
 	}
 }
 
-// Meta-test for the goroutineLeakGuard watchdog itself is non-trivial:
-// the watchdog panic fires from a time.AfterFunc goroutine, which the
-// runtime delivers to the FAIL handler — recover() in a sibling test
-// goroutine cannot catch it. A meaningful meta-test would require
-// extracting the panic body into a testable function. Documented gap.
+// No test covers the goroutineLeakGuard watchdog itself: the watchdog
+// panics in a time.AfterFunc goroutine, and an unrecovered panic there
+// stops the test binary; recover() in a test goroutine cannot catch it.
+// Such a test would need the panic body in a function of its own.
 
-// dumpGoroutines writes every goroutine's stack to os.Stderr through
-// t.Logf so the dump is interleaved with the failing test's output.
-// Useful when a non-watchdog assertion fails and you still want a
-// goroutine snapshot for diagnosis.
+// dumpGoroutines writes every goroutine's stack to the test log (t.Logf),
+// so the dump stays with the output of the failing test. Tests call it
+// when an assertion other than the watchdog fails.
 func dumpGoroutines(t *testing.T) {
 	t.Helper()
 	buf := make([]byte, 4*1024*1024)

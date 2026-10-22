@@ -52,8 +52,8 @@ func TestNodeReadSharesOneLoad(t *testing.T) {
 }
 
 // TestNodeReadLoadsShardsOnce counts the shard loads of one warm search of a
-// dirty Git node: the strict route and the description route each load the
-// node's shards once, for every query of the read. A read with no search
+// dirty Git node: the strict route (no model) and the model route each load
+// the node's shards once, for every query of the read. A read with no search
 // loads none.
 func TestNodeReadLoadsShardsOnce(t *testing.T) {
 	requireTools(t)

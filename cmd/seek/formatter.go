@@ -21,8 +21,8 @@ import (
 // longer than maxLineBytes is tail-trimmed. Both bounds are SOURCE bytes —
 // ANSI color escapes and the "…+N bytes" markers do not count toward them.
 //
-// TODO: expose as a config flag if someone asks. Kept as consts to honour the
-// "zero new flags" contract.
+// TODO: make these a flag when a user needs other bounds. They stay constants
+// until then, so the CLI has no flag for them.
 const (
 	maxLineBytes  = 1024
 	matchCtxBytes = 512
@@ -494,10 +494,10 @@ func writeMatchLineContent(sb corpusFormatWriter, content []byte, frags []zoekt.
 	}
 }
 
-// stripRune reports whether output must omit r. It drops C0, C1, and DEL control
-// characters except tab. It also drops bidirectional formatting and line or
-// paragraph separators because they can alter the displayed source layout. It
-// keeps zero-width joiners for scripts and emoji sequences.
+// stripRune reports whether output must omit r. It drops C0, C1, and DEL
+// control characters except tab. It also drops bidirectional formatting and
+// line or paragraph separators because they can alter the displayed source
+// layout. It keeps zero-width joiners for scripts and emoji sequences.
 func stripRune(r rune) bool {
 	if r < 0x80 {
 		// Strip C0 controls and DEL, but keep tab.
@@ -521,9 +521,9 @@ func stripRune(r rune) bool {
 // It iterates runes because C1 values overlap UTF-8 continuation bytes. When no
 // rune is removed, it writes the original bytes unchanged.
 //
-// Invalid UTF-8: a clean line is written verbatim (bytes preserved); a line that
-// also needs stripping goes through the rune path, where invalid bytes decode to
-// U+FFFD.
+// Invalid UTF-8: a clean line is written verbatim (bytes preserved); a line
+// that also needs stripping goes through the rune path, where invalid bytes
+// decode to U+FFFD.
 func writeSanitized(sb corpusFormatWriter, b []byte) {
 	clean := true
 	for _, r := range string(b) {
@@ -564,9 +564,9 @@ func writeSanitizedString(sb corpusFormatWriter, text string) {
 	}
 }
 
-// containsVisible reports whether b has any rune that survives sanitization
-// (i.e. a non-control rune, or tab). Used to avoid emitting an empty color pair
-// around an all-control match span.
+// containsVisible reports whether b has a rune that stripRune keeps. It
+// prevents an empty color pair around a match span that holds only stripped
+// runes.
 func containsVisible(b []byte) bool {
 	for _, r := range string(b) {
 		if !stripRune(r) {

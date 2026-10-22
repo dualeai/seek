@@ -131,6 +131,41 @@ func TestSemanticBuildSkipsBinaryContent(t *testing.T) {
 	}
 }
 
+// TestSemanticBuildSkipsZoektNameOnlyContent builds vectors for files at
+// Zoekt's content limits: a file of 1 or 2 bytes and a file with a NUL byte
+// past its start keep only their names in Zoekt, so they get no rows. A file
+// of 3 bytes gets rows.
+func TestSemanticBuildSkipsZoektNameOnlyContent(t *testing.T) {
+	units := buildSemanticTestUnits(t, map[string][]byte{
+		"one.txt":   []byte("x"),
+		"two.txt":   []byte("x\n"),
+		"nul.txt":   []byte("text\x00more"),
+		"three.txt": []byte("xy\n"),
+	})
+	paths := map[string]struct{}{}
+	for _, unit := range units {
+		paths[unit.path] = struct{}{}
+	}
+	if !maps.Equal(paths, map[string]struct{}{"three.txt": {}}) {
+		t.Fatalf("rows of %v, want rows of three.txt only", slices.Sorted(maps.Keys(paths)))
+	}
+}
+
+// TestSemanticManifestRejectsTinyFileRows validates a manifest of the
+// extraction rule that gives rows to files of 1 or 2 bytes
+// (ctags-gaps-v6-windows). No shard copy matches such rows, so the check
+// rejects that generation, and the next build replaces it.
+func TestSemanticManifestRejectsTinyFileRows(t *testing.T) {
+	manifest := testLargeSemanticManifest(t, 1)
+	if err := validateSemanticManifest(manifest, "head"); err != nil {
+		t.Fatalf("a manifest of the current rule fails: %v", err)
+	}
+	manifest.Extractor = "ctags-gaps-v6-windows"
+	if err := validateSemanticManifest(manifest, "head"); err == nil {
+		t.Fatal("a generation with rows of files that Zoekt keeps by name only validates")
+	}
+}
+
 // TestGeneratedFileInVectors checks that a file with the generated-code
 // marker gives rows over the whole file, as any source file does.
 func TestGeneratedFileInVectors(t *testing.T) {

@@ -92,8 +92,8 @@ func e2eMarkerModelPaths(scorer *hybridTestScorer) (embedded, scored []string) {
 	return slices.Compact(embedded), slices.Compact(scored)
 }
 
-// e2eMarkerSameBlocks fails the test unless the description output and the
-// text oracle print the same headers, tags and lines.
+// e2eMarkerSameBlocks fails the test unless the text oracle prints at least
+// one file and the description output prints the same headers, tags and lines.
 func e2eMarkerSameBlocks(t *testing.T, label, description, oracle string) {
 	t.Helper()
 	got, want := e2eMarkerBlocks(description), e2eMarkerBlocks(oracle)
@@ -110,7 +110,8 @@ func e2eMarkerSameBlocks(t *testing.T, label, description, oracle string) {
 
 // TestE2EMarkerUncommittedTagOnDirtyVectorHits finds files of one Git node
 // only through vectors. Modified, staged and untracked files print with
-// [uncommitted], and the clean file prints with no tag. A text search agrees.
+// [uncommitted] and their current bytes, and the clean file prints with no
+// tag. A text search agrees. A warm search prints the same and embeds nothing.
 func TestE2EMarkerUncommittedTagOnDirtyVectorHits(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -273,8 +274,8 @@ func TestE2EMarkerNodeTagsAcrossRoots(t *testing.T) {
 
 // TestE2EMarkerVectorOnlyDuplicatesCollapse finds one content only through
 // vectors in a repository, its linked worktree, an untracked copy and a
-// folder. The copies print as one result with an "also:" line (D30), and the
-// model scores one copy. An edited copy prints as its own result.
+// folder. The copies print as one result with an "also:" line, and the model
+// scores one copy. An edited copy prints as its own result.
 func TestE2EMarkerVectorOnlyDuplicatesCollapse(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -296,7 +297,7 @@ func TestE2EMarkerVectorOnlyDuplicatesCollapse(t *testing.T) {
 		t.Fatalf("no vector hit: %v", err)
 	}
 	// The copies with the same bytes, from the fixture. The representative
-	// is the smallest path (D30), and the other copies follow it.
+	// is the smallest path, and the other copies follow it.
 	copies := []string{
 		filepath.Join(folder, "dup.go"),
 		filepath.Join(repo, "dup.go"),
@@ -328,7 +329,7 @@ func TestE2EMarkerVectorOnlyDuplicatesCollapse(t *testing.T) {
 }
 
 // TestE2EMarkerNameOnlyFilesNeverReachTheModel puts a vector target in
-// binary files (a NUL byte at the start and after the 8,000-byte probe), a
+// binary files (a NUL byte in the 8,000-byte probe and after it), a
 // file above the content limit, an unreadable file and a blob that a partial
 // clone lacks. The model never embeds or scores them, and the name-only
 // notice counts all 10, as the text search does.
@@ -405,7 +406,8 @@ func TestE2EMarkerNameOnlyFilesNeverReachTheModel(t *testing.T) {
 // TestE2EMarkerNestedRepositoriesAreTheirOwnNodes searches a repository with
 // a submodule and an untracked nested repository. The vector hits of each
 // print under its own path with its own tags, also a dirty submodule file.
-// The parent never embeds a file of a child. A text search agrees.
+// The parent never embeds a file of a child. A text search agrees, and a warm
+// search prints the same.
 func TestE2EMarkerNestedRepositoriesAreTheirOwnNodes(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -492,10 +494,11 @@ func TestE2EMarkerGitIgnoredFileFollowsTheOperand(t *testing.T) {
 }
 
 // TestE2EMarkerStaleIndexAddsNoFilesByMeaning holds the build locks of a Git
-// node and a folder node, as a peer builder does, after a change. The
-// description then gets its candidates from text matches only (README
-// "Parallel use"). This test needs text hits: strict.go and fstrict.go hold
-// both description words.
+// node and a folder node, as a peer builder does, and then adds vector
+// targets. The description then gets its candidates from text matches only
+// (README "Parallel use"), and the model embeds nothing. When the locks go,
+// the search finds the new targets. This test needs text hits: strict.go and
+// fstrict.go hold both description words.
 func TestE2EMarkerStaleIndexAddsNoFilesByMeaning(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -571,8 +574,10 @@ func TestE2EMarkerStaleIndexAddsNoFilesByMeaning(t *testing.T) {
 
 // TestE2EMarkerCommitMovesTheBaseAndTheOverlay changes a Git node between
 // descriptions: dirty files first, then a commit of them and a deletion. Each
-// step prints the files, tags and lines that a text search prints. After the
-// commit, no file keeps [uncommitted] and the deleted file is gone.
+// step prints the files, tags and lines that a text search prints, and a
+// function that moved down prints its current line. After the commit, no file
+// keeps [uncommitted], the deleted file is gone, and a warm search embeds
+// nothing.
 func TestE2EMarkerCommitMovesTheBaseAndTheOverlay(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)

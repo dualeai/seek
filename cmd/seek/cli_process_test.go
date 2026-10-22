@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -308,9 +310,10 @@ func TestCLIProcess_LexicalOnlySkipsSemanticCacheAndModel(t *testing.T) {
 	}
 }
 
-// TestCLIProcess_QueryShapeDecidesSemanticCache checks the user-visible rule
-// the README states: Seek builds meaning-based data only for a search that can
-// read it. An exact word cannot reach it, a description can.
+// TestCLIProcess_QueryShapeDecidesSemanticCache checks the user-visible rule:
+// Seek builds meaning-based data for every search that can read it. One word,
+// a symbol filter and a description reach it; a query of negations only gives
+// the model no text, so it builds none.
 //
 // This sits at process level beside the --lexical-only test because it makes
 // the same kind of claim: a command either leaves semantic data in the cache or
@@ -331,9 +334,10 @@ func TestCLIProcess_QueryShapeDecidesSemanticCache(t *testing.T) {
 		wantResults bool
 		wantVectors bool
 	}{
-		{name: "exact word", query: "alpha", wantCode: 0, wantResults: true, wantVectors: false},
-		{name: "symbol lookup", query: "sym:Missing", wantCode: 1, wantResults: false, wantVectors: false},
+		{name: "exact word", query: "alpha", wantCode: 0, wantResults: true, wantVectors: true},
+		{name: "symbol lookup", query: "sym:Missing", wantCode: 1, wantResults: false, wantVectors: true},
 		{name: "description", query: "describes the sample", wantCode: 0, wantResults: true, wantVectors: true},
+		{name: "negations only", query: "-file:missing", wantCode: 0, wantResults: true, wantVectors: false},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			cacheDir := t.TempDir()
@@ -408,8 +412,23 @@ func runCLIProcess(t *testing.T, dir string, args, extraEnv []string) cliProcess
 
 func runCLIProcessWithCache(t *testing.T, cacheDir, dir string, args, extraEnv []string) cliProcessResult {
 	t.Helper()
+	result, _ := runCLIProcessWithin(t, 0, cacheDir, dir, args, extraEnv)
+	return result
+}
+
+// runCLIProcessWithin runs the CLI process as runCLIProcessWithCache does. A
+// positive timeout kills a process that runs longer, and the second result
+// then is true.
+func runCLIProcessWithin(t *testing.T, timeout time.Duration, cacheDir, dir string, args, extraEnv []string) (cliProcessResult, bool) {
+	t.Helper()
+	ctx := t.Context()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 	commandArgs := append([]string{"-test.run=^TestCLIProcessHelper$", "--"}, args...)
-	cmd := exec.Command(os.Args[0], commandArgs...)
+	cmd := exec.CommandContext(ctx, os.Args[0], commandArgs...)
 	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -424,14 +443,17 @@ func runCLIProcessWithCache(t *testing.T, cacheDir, dir string, args, extraEnv [
 	runErr := cmd.Run()
 	result := cliProcessResult{stdout: stdout.String(), stderr: stderr.String()}
 	if runErr == nil {
-		return result
+		return result, false
+	}
+	if timeout > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return result, true
 	}
 	var exitErr *exec.ExitError
 	if !errors.As(runErr, &exitErr) {
 		t.Fatalf("run CLI helper: %v", runErr)
 	}
 	result.code = exitErr.ExitCode()
-	return result
+	return result, false
 }
 
 // TestCLIProcess_ContentRulesOnStdoutAndStderr checks the user-facing contract

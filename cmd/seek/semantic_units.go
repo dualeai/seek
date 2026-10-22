@@ -34,7 +34,9 @@ const (
 	semanticUnitsSegmentExt  = ".seg"
 )
 
-// semanticUnitsDirFor is the store of one model compatibility key.
+// semanticUnitsDirFor is the store of one row-key prefix
+// (semanticRowKeyPrefix): a new model, representation, codec, or run time
+// starts a new store.
 func semanticUnitsDirFor(cacheRoot string) string {
 	return filepath.Join(cacheRoot, corporaDir, semanticUnitsDir, hex.EncodeToString(semanticRowKeyPrefix()[:16]))
 }
@@ -284,9 +286,9 @@ func semanticRowVectorsValid(generation *semanticGeneration, row uint64) bool {
 	return semanticVectorsValid(&generation.vectors[row], &generation.coarse[row])
 }
 
-func semanticVectorsValid(fine *semanticFineSNORM16Vectors, coarse *semanticCoarseSNORM16Vectors) bool {
+func semanticVectorsValid(fine *semanticFineF16Vectors, coarse *semanticCoarseSNORM16Vectors) bool {
 	for centroid := range fine {
-		if validateSemanticSNORM16Vector(&fine[centroid]) != nil {
+		if validateSemanticF16Vector(&fine[centroid]) != nil {
 			return false
 		}
 	}

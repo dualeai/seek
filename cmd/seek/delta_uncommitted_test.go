@@ -1,17 +1,22 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/sourcegraph/zoekt/index"
 )
 
 // dirtyAndIndex rewrites the working-tree file at relPath with content and
@@ -119,8 +124,9 @@ func TestDeltaUncommitted_DirtyToCommittedTombstonesUncommittedShard(t *testing.
 func TestDeltaUncommitted_CommittedToDirtyHidesCommittedContent(t *testing.T) {
 	requireTools(t)
 
-	// deduplicateCorpusResults makes dirty content replace committed content for
-	// the same path. Use runSeekInRepo to exercise the public search path.
+	// The node read hides the committed copy of a dirty file, so dirty content
+	// replaces committed content. Use runSeekInRepo to exercise the public
+	// search path.
 	dir := initGitRepo(t, "app.go", "package main\n// committed_only_marker\n")
 
 	files, err := runSeekInRepo(t, dir, "committed_only_marker")
@@ -371,7 +377,7 @@ func TestDeltaUncommitted_NewFileAppearsInDelta(t *testing.T) {
 	}
 	reindexGit(t, ctx, paths, plan)
 
-	// Second cycle adds a brand-new untracked file — the delta must pick it up.
+	// The second cycle adds a new untracked file: the delta must read it.
 	if err := os.WriteFile(filepath.Join(dir, "new.go"), []byte("package main\n// brand_new_dirty_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -491,12 +497,304 @@ func TestDeltaUncommitted_RemovalOnlyHidesTheRemovedFile(t *testing.T) {
 		[]string{"keep_second_marker", "added_marker", "committed_base"})
 }
 
-// TestDeltaUncommitted_OnlyAMissingFileIsGone stats a deleted file and a path
-// too long for Lstat: only the deleted file is gone, and the delta reads the
+// shardFileState is the identity of a shard family on disk: the inode of each
+// .zoekt file and the content of each .meta sidecar, by file name.
+type shardFileState struct {
+	shards map[string]uint64
+	metas  map[string]string
+}
+
+// readShardFileState reads the shard files of repoName in indexDir.
+func readShardFileState(t *testing.T, indexDir, repoName string) shardFileState {
+	t.Helper()
+	state := shardFileState{shards: map[string]uint64{}, metas: map[string]string{}}
+	for _, shard := range repositoryShardFiles(indexDir, repoName) {
+		info, err := os.Stat(shard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state.shards[filepath.Base(shard)] = info.Sys().(*syscall.Stat_t).Ino
+		if meta, err := os.ReadFile(shard + ".meta"); err == nil {
+			state.metas[filepath.Base(shard)] = string(meta)
+		}
+	}
+	return state
+}
+
+// requireTombstoneOnlyDelta fails unless after has the shard files of before,
+// each with its inode, and at least one .meta sidecar changed: a delta wrote
+// only tombstones and rebuilt no shard.
+func requireTombstoneOnlyDelta(t *testing.T, before, after shardFileState) {
+	t.Helper()
+	if !maps.Equal(before.shards, after.shards) {
+		t.Fatalf("shard files changed: before=%v after=%v", before.shards, after.shards)
+	}
+	if maps.Equal(before.metas, after.metas) {
+		t.Fatal("no .meta sidecar changed: the delta wrote no tombstone")
+	}
+}
+
+// TestDeltaUncommitted_RemovalOnlyKeepsShards removes one of two dirty files.
+// The delta writes tombstones only: every prior uncommitted shard keeps its
+// inode, the shard count stays, and only the .meta sidecars change.
+func TestDeltaUncommitted_RemovalOnlyKeepsShards(t *testing.T) {
+	requireTools(t)
+	dir := initGitRepo(t, "app.go", "package main\n// committed_base\n")
+	ctx := context.Background()
+	paths, plan := planGitTestCorpus(t, dir)
+	reindexGit(t, ctx, paths, plan)
+	keep := "package main\n// keep_marker\n" + strings.Repeat("// filler line\n", 40)
+	if err := os.WriteFile(filepath.Join(dir, "keep.go"), []byte(keep), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "gone.go"), []byte("package main\n// gone_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	before := readShardFileState(t, plan.indexDir, repoUncommitted)
+	if len(before.shards) == 0 {
+		t.Fatal("no uncommitted shard")
+	}
+
+	if err := os.Remove(filepath.Join(dir, "gone.go")); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	requireTombstoneOnlyDelta(t, before, readShardFileState(t, plan.indexDir, repoUncommitted))
+	if results, err := searchPlannedCorpusForTest(ctx, plan, "gone_marker"); err != nil || len(results) != 0 {
+		t.Fatalf("gone_marker matches %d files, want none; error=%v", len(results), err)
+	}
+}
+
+// requireFullRebuild fails unless after shares no shard file with before: the
+// build replaced the family.
+func requireFullRebuild(t *testing.T, before, after shardFileState) {
+	t.Helper()
+	for name, inode := range before.shards {
+		if after.shards[name] == inode {
+			t.Fatalf("shard %s kept inode %d: the build was a delta", name, inode)
+		}
+	}
+	if len(after.shards) == 0 {
+		t.Fatal("no shard after the full rebuild")
+	}
+}
+
+// requireTombstoneOnlyDeltaOrNewShard fails unless every shard of before keeps
+// its inode in after: the build was a delta, which can add shards.
+func requireTombstoneOnlyDeltaOrNewShard(t *testing.T, before, after shardFileState) {
+	t.Helper()
+	for name, inode := range before.shards {
+		if after.shards[name] != inode {
+			t.Fatalf("shard %s changed inode %d -> %d: the build was not a delta", name, inode, after.shards[name])
+		}
+	}
+}
+
+// compactionFixtureFile is the content of file i of the compaction tests:
+// files of one size, so a count of files is a count of bytes.
+func compactionFixtureFile(i int) string {
+	return fmt.Sprintf("package main\n// compact_marker_%02d\n", i) + strings.Repeat("// filler line\n", 40)
+}
+
+// TestDeltaUncommitted_TombstonedBytesCompactTheFamily removes 3 of 10 dirty
+// files of one size, then 2 more. The first delta tombstones 3 files against 7
+// live ones and stays a delta. With the second, deltas tombstoned 5 files
+// against 5 live ones, so the build replaces the family
+// (deltaNeedsCompaction).
+func TestDeltaUncommitted_TombstonedBytesCompactTheFamily(t *testing.T) {
+	requireTools(t)
+	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
+	// shard) below the bytes of two of these files of 634 bytes.
+	swapShardMaxForTest(t, 1024)
+	dir := initGitRepo(t, "app.go", "package main\n// committed_base\n")
+	ctx := context.Background()
+	paths, plan := planGitTestCorpus(t, dir)
+	reindexGit(t, ctx, paths, plan)
+	for i := range 10 {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("d%02d.go", i)), []byte(compactionFixtureFile(i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reindexGit(t, ctx, paths, plan)
+	remove := func(files ...int) {
+		t.Helper()
+		for _, i := range files {
+			if err := os.Remove(filepath.Join(dir, fmt.Sprintf("d%02d.go", i))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		reindexGit(t, ctx, paths, plan)
+	}
+
+	before := readShardFileState(t, plan.indexDir, repoUncommitted)
+	remove(0, 1, 2)
+	requireTombstoneOnlyDelta(t, before, readShardFileState(t, plan.indexDir, repoUncommitted))
+
+	before = readShardFileState(t, plan.indexDir, repoUncommitted)
+	remove(3, 4)
+	requireFullRebuild(t, before, readShardFileState(t, plan.indexDir, repoUncommitted))
+	for i := range 10 {
+		results, err := searchPlannedCorpusForTest(ctx, plan, fmt.Sprintf("compact_marker_%02d", i))
+		if want := min(max(i-4, 0), 1); err != nil || len(results) != want {
+			t.Fatalf("compact_marker_%02d matches %d files, want %d; error=%v", i, len(results), want, err)
+		}
+	}
+}
+
+// TestNameOnlyMarkerBytes checks the bytes that a shard document holds for
+// each kind of document: Zoekt's NOT-INDEXED marker for a document kept by
+// name only, by the reader or by Zoekt's own check, else the content.
+func TestNameOnlyMarkerBytes(t *testing.T) {
+	late := append(bytes.Repeat([]byte("a"), 9000), 0)
+	for _, test := range []struct {
+		name string
+		doc  fileContent
+		held int64
+	}{
+		{"text", fileContent{content: []byte("package main\n")}, 13},
+		{"empty", fileContent{}, 0},
+		{"two bytes", fileContent{content: []byte("ab")}, int64(len("NOT-INDEXED: contains too few trigrams"))},
+		{"NUL after the reader's probe", fileContent{content: late}, int64(len("NOT-INDEXED: contains binary content"))},
+		{"binary by the reader", fileContent{skipReason: index.SkipReasonBinary}, int64(len("NOT-INDEXED: contains binary content"))},
+		{"too large", fileContent{skipReason: index.SkipReasonTooLarge}, int64(len("NOT-INDEXED: exceeds the maximum size limit"))},
+		{"no bytes", fileContent{skipReason: seekNoBytesReason}, int64(len("NOT-INDEXED: contains too many trigrams"))},
+	} {
+		if got := heldContentBytes(test.doc); got != test.held {
+			t.Errorf("%s: held=%d, want %d", test.name, got, test.held)
+		}
+	}
+}
+
+// binaryFixtureFile is a file of 8,000 bytes with NUL bytes: its shard holds
+// a marker of 36 bytes.
+var binaryFixtureFile = bytes.Repeat([]byte{0, 1, 2, 3}, 2000)
+
+// textFixture8000 is a text file of 8,000 bytes.
+var textFixture8000 = bytes.Repeat([]byte("// text line of about eighty bytes for the large text file of the fixture\n"), 110)[:8000]
+
+// TestDeltaUncommitted_TextFileThatBecomesBinaryCompacts removes 2 of 10 dirty
+// text files beside a text file of 8,000 bytes, then makes that file binary.
+// Before the reads, the file counts at its size, so the rule keeps a delta.
+// After the reads, it counts as its 36-byte marker: 2 dead text files and its
+// old 8,000 bytes then reach the 8 live text files and the marker, so the
+// family builds in full (deltaNeedsCompaction).
+func TestDeltaUncommitted_TextFileThatBecomesBinaryCompacts(t *testing.T) {
+	requireTools(t)
+	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
+	// shard) below the bytes of two of these files of 634 bytes.
+	swapShardMaxForTest(t, 1024)
+	dir := initGitRepo(t, "app.go", "package main\n// committed_base\n")
+	ctx := context.Background()
+	paths, plan := planGitTestCorpus(t, dir)
+	reindexGit(t, ctx, paths, plan)
+	for i := range 10 {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("d%02d.go", i)), []byte(compactionFixtureFile(i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "big.txt"), textFixture8000, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	for i := range 2 {
+		if err := os.Remove(filepath.Join(dir, fmt.Sprintf("d%02d.go", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reindexGit(t, ctx, paths, plan)
+	before := readShardFileState(t, plan.indexDir, repoUncommitted)
+	if err := os.WriteFile(filepath.Join(dir, "big.txt"), binaryFixtureFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	requireFullRebuild(t, before, readShardFileState(t, plan.indexDir, repoUncommitted))
+}
+
+// TestDeltaUncommitted_BinaryFileThatBecomesTextStaysADelta removes 4 of 10
+// dirty text files beside a binary file, then 2 more while the binary file
+// becomes 20,280 bytes of text. Before the reads, the changed file counts at
+// an upper bound of its shard bytes, not at its old marker, so the rule keeps
+// the delta that the read bytes keep: 6 dead text files and the old marker
+// stay below the live bytes (deltaNeedsCompaction).
+func TestDeltaUncommitted_BinaryFileThatBecomesTextStaysADelta(t *testing.T) {
+	requireTools(t)
+	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
+	// shard) below the bytes of two of these files of 634 bytes.
+	swapShardMaxForTest(t, 1024)
+	dir := initGitRepo(t, "app.go", "package main\n// committed_base\n")
+	ctx := context.Background()
+	paths, plan := planGitTestCorpus(t, dir)
+	reindexGit(t, ctx, paths, plan)
+	for i := range 10 {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("d%02d.go", i)), []byte(compactionFixtureFile(i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "blob.bin"), binaryFixtureFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	remove := func(files ...int) {
+		t.Helper()
+		for _, i := range files {
+			if err := os.Remove(filepath.Join(dir, fmt.Sprintf("d%02d.go", i))); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	remove(0, 1, 2, 3)
+	reindexGit(t, ctx, paths, plan)
+	before := readShardFileState(t, plan.indexDir, repoUncommitted)
+	remove(4, 5)
+	text := bytes.Repeat([]byte("// text line of the former binary file\n"), 520)
+	if err := os.WriteFile(filepath.Join(dir, "blob.bin"), text, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	requireTombstoneOnlyDeltaOrNewShard(t, before, readShardFileState(t, plan.indexDir, repoUncommitted))
+}
+
+// TestDeltaUncommitted_BinaryFilesCountTheirMarker removes 8 of 10 dirty text
+// files beside a dirty binary file of 8,000 bytes. The binary file counts as
+// its marker, so 8 dead text files against 2 live ones and the marker rebuild
+// the family (deltaNeedsCompaction).
+func TestDeltaUncommitted_BinaryFilesCountTheirMarker(t *testing.T) {
+	requireTools(t)
+	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
+	// shard) below the bytes of two of these files of 634 bytes.
+	swapShardMaxForTest(t, 1024)
+	dir := initGitRepo(t, "app.go", "package main\n// committed_base\n")
+	ctx := context.Background()
+	paths, plan := planGitTestCorpus(t, dir)
+	reindexGit(t, ctx, paths, plan)
+	for i := range 10 {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("d%02d.go", i)), []byte(compactionFixtureFile(i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "blob.bin"), binaryFixtureFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	before := readShardFileState(t, plan.indexDir, repoUncommitted)
+	for i := range 8 {
+		if err := os.Remove(filepath.Join(dir, fmt.Sprintf("d%02d.go", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reindexGit(t, ctx, paths, plan)
+	requireFullRebuild(t, before, readShardFileState(t, plan.indexDir, repoUncommitted))
+}
+
+// TestDeltaUncommitted_OnlyAMissingFileIsGone stats a deleted file and a file
+// at the root whose name passes the 255-byte limit of one file name, so Lstat
+// fails with ENAMETOOLONG on Linux and macOS (a missing folder before it would
+// give ENOENT first): only the deleted file is gone, and the delta reads the
 // other one. A gone file gets no manifest entry, so when it comes back the
 // delta tombstones nothing.
 func TestDeltaUncommitted_OnlyAMissingFileIsGone(t *testing.T) {
-	long := strings.Repeat("z/", 600) + "x.txt"
+	long := strings.Repeat("z", 300) + ".txt"
 	candidates := statUncommittedCandidates(t.TempDir(), []string{"deleted.txt", long})
 	if len(candidates) != 2 || !candidates[0].gone || candidates[1].gone {
 		t.Fatalf("candidates=%+v, want deleted.txt gone and the long path not", candidates)
@@ -504,7 +802,7 @@ func TestDeltaUncommitted_OnlyAMissingFileIsGone(t *testing.T) {
 	if entries := uncommittedManifestEntries(candidates); len(entries) != 1 || entries[0].Name != long {
 		t.Fatalf("entries=%+v, want the long path only", entries)
 	}
-	toRead, changed := diffUncommittedAgainstManifest(candidates, uncommittedManifest{})
+	toRead, changed, _ := diffUncommittedAgainstManifest(candidates, uncommittedManifest{})
 	if len(toRead) != 1 || toRead[0].name != long || !slices.Equal(changed, []string{long}) {
 		t.Fatalf("toRead=%+v changed=%v, want the long path only", toRead, changed)
 	}

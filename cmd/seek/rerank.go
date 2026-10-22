@@ -31,8 +31,9 @@ var errRerankUnavailable = errors.New("re-ranker unavailable")
 type rerankQueryPlan struct {
 	modelQuery string
 	relaxedQ   query.Q
-	// filters are the filter children of the description: Zoekt evaluates them
-	// on each node for the semantic row mask (nodeRowSelection).
+	// filters bound the vectors: the filter part of each filter and of each
+	// or that holds descriptions (rerankMask). Zoekt evaluates them on each
+	// node for the semantic row mask (nodeRowSelection).
 	filters []query.Q
 }
 
@@ -44,6 +45,9 @@ type rerankDocument struct {
 	// matchAt and matchEnd are byte offsets in Text.
 	matchAt  int
 	matchEnd int
+	// modelBase is the model path base of the file's node (modelPathBase):
+	// the model reads the path that the window header of its rows names.
+	modelBase string
 }
 
 // searchRunConfig is the search policy and the model factory of one command.
@@ -54,16 +58,26 @@ type searchRunConfig struct {
 
 // planRerankQuery plans the model routes from Zoekt's parsed tree, after
 // Zoekt's own simplification, so a route never depends on how the query was
-// spelled. Description atoms feed the model; filters stay with Zoekt;
-// modifiers change no route (querySupport in query_support_table_test.go). It
-// needs two description atoms and returns false for an or between descriptions
-// and for a query that matches nothing.
+// spelled. A query of files that gives the model text uses the model: one
+// word, an identifier and a phrase too. Description atoms feed the model;
+// filters stay with Zoekt; modifiers change no route (querySupport in
+// query_support_table_test.go). An or that holds descriptions gives the model
+// every description atom in it, in query order, and relaxed retrieval any one
+// of them; the strict query keeps the or, and its filters bound the vectors.
+// A query of filters only gives the model the text of its positive patterns
+// (rerankFilterText): sym:Foo reads Foo. It returns false for a query with no
+// text for the model: one that matches nothing, one of a result type other
+// than files (type:repo), and one whose filters have no positive pattern
+// (negations, punctuation, repo: or branch: only).
 func planRerankQuery(raw query.Q) (rerankQueryPlan, bool) {
-	tree := query.Simplify(raw)
-	// type:file is an output mode: plan its child.
-	if typed, ok := tree.(*query.Type); ok && typed.Type == query.TypeFileName {
-		tree = typed.Child
-	}
+	// type:file is an output mode at every depth: Zoekt matches a type:file
+	// node as its child, so the plan reads the child.
+	tree := query.Simplify(query.Map(raw, func(node query.Q) query.Q {
+		if typed, ok := node.(*query.Type); ok && typed.Type == query.TypeFileName {
+			return typed.Child
+		}
+		return node
+	}))
 	children := []query.Q{tree}
 	if and, ok := tree.(*query.And); ok {
 		children = and.Children
@@ -71,6 +85,8 @@ func planRerankQuery(raw query.Q) (rerankQueryPlan, bool) {
 	terms := make([]string, 0, len(children))
 	descriptions := make([]query.Q, 0, len(children))
 	filters := make([]query.Q, 0, len(children))
+	relaxedFilters := make([]query.Q, 0, len(children))
+	var filterText []string
 	var punctuation []query.Q
 	for _, child := range children {
 		if term, text, ok := rerankDescriptionAtom(child); ok {
@@ -84,17 +100,40 @@ func planRerankQuery(raw query.Q) (rerankQueryPlan, bool) {
 			punctuation = append(punctuation, child)
 			continue
 		}
-		if !rerankFilter(child) {
-			return rerankQueryPlan{}, false
+		if rerankFilter(child) {
+			// Relaxed retrieval keeps the filter as Zoekt reads it, as it
+			// keeps a punctuation token.
+			filterText = rerankFilterText(child, filterText)
+			relaxedFilters = append(relaxedFilters, child)
+			if mask := rerankMask(child); mask != nil {
+				filters = append(filters, mask)
+			}
+			continue
 		}
-		filters = append(filters, child)
+		// An or that holds descriptions is not a filter: its atoms feed the
+		// model and relaxed retrieval, and the strict query keeps the or. Its
+		// filters still bound the vectors.
+		for _, atom := range rerankDescriptionAtoms(child, nil) {
+			term, text, _ := rerankDescriptionAtom(atom)
+			terms = append(terms, text)
+			descriptions = append(descriptions, term)
+		}
+		if mask := rerankMask(child); mask != nil {
+			filters = append(filters, mask)
+			relaxedFilters = append(relaxedFilters, mask)
+		}
 	}
-	if len(terms) < 2 {
+	if len(terms) == 0 {
+		terms = filterText
+	}
+	if len(terms) == 0 {
 		return rerankQueryPlan{}, false
 	}
-	relaxedChildren := make([]query.Q, 0, len(filters)+len(punctuation)+1)
-	relaxedChildren = append(relaxedChildren, query.NewOr(descriptions...))
-	relaxedChildren = append(relaxedChildren, filters...)
+	relaxedChildren := make([]query.Q, 0, len(relaxedFilters)+len(punctuation)+1)
+	if len(descriptions) > 0 {
+		relaxedChildren = append(relaxedChildren, query.NewOr(descriptions...))
+	}
+	relaxedChildren = append(relaxedChildren, relaxedFilters...)
 	relaxedChildren = append(relaxedChildren, punctuation...)
 	plan := rerankQueryPlan{
 		modelQuery: strings.Join(terms, " "),
@@ -104,9 +143,95 @@ func planRerankQuery(raw query.Q) (rerankQueryPlan, bool) {
 	return plan, true
 }
 
+// rerankDescriptionAtoms appends the description atoms of an and or an or, in
+// query order. A negation holds none: its atoms filter.
+func rerankDescriptionAtoms(node query.Q, atoms []query.Q) []query.Q {
+	if _, _, ok := rerankDescriptionAtom(node); ok {
+		return append(atoms, node)
+	}
+	switch typed := node.(type) {
+	case *query.And:
+		for _, child := range typed.Children {
+			atoms = rerankDescriptionAtoms(child, atoms)
+		}
+	case *query.Or:
+		for _, child := range typed.Children {
+			atoms = rerankDescriptionAtoms(child, atoms)
+		}
+	}
+	return atoms
+}
+
+// rerankMask returns the part of node that bounds the vectors, or nil when it
+// bounds nothing: node with each description atom and each punctuation atom
+// outside a negation read as true (rerankDescriptionsAsTrue).
+func rerankMask(node query.Q) query.Q {
+	mask := query.Simplify(rerankDescriptionsAsTrue(node))
+	if always, ok := mask.(*query.Const); ok && always.Value {
+		return nil
+	}
+	return mask
+}
+
+// rerankDescriptionsAsTrue returns node with each description atom outside a
+// negation replaced by true. A punctuation atom filters nothing, as at the top
+// level, so it reads as true too. An atom inside a negation is a filter and
+// stays.
+func rerankDescriptionsAsTrue(node query.Q) query.Q {
+	if _, _, ok := rerankDescriptionAtom(node); ok || rerankPunctuationAtom(node) {
+		return &query.Const{Value: true}
+	}
+	switch typed := node.(type) {
+	case *query.And:
+		children := make([]query.Q, len(typed.Children))
+		for index, child := range typed.Children {
+			children[index] = rerankDescriptionsAsTrue(child)
+		}
+		return query.NewAnd(children...)
+	case *query.Or:
+		children := make([]query.Q, len(typed.Children))
+		for index, child := range typed.Children {
+			children[index] = rerankDescriptionsAsTrue(child)
+		}
+		return query.NewOr(children...)
+	}
+	return node
+}
+
+// rerankFilterText appends the model text of the positive patterns of a
+// filter: the pattern of a file, content or symbol atom, and the name of a
+// language. A negation, a repository or branch atom, a result type and the
+// API-only nodes add none.
+func rerankFilterText(node query.Q, text []string) []string {
+	switch typed := node.(type) {
+	case *query.Substring:
+		if hasWordCharacter(typed.Pattern) {
+			text = append(text, typed.Pattern)
+		}
+	case *query.Regexp:
+		if typed.Regexp != nil && regexpHasLiteralWord(typed.Regexp) {
+			text = append(text, regexpModelText(typed.Regexp))
+		}
+	case *query.Symbol:
+		text = rerankFilterText(typed.Expr, text)
+	case *query.Language:
+		text = append(text, typed.Language)
+	case *query.And:
+		for _, child := range typed.Children {
+			text = rerankFilterText(child, text)
+		}
+	case *query.Or:
+		for _, child := range typed.Children {
+			text = rerankFilterText(child, text)
+		}
+	}
+	return text
+}
+
 // rerankDescriptionAtom returns a description atom as the content-only node
 // of relaxed retrieval, and the text that the model reads: any word, phrase,
-// or regular expression that is not a file or content filter.
+// or regular expression with a literal letter or digit that is not a file or
+// content filter.
 func rerankDescriptionAtom(node query.Q) (query.Q, string, bool) {
 	switch typed := node.(type) {
 	case *query.Substring:
@@ -233,8 +358,9 @@ func regexpModelRepeated(sub *syntax.Regexp) string {
 
 // rerankFilter reports a node that Zoekt applies as a filter of the
 // description atoms: a file, content, language, or symbol atom, a negation, a
-// repository or branch atom (which Seek passes to Zoekt unchanged), or an or
-// of filters. An or that holds a description is not a filter.
+// repository or branch atom (which Seek passes to Zoekt unchanged), or an and
+// or an or of filters. An and or an or that holds a description is not a
+// filter.
 func rerankFilter(node query.Q) bool {
 	switch typed := node.(type) {
 	case *query.Substring, *query.Regexp:
@@ -283,8 +409,9 @@ func rerankModelSearchConfig(config searchConfig) searchConfig {
 // matchAt and matchEnd fields identify the matched bytes in the selected text.
 func newRerankDocument(result corpusSearchResult) rerankDocument {
 	document := rerankDocument{
-		Path:     result.file.FileName,
-		Language: result.file.Language,
+		Path:      result.file.FileName,
+		Language:  result.file.Language,
+		modelBase: result.modelBase,
 	}
 	if len(result.file.LineMatches) == 0 {
 		return document
@@ -368,7 +495,7 @@ func serializeLateOnDocumentWithMatch(
 ) (string, int, int, int) {
 	var metadata strings.Builder
 	if document.Path != "" {
-		fmt.Fprintf(&metadata, "path: %s\n", rerankPathTail(document.Path))
+		fmt.Fprintf(&metadata, "path: %s\n", rerankPathTail(semanticModelPath(document.modelBase, document.Path)))
 	}
 	if document.Language != "" {
 		fmt.Fprintf(&metadata, "language: %s\n", document.Language)
@@ -405,11 +532,13 @@ func serializeLateOnDocumentWithMatch(
 
 // rerankPathTail limits path metadata to the final path components.
 func rerankPathTail(value string) string {
-	parts := strings.Split(value, "/")
-	if len(parts) <= rerankPathComponentLimit {
-		return value
+	at := len(value)
+	for range rerankPathComponentLimit {
+		if at = strings.LastIndexByte(value[:at], '/'); at < 0 {
+			return value
+		}
 	}
-	return strings.Join(parts[len(parts)-rerankPathComponentLimit:], "/")
+	return value[at+1:]
 }
 
 func rerankValidTextSpan(text string, matchAt, matchEnd int) (string, int, int) {

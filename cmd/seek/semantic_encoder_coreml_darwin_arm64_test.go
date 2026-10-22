@@ -182,18 +182,6 @@ func TestFolderBuildOtherFaultKeepsProvider(t *testing.T) {
 		t.Fatalf("an unrelated build failure demoted the provider: %v", err)
 	}
 }
-func TestRunCoreMLCacheDirectoryRefusesUninitializedRuntime(t *testing.T) {
-	// The key carries the ONNX Runtime version, which is empty until the
-	// environment is ready. Caching an empty one would send the verdict writer
-	// and reader to different directories, and the only symptom would be a probe
-	// that repeats on every run.
-	if ort.GetVersion() != "" {
-		t.Skip("the run time is already initialized in this test binary")
-	}
-	if _, err := lateOnRunCoreMLCacheDirectory([]byte("model")); err == nil {
-		t.Fatal("an uninitialized run time produced a cache directory")
-	}
-}
 
 func TestRunCoreMLCacheDirectoryIsStableAcrossCacheRoots(t *testing.T) {
 	// The model initializes the run time, which the cache key reads.
@@ -229,8 +217,8 @@ func TestRunCoreMLCacheDirectoryIsStableAcrossCacheRoots(t *testing.T) {
 }
 
 func TestRejectedModelStopsRefreshingItsAccessMarker(t *testing.T) {
-	// A rejected host never reads the compiled model again, so the collector must
-	// be able to age it out. Refreshing the marker would pin it for ever.
+	// A rejected host never reads the compiled model again, so the collector
+	// must be able to age it out. Refreshing the marker would pin it for ever.
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
 	const key = "fedcba9876543210fedcba9876543210"
 	directory, err := lateOnCoreMLCacheDirectoryForKey(key)
@@ -326,10 +314,10 @@ func TestRecordFaultOnlyActsOnProviderFaults(t *testing.T) {
 	}
 }
 
-// pinAcceleratedProviderForTest arranges the state a real selection leaves — the
-// accelerated provider in use, with its verdict at a known path — and returns
-// that path. Many tests need it, and the save and restore is easy to get subtly
-// wrong in each of them.
+// pinAcceleratedProviderForTest arranges the state a real selection leaves —
+// the accelerated provider in use, with its verdict at a known path — and
+// returns that path. Many tests need it, and the save and restore is easy to
+// get subtly wrong in each of them.
 func pinAcceleratedProviderForTest(t *testing.T) string {
 	t.Helper()
 	verdict := filepath.Join(t.TempDir(), lateOnProviderVerdictFile)
@@ -348,8 +336,9 @@ func pinAcceleratedProviderForTest(t *testing.T) string {
 	return verdict
 }
 
-// buildFolderWithFailingModel runs a real folder index build whose model returns
-// failure, and requires the build to keep lexical search rather than fail.
+// buildFolderWithFailingModel runs a real folder index build whose model
+// returns failure, and requires the build to keep lexical search rather than
+// fail.
 func buildFolderWithFailingModel(t *testing.T, embedErr error) {
 	t.Helper()
 	requireTools(t)
@@ -399,8 +388,8 @@ func TestReadLateOnProviderRecordRejectsMalformedRecords(t *testing.T) {
 	if got := readLateOnProviderRecord(path).faults; got != 1 {
 		t.Fatalf("counted %d faults, want 1", got)
 	}
-	// A lone old fault expires, so a host that saw one benign cancellation stops
-	// paying for a probe on every search.
+	// A lone old fault expires, so a host that saw one benign cancellation
+	// stops paying for a probe on every search.
 	expired := time.Now().Add(-lateOnProviderFaultWindow - time.Hour).Unix()
 	if err := os.WriteFile(path, fmt.Appendf(nil, "%s 1 %d\n", lateOnVerdictRecheck, expired), 0o600); err != nil {
 		t.Fatal(err)
@@ -411,8 +400,8 @@ func TestReadLateOnProviderRecordRejectsMalformedRecords(t *testing.T) {
 }
 
 func TestProviderFaultCountSurvivesAPassingProbe(t *testing.T) {
-	// A provider that agrees on the fixed probe batch but fails on real work must
-	// still earn a demotion. If a passing probe cleared the count, the two
+	// A provider that agrees on the fixed probe batch but fails on real work
+	// must still earn a demotion. If a passing probe cleared the count, the two
 	// records would alternate for ever and nothing would change.
 	rawModel, _, path := newModelWithVerdictPath(t)
 	stamped := fmt.Sprintf("%s 1 %d\n", lateOnVerdictRecheck, time.Now().Unix())
@@ -476,11 +465,12 @@ func TestRecheckVerdictMakesTheNextProcessMeasureAgain(t *testing.T) {
 	}
 }
 
-// newModelWithVerdictPath builds the model under a fresh cache, then returns the
-// decoded model bytes and the path its provider verdict will live at. Several
-// tests need exactly this preamble, and it has an ordering trap: the cache key
-// carries the ONNX Runtime version, which is empty until the model initializes
-// the run time, so resolving the directory first yields a different key.
+// newModelWithVerdictPath builds the model under a fresh cache, then returns
+// the decoded model bytes and the path its provider verdict will live at.
+// Several tests need exactly this preamble, and it has an ordering trap: the
+// cache key carries the ONNX Runtime version, which is empty until the model
+// initializes the run time, so resolving the directory first yields a different
+// key.
 func newModelWithVerdictPath(t *testing.T) (semanticModel, []byte, string) {
 	t.Helper()
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
@@ -529,7 +519,7 @@ func TestOverlayScanFaultIsRecorded(t *testing.T) {
 	}
 }
 
-// TestOneCommandRecordsOneProviderFault runs one description whose vector
+// TestOneCommandRecordsOneProviderFault runs one model search whose vector
 // build and ranking both give degenerate output: the command records one
 // provider fault, not one per failure.
 func TestOneCommandRecordsOneProviderFault(t *testing.T) {

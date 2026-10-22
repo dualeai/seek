@@ -108,9 +108,15 @@ type e2eFilterRun struct {
 // with the default policy and the test model.
 func e2eFilterSearch(t *testing.T, windows int, query string, operands ...string) e2eFilterRun {
 	t.Helper()
+	return e2eFilterSearchWith(t, defaultSearchPolicy(), windows, query, operands...)
+}
+
+// e2eFilterSearchWith runs e2eFilterSearch with policy.
+func e2eFilterSearchWith(t *testing.T, policy searchPolicy, windows int, query string, operands ...string) e2eFilterRun {
+	t.Helper()
 	scorer := &e2eFilterScorer{hybridTestScorer: &hybridTestScorer{}, windows: windows}
 	var factory atomic.Int32
-	output, err := runHybridTestSearch(t, query, operands, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
+	output, err := runHybridTestSearch(t, query, operands, policy, func(context.Context) (semanticModel, error) {
 		factory.Add(1)
 		return scorer, nil
 	})
@@ -142,7 +148,7 @@ type e2eFilterRow struct {
 func e2eFilterExpect(t *testing.T, row e2eFilterRow) e2eFilterRun {
 	t.Helper()
 	want := slices.Sorted(slices.Values(row.want))
-	text := e2eFilterSearch(t, 1, "zqmark "+row.filter, ".")
+	text := e2eFilterSearchWith(t, lexicalOnlySearchPolicy(), 1, "zqmark "+row.filter, ".")
 	if got := e2eFilterNames(text.output); !slices.Equal(got, want) ||
 		(len(want) == 0) != errors.Is(text.err, errNoMatch) {
 		t.Fatalf("text oracle %q kept %v (err=%v), want %v:\n%s", row.filter, got, text.err, want, text.output)
@@ -198,12 +204,13 @@ func e2eFilterCheckTable(t *testing.T, rows []e2eFilterRow) {
 // repository filters, and makes it the current folder. The tree has three
 // nodes:
 //
-//   - repo, a Git node with zoekt.archived=1: clean.go is committed and
-//     clean; mod.go is modified, and its work-tree copy changes every
-//     attribute of its committed copy; gone.go, which has every attribute, is
-//     deleted from the work tree; new.go is untracked.
+//   - repo, a Git node with zoekt.archived=1, which Seek does not read:
+//     clean.go is committed and clean; mod.go is modified, and its work-tree
+//     copy changes every attribute of its committed copy; gone.go, which has
+//     every attribute, is deleted from the work tree; new.go is untracked.
 //   - the tree itself, a folder node with loose/loose.go.
-//   - other, a Git node with zoekt.name=zqnamed: other.go is committed.
+//   - other, a Git node with zoekt.name=zqnamed, which Seek does not read:
+//     other.go is committed in the repository with the opaque name.
 //
 // Each live file holds SEMANTIC_TARGET and zqmark. It returns the cache home.
 func e2eFilterContentTree(t *testing.T) string {
@@ -227,6 +234,18 @@ func e2eFilterContentTree(t *testing.T) string {
 	home := setTestUserCache(t)
 	t.Chdir(f.path("tree"))
 	return home
+}
+
+// e2eFilterOtherRepo returns the opaque repository name of the other node of
+// e2eFilterContentTree, from the tree folder. repo: matches only this name;
+// Seek does not read zoekt.name.
+func e2eFilterOtherRepo(t *testing.T) string {
+	t.Helper()
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fallbackGitRepositoryName(filepath.Join(cwd, "other"))
 }
 
 // e2eFilterPathTree writes the fixture of the path filters and the
@@ -283,6 +302,7 @@ func TestE2EFilterContentSymbolBranchRepo(t *testing.T) {
 	requireTools(t)
 	e2eFilterContentTree(t)
 	all := []string{"clean.go", "mod.go", "new.go", "loose.go", "other.go"}
+	other := e2eFilterOtherRepo(t)
 	e2eFilterCheckTable(t, []e2eFilterRow{
 		{"content:zqdrop", []string{"mod.go", "new.go", "other.go"}},
 		{"c:zqdrop", []string{"mod.go", "new.go", "other.go"}},
@@ -312,13 +332,14 @@ func TestE2EFilterContentSymbolBranchRepo(t *testing.T) {
 		// Work-tree files are in Seek's internal repository "uncommitted".
 		{"repo:uncommitted", []string{"mod.go", "new.go"}},
 		{"-repo:uncommitted", []string{"clean.go", "loose.go", "other.go"}},
-		{"repo:zqnamed", []string{"other.go"}},
-		{"r:zqnamed", []string{"other.go"}},
-		{"-repo:zqnamed", []string{"clean.go", "mod.go", "new.go", "loose.go"}},
-		{"-r:zqnamed", []string{"clean.go", "mod.go", "new.go", "loose.go"}},
-		// Only the committed shard of repo reads zoekt.archived=1.
-		{"archived:yes", []string{"clean.go"}},
-		{"archived:no", []string{"mod.go", "new.go", "loose.go", "other.go"}},
+		{"repo:" + other, []string{"other.go"}},
+		{"r:" + other, []string{"other.go"}},
+		{"-repo:" + other, []string{"clean.go", "mod.go", "new.go", "loose.go"}},
+		{"-r:" + other, []string{"clean.go", "mod.go", "new.go", "loose.go"}},
+		{"repo:zqnamed", nil},
+		// No shard reads zoekt.archived=1.
+		{"archived:yes", nil},
+		{"archived:no", all},
 		{"fork:yes", nil},
 		{"fork:no", all},
 		{"public:yes", nil},
@@ -327,7 +348,7 @@ func TestE2EFilterContentSymbolBranchRepo(t *testing.T) {
 		{"meta.owner:x", nil},
 		{"-meta.owner:x", all},
 		{"(content:zqdrop or file:loose)", []string{"mod.go", "new.go", "loose.go", "other.go"}},
-		{"(repo:uncommitted or repo:zqnamed)", []string{"mod.go", "new.go", "other.go"}},
+		{"(repo:uncommitted or repo:" + other + ")", []string{"mod.go", "new.go", "other.go"}},
 		{"-(content:zqkeep or file:other)", []string{"mod.go", "new.go"}},
 		{"-(file:repo/ or sym:ZqHeld)", []string{"other.go"}},
 	})
@@ -438,56 +459,86 @@ func TestE2EFilterDescriptionAtomsReachTheModel(t *testing.T) {
 	}
 }
 
-// TestE2EFilterStrictFormsDoNoVectorWork runs the query forms that keep
-// strict ranking on a fresh cache: one description atom, with and without
-// filters, a lone quoted phrase, an or between descriptions, an or that binds
-// the whole query, and filters alone. No query starts the model or writes
-// vectors, and each prints what --lexical-only prints.
-func TestE2EFilterStrictFormsDoNoVectorWork(t *testing.T) {
+// TestE2EFilterEveryFormUsesVectors runs the query forms on a fresh cache.
+// A query of negations only gives the model no text: it starts no model,
+// writes no vectors, and prints what --lexical-only prints. Every other form
+// (one description atom, with and without filters, a lone quoted phrase, an or
+// between descriptions, an or that binds the whole query, and filters alone)
+// prepares one model query and keeps every file of the strict search.
+func TestE2EFilterEveryFormUsesVectors(t *testing.T) {
 	requireTools(t)
 	home := e2eFilterPathTree(t)
-	cases := []struct {
+	lexical := func(t *testing.T, query string) (string, error) {
+		t.Helper()
+		// The root command runs the query with --lexical-only, as the CLI
+		// does. The "--" keeps a query that starts with "-" as an argument.
+		root := newQuietRootCmd()
+		root.SetArgs([]string{"--lexical-only", "--", query, "."})
+		return captureStdout(t, func() error { return root.ExecuteContext(t.Context()) })
+	}
+	t.Run("-file:zqup -lang:go", func(t *testing.T) {
+		run := e2eFilterSearch(t, 1, "-file:zqup -lang:go", ".")
+		if run.factory != 0 || run.scorer.prepareCalls.Load() != 0 || run.scorer.embedCalls.Load() != 0 {
+			t.Fatalf("the model started: factory=%d prepares=%d embeds=%d",
+				run.factory, run.scorer.prepareCalls.Load(), run.scorer.embedCalls.Load())
+		}
+		if got := e2eFilterNames(run.output); !slices.Equal(got, []string{"zqbare"}) {
+			t.Fatalf("strict search kept %v (err=%v), want zqbare:\n%s", got, run.err, run.output)
+		}
+		text, textErr := lexical(t, "-file:zqup -lang:go")
+		if text != run.output || errors.Is(textErr, errNoMatch) != errors.Is(run.err, errNoMatch) {
+			t.Fatalf("--lexical-only prints another answer (err=%v):\n%s\nwant:\n%s", textErr, text, run.output)
+		}
+		if dirs := e2eFilterSemanticDirs(t, home); len(dirs) != 0 {
+			t.Fatalf("a query of negations only wrote vector generations: %v", dirs)
+		}
+	})
+	for _, test := range []struct {
 		query string
 		// want holds the files that the strict search keeps; nil keeps none.
 		want []string
+		// filters is the filter part of the query; every printed file must
+		// pass it. Empty: the query has no filter.
+		filters string
 	}{
-		{"zqalpha", nil},
-		{"zqalpha lang:go -file:loose", nil},
-		{`"zqalpha zqbeta"`, nil},
-		{"zqalpha or zqbeta", nil},
-		{"(zqalpha or zqbeta) lang:go", nil},
+		{"zqalpha", nil, ""},
+		{"zqalpha lang:go -file:loose", nil, "lang:go -file:loose"},
+		{`"zqalpha zqbeta"`, nil, ""},
+		{"zqalpha or zqbeta", nil, ""},
+		{"(zqalpha or zqbeta) lang:go", nil, "lang:go"},
 		// The or binds the whole query: (zqalpha zqbeta file:zqlow) or
 		// file:other.
-		{"zqalpha zqbeta file:zqlow or file:other", []string{"other.go"}},
-		{"zqmark -lang:go", []string{"new.py", "loose_test.py", "zqbare"}},
-		{"lang:go -file:_test", []string{"clean.go", "loose.go", "other.go"}},
-		{"file:ZqUp", []string{"clean.go", "new.py", "loose_test.py"}},
-		{"-file:zqup -lang:go", []string{"zqbare"}},
-	}
-	for _, test := range cases {
+		{"zqalpha zqbeta file:zqlow or file:other", []string{"other.go"}, "file:zqlow or file:other"},
+		{"zqmark -lang:go", []string{"new.py", "loose_test.py", "zqbare"}, "-lang:go"},
+		{"lang:go -file:_test", []string{"clean.go", "loose.go", "other.go"}, "lang:go -file:_test"},
+		{"file:ZqUp", []string{"clean.go", "new.py", "loose_test.py"}, "file:ZqUp"},
+	} {
 		t.Run(test.query, func(t *testing.T) {
 			run := e2eFilterSearch(t, 1, test.query, ".")
-			if run.factory != 0 || run.scorer.prepareCalls.Load() != 0 || run.scorer.embedCalls.Load() != 0 {
-				t.Fatalf("the model started: factory=%d prepares=%d embeds=%d",
-					run.factory, run.scorer.prepareCalls.Load(), run.scorer.embedCalls.Load())
+			if run.scorer.prepareCalls.Load() != 1 {
+				t.Fatalf("model queries=%d, want 1", run.scorer.prepareCalls.Load())
 			}
+			text, textErr := lexical(t, test.query)
 			want := slices.Sorted(slices.Values(test.want))
-			if got := e2eFilterNames(run.output); !slices.Equal(got, want) ||
-				(len(want) == 0) != errors.Is(run.err, errNoMatch) {
-				t.Fatalf("strict search kept %v (err=%v), want %v:\n%s", got, run.err, want, run.output)
+			if strict := e2eFilterNames(text); !slices.Equal(strict, want) || (len(want) == 0) != errors.Is(textErr, errNoMatch) {
+				t.Fatalf("strict search kept %v (err=%v), want %v:\n%s", strict, textErr, want, text)
 			}
-			// The root command runs the query with --lexical-only, as the CLI
-			// does. The "--" keeps a query that starts with "-" as an argument.
-			root := newQuietRootCmd()
-			root.SetArgs([]string{"--lexical-only", "--", test.query, "."})
-			lexical, lexicalErr := captureStdout(t, func() error { return root.ExecuteContext(t.Context()) })
-			if lexical != run.output || errors.Is(lexicalErr, errNoMatch) != errors.Is(run.err, errNoMatch) {
-				t.Fatalf("--lexical-only prints another answer (err=%v):\n%s\nwant:\n%s", lexicalErr, lexical, run.output)
+			got := e2eFilterNames(run.output)
+			for _, name := range want {
+				if !slices.Contains(got, name) {
+					t.Fatalf("the model route dropped the strict file %s:\n%s", name, run.output)
+				}
+			}
+			if test.filters != "" {
+				allowedText, _ := lexical(t, test.filters)
+				allowed := e2eFilterNames(allowedText)
+				for _, name := range got {
+					if !slices.Contains(allowed, name) {
+						t.Fatalf("the model route printed %s, which %q drops:\n%s", name, test.filters, run.output)
+					}
+				}
 			}
 		})
-	}
-	if dirs := e2eFilterSemanticDirs(t, home); len(dirs) != 0 {
-		t.Fatalf("strict queries wrote vector generations: %v", dirs)
 	}
 }
 
@@ -554,7 +605,8 @@ func TestE2EFilterTypeFilePrintsNamesOnly(t *testing.T) {
 		{"type:file", []string{"clean.go", "mod.go", "new.go", "loose.go", "other.go"}},
 		{"t:file content:zqdrop", []string{"mod.go", "new.go", "other.go"}},
 		{"type:filename -branch:HEAD", []string{"mod.go", "new.go", "loose.go"}},
-		{"t:filename repo:zqnamed", []string{"other.go"}},
+		{"t:filename repo:" + e2eFilterOtherRepo(t), []string{"other.go"}},
+		{"t:filename repo:zqnamed", nil},
 	} {
 		t.Run(row.filter, func(t *testing.T) {
 			run := e2eFilterExpect(t, row)
@@ -594,11 +646,11 @@ func TestE2EFilterTypeFilePrintsNamesOnly(t *testing.T) {
 
 // TestE2EFilterUpstreamPanicForms runs descriptions with type:filematch,
 // type:repo, their t: spellings, and a negated -case: in the real process.
-// The support table documents an upstream Zoekt bug: the per-shard searcher
-// panics on these atoms, so the process stops with exit code 2 and prints no
-// result. A concurrent shard read can then fault, so the crash text is a
-// panic or a fault, and both name Zoekt's per-shard searcher. The type: rows
-// keep strict ranking: the crash comes before any vector work.
+// Zoekt's per-shard searcher panics on these atoms (an upstream bug). Seek
+// recovers the panic at the shard: the node is skipped with one warning that
+// names the panic, and with no other node the search prints nothing and ends
+// with exit code 1. The type: rows keep strict ranking, so the search writes
+// no vectors.
 func TestE2EFilterUpstreamPanicForms(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
@@ -617,16 +669,17 @@ func TestE2EFilterUpstreamPanicForms(t *testing.T) {
 		t.Run(test.query, func(t *testing.T) {
 			cache := t.TempDir()
 			result := runCLIProcessWithCache(t, cache, folder, []string{test.query, folder}, nil)
-			if result.code != 2 || result.stdout != "" ||
-				!strings.Contains(result.stderr, "zoekt/index.(*indexData).newMatchTree") {
-				t.Fatalf("code=%d stdout=%q, want the crash of Zoekt's per-shard searcher:\n%s",
+			if result.code != 1 || result.stdout != "" ||
+				strings.Count(result.stderr, "Skipped a search node") != 1 ||
+				!strings.Contains(result.stderr, "shard search panicked") {
+				t.Fatalf("code=%d stdout=%q, want one skipped-node warning for the shard panic:\n%s",
 					result.code, result.stdout, result.stderr)
 			}
 			if !test.strict {
 				return
 			}
 			// The model route builds the vectors of a node before it reads the
-			// node, so a crash on that route leaves a vector generation.
+			// node, so a panic on that route leaves a vector generation.
 			if dirs := e2eFilterSemanticDirs(t, cache); len(dirs) != 0 {
 				t.Fatalf("the search wrote vector generations: %v", dirs)
 			}

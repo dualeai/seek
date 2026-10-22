@@ -1,26 +1,12 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/binary"
-	"encoding/hex"
 	"math"
 	"testing"
 	"unsafe"
 )
 
 const semanticSNORM16MaximumDecodeError = 2.980141289299354e-8
-
-func testSemanticSNORM16GoldenEmbedding() semanticUnitEmbedding {
-	var embedding semanticUnitEmbedding
-	embedding.fine[0] = semanticVector{0: -0.5, 1: 0.5, 2: float32(math.Sqrt(0.5))}
-	for centroid := 1; centroid < 19; centroid++ {
-		embedding.fine[centroid][centroid] = 1
-	}
-	embedding.fine[19][47] = -1
-	copy(embedding.coarse[:], embedding.fine[:semanticCoarseCentroidsPerUnit])
-	return embedding
-}
 
 func semanticSourceSquaredNormBounds() (float64, float64) {
 	u32 := math.Ldexp(1, -24)
@@ -99,82 +85,6 @@ func TestSemanticSNORM16ComponentRoundTripAllCodes(t *testing.T) {
 	}
 }
 
-func TestEncodeSemanticFineVectorsLayout(t *testing.T) {
-	embedding := testSemanticUnitEmbedding(semanticVector{0: 1})
-	buffer := make([]byte, semanticFineVectorBytesPerUnit+16)
-	for index := range buffer {
-		buffer[index] = 0xa5
-	}
-	encoded, err := encodeSemanticFineVectors(buffer, []semanticUnitEmbedding{embedding}, 7)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(encoded) != semanticFineVectorBytesPerUnit {
-		t.Fatalf("bytes=%d, want %d", len(encoded), semanticFineVectorBytesPerUnit)
-	}
-	const vectorBytes = semanticEmbeddingDimensions * 2
-	for centroid := range semanticFineCentroidsPerUnit {
-		at := centroid * vectorBytes
-		if got := int16(binary.LittleEndian.Uint16(encoded[at : at+2])); got != semanticSNORM16Scale {
-			t.Fatalf("centroid %d first code=%d, want %d", centroid, got, semanticSNORM16Scale)
-		}
-		for dimension := 1; dimension < semanticEmbeddingDimensions; dimension++ {
-			componentAt := at + dimension*2
-			if got := binary.LittleEndian.Uint16(encoded[componentAt : componentAt+2]); got != 0 {
-				t.Fatalf("centroid %d dimension %d code=%d, want 0", centroid, dimension, got)
-			}
-		}
-	}
-	for index, value := range buffer[semanticFineVectorBytesPerUnit:] {
-		if value != 0xa5 {
-			t.Fatalf("byte after payload %d changed", index)
-		}
-	}
-	if _, err := encodeSemanticFineVectors(buffer[:semanticFineVectorBytesPerUnit-1], []semanticUnitEmbedding{embedding}, 0); err == nil {
-		t.Fatal("short output buffer was accepted")
-	}
-	if _, err := encodeSemanticFineVectors(buffer, []semanticUnitEmbedding{embedding}, -1); err == nil {
-		t.Fatal("negative start row was accepted")
-	}
-}
-
-func TestSemanticSNORM16LittleEndianGolden(t *testing.T) {
-	const rowBytes = 1_920
-	embedding := testSemanticSNORM16GoldenEmbedding()
-	encoded, err := encodeSemanticFineVectors(
-		make([]byte, rowBytes),
-		[]semanticUnitEmbedding{embedding},
-		0,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(encoded) != rowBytes {
-		t.Fatalf("encoded row has %d bytes, want %d", len(encoded), rowBytes)
-	}
-	checks := []struct {
-		at   int
-		want int16
-	}{
-		{at: 0, want: -16_384},
-		{at: 2, want: 16_384},
-		{at: 4, want: 23_170},
-		{at: 98, want: 32_767},
-		{at: 1_764, want: 32_767},
-		{at: 1_918, want: -32_767},
-	}
-	for _, check := range checks {
-		if got := int16(binary.LittleEndian.Uint16(encoded[check.at : check.at+2])); got != check.want {
-			t.Fatalf("code at byte %d=%d, want %d", check.at, got, check.want)
-		}
-	}
-	digest := sha256.Sum256(encoded)
-	const wantSHA256 = "cc23605279c5bf152de3c05ee5c2a0733e4d4ff317c3973009f765e9673e69f4"
-	if got := hex.EncodeToString(digest[:]); got != wantSHA256 {
-		t.Fatalf("encoded row SHA-256=%s, want %s", got, wantSHA256)
-	}
-}
-
 func TestSemanticSNORM16StorageErrorBound(t *testing.T) {
 	const componentBound = 0.5/semanticSNORM16Scale + semanticSNORM16MaximumDecodeError
 	vectorBound := math.Sqrt(semanticEmbeddingDimensions) * componentBound
@@ -247,86 +157,6 @@ func TestSemanticSNORM16IntegerNormThreshold(t *testing.T) {
 	}
 }
 
-func TestSemanticSNORM16ScoreMatchesFloat64Oracle(t *testing.T) {
-	query := semanticVector{0: 0.6, 1: 0.8}
-	document := semanticVector{0: 0.8, 1: 0.6}
-	stored, err := encodeSemanticSNORM16Vector(&document)
-	if err != nil {
-		t.Fatal(err)
-	}
-	scaled, err := prepareSemanticSNORM16Query([]semanticVector{query})
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := semanticSNORM16VectorDot(&scaled[0], &stored)
-	decoded := decodeSemanticSNORM16Vector(stored)
-	var oracle float64
-	for dimension := range query {
-		oracle += float64(query[dimension]) * float64(decoded[dimension])
-	}
-	if difference := math.Abs(float64(got) - oracle); difference > 1e-6 {
-		t.Fatalf("score=%g oracle=%g difference=%g", got, oracle, difference)
-	}
-}
-
-func TestSemanticSNORM16ScoreErrorBound(t *testing.T) {
-	const scorerArithmeticBound = 1e-5
-	u := math.Ldexp(1, -24)
-	// gamma100 overcounts the reciprocal conversion, query pre-scale,
-	// component multiply, and float32 accumulation roundings for one dot.
-	// A fused multiply-add uses fewer roundings and stays inside this bound.
-	gamma100 := 100 * u / (1 - 100*u)
-	_, sourceNormLimit := semanticSourceSquaredNormBounds()
-	storedNormLimit := math.Sqrt(
-		1 + float64(semanticSNORM16SquaredNormCodeTolerance)/semanticSNORM16SquaredScale,
-	)
-	derivedArithmeticBound := gamma100 *
-		math.Sqrt(sourceNormLimit) * storedNormLimit
-	if scorerArithmeticBound < derivedArithmeticBound {
-		t.Fatalf("scorer bound=%g, need at least %g", scorerArithmeticBound, derivedArithmeticBound)
-	}
-	storageBound := math.Sqrt(sourceNormLimit) *
-		math.Sqrt(semanticEmbeddingDimensions) / (2 * semanticSNORM16Scale)
-	for seed := 1; seed <= 4_096; seed++ {
-		var query, document semanticVector
-		for dimension := range query {
-			query[dimension] = float32((seed*(dimension+17))%251 - 125)
-			document[dimension] = float32((seed*(dimension+43)+dimension*29)%257 - 128)
-		}
-		if err := normalizeSemanticVector(&query); err != nil {
-			t.Fatalf("query seed %d: %v", seed, err)
-		}
-		if err := normalizeSemanticVector(&document); err != nil {
-			t.Fatalf("document seed %d: %v", seed, err)
-		}
-		stored, err := encodeSemanticSNORM16Vector(&document)
-		if err != nil {
-			t.Fatalf("stored seed %d: %v", seed, err)
-		}
-		scaled, err := prepareSemanticSNORM16Query([]semanticVector{query})
-		if err != nil {
-			t.Fatalf("scaled seed %d: %v", seed, err)
-		}
-		got := semanticSNORM16VectorDot(&scaled[0], &stored)
-		var storedOracle, sourceOracle float64
-		for dimension, code := range stored {
-			storedOracle += float64(query[dimension]) * float64(code) / semanticSNORM16Scale
-			sourceOracle += float64(query[dimension]) * float64(document[dimension])
-		}
-		if difference := math.Abs(float64(got) - storedOracle); difference > scorerArithmeticBound {
-			t.Fatalf("seed %d scorer difference=%g, bound=%g", seed, difference, scorerArithmeticBound)
-		}
-		if difference := math.Abs(float64(got) - sourceOracle); difference > storageBound+scorerArithmeticBound {
-			t.Fatalf(
-				"seed %d total difference=%g, bound=%g",
-				seed,
-				difference,
-				storageBound+scorerArithmeticBound,
-			)
-		}
-	}
-}
-
 func TestValidateSemanticSNORM16VectorRejectsInvalidCodesAndNorm(t *testing.T) {
 	source := semanticVector{0: 1}
 	valid, err := encodeSemanticSNORM16Vector(&source)
@@ -356,105 +186,17 @@ func TestSemanticSNORM16TypeSizes(t *testing.T) {
 	if got, want := unsafe.Sizeof(semanticSNORM16Vector{}), uintptr(semanticEmbeddingDimensions*2); got != want {
 		t.Fatalf("vector bytes=%d, want %d", got, want)
 	}
-	if got, want := unsafe.Sizeof(semanticFineSNORM16Vectors{}), uintptr(semanticFineVectorBytesPerUnit); got != want {
+	if got, want := unsafe.Sizeof(semanticCoarseSNORM16Vectors{}), uintptr(semanticCoarseVectorBytesPerUnit); got != want {
 		t.Fatalf("row bytes=%d, want %d", got, want)
-	}
-}
-
-func TestPrepareSemanticSNORM16QueryScalesInPlaceWithoutAllocation(t *testing.T) {
-	query := make([]semanticVector, 1)
-	var scaled []semanticVector
-	var prepareErr error
-	allocations := testing.AllocsPerRun(1_000, func() {
-		query[0] = semanticVector{0: 1}
-		scaled, prepareErr = prepareSemanticSNORM16Query(query)
-	})
-	if prepareErr != nil {
-		t.Fatal(prepareErr)
-	}
-	if allocations != 0 {
-		t.Fatalf("query preparation allocations=%g, want 0", allocations)
-	}
-	if &scaled[0] != &query[0] {
-		t.Fatal("query preparation copied its owned input")
-	}
-	const wantScale float32 = 1.0 / 32_767.0
-	if scaled[0][0] != wantScale {
-		t.Fatalf("scaled component=%g, want %g", scaled[0][0], wantScale)
-	}
-}
-
-func TestCheckedSemanticVectorBytesUsesSNORM16Stride(t *testing.T) {
-	if got, ok := checkedSemanticVectorBytes(0); !ok || got != 0 {
-		t.Fatalf("zero rows: bytes=%d ok=%v", got, ok)
-	}
-	if got, ok := checkedSemanticVectorBytes(1); !ok || got != 1_920 {
-		t.Fatalf("one row: bytes=%d ok=%v, want 1920 and true", got, ok)
-	}
-	if _, ok := checkedSemanticVectorBytes(math.MaxUint64); ok {
-		t.Fatal("overflowing vector size was accepted")
-	}
-}
-
-func TestSemanticSNORM16VectorDotDoesNotAllocate(t *testing.T) {
-	query := semanticVector{0: 1}
-	stored, err := encodeSemanticSNORM16Vector(&query)
-	if err != nil {
-		t.Fatal(err)
-	}
-	scaled, err := prepareSemanticSNORM16Query([]semanticVector{query})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if allocations := testing.AllocsPerRun(1_000, func() {
-		_ = semanticSNORM16VectorDot(&scaled[0], &stored)
-	}); allocations != 0 {
-		t.Fatalf("allocations=%g, want 0", allocations)
 	}
 }
 
 func BenchmarkSemanticVectorDot(b *testing.B) {
 	query := semanticVector{0: 0.6, 1: 0.8}
 	document := semanticVector{0: -0.8, 1: 0.6}
-	stored, err := encodeSemanticSNORM16Vector(&document)
-	if err != nil {
-		b.Fatal(err)
-	}
-	scaled, err := prepareSemanticSNORM16Query([]semanticVector{query})
-	if err != nil {
-		b.Fatal(err)
-	}
 	b.Run("float32", func(b *testing.B) {
 		for b.Loop() {
 			_ = semanticVectorDot(query, document)
 		}
 	})
-	b.Run("snorm16", func(b *testing.B) {
-		for b.Loop() {
-			_ = semanticSNORM16VectorDot(&scaled[0], &stored)
-		}
-	})
-}
-
-var semanticSNORM16BenchmarkBytes []byte
-
-func BenchmarkEncodeSemanticFineVectors(b *testing.B) {
-	const rows = semanticModelBatchRows
-	vector := semanticUSearchTestVector(7)
-	embeddings := make([]semanticUnitEmbedding, rows)
-	for row := range embeddings {
-		for centroid := range embeddings[row].fine {
-			embeddings[row].fine[centroid] = vector
-		}
-	}
-	buffer := make([]byte, rows*semanticFineVectorBytesPerUnit)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for b.Loop() {
-		encoded, err := encodeSemanticFineVectors(buffer, embeddings, 0)
-		if err != nil {
-			b.Fatal(err)
-		}
-		semanticSNORM16BenchmarkBytes = encoded
-	}
 }

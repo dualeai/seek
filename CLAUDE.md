@@ -36,7 +36,7 @@ memory, and disk as it needs. Low resource use is not a goal.
 ## Code search — use `seek`
 
 Prefer `seek` over grep and ripgrep for code search. It returns ranked results
-with context, grouped by file, with definition tags.
+with context, grouped by file, and tags the definitions that `sym:` finds.
 
 Usage: `seek [flags] '<query>' [path...]`. Flags come before the query, and
 paths after it. Put all filters in the one single-quoted query. Paths can be
@@ -56,19 +56,18 @@ seek 'TODO' ./cmd/seek /tmp/notes
 seek 'validate search query syntax'
 ```
 
-A description of two or more words also uses the local model to find code by
-meaning; filters and paths apply to both. These results are approximate, and
-no result (exit code 1) is not proof of absence. `--lexical-only` skips the
-model. The first description search of a large repository builds its index and
-can take tens of seconds.
+A query also uses the local model to find code by meaning; filters and paths
+apply to both. These results are approximate, and no result (exit code 1)
+is not proof of absence. `--lexical-only` skips the model. The first search of
+a large repository builds its index and can take tens of seconds.
 
 For absence checks, renames, counts, and complete call-site lists, use
 `SEEK_ROUTER=off grep -rn 'PATTERN' .`
 
 When a sub-agent does not read this file, pass it:
 "Use `seek 'query' [path...]` for ranked code navigation, with all filters in
-one quoted query. A description of two or more words also finds code by
-meaning. Use `--lexical-only` to skip the model. Use `SEEK_ROUTER=off grep` for
+one quoted query. A query also finds code by meaning. Use
+`--lexical-only` to skip the model. Use `SEEK_ROUTER=off grep` for
 absence checks, counts, renames, and complete call-site lists."
 
 ## GitHub Actions

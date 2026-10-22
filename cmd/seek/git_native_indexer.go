@@ -1,191 +1,65 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"errors"
 	"fmt"
-	"log/slog"
-	"maps"
-	"os/exec"
-	"strconv"
-	"strings"
 
 	"github.com/sourcegraph/zoekt"
-	"github.com/sourcegraph/zoekt/ignore"
 )
 
 type gitSnapshot struct {
 	commitOID gitObjectID
 }
 
-// captureGitSnapshot verifies a full SHA-1 or SHA-256 commit ID: the commit
-// must exist in the repository. The "no-head" value returns ok=false without
-// an error.
-func captureGitSnapshot(ctx context.Context, repoDir, captured string) (gitSnapshot, bool, error) {
+// captureGitSnapshot verifies the form of a full SHA-1 or SHA-256 commit ID.
+// It runs no Git process: the git status call that captured the ID read the
+// commit and its tree, and it fails ("bad object HEAD") when either is missing.
+// A commit that disappears after that call fails the build that reads it, and
+// the build then checks the commit (capturedCommitMissing). A separate check
+// here costs one Git process per committed build and delta. The "no-head"
+// value returns ok=false without an error.
+func captureGitSnapshot(captured string) (gitSnapshot, bool, error) {
 	if captured == "no-head" {
 		return gitSnapshot{}, false, nil
 	}
-	want, err := parseGitObjectID([]byte(captured))
+	oid, err := parseGitObjectID([]byte(captured))
 	if err != nil {
 		return gitSnapshot{}, false, fmt.Errorf("captured Git commit: %w", err)
 	}
-
-	cmd := newGitCommand(ctx, repoDir, "show", "--no-patch", "--format=%H", captured+"^{commit}")
-	raw, err := gitOutput(ctx, cmd, "git show")
-	if err != nil {
-		return gitSnapshot{}, false, err
-	}
-	got, err := parseGitObjectID(bytes.TrimSuffix(raw, []byte{'\n'}))
-	if err != nil {
-		return gitSnapshot{}, false, fmt.Errorf("git show commit: %w", err)
-	}
-	if got != want {
-		return gitSnapshot{}, false, fmt.Errorf("git show returned commit %s, want %s", got, want)
-	}
-	return gitSnapshot{commitOID: got}, true, nil
+	return gitSnapshot{commitOID: oid}, true, nil
 }
 
-// nativeGitConfig holds the local zoekt.* options. Git prints config names
-// with the section and the option in lowercase, so each key is lowercase.
-type nativeGitConfig map[string]string
-
-func readNativeGitConfig(ctx context.Context, repoDir string) (nativeGitConfig, error) {
-	cmd := newGitCommand(ctx, repoDir, "config", "--null", "--local", "--get-regexp", "^zoekt\\.")
-	out, err := gitOutput(ctx, cmd, "git config")
-	if err != nil {
-		// Exit 1 with no output means no zoekt.* key.
-		if exitErr, ok := errors.AsType[*exec.ExitError](err); !ok || exitErr.ExitCode() != 1 || len(out) != 0 {
-			return nil, err
-		}
+// capturedCommitMissing reports whether the captured commit of a build that
+// read it is no longer in the repository. It runs one git cat-file, and only
+// after such a build failed. A failed check reports false, so the build keeps
+// its other error handling.
+func capturedCommitMissing(ctx context.Context, repoDir string, build gitBuildPlan, snapshot gitSnapshot) bool {
+	if !build.snapshot() {
+		return false
 	}
-
-	result := nativeGitConfig{}
-	for _, record := range bytes.Split(out, []byte{0}) {
-		if len(record) == 0 {
-			continue
-		}
-		keyRaw, valueRaw, ok := bytes.Cut(record, []byte{'\n'})
-		if !ok || len(keyRaw) == 0 {
-			return nil, fmt.Errorf("malformed git config record")
-		}
-		key := string(keyRaw)
-		if strings.HasPrefix(strings.ToLower(key), "zoekt.") {
-			// Git config keys are case-insensitive. Keep RawConfig deterministic by
-			// storing the spelling that Git exposes: lowercase option names.
-			option := strings.ToLower(key[len("zoekt."):])
-			result[option] = string(valueRaw)
-		}
-	}
-	return result, nil
+	exists, err := nativeGitCommitExists(ctx, repoDir, snapshot.commitOID)
+	return err == nil && !exists
 }
 
-// nativeGitRepository makes provider-neutral metadata for one captured commit.
-// Only explicit local zoekt.* settings can replace its opaque name or set its
-// web URL. It sets no repository rank and no commit time: Zoekt reads them
-// only in its classic scorer, and every Seek search uses BM25
-// (searchOpts.UseBM25Scoring).
-func nativeGitRepository(ctx context.Context, repoDir string, snapshot gitSnapshot) (zoekt.Repository, error) {
-	repository := zoekt.Repository{
+// nativeGitRepository makes the provider-neutral metadata of one captured
+// commit: the opaque name, the work-tree source, and the HEAD branch. It reads
+// no zoekt.* Git config and no remote, so it sets no URL, ID, or raw config.
+// Seek shows none of these fields, and a config read costs one Git process per
+// committed build and delta. The repo: filter matches the opaque name. It
+// sets no repository rank and no commit time: Zoekt reads them only in its
+// classic scorer, and every Seek search uses BM25 (searchOpts.UseBM25Scoring).
+func nativeGitRepository(repoDir string, snapshot gitSnapshot) zoekt.Repository {
+	return zoekt.Repository{
 		Name:     fallbackGitRepositoryName(repoDir),
 		Source:   repoDir,
 		Branches: []zoekt.RepositoryBranch{{Name: "HEAD", Version: snapshot.commitOID.String()}},
 	}
-	config, err := readNativeGitConfig(ctx, repoDir)
-	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return zoekt.Repository{}, err
-		}
-		slog.Debug("Cannot read Git repository metadata", "repo", repoDir, "error", err)
-		return repository, nil
-	}
-	applyNativeGitConfig(&repository, config)
-	return repository, nil
-}
-
-// applyNativeGitConfig enforces the provider-neutral architecture. Git is the
-// format and object source; its hosting service does not control index
-// behavior. Seek does not inspect a remote or make host-specific URL
-// templates. The local [zoekt] section can set one repository name and one
-// opaque web URL explicitly.
-func applyNativeGitConfig(repository *zoekt.Repository, config nativeGitConfig) {
-	if name := config["name"]; name != "" && !reservedGitRepositoryName(name) {
-		repository.Name = name
-	}
-	if webURL := config["web-url"]; webURL != "" {
-		repository.URL = webURL
-	}
-
-	id, _ := strconv.ParseUint(config["repoid"], 10, 32)
-	repository.ID = uint32(id)
-	repository.TenantID, _ = strconv.Atoi(config["tenantid"])
-	if len(config) > 0 {
-		repository.RawConfig = maps.Clone(config)
-	}
-}
-
-// reservedGitRepositoryName reports names that overlap the fixed shard prefix
-// for the dirty-file repository. The shard publisher uses this prefix to keep
-// committed and dirty families separate.
-func reservedGitRepositoryName(name string) bool {
-	lower := strings.ToLower(name)
-	return lower == repoUncommitted || strings.HasPrefix(lower, repoUncommitted+"_v")
-}
-
-func readNativeGitIgnore(ctx context.Context, repoDir string, snapshot gitSnapshot) (*ignore.Matcher, error) {
-	entry, err := readNativeGitRootIgnoreEntry(ctx, repoDir, snapshot)
-	if err != nil {
-		return nil, err
-	}
-	if entry == nil {
-		return &ignore.Matcher{}, nil
-	}
-	batch, err := startNativeGitBatch(ctx, repoDir)
-	if err != nil {
-		return nil, fmt.Errorf("start .sourcegraph/ignore object reader: %w", err)
-	}
-	matcher, readErr := readNativeGitIgnoreEntry(batch, entry)
-	closeErr := batch.close()
-	if readErr != nil {
-		return nil, readErr
-	}
-	if closeErr != nil {
-		return nil, fmt.Errorf("finish .sourcegraph/ignore object reader: %w", closeErr)
-	}
-	return matcher, nil
-}
-
-func readNativeGitIgnoreEntry(batch *nativeGitBatch, entry *gitTreeEntry) (*ignore.Matcher, error) {
-	if entry == nil {
-		return &ignore.Matcher{}, nil
-	}
-	infos, err := batch.check([]gitTreeEntry{*entry})
-	if err != nil {
-		return nil, fmt.Errorf("check .sourcegraph/ignore: %w", err)
-	}
-	info := infos[0]
-	if info.oversize {
-		return nil, fmt.Errorf(".sourcegraph/ignore exceeds the %d-byte document limit", documentContentLimit)
-	}
-	var matcher *ignore.Matcher
-	if err := batch.read([]gitBlobInfo{info}, func(document fileContent) error {
-		parsed, parseErr := ignore.ParseIgnoreFile(bytes.NewReader(document.content))
-		if parseErr != nil {
-			return parseErr
-		}
-		matcher = parsed
-		if document.weight > 0 {
-			readSemaphore.Release(document.weight)
-		}
-		return nil
-	}); err != nil {
-		return nil, fmt.Errorf("read .sourcegraph/ignore: %w", err)
-	}
-	return matcher, nil
 }
 
 // streamNativeGitDocuments sends the documents of one captured commit: every
-// file but gitlinks and the files that the root .sourcegraph/ignore names.
+// committed file but gitlinks. Seek indexes all content, so no path exclusion
+// file, such as .sourcegraph/ignore, applies. Thus the build needs no Git
+// process to read such a file.
 // The error channel gets one value when the stream ends; missing, when set,
 // then holds the blobs that the stream read as missing.
 func streamNativeGitDocuments(
@@ -194,23 +68,26 @@ func streamNativeGitDocuments(
 	snapshot gitSnapshot,
 	missing *[]missingBlob,
 ) (<-chan fileContent, <-chan error) {
+	return streamCountedNativeGitDocuments(ctx, repoDir, snapshot, missing, nil)
+}
+
+// streamCountedNativeGitDocuments is streamNativeGitDocuments that also adds
+// the content bytes that the shard documents of the sent documents hold
+// (heldContentBytes) to contentBytes, when it is set, before the error channel
+// gets its value. A binary blob then counts as its marker.
+func streamCountedNativeGitDocuments(
+	ctx context.Context,
+	repoDir string,
+	snapshot gitSnapshot,
+	missing *[]missingBlob,
+	contentBytes *int64,
+) (<-chan fileContent, <-chan error) {
 	documents := make(chan fileContent)
 	result := make(chan error, 1)
 	go func() {
 		defer close(documents)
-		ignoreEntry, err := readNativeGitRootIgnoreEntry(ctx, repoDir, snapshot)
-		if err != nil {
-			result <- err
-			return
-		}
 		batch, err := startNativeGitBatch(ctx, repoDir)
 		if err != nil {
-			result <- err
-			return
-		}
-		matcher, err := readNativeGitIgnoreEntry(batch, ignoreEntry)
-		if err != nil {
-			_ = batch.close()
 			result <- err
 			return
 		}
@@ -219,7 +96,7 @@ func streamNativeGitDocuments(
 		err = readNativeGitTree(ctx, repoDir, snapshot, func(entries []gitTreeEntry) error {
 			blobs := make([]gitTreeEntry, 0, len(entries))
 			for _, entry := range entries {
-				if entry.mode != "160000" && !matcher.Match(entry.path) {
+				if entry.mode != "160000" {
 					blobs = append(blobs, entry)
 				}
 			}
@@ -232,8 +109,12 @@ func streamNativeGitDocuments(
 			}
 			return batch.read(infos, func(document fileContent) error {
 				document.branches = headBranch
+				held := heldContentBytes(document)
 				select {
 				case documents <- document:
+					if contentBytes != nil {
+						*contentBytes += held
+					}
 					return nil
 				case <-ctx.Done():
 					return ctx.Err()
@@ -249,11 +130,12 @@ func streamNativeGitDocuments(
 }
 
 // indexNativeGitFull writes one captured commit to indexDir through the shared
-// Builder sink. It applies the root .sourcegraph/ignore file, skips gitlinks,
-// and emits oversize blob names without their bodies. In a partial clone, a
-// missing blob is indexed by name and added to missing when missing is set.
-// indexDir is caller-owned staging; the caller validates HEAD and publishes
-// it.
+// Builder sink. It indexes every committed blob, skips gitlinks, and emits
+// oversize blob names without their bodies. In a partial clone, a missing blob
+// is indexed by name and added to missing when missing is set. indexDir is
+// caller-owned staging; the caller validates HEAD and publishes it. It returns
+// the content bytes that it indexed, the live bytes of the committed state
+// (deltaNeedsCompaction).
 func indexNativeGitFull(
 	ctx context.Context,
 	repoDir string,
@@ -261,17 +143,15 @@ func indexNativeGitFull(
 	snapshot gitSnapshot,
 	parallelism int,
 	missing *[]missingBlob,
-) error {
+) (int64, error) {
 	if err := requireNativeGitVersion(ctx); err != nil {
-		return err
+		return 0, err
 	}
-	repository, err := nativeGitRepository(ctx, repoDir, snapshot)
-	if err != nil {
-		return err
-	}
+	repository := nativeGitRepository(repoDir, snapshot)
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	documents, result := streamNativeGitDocuments(streamCtx, repoDir, snapshot, missing)
+	var contentBytes int64
+	documents, result := streamCountedNativeGitDocuments(streamCtx, repoDir, snapshot, missing, &contentBytes)
 	_, buildErr := indexDocumentsWithRepository(
 		streamCtx,
 		indexDir,
@@ -282,10 +162,10 @@ func indexNativeGitFull(
 	)
 	streamErr := <-result
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return ctxErr
+		return 0, ctxErr
 	}
 	if buildErr != nil {
-		return buildErr
+		return 0, buildErr
 	}
-	return streamErr
+	return contentBytes, streamErr
 }

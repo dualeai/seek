@@ -63,6 +63,48 @@ func TestMissingBlobRecordDamaged(t *testing.T) {
 	}
 }
 
+// TestPendingMissingBlobRecordKeepsADamagedRecord writes the pending record
+// of a build over a live record: a valid one takes the union of both blob
+// sets with a store that forces a check, and a damaged one stays damaged, so
+// a stop before the publish still makes the next search rebuild the data,
+// whether the build read missing blobs or none.
+func TestPendingMissingBlobRecordKeepsADamagedRecord(t *testing.T) {
+	head := strings.Repeat("b", 40)
+	live := missingBlob{oid: gitObjectID(strings.Repeat("a", 40)), path: "live.txt"}
+	built := missingBlob{oid: gitObjectID(strings.Repeat("c", 40)), path: "built.txt"}
+	for _, row := range []struct {
+		name  string
+		blobs []missingBlob
+	}{
+		{name: "build read missing blobs", blobs: []missingBlob{built}},
+		{name: "build read every blob"},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, lexicalMissingBlobsFile), []byte("v1\nstore s\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := writePendingMissingBlobRecord(dir, lexicalMissingBlobsFile, head, row.blobs); err != nil {
+				t.Fatal(err)
+			}
+			if got, ok := readMissingBlobRecord(dir, lexicalMissingBlobsFile); !ok || got.head != "" {
+				t.Fatalf("read %+v ok=%t, want the damaged record that marks the data stale", got, ok)
+			}
+		})
+	}
+	dir := t.TempDir()
+	if err := writeMissingBlobRecord(dir, lexicalMissingBlobsFile, missingBlobRecord{head: head, fingerprint: "s", blobs: []missingBlob{live}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePendingMissingBlobRecord(dir, lexicalMissingBlobsFile, head, []missingBlob{built}); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := readMissingBlobRecord(dir, lexicalMissingBlobsFile)
+	if want := []missingBlob{built, live}; !ok || got.fingerprint != unknownObjectStore || !reflect.DeepEqual(got.blobs, want) {
+		t.Fatalf("read %+v ok=%t, want blobs %v with an unknown store", got, ok, want)
+	}
+}
+
 // TestDeltaMissingBlobsDropsChangedPaths keeps the base blobs of the paths
 // that a delta did not change and adds the delta's own: the blob of a deleted
 // or changed path does not force a full build when it arrives.

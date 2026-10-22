@@ -25,9 +25,10 @@ func TestFamilyScanContiguous(t *testing.T) {
 		{"missing zero", familyAll, []string{"r_v16.00001.zoekt", "r_v16.00002.zoekt"}, false},
 		{"gap in the middle", familyAll, []string{"r_v16.00000.zoekt", "r_v16.00002.zoekt"}, false},
 		{
-			// The case the comment calls out: a second family whose whole name
-			// sorts between the first family's shard 0 and shard 1. Sorting by
-			// basename alone would interleave the two runs and mis-decide.
+			// The case that the doc comment of contiguous names: a second
+			// family whose whole name sorts between the first family's shard 0
+			// and shard 1. Sorting by basename alone would interleave the two
+			// runs and mis-decide.
 			name: "two prefixes interleaved by basename",
 			fam:  familyAll,
 			names: []string{
@@ -97,7 +98,8 @@ func TestFamilyScanContiguous(t *testing.T) {
 }
 
 // TestMatchesManifestFamilyScoping checks that a change to the uncommitted
-// family does not mark the committed family as damaged.
+// family does not mark the committed family as damaged, and that a changed or
+// a missing committed shard does.
 func TestMatchesManifestFamilyScoping(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, content string) {

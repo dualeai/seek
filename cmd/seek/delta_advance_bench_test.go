@@ -15,10 +15,10 @@ import (
 // HEAD, create a scratch clone under b.TempDir(), check out a local benchmark
 // branch at the oldest commit, build a base index, then reset the clone to each
 // next SHA and time the node refresh that a search runs (gitNode.refresh). The
-// sampled chain has at most ten advances. If Go's benchmark framework wants
-// more, it resets the loop and replays the chain. Each timed iteration
-// advances by one real commit; it is not a reflog oscillation between distant
-// points.
+// sampled chain has at most ten advances. When b.Loop runs more rounds, the
+// benchmark resets the clone to the oldest commit, indexes it outside the
+// timer, and replays the chain. Each timed iteration advances by one real
+// commit; it is not a reflog oscillation between distant points.
 //
 // SEEK_BENCH_REPO is only used as a read-only source; hard resets happen in the
 // temp clone.

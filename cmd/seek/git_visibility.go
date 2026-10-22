@@ -54,14 +54,14 @@ func classifyVisibility(ctx context.Context, repoRoot string, paths []string) (m
 	}
 
 	// The batch hit a 128: a within-worktree path crosses a submodule
-	// boundary and aborted the whole run. Re-query each path alone so one
-	// offending path cannot misclassify the rest.
+	// boundary or leaves the repository, and aborted the whole run. Re-query
+	// each path alone so one offending path cannot misclassify the rest.
 	for rel, p := range relOf {
 		ign, aborted1, err := checkGitIgnore(ctx, repoRoot, []string{rel})
 		if err != nil {
 			return nil, err
 		}
-		// An aborted path is the one inside a submodule.
+		// An aborted path is inside a submodule or outside the repository.
 		out[p] = !aborted1 && !ign[rel]
 	}
 	return out, nil

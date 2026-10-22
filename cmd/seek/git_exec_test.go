@@ -11,7 +11,7 @@ import (
 // TestGitCommandHardening checks the hardening flags, the literal pathspecs,
 // and the fixed environment of a Git command.
 func TestGitCommandHardening(t *testing.T) {
-	// A literal list: deleting a flag from gitHardeningArgs must fail this test.
+	// A literal list, so a flag removed from gitHardeningArgs fails this test.
 	hardening := []string{
 		"-c", "core.fsmonitor=false",
 		"-c", "core.hooksPath=/dev/null",

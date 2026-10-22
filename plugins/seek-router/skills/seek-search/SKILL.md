@@ -5,8 +5,8 @@ description: Search code with seek, a local ranked search for exact queries, des
 
 # Search code with seek
 
-`seek` returns the most relevant files, with context and definition tags. Use
-it to find code, not to list every match.
+`seek` returns the most relevant files with context, and tags the definitions
+that `sym:` finds. Use it to find code, not to list every match.
 
 ```sh
 seek [flags] '<query>' [path...]
@@ -40,8 +40,7 @@ seek -n 5 'retry backoff' ./cmd ./docs       # top 5 files in two folders
 
 ## Descriptions
 
-When you know what the code does but not its name, write a description of two
-or more words:
+When you know what the code does but not its name, write a description:
 
 ```sh
 seek 'validate search query syntax'

@@ -12,8 +12,10 @@ const lateOnExtractHelperEnv = "SEEK_TEST_RERANK_EXTRACT"
 
 func TestMain(m *testing.M) {
 	log.SetOutput(io.Discard)
+	// A helper process ends with os.Exit, so it would leave a cache directory
+	// behind: it uses the cache of its parent or none.
 	if os.Getenv(cliProcessHelperEnv) == cliProcessTestMarker ||
-		os.Getenv(lateOnExtractHelperEnv) == "1" {
+		os.Getenv(lateOnExtractHelperEnv) == "1" || os.Getenv(shardScanEnv) != "" {
 		os.Exit(m.Run())
 	}
 	cacheDir, err := os.MkdirTemp("", "seek-test-cache-*")

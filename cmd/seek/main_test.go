@@ -2,10 +2,11 @@ package main
 
 import "testing"
 
-// TestDirtyFileSetFromState pins the dirty-set as EXACT-membership. The
-// formatter suppresses a committed match only when its FileName is in this set,
-// so a substring/prefix/whitespace-tolerant set would wrongly hide unrelated
-// files. Independent oracle: hand-picked members and non-members.
+// TestDirtyFileSetFromState pins the dirty-set as EXACT-membership. A node
+// read hides the committed copy of each file in this set (currentCopies), and
+// semantic retrieval skips the rows of each such file (nodeRowFilter), so a
+// substring/prefix/whitespace-tolerant set would wrongly hide unrelated files.
+// Independent oracle: hand-picked members and non-members.
 func TestDirtyFileSetFromState(t *testing.T) {
 	if got := dirtyFileSetFromState(repoState{}); got != nil {
 		t.Errorf("empty state must yield a nil set, got %v", got)

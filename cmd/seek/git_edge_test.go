@@ -37,7 +37,8 @@ func TestIntegration_DetachedHEAD(t *testing.T) {
 }
 
 // TestIntegration_InitialCommitEmpty verifies seek handles a repo with only
-// an initial commit containing a single empty tree (e.g. git commit --allow-empty).
+// an initial commit containing a single empty tree (git commit --allow-empty)
+// and an untracked file, which must be found.
 func TestIntegration_InitialCommitEmpty(t *testing.T) {
 	requireTools(t)
 
@@ -55,7 +56,8 @@ func TestIntegration_InitialCommitEmpty(t *testing.T) {
 			t.Fatalf("%v failed: %v\n%s", args, err, out)
 		}
 	}
-	// Add an untracked file — should be findable even with empty initial commit
+	// Add an untracked file — should be findable even with empty initial
+	// commit
 	if err := os.WriteFile(filepath.Join(dir, "new.go"), []byte("package main\n// empty_initial_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -782,7 +784,8 @@ func TestStreamDirtyFiles_RacyDeletion(t *testing.T) {
 	results := collectStreamFilesForTest(t, t.Context(), dir, fileNames, 4)
 	wg.Wait()
 
-	// Should not panic; should have between 50 and 100 results depending on timing
+	// Should not panic; should have between 50 and 100 results depending on
+	// timing
 	if len(results) == 0 {
 		t.Error("expected at least some results despite concurrent deletion")
 	}
@@ -860,6 +863,15 @@ func TestIntegration_VeryLargeUncommittedFile(t *testing.T) {
 	}
 	if len(files) == 0 {
 		t.Fatal("expected match for small file when large file is present")
+	}
+	// The large file is found by its name and not by its content.
+	named, err := runHybridTestSearch(t, "file:huge.dat", []string{dir}, lexicalOnlySearchPolicy(), nil)
+	if err != nil || !strings.Contains(named, "huge.dat") {
+		t.Fatalf("the large file is not found by name: err=%v\n%s", err, named)
+	}
+	content, err := runHybridTestSearch(t, strings.Repeat("x", 32), []string{dir}, lexicalOnlySearchPolicy(), nil)
+	if err != nil && !errors.Is(err, errNoMatch) || strings.Contains(content, "huge.dat") {
+		t.Fatalf("the content of the large file is indexed: err=%v\n%s", err, content)
 	}
 }
 

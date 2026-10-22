@@ -87,7 +87,7 @@ func requireCompleteNativeIndex(t *testing.T, repoDir string, want []string) {
 	t.Helper()
 	indexDir := t.TempDir()
 	snapshot := captureHeadForTest(t, repoDir)
-	if err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, 1, nil); err != nil {
+	if _, err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, 1, nil); err != nil {
 		t.Fatalf("native committed index: %v", err)
 	}
 	got := zoektIndexedPaths(t, indexDir)
@@ -276,22 +276,22 @@ func TestNativeGitIndexer_VisibleContract(t *testing.T) {
 	gitlinkOID := gitOutputIn(t, repoDir, "rev-parse", "HEAD")
 	gitRunIn(t, repoDir, "update-index", "--add", "--cacheinfo", "160000,"+gitlinkOID+",submodule")
 	gitRunIn(t, repoDir, "commit", "-m", "golden gitlink")
+	// Seek reads no zoekt.* config: the shards get none of these values.
 	gitRunIn(t, repoDir, "config", "zoekt.name", "native-golden")
 	gitRunIn(t, repoDir, "config", "zoekt.web-url", "https://example.test/native-golden")
-	gitRunIn(t, repoDir, "config", "zoekt.web-url-type", "github")
 	gitRunIn(t, repoDir, "config", "zoekt.repoid", "42")
 	gitRunIn(t, repoDir, "config", "zoekt.tenantID", "7")
-	gitRunIn(t, repoDir, "config", "zoekt.github-stars", "100")
 
 	indexDir := t.TempDir()
 	snapshot := captureHeadForTest(t, repoDir)
-	if err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, 1, nil); err != nil {
+	if _, err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, 1, nil); err != nil {
 		t.Fatalf("native committed index: %v", err)
 	}
 	wantPaths := []string{
 		".sourcegraph/ignore",
 		"binary.bin",
 		"empty.txt",
+		"ignored.go",
 		"link.go",
 		"oversize.dat",
 		"regular.go",
@@ -303,13 +303,13 @@ func TestNativeGitIndexer_VisibleContract(t *testing.T) {
 
 	head := gitOutputIn(t, repoDir, "rev-parse", "HEAD")
 	repository := zoektRepositoryMetadata(t, indexDir)
-	if repository.Name != "native-golden" || repository.Source != repoDir {
+	if repository.Name != fallbackGitRepositoryName(repoDir) || repository.Source != repoDir {
 		t.Fatalf("repository identity name=%q source=%q", repository.Name, repository.Source)
 	}
-	if repository.URL != "https://example.test/native-golden" {
+	if repository.URL != "" {
 		t.Fatalf("repository URL=%q", repository.URL)
 	}
-	if repository.ID != 42 || repository.TenantID != 7 || repository.Rank != 0 {
+	if repository.ID != 0 || repository.TenantID != 0 || repository.Rank != 0 {
 		t.Fatalf("repository numeric metadata ID=%d TenantID=%d Rank=%d", repository.ID, repository.TenantID, repository.Rank)
 	}
 	if repository.CommitURLTemplate != "" || repository.FileURLTemplate != "" || repository.LineFragmentTemplate != "" {
@@ -318,7 +318,7 @@ func TestNativeGitIndexer_VisibleContract(t *testing.T) {
 	if len(repository.Branches) != 1 || repository.Branches[0].Name != "HEAD" || repository.Branches[0].Version != head {
 		t.Fatalf("repository branches=%v, want HEAD@%s", repository.Branches, head)
 	}
-	if repository.RawConfig["name"] != "native-golden" {
+	if repository.RawConfig != nil {
 		t.Fatalf("raw config=%v", repository.RawConfig)
 	}
 	if repository.IndexOptions == "" || !repository.HasSymbols {

@@ -461,10 +461,10 @@ func TestBM25InPlaceAverageReadsItsOwnShards(t *testing.T) {
 }
 
 // TestBM25FileAtomTermInAnyLayout searches with explicit file: atoms as one
-// node whose headers are its paths and as two nodes whose headers are not:
-// Zoekt scores the atom on the index path in both (through atom-or-not-atom
-// beside the header set), so the scores are the same, filter-only queries
-// included.
+// node whose headers are its index paths and as two nodes whose headers are
+// not. In both, Zoekt scores the atom on the index path (through the clause
+// atom-or-not-atom beside the header set), so the scores are the same, for
+// filter-only queries too.
 func TestBM25FileAtomTermInAnyLayout(t *testing.T) {
 	requireTools(t)
 	root := t.TempDir()

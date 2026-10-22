@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -272,7 +273,8 @@ func TestStateFile_WriteRemovesTmp(t *testing.T) {
 	if err := writeStateFile(dir, "test"); err != nil {
 		t.Fatalf("writeStateFile: %v", err)
 	}
-	// .state.tmp should not exist after successful atomic write (rename removes it)
+	// .state.tmp should not exist after successful atomic write (rename removes
+	// it)
 	if _, err := os.Stat(filepath.Join(dir, stateTmpFile)); !os.IsNotExist(err) {
 		t.Error("expected .state.tmp to not exist after successful write")
 	}
@@ -473,6 +475,9 @@ func TestStreamDirtyFiles_Parallelism1(t *testing.T) {
 
 // --- cleanUncommittedShards tests ---
 
+// TestCleanUncommittedShards_RemovesMatching removes the shards, records and
+// temporary shards (a Builder that stopped before its Finish renamed them) of
+// the uncommitted family, and keeps those of another repository.
 func TestCleanUncommittedShards_RemovesMatching(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range []string{
@@ -480,36 +485,51 @@ func TestCleanUncommittedShards_RemovesMatching(t *testing.T) {
 		"uncommitted_v16.00000.zoekt.meta",
 		"uncommitted_v16.00001.zoekt",
 		"uncommitted_v16.00002.zoekt.meta",
+		"uncommitted_v16.00003.zoekt.4242.tmp",
+		"uncommitted_v16.00003.zoekt.meta.17.tmp",
 		"myrepo_v16.00000.zoekt",
 		"myrepo_v16.00000.zoekt.meta",
+		"myrepo_v16.00001.zoekt.9.tmp",
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	cleanUncommittedShards(dir)
-
-	entries := familyShardFilesForTest(t, dir, familyAll)
-	if len(entries) != 2 {
-		t.Fatalf("remaining artifacts=%v, want committed pair", entries)
+	discard, err := cleanUncommittedShards(dir)
+	if err != nil {
+		t.Fatal(err)
 	}
+	discard()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
 	for _, entry := range entries {
-		if !strings.HasPrefix(filepath.Base(entry), "myrepo_v16.") {
-			t.Errorf("wrong artifact preserved: %s", entry)
-		}
+		names = append(names, entry.Name())
+	}
+	if want := []string{"myrepo_v16.00000.zoekt", "myrepo_v16.00000.zoekt.meta", "myrepo_v16.00001.zoekt.9.tmp"}; !slices.Equal(names, want) {
+		t.Fatalf("remaining files %v, want %v", names, want)
 	}
 }
 
 func TestCleanUncommittedShards_NoShards(t *testing.T) {
 	dir := t.TempDir()
 	// Should not panic on empty directory
-	cleanUncommittedShards(dir)
+	discard, err := cleanUncommittedShards(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	discard()
 }
 
 func TestCleanUncommittedShards_NonexistentDir(t *testing.T) {
 	// Should not panic
-	cleanUncommittedShards("/nonexistent/path/that/does/not/exist")
+	if _, err := cleanUncommittedShards("/nonexistent/path/that/does/not/exist"); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // --- shardsExist tests ---
@@ -961,7 +981,7 @@ func TestExtractV2Path_ZeroSkipFields(t *testing.T) {
 }
 
 func TestExtractV2Path_ExactFieldCount(t *testing.T) {
-	// Entry with exactly 3 space-separated fields, skip 3 — no trailing content
+	// An entry of exactly 3 space-separated fields, skip 3: nothing is left.
 	result := extractV2Path("a b c", 3)
 	if result != "" {
 		t.Errorf("expected empty string when all fields consumed, got %q", result)
@@ -991,7 +1011,11 @@ func TestCleanUncommittedShards_PreservesCommittedShards(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(dir, "myrepo_v16.00000.zoekt"), []byte{}, 0o644)
 	_ = os.WriteFile(filepath.Join(dir, "other_v16.00001.zoekt"), []byte{}, 0o644)
 
-	cleanUncommittedShards(dir)
+	discard, err := cleanUncommittedShards(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	discard()
 
 	entries, _ := filepath.Glob(filepath.Join(dir, "*.zoekt"))
 	if len(entries) != 2 {
@@ -1007,7 +1031,11 @@ func TestCleanUncommittedShards_ReadOnlyFile(t *testing.T) {
 	}
 	// The mode of a file does not prevent its removal from a writable
 	// directory.
-	cleanUncommittedShards(dir)
+	discard, err := cleanUncommittedShards(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	discard()
 	if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("read-only uncommitted shard remains: stat error=%v", err)
 	}
@@ -1382,7 +1410,8 @@ func TestStateCaching_StaleCapturedHeadDiscardsBuild(t *testing.T) {
 	gitRunIn(t, dir, "add", "app.go")
 	gitRunIn(t, dir, "commit", "-m", "move head after state capture")
 
-	// Run with the stale captured state. HEAD validation must discard the build.
+	// Run with the stale captured state. HEAD validation must discard the
+	// build.
 	deleteStateFiles(plan.cacheDir)
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
@@ -1769,8 +1798,9 @@ func TestRepoStateFingerprint_InodeChange_AtomicWrite(t *testing.T) {
 	}
 	fp1 := repoStateFingerprint(dir, state)
 
-	// Simulate atomic write: write to a new tmp file, then rename over original.
-	// The tmp file exists beside the original, so it has a different inode.
+	// Simulate atomic write: write to a new tmp file, then rename over
+	// original. The tmp file exists beside the original, so it has a different
+	// inode.
 	tmpPath := filepath.Join(dir, "file.go.tmp")
 	if err := os.WriteFile(tmpPath, content, 0o644); err != nil {
 		t.Fatal(err)
@@ -1914,7 +1944,8 @@ func TestRepoStateFingerprint_MixedDeletedAndExistingIsSensitive(t *testing.T) {
 }
 
 // TestRepoStateFingerprint_ContentEditWithNewMetadata verifies that a content
-// edit with a new size and mtime changes the metadata fingerprint.
+// edit with a new mtime changes the metadata fingerprint. The size stays the
+// same (version1 and version2).
 func TestRepoStateFingerprint_ContentEditWithNewMetadata(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "f.go")
@@ -2017,9 +2048,9 @@ func TestRepoStateFingerprint_SymlinkInFingerprint(t *testing.T) {
 	}
 }
 
-// TestRepoStateFingerprint_EmptyFileName verifies that an empty file name
-// in the Files list doesn't cause panics or format corruption.
-// Note: git status never produces empty filenames, so this is a robustness test.
+// TestRepoStateFingerprint_EmptyFileName verifies that an empty file name in
+// the Files list doesn't cause panics or format corruption. Note: git status
+// never produces empty filenames, so this is a robustness test.
 func TestRepoStateFingerprint_EmptyFileName(t *testing.T) {
 	dir := t.TempDir()
 	state := repoState{
@@ -2348,9 +2379,10 @@ func TestStreamingMemoryBounded(t *testing.T) {
 	tracker := newPeakHeapTracker()
 	documents, check := streamDirtyFilesAsTextIndex(t, t.Context(), dir, files, parallelism)
 	for fc := range documents {
-		// Consumer owns the readSemaphore Release per fileContent.
-		// In production this happens in indexDocuments after Finish;
-		// here the test just discards, so release immediately.
+		// The consumer releases the readSemaphore weight of each fileContent.
+		// In production indexDocuments releases it when Builder.Add returns
+		// (after Finish for a document that fills a shard of its own); the
+		// test discards each document, so it releases at once.
 		readSemaphore.Release(fc.weight)
 	}
 	heapDelta := tracker.stop()
@@ -2613,5 +2645,92 @@ func TestWriteSharedCacheFileConcurrentWriters(t *testing.T) {
 	}
 	if left, _ := filepath.Glob(filepath.Join(dir, bm25StatsFile+sharedTmpInfix+"*")); len(left) != 0 {
 		t.Fatalf("temp files left: %v", left)
+	}
+}
+
+// TestPartialPrebuildKeepsADamagedFamilyUnnamed gives a Git node a dirty file
+// that fails with EIO (kept by name: no state), removes the record that
+// tombstones the first copy of u2.go, and builds with an EMFILE in the
+// prebuild: the partial build leaves the live uncommitted family as it was,
+// and its record must not name that damaged family. So the next builds
+// rebuild it, and the replaced first copy is not found.
+func TestPartialPrebuildKeepsADamagedFamilyUnnamed(t *testing.T) {
+	requireTools(t)
+	swapShardMaxForTest(t, 1024)
+	dir := initGitRepo(t, "app.go", "package main\n// zqpartialapp\n")
+	ctx := t.Context()
+	paths, plan := planGitTestCorpus(t, dir)
+	build := func() error {
+		t.Helper()
+		state := mustGitRepoStateIn(t, ctx, paths.RepoDir)
+		return runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, gitCorpusStateHash(paths, state))
+	}
+	_ = build()
+	writeFileAt(t, dir, "u1.go", "package main\n// zqpartialu1\n"+strings.Repeat("// filler line of u1\n", 100))
+	_ = build()
+	writeFileAt(t, dir, "u2.go", "package main\n// zqpartialfirst\n")
+	_ = build()
+	writeFileAt(t, dir, "u2.go", "package main\n// zqpartialsecond\n")
+	_ = build()
+	writeFileAt(t, dir, "k.go", "package main\n// zqpartialkept\n")
+	realOpen := dirtyOpenFile
+	t.Cleanup(func() { dirtyOpenFile = realOpen })
+	failOpen := func(emfile bool) {
+		dirtyOpenFile = func(path string) (*os.File, error) {
+			switch base := filepath.Base(path); {
+			case base == "k.go":
+				return nil, &os.PathError{Op: "open", Path: path, Err: syscall.EIO}
+			case emfile && base == "u1.go":
+				return nil, &os.PathError{Op: "open", Path: path, Err: syscall.EMFILE}
+			}
+			return realOpen(path)
+		}
+	}
+	failOpen(false)
+	_ = build()
+	if err := os.Remove(filepath.Join(plan.indexDir, repoUncommitted+"_v16.00001.zoekt.meta")); err != nil {
+		t.Fatal(err)
+	}
+	failOpen(true)
+	_ = build()
+	if scan, err := scanFamilyOptional(plan.indexDir); err != nil || scan.matchesManifest(plan.indexDir) {
+		t.Fatalf("the partial build named the damaged uncommitted family (err=%v)", err)
+	}
+	failOpen(false)
+	_ = build()
+	dirtyOpenFile = realOpen
+	if err := build(); err != nil {
+		t.Fatal(err)
+	}
+	files, err := searchPlannedCorpusForTest(ctx, plan, "zqpartialfirst")
+	if err != nil || len(files) != 0 {
+		t.Fatalf("the replaced first copy of u2.go is found: files=%d err=%v", len(files), err)
+	}
+}
+
+// TestCleanBuildLeavesNoBuildDirectory builds a Git node with a dirty file,
+// removes the file, and builds again: the build removes the uncommitted
+// family through a build directory, which goes after the publish lock, so no
+// build directory and no moved shard stays in the index directory.
+func TestCleanBuildLeavesNoBuildDirectory(t *testing.T) {
+	requireTools(t)
+	dir := initGitRepo(t, "app.go", "package main\n// zqcleandirapp\n")
+	ctx := t.Context()
+	paths, plan := planGitTestCorpus(t, dir)
+	reindexGit(t, ctx, paths, plan)
+	writeFileAt(t, dir, "u1.go", "package main\n// zqcleandiru1\n")
+	reindexGit(t, ctx, paths, plan)
+	if len(repositoryShardFiles(plan.indexDir, repoUncommitted)) == 0 {
+		t.Fatal("no uncommitted shard after the dirty build")
+	}
+	if err := os.Remove(filepath.Join(dir, "u1.go")); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	if shards := repositoryShardFiles(plan.indexDir, repoUncommitted); len(shards) != 0 {
+		t.Fatalf("uncommitted shards %v after the clean", shards)
+	}
+	if left, _ := filepath.Glob(filepath.Join(plan.indexDir, buildDirPrefix+"*")); len(left) != 0 {
+		t.Fatalf("the clean left build directories %v", left)
 	}
 }

@@ -411,8 +411,77 @@ func TestCacheBudgetMessageWhenFloorBinds(t *testing.T) {
 		t.Errorf("message %q suggests a larger override although the floor binds", floor)
 	}
 	plain := formatCLIError(&cacheBudgetError{planned: 6 << 20, growth: 6 << 20, budget: 4 << 20})
-	if !strings.Contains(plain, "for example SEEK_CACHE_BUDGET=") {
-		t.Errorf("message %q lacks the override example", plain)
+	if !strings.Contains(plain, "for example SEEK_CACHE_BUDGET=") || strings.Contains(plain, "--lexical-only") {
+		t.Errorf("message %q lacks the override example or names --lexical-only", plain)
+	}
+}
+
+// TestCacheBudgetStopNamesTextSearchWhenItFits searches a folder with a
+// budget that its text index fits and its vectors do not: the search stops,
+// and the hint names --lexical-only, which then runs.
+func TestCacheBudgetStopNamesTextSearchWhenItFits(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	folder := t.TempDir()
+	// 8,390 bytes of content: its text index is about 23 KB, and with vectors
+	// about 144 KB (zoektIndexRatio, semanticBytesPerContentByte).
+	for index := range 40 {
+		writeFileAt(t, folder, fmt.Sprintf("f%02d.go", index),
+			fmt.Sprintf("package p\n// Foo%d alpha beta\n%s", index, strings.Repeat("// filler text line\n", 9)))
+	}
+	t.Chdir(t.TempDir())
+	t.Setenv(envCacheBudget, "60K")
+	_, err := runHybridTestSearch(t, "Foo1", []string{folder}, defaultSearchPolicy(),
+		func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil })
+	if budgetErr, ok := errors.AsType[*cacheBudgetError](err); !ok || !budgetErr.textFits ||
+		!strings.Contains(formatCLIError(err), "--lexical-only") {
+		t.Fatalf("err=%v, want a budget stop whose hint names --lexical-only", err)
+	}
+	if _, err := runHybridTestSearch(t, "Foo1", []string{folder}, lexicalOnlySearchPolicy(), nil); err != nil {
+		t.Fatalf("the text search the hint names failed: %v", err)
+	}
+}
+
+// TestCacheBudgetHintFollowsTheTextSearch checks the --lexical-only hint
+// against what a text search then does. With a budget below the text index of
+// a cold folder, the text search stops too, so the hint does not name it. With
+// a current text index larger than the budget, a text search builds nothing
+// and runs, so the hint names it.
+func TestCacheBudgetHintFollowsTheTextSearch(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	folder := t.TempDir()
+	for index := range 40 {
+		writeFileAt(t, folder, fmt.Sprintf("f%02d.go", index),
+			fmt.Sprintf("package p\n// Foo%d alpha beta\n%s", index, strings.Repeat("// filler text line\n", 9)))
+	}
+	t.Chdir(t.TempDir())
+	describe := func() error {
+		_, err := runHybridTestSearch(t, "Foo1", []string{folder}, defaultSearchPolicy(),
+			func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil })
+		return err
+	}
+	lexical := func() error {
+		_, err := runHybridTestSearch(t, "Foo1", []string{folder}, lexicalOnlySearchPolicy(), nil)
+		return err
+	}
+	t.Setenv(envCacheBudget, "4K")
+	if err := describe(); err == nil || strings.Contains(formatCLIError(err), "--lexical-only") {
+		t.Fatalf("cold, 4K: err=%v, want a stop whose hint does not name --lexical-only", err)
+	}
+	if err := lexical(); err == nil {
+		t.Fatal("cold, 4K: the text search did not stop")
+	}
+	t.Setenv(envCacheBudget, "1G")
+	if err := lexical(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(envCacheBudget, "4K")
+	if err := describe(); err == nil || !strings.Contains(formatCLIError(err), "--lexical-only") {
+		t.Fatalf("current text index, 4K: err=%v, want a stop whose hint names --lexical-only", err)
+	}
+	if err := lexical(); err != nil {
+		t.Fatalf("current text index, 4K: the text search the hint names failed: %v", err)
 	}
 }
 
@@ -1029,8 +1098,8 @@ func TestCacheBudgetEstimatesAnOrphanBranch(t *testing.T) {
 
 // TestCacheBudgetCountsOnlyVectorsForACurrentTextIndex warms a dirty
 // repository with a text search: its text index is current, so a first
-// description adds the vectors of the commit and of the dirty file, and no
-// text index bytes.
+// search with vectors adds the vectors of the commit and of the dirty file,
+// and no text index bytes.
 func TestCacheBudgetCountsOnlyVectorsForACurrentTextIndex(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -1061,9 +1130,9 @@ func TestCacheBudgetCountsOnlyVectorsForACurrentTextIndex(t *testing.T) {
 
 // TestCacheBudgetCountsVectorsBehindTheTextIndex builds the vectors of a
 // folder and of a Git node, adds a file (in a commit for Git), and runs a text
-// search: the text index holds the file, the vectors do not. The next
-// description must count the vectors of the new file: exactly for Git, and at
-// least that for the folder.
+// search: the text index holds the file, the vectors do not. The next search
+// with vectors must count the vectors of the new file: exactly for Git, and
+// at least that for the folder.
 func TestCacheBudgetCountsVectorsBehindTheTextIndex(t *testing.T) {
 	requireTools(t)
 	for _, kind := range []string{"folder", "git"} {
@@ -1110,9 +1179,9 @@ func TestCacheBudgetCountsVectorsBehindTheTextIndex(t *testing.T) {
 }
 
 // TestCacheBudgetCountsTheChangedFilesOfABoundFolder builds a folder's vectors,
-// edits one file, and estimates the next description: the vectors hold the
-// published state, so the build adds the text and vectors of the edited file
-// only.
+// edits one file, and estimates the next search with vectors: the vectors hold
+// the published state, so the build adds the text and vectors of the edited
+// file only.
 func TestCacheBudgetCountsTheChangedFilesOfABoundFolder(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -1141,9 +1210,9 @@ func TestCacheBudgetCountsTheChangedFilesOfABoundFolder(t *testing.T) {
 
 // TestCacheBudgetCountsACommitAfterTheVectors builds a repository's text and
 // vectors, then commits a file: the text index and the vectors hold the old
-// commit, so the next description adds the text and vectors of the commit
-// range, the new file alone. The estimate runs one git diff-tree: the vector
-// figure reuses the text figure.
+// commit, so the next search with vectors adds the text and vectors of the
+// commit range, the new file alone. The estimate runs one git diff-tree: the
+// vector figure reuses the text figure.
 func TestCacheBudgetCountsACommitAfterTheVectors(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)

@@ -12,24 +12,23 @@ import (
 )
 
 // TestEnsureFolderCorpusFresh_CancelAfterReadActivity starts an indexing
-// pass, waits until the semaphore probe observes read activity, then cancels it.
-// Every goroutine must stop, and the semaphore must return to its
-// starting balance.
+// pass, waits until the semaphore probe observes read activity, then cancels
+// it. Every goroutine must stop, and the semaphore must return to its
+// starting balance. The pass can return nil or context.Canceled.
 //
-// goleak.VerifyNone catches any goroutine that wedged on Acquire,
-// channel send, or builder I/O. Ignored top-frames are stdlib
-// background workers + this test's parent runtime.
+// goleak.VerifyNone catches any goroutine that stays blocked on Acquire, a
+// channel send, or builder I/O. It ignores only the goroutines that ran
+// before the test (goleak.IgnoreCurrent).
 func TestEnsureFolderCorpusFresh_CancelAfterReadActivity(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
 	}
-	// IgnoreCurrent snapshots the runtime goroutine set at defer time
-	// (top of test); a leaked reader appears as a NEW goroutine after
-	// the snapshot and surfaces in VerifyNone. Note: we intentionally
-	// do NOT use IgnoreTopFunction("internal/poll.runtime_pollWait") —
-	// it would mask a leaked reader stuck on os.(*File).Read on slow
-	// storage. The runtime test harness goroutines are already
-	// captured by IgnoreCurrent.
+	// IgnoreCurrent records the goroutines when this defer statement runs,
+	// at the top of the test, so a leaked reader is a new goroutine that
+	// VerifyNone reports. The test does not use
+	// IgnoreTopFunction("internal/poll.runtime_pollWait"): it would hide a
+	// leaked reader that stays blocked in os.(*File).Read on slow storage.
+	// IgnoreCurrent already records the goroutines of the test runner.
 	defer goleak.VerifyNone(t,
 		goleak.IgnoreCurrent(),
 	)

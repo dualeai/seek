@@ -25,9 +25,8 @@ func scanFolderForTest(t *testing.T, root string) (string, []gitPaths) {
 	return capture.stateHash, gitRoots
 }
 
-// TestFolderWalkerDiscoversNestedGit — parent folder containing one
-// nested git repo: the walk records exactly one Git root, at the nested repo
-// path.
+// TestFolderWalkerDiscoversNestedGit checks that the walk of a folder with one
+// nested Git repo records exactly one Git root, at the nested repo path.
 func TestFolderWalkerDiscoversNestedGit(t *testing.T) {
 	root := canonTempDir(t)
 	if err := os.MkdirAll(filepath.Join(root, "sub"), 0o755); err != nil {
@@ -51,8 +50,8 @@ func TestFolderWalkerDiscoversNestedGit(t *testing.T) {
 	}
 }
 
-// TestFolderWalkerDepth3 — nested at a/b/c/repo/.git; discovery must
-// find it regardless of depth.
+// TestFolderWalkerDepth3 checks that the walk records a Git root below three
+// folders (a/b/c/repo).
 func TestFolderWalkerDepth3(t *testing.T) {
 	root := canonTempDir(t)
 	deep := filepath.Join(root, "a", "b", "c", "repo")
@@ -66,9 +65,9 @@ func TestFolderWalkerDepth3(t *testing.T) {
 	}
 }
 
-// TestFolderFingerprintStableUnderNestedCommit — committing inside a
-// nested repo must not change the parent's fingerprint: the nested repo is
-// its own node.
+// TestFolderFingerprintStableUnderNestedCommit checks that a file edit and a
+// new file inside a nested repo do not change the parent's state hash: the
+// nested repo is its own node. The test makes no commit.
 func TestFolderFingerprintStableUnderNestedCommit(t *testing.T) {
 	root := canonTempDir(t)
 	nested := filepath.Join(root, "repo")
@@ -78,7 +77,7 @@ func TestFolderFingerprintStableUnderNestedCommit(t *testing.T) {
 	}
 	before, _ := scanFolderForTest(t, root)
 
-	// Simulate a "commit" inside the nested repo by adding content.
+	// Change the work tree of the nested repo.
 	if err := os.WriteFile(filepath.Join(nested, "a.go"), []byte("package main\n// changed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -130,9 +129,9 @@ func TestFolderWalkerSkipsSymlinkedWorktree(t *testing.T) {
 	}
 }
 
-// TestBrokenSubmoduleGracefulSkip — a .git file with a dangling pointer is a
-// failed node: the walk records no Git root, skips the directory, and
-// continues without error.
+// TestBrokenSubmoduleGracefulSkip checks that a .git file that points to a
+// missing directory makes a failed node: the walk records no Git root and
+// returns no error.
 func TestBrokenSubmoduleGracefulSkip(t *testing.T) {
 	root := canonTempDir(t)
 	bad := filepath.Join(root, "bad-sub")

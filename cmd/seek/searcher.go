@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strings"
@@ -32,7 +33,7 @@ const searchContextLines = 3
 var searchOpts = zoekt.SearchOptions{
 	// MaxDocDisplayCount is intentionally left at 0 (unlimited). Display
 	// limiting is handled by seek's --limit/-n flag during formatting,
-	// which applies after dedup and BM25 sort. A zoekt-level display cap
+	// which applies after the BM25 sort. A zoekt-level display cap
 	// would silently drop low-ranked files before seek or downstream
 	// pipes (| grep, | head) see them, causing false negatives.
 	//
@@ -50,7 +51,7 @@ type searchConfig struct {
 	// opts holds the Zoekt options. It is never nil.
 	opts *zoekt.SearchOptions
 	// bm25 marks a lexical search (the strict query, or the relaxed rank of
-	// a description) whose hits the command rescores with one global average
+	// a model query) whose hits the command rescores with one global average
 	// file length.
 	bm25              bool
 	afterOnly         bool
@@ -99,7 +100,7 @@ func openShard(path string) (zoekt.Searcher, error) {
 		_ = f.Close()
 		return nil, err
 	}
-	s, err := index.NewSearcher(iFile)
+	s, err := zoektOpen(iFile)
 	if err != nil {
 		iFile.Close()
 		return nil, err
@@ -419,19 +420,18 @@ func bm25ShardParts(ctx context.Context, searchers []zoekt.Searcher, paths []str
 }
 
 // bm25FilesPerWorker is the share of a shard's hits below which one more
-// goroutine costs more than it saves: 4 halves the rebuild phase on
-// Kubernetes, whose shards hold few hits each.
+// goroutine costs more than it saves. On the Kubernetes repository, whose
+// shards hold few hits each, 4 instead of 64 took the rebuild phase of
+// `case:yes func Convert` from 5.97 to 2.85 ms (all 26 shards, median of 15
+// runs). The end-to-end search time did not change measurably.
 const bm25FilesPerWorker = 4
 
 // searchLoadedShards searches the loaded shards and returns clones of the
 // hits. It returns only after all its search workers return, and it does not
 // close the searchers: one load can serve several searches.
 //
-// NOTE(zoekt): a query with a `query.Type` other than type:file panics inside
-// index.Searcher.Search (index/matchtree.go:1298, log.Panicf("type %T")).
-// Seek leaves the crash until Zoekt fixes it.
-// TODO(https://github.com/sourcegraph/zoekt/issues/1189): drop this note once
-// Zoekt returns an error for these types.
+// A panic in one shard search becomes that shard's error (zoektSearch); the
+// other shards still run.
 func searchLoadedShards(
 	ctx context.Context,
 	searchers []zoekt.Searcher,
@@ -440,7 +440,7 @@ func searchLoadedShards(
 	parts func(int, []zoekt.FileMatch),
 ) ([]zoekt.FileMatch, error) {
 	searchShard := func(i int) ([]zoekt.FileMatch, error) {
-		r, err := searchers[i].Search(ctx, q, config.opts)
+		r, err := zoektSearch(ctx, searchers[i], q, config.opts)
 		if err != nil {
 			return nil, fmt.Errorf("search: %w", err)
 		}
@@ -451,12 +451,11 @@ func searchLoadedShards(
 		roundScores(r.Files)
 		return r.Files, nil
 	}
-	// The shards fan out across GOMAXPROCS goroutines: the windowed
-	// indexer's rotation can drive the shard count into the hundreds for
-	// multi-GiB corpora, and parallel dispatch turns the query cost from the
-	// sum of the shards into their maximum. One shard needs no goroutine.
-	// Every shard search runs to its end, and the first failed shard in
-	// order gives the error.
+	// The shards fan out across GOMAXPROCS goroutines: shardMax drives the
+	// shard count into the hundreds for multi-GiB corpora, and parallel
+	// dispatch turns the query cost from the sum of the shards into their
+	// maximum. One shard needs no goroutine. Every shard search runs to its
+	// end, and the first failed shard in order gives the error.
 	results := make([][]zoekt.FileMatch, len(searchers))
 	errs := make([]error, len(searchers))
 	if len(searchers) == 1 {
@@ -485,6 +484,97 @@ func searchLoadedShards(
 		files = slices.Concat(results...)
 	}
 	return cloneFileMatches(files, config), nil
+}
+
+// zoektSearch runs one Zoekt shard search; zoektList lists one shard's
+// repositories; zoektOpen parses one shard file; zoektReadMetadata reads the
+// repository records of one shard file; zoektShardCall runs any other Zoekt
+// call that reads shard files (a delta Builder reads the records of the old
+// shards). Zoekt's index package panics where it could return an error, and
+// its own sharded searcher recovers the panic at the shard boundary
+// (search.searchOneShard). Seek calls the shards itself, so every Zoekt shard
+// call goes through these five functions. A memory fault in a damaged mapping
+// becomes a panic too (debug.SetPanicOnFault). They cover only the Zoekt call:
+// a panic in Seek's own code still stops the process, so a Seek bug is not
+// taken for index damage.
+func zoektSearch(ctx context.Context, searcher zoekt.Searcher, q query.Q, opts *zoekt.SearchOptions) (_ *zoekt.SearchResult, err error) {
+	defer recoverShardPanic(&err)
+	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
+	result, err := searcher.Search(ctx, q, opts)
+	return result, shardCallError(err)
+}
+
+func zoektList(ctx context.Context, searcher zoekt.Searcher, q query.Q, opts *zoekt.ListOptions) (_ *zoekt.RepoList, err error) {
+	defer recoverShardPanic(&err)
+	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
+	list, err := searcher.List(ctx, q, opts)
+	return list, shardCallError(err)
+}
+
+func zoektOpen(file index.IndexFile) (_ zoekt.Searcher, err error) {
+	defer recoverShardPanic(&err)
+	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
+	searcher, err := index.NewSearcher(file)
+	return searcher, shardCallError(err)
+}
+
+func zoektShardCall(call func() error) (err error) {
+	defer recoverShardPanic(&err)
+	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
+	return shardCallError(call())
+}
+
+// zoektReadMetadata drops a nil record: Zoekt gives one with no error for a
+// .meta file that holds null, a damaged record.
+func zoektReadMetadata(path string) (_ []*zoekt.Repository, err error) {
+	defer recoverShardPanic(&err)
+	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
+	repos, _, err := index.ReadMetadataPath(path)
+	repos = slices.DeleteFunc(repos, func(repo *zoekt.Repository) bool { return repo == nil })
+	return repos, shardCallError(err)
+}
+
+// shardCallError marks a Zoekt error that names a read past the end of the
+// shard file (index.mmapedIndexFile.Read, "out of bounds:") as index damage:
+// only shard offsets that do not match the file give it.
+func shardCallError(err error) error {
+	if err != nil && strings.Contains(err.Error(), "out of bounds: ") {
+		return fmt.Errorf("%w: %w", errShardUnloadable, err)
+	}
+	return err
+}
+
+// recoverShardPanic sets *err from the panic of a Zoekt shard call
+// (shardSearchPanic). It must be deferred directly by that call.
+func recoverShardPanic(err *error) {
+	if recovered := recover(); recovered != nil {
+		*err = shardSearchPanic(recovered)
+		slog.Debug("Zoekt shard call panicked", "error", *err, "stack", string(debug.Stack()))
+	}
+}
+
+// shardSearchPanic turns the panic of one Zoekt shard call into an error.
+// Index damage, which openNode repairs with one rebuild, is a panic that names
+// a corrupt shard (index.contentProvider.panicCorrupt) or a corrupt index
+// (index/eval.go: a damaged subRepos section), or a Go runtime error (an index
+// or slice bound, or a memory fault): shard bytes that do not match their
+// offsets give these. In a census of single-byte changes to one shard,
+// 37 gave the corrupt-shard panic and 43 a runtime error. Zoekt's other
+// panics are strings, such as the one for type:repo, type:filematch or a
+// negated case:, and fail only this node, with one warning.
+// TODO(https://github.com/sourcegraph/zoekt/issues/1189): Zoekt returns an
+// error for type:repo and type:filematch; then that error names the cause.
+func shardSearchPanic(recovered any) error {
+	err, ok := recovered.(error)
+	if !ok {
+		err = fmt.Errorf("%v", recovered)
+	}
+	var runtimeErr runtime.Error
+	message := err.Error()
+	if strings.HasPrefix(message, "corrupt shard ") || strings.HasPrefix(message, "corrupt index:") || errors.As(err, &runtimeErr) {
+		return fmt.Errorf("%w: %w", errShardUnloadable, err)
+	}
+	return fmt.Errorf("shard search panicked: %w", err)
 }
 
 // roundScores rounds each score once, after the parts read the exact value:

@@ -23,7 +23,7 @@ import (
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// Fix #1: Locked shard swap — no gap during re-indexing
+// Locked shard swap: no gap during re-indexing
 //
 // Planned Git corpus search refreshes dirty content through the normal
 // freshness path before reading Zoekt shards, so there is no visible gap where
@@ -73,7 +73,7 @@ func TestFix_NoShardGapDuringReindexing(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix #2: acquireReadLock polls until LOCK_EX is released
+// acquireReadLock polls until LOCK_EX is released
 //
 // acquireReadLock is the lock primitive of every node read (openNodeRead).
 // The NB shared lock fails while any LOCK_EX is held, so a searcher waits for
@@ -108,7 +108,7 @@ func TestFix_SharedLockBlocksSearchDuringIndexing(t *testing.T) {
 			_ = f.Close()
 		}()
 		// This polls until LOCK_EX is released
-		if err := acquireReadLock(context.Background(), filepath.Dir(f.Name()), f); err != nil {
+		if err := acquireReadLock(context.Background(), f); err != nil {
 			return
 		}
 		sharedAcquiredAt.Store(time.Now().UnixNano())
@@ -140,7 +140,7 @@ func TestFix_SharedLockBlocksSearchDuringIndexing(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Fix #3: Concurrent search+reindex stress — with LOCK_SH protection
+// Concurrent search and reindex stress, with LOCK_SH protection
 //
 // Searches through the planned-corpus boundary while lower-level reindexing
 // updates shards and holds locks.
@@ -255,15 +255,16 @@ func TestFix_ConcurrentSearchDuringReindex_Stress(t *testing.T) {
 	}
 }
 
-// TestFix_ConcurrentSearchDuringCommittedSwap forces the committed-family
-// temp-swap (delete-live-then-rename) to overlap live searches by COMMITTING a
-// new file each builder iteration (HEAD moves → a committed rebuild → a swap
-// every cycle). A stable committed marker must be found on EVERY concurrent
-// search — proving the publish EX lock excludes readers from the non-atomic
-// swap window. The existing TestFix_* only edit the working tree (HEAD fixed),
-// so they never exercise this path. Each swap stays open for 20 ms and the
-// searches run until the last build ends, so a search that does not wait for
-// the publish lock meets the torn family.
+// TestFix_ConcurrentSearchDuringCommittedSwap makes the swap of the committed
+// family (swapFiles moves the live family aside, then renames the new files
+// in) overlap live searches: the builder commits a new file in each
+// iteration, so HEAD moves and each committed build swaps the family. Each
+// concurrent search must find a stable committed marker: the publish lock
+// (LOCK_EX) keeps readers out of the swap, which is not atomic. The other
+// TestFix_* tests only edit the working tree (HEAD stays), so they never test
+// this path. Each swap stays open for 20 ms and the searches run until the
+// last build ends, so a search that does not wait for the publish lock meets
+// the torn family. The test fails when no build swapped the family.
 func TestFix_ConcurrentSearchDuringCommittedSwap(t *testing.T) {
 	requireTools(t)
 	dir := initGitRepo(t, "stable.go", "package main\n// always_committed_marker\n")
@@ -280,11 +281,11 @@ func TestFix_ConcurrentSearchDuringCommittedSwap(t *testing.T) {
 	start := make(chan struct{})
 	built := make(chan struct{})
 	var swaps atomic.Int32
-	afterDeleteBeforeRenameHook = func() {
+	afterAsideBeforeRenameHook = func() {
 		swaps.Add(1)
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Cleanup(func() { afterDeleteBeforeRenameHook = nil })
+	t.Cleanup(func() { afterAsideBeforeRenameHook = nil })
 
 	wg.Add(1)
 	go func() {
@@ -380,11 +381,11 @@ func TestDescriptionReadDuringRepublish_Stress(t *testing.T) {
 	}
 
 	var swaps atomic.Int32
-	afterDeleteBeforeRenameHook = func() {
+	afterAsideBeforeRenameHook = func() {
 		swaps.Add(1)
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Cleanup(func() { afterDeleteBeforeRenameHook = nil })
+	t.Cleanup(func() { afterAsideBeforeRenameHook = nil })
 
 	errs := make(chan error, 1024)
 	// report never blocks: a defect that fails every read must fail the

@@ -12,8 +12,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	zoektindex "github.com/sourcegraph/zoekt/index"
 )
 
 const (
@@ -24,8 +22,8 @@ const (
 	rerankerDir = "reranker"
 	gcTrashDir  = ".trash"
 
-	// Per-corpus marker. mtime = "last access" — explicit, since atime is
-	// disabled (noatime/relatime) on most modern filesystems.
+	// Per-corpus marker. Its mtime records the last access, because most
+	// file systems mount with noatime or relatime, which keep no current atime.
 	usedFile          = ".used"
 	defaultGCInterval = 24 * time.Hour
 	gcRunTimeout      = 5 * time.Second
@@ -53,11 +51,11 @@ type corpusDirEntry struct {
 type gcAction uint8
 
 const (
-	actionKept    gcAction = iota // not planned for eviction, or TOCTOU re-bump under lock
+	actionKept    gcAction = iota // not planned, or used again since the plan
 	actionEvicted                 // rename to .trash + RemoveAll succeeded
-	actionLocked                  // corpus .lock or .build.lock held by active indexer/searcher
+	actionLocked                  // a search or build holds .lock or .build.lock
 	actionGone                    // corpus dir vanished mid-flight
-	actionTrashed                 // renamed to .trash but RemoveAll failed; drainTrash will finish
+	actionTrashed                 // renamed, RemoveAll failed; drainTrash retries
 	actionFailed                  // open-lock, build-lock check, or rename error
 )
 
@@ -108,7 +106,8 @@ func shortErr(err error) string {
 }
 
 // gcOptions tunes a single runGC invocation.
-//   - skipThrottle bypasses the .last-gc mtime gate (manual `seek gc --force`).
+//   - skipThrottle bypasses the .last-gc mtime gate (`seek gc --force` or
+//     `--all`).
 //   - evictAll evicts every corpus that no search holds (`seek gc --all`).
 //     Otherwise GC evicts the least recently used corpora only while the
 //     cache is over its budget; age alone never evicts a corpus.
@@ -143,9 +142,10 @@ func fireOpportunisticGC(runFn func(context.Context), timeout time.Duration) {
 	}
 }
 
-// runOpportunisticGC is the entry point fired from main() after every run,
-// successful or not. Every failure is logged and swallowed; never returns an
-// error and never affects exit code. Bounded by ctx (gcRunTimeout).
+// runOpportunisticGC is the automatic GC that main() runs after each search
+// command, successful or not (shouldRunOpportunisticGC). It logs every failure
+// and a panic, and returns no error, so it never changes the exit code. ctx
+// bounds it (gcRunTimeout).
 func runOpportunisticGC(ctx context.Context) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -157,9 +157,9 @@ func runOpportunisticGC(ctx context.Context) {
 
 // runGC is the shared GC body. Two callers:
 //   - runOpportunisticGC: writer nil → silent eviction sweep, post-run.
-//   - runGCCommandCmd (`seek gc --force` / `--all`): writer os.Stdout → streams
-//     the same banner + table + summary as `--dry-run`, with the ACTION column
-//     reflecting the real per-corpus outcome.
+//   - runGCCommandCmd (`seek gc`, `--force`, `--all`): writer os.Stdout →
+//     streams the same banner + table + summary as `--dry-run`, with the
+//     ACTION column reflecting the real per-corpus outcome.
 //
 // Order of operations:
 //  1. throttle gate (`.last-gc` mtime) unless skipThrottle
@@ -320,8 +320,9 @@ func runGC(ctx context.Context, opts gcOptions) {
 
 // sweepRetiredRuntimes removes the native runtimes of other Seek versions:
 // ONNX Runtime under reranker/<version>/<sha256> (or the older flat
-// reranker/ort-<version>-<platform>-<hash> layout) and USearch under
-// semantic/usearch/<key>. The runtimes of this binary stay. A runtime goes
+// reranker/ort-<version>-<platform>-<hash> layout), USearch under
+// semantic/usearch/<key>, and NumKong under semantic/numkong/<key>. The
+// runtimes of this binary stay. A runtime goes
 // when its directory is older than the age bound (retiredRuntimes); its next
 // use installs it again. Each runtime is renamed aside first, so no process
 // finds it half removed.
@@ -366,6 +367,8 @@ func retireRuntimes(ctx context.Context, writer io.Writer, cacheRoot string, bef
 func retiredRuntimes(cacheRoot string, before time.Time) []string {
 	usearchRoot := filepath.Join(cacheRoot, "semantic", "usearch")
 	due := agedRuntimeDirs(usearchRoot, filepath.Join(usearchRoot, semanticUSearchAssetKey()), before)
+	numkongRoot := filepath.Join(cacheRoot, "semantic", "numkong")
+	due = append(due, agedRuntimeDirs(numkongRoot, filepath.Join(numkongRoot, semanticNumKongAssetKey()), before)...)
 	bundle, err := lateOnRuntimeForPlatform()
 	if err != nil {
 		return due
@@ -441,8 +444,9 @@ func touchStamp(cacheRoot string) {
 	_ = writeCacheFile(cacheRoot, gcStampFile, "")
 }
 
-// warnNFSOnce logs a Warn the first ever time GC detects a network FS, then
-// debounces future warnings via .last-gc presence.
+// warnNFSOnce logs a warning the first time GC finds the cache on a network
+// file system. It then writes .last-gc, and while that file exists, later
+// runs log at Debug level only.
 func warnNFSOnce(cacheRoot string) {
 	stampPath := filepath.Join(cacheRoot, gcStampFile)
 	if _, err := os.Stat(stampPath); errors.Is(err, fs.ErrNotExist) {
@@ -508,12 +512,11 @@ func shouldRunGC(cacheRoot string, interval time.Duration) bool {
 const buildTmpMaxAge = time.Hour
 
 // providerArtifactDiscardPrefix marks a compiled model or runtime that is being
-// removed. Removing one in place is not atomic, and a truncated removal would
-// update the directory's own modification time, which would hide it from the
-// age test for good while leaving a broken compiled model or runtime where Seek
-// expects a whole one. Renaming first makes the leftover self-identifying, so a
-// later sweep removes it whatever its age, the way drainTrash retries a partly
-// evicted corpus.
+// removed. A removal in place is not atomic. A cut removal changes the
+// directory's modification time, so the age test sees the directory as new.
+// It also leaves a broken compiled model or runtime where Seek expects a whole
+// one. A rename first marks the leftover, so a later sweep removes it at any
+// age, as drainTrash retries a partly evicted corpus.
 const providerArtifactDiscardPrefix = ".discarding-"
 
 // sweepAgedProviderArtifacts removes compiled accelerator models that no search
@@ -522,12 +525,13 @@ const providerArtifactDiscardPrefix = ".discarding-"
 // megabytes.
 //
 // Removing one that is still wanted costs a recompile AND a fresh provider
-// check, because the verdict file lives in the same directory. It therefore ages
-// on the access marker a search refreshes, not on the directory's own timestamp,
-// which nothing moves after the compile.
+// check, because the verdict file lives in the same directory. It therefore
+// ages on the access marker a search refreshes, not on the directory's own
+// timestamp, which nothing moves after the compile.
 //
 // It reports what it reclaimed to writer, so a live collection says the same
-// thing its plan did. A nil writer stays silent, which is the opportunistic path.
+// thing its plan did. A nil writer stays silent, which is the opportunistic
+// path.
 //
 // Callers reach this only from runGC. The dry-run path returns before runGC, so
 // this never runs for a plan.
@@ -541,9 +545,9 @@ func sweepAgedProviderArtifacts(ctx context.Context, writer io.Writer, cacheRoot
 	discardAgedDirs(ctx, writer, "compiled model files", agedProviderArtifacts(ctx, cacheRoot, before), unused, nil)
 }
 
-// agedProviderArtifacts lists the compiled models a collection would remove, so
-// the live sweep and `--dry-run` agree on what is due. An entry a previous sweep
-// left marked is always due, whatever its age.
+// agedProviderArtifacts lists the compiled models a collection would remove,
+// so the live sweep and `--dry-run` agree on what is due. An entry a previous
+// sweep left marked is always due, whatever its age.
 func agedProviderArtifacts(ctx context.Context, cacheRoot string, before time.Time) []string {
 	root := filepath.Join(cacheRoot, rerankerDir, "coreml")
 	formats, err := os.ReadDir(root)
@@ -641,9 +645,9 @@ func discardAgedDirs(
 	return true
 }
 
-// sweepOrphanBuildDirs removes leftover .build-* temp index dirs (from a crashed
-// or killed builder) whose mtime is older than `before`. A still-running build's
-// temp dir has a recent mtime and is skipped.
+// sweepOrphanBuildDirs removes leftover .build-* temp index dirs (from a
+// crashed or killed builder) whose mtime is older than `before`. A
+// still-running build's temp dir has a recent mtime and is skipped.
 func sweepOrphanBuildDirs(indexDir string, before time.Time) {
 	entries, err := os.ReadDir(indexDir)
 	if err != nil {
@@ -795,7 +799,7 @@ func evictIfPlanned(e corpusDirEntry, trashDir string, evict map[corpusID]bool) 
 // evictCorpus performs a two-phase delete under a non-blocking per-corpus
 // lock. Returns a gcRowResult describing the outcome:
 //   - actionLocked: corpus .lock or .build.lock held by another seek
-//   - actionKept:   .used was bumped between enumeration and lock (TOCTOU close)
+//   - actionKept:   .used changed between enumeration and lock (a new use)
 //   - actionGone:   corpus dir vanished mid-flight (concurrent process)
 //   - actionEvicted: rename + RemoveAll both succeeded
 //   - actionTrashed: rename succeeded, RemoveAll failed; drainTrash finishes
@@ -857,9 +861,9 @@ func evictCorpus(e corpusDirEntry, trashDir string, cutoff time.Time) gcRowResul
 
 // pickDisplayShard chooses which shard's metadata to read for display.
 // Prefers a non-uncommitted shard so Repository.Source comes from the committed
-// corpus when available. Repository.Name uses the opaque default unless local
-// zoekt.name config replaces it. Returns shards[0] when all shards are
-// uncommitted; their Source is still the repository path.
+// corpus when available. Repository.Name is the opaque name of the
+// repository. Returns shards[0] when all shards are uncommitted; their Source
+// is still the repository path.
 func pickDisplayShard(shards []string) string {
 	for _, s := range shards {
 		if !isUncommittedShard(filepath.Base(s)) {
@@ -870,7 +874,7 @@ func pickDisplayShard(shards []string) string {
 }
 
 // corpusDisplayInfo summarizes a corpus for the ROOT column of the seek gc
-// table — used by both `--dry-run` (reportGCPlan) and live `--force` (runGC
+// table — used by both `--dry-run` (reportGCPlan) and a live `seek gc` (runGC
 // streaming path). Source is the absolute on-disk root (from zoekt
 // Repository.Source). When the source path no longer exists on the
 // filesystem, gone is true.
@@ -882,8 +886,8 @@ type corpusDisplayInfo struct {
 // readCorpusDisplayInfo reads Repository.Source from a committed shard when one
 // exists. It uses an uncommitted shard when that is the only available shard.
 //
-// It returns an empty value when no readable shard exists. Callers then show the
-// corpus hash.
+// It returns an empty value when no readable shard exists. Callers then show
+// the corpus hash.
 func readCorpusDisplayInfo(corpusDir string) corpusDisplayInfo {
 	indexDir := filepath.Join(corpusDir, "index")
 	shards, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
@@ -891,7 +895,7 @@ func readCorpusDisplayInfo(corpusDir string) corpusDisplayInfo {
 		return corpusDisplayInfo{}
 	}
 	pick := pickDisplayShard(shards)
-	repos, _, err := zoektindex.ReadMetadataPath(pick)
+	repos, err := zoektReadMetadata(pick)
 	if err != nil || len(repos) == 0 {
 		return corpusDisplayInfo{}
 	}

@@ -2,8 +2,8 @@
 
 Ranked local code search for AI coding agents. `seek` searches the current
 folder or the paths you give, and returns the most relevant matches with their
-definitions and context. A plain description of two or more words also finds
-code by meaning, with a bundled local model. No server or API key is needed.
+definitions and context. A query also finds code by meaning, with a bundled
+local model. No server or API key is needed.
 
 Seek caches its indexes for fast repeat searches and safe concurrent use. It is
 built for the shortest search time: it uses all CPU cores and as much memory and
@@ -56,9 +56,9 @@ seek --lexical-only 'handleRequest'  # text only, no model work
 ```
 
 Results are grouped by file, most relevant first, with 3 lines of context on
-each side. `[func]` and `[class]` tags mark definitions, and `[uncommitted]`
-marks a file with local changes. Piped output has no color. Set `NO_COLOR` to
-disable color, or `CLICOLOR_FORCE` to force it.
+each side. In `sym:` results, a tag such as `[func]` or `[class]` marks each
+definition. `[uncommitted]` marks a file with local changes. Piped output has
+no color. Set `NO_COLOR` to disable color, or `CLICOLOR_FORCE` to force it.
 
 The first search of a project builds its indexes. On a large repository this
 can take tens of seconds and several GiB of memory and cache.
@@ -92,7 +92,8 @@ quoted query.
 | `type:file config` | File names only |
 | `foo or bar`, `(foo or bar) lang:go` | Either term; grouping |
 
-`file:` matches the path as printed, which starts with the path you typed.
+`file:` matches the path as printed, which starts with the path you typed
+(Seek prints `./src` as `src`).
 Seek accepts the full [Zoekt query syntax](https://github.com/sourcegraph/zoekt/blob/0e68f41329d9/doc/query_syntax.md).
 
 | Flag | Meaning |
@@ -114,19 +115,19 @@ seek 'validate search query syntax'
 seek -n 5 'find request parser lang:go -file:_test\.go$'
 ```
 
-A query of two or more description words uses the model. In every searched
-folder and repository, Seek adds files whose code has a similar meaning, and the
-model ranks them with the text matches. Filters and paths apply to both. A
-one-word query, a lone quoted phrase, `or` between descriptions, and a query of
-filters only use text order.
+A query uses the model when it gives the model text, such as words or the
+patterns of its filters. In every searched folder and repository, Seek adds
+files whose code has a similar meaning, and the model ranks them with the text
+matches. Filters and paths apply to both. A query that gives the model no text,
+such as negations or punctuation alone, uses text order.
 
 Meaning-based search is approximate. A file with every query word stays; a file
 that only the model adds must pass a score threshold. No result means exit code
 1, which does not prove that the code is absent. If the model fails, Seek
 returns the text matches (`-v` gives the reason).
 
-The first description search builds the meaning-based index; later searches
-embed only changed files. Set `SEEK_PROVIDER=cpu` to run the model on the CPU,
+The first search builds the meaning-based index; later searches embed only
+changed files. Set `SEEK_PROVIDER=cpu` to run the model on the CPU,
 for example to report a problem; the default picks the best provider of the
 host.
 
@@ -163,7 +164,7 @@ Without the plugin, add this to the agent's instructions:
 ```text
 Use `seek` for ranked code navigation. Put filters in one quoted query and
 paths after it: seek 'sym:Name file:src -file:test' ./cmd
-Use a plain description with two or more words when the name is unknown.
+Use a plain description when the name is unknown.
 Use an exhaustive tool for renames, counts, and absence checks.
 ```
 
@@ -172,7 +173,7 @@ Use an exhaustive tool for renames, counts, and absence checks.
 | | ripgrep | seek |
 |---|---|---|
 | Search | Scans the files each time | Builds an index once, then reuses it |
-| Order | Unspecified | Relevance; model ranking for descriptions |
+| Order | Unspecified | Relevance; model ranking |
 | Descriptions | Literal text or regular expression | Finds code with a similar meaning |
 | Symbols | None | `sym:` finds definitions |
 | Context | None by default | 3 lines on each side |
@@ -203,16 +204,16 @@ seek gc --all                   # delete everything that no search uses
 
 Seek has no file-count or size limit. A file that it cannot index by content
 (a NUL byte, under three bytes, larger than one 4 GiB index shard, not on disk,
-or unreadable) is found by name only, and the search says how many such files
-could also match.
+or unreadable) is found by name only. After its results, a search gives the
+count of such files, other than those under three bytes, that could also match.
 
 ## Parallel use
 
 | Situation | What happens |
 |-----------|--------------|
 | The index is current | All searches run at the same time |
-| Another search updates the index | Searches use the last complete index and can miss its newest changes; descriptions then use text matches only |
-| An update fails | Seek warns and uses the last complete index |
+| Another search updates the index | Searches use the last complete index, can miss its newest changes, and find text matches only |
+| An update fails | Seek warns, uses the last complete index, and finds text matches only |
 | No index yet | The first search builds it; the others wait |
 
 ## Exit codes

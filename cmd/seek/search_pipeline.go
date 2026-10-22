@@ -22,7 +22,9 @@ import (
 )
 
 // The one search pipeline moves three stage types between its stages: a
-// queryPlan in, nodeHits from each node, and one ranked list out.
+// queryPlan in, nodeHits from each node, and one ranked list out. A query with
+// no model stage gets corpusSearchResult values from each node (strictNode)
+// and has no ranked list.
 
 // Retrieval rule: a semantic hit is a row whose fine MeanMaxSim is at least
 // tau_file - delta. A file whose model MeanMaxSim passes tau_file then has its
@@ -50,8 +52,10 @@ const semanticRetrievalRadius = pipelineTauFile - semanticRetrievalDelta
 // the exact top 20 in every query; 0.7 reached the recall target (top-20
 // overlap of at least 0.95) only at its limit, 0.8 kept half. That
 // measurement read a 127^2 scale, 4.5 % below the cosine (an effective cosine
-// of about 0.627); the bound is a cosine, so it keeps a few more rows than
-// measured.
+// of about 0.627). The bound applies to USearch's cosine of the int8 codes.
+// For keys at a cosine of 0.5 or more, it differs from the f32 cosine by a
+// mean under 0.001 and by at most 0.012. So the bound keeps a few more rows
+// than measured.
 var semanticUSearchDeepenSimilarity float32 = 0.6
 
 // nodeHit is one file of one node: the unit of merge, duplicate collapse,
@@ -293,6 +297,22 @@ type openedNode struct {
 	// semantic source of that state: the commit of a Git node, the walk
 	// state of a folder node. nil reads text only.
 	version func() (state, source string, ok bool)
+	// attempt counts the reads of this node in one openNode: 0, or 1 after a
+	// repair or a tree change.
+	attempt int
+	// repair collects the repairs that the read asks for; openNode runs them
+	// after the read releases its lock.
+	repair *nodeRepair
+}
+
+// nodeRepair is a repair that a node read asks for. A read holds the node's
+// read lock, and a repair takes the publish lock, which waits for every
+// reader: so the read only records it.
+type nodeRepair struct {
+	// vectors is set when a read finds vector data that no shard repair
+	// fixes: rows that still do not match their shard copy after the shard
+	// repair, or a graph shard that fails its hash.
+	vectors atomic.Bool
 }
 
 // openNode makes one node's index current, then runs read on it: the build or
@@ -301,8 +321,10 @@ type openedNode struct {
 // A read that finds a shard it cannot load removes the family manifest that
 // it saw (removeDamagedFamilyManifest) and opens the node once more
 // (errShardUnloadable); a second failure returns. A read that sees the tree
-// change opens the node once more from a new capture. Every prepare path of a
-// search goes through openNode.
+// change opens the node once more from a new capture. When a read records
+// vector damage (nodeRepair), openNode removes the node's vector generations
+// after the read (removeDamagedVectors). Every prepare path of a search goes
+// through openNode.
 func openNode(
 	ctx context.Context,
 	plan node,
@@ -320,7 +342,11 @@ func openNode(
 		if err != nil {
 			return asNodeFailure(ctx, err)
 		}
+		opened.attempt, opened.repair = attempt, &nodeRepair{}
 		err = read(opened)
+		if opened.repair.vectors.Load() {
+			removeDamagedVectors(ctx, plan)
+		}
 		retry := errors.Is(err, errShardUnloadable) || errors.Is(err, errGitIndexStateChanged)
 		switch {
 		case retry && attempt == 0:
@@ -344,6 +370,41 @@ func openNode(
 		}
 		return nil
 	}
+}
+
+// removeDamagedVectors removes the node's vector generations, so the next
+// preparation builds them again. The shard repair rebuilds only the Zoekt
+// family, and the open check of a generation trusts rows that its build
+// recorded, so damaged rows would else give the same mismatch on every search.
+// The open check does not read the graph shards either, so the next bind would
+// serve a damaged graph shard again, and each search would hash it and fall
+// back to the exact vectors. The windows of the removed generations go to the
+// unit store first: the rebuild copies every window whose file and content
+// still match, and embeds only the damaged rows again, because their content
+// no longer matches. The graphs are built again from the rows. The
+// removal takes the publish lock, as removeDamagedFamilyManifest does. It
+// also takes the node's build lock with no wait: a peer build can still link
+// graph files of these generations, so the removal skips while one runs. That
+// build's rows are good, because the damaged rows no longer match their
+// content and are not copied, and it hashes a graph shard whose check fails
+// before it links it.
+func removeDamagedVectors(ctx context.Context, plan node) {
+	build, ok, err := tryBuildLock(plan.cacheDir)
+	if err != nil || !ok {
+		slog.Debug("Kept the damaged vector index", "root", plan.root, "cause", "a build runs", "error", err)
+		return
+	}
+	defer releaseLock(build)
+	lock, err := acquirePublishLock(ctx, plan.cacheDir)
+	if err != nil {
+		slog.Debug("Kept the damaged vector index", "root", plan.root, "error", err)
+		return
+	}
+	defer releaseLock(lock)
+	removeJoinedGeneration(plan.cacheDir)
+	archiveSupersededUnits(plan.indexDir)
+	removeSemanticGenerationsExcept(plan.indexDir, nil)
+	slog.Warn("Vector index damage detected; rebuilding the vectors", "root", plan.root)
 }
 
 // removeDamagedFamilyManifest removes the family manifest that a damaged read
@@ -618,13 +679,14 @@ func (nodes *skippedNodes) first(root string) bool {
 }
 
 // queryPlan is the first stage of the pipeline: the strict query that
-// every node runs, and for a description the plan of the model stages.
+// every node runs, and for a query that gives the model text the plan of the
+// model stages.
 type queryPlan struct {
 	raw    query.Q
 	strict query.Q
 	// halves holds the file-name atoms of strict that bare words made.
 	halves map[query.Q]struct{}
-	// model is set for a description.
+	// model is set for a query that gives the model text (planRerankQuery).
 	model *rerankQueryPlan
 }
 
@@ -689,7 +751,7 @@ func strictNode(ctx context.Context, plan node, qp queryPlan, config searchConfi
 	return results, dirty, nil
 }
 
-// retrieveNode opens one node and reads it for a description: strict
+// retrieveNode opens one node and reads it for a model query: strict
 // lexical retrieval, semantic retrieval within the radius over the rows that
 // the query's filters and the node's scope allow, and the relaxed lexical rank
 // of each semantic hit, under one read lock on one generation. It gives one
@@ -718,11 +780,11 @@ func retrieveNode(ctx context.Context, plan node, qp queryPlan, config searchCon
 	return hits, dirty, nil
 }
 
-// readNodeEvidence reads one opened node for a description. Under the node's
+// readNodeEvidence reads one opened node for a model query. Under the node's
 // read lock it runs the strict search, the name-only count, semantic retrieval
-// on the bound generation and the overlay, and the relaxed lexical rank of
-// each semantic file. After the unlock it reads the source of each semantic
-// file for its display.
+// on the bound generation and the overlay, the relaxed lexical rank of each
+// semantic file, and the text of each semantic file from the shards
+// (readSemanticEvidence).
 func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config searchConfig, execution searchExecution, nameOnlyFiles *int64) (nodeHits, error) {
 	plan := node.plan
 	read, ctx, err := openNodeRead(ctx, plan, node.dirty)
@@ -746,10 +808,17 @@ func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config
 	case node.version != nil:
 		state, source, ok = node.version()
 	}
-	if ok {
-		if readStateFile(plan.cacheDir) != state {
+	if ok && readStateFile(plan.cacheDir) != state {
+		if node.attempt == 0 {
 			return nil, treeChanged(plan)
 		}
+		// The tree changed again after the retry's capture, as a file
+		// written on each save does: the node serves its text with no
+		// vectors, as a stale index does.
+		slog.Debug("vectors unavailable", "root", plan.displayRoot, "cause", "the tree changed again")
+		ok = false
+	}
+	if ok {
 		overlaySource := ""
 		// Only the Git prepare sets dirty files.
 		if execution.buildsOverlay(len(node.dirty) > 0) {
@@ -758,6 +827,15 @@ func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config
 		if plan.joinedGenerationsMatch(state, source, overlaySource) {
 			if source != "" {
 				generation, err = plan.openJoinedSemanticGeneration(source)
+			}
+			if generation != nil {
+				// The descriptor removal alone gives no new graph: the next
+				// bind would serve the same file.
+				clearDescriptor := generation.onUSearchDamage
+				generation.onUSearchDamage = func() {
+					clearDescriptor()
+					node.repair.vectors.Store(true)
+				}
 			}
 			if err == nil && overlaySource != "" {
 				overlay, err = openSemanticGenerationForSearch(semanticGenerationDir(plan.indexDir, overlaySource), overlaySource)
@@ -860,39 +938,45 @@ func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config
 			pending[candidate.unit.path] = struct{}{}
 		}
 	}
+	// The relaxed rank and the text of the semantic files are two searches of
+	// the loaded shards, so they run at the same time. On Kubernetes this
+	// saves about 25 ms of a 1.9 s description search.
 	relaxedScores := make(map[string]relaxedLexical, len(pending))
+	var evidence []semanticFileCandidate
+	tail, tailCtx := errgroup.WithContext(ctx)
 	if len(pending) > 0 {
-		opts := searchOpts
-		opts.NumContextLines = 0
-		relaxedQ := query.NewAnd(qp.model.relaxedQ, &query.FileNameSet{Set: pending})
-		// The relaxed rank reads the global average too.
-		relaxed, err := read.search(ctx, relaxedQ, searchConfig{opts: &opts, bm25: true})
-		if err != nil {
-			return nil, err
-		}
-		for _, file := range relaxed {
-			if best, ok := relaxedScores[file.FileName]; !ok || file.Score > best.score {
-				relaxedScores[file.FileName] = relaxedLexical{score: file.Score, parts: file.Debug}
+		tail.Go(func() error {
+			opts := searchOpts
+			opts.NumContextLines = 0
+			relaxedQ := query.NewAnd(qp.model.relaxedQ, &query.FileNameSet{Set: pending})
+			// The relaxed rank reads the global average too.
+			relaxed, err := read.search(tailCtx, relaxedQ, searchConfig{opts: &opts, bm25: true})
+			if err != nil {
+				return err
 			}
-		}
+			for _, file := range relaxed {
+				if best, ok := relaxedScores[file.FileName]; !ok || file.Score > best.score {
+					relaxedScores[file.FileName] = relaxedLexical{score: file.Score, parts: file.Debug}
+				}
+			}
+			return nil
+		})
 	}
-	// The rows and vectors stay mapped while the generation is open; the
-	// evidence reads the source, not the index.
-	read.close()
-
-	contextLines := max(configuredContextLines(config), searchContextLines)
-	if len(semanticFiles) > 0 {
-		semanticFiles, err = plan.behavior.materialize(ctx, node, semanticFiles, contextLines)
-		if err != nil {
-			return nil, err
-		}
-	}
-	// Overlay files print as the dirty files that they are.
-	overlayFiles, err = materializeWorkTreeSemanticCandidates(ctx, plan, repoUncommitted, overlayFiles, contextLines)
-	if err != nil {
+	// The base rows exclude the dirty files, and the overlay rows hold only
+	// them, so each path has one candidate. The current-copy clause of the
+	// read gives an overlay file its work-tree copy.
+	tail.Go(func() error {
+		var err error
+		evidence, err = readSemanticEvidence(tailCtx, read, node, slices.Concat(semanticFiles, overlayFiles),
+			max(config.opts.NumContextLines, searchContextLines))
+		return err
+	})
+	if err := tail.Wait(); err != nil {
 		return nil, err
 	}
-	return nodeEvidenceHits(plan, node.dirty, generation, overlay, strict, slices.Concat(semanticFiles, overlayFiles), relaxedScores), nil
+	// The rows and vectors stay mapped while the generation is open.
+	read.close()
+	return nodeEvidenceHits(plan, node.dirty, generation, overlay, strict, evidence, relaxedScores), nil
 }
 
 // scanNode runs semantic retrieval on one node through USearch: its filtered
@@ -933,7 +1017,10 @@ func scanOverlay(ctx context.Context, qp queryPlan, overlay *semanticGeneration,
 // scanWithinRadius runs one scan with the command's query and the node's row
 // selection. The scan keeps the rows whose summed fine MaxSim reaches the
 // radius times the query's token count. Each kept row then takes its fine
-// MeanMaxSim as its score.
+// MeanMaxSim as its score. The scorer applies this floor before it sorts, so
+// it sorts only the kept rows. On Kubernetes, about 2 % of 1.3 million rows
+// reach the radius, and a sort of every scored row costs 6 to 9 % of a
+// description search.
 func scanWithinRadius(
 	ctx context.Context,
 	qp queryPlan,
@@ -1152,11 +1239,11 @@ func lexicalMatchKey(file zoekt.FileMatch) string {
 	return fmt.Sprintf("line:%d", file.LineMatches[best].LineNumber)
 }
 
-// rankDescription runs the model stages over the merged hits:
+// rankModelQuery runs the model stages over the merged hits:
 // the candidate set, the model score of each candidate in batches, and the
 // per-file acceptance. A model error gives the strict order with one debug
 // line.
-func rankDescription(ctx context.Context, hits nodeHits, qp queryPlan, execution searchExecution) (ranked, error) {
+func rankModelQuery(ctx context.Context, hits nodeHits, qp queryPlan, execution searchExecution) (ranked, error) {
 	merged := mergeNodeHits(hits)
 	scored, nameOnly := candidateFiles(merged)
 	if len(scored) == 0 {

@@ -20,16 +20,18 @@ rg -l 'class Router|route_request' ./src | head
 ```
 
 Routed searches show at most 20 files and 3 matches per file (one per file for
-an `rg` context search). They are ranked, not complete. A routed query has no
-description, so it uses text ranking and builds no meaning-based index. For
-every match, prefix the command with `SEEK_ROUTER=off`, or set it in the
-session environment to stop all routing.
+an `rg` context search). They are ranked, not complete. A routed search can
+use the model too, so the first one in a large folder can build the
+meaning-based index and take tens of seconds. For every match, prefix the
+command with `SEEK_ROUTER=off`, or set it in the session environment to stop
+all routing.
 
 The hook handles one static shell call, or one file-name search piped to `head`
-with a positive numeric limit. It accepts literal words and quoted strings.
+with an optional positive line count. It accepts literal words and quoted
+strings.
 
-- `grep`: recursive search with an explicit path, with bundled `r`, `n`, `l`,
-  `H`, `I`, `F`, `E`, or `i` flags.
+- `grep`: recursive search for one word (any string with `F`) with an explicit
+  path, with bundled `r`, `n`, `l`, `H`, `I`, `F`, `E`, or `i` flags.
 - `rg`: one pattern (or `-e` pattern), optional literal paths, short search
   flags and their long forms. Context flags need an explicit path.
 - `git grep`: one plain pattern, bundled `n`, `l`, `F`, or `i` flags, and
@@ -45,10 +47,10 @@ expressions use Seek's Zoekt dialect. With no path, Seek searches the current
 folder, as the original command does.
 
 The hook leaves everything else unchanged: `egrep`, `fgrep`, `ag`, `ack`,
-non-recursive `grep`, standard input, long or unknown flags, file filters,
-counts, replacement, multiline modes, `git grep` tree objects and path magic,
-other `fd` options, compound `find` expressions, variables, substitutions,
-globs, redirects, and other pipelines.
+non-recursive `grep`, standard input, other flags, file filters, counts,
+replacement, multiline modes, `git grep` tree objects and path magic, other
+`fd` options, compound `find` expressions, variables, substitutions, globs,
+redirects, and other pipelines.
 
 The hook always exits with status 0. Invalid input, an unsupported command, a
 missing dependency, or a parser failure gives no decision, and the host runs

@@ -95,6 +95,8 @@ type semanticFilterMask struct {
 
 // semanticFilteredExactRows is the largest complete semantic-row selection
 // that Seek scores directly without planning individual shard routes.
+// TODO(https://github.com/unum-cloud/USearch/issues/817): let USearch score
+// these rows once its C API has an exact filtered search.
 const semanticFilteredExactRows = 256
 
 // buildSemanticFilterMask evaluates keep once for each adjacent group of rows

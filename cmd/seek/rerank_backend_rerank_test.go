@@ -516,10 +516,10 @@ func TestLateOnInferenceMatchesReferenceScores(t *testing.T) {
 	if lateOnAcceleratedProviderName == lateOnCPUProviderName {
 		return
 	}
-	// Pinning the accelerated provider bypasses the run-time check, so this case
-	// records its scores without gating. On a host where that provider is wrong,
-	// the automatic case above still passes because the check demotes it, and the
-	// deltas recorded here say how wrong it is.
+	// Pinning the accelerated provider bypasses the run-time check, so this
+	// case records its scores without gating. On a host where that provider
+	// is wrong, the automatic case above still passes because the check
+	// demotes it, and the deltas recorded here say how wrong it is.
 	t.Run(lateOnAcceleratedProviderName, func(t *testing.T) {
 		t.Setenv(lateOnProviderEnv, lateOnAcceleratedProviderName)
 		lateOnReferenceScoreCheck(t, false)
@@ -527,7 +527,9 @@ func TestLateOnInferenceMatchesReferenceScores(t *testing.T) {
 }
 
 // lateOnReferenceScoreCheck holds the scores this project calibrated its
-// acceptance thresholds against. Every provider must reproduce them.
+// acceptance thresholds against. Every provider must reproduce them. With
+// gate false, a difference in a score or in the rank order is logged, not
+// failed.
 //
 // A provider that passes the run-time check in verifyLateOnAcceleratedProvider
 // but fails here means that check is too permissive. That is the signal to
@@ -893,10 +895,10 @@ func TestLateOnMaxSimRejectsZeroDocumentVectors(t *testing.T) {
 }
 
 func TestPrepareSemanticQueryReturnsUsableTokens(t *testing.T) {
-	// PrepareSemanticQuery guards its own output, because a degenerate query row
-	// gives every candidate a finite score of zero that no later guard can tell
-	// apart from a genuine miss. Assert the invariant on real model output, so a
-	// provider that starts returning zero rows fails here.
+	// PrepareSemanticQuery guards its own output, because a degenerate query
+	// row gives every candidate a finite score of zero that no later guard can
+	// tell apart from a genuine miss. Assert the invariant on real model
+	// output, so a provider that starts returning zero rows fails here.
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
 	model, err := newLateOnSemanticModel(t.Context())
 	if err != nil {
@@ -999,7 +1001,8 @@ func TestLateOnProbeRowsCoverActiveTokens(t *testing.T) {
 		t.Fatal("the probe row is not stable between calls")
 	}
 	// Every attended token must be one the model can embed, and nothing beyond
-	// them may be attended, or the two providers would be compared over padding.
+	// them may be attended, or the two providers would be compared over
+	// padding.
 	for row := range semanticModelBatchRows {
 		base := row * lateOnSequenceLength
 		for token := range lateOnSequenceLength {
@@ -1042,8 +1045,9 @@ func TestLateOnOutputsAgreeSeparatesFaultFromNoise(t *testing.T) {
 		t.Fatalf("identical outputs disagreed: %s", why)
 	}
 
-	// A uniform shrink keeps every cosine at 1 but depresses every score by the
-	// same factor, which is the shape of the macOS 15 fault. It must be rejected.
+	// A uniform shrink keeps every cosine at 1 but lowers every score by the
+	// same factor, which is the shape of the macOS 15 fault. It must be
+	// rejected.
 	scaled := make([]float32, batch)
 	for index, value := range reference {
 		scaled[index] = value * 0.87
@@ -1061,9 +1065,9 @@ func TestLateOnOutputsAgreeSeparatesFaultFromNoise(t *testing.T) {
 		t.Fatalf("a 0.1 percent scale disagreed: %s", why)
 	}
 
-	// A zero token vector is the shape the macOS 15 fault takes.
-	// Put the fault in the last row, so a check that inspects only the first row
-	// fails this test.
+	// A zero token vector is the shape the macOS 15 fault takes. Put the
+	// fault in the last row, so a check that inspects only the first row fails
+	// this test.
 	lastRow := (semanticModelBatchRows - 1) * lateOnSequenceLength
 	zeroed := append([]float32(nil), reference...)
 	for dimension := range semanticEmbeddingDimensions {

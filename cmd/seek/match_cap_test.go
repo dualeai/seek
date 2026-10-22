@@ -63,8 +63,8 @@ func TestMatchTotalIndependentOfOperandSplit(t *testing.T) {
 	}
 }
 
-// searchMatchCapFixture shows one match per file so the captured output stays
-// small: captureStdout reads the pipe only after the search returns.
+// searchMatchCapFixture runs a text search with no model and shows one match
+// per file, so the captured output stays small.
 func searchMatchCapFixture(t *testing.T, limit int, operands ...string) string {
 	t.Helper()
 	out, err := captureStdout(t, func() error {

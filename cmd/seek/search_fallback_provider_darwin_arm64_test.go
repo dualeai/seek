@@ -27,9 +27,9 @@ func TestRunSearchCommandEmbeddingFaultRecordsOnce(t *testing.T) {
 			verdict := pinAcceleratedProviderForTest(t)
 			scorer := &hybridTestScorer{embedErr: errDegenerateSemanticVector}
 
-			// Start with no index. Query preparation and final scoring still work
-			// when the vector build fails, so the strict file returns; a relaxed
-			// match alone is no candidate.
+			// Start with no index. Query preparation and final scoring still
+			// work when the vector build fails, so the strict file returns; a
+			// relaxed match alone is no candidate.
 			output, err := runHybridTestSearch(t, "alpha beta", []string{root}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
 				return scorer, nil
 			})

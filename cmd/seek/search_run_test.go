@@ -14,9 +14,10 @@ import (
 	"testing"
 )
 
-// describe runs a description through the pipeline with the fake model: a
-// unit that holds SEMANTIC_TARGET has the query's vector, and the model
-// scores its text 100; every other unit is orthogonal and scores 0.
+// describe runs query through the pipeline with the fake model
+// (hybridTestScorer): a unit that holds SEMANTIC_TARGET lies near the query
+// vector, and the model scores its text 100; every other unit is orthogonal
+// to the query and scores 0.
 func describe(t *testing.T, query string, operands ...string) (string, *hybridTestScorer, error) {
 	t.Helper()
 	scorer := &hybridTestScorer{}
@@ -250,12 +251,13 @@ func (longQueryScorer) PrepareSemanticQuery(_ context.Context, query string) (*s
 	return prepared, nil
 }
 
-// TestLongQueryUsesVectors runs a 300-term description whose query embedding
-// has three windows. The target holds no query word, so only vectors find it,
-// and only with the tokens of every window: its MeanMaxSim is 1 when
-// retrieval reads the three windows, and 1/3 (below the 0.4842 radius) when
-// it reads only the first. TestLateOnPrepareSemanticQueryUsesWindows checks
-// the windows that the model makes.
+// TestLongQueryUsesVectors runs a 303-term query whose query embedding has
+// three windows (longQueryScorer). The target holds no query word, so only
+// vectors find it, and only with the tokens of every window: its MeanMaxSim
+// is 1 when retrieval reads the three windows, and 1/3 (below the 0.4842
+// radius) when it reads only the first.
+// TestLateOnPrepareSemanticQueryUsesWindows checks the windows that the model
+// makes.
 func TestLongQueryUsesVectors(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
@@ -267,6 +269,114 @@ func TestLongQueryUsesVectors(t *testing.T) {
 		func(context.Context) (semanticModel, error) { return scorer, nil })
 	if err != nil || !strings.Contains(output, "target.go") {
 		t.Fatalf("the long query did not find the target through vectors: err=%v\n%s", err, output)
+	}
+}
+
+// queryShapeFolder writes a folder with one strict target (cmd/parse.go), its
+// test file, and one file that only vectors reach (target.go), and moves into
+// it: file filters match the header, and a header of "." holds no part of the
+// temporary path (whose test name holds "Test").
+func queryShapeFolder(t *testing.T) string {
+	t.Helper()
+	folder := t.TempDir()
+	writeFileAt(t, folder, "cmd/parse.go", "package cmd\n\nfunc ParseRequest() {}\n\n// parse the request line and decode the header\n")
+	writeFileAt(t, folder, "cmd/parse_test.go", "package cmd\n\nfunc TestParseRequest() {}\n")
+	writeFileAt(t, folder, "target.go", "package sample\n// SEMANTIC_TARGET dispatches each call\n")
+	t.Chdir(folder)
+	return "."
+}
+
+// searchShape runs one query on folder with the fake model and returns its
+// output, the model sessions it opened and the semantic searches it logged.
+func searchShape(t *testing.T, query, folder string) (string, int32, int) {
+	t.Helper()
+	logs := captureTestLogs(t, slog.LevelDebug)
+	output, scorer, err := describe(t, query, folder)
+	if err != nil {
+		t.Fatalf("%s: %v\n%s", query, err, output)
+	}
+	searches := 0
+	for _, record := range logs.Records() {
+		if record.Message == "Searched semantic index" {
+			searches++
+		}
+	}
+	return output, scorer.prepareCalls.Load(), searches
+}
+
+// TestEveryQueryShapeUsesVectors searches one word, an identifier, a phrase,
+// type:file, case:yes, a symbol filter and file filters alone: each opens one
+// model session and searches the vectors once. A shape with no filter also
+// finds the file that only vectors reach.
+func TestEveryQueryShapeUsesVectors(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	folder := queryShapeFolder(t)
+	for query, unfiltered := range map[string]bool{
+		"request":                 true,
+		"ParseRequest":            true,
+		`"request line"`:          true,
+		"type:file parse request": true,
+		"case:yes parse request":  true,
+		"sym:ParseRequest":        false,
+		"file:cmd -file:test":     false,
+	} {
+		t.Run(query, func(t *testing.T) {
+			output, sessions, searches := searchShape(t, query, folder)
+			if sessions != 1 || searches != 1 {
+				t.Fatalf("model sessions=%d semantic searches=%d, want 1 and 1:\n%s", sessions, searches, output)
+			}
+			if unfiltered && !strings.Contains(output, "target.go") {
+				t.Fatalf("no vector-only hit:\n%s", output)
+			}
+		})
+	}
+}
+
+// TestOrOfDescriptionsUsesVectors searches an or of two descriptions: the
+// model reads both, the vectors find the file that only they reach, and the
+// strict or keeps its hit.
+func TestOrOfDescriptionsUsesVectors(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	folder := queryShapeFolder(t)
+	output, sessions, searches := searchShape(t, "parse request or decode header", folder)
+	if sessions != 1 || searches != 1 || !strings.Contains(output, "target.go") || !strings.Contains(output, "parse.go") {
+		t.Fatalf("model sessions=%d semantic searches=%d, want 1 and 1, the vector hit and the strict hit:\n%s",
+			sessions, searches, output)
+	}
+}
+
+// TestOrOfDescriptionsKeepsItsFilters searches ors whose every branch holds a
+// filter: the vectors add only files that a branch's filter allows, so a
+// vector target in another language or path never prints, and the target that
+// a filter allows does.
+func TestOrOfDescriptionsKeepsItsFilters(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	folder := t.TempDir()
+	writeFileAt(t, folder, "a.go", "package a\n// alpha\n")
+	writeFileAt(t, folder, "b.py", "# beta\n")
+	writeFileAt(t, folder, "target.rs", "// SEMANTIC_TARGET dispatches each call\nfn main() {}\n")
+	writeFileAt(t, folder, "other/target.go", "package other\n// SEMANTIC_TARGET dispatches each call\n")
+	t.Chdir(folder)
+	for query, want := range map[string][]string{
+		"(lang:go alpha) or (lang:python beta)":       {"a.go", "b.py", "other/target.go"},
+		`(file:^a\.go$ alpha) or (file:^b\.py$ beta)`: {"a.go", "b.py"},
+		// Punctuation filters nothing, as at the top level: the Go vector
+		// target has no digit and still prints, also in an or of filters.
+		`(alpha \d+ lang:go) or (lang:python beta)`: {"b.py", "other/target.go"},
+		`(\d+ lang:go) or lang:python`:              {"b.py", "other/target.go"},
+		// A nested type:file reads as its child, as at the top level.
+		"lang:go (type:file alpha)": {"a.go", "other/target.go"},
+	} {
+		output, _, err := describe(t, query, ".")
+		if err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+		if got := slices.Sorted(slices.Values(headerPaths(output))); !slices.Equal(got, want) {
+			t.Fatalf("%s printed %v, want %v:\n%s", query, got, want, output)
+		}
 	}
 }
 
@@ -579,9 +689,8 @@ func TestRelaxedRankReadsTheCurrentCopy(t *testing.T) {
 
 // TestModelInputIndependentOfSearchRoot searches a Git node as the operand,
 // then as a child of a parent folder seed: the second search embeds nothing,
-// because the model input keeps the node-relative path. It has no folder row:
-// a folder node is rooted at the search root, so its node-relative paths
-// change with the root.
+// because the model input keeps the repository-relative path. The folder rows
+// are in TestFolderModelInputIndependentOfSearchRoot.
 func TestModelInputIndependentOfSearchRoot(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -609,6 +718,151 @@ func TestModelInputIndependentOfSearchRoot(t *testing.T) {
 		defer scorer.mu.Unlock()
 		t.Fatalf("the parent search embedded %d batches (%v), want 0", got, scorer.embeddedPaths)
 	}
+}
+
+// requireRowsKeyAbsolutePath checks that every row of the one generation in
+// the cache keys a window whose header names the absolute path of its file
+// below root.
+func requireRowsKeyAbsolutePath(t *testing.T, root string) {
+	t.Helper()
+	cache, err := seekUserCacheRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirs, _ := filepath.Glob(filepath.Join(cache, "corpora", "*", "index", semanticGenerationPrefix+"*"))
+	if len(dirs) != 1 {
+		t.Fatalf("generations %v, want one", dirs)
+	}
+	manifest, err := readSemanticManifestUnchecked(dirs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(filepath.Join(dirs[0], semanticRowsFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := readSemanticRowsFrom(file, manifest.Rows, false)
+	_ = file.Close()
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("rows=%d err=%v", len(rows), err)
+	}
+	tokenizer, err := lateOnTokenizers.take(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lateOnTokenizers.release(tokenizer)
+	for _, row := range rows {
+		content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(row.path)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		row.text = content[row.start:row.end]
+		windows, err := semanticUnitWindows(tokenizer, row, filepath.ToSlash(root))
+		if err != nil || len(windows) != 1 || makeSemanticRowKey(windows[0].input) != row.key {
+			t.Fatalf("the row of %s does not key the window that names its absolute path (windows=%d err=%v)",
+				row.path, len(windows), err)
+		}
+	}
+}
+
+// TestRenamedFolderGetsVectorsOfItsNewPath searches a folder, renames it, and
+// searches it again. The folder keeps its corpus (the corpus ID is the root's
+// file identity), and the model reads its files by absolute path: the second
+// search builds vectors whose windows name the new path.
+func TestRenamedFolderGetsVectorsOfItsNewPath(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	f := newGraphFixture(t)
+	writeFixtureFile(t, f.path("old/notes/a.go"), "package notes\n// alpha beta handler\n")
+	if _, _, err := describe(t, "alpha beta", f.path("old/notes")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(f.path("old"), f.path("new")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := describe(t, "alpha beta", f.path("new/notes")); err != nil {
+		t.Fatal(err)
+	}
+	requireRowsKeyAbsolutePath(t, canonicalCorpusPath(f.path("new/notes")))
+}
+
+// TestFileRootReusesOnlyFoldersThatHoldIt searches a subfolder and then a
+// file next to it: no folder inside the file's directory can hold the file,
+// so the file's build loads no generation. A file inside a searched folder
+// copies that folder's vectors.
+func TestFileRootReusesOnlyFoldersThatHoldIt(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	f := newGraphFixture(t)
+	writeFixtureFile(t, f.path("dir/sub/x.go"), "package sub\n// alpha beta inside\n")
+	writeFixtureFile(t, f.path("dir/f.go"), "package dir\n// alpha beta beside\n")
+	loaded := func(t *testing.T, operand string) (int64, int32) {
+		t.Helper()
+		logs := captureTestLogs(t, slog.LevelDebug)
+		output, scorer, err := describe(t, "alpha beta", operand)
+		if err != nil {
+			t.Fatalf("search %s: %v\n%s", operand, err, output)
+		}
+		var generations int64 = -1
+		for _, record := range logs.Records() {
+			if record.Message == "Loaded semantic reuse sources" {
+				generations, _ = testLogAttrs(record)["generations"].(int64)
+			}
+		}
+		return generations, scorer.embedCalls.Load()
+	}
+	if _, _, err := describe(t, "alpha beta", f.path("dir/sub")); err != nil {
+		t.Fatal(err)
+	}
+	if generations, _ := loaded(t, f.path("dir/f.go")); generations != 0 {
+		t.Fatalf("the file root loaded %d generations, want none", generations)
+	}
+	if generations, embeds := loaded(t, f.path("dir/sub/x.go")); generations != 1 || embeds != 0 {
+		t.Fatalf("a file inside a searched folder loaded %d generations and embedded %d batches, want 1 and 0", generations, embeds)
+	}
+}
+
+// TestFolderModelInputIndependentOfSearchRoot searches a folder and then a
+// subfolder of it, and in a new cache the subfolder first. A folder node is
+// rooted at its search root, so its node-relative paths change with the root;
+// the model reads a folder file by its absolute path instead. So the second
+// search copies the vectors of every file that the first one embedded, and
+// embeds only the files that the first one did not hold.
+func TestFolderModelInputIndependentOfSearchRoot(t *testing.T) {
+	requireTools(t)
+	f := newGraphFixture(t)
+	writeFixtureFile(t, f.path("parent/notes/a/x.go"), "package a\n// alpha beta handler\n")
+	writeFixtureFile(t, f.path("parent/notes/b.go"), "package notes\n// alpha beta worker\n")
+	writeFixtureFile(t, f.path("parent/top.go"), "package parent\n// alpha beta top\n")
+	embedded := func(t *testing.T, operand string) []string {
+		t.Helper()
+		output, scorer, err := describe(t, "alpha beta", operand)
+		if err != nil {
+			t.Fatalf("search %s: %v\n%s", operand, err, output)
+		}
+		scorer.mu.Lock()
+		defer scorer.mu.Unlock()
+		return slices.Compact(slices.Sorted(slices.Values(scorer.embeddedPaths)))
+	}
+	t.Run("folder then subfolder", func(t *testing.T) {
+		setTestUserCache(t)
+		if got := embedded(t, f.path("parent")); len(got) != 3 {
+			t.Fatalf("the folder search embedded %v, want its 3 files", got)
+		}
+		requireRowsKeyAbsolutePath(t, canonicalCorpusPath(f.path("parent")))
+		if got := embedded(t, f.path("parent/notes")); len(got) != 0 {
+			t.Fatalf("the subfolder search embedded %v, want none", got)
+		}
+	})
+	t.Run("subfolder then folder", func(t *testing.T) {
+		setTestUserCache(t)
+		if got := embedded(t, f.path("parent/notes")); !slices.Equal(got, []string{"a/x.go", "b.go"}) {
+			t.Fatalf("the subfolder search embedded %v, want its 2 files", got)
+		}
+		if got := embedded(t, f.path("parent")); !slices.Equal(got, []string{"top.go"}) {
+			t.Fatalf("the folder search embedded %v, want only top.go", got)
+		}
+	})
 }
 
 // TestDisplayLimitsApplyAfterTheRank searches five strict files whose model
@@ -662,8 +916,10 @@ func TestDisplayLimitsApplyAfterTheRank(t *testing.T) {
 }
 
 // TestDeletedSemanticSourceKeepsOtherNodes deletes a folder file while its
-// unit is embedded (a change during a build): the node reads its tree again,
-// the deleted file is gone, and the other node still answers.
+// unit is embedded (a change during a build). The command still answers with
+// the other node's file. A vector hit of the deleted file shows the text that
+// the index holds, as a strict hit does. The next search reads the tree again
+// and prints no deleted file.
 func TestDeletedSemanticSourceKeepsOtherNodes(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -680,64 +936,22 @@ func TestDeletedSemanticSourceKeepsOtherNodes(t *testing.T) {
 		}
 		return semanticVector{1: 1}
 	}}
-	output, err := runHybridTestSearch(t, "alpha beta", []string{f.path("tree/a"), f.path("tree/b")}, defaultSearchPolicy(),
-		func(context.Context) (semanticModel, error) { return scorer, nil })
-	if err != nil {
-		t.Fatalf("one deleted file ended the command: %v", err)
-	}
-	if !strings.Contains(output, "b.go") || strings.Contains(output, "target.go") {
-		t.Fatalf("want the other node's file and no deleted file:\n%s", output)
-	}
-}
-
-// TestManySemanticHitsReadTheWholeTree gives a Git node more semantic hits
-// than the pathspec route takes: the evidence read lists the whole tree with
-// no pathspec, so no argument list can pass ARG_MAX.
-func TestManySemanticHitsReadTheWholeTree(t *testing.T) {
-	requireTools(t)
-	f := newGraphFixture(t)
-	repo := f.GitRepo("repo", "README.md", "readme\n")
-	const files = evidencePathspecPaths + 44
-	for index := range files {
-		writeFixtureFile(t, filepath.Join(repo, fmt.Sprintf("d%02d/f%03d.go", index%10, index)), fmt.Sprintf("package p\n// SEMANTIC_TARGET handler %d\n", index))
-	}
-	gitRunIn(t, repo, "add", ".")
-	gitRunIn(t, repo, "commit", "-q", "-m", "many")
-	setTestUserCache(t)
-	trace := filepath.Join(t.TempDir(), "trace")
-	t.Setenv("GIT_TRACE", trace)
-	scorer := &hybridTestScorer{vectorForUnit: func(unit semanticUnit) semanticVector {
-		var index int
-		if _, err := fmt.Sscanf(filepath.Base(unit.path), "f%03d.go", &index); err != nil {
-			return semanticVector{1: 1}
+	search := func() string {
+		output, err := runHybridTestSearch(t, "alpha beta", []string{f.path("tree/a"), f.path("tree/b")}, defaultSearchPolicy(),
+			func(context.Context) (semanticModel, error) { return scorer, nil })
+		if err != nil {
+			t.Fatalf("one deleted file ended the command: %v", err)
 		}
-		// Distinct vectors near the query give a sound HNSW graph.
-		vector := semanticVector{0: 1}
-		vector[1+index%(semanticEmbeddingDimensions-1)] = 0.05 * float32(1+index/(semanticEmbeddingDimensions-1))
-		if err := normalizeSemanticVector(&vector); err != nil {
-			t.Fatal(err)
+		if !strings.Contains(output, "b.go") {
+			t.Fatalf("want the other node's file:\n%s", output)
 		}
-		return vector
-	}}
-	output, err := runHybridTestSearch(t, "alpha beta", []string{repo}, defaultSearchPolicy(),
-		func(context.Context) (semanticModel, error) { return scorer, nil })
-	if err != nil {
-		t.Fatal(err)
+		return output
 	}
-	// HNSW reaches most points of this tight synthetic cluster; the
-	// test needs only more hits than the pathspec route takes.
-	if got := strings.Count(output, "## "); got <= evidencePathspecPaths {
-		t.Fatalf("printed %d files, want more than %d", got, evidencePathspecPaths)
+	if output := search(); strings.Contains(output, "target.go") && !strings.Contains(output, "SEMANTIC_TARGET dispatches the request") {
+		t.Fatalf("the deleted file prints with no indexed text:\n%s", output)
 	}
-	data, err := os.ReadFile(trace)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for line := range strings.Lines(string(data)) {
-		// The root .sourcegraph/ignore probe is the one ls-tree with no -r.
-		if strings.Contains(line, "built-in: git") && strings.Contains(line, "ls-tree -r") && strings.Contains(line, " -- ") {
-			t.Fatalf("the evidence read passed pathspecs for %d hits: %.200s", files, line)
-		}
+	if output := search(); strings.Contains(output, "target.go") {
+		t.Fatalf("the next search prints the deleted file:\n%s", output)
 	}
 }
 

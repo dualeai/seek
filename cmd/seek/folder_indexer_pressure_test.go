@@ -11,8 +11,8 @@ import (
 // TestEnsureFolderCorpusFresh_BeyondInFlightBudget — synthesise a
 // folder whose cumulative selected bytes exceed the test-local
 // readSemaphore budget, then index via the real folder pipeline.
-// Window rotation must Release per-window so reading proceeds; the
-// goroutineLeakGuard trips its watchdog if rotation regresses.
+// The consumer must release weight before the terminal Finish so reading
+// proceeds; the goroutineLeakGuard trips its watchdog if it does not.
 //
 // testing.Short() routes writeRandomFolder through sparse files
 // (os.Truncate). Lstat.Size drives the Acquire weight, so behaviour
@@ -31,9 +31,9 @@ func TestEnsureFolderCorpusFresh_BeyondInFlightBudget(t *testing.T) {
 }
 
 // TestEnsureFolderCorpusFresh_AtBudgetBoundary — cumulative content
-// twice the budget. Every Acquire fits but only N-1 readers can hold
-// weight at once, so the Nth must wait for a Release from the consumer
-// side. Beacon search proves cross-window searchability.
+// twice the budget, in 1 MiB files. Each Acquire fits, but the budget holds
+// at most four files at once, so the fifth reader waits for a Release from
+// the consumer. The beacon search proves that the build is searchable.
 func TestEnsureFolderCorpusFresh_AtBudgetBoundary(t *testing.T) {
 	const testBudget int64 = 4 * 1024 * 1024
 	const fileSize int64 = 1024 * 1024       // 1 MiB
@@ -47,14 +47,14 @@ func TestEnsureFolderCorpusFresh_AtBudgetBoundary(t *testing.T) {
 	)
 }
 
-// TestEnsureFolderCorpusFresh_ManySmallFilesOverBudget — verifies the
-// fix handles a different size distribution. Many small files force
-// many cheap Acquire/Release cycles instead of a handful of large ones.
-// Beacon search proves cross-window searchability under high-fanout.
+// TestEnsureFolderCorpusFresh_ManySmallFilesOverBudget — 64 KiB files,
+// four times the budget in all: many small Acquire and Release cycles
+// instead of a few large ones. The beacon search proves that the build is
+// searchable.
 func TestEnsureFolderCorpusFresh_ManySmallFilesOverBudget(t *testing.T) {
 	const testBudget int64 = 2 * 1024 * 1024 // 2 MiB
 	const fileSize int64 = 64 * 1024         // 64 KiB
-	const totalBytes int64 = 8 * 1024 * 1024 // 8 MiB > 4× budget
+	const totalBytes int64 = 8 * 1024 * 1024 // 8 MiB = 4× budget
 	testFolderIndexUnderBudgetPressure(
 		t,
 		testBudget,
@@ -102,11 +102,12 @@ func testFolderIndexUnderBudgetPressure(
 	}
 }
 
-// TestEnsureFolderCorpusFresh_SparseFiles — sparse files via Truncate
-// reproduce the deadlock with ~zero disk usage and ~zero read cost.
-// Useful sanity check that the fix isn't accidentally relying on real
-// I/O timing. Includes a beacon search to verify cross-window shard
-// chain produces queryable output even when reads return zero bytes.
+// TestEnsureFolderCorpusFresh_SparseFiles — sparse files (writeSparseFile)
+// put the same weight on the read budget as real bytes, with almost no disk
+// space and read cost. So the test checks that the build does not wait
+// forever on the read budget, with no dependency on real I/O time. A beacon
+// search checks that the shards are searchable when the other files are
+// mostly NUL bytes.
 func TestEnsureFolderCorpusFresh_SparseFiles(t *testing.T) {
 	const testBudget int64 = 4 * 1024 * 1024
 	defer setupPressureTest(t, testBudget)()
@@ -118,8 +119,8 @@ func TestEnsureFolderCorpusFresh_SparseFiles(t *testing.T) {
 		writeSparseFile(t, root+"/"+testFileName("sparse", i), fileSize)
 	}
 	// Beacon written as a normal (non-sparse) file last in scanner
-	// order so it lands in the final shard window. Asserts the
-	// rotated shard chain accepts mixed sparse+real content.
+	// order so it lands in the final shard. Asserts the shard chain
+	// accepts mixed sparse+real content.
 	const beacon = "SPARSE_BEACON_DEADCAFE"
 	beaconPath := filepath.Join(root, "z_beacon.txt")
 	if err := os.WriteFile(beaconPath, []byte(beacon+"\n"), 0o644); err != nil {

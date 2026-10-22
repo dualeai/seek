@@ -10,9 +10,6 @@ type nodeKind interface {
 	// one after a failed build or during a peer's build (corpusStale), and
 	// returns what its read needs.
 	prepare(ctx context.Context, plan node, execution searchExecution) (openedNode, error)
-	// materialize reads the evidence of the base generation's semantic hits
-	// from the source that the generation holds.
-	materialize(ctx context.Context, opened openedNode, candidates []semanticFileCandidate, contextLines int) ([]semanticFileCandidate, error)
 	// estimate gives the cache bytes of the node's next generation and
 	// whether the search rebuilds it (cache_budget.go).
 	estimate(ctx context.Context, plan node, vectors, probe bool) (bytes int64, rebuild bool, err error)
@@ -27,7 +24,7 @@ type folderNode struct{}
 // prepare refreshes the Git index from one git status capture.
 func (g *gitNode) prepare(ctx context.Context, plan node, execution searchExecution) (openedNode, error) {
 	// One combined whole-repo index serves both scoped and unscoped
-	// searches; scope is applied at search time.
+	// searches; the scope applies at search time.
 	state, indexState, err := g.refresh(ctx, plan, execution)
 	if err != nil {
 		return openedNode{}, err
@@ -53,11 +50,6 @@ func (g *gitNode) prepare(ctx context.Context, plan node, execution searchExecut
 	}, nil
 }
 
-// materialize reads the hits from the prepared commit.
-func (g *gitNode) materialize(ctx context.Context, opened openedNode, candidates []semanticFileCandidate, contextLines int) ([]semanticFileCandidate, error) {
-	return materializeSemanticCandidates(ctx, opened.plan, g.paths, opened.state.HeadSHA, candidates, contextLines)
-}
-
 // prepare builds the folder's index. A folder whose update fails while shards
 // exist serves them with a warning.
 func (*folderNode) prepare(ctx context.Context, plan node, execution searchExecution) (openedNode, error) {
@@ -69,19 +61,25 @@ func (*folderNode) prepare(ctx context.Context, plan node, execution searchExecu
 		indexState = corpusStale
 	}
 	capture := plan.folder
+	// After a tree change the shared capture is stale, and this prepare walked
+	// the folder again: the index's state file then holds the state that it
+	// built or checked. Without this state, a node read again after a save
+	// during its build would get no vector hit.
+	built := ""
+	if indexState != corpusStale {
+		built = readStateFile(plan.cacheDir)
+	}
 	return openedNode{
 		plan:       plan,
 		indexState: indexState,
-		// The walk state is the semantic source; an invalid capture reads
-		// text only.
+		// The walk state and the model path base give the semantic source
+		// (folderSemanticSource). The read checks the state under the lock
+		// (readStateFile in readNodeEvidence).
 		version: func() (string, string, bool) {
-			state, _, ok := capture.current()
-			return state, state, ok
+			if state, _, ok := capture.current(); ok {
+				return state, plan.folderSemanticSource(state), true
+			}
+			return built, plan.folderSemanticSource(built), built != ""
 		},
 	}, nil
-}
-
-// materialize reads the hits from the folder's files.
-func (*folderNode) materialize(ctx context.Context, opened openedNode, candidates []semanticFileCandidate, contextLines int) ([]semanticFileCandidate, error) {
-	return materializeWorkTreeSemanticCandidates(ctx, opened.plan, folderRepoName(opened.plan), candidates, contextLines)
 }

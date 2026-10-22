@@ -14,11 +14,11 @@ import (
 	"github.com/spf13/pflag"
 )
 
-// TestSplicePassthroughSeparator locks the contract that determines
-// when an unknown leading `-token` is a Zoekt query (must pass through
-// to pflag as positional via `--`) vs a typo in a known flag (must
-// surface pflag's "unknown flag" error). Every case is named so the
-// matrix doubles as documentation.
+// TestSplicePassthroughSeparator checks when splicePassthroughSeparator
+// reads an unknown leading `-token` as a Zoekt query (it goes to pflag as a
+// positional argument after a new `--`) and when as a typo of a known flag
+// (a `--token`, for which pflag gives its "unknown flag" error). Each case
+// has a name, so the table also documents the rule.
 func TestSplicePassthroughSeparator(t *testing.T) {
 	flags := newRootCmd(newLateOnSemanticModel).Flags()
 	cases := []struct {
@@ -135,9 +135,8 @@ func TestSplicePassthroughSeparator(t *testing.T) {
 	}
 }
 
-// newQuietRootCmd builds the root command with stdout/stderr silenced
-// so test runs don't leak Cobra's auto-generated usage prints. Shared
-// boilerplate across the TestRootCmd_* + TestSuggestFlagError_* cases.
+// newQuietRootCmd builds the root command with its output and error output
+// discarded, so a test does not print Cobra's usage text.
 func newQuietRootCmd() *cobra.Command {
 	root := newRootCmd(newLateOnSemanticModel)
 	root.SetOut(io.Discard)
@@ -311,12 +310,10 @@ func TestSelectSearchConfig(t *testing.T) {
 	}
 }
 
-// TestRootCmd_VersionOutputHasNoDoublePrefix — drive `seek --version`
-// end-to-end and capture stdout. Asserts the user-visible contract
-// (the printed line starts with exactly one "seek " prefix), not the
-// internal Version field layout — so renaming the field or switching
-// to SetVersionTemplate would not break the test as long as the
-// printed output stays sane.
+// TestRootCmd_VersionOutputHasNoDoublePrefix runs `seek --version` and
+// reads stdout: the printed line starts with exactly one "seek " prefix. It
+// checks the printed output, not the layout of the Version field, so a
+// rename of the field or a change to SetVersionTemplate does not break it.
 func TestRootCmd_VersionOutputHasNoDoublePrefix(t *testing.T) {
 	root := newRootCmd(newLateOnSemanticModel)
 	var out bytes.Buffer
@@ -366,10 +363,10 @@ func TestSuggestFlagError_NoSuggestionWhenTooFar(t *testing.T) {
 	}
 }
 
-// TestSuggestFlagError_SubcommandInheritedFlag — a typo of an
-// inherited PersistentFlag on the gc subcommand should still surface a
-// suggestion. Covers the collectFlagNames → InheritedFlags branch
-// (the local Flags of `gc` don't include --verbose).
+// TestSuggestFlagError_SubcommandInheritedFlag checks that a typo of an
+// inherited persistent flag on the gc subcommand still gets a suggestion. It
+// covers the InheritedFlags branch of collectFlagNames (the local Flags of
+// `gc` do not include --verbose).
 func TestSuggestFlagError_SubcommandInheritedFlag(t *testing.T) {
 	root := newQuietRootCmd()
 	root.SetArgs([]string{"gc", "--verbos"})
@@ -443,8 +440,8 @@ func TestShouldRunOpportunisticGC(t *testing.T) {
 }
 
 func TestBadProviderPinOnlyStopsCommandsThatUseTheModel(t *testing.T) {
-	// A typo in SEEK_PROVIDER must be loud for a search that would use the
-	// model, and must not stop commands that never read the setting.
+	// A typo in SEEK_PROVIDER stops a search that would use the model, and
+	// does not stop commands that never read the setting.
 	t.Setenv(lateOnProviderEnv, "gpu")
 	// Each command also has a bad argument that fails after the provider
 	// check, so the error tells which check stopped it first.

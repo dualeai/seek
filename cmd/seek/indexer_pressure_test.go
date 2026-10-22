@@ -9,16 +9,16 @@ import (
 	"time"
 )
 
-// TestIndexDocuments_RotatesBeyondTheBudget — drive the real
-// indexDocuments consumer with a hand-built fileCh whose cumulative
-// weight exceeds the readSemaphore budget. The windowed indexer must
-// rotate (Release per window) so reading proceeds; any regression
-// that aggregates Release until terminal Finish wedges and the
-// goroutineLeakGuard panics with a stack dump.
+// TestIndexDocuments_ReadsBeyondTheBudget drives the real indexDocuments
+// consumer with a hand-built fileCh whose cumulative weight exceeds the
+// readSemaphore budget. The consumer releases the weight of a normal document
+// when Builder.Add returns, so reading proceeds. A regression that keeps the
+// weight until the terminal Finish wedges, and the goroutineLeakGuard panics
+// with a stack dump.
 //
 // Uses swapReadSemaphoreForTest so the fixture fits in ~12 MiB of
 // synthesised payload instead of >600 MiB.
-func TestIndexDocuments_RotatesBeyondTheBudget(t *testing.T) {
+func TestIndexDocuments_ReadsBeyondTheBudget(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
 	}
@@ -83,23 +83,22 @@ func TestIndexDocuments_RotatesBeyondTheBudget(t *testing.T) {
 	if got := availableWeight(readSemaphore); got != testBudget {
 		t.Fatalf("semaphore leak after indexDocuments: got=%d want=%d", got, testBudget)
 	}
-	// Rotation sanity: with chunk=1 MiB summing to 12 MiB through a
-	// 2 MiB window, the indexer should emit multiple shards. Single
-	// shard means rotation didn't fire.
+	// With 12 MiB of content and the 10 MiB shardMax, the build makes at
+	// least two shards.
 	if n := repositoryShardCount(indexDir, "pressure_repo"); n < 2 {
-		t.Fatalf("expected >= 2 shards (rotation didn't fire), got %d", n)
+		t.Fatalf("expected >= 2 shards, got %d", n)
 	}
 }
 
-// TestIndexDocuments_ReleasesWeightOnFinishError — when Finish errors,
-// every Acquired weight must still be Released. Forces a real Finish
-// error by writing into a read-only indexDir + a content size that
-// triggers Zoekt's mid-Add flush.
+// TestIndexDocuments_ReleasesWeightOnFinishError checks that a Finish error
+// still releases every acquired read weight. It forces a Finish error:
+// it writes into a read-only indexDir, with content large enough to make
+// Zoekt flush a shard during Add.
 //
-// TODO(#64): the skip-on-err==nil branch accepts ANY non-nil error.
-// Strengthen by injecting a Builder factory (invasive — shard logic
-// is inline in indexDocuments) or by narrowing to fs.ErrPermission
-// (risks over-fitting to Zoekt's internal error wrapping).
+// TODO: the test skips when err is nil and accepts any other error. A
+// narrower check needs a Builder factory to inject (the shard logic is
+// inline in indexDocuments), or a test for fs.ErrPermission, which depends on
+// how Zoekt wraps its errors.
 func TestIndexDocuments_ReleasesWeightOnFinishError(t *testing.T) {
 	if err := checkCtagsCached(); err != nil {
 		t.Skipf("ctags required: %v", err)
@@ -118,8 +117,8 @@ func TestIndexDocuments_ReleasesWeightOnFinishError(t *testing.T) {
 	source := t.TempDir()
 
 	// Build a doc that will trigger an internal flush. shardMax=10 MiB,
-	// so a single 11 MiB doc forces flush inside Add → buildShard tries
-	// to write into a read-only dir → error propagates back through
+	// so a single 11 MiB doc forces flush inside Add → Zoekt's buildShard
+	// tries to write into a read-only dir → error propagates back through
 	// Add (or surfaces at Finish).
 	payload := make([]byte, 11*1024*1024)
 	for i := range payload {
