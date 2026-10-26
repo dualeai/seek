@@ -3,41 +3,52 @@ package main
 import (
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
+// TestDynamicCPUGateUsesNewCapacity holds the one CPU of the gate, so a second
+// acquire waits. When the live limit grows to 2, the waiting acquire must read
+// it again and pass. The test runs in a synctest bubble: synctest.Wait returns
+// when the second acquire waits, and the gate's retry timer runs on fake time.
 func TestDynamicCPUGateUsesNewCapacity(t *testing.T) {
-	var limit atomic.Int32
-	limit.Store(1)
-	gate := newDynamicCPUGate(func() int { return int(limit.Load()) })
-	first, err := gate.acquire(t.Context(), 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer first.release()
-
-	admitted := make(chan cpuLease, 1)
-	go func() {
-		lease, acquireErr := gate.acquire(t.Context(), 1)
-		if acquireErr == nil {
-			admitted <- lease
+	synctest.Test(t, func(t *testing.T) {
+		var limit atomic.Int32
+		limit.Store(1)
+		gate := newDynamicCPUGate(func() int { return int(limit.Load()) })
+		first, err := gate.acquire(t.Context(), 1)
+		if err != nil {
+			t.Fatal(err)
 		}
-	}()
+		defer first.release()
 
-	select {
-	case lease := <-admitted:
-		lease.release()
-		t.Fatal("gate exceeded its first CPU limit")
-	case <-time.After(20 * time.Millisecond):
-	}
+		admitted := make(chan cpuLease, 1)
+		go func() {
+			lease, acquireErr := gate.acquire(t.Context(), 1)
+			if acquireErr == nil {
+				admitted <- lease
+			}
+		}()
 
-	limit.Store(2)
-	select {
-	case lease := <-admitted:
-		lease.release()
-	case <-time.After(time.Second):
-		t.Fatal("gate did not use the larger live CPU limit")
-	}
+		synctest.Wait()
+		select {
+		case lease := <-admitted:
+			lease.release()
+			t.Fatal("gate exceeded its first CPU limit")
+		default:
+		}
+
+		limit.Store(2)
+		// A second of fake time holds several retries of the waiting acquire.
+		time.Sleep(time.Second)
+		synctest.Wait()
+		select {
+		case lease := <-admitted:
+			lease.release()
+		default:
+			t.Fatal("gate did not use the larger live CPU limit")
+		}
+	})
 }
 
 func TestSearchResourcesDoNotChargeAcceleratorWait(t *testing.T) {

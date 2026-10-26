@@ -98,7 +98,7 @@ func TestNativeGitSHA256FullAndDelta(t *testing.T) {
 	repoDir := t.TempDir()
 	cmd := exec.Command("git", "init", "--object-format=sha256", repoDir)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Skipf("installed Git does not support SHA-256 repositories: %v: %s", err, out)
+		t.Fatalf("the installed Git cannot make a SHA-256 repository: %v: %s", err, out)
 	}
 	gitRunIn(t, repoDir, "config", "user.email", "test@test.com")
 	gitRunIn(t, repoDir, "config", "user.name", "Test")

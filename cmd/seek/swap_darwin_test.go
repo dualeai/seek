@@ -1,13 +1,62 @@
 package main
 
 import (
+	"errors"
+	"io/fs"
 	"os"
+	"os/exec"
+	"os/user"
 	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
 	"testing"
 )
+
+// TestPublishMarksAFailedMoveBack gives the build folder an ACL entry that
+// denies the test user delete_child and passes to new subfolders. The folder
+// that swapFiles makes for the live shards gets the entry. The move aside adds
+// an entry to that folder, so it works. The rename in removes an entry from
+// the build folder, and the move back removes an entry from the aside folder,
+// so both fail. The family is torn, and .swapping must name it for repair.
+// Linux has no such trigger for a user that is not root: one mode bit gives
+// the right to add and to remove an entry of a folder.
+func TestPublishMarksAFailedMoveBack(t *testing.T) {
+	const shard = "folder_x_v16.00000.zoekt"
+	store := corpusStore{cacheDir: t.TempDir(), indexDir: filepath.Join(t.TempDir(), "index")}
+	buildDir := filepath.Join(filepath.Dir(store.indexDir), "build")
+	for _, dir := range []string{store.indexDir, buildDir} {
+		writeFixtureFile(t, filepath.Join(dir, shard), "shard")
+	}
+	probe := filepath.Join(buildDir, "probe")
+	writeFixtureFile(t, probe, "")
+	me, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The cleanup runs before the removal of t.TempDir, which the entries
+	// would stop.
+	t.Cleanup(func() {
+		if out, err := exec.Command("/bin/chmod", "-RN", buildDir).CombinedOutput(); err != nil {
+			t.Errorf("remove the ACL entries: %v: %s", err, out)
+		}
+	})
+	if out, err := exec.Command("/bin/chmod", "+a", "user:"+me.Username+" deny delete_child,directory_inherit", buildDir).CombinedOutput(); err != nil {
+		t.Fatalf("set the ACL entry: %v: %s", err, out)
+	}
+	if err := os.Remove(probe); !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("remove an entry against the deny entry: %v, want a permission error: the test user ignores ACL entries, as root does", err)
+	}
+	if _, err := store.publishShardFamilyLocked(buildDir, familyAll); err == nil {
+		t.Fatal("the publish renamed a shard out of a folder that denies delete_child")
+	}
+	if _, err := os.Lstat(filepath.Join(store.indexDir, shard)); !os.IsNotExist(err) {
+		t.Fatalf("the live shard is in the index after the publish (err=%v), so the move aside did not work or the move back worked", err)
+	}
+	if label := readCacheFile(store.cacheDir, swappingMarkerFile); label != familyAll.label() {
+		t.Fatalf(".swapping=%q after a failed move back, want %q", label, familyAll.label())
+	}
+}
 
 // TestPublishKeepsAFamilyWithAnImmutableShard makes the later shard of a
 // two-shard folder family immutable (no link, no move, no removal) and

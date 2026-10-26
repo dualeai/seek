@@ -7,7 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
+	"testing/synctest"
 
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/query"
@@ -138,59 +138,54 @@ func TestSearchLoadedShardsRejectsCancelledPartialResult(t *testing.T) {
 	}
 }
 
+// TestSearchLoadedShardsJoinsWorkersBeforeCancellation cancels the search in
+// one shard while another shard still runs. The test runs in a synctest
+// bubble, where synctest.Wait returns only when every other goroutine is
+// blocked. So when synctest.Wait returns, a search that does not wait for its
+// last worker has already returned.
 func TestSearchLoadedShardsJoinsWorkersBeforeCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	first := &cancellationTestShard{search: func(context.Context) (*zoekt.SearchResult, error) {
-		cancel()
-		return &zoekt.SearchResult{Files: []zoekt.FileMatch{{FileName: "first.go"}}}, nil
-	}}
-	started, release := make(chan struct{}), make(chan struct{})
-	var releaseOnce sync.Once
-	releaseWorker := func() { releaseOnce.Do(func() { close(release) }) }
-	t.Cleanup(releaseWorker)
-	second := &cancellationTestShard{search: func(context.Context) (*zoekt.SearchResult, error) {
-		close(started)
-		<-release
-		return &zoekt.SearchResult{Files: []zoekt.FileMatch{{FileName: "second.go"}}}, nil
-	}}
-	type result struct {
-		files []zoekt.FileMatch
-		err   error
-	}
-	done := make(chan result, 1)
-	go func() {
-		files, err := searchLoadedShards(ctx, []zoekt.Searcher{first, second}, &query.Const{Value: true}, defaultSearchConfig(), nil)
-		done <- result{files: files, err: err}
-	}()
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("second shard did not start")
-	}
-	select {
-	case <-ctx.Done():
-	case <-time.After(5 * time.Second):
-		t.Fatal("first shard did not cancel the search")
-	}
-	select {
-	case got := <-done:
-		t.Fatalf("search returned before the worker finished: %+v", got)
-	default:
-	}
-	if first.closeCalls.Load() != 0 || second.closeCalls.Load() != 0 {
-		t.Error("searchers closed before all workers finished")
-	}
-	releaseWorker()
-	select {
-	case got := <-done:
-		if !errors.Is(got.err, context.Canceled) || len(got.files) != 0 {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		first := &cancellationTestShard{search: func(context.Context) (*zoekt.SearchResult, error) {
+			cancel()
+			return &zoekt.SearchResult{Files: []zoekt.FileMatch{{FileName: "first.go"}}}, nil
+		}}
+		started, release := make(chan struct{}), make(chan struct{})
+		var releaseOnce sync.Once
+		releaseWorker := func() { releaseOnce.Do(func() { close(release) }) }
+		t.Cleanup(releaseWorker)
+		second := &cancellationTestShard{search: func(context.Context) (*zoekt.SearchResult, error) {
+			close(started)
+			<-release
+			return &zoekt.SearchResult{Files: []zoekt.FileMatch{{FileName: "second.go"}}}, nil
+		}}
+		type result struct {
+			files []zoekt.FileMatch
+			err   error
+		}
+		done := make(chan result, 1)
+		go func() {
+			files, err := searchLoadedShards(ctx, []zoekt.Searcher{first, second}, &query.Const{Value: true}, defaultSearchConfig(), nil)
+			done <- result{files: files, err: err}
+		}()
+		<-started
+		<-ctx.Done()
+		synctest.Wait()
+		select {
+		case got := <-done:
+			t.Fatalf("search returned before the worker finished: %+v", got)
+		default:
+		}
+		if first.closeCalls.Load() != 0 || second.closeCalls.Load() != 0 {
+			t.Error("searchers closed before all workers finished")
+		}
+		releaseWorker()
+		if got := <-done; !errors.Is(got.err, context.Canceled) || len(got.files) != 0 {
 			t.Errorf("cancelled shards: files=%v error=%v, want no files and cancellation", got.files, got.err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("search did not return after all workers finished")
-	}
-	if first.closeCalls.Load() != 0 || second.closeCalls.Load() != 0 {
-		t.Errorf("close calls=%d/%d, want 0/0: the caller closes the shards", first.closeCalls.Load(), second.closeCalls.Load())
-	}
+		if first.closeCalls.Load() != 0 || second.closeCalls.Load() != 0 {
+			t.Errorf("close calls=%d/%d, want 0/0: the caller closes the shards", first.closeCalls.Load(), second.closeCalls.Load())
+		}
+	})
 }

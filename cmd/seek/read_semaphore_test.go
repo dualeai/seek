@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
+	"testing/synctest"
 
 	"github.com/sourcegraph/zoekt/index"
 	"golang.org/x/sync/semaphore"
@@ -20,24 +20,6 @@ import (
 // Tests that only use a LOCAL semaphore (constructed in-test) don't
 // need this lock.
 var testReadSemMu sync.Mutex
-
-// waitUntilSemaphoreBelow polls availableWeight every 10 ms until it
-// drops below `threshold` or the deadline expires. Used by
-// cancellation tests as a sync mechanism robust to CI scheduling
-// jitter — replaces fixed time.Sleep "wait for producers to start"
-// patterns.
-func waitUntilSemaphoreBelow(t *testing.T, sem *semaphore.Weighted, threshold int64, deadline time.Duration) {
-	t.Helper()
-	end := time.Now().Add(deadline)
-	for time.Now().Before(end) {
-		if availableWeight(sem) < threshold {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("waitUntilSemaphoreBelow: %v deadline exceeded (still at %d, threshold %d)",
-		deadline, availableWeight(sem), threshold)
-}
 
 // availableWeight probes available weight by binary-search with
 // TryAcquire/Release. While a waiter is queued, TryAcquire can fail even when
@@ -61,54 +43,56 @@ func availableWeight(sem *semaphore.Weighted) int64 {
 
 // TestReader_OversizeCandidate_NoSemaphoreTouch — a synthetic
 // candidate larger than the content limit must become one name-only
-// document without touching the semaphore.
+// document without touching the semaphore. The test runs in a synctest
+// bubble: a reader that waits for read weight fails at once as a deadlock.
 func TestReader_OversizeCandidate_NoSemaphoreTouch(t *testing.T) {
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
 	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
-	// Hold the whole read budget, as busy readers would: a reader that
-	// acquires any weight waits until its context ends and sends nothing.
-	const budget = 1 << 20
-	defer swapReadSemaphoreForTest(budget)()
-	if !readSemaphore.TryAcquire(budget) {
-		t.Fatal("cannot hold the test read budget")
-	}
-	defer readSemaphore.Release(budget)
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-	out := make(chan fileContent, 1)
-
-	// Larger than the swapped content limit: the reader must send it by name
-	// only, without Acquiring weight.
-	c := folderCandidate{
-		name: "huge",
-		path: "/nonexistent/huge",
-		size: maxInFlightBytes + 1,
-	}
-	readCtx, fail := context.WithCancelCause(ctx)
-	defer fail(nil)
-	readOneFolderFileStreaming(readCtx, c, out, fail)
-	close(out)
-	if cause := context.Cause(readCtx); cause != nil {
-		t.Fatalf("the reader reported a failure: %v", cause)
-	}
-	sent := 0
-	for document := range out {
-		sent++
-		if document.skipReason != index.SkipReasonTooLarge || document.content != nil || document.weight != 0 {
-			t.Fatalf("oversize candidate = %+v, want a name-only TooLarge document", document)
+	synctest.Test(t, func(t *testing.T) {
+		// Hold the whole read budget, as busy readers would: a reader that
+		// acquires any weight waits and sends nothing.
+		const budget = 1 << 20
+		defer swapReadSemaphoreForTest(budget)()
+		if !readSemaphore.TryAcquire(budget) {
+			t.Fatal("cannot hold the test read budget")
 		}
-	}
-	if sent != 1 || ctx.Err() != nil {
-		t.Fatalf("sent %d documents (context error %v), want one name-only document with no wait for read weight", sent, ctx.Err())
-	}
+		defer readSemaphore.Release(budget)
+		out := make(chan fileContent, 1)
+
+		// Larger than the swapped content limit: the reader must send it by
+		// name only, without Acquiring weight.
+		c := folderCandidate{
+			name: "huge",
+			path: "/nonexistent/huge",
+			size: maxInFlightBytes + 1,
+		}
+		readCtx, fail := context.WithCancelCause(t.Context())
+		defer fail(nil)
+		readOneFolderFileStreaming(readCtx, c, out, fail)
+		close(out)
+		if cause := context.Cause(readCtx); cause != nil {
+			t.Fatalf("the reader reported a failure: %v", cause)
+		}
+		sent := 0
+		for document := range out {
+			sent++
+			if document.skipReason != index.SkipReasonTooLarge || document.content != nil || document.weight != 0 {
+				t.Fatalf("oversize candidate = %+v, want a name-only TooLarge document", document)
+			}
+		}
+		if sent != 1 {
+			t.Fatalf("sent %d documents, want one name-only document", sent)
+		}
+	})
 }
 
 // TestReader_AboveBudgetCandidate_ClampsWeight checks that a document larger
 // than the whole read budget does not wait forever in Acquire. The path does
 // not exist, so the reader acquires its clamped weight, fails to open the file,
-// and must return promptly with the weight released.
+// and must return with the weight released. The test runs in a synctest
+// bubble: a reader that waits forever fails at once as a deadlock.
 func TestReader_AboveBudgetCandidate_ClampsWeight(t *testing.T) {
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
@@ -117,24 +101,20 @@ func TestReader_AboveBudgetCandidate_ClampsWeight(t *testing.T) {
 	swapDocumentContentLimitForTest(t, readBudgetBytes+2)
 
 	before := availableWeight(readSemaphore)
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	out := make(chan fileContent, 1)
-	c := folderCandidate{name: "huge", path: "/nonexistent/huge", size: readBudgetBytes + 1}
-	start := time.Now()
-	readCtx, fail := context.WithCancelCause(ctx)
-	defer fail(nil)
-	readOneFolderFileStreaming(readCtx, c, out, fail)
-	close(out)
-	if cause := context.Cause(readCtx); cause != nil && ctx.Err() == nil {
-		t.Fatalf("the reader reported a failure: %v", cause)
-	}
-	if ctx.Err() != nil {
-		t.Fatalf("reader waited %v for a weight above the budget", time.Since(start))
-	}
-	for document := range out {
-		t.Fatalf("unexpected document for a missing file: %+v", document)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		out := make(chan fileContent, 1)
+		c := folderCandidate{name: "huge", path: "/nonexistent/huge", size: readBudgetBytes + 1}
+		readCtx, fail := context.WithCancelCause(t.Context())
+		defer fail(nil)
+		readOneFolderFileStreaming(readCtx, c, out, fail)
+		close(out)
+		if cause := context.Cause(readCtx); cause != nil {
+			t.Fatalf("the reader reported a failure: %v", cause)
+		}
+		for document := range out {
+			t.Fatalf("unexpected document for a missing file: %+v", document)
+		}
+	})
 	if got := availableWeight(readSemaphore); got != before {
 		t.Fatalf("semaphore leak: before=%d after=%d", before, got)
 	}

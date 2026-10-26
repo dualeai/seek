@@ -8,7 +8,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 // reindexGit runs one full indexing cycle for the committed and uncommitted
@@ -237,9 +236,6 @@ func TestDeltaCommitted_RebaseLeavesNoDuplicateHits(t *testing.T) {
 
 func TestDeltaCommitted_ShardThresholdTriggersFullRebuild(t *testing.T) {
 	requireTools(t)
-	if testing.Short() {
-		t.Skip("threshold test makes 65+ commits; skipped under -short")
-	}
 
 	dir := initGitRepo(t, "seed.go", "package main\n// threshold_seed\n")
 	ctx := context.Background()
@@ -350,12 +346,24 @@ func TestDeltaCommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 	var missed atomic.Int64
 	var searchErr atomic.Int64
 	var wg sync.WaitGroup
-	start := make(chan struct{})
+	// The writer closes reindexing[i] when cycle i starts its reindex, and
+	// search i starts then. So search i runs beside cycle i, after the
+	// publish of each cycle before it.
+	reindexing := make([]chan struct{}, iterations)
+	for i := range reindexing {
+		reindexing[i] = make(chan struct{})
+	}
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		<-start
+		started := 0
+		// A writer that stops early starts the remaining searches.
+		defer func() {
+			for _, ch := range reindexing[started:] {
+				close(ch)
+			}
+		}()
 		for i := range iterations {
 			name := fmt.Sprintf("step%d.go", i)
 			body := fmt.Sprintf("package main\n// concurrent_delta_step_%d\n", i)
@@ -371,6 +379,8 @@ func TestDeltaCommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 				return
 			}
 			hash := gitCorpusStateHash(paths, state)
+			close(reindexing[i])
+			started++
 			if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, hash); err != nil {
 				t.Errorf("reindex: %v", err)
 				return
@@ -382,8 +392,7 @@ func TestDeltaCommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			<-start
-			time.Sleep(time.Duration(1+idx%4) * time.Millisecond)
+			<-reindexing[idx]
 			res, err := searchPlannedCorpusForTest(ctx, plan, "concurrent_delta_stable")
 			if err != nil {
 				searchErr.Add(1)
@@ -394,7 +403,6 @@ func TestDeltaCommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 			}
 		}(i)
 	}
-	close(start)
 	wg.Wait()
 
 	if missed.Load() > 0 {

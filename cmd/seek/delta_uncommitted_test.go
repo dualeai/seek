@@ -252,9 +252,6 @@ func TestDeltaUncommitted_CorruptManifestFallsBackToFullRebuild(t *testing.T) {
 
 func TestDeltaUncommitted_ShardThresholdTriggersFullRebuild(t *testing.T) {
 	requireTools(t)
-	if testing.Short() {
-		t.Skip("threshold test does maxUncommittedDeltaShards+2 cycles; skipped under -short")
-	}
 
 	dir := initGitRepo(t, "app.go", "package main\n// uthreshold_baseline\n")
 	ctx := context.Background()
@@ -820,12 +817,24 @@ func TestDeltaUncommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 	var missed atomic.Int64
 	var searchErr atomic.Int64
 	var wg sync.WaitGroup
-	start := make(chan struct{})
+	// The writer closes reindexing[i] when cycle i starts its reindex, and
+	// search i starts then. So search i runs beside cycle i, after the
+	// publish of each cycle before it.
+	reindexing := make([]chan struct{}, iterations)
+	for i := range reindexing {
+		reindexing[i] = make(chan struct{})
+	}
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		<-start
+		started := 0
+		// A writer that stops early starts the remaining searches.
+		defer func() {
+			for _, ch := range reindexing[started:] {
+				close(ch)
+			}
+		}()
 		for i := range iterations {
 			if err := os.WriteFile(filepath.Join(dir, "app.go"), fmt.Appendf(nil, "package main\n// concurrent_uncommitted_%d\n", i), 0o644); err != nil {
 				t.Errorf("write: %v", err)
@@ -837,6 +846,8 @@ func TestDeltaUncommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 				return
 			}
 			hash := gitCorpusStateHash(paths, state)
+			close(reindexing[i])
+			started++
 			if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, hash); err != nil {
 				t.Errorf("reindex: %v", err)
 				return
@@ -848,8 +859,7 @@ func TestDeltaUncommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			<-start
-			time.Sleep(time.Duration(1+idx%4) * time.Millisecond)
+			<-reindexing[idx]
 			res, err := searchPlannedCorpusForTest(ctx, plan, "uncommitted_concurrent_stable")
 			if err != nil {
 				searchErr.Add(1)
@@ -860,7 +870,6 @@ func TestDeltaUncommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 			}
 		}(i)
 	}
-	close(start)
 	wg.Wait()
 
 	if missed.Load() > 0 {

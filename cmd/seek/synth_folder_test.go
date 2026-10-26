@@ -52,18 +52,12 @@ var synthFolderWords = []string{
 // add up to total. Each file holds fileSize bytes, except the last, which can
 // hold less.
 //
-// Mode:
-//   - testing.Short(): writeSparseFile, a text prefix and then a sparse rest.
-//     The readSemaphore weight comes from the file size, so sparse files put
-//     the same pressure on the read budget as real bytes, at almost no disk
-//     space and CPU.
-//   - long mode, which CI runs: words from synthFolderWords, picked by a
-//     generator seeded from t.Name(), so each run writes the same bytes.
-//     Callers check read weight, window rotation, and cancellation. None of
-//     them searches the generated words; the beacon tests search a separate
-//     file. The small vocabulary has few distinct trigrams, so Zoekt indexes
-//     the full content at a low cost; random printable ASCII makes the callers
-//     about 8 times slower under -race.
+// The files hold words from synthFolderWords, picked by a generator seeded
+// from t.Name(), so each run writes the same bytes. Callers check read weight,
+// window rotation, and cancellation. None of them searches the generated
+// words; the beacon tests search a separate file. The small vocabulary has few
+// distinct trigrams, so Zoekt indexes the full content at a low cost. Random
+// printable ASCII makes the callers about 8 times slower under -race.
 //
 // The path comes from t.TempDir(), so the testing package removes it.
 func writeRandomFolder(t *testing.T, total, fileSize int64) string {
@@ -89,23 +83,19 @@ func writeRandomFolder(t *testing.T, total, fileSize int64) string {
 			sz = remaining
 		}
 		p := filepath.Join(root, fmt.Sprintf("f%05d.bin", i))
-		if testing.Short() {
-			writeSparseFile(t, p, sz)
-		} else {
-			// Words and spaces have no NUL byte, so the content is indexable
-			// text, not a binary file.
-			buf := make([]byte, 0, sz+16)
-			for word := 0; int64(len(buf)) < sz; word++ {
-				buf = append(buf, synthFolderWords[rng.IntN(len(synthFolderWords))]...)
-				if word%10 == 9 {
-					buf = append(buf, '\n')
-				} else {
-					buf = append(buf, ' ')
-				}
+		// Words and spaces have no NUL byte, so the content is indexable
+		// text, not a binary file.
+		buf := make([]byte, 0, sz+16)
+		for word := 0; int64(len(buf)) < sz; word++ {
+			buf = append(buf, synthFolderWords[rng.IntN(len(synthFolderWords))]...)
+			if word%10 == 9 {
+				buf = append(buf, '\n')
+			} else {
+				buf = append(buf, ' ')
 			}
-			if err := os.WriteFile(p, buf[:sz], 0o644); err != nil {
-				t.Fatalf("writeRandomFolder: %v", err)
-			}
+		}
+		if err := os.WriteFile(p, buf[:sz], 0o644); err != nil {
+			t.Fatalf("writeRandomFolder: %v", err)
 		}
 		written += sz
 	}
@@ -115,8 +105,7 @@ func writeRandomFolder(t *testing.T, total, fileSize int64) string {
 // writeSparseFile creates path with size bytes. It writes a text prefix past
 // the readers' binary probe, so readers read the file fully, and uses
 // os.Truncate for the rest, which uses almost no disk space. Tests that need
-// large files with little I/O use it: writeRandomFolder under -short, and the
-// property, pressure and soak tests.
+// large files with little I/O use it: the property, pressure and soak tests.
 func writeSparseFile(t *testing.T, path string, size int64) {
 	t.Helper()
 	prefix := bytes.Repeat([]byte("x"), int(min(size, 2*binaryProbeBytes)))

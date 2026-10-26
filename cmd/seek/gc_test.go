@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -410,30 +411,6 @@ func TestGC_TrashDir_NotEnumeratedAsCorpus(t *testing.T) {
 	}
 	if entries[0].path != valid {
 		t.Fatalf("wrong corpus surfaced: %s", entries[0].path)
-	}
-}
-
-func TestGC_TouchUsed_LatencySubMillisecond(t *testing.T) {
-	if testing.Short() {
-		t.Skip("latency check")
-	}
-	root := cacheRootForTest(t)
-	resetNFSCheck(t)
-	dir := filepath.Join(root, corporaDir, fakeCorpusHash(14))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	touchUsed(dir) // warm: ensure .used exists
-
-	const N = 1000
-	start := time.Now()
-	for i := 0; i < N; i++ {
-		touchUsed(dir)
-	}
-	elapsed := time.Since(start)
-	avg := elapsed / N
-	if avg > time.Millisecond {
-		t.Fatalf("touchUsed too slow: avg=%v over %d calls", avg, N)
 	}
 }
 
@@ -1022,12 +999,13 @@ func TestGC_FireOpportunisticGC_FastReturn(t *testing.T) {
 	runFn := func(_ context.Context) {
 		called.Add(1)
 	}
-	start := time.Now()
-	fireOpportunisticGC(runFn, 5*time.Second)
-	elapsed := time.Since(start)
-	if elapsed > 500*time.Millisecond {
-		t.Fatalf("fireOpportunisticGC should return as soon as runFn does; took %v", elapsed)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		fireOpportunisticGC(runFn, 5*time.Second)
+		if elapsed := time.Since(start); elapsed != 0 {
+			t.Fatalf("fireOpportunisticGC should return as soon as runFn does; took %v of fake time", elapsed)
+		}
+	})
 	if called.Load() != 1 {
 		t.Fatalf("runFn should run exactly once, got %d", called.Load())
 	}
@@ -1037,20 +1015,18 @@ func TestGC_FireOpportunisticGC_FastReturn(t *testing.T) {
 // hold the caller indefinitely. If the select-on-ctx-Done arm is removed,
 // this test hangs forever (caught by `go test -timeout`).
 func TestGC_FireOpportunisticGC_TimeoutBoundsHang(t *testing.T) {
-	released := make(chan struct{})
-	defer close(released)
-	runFn := func(_ context.Context) {
-		<-released // simulate hang; runs in goroutine, freed at test end
-	}
-	start := time.Now()
-	fireOpportunisticGC(runFn, 100*time.Millisecond)
-	elapsed := time.Since(start)
-	if elapsed < 80*time.Millisecond {
-		t.Fatalf("returned before timeout: %v", elapsed)
-	}
-	if elapsed > 500*time.Millisecond {
-		t.Fatalf("returned far past timeout (no bound on wait?): %v", elapsed)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		released := make(chan struct{})
+		defer close(released)
+		runFn := func(_ context.Context) {
+			<-released // simulate hang; runs in goroutine, freed at test end
+		}
+		start := time.Now()
+		fireOpportunisticGC(runFn, 100*time.Millisecond)
+		if elapsed := time.Since(start); elapsed != 100*time.Millisecond {
+			t.Fatalf("returned after %v of fake time, want the 100ms timeout", elapsed)
+		}
+	})
 }
 
 // TestGC_FireOpportunisticGC_PassesContextWithDeadline confirms the runFn
@@ -1067,12 +1043,12 @@ func TestGC_FireOpportunisticGC_PassesContextWithDeadline(t *testing.T) {
 			observedRemaining.Store(int64(time.Until(dl)))
 		}
 	}
-	fireOpportunisticGC(runFn, 200*time.Millisecond)
+	synctest.Test(t, func(t *testing.T) { fireOpportunisticGC(runFn, 200*time.Millisecond) })
 	if !observedDeadlineSet.Load() {
 		t.Fatalf("runFn must receive a context with a deadline")
 	}
 	rem := time.Duration(observedRemaining.Load())
-	if rem <= 0 || rem > 200*time.Millisecond {
+	if rem != 200*time.Millisecond {
 		t.Fatalf("deadline remaining out of bounds: %v", rem)
 	}
 }
@@ -1095,16 +1071,7 @@ func TestGC_RunGC_CtxCanceledBreaksLoop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // pre-canceled
 
-	start := time.Now()
 	runGC(ctx, gcOptions{skipThrottle: true})
-	elapsed := time.Since(start)
-
-	// Pre-canceled ctx → loop's first ctx.Err() check trips immediately.
-	// The bound leaves room for a loaded host; the count below is
-	// the real check.
-	if elapsed > time.Second {
-		t.Fatalf("canceled ctx did not short-circuit loop: took %v", elapsed)
-	}
 
 	// No corpus is evicted: the loop checks ctx before the first entry.
 	entries, err := enumerateCorpusDirs(filepath.Join(root, corporaDir))
@@ -1132,13 +1099,13 @@ func TestGC_FireOpportunisticGC_Composition(t *testing.T) {
 	t.Setenv(envGCInterval, "0s")
 	t.Setenv(envCacheBudget, "1")
 
-	start := time.Now()
-	fireOpportunisticGC(runOpportunisticGC, 5*time.Second)
-	elapsed := time.Since(start)
-
-	if elapsed > 4500*time.Millisecond {
-		t.Fatalf("composition pinned to timeout — runOpportunisticGC may be a no-op: %v", elapsed)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		fireOpportunisticGC(runOpportunisticGC, 5*time.Second)
+		if elapsed := time.Since(start); elapsed != 0 {
+			t.Fatalf("composition took %v of fake time, want none", elapsed)
+		}
+	})
 	if _, err := os.Stat(staleDir); !os.IsNotExist(err) {
 		t.Fatalf("stale corpus should be evicted via composition: err=%v", err)
 	}
@@ -1148,42 +1115,38 @@ func TestGC_FireOpportunisticGC_Composition(t *testing.T) {
 // ends at once, and fireOpportunisticGC must return within 200 ms. runFn can
 // fail to run; when it runs, it must not panic.
 func TestGC_FireOpportunisticGC_ZeroTimeout(t *testing.T) {
-	start := time.Now()
-	fireOpportunisticGC(func(ctx context.Context) {
-		// If we get here, ctx is already canceled — verify deadline path
-		// is observable without panicking.
-		_ = ctx.Err()
-	}, 0)
-	if time.Since(start) > 200*time.Millisecond {
-		t.Fatalf("zero timeout should return immediately")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		fireOpportunisticGC(func(ctx context.Context) {
+			_ = ctx.Err()
+		}, 0)
+		if time.Since(start) != 0 {
+			t.Fatalf("zero timeout should return immediately")
+		}
+	})
 }
 
 // TestGC_FireOpportunisticGC_RunFnReturnsAfterTimeout gives a runFn that runs
 // past the deadline. fireOpportunisticGC must return at the timeout and not
 // wait for the goroutine. The goroutine runs until runFn ends; that is correct
-// while the caller does not wait for it.
+// while the caller does not wait for it. The test runs in a synctest bubble:
+// a call that waits for runFn fails at once as a deadlock.
 func TestGC_FireOpportunisticGC_RunFnReturnsAfterTimeout(t *testing.T) {
-	completed := make(chan struct{})
-	fireOpportunisticGC(func(_ context.Context) {
-		// Long sleep, well past the 50ms timeout below. The goroutine
-		// will outlive fireOpportunisticGC's return.
-		time.Sleep(300 * time.Millisecond)
-		close(completed)
-	}, 50*time.Millisecond)
-	// fireOpportunisticGC returned. Did the goroutine survive?
-	select {
-	case <-completed:
-		t.Fatalf("goroutine completed too fast (should still be sleeping)")
-	case <-time.After(10 * time.Millisecond):
-		// expected — goroutine still working post-return
-	}
-	// Wait for goroutine to actually finish so the test process is clean.
-	select {
-	case <-completed:
-	case <-time.After(time.Second):
-		t.Fatalf("goroutine never completed")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+		completed := make(chan struct{})
+		start := time.Now()
+		fireOpportunisticGC(func(_ context.Context) {
+			// runFn ends only when the test releases it, after the call returns.
+			<-release
+			close(completed)
+		}, 50*time.Millisecond)
+		if elapsed := time.Since(start); elapsed != 50*time.Millisecond {
+			t.Fatalf("returned after %v of fake time, want the 50ms timeout", elapsed)
+		}
+		close(release)
+		<-completed
+	})
 }
 
 // TestGC_FireOpportunisticGC_Sequential calls fireOpportunisticGC five times
@@ -1202,19 +1165,18 @@ func TestGC_FireOpportunisticGC_Sequential(t *testing.T) {
 
 // TestGC_FireOpportunisticGC_RunFnReadsCtxMidExecution checks that runFn sees
 // its context end when the timeout fires, as the ctx.Err() check in the
-// eviction loop of runGC needs.
+// eviction loop of runGC needs. The test runs in a synctest bubble: a runFn
+// whose context does not end fails at once as a deadlock.
 func TestGC_FireOpportunisticGC_RunFnReadsCtxMidExecution(t *testing.T) {
-	observedCancel := make(chan struct{})
-	runFn := func(ctx context.Context) {
-		<-ctx.Done()
-		close(observedCancel)
-	}
-	fireOpportunisticGC(runFn, 50*time.Millisecond)
-	select {
-	case <-observedCancel:
-	case <-time.After(time.Second):
-		t.Fatalf("runFn never observed ctx cancellation")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		observedCancel := make(chan struct{})
+		runFn := func(ctx context.Context) {
+			<-ctx.Done()
+			close(observedCancel)
+		}
+		fireOpportunisticGC(runFn, 50*time.Millisecond)
+		<-observedCancel
+	})
 }
 
 // TestGC_RunGC_CtxCanceledEmptyCorpora runs runGC with a context canceled
@@ -1701,15 +1663,17 @@ func TestGCAllRemovesCompiledModelsAndOtherVersionsRuntimes(t *testing.T) {
 // The runtime path must be gone, and the renamed leftover waits for the next
 // sweep.
 func TestRetireRuntimesRenamesBeforeTheRemoval(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root removes a read-only directory")
-	}
 	cacheRoot := t.TempDir()
 	runtime := plantRuntime(t, cacheRoot, "0.0.1", 30*24*time.Hour)
 	locked := filepath.Join(runtime, "locked")
 	writeFixtureFile(t, filepath.Join(locked, "lib"), "x")
 	if err := os.Chmod(locked, 0o500); err != nil {
 		t.Fatal(err)
+	}
+	// The removal fails part way only for a user who cannot change a mode-0500
+	// folder. Root can, so the test fails for root with the cause.
+	if err := os.WriteFile(filepath.Join(locked, "probe"), nil, 0o644); err == nil {
+		t.Fatalf("the test user adds a file to the mode-0500 folder %s, so the removal cannot fail part way", locked)
 	}
 	leftover := filepath.Join(filepath.Dir(runtime), providerArtifactDiscardPrefix+filepath.Base(runtime))
 	t.Cleanup(func() { _ = os.Chmod(filepath.Join(leftover, "locked"), 0o700) })

@@ -5,10 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"sync"
-	"sync/atomic"
 	"testing"
-	"time"
+	"testing/synctest"
 
 	"golang.org/x/sync/semaphore"
 )
@@ -48,9 +46,7 @@ func withReadSemLock(t *testing.T) func() {
 // TestIndexDocuments_ReleaseAccounting_Success indexes three documents with
 // no error: every acquired byte is released when indexDocuments returns.
 func TestIndexDocuments_ReleaseAccounting_Success(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+	requireTools(t)
 	done := withReadSemLock(t)
 	defer done()
 
@@ -99,9 +95,7 @@ func TestIndexDocuments_EmptyChannel_NoLeak(t *testing.T) {
 // mean Zoekt got more permissive and we lost the precondition that
 // makes this test meaningful.
 func TestIndexDocuments_BuilderInitFail_ReleasesWeight(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+	requireTools(t)
 	done := withReadSemLock(t)
 	defer done()
 
@@ -124,9 +118,7 @@ func TestIndexDocuments_BuilderInitFail_ReleasesWeight(t *testing.T) {
 // TestIndexDeltaDocuments_ReleaseAccounting_Success — same accounting
 // check for the delta entry point.
 func TestIndexDeltaDocuments_ReleaseAccounting_Success(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+	requireTools(t)
 	indexDir := t.TempDir()
 	source := t.TempDir()
 
@@ -158,9 +150,7 @@ func TestIndexDeltaDocuments_ReleaseAccounting_Success(t *testing.T) {
 // TestIndexDeltaDocuments_BuilderInitFail_ReleasesWeight — delta-side
 // counterpart. Fatal if NewBuilder doesn't fail.
 func TestIndexDeltaDocuments_BuilderInitFail_ReleasesWeight(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+	requireTools(t)
 	done := withReadSemLock(t)
 	defer done()
 
@@ -185,12 +175,7 @@ func TestIndexDeltaDocuments_BuilderInitFail_ReleasesWeight(t *testing.T) {
 // payload) while still driving Acquire queueing through the real
 // production consumer (indexDocuments).
 func TestIndexDocuments_StressNoLeakUnderRace(t *testing.T) {
-	if testing.Short() {
-		t.Skip("stress test skipped in -short")
-	}
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+	requireTools(t)
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
@@ -199,7 +184,7 @@ func TestIndexDocuments_StressNoLeakUnderRace(t *testing.T) {
 	const numFiles = 48
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
-	defer goroutineLeakGuard(t, 60*time.Second)()
+	defer goroutineLeakGuard(t)()
 
 	dir := t.TempDir()
 	files := make([]string, numFiles)
@@ -263,9 +248,6 @@ func TestReader_ContextCancelled_NoLeak(t *testing.T) {
 // Reliable trigger: a regular file chmod-ed to 0 (unreadable for
 // non-root processes on Linux and macOS).
 func TestReader_OpenFails_NoLeak(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("chmod 0 cannot block root; skipping unreadable-file test")
-	}
 	done := withReadSemLock(t)
 	defer done()
 
@@ -279,6 +261,10 @@ func TestReader_OpenFails_NoLeak(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	if file, err := os.Open(path); err == nil {
+		_ = file.Close()
+		t.Fatalf("the test user opens the mode-000 file %s, so the open cannot fail", path)
+	}
 
 	documents, check := streamDirtyFilesAsTextIndex(t, t.Context(), dir, []string{name}, 1)
 	var got []fileContent
@@ -309,7 +295,7 @@ func TestReader_SymlinkRejected_NoLeak(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(target, link); err != nil {
-		t.Skipf("symlink unsupported on this fs: %v", err)
+		t.Fatal(err)
 	}
 
 	documents, check := streamDirtyFilesAsTextIndex(t, t.Context(), dir, []string{"link.go"}, 1)
@@ -321,31 +307,27 @@ func TestReader_SymlinkRejected_NoLeak(t *testing.T) {
 }
 
 // TestReader_BackPressureQueuesAcquires tests the contract of
-// streamDirtyFiles: when the bytes in flight pass the budget, the readers
-// queue their Acquires, and every file still reaches the channel. The
-// consumer here is a test pool that releases the weight of each document.
-// It is not the production consumer indexDocuments, which releases the
-// weight of a normal document when Builder.Add returns, so this is not an
-// end-to-end semaphore test.
+// streamDirtyFiles: when the bytes in flight reach the budget, the readers
+// queue their Acquires, and every file still reaches the channel. The test is
+// the consumer: it keeps each document with its weight, and releases the
+// weight of a full round at once. It is not the production consumer
+// indexDocuments, which releases the weight of a normal document when
+// Builder.Add returns, so this is not an end-to-end semaphore test.
 //
 // TestEnsureFolderCorpusFresh_ManySmallFilesOverBudget (end to end) and
 // TestIndexDocuments_ReadsBeyondTheBudget (consumer only) cover the
 // production reader and consumer under back-pressure.
 //
 // A test semaphore with a small budget (swapReadSemaphoreForTest) forces
-// the queue without writing hundreds of MiB to disk. The consumers run in
-// parallel: with one sleeping consumer, every worker blocks on the
-// unbuffered send, and the peak is always 1.
+// the queue without writing hundreds of MiB to disk. The read runs in a
+// synctest bubble, where synctest.Wait returns only when each reader waits on
+// its send or its Acquire. So when no document is ready after synctest.Wait,
+// the readers wait for weight, and the test holds the documents that fill the
+// budget.
 //
 // All bounds derive from `testBudget` and `fileSize`, so the assertions
 // stay consistent when these constants change.
 func TestReader_BackPressureQueuesAcquires(t *testing.T) {
-	if testing.Short() {
-		t.Skip("saturation test writes ~64 MiB to disk; skipped in -short")
-	}
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
@@ -353,9 +335,7 @@ func TestReader_BackPressureQueuesAcquires(t *testing.T) {
 	const fileSize = 4 * 1024 * 1024    // 4 MiB → budget/file = 4
 	const expectedPeakLimit = testBudget / fileSize
 	const parallelism = 2 * expectedPeakLimit // 8 → forces queueing
-	const numConsumers = parallelism          // match readers
 	const numFiles = 4 * expectedPeakLimit    // 16 → multiple rounds
-	const consumerHold = 3 * time.Millisecond
 
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
@@ -374,47 +354,49 @@ func TestReader_BackPressureQueuesAcquires(t *testing.T) {
 		}
 	}
 
-	out, check := streamDirtyFilesAsTextIndex(t, t.Context(), dir, files, parallelism)
-
-	var indexed, concurrent, maxConcurrent int32
-	var wg sync.WaitGroup
-	for range numConsumers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for fc := range out {
-				cur := atomic.AddInt32(&concurrent, 1)
-				for {
-					prev := atomic.LoadInt32(&maxConcurrent)
-					if cur <= prev || atomic.CompareAndSwapInt32(&maxConcurrent, prev, cur) {
-						break
-					}
-				}
-				time.Sleep(consumerHold)
-				atomic.AddInt32(&concurrent, -1)
-				atomic.AddInt32(&indexed, 1)
-				readSemaphore.Release(fc.weight)
+	synctest.Test(t, func(t *testing.T) {
+		out, check := streamDirtyFilesAsTextIndex(t, t.Context(), dir, files, parallelism)
+		indexed := 0
+		var held []fileContent
+		// endRound requires a full budget of held documents, or all the
+		// files that stay, and then releases their weight.
+		endRound := func() {
+			t.Helper()
+			if want := min(expectedPeakLimit, numFiles-indexed); len(held) != want {
+				t.Fatalf("the readers stopped with %d documents in flight, want %d (budget=%d B / file=%d B)",
+					len(held), want, testBudget, fileSize)
 			}
-		}()
-	}
-	wg.Wait()
-	check()
-
-	if got := atomic.LoadInt32(&indexed); got != numFiles {
-		t.Fatalf("saturation: expected %d files indexed, got %d", numFiles, got)
-	}
-	peak := atomic.LoadInt32(&maxConcurrent)
-	if peak > int32(expectedPeakLimit) {
-		t.Fatalf("semaphore violated: peak in-flight=%d > expected %d (budget=%d B / file=%d B)",
-			peak, expectedPeakLimit, testBudget, fileSize)
-	}
-	// Sanity: under genuine saturation, peak should sit between 2 and
-	// expectedPeakLimit. peak < 2 means the workload never queued any
-	// concurrent Acquires — the test ran too fast or the scheduler
-	// serialized everything — and proves nothing about back-pressure.
-	if peak < 2 {
-		t.Fatalf("no queueing observed: peak=%d — test failed to saturate the semaphore", peak)
-	}
+			indexed += len(held)
+			releaseFileContentWeights(held)
+			held = held[:0]
+		}
+	read:
+		for {
+			synctest.Wait()
+			select {
+			case fc, ok := <-out:
+				if !ok {
+					endRound()
+					break read
+				}
+				if fc.weight != fileSize {
+					t.Fatalf("document %s has weight %d, want %d", fc.name, fc.weight, fileSize)
+				}
+				held = append(held, fc)
+				if len(held) > expectedPeakLimit {
+					t.Fatalf("semaphore violated: %d documents in flight > expected %d (budget=%d B / file=%d B)",
+						len(held), expectedPeakLimit, testBudget, fileSize)
+				}
+			default:
+				// No reader can send: each one waits for weight.
+				endRound()
+			}
+		}
+		check()
+		if indexed != numFiles {
+			t.Fatalf("saturation: expected %d files indexed, got %d", numFiles, indexed)
+		}
+	})
 }
 
 // swapReadSemaphoreForTest replaces the package-level readSemaphore
@@ -471,17 +453,15 @@ func swapIndexWindowBytesForTest(window int64) func() {
 
 // setupPressureTest bundles the boilerplate every pressure test repeats:
 // require ctags, hold testReadSemMu, swap the readSemaphore + window
-// budget, and arm the goroutine-leak watchdog. It returns the restore function.
+// budget, and check for leaked goroutines. It returns the restore function.
 //
 //	defer setupPressureTest(t, testBudget)()
 func setupPressureTest(t *testing.T, budget int64) func() {
 	t.Helper()
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+	requireTools(t)
 	testReadSemMu.Lock()
 	restoreSem := swapReadSemaphoreForTest(budget)
-	guardCleanup := goroutineLeakGuard(t, 60*time.Second)
+	guardCleanup := goroutineLeakGuard(t)
 	return func() {
 		guardCleanup()
 		restoreSem()

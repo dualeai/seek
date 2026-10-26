@@ -229,9 +229,10 @@ func assertOneMissingBlobWarning(t *testing.T, logs *testLogRecorder) {
 }
 
 // TestPartialCloneBlobArrivesDuringDelta fetches a missing blob after the
-// recheck of a delta build and before its reads: the record keeps the
-// store from before the recheck, so the next search sees the change and
-// indexes the content.
+// recheck of a delta build and before its reads. A Git shim runs the fetch
+// when the recheck ends: the first `git cat-file --batch-command` of the
+// delta search. The record keeps the store from before the recheck, so the
+// next search sees the change and indexes the content.
 func TestPartialCloneBlobArrivesDuringDelta(t *testing.T) {
 	requireTools(t)
 	clone := newPartialClone(t)
@@ -250,19 +251,47 @@ func TestPartialCloneBlobArrivesDuringDelta(t *testing.T) {
 	writeFixtureFile(t, filepath.Join(source, "kept.txt"), "zqpartialmarker kept two\n")
 	gitRunIn(t, source, "commit", "-qam", "two")
 	gitRunIn(t, clone, "pull", "-q", "--ff-only")
-	oid := gitOutputIn(t, clone, "rev-parse", "HEAD:dir/missing.txt")
-	missingBlobRecheckTestHook = func() { gitRunIn(t, clone, "fetch", "-q", "origin", oid) }
-	t.Cleanup(func() { missingBlobRecheckTestHook = nil })
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The shim keeps its stdout open until the fetch ends, so the recheck
+	// reads the end of the cat-file output only after the blob arrived. The
+	// rename of the armed file lets one cat-file run the fetch. The prepare
+	// before the build runs `git cat-file --batch`, which the shim passes on.
+	armed := filepath.Join(t.TempDir(), "armed")
+	shim := t.TempDir()
+	writeExecutable(t, filepath.Join(shim, "git"), "#!/bin/sh\n"+gitShimSubcommand+
+		"case \"$subcommand $*\" in\n"+
+		"cat-file*--batch-command*)\n"+
+		"  if mv \"$SEEK_TEST_ARMED\" \"$SEEK_TEST_ARMED.done\" 2>/dev/null; then\n"+
+		"    \"$SEEK_TEST_REAL_GIT\" \"$@\"\n"+
+		"    status=$?\n"+
+		"    \"$SEEK_TEST_REAL_GIT\" -C \"$SEEK_TEST_CLONE\" fetch -q origin \"$SEEK_TEST_OID\" >&2 || exit 1\n"+
+		"    exit $status\n"+
+		"  fi ;;\n"+
+		"esac\n"+
+		"exec \"$SEEK_TEST_REAL_GIT\" \"$@\"\n")
+	t.Setenv("SEEK_TEST_REAL_GIT", realGit)
+	t.Setenv("SEEK_TEST_ARMED", armed)
+	t.Setenv("SEEK_TEST_CLONE", clone)
+	t.Setenv("SEEK_TEST_OID", gitOutputIn(t, clone, "rev-parse", "HEAD:dir/missing.txt"))
+	t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
+	writeFixtureFile(t, armed, "")
 	lexical()
-	missingBlobRecheckTestHook = nil
+	if _, err := os.Stat(armed + ".done"); err != nil {
+		t.Fatalf("no cat-file ran the fetch: %v", err)
+	}
 	if out := lexical(); !strings.Contains(out, "dir/missing.txt") {
 		t.Fatalf("the blob that arrived during the delta is still name-only:\n%s", out)
 	}
 }
 
 // TestPartialCloneSemanticPublishStops stops the semantic publish after a
-// blob arrived, as a kill there would: the pending record still names
-// the blob, so the next descriptive search rebuilds the generation.
+// blob arrived, as a kill there would. The publish replaces the generation of
+// HEAD, and each folder of that generation takes no change, so the publish
+// fails. The pending record still names the blob, so the next descriptive
+// search rebuilds the generation.
 func TestPartialCloneSemanticPublishStops(t *testing.T) {
 	requireTools(t)
 	clone := newPartialClone(t)
@@ -274,14 +303,19 @@ func TestPartialCloneSemanticPublishStops(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	rowsHaveArrivedBlob := func() bool {
+	generationDir := func() (dir, head string) {
 		t.Helper()
 		plans, err := planCorpora(context.Background(), []string{clone})
 		if err != nil {
 			t.Fatal(err)
 		}
-		head := readHeadFile(plans[0].cacheDir)
-		generation, err := openSemanticGenerationForSearch(semanticGenerationDir(plans[0].indexDir, head), head)
+		head = readHeadFile(plans[0].cacheDir)
+		return semanticGenerationDir(plans[0].indexDir, head), head
+	}
+	rowsHaveArrivedBlob := func() bool {
+		t.Helper()
+		dir, head := generationDir()
+		generation, err := openSemanticGenerationForSearch(dir, head)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -293,19 +327,12 @@ func TestPartialCloneSemanticPublishStops(t *testing.T) {
 		t.Fatal("the generation has rows for a missing blob")
 	}
 	gitRunIn(t, clone, "fetch", "-q", "origin", gitOutputIn(t, clone, "rev-parse", "HEAD:dir/missing.txt"))
-	stopped := false
-	semanticPublishTestHook = func() error {
-		if stopped {
-			return nil
-		}
-		stopped = true
-		return errors.New("the process stopped before the publish")
-	}
-	t.Cleanup(func() { semanticPublishTestHook = nil })
+	dir, _ := generationDir()
+	unlock := lockFolderTree(t, dir)
 	describe()
-	semanticPublishTestHook = nil
-	if !stopped {
-		t.Fatal("the semantic publish did not run")
+	unlock()
+	if rowsHaveArrivedBlob() {
+		t.Fatal("the publish replaced a generation that takes no change, so the test stopped nothing")
 	}
 	describe()
 	if !rowsHaveArrivedBlob() {

@@ -8,16 +8,13 @@ import (
 	"strconv"
 	"sync"
 	"testing"
-	"time"
 )
 
 // TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable checks that a built
 // corpus with a stored state remains searchable on a warm call, and that the
-// warm call returns before it takes a build slot.
+// warm call returns before it takes a build slot. A warm call that waits for
+// a slot runs until the go test timeout, which prints each goroutine.
 func TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable(t *testing.T) {
-	if testing.Short() {
-		t.Skip("invokes Zoekt indexer + ctags subprocess")
-	}
 	requireTools(t)
 
 	root := t.TempDir()
@@ -38,9 +35,7 @@ func TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable(t *testing.T) {
 	// With every build slot held, only the warm return before the slot can
 	// answer.
 	release := holdEveryBuildSlot(t)
-	warmCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	state, err := ensureFolderCorpusFresh(warmCtx, plan)
-	cancel()
+	state, err := ensureFolderCorpusFresh(ctx, plan)
 	release()
 	if err != nil {
 		t.Fatalf("second call: %v", err)
@@ -51,13 +46,11 @@ func TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable(t *testing.T) {
 }
 
 // holdEveryBuildSlot takes all of buildWindowBytes from buildWindows, so a
-// build waits for a slot; release frees it.
+// build waits for a slot; release frees it. A slot that another test kept
+// makes it wait until the go test timeout, which prints each goroutine.
 func holdEveryBuildSlot(t *testing.T) (release func()) {
 	t.Helper()
-	// A slot that another test kept fails here, not at the suite timeout.
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
-	if err := buildWindows.Acquire(ctx, buildWindowBytes); err != nil {
+	if err := buildWindows.Acquire(t.Context(), buildWindowBytes); err != nil {
 		t.Fatal(err)
 	}
 	var once sync.Once
@@ -158,11 +151,9 @@ func TestWalkDirectory_GitContentNotInStateHash(t *testing.T) {
 
 // TestEnsureFolderCorpusFresh_ColdThenWarm_SearchableBoth builds a folder of
 // 25 files cold, then calls again warm: both calls give corpusSearchable, and
-// the warm call returns before it takes a build slot.
+// the warm call returns before it takes a build slot. A warm call that waits
+// for a slot runs until the go test timeout, which prints each goroutine.
 func TestEnsureFolderCorpusFresh_ColdThenWarm_SearchableBoth(t *testing.T) {
-	if testing.Short() {
-		t.Skip("invokes Zoekt indexer + ctags subprocess")
-	}
 	requireTools(t)
 
 	root := t.TempDir()
@@ -188,9 +179,7 @@ func TestEnsureFolderCorpusFresh_ColdThenWarm_SearchableBoth(t *testing.T) {
 	// With every build slot held, only the warm return before the slot can
 	// answer.
 	release := holdEveryBuildSlot(t)
-	warmCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	warm, err := ensureFolderCorpusFresh(warmCtx, plan)
-	cancel()
+	warm, err := ensureFolderCorpusFresh(ctx, plan)
 	release()
 	if err != nil {
 		t.Fatalf("warm: %v", err)

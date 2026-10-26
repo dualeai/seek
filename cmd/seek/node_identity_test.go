@@ -12,7 +12,8 @@ import (
 
 // TestNodeIdentityIgnoresTypedPath checks that the typed path (a symlink, or
 // another letter case on a case-insensitive file system) never changes a
-// node: one corpus, one result.
+// node: one corpus, one result. On a case-sensitive file system, the other
+// letter case names no file.
 func TestNodeIdentityIgnoresTypedPath(t *testing.T) {
 	requireTools(t)
 	const marker = "zqnodeidentitymarker"
@@ -23,7 +24,7 @@ func TestNodeIdentityIgnoresTypedPath(t *testing.T) {
 		writeFixtureFile(t, filepath.Join(folder, "a.txt"), marker+"\n")
 		link := f.path("link")
 		if err := os.Symlink(folder, link); err != nil {
-			t.Skipf("symlink unsupported: %v", err)
+			t.Fatal(err)
 		}
 		setTestUserCache(t)
 		assertNodeIdentityOnce(t, marker, folder, link)
@@ -33,13 +34,14 @@ func TestNodeIdentityIgnoresTypedPath(t *testing.T) {
 		f := newGraphFixture(t)
 		repo := f.GitRepo("repoC", "c.txt", marker+"\n")
 		upper := filepath.Join(filepath.Dir(repo), "REPOC")
-		if _, err := os.Stat(upper); err != nil {
-			t.Skip("file system is case-sensitive")
-		}
 		writeFixtureFile(t, filepath.Join(repo, "sub", "s.txt"), "sub\n")
 		gitRunIn(t, repo, "add", "sub")
 		gitRunIn(t, repo, "commit", "-q", "-m", "sub")
 		setTestUserCache(t)
+		if _, err := os.Stat(upper); err != nil {
+			requireMissingOperand(t, upper)
+			return
+		}
 		assertNodeIdentityOnce(t, marker, repo, upper)
 		// Operands of one node in two letter cases merge into one scope,
 		// in either order and with "." in the work tree.
@@ -98,7 +100,8 @@ func planIDOf(t *testing.T, operand string) corpusID {
 // TestOperandCaseInRepoThatGitClassifies types an operand in another letter
 // case inside a repository whose `.git` is a file that names a separate Git
 // directory, so only Git can classify the path. The operand stays a Git
-// scope: the Git-ignored file is not shown.
+// scope: the Git-ignored file is not shown. On a case-sensitive file system,
+// the operand names no file.
 func TestOperandCaseInRepoThatGitClassifies(t *testing.T) {
 	requireTools(t)
 	const marker = "zqoperandcasemarker"
@@ -109,15 +112,16 @@ func TestOperandCaseInRepoThatGitClassifies(t *testing.T) {
 	}
 	gitRunIn(t, f.root, "init", "-q", "--separate-git-dir", f.path("meta/repoS.git"), repo)
 	upper := filepath.Join(filepath.Dir(repo), "REPOS")
-	if _, err := os.Stat(upper); err != nil {
-		t.Skip("file system is case-sensitive")
-	}
 	writeFixtureFile(t, filepath.Join(repo, ".gitignore"), "sub/ign.txt\n")
 	f.graphFile("repoS/sub/kept.txt", marker)
 	gitRunIn(t, repo, "add", ".gitignore", "sub/kept.txt")
 	gitRunIn(t, repo, "commit", "-q", "-m", "content")
 	f.graphFile("repoS/sub/ign.txt", marker)
 	setTestUserCache(t)
+	if _, err := os.Stat(upper); err != nil {
+		requireMissingOperand(t, filepath.Join(upper, "sub"))
+		return
+	}
 	got := slices.Sorted(maps.Keys(graphSearch(t, marker, filepath.Join(upper, "sub"))))
 	if want := []string{"repoS/sub/kept.txt"}; !slices.Equal(got, want) {
 		t.Fatalf("found %q, want %q", got, want)

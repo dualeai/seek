@@ -358,7 +358,7 @@ func newLateOnRowEncoder(ctx context.Context, interactive bool) (built *lateOnSt
 				return nil, fmt.Errorf("release the rejected LateOn session: %w", destroyErr)
 			}
 			session = nil
-			providerErr = fmt.Errorf("%s disagrees with the CPU provider: %s",
+			providerErr = fmt.Errorf("the provider check rejected %s: %s",
 				lateOnAcceleratedProviderName, reason)
 		}
 	}

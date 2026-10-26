@@ -266,7 +266,7 @@ func TestDetectGitBoundary_SymlinkedExternalPointerAsksGit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(outside, filepath.Join(linkDir, "outside")); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
+		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: links/outside/real-git\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -290,7 +290,7 @@ func TestDetectGitBoundary_SymlinkedGitAsksGit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(realGitDir, filepath.Join(worktree, ".git")); err != nil {
-		t.Skipf("symlink unsupported: %v", err)
+		t.Fatal(err)
 	}
 
 	_, status := detectGitBoundary(worktree)
@@ -438,7 +438,7 @@ func TestDetectGitBoundary_SymlinkedHEADRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(target, filepath.Join(gitDir, "HEAD")); err != nil {
-		t.Skipf("symlink unsupported: %v", err)
+		t.Fatal(err)
 	}
 	_, status := detectGitBoundary(root)
 	if status != ambiguous {

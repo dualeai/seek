@@ -1,9 +1,7 @@
 package main
 
 import (
-	"context"
 	"testing"
-	"time"
 )
 
 // TestSequentialCorpora_SemaphoreDrainsBetweenPlans — process plans
@@ -11,9 +9,7 @@ import (
 // starting balance — otherwise plan N+1 starts with reduced budget
 // and may wedge once cumulative > remaining.
 func TestSequentialCorpora_SemaphoreDrainsBetweenPlans(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+	requireTools(t)
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
@@ -23,16 +19,13 @@ func TestSequentialCorpora_SemaphoreDrainsBetweenPlans(t *testing.T) {
 
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
-	defer goroutineLeakGuard(t, 90*time.Second)()
+	defer goroutineLeakGuard(t)()
 
 	for _, label := range []string{"A", "B"} {
 		root := writeRandomFolder(t, totalPerCorpus, fileSize)
 		plan := planSynthCorpus(t, root)
 
-		ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
-		_, err := ensureFolderCorpusFresh(ctx, plan)
-		cancel()
-		if err != nil {
+		if _, err := ensureFolderCorpusFresh(t.Context(), plan); err != nil {
 			t.Fatalf("corpus %s ensureFolderCorpusFresh: %v", label, err)
 		}
 		// A shard proves that this corpus reached the indexing path before the
@@ -50,16 +43,14 @@ func TestSequentialCorpora_SemaphoreDrainsBetweenPlans(t *testing.T) {
 // in sequence. It checks that the known-empty path does not leak weight and
 // that each plan releases its weight.
 func TestSequentialCorpora_ThreeWayMix(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+	requireTools(t)
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
 	const testBudget int64 = 4 * 1024 * 1024
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
-	defer goroutineLeakGuard(t, 60*time.Second)()
+	defer goroutineLeakGuard(t)()
 
 	emptyRoot := t.TempDir()
 	roots := []struct {
@@ -72,10 +63,7 @@ func TestSequentialCorpora_ThreeWayMix(t *testing.T) {
 	}
 	for _, rc := range roots {
 		plan := planSynthCorpus(t, rc.path)
-		ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
-		_, err := ensureFolderCorpusFresh(ctx, plan)
-		cancel()
-		if err != nil {
+		if _, err := ensureFolderCorpusFresh(t.Context(), plan); err != nil {
 			t.Fatalf("corpus[%s]: %v", rc.label, err)
 		}
 		// Empty corpus produces 0 shards (zero-doc branch in

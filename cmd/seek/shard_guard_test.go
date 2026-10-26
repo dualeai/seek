@@ -104,9 +104,6 @@ func expectGuardedShards(t *testing.T, dir string) {
 
 func TestGuardWrappedShards_SkippedDocumentDoesNotShiftMapping(t *testing.T) {
 	requireTools(t)
-	if testing.Short() {
-		t.Skip("indexes 5 MiB per build")
-	}
 	orders := map[string][]string{
 		// A skipped document first must not shift the mapping.
 		"skipped first": {"bin.dat", "fits.txt", "wraps.txt"},

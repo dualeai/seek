@@ -51,7 +51,7 @@ func TestReadNativeGitDiffFixedChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink("modify.go", filepath.Join(repoDir, "type.go")); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
+		t.Fatal(err)
 	}
 	gitRunIn(t, repoDir, "mv", "rename-old.go", "rename-new.go")
 	if err := os.WriteFile(filepath.Join(repoDir, "add.go"), []byte("package added\n"), 0o644); err != nil {
@@ -202,7 +202,7 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 					t.Fatal(err)
 				}
 				if err := os.Symlink("keep.go", filepath.Join(repoDir, "change.go")); err != nil {
-					t.Skipf("symlink unavailable: %v", err)
+					t.Fatal(err)
 				}
 			},
 		},
@@ -669,7 +669,7 @@ func TestPrepareNativeGitDeltaMissingBaseSelectsFull(t *testing.T) {
 	probe := exec.Command("git", "cat-file", "-e", oldCommit+"^{commit}")
 	probe.Dir = repoDir
 	if err := probe.Run(); err == nil {
-		t.Skip("Git retained the unreachable base object")
+		t.Fatal("Git kept the unreachable base commit after gc --prune=now, so the base is not missing")
 	}
 	scan, err := scanFamily(plan.indexDir)
 	if err != nil {

@@ -29,7 +29,7 @@ func TestResolveOperands_PathReadErrorsPreserveOperand(t *testing.T) {
 				root := t.TempDir()
 				link := filepath.Join(root, "broken-link")
 				if err := os.Symlink(filepath.Join(root, "missing-target"), link); err != nil {
-					t.Skipf("symlink unavailable: %v", err)
+					t.Fatalf("make the broken symlink: %v", err)
 				}
 				return link
 			},

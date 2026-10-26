@@ -168,7 +168,7 @@ func TestBytecapFixtureSearchesToTheEnd(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := file.Truncate(int64(39) << 30 / 10); err != nil {
-			t.Skipf("sparse file unsupported: %v", err)
+			t.Fatalf("make the 3.9 GiB file %s: %v", path, err)
 		}
 		_ = file.Close()
 	}
@@ -255,14 +255,23 @@ func TestCacheLedgerMatchesDirAfterVectorBind(t *testing.T) {
 	if _, err := seek(t, "--lexical-only", "alpha beta", folder); err != nil {
 		t.Fatal(err)
 	}
-	// The vector bind and the ledger can fall in one mtime tick.
-	time.Sleep(20 * time.Millisecond)
-	if _, _, err := stubSearch(t, payloadFar, "alpha beta", folder); err != nil {
-		t.Fatal(err)
-	}
 	plans, err := planCorpora(context.Background(), []string{folder})
 	if err != nil || len(plans) != 1 {
 		t.Fatalf("plans=%d err=%v", len(plans), err)
+	}
+	// Put the state of the text build one second before its ledger entry, so
+	// only the vector bind can make the entry stale. A bind in the time step
+	// of the entry also makes it stale: ledgerStale counts an equal time.
+	ledger, err := os.Stat(filepath.Join(plans[0].cacheDir, corpusSizeFile))
+	if err != nil {
+		t.Fatalf("no ledger entry after the text build: %v", err)
+	}
+	textBuilt := ledger.ModTime().Add(-time.Second)
+	if err := os.Chtimes(filepath.Join(plans[0].cacheDir, stateFile), textBuilt, textBuilt); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := stubSearch(t, payloadFar, "alpha beta", folder); err != nil {
+		t.Fatal(err)
 	}
 	if dirs := semanticGenerationDirs(t, plans[0].indexDir); len(dirs) != 1 {
 		t.Fatalf("vector generations=%d, want 1", len(dirs))
@@ -750,7 +759,9 @@ func TestDirtyReaderTransientErrorDoesNotPublish(t *testing.T) {
 
 // TestDirtyFileReadAgainAfterChmod makes a dirty Git file unreadable, then
 // readable: the chmod alone changes the state, so the next search reads the
-// dirty text.
+// dirty text. Root, or any user who can open a mode-000 file, reads the file
+// in the first search. The test then expects the dirty text in both searches,
+// and still requires that the chmod changes the fingerprint of the file.
 func TestDirtyFileReadAgainAfterChmod(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -761,16 +772,23 @@ func TestDirtyFileReadAgainAfterChmod(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	// The fingerprint of d.txt must change with its mode alone, for any user.
+	dirty := repoState{Files: []string{"d.txt"}}
+	unreadable := repoStateFingerprint(repo, dirty)
+	unreadableHeaders := 0
 	if file, err := os.Open(path); err == nil {
 		_ = file.Close()
-		t.Skip("the test user can open a mode 000 file")
+		unreadableHeaders = 1
 	}
 	setTestUserCache(t)
-	if _, headers := searchHeaders(t, "zqdirtychmod", repo); len(headers) != 0 {
-		t.Fatalf("an unreadable file matched by content: %v", headers)
+	if _, headers := searchHeaders(t, "zqdirtychmod", repo); len(headers) != unreadableHeaders {
+		t.Fatalf("the mode-000 file gave %v, want %d content matches", headers, unreadableHeaders)
 	}
 	if err := os.Chmod(path, 0o644); err != nil {
 		t.Fatal(err)
+	}
+	if repoStateFingerprint(repo, dirty) == unreadable {
+		t.Fatal("the chmod did not change the fingerprint of d.txt, so a search would not read it again")
 	}
 	if _, headers := searchHeaders(t, "zqdirtychmod", repo); len(headers) != 1 {
 		t.Fatalf("after chmod the search found %v, want the dirty content", headers)

@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"testing"
 	"testing/quick"
-	"time"
 
 	"github.com/sourcegraph/zoekt/index"
 )
@@ -21,12 +20,7 @@ import (
 // Sparse files limit fixture I/O. A small test-local readSemaphore budget lets
 // small payloads put back pressure on the readers.
 func TestEnsureFolderCorpusFresh_RandomDistribution(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
-	if testing.Short() {
-		t.Skip("property test skipped in -short")
-	}
+	requireTools(t)
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
@@ -48,7 +42,7 @@ func TestEnsureFolderCorpusFresh_RandomDistribution(t *testing.T) {
 		if n == 0 || maxSize == 0 {
 			return true
 		}
-		defer goroutineLeakGuard(t, 30*time.Second)()
+		defer goroutineLeakGuard(t)()
 		rng := rand.New(rand.NewPCG(seed|1, seed^0xDEADBEEF))
 		root := t.TempDir()
 		var total int64
@@ -63,9 +57,7 @@ func TestEnsureFolderCorpusFresh_RandomDistribution(t *testing.T) {
 		}
 		plan := planSynthCorpus(t, root)
 
-		ctx, cancel := context.WithTimeout(t.Context(), 25*time.Second)
-		defer cancel()
-		if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
+		if _, err := ensureFolderCorpusFresh(t.Context(), plan); err != nil {
 			t.Logf("ensureFolderCorpusFresh seed=%d n=%d maxSize=%d: %v", seed, n, maxSize, err)
 			return false
 		}
@@ -81,7 +73,8 @@ func TestEnsureFolderCorpusFresh_RandomDistribution(t *testing.T) {
 }
 
 // FuzzReadOneFolderFileStreaming_Sizes checks the per-file size boundary of
-// readOneFolderFileStreaming. For any size in [0, testDocumentContentLimit+1],
+// readOneFolderFileStreaming. The fuzzer's size folds into
+// [0, testDocumentContentLimit+1], so every input tests a size. For each size,
 // the function must either
 // (a) send exactly one fileContent with weight=size and never leak,
 // or (b) send one name-only document without touching the semaphore.
@@ -94,9 +87,8 @@ func FuzzReadOneFolderFileStreaming_Sizes(f *testing.F) {
 	}
 	f.Fuzz(func(t *testing.T, size int64) {
 		swapDocumentContentLimitForTest(t, testDocumentContentLimit)
-		if size < 0 || size > testDocumentContentLimit+1 {
-			t.Skip()
-		}
+		const sizes = testDocumentContentLimit + 2
+		size = (size%sizes + sizes) % sizes
 		testReadSemMu.Lock()
 		defer testReadSemMu.Unlock()
 		before := availableWeight(readSemaphore)
@@ -112,9 +104,7 @@ func FuzzReadOneFolderFileStreaming_Sizes(f *testing.F) {
 		// gives the reader a failure function.
 		c := newFolderCandidate("fuzz.bin", p, info)
 		out := make(chan fileContent, 1)
-		timeoutCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-		defer cancel()
-		ctx, fail := context.WithCancelCause(timeoutCtx)
+		ctx, fail := context.WithCancelCause(t.Context())
 		defer fail(nil)
 		readOneFolderFileStreaming(ctx, c, out, fail)
 		close(out)
@@ -159,18 +149,14 @@ func FuzzReadOneFolderFileStreaming_Sizes(f *testing.F) {
 // with one file of maxReadWeightBytes, and then of one byte more, next to a
 // 16-byte file. The production semaphore (not swapped) must admit the first
 // size and clamp the weight of the second, with no hang and no leaked weight.
+// A hang runs until the go test timeout, which prints each goroutine.
 func TestEnsureFolderCorpusFresh_SingleFileAroundReadWeightCap(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
-	if testing.Short() {
-		t.Skip("creates 100 MiB sparse files")
-	}
+	requireTools(t)
 	for _, size := range []int64{maxReadWeightBytes, maxReadWeightBytes + 1} {
 		t.Run(strconv.FormatInt(size, 10), func(t *testing.T) {
 			testReadSemMu.Lock()
 			defer testReadSemMu.Unlock()
-			defer goroutineLeakGuard(t, 120*time.Second)()
+			defer goroutineLeakGuard(t)()
 
 			root := t.TempDir()
 			writeSparseFile(t, filepath.Join(root, "huge.bin"), size)
@@ -179,9 +165,7 @@ func TestEnsureFolderCorpusFresh_SingleFileAroundReadWeightCap(t *testing.T) {
 			plan := planSynthCorpus(t, root)
 
 			before := availableWeight(readSemaphore)
-			ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-			defer cancel()
-			if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
+			if _, err := ensureFolderCorpusFresh(t.Context(), plan); err != nil {
 				t.Fatalf("ensureFolderCorpusFresh: %v", err)
 			}
 			if got := availableWeight(readSemaphore); got != before {

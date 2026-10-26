@@ -134,11 +134,8 @@ func TestScopeAddsNoScoreTerm(t *testing.T) {
 			t.Fatalf("%s: %v", operand, err)
 		}
 		var files []string
-		for line := range strings.Lines(out) {
-			if header, ok := strings.CutPrefix(line, "## "); ok {
-				name, _, _ := strings.Cut(header, " (")
-				files = append(files, filepath.Base(name))
-			}
+		for _, result := range printedResults(out) {
+			files = append(files, filepath.Base(result.path))
 		}
 		return files
 	}

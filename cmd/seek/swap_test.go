@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -178,11 +177,12 @@ func TestTempSwap_RecoversFolderIncompleteSwap(t *testing.T) {
 	}
 }
 
-// TestTempSwap_ReaderExcludedFromTornWindow checks that the publish EX lock
-// keeps a concurrent reader out of the torn window (live committed family
-// moved aside, replacements not yet renamed in). afterAsideBeforeRenameHook
-// starts a search in that window and waits 250 ms; the reader must block on
-// LOCK_SH and find TORN_MARKER. A read of the torn set finds no file.
+// TestTempSwap_ReaderExcludedFromTornWindow takes the publish lock and moves
+// the live committed family aside, as a swap does before it renames the new
+// family in. A reader that starts in this torn window must wait for the lock,
+// which its debug line shows. It must not read the torn family, where it finds
+// no file. When the family is back and the lock is free, the reader finds
+// TORN_MARKER.
 func TestTempSwap_ReaderExcludedFromTornWindow(t *testing.T) {
 	requireTools(t)
 	dir := initGitRepo(t, "stable.go", "package main\n// TORN_MARKER\n")
@@ -193,50 +193,70 @@ func TestTempSwap_ReaderExcludedFromTornWindow(t *testing.T) {
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, st, gitCorpusStateHash(paths, st)); err != nil {
 		t.Fatalf("initial build: %v", err)
 	}
-
-	readerDone := make(chan int, 1)
-	var once sync.Once
-	afterAsideBeforeRenameHook = func() {
-		// Torn window is open. Launch a reader and give it time to try its
-		// lock: it must block on SH because this runs under the publish EX
-		// lock.
-		once.Do(func() {
-			go func() {
-				res, err := searchPlannedCorpusForTest(ctx, plan, "TORN_MARKER")
-				if err != nil {
-					readerDone <- -1
-					return
-				}
-				readerDone <- len(res)
-			}()
-			time.Sleep(250 * time.Millisecond)
-		})
+	_, waiting := captureTestLogsWithSignal(t, slog.LevelWarn, lockWaitPublish, filepath.Join(plan.cacheDir, lockFile))
+	pub, err := acquirePublishLock(ctx, plan.cacheDir)
+	if err != nil {
+		t.Fatal(err)
 	}
-	defer func() { afterAsideBeforeRenameHook = nil }()
-
-	// New commit → HEAD moves → committed swap → hook fires mid-swap.
-	writeTrackedFile(t, dir, "b.go", "package main\n// B\n")
-	s := mustGitRepoStateIn(t, ctx, dir)
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, s, gitCorpusStateHash(paths, s)); err != nil {
-		t.Fatalf("delta build: %v", err)
+	restore := tearFamily(t, plan, familyCommitted)
+	type result struct {
+		files int
+		err   error
 	}
-
-	var got int
+	done := make(chan result, 1)
+	go func() {
+		files, err := searchPlannedCorpusForTest(ctx, plan, "TORN_MARKER")
+		done <- result{files: len(files), err: err}
+	}()
 	select {
-	case got = <-readerDone:
-	case <-time.After(30 * time.Second):
-		t.Fatal("no swap ran the hook, so no reader was started")
+	case <-waiting:
+	case got := <-done:
+		restore()
+		releaseLock(pub)
+		t.Fatalf("a reader read the torn family during the publish: files=%d err=%v", got.files, got.err)
 	}
-	if got <= 0 {
-		t.Fatalf("reader observed torn/empty committed set during swap (got %d) — SH exclusion failed", got)
+	restore()
+	releaseLock(pub)
+	if got := <-done; got.err != nil || got.files == 0 {
+		t.Fatalf("the reader after the publish: files=%d err=%v, want TORN_MARKER", got.files, got.err)
+	}
+}
+
+// tearFamily moves the shards and sidecars of fam out of the index directory
+// of plan, as swapFiles does before it renames the new family in. The caller
+// holds the publish lock. The returned restore moves them back.
+func tearFamily(t *testing.T, plan node, fam shardFamily) (restore func()) {
+	t.Helper()
+	shards := familyShardFilesForTest(t, plan.indexDir, fam)
+	if len(shards) == 0 {
+		t.Fatal("the family has no shard to move aside")
+	}
+	aside, err := os.MkdirTemp(plan.cacheDir, "torn-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range shards {
+		if err := os.Rename(path, filepath.Join(aside, filepath.Base(path))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return func() {
+		t.Helper()
+		for _, path := range shards {
+			if err := os.Rename(filepath.Join(aside, filepath.Base(path)), path); err != nil {
+				t.Errorf("move %s back: %v", filepath.Base(path), err)
+			}
+		}
+		_ = os.Remove(aside)
 	}
 }
 
 // TestPublishStepFailureKeepsTheLiveFamily fails one rename of a publish
-// after the live family moved aside: the hook removes the last shard of the
-// build. It runs for each node kind. The swap moves the live family back, so
-// the search serves it whole, with a warning and no .swapping; the edit is not
-// in it. The next search publishes the edit.
+// after the live family moved aside. The edit adds a shard to the family, and
+// a folder that the test user cannot empty holds the path of that shard. It
+// runs for each node kind. The swap moves the live family back, so the search
+// serves it whole, with a warning and no .swapping; the edit is not in it.
+// When the folder is gone, the next search publishes the edit.
 func TestPublishStepFailureKeepsTheLiveFamily(t *testing.T) {
 	requireTools(t)
 	for _, test := range []struct {
@@ -278,29 +298,24 @@ func TestPublishStepFailureKeepsTheLiveFamily(t *testing.T) {
 				t.Fatalf("plans=%d err=%v", len(plans), err)
 			}
 			plan := plans[0]
-			var removed int
-			afterAsideBeforeRenameHook = func() {
-				dirs, _ := filepath.Glob(filepath.Join(plan.indexDir, buildDirPrefix+"*"))
-				for _, dir := range dirs {
-					shards, err := familyShardFiles(dir, test.fam)
-					if err != nil || len(shards) < 2 {
-						t.Errorf("build %s: shards=%v err=%v, want 2 or more", dir, shards, err)
-						continue
-					}
-					if err := os.Remove(shards[len(shards)-1]); err != nil {
-						t.Error(err)
-						continue
-					}
-					removed++
+			// The edit adds the shard after the last one (a delta). The scan
+			// of the live family skips folders, so the swap meets the folder
+			// only when it renames that shard in.
+			sc, err := scanFamily(plan.indexDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			prefix, last := "", -1
+			for _, member := range sc.members {
+				if member.shard && member.numbered && inFamily(test.fam, member) && member.num > last {
+					prefix, last = member.prefix, member.num
 				}
 			}
-			t.Cleanup(func() { afterAsideBeforeRenameHook = nil })
+			blocker := filepath.Join(plan.indexDir, fmt.Sprintf("%s.%05d%s", prefix, last+1, shardSuffix))
+			writeFixtureFile(t, filepath.Join(blocker, "kept"), "the swap cannot remove this folder\n")
+			unlock := lockFolderTree(t, blocker)
 			logs := captureTestLogs(t, slog.LevelWarn)
 			out := search()
-			afterAsideBeforeRenameHook = nil
-			if removed != 1 {
-				t.Fatalf("the hook removed %d shards, want 1", removed)
-			}
 			warned := false
 			for _, record := range logs.Records() {
 				warned = warned || record.Message == "Index update failed; using the existing index"
@@ -312,6 +327,10 @@ func TestPublishStepFailureKeepsTheLiveFamily(t *testing.T) {
 			}
 			if label := readCacheFile(plan.cacheDir, swappingMarkerFile); label != "" {
 				t.Fatalf(".swapping=%q after a rolled-back swap, want none", label)
+			}
+			unlock()
+			if err := os.RemoveAll(blocker); err != nil {
+				t.Fatal(err)
 			}
 			if edited, err := seek(t, "--lexical-only", "zqtornedit", root); err != nil || !strings.Contains(edited, "f3.txt") {
 				t.Fatalf("the next search must publish the edit: err=%v\n%s", err, edited)
@@ -374,13 +393,9 @@ func TestRecoverIncompleteSwapCleansTornFamily(t *testing.T) {
 
 // TestPublishMarksOnlyASwapThatMovedFiles publishes into an index directory
 // that cannot be listed: the scan fails before any move, so no .swapping
-// stays and the next build keeps the family. Then the index directory takes
-// no new entry after the live shard moved aside: the rename in and the move
-// back fail, the family is torn, and .swapping names it for repair.
+// stays and the next build keeps the family. TestPublishMarksAFailedMoveBack
+// (macOS) covers a move back that fails.
 func TestPublishMarksOnlyASwapThatMovedFiles(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root ignores directory modes")
-	}
 	const shard = "folder_x_v16.00000.zoekt"
 	store := corpusStore{cacheDir: t.TempDir(), indexDir: filepath.Join(t.TempDir(), "index")}
 	buildDir := filepath.Join(filepath.Dir(store.indexDir), "build")
@@ -391,25 +406,13 @@ func TestPublishMarksOnlyASwapThatMovedFiles(t *testing.T) {
 	if err := os.Chmod(store.indexDir, 0o333); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := os.ReadDir(store.indexDir); err == nil {
+		t.Fatal("the test user lists a mode-0333 directory, so the scan cannot fail")
+	}
 	if _, err := store.publishShardFamilyLocked(buildDir, familyAll); err == nil {
 		t.Fatal("the publish listed an index directory that cannot be read")
 	}
 	if label := readCacheFile(store.cacheDir, swappingMarkerFile); label != "" {
 		t.Fatalf(".swapping=%q after a scan error, want none", label)
-	}
-	if err := os.Chmod(store.indexDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	afterAsideBeforeRenameHook = func() {
-		if err := os.Chmod(store.indexDir, 0o555); err != nil {
-			t.Error(err)
-		}
-	}
-	t.Cleanup(func() { afterAsideBeforeRenameHook = nil })
-	if _, err := store.publishShardFamilyLocked(buildDir, familyAll); err == nil {
-		t.Fatal("the publish renamed into an index directory that takes no entry")
-	}
-	if label := readCacheFile(store.cacheDir, swappingMarkerFile); label != "all" {
-		t.Fatalf(".swapping=%q after a failed move back, want all", label)
 	}
 }

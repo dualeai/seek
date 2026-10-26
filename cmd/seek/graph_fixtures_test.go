@@ -1,11 +1,13 @@
 package main
 
 import (
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -295,6 +297,48 @@ func writeExecutable(t *testing.T, path, content string) {
 func localGitConfig(t *testing.T, dir string) string {
 	t.Helper()
 	return gitOutputIn(t, dir, "config", "--local", "--list")
+}
+
+// lockFolderTree sets mode 0555 on root and on each folder in it, so no entry
+// can be added to or removed from the tree. It fails the test when the test
+// user can still add an entry, as root can. The returned unlock puts back the
+// modes; it runs once, and the test cleanup also runs it.
+func lockFolderTree(t *testing.T, root string) (unlock func()) {
+	t.Helper()
+	modes := map[string]fs.FileMode{}
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil || !entry.IsDir() {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		modes[path] = info.Mode().Perm()
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock = sync.OnceFunc(func() {
+		for path, mode := range modes {
+			if err := os.Chmod(path, mode); err != nil {
+				t.Errorf("put back the mode of %s: %v", path, err)
+			}
+		}
+	})
+	t.Cleanup(unlock)
+	for path := range modes {
+		if err := os.Chmod(path, 0o555); err != nil {
+			t.Fatal(err)
+		}
+	}
+	probe := filepath.Join(root, "probe")
+	if err := os.WriteFile(probe, nil, 0o644); err == nil {
+		_ = os.Remove(probe)
+		t.Fatalf("the test user adds a file to the mode-0555 folder %s, so the tree cannot refuse a change", root)
+	}
+	return unlock
 }
 
 // gitShimSubcommand is a shell snippet for Git shims in tests. It sets

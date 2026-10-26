@@ -1,12 +1,10 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 // TestEnsureFolderCorpusFresh_MultiShardEarlyBeaconSurvives checks a build of
@@ -14,16 +12,14 @@ import (
 // marker sorts into the first shard, and the last marker sorts into the final
 // shard. Both must remain searchable.
 func TestEnsureFolderCorpusFresh_MultiShardEarlyBeaconSurvives(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+	requireTools(t)
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
 	const testBudget int64 = 4 * 1024 * 1024 // 4 MiB
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
-	defer goroutineLeakGuard(t, 60*time.Second)()
+	defer goroutineLeakGuard(t)()
 
 	const earlyBeacon = "EARLY_BEACON_A_F00DCAFE"
 	const lateBeacon = "LATE_BEACON_Z_BAADBEEF"
@@ -56,8 +52,7 @@ func TestEnsureFolderCorpusFresh_MultiShardEarlyBeaconSurvives(t *testing.T) {
 	}
 
 	plan := planSynthCorpus(t, root)
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
+	ctx := t.Context()
 
 	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 		t.Fatalf("ensureFolderCorpusFresh: %v", err)

@@ -329,29 +329,32 @@ type printedResult struct {
 	header string
 	// path is the path at the start of the header. It can hold spaces.
 	path string
+	// tags holds the tags after the language as the header prints them, for
+	// example "[uncommitted] [git]", or "" when the header has none.
+	tags string
 	// also holds the paths of the "also:" line under the header: the copies
 	// with the same content.
 	also []string
 	// body holds each line under the header, with no newline, up to the blank
-	// line before the next header: the "also:" line, then the lines of the
-	// file. A blank line ("") in body separates two regions of the file. The
-	// body of the last result also holds what the search prints after it,
-	// each part after a blank line: the "… N more files" footer and the
-	// name-only notice.
+	// line before the next header. It starts with the "also:" line, then the
+	// lines of the file. A blank line ("") in body separates two regions of the
+	// file. The body of the last result also holds what the search prints after
+	// it. These are the "… N more files" footer and the name-only notice, each
+	// after a blank line.
 	body []string
 }
 
-// printedHeader matches the text of a result header after "## " as the
-// formatter writes it (formatCorpusFileMatch): the path (group 1), " (", the
-// language, ")", and a " [tag]" for each tag. A language name can hold one
-// pair of parentheses, as "Graphviz (DOT)" does. The path is the longest
-// prefix that leaves a language and tags, so a path can hold " (".
-var printedHeader = regexp.MustCompile(`^(.+) \((?:[^()]|\([^()]*\))+\)(?: \[[a-z]+\])*$`)
+// printedHeader matches the text of a result header after "## ", as the
+// formatter writes it (formatCorpusFileMatch). The text is the path (group 1),
+// " (", the language, ")", and a " [tag]" for each tag (group 2). A language
+// name can hold one pair of parentheses, as "Graphviz (DOT)" does. The path is
+// the longest prefix that leaves a language and tags, so a path can hold " (".
+var printedHeader = regexp.MustCompile(`^(.+) \((?:[^()]|\([^()]*\))+\)((?: \[[a-z]+\])*)$`)
 
 // printedResults returns each result of output, in print order. The tests read
 // the results of the search output through it, so they agree on one parse of
 // the format. A "## " line that does not match printedHeader is a defect of
-// the output: its result keeps the whole header text as its path, so a test
+// the output. Its result keeps the whole header text as its path, so a test
 // that compares paths fails and shows the header.
 func printedResults(output string) []printedResult {
 	var results []printedResult
@@ -367,7 +370,7 @@ func printedResults(output string) []printedResult {
 			}
 			result := printedResult{header: header, path: header}
 			if match := printedHeader.FindStringSubmatch(header); match != nil {
-				result.path = match[1]
+				result.path, result.tags = match[1], strings.TrimPrefix(match[2], " ")
 			}
 			results = append(results, result)
 			continue
@@ -491,20 +494,20 @@ func TestPrintedResultsReadsSearchOutput(t *testing.T) {
 		t.Fatalf("search: %v\n%s", err, output)
 	}
 	path := func(node, name string) string { return filepath.Join(node, filepath.FromSlash(name)) }
-	result := func(file, header string, also []string, body ...string) printedResult {
-		return printedResult{header: file + header, path: file, also: also, body: body}
+	result := func(file, language, tags string, also []string, body ...string) printedResult {
+		return printedResult{header: file + " (" + language + ") " + tags, path: file, tags: tags, also: also, body: body}
 	}
 	binary := path(loose, "zqparse zqmark.bin")
 	want := []printedResult{
-		result(path(loose, "gap.txt"), " (Text) [folder]", nil,
+		result(path(loose, "gap.txt"), "Text", "[folder]", nil,
 			"1 zqparse zqmark one", "2 2", "3 3", "4 4", "", "10 10", "11 11", "12 12", "13 zqparse zqmark two"),
-		result(path(loose, "graph (v1).gv"), " (Graphviz (DOT)) [folder]", nil,
+		result(path(loose, "graph (v1).gv"), "Graphviz (DOT)", "[folder]", nil,
 			"1 digraph g {", "2   // zqparse zqmark graph", "3   a -> b", "4 }"),
-		result(binary, " (unknown) [folder]", nil, "0 "+binary),
-		result(path(repo, "copy a.txt"), " (Text) [git]", []string{path(repo, "copy b.txt")},
+		result(binary, "unknown", "[folder]", nil, "0 "+binary),
+		result(path(repo, "copy a.txt"), "Text", "[git]", []string{path(repo, "copy b.txt")},
 			"also: "+path(repo, "copy b.txt"), "1 zqparse zqmark copy"),
-		result(path(repo, "net/retry file.go"), " (Go) [git]", nil, "1 package net", "2 // zqparse zqmark retry"),
-		result(path(repo, "new file.go"), " (Go) [uncommitted] [git]", nil, "1 package repo", "2 // zqparse zqmark new"),
+		result(path(repo, "net/retry file.go"), "Go", "[git]", nil, "1 package net", "2 // zqparse zqmark retry"),
+		result(path(repo, "new file.go"), "Go", "[uncommitted] [git]", nil, "1 package repo", "2 // zqparse zqmark new"),
 	}
 	got := printedResults(output)
 	slices.SortFunc(got, func(left, right printedResult) int { return strings.Compare(left.path, right.path) })

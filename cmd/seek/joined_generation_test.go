@@ -8,43 +8,41 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
+	"testing/synctest"
 )
 
+// TestRunJoinedIndexBuildsStartsBothBranches gives two branches that wait
+// for the test. Both must start before either ends. The test runs in a
+// synctest bubble: synctest.Wait returns when every branch that started
+// waits.
 func TestRunJoinedIndexBuildsStartsBothBranches(t *testing.T) {
-	started := make(chan string, 2)
-	release := make(chan struct{})
-	var releaseOnce sync.Once
-	unblock := func() { releaseOnce.Do(func() { close(release) }) }
-	t.Cleanup(unblock)
-	branch := func(name string) func() {
-		return func() {
-			started <- name
-			<-release
+	synctest.Test(t, func(t *testing.T) {
+		started := make(chan string, 2)
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		unblock := func() { releaseOnce.Do(func() { close(release) }) }
+		t.Cleanup(unblock)
+		branch := func(name string) func() {
+			return func() {
+				started <- name
+				<-release
+			}
 		}
-	}
-	done := make(chan struct{})
-	go func() {
-		runJoinedIndexBuilds(branch("lexical"), branch("semantic"))
-		close(done)
-	}()
+		done := make(chan struct{})
+		go func() {
+			runJoinedIndexBuilds(branch("lexical"), branch("semantic"))
+			close(done)
+		}()
 
-	seen := make(map[string]bool, 2)
-	for len(seen) < 2 {
-		select {
-		case name := <-started:
-			seen[name] = true
-		case <-time.After(5 * time.Second):
+		synctest.Wait()
+		if count := len(started); count != 2 {
 			unblock()
-			t.Fatalf("joined builds started=%v, want both branches", seen)
+			<-done
+			t.Fatalf("joined builds started %d branches before either ended, want both", count)
 		}
-	}
-	unblock()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("joined builds did not finish")
-	}
+		unblock()
+		<-done
+	})
 }
 
 func TestJoinedGenerationDescriptorBindsBothIndexParts(t *testing.T) {

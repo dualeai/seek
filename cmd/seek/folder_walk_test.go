@@ -4,43 +4,42 @@ import (
 	"context"
 	"log/slog"
 	"maps"
-	"math/rand/v2"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
 
 // TestFolderBusyWriterColdSearchSucceeds edits a file after the walk capture
-// and before the cold build ends. The search succeeds; the next search
-// indexes the edit.
+// and before the cold build ends. The test holds a read lock, so the build
+// waits to publish, and the test edits the file during that wait. The search
+// succeeds; the next search indexes the edit.
 func TestFolderBusyWriterColdSearchSucceeds(t *testing.T) {
 	requireTools(t)
 	const marker = "zqbusywritermarker"
 	f := newGraphFixture(t)
 	f.graphFile("folder/a.txt", marker)
 	setTestUserCache(t)
-	edited := false
-	folderBuildTestHook = func() {
-		if !edited {
-			edited = true
-			writeFixtureFile(t, f.path("folder/a.txt"), marker+" folder/a.txt edited\n")
-		}
+	plans, err := planCorpora(t.Context(), []string{f.path("folder")})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%d err=%v", len(plans), err)
 	}
-	t.Cleanup(func() { folderBuildTestHook = nil })
+	release := holdReadLock(t, plans[0].cacheDir)
+	_, waiting := captureTestLogsWithSignal(t, slog.LevelWarn, lockWaitReaders, filepath.Join(plans[0].cacheDir, lockFile))
+	acted := onLockWait(t, waiting, func() error {
+		return os.WriteFile(f.path("folder/a.txt"), []byte(marker+" folder/a.txt edited\n"), 0o644)
+	}, release)
 
 	if got := graphSearch(t, marker, f.path("folder")); len(got) != 1 {
 		t.Fatalf("cold search found %v, want 1 file", got)
 	}
-	if !edited {
-		t.Fatal("the build hook did not run")
-	}
+	lockWaitActed(t, acted)
 	out, err := seek(t, "--lexical-only", "edited", f.path("folder"))
 	if err != nil || !strings.Contains(out, "a.txt") {
 		t.Fatalf("next search missed the edit: err=%v\n%s", err, out)
@@ -52,18 +51,12 @@ func TestFolderBusyWriterColdSearchSucceeds(t *testing.T) {
 // first path.
 func TestFolderUnreadableSubfolderWarns(t *testing.T) {
 	requireTools(t)
-	if os.Geteuid() == 0 {
-		t.Skip("root reads a mode-000 directory")
-	}
 	const marker = "zqunreadablemarker"
 	f := newGraphFixture(t)
 	f.graphFile("folder/ok.txt", marker)
 	f.graphFile("folder/locked/hidden.txt", marker)
 	locked := f.path("folder/locked")
-	if err := os.Chmod(locked, 0); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	chmodUnreadableOrFatal(t, locked, 0)
 	setTestUserCache(t)
 	logs := captureTestLogs(t, slog.LevelWarn)
 
@@ -203,18 +196,11 @@ func TestFolderSameSizeRewriteDetected(t *testing.T) {
 // does not reach the seed, so the seed stays its own node.
 func TestFolderSeedBelowUnreadableDirStays(t *testing.T) {
 	requireTools(t)
-	if os.Geteuid() == 0 {
-		t.Skip("root lists a mode-0111 directory")
-	}
 	const marker = "zqunlistablemarker"
 	f := newGraphFixture(t)
 	f.graphFile("folder/ok.txt", marker)
 	f.graphFile("folder/locked/inner/in.txt", marker)
-	locked := f.path("folder/locked")
-	if err := os.Chmod(locked, 0o111); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	chmodUnreadableOrFatal(t, f.path("folder/locked"), 0o111)
 	setTestUserCache(t)
 	got := slices.Sorted(maps.Keys(graphSearch(t, marker, f.path("folder"), f.path("folder/locked/inner"))))
 	if want := []string{"folder/locked/inner/in.txt", "folder/ok.txt"}; !slices.Equal(got, want) {
@@ -224,17 +210,22 @@ func TestFolderSeedBelowUnreadableDirStays(t *testing.T) {
 
 // TestFolderNestedSeedsInAnotherCase names a folder in another letter case
 // and a folder below it. On a case-insensitive file system the inner seed is
-// part of the outer node: each file is found once.
+// part of the outer node: each file is found once. A case-sensitive file
+// system has no folder in the other case: the operand does not resolve.
 func TestFolderNestedSeedsInAnotherCase(t *testing.T) {
 	requireTools(t)
 	const marker = "zqnestedcasemarker"
 	f := newGraphFixture(t)
 	f.graphFile("folder/sub/a.txt", marker)
 	upper := f.path("FOLDER")
-	if _, err := os.Stat(upper); err != nil {
-		t.Skip("file system is case-sensitive")
-	}
 	setTestUserCache(t)
+	if _, err := os.Stat(upper); err != nil {
+		_, err := seek(t, "--lexical-only", marker, upper, f.path("folder/sub"))
+		if want := "seek: path does not exist: " + strconv.Quote(upper); err == nil || formatCLIError(err) != want {
+			t.Fatalf("err=%v, want %q", err, want)
+		}
+		return
+	}
 	got := slices.Sorted(maps.Keys(graphSearch(t, marker, upper, f.path("folder/sub"))))
 	if want := []string{"folder/sub/a.txt"}; !slices.Equal(got, want) {
 		t.Fatalf("found %q, want %q", got, want)
@@ -244,7 +235,10 @@ func TestFolderNestedSeedsInAnotherCase(t *testing.T) {
 // TestFolderWalkVisitedSetPrefixOrder reports two mounts of one directory at
 // "a" and "a-b", and of its child at "a/s" and "a-b/s". "/" sorts after "-",
 // so a whole-string order would pick "a" but "a-b/s". The component order
-// picks "a" and "a/s" every run, at every worker count.
+// picks "a" and "a/s" every run, at every worker count. Each sibling claims
+// first in some runs. One worker takes "a-b" first, because the queue is last
+// in, first out. From two workers on, every other run holds the identity of
+// "a-b" until the walk reads "a/s", so "a" claims first.
 func TestFolderWalkVisitedSetPrefixOrder(t *testing.T) {
 	root := canonTempDir(t)
 	for _, dir := range []string{"a", "a-b"} {
@@ -252,14 +246,25 @@ func TestFolderWalkVisitedSetPrefixOrder(t *testing.T) {
 		writeFixtureFile(t, filepath.Join(root, dir, "s", "f.txt"), "f\n")
 	}
 	realIdentity := folderDirIdentity
+	// The test sets both before each walk; the workers only read them.
+	var smallerFirst bool
+	var childOfSmallerRead chan struct{}
 	folderDirIdentity = func(f *os.File) (dirIdentity, error) {
 		rel, _ := filepath.Rel(root, f.Name())
 		switch rel {
-		case "a", "a-b":
-			// Jitter, so either sibling can claim first.
-			time.Sleep(time.Duration(rand.IntN(200)) * time.Microsecond)
+		case "a-b":
+			if smallerFirst {
+				<-childOfSmallerRead
+			}
 			return dirIdentity{dev: 1, ino: 1}, nil
-		case filepath.Join("a", "s"), filepath.Join("a-b", "s"):
+		case "a":
+			return dirIdentity{dev: 1, ino: 1}, nil
+		case filepath.Join("a", "s"):
+			if smallerFirst {
+				close(childOfSmallerRead)
+			}
+			return dirIdentity{dev: 1, ino: 2}, nil
+		case filepath.Join("a-b", "s"):
 			return dirIdentity{dev: 1, ino: 2}, nil
 		}
 		return realIdentity(f)
@@ -276,7 +281,10 @@ func TestFolderWalkVisitedSetPrefixOrder(t *testing.T) {
 	states := make(map[string]bool)
 	for _, procs := range []int{1, 2, 4, 8} {
 		old := runtime.GOMAXPROCS(procs)
-		for range 50 {
+		for run := range 50 {
+			// One worker waiting for "a/s" in "a-b" would wait forever.
+			smallerFirst = procs > 1 && run%2 == 1
+			childOfSmallerRead = make(chan struct{})
 			capture, _, err := captureFolderNode(t.Context(), plan)
 			if err != nil {
 				runtime.GOMAXPROCS(old)
@@ -303,16 +311,10 @@ func TestFolderWalkVisitedSetPrefixOrder(t *testing.T) {
 // root: its content cannot be read, but its name stays searchable.
 func TestFolderUnreadableFileSearchableByName(t *testing.T) {
 	requireTools(t)
-	if os.Geteuid() == 0 {
-		t.Skip("root reads a mode-000 file")
-	}
 	f := newGraphFixture(t)
 	path := f.path("folder/locked.txt")
 	writeFixtureFile(t, path, "secret\n")
-	if err := os.Chmod(path, 0); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	chmodUnreadableOrFatal(t, path, 0)
 	setTestUserCache(t)
 	out, err := seek(t, "--lexical-only", "file:locked", f.path("folder"))
 	if err != nil || !strings.Contains(out, "locked.txt") {
@@ -325,18 +327,12 @@ func TestFolderUnreadableFileSearchableByName(t *testing.T) {
 // warns once.
 func TestFolderUnreadableSubfolderWarnsOncePerCommand(t *testing.T) {
 	requireTools(t)
-	if os.Geteuid() == 0 {
-		t.Skip("root reads a mode-000 directory")
-	}
 	const marker = "zqwarnonceunreadablemarker"
 	f := newGraphFixture(t)
 	f.graphFile("outer/inner/ok.txt", marker)
 	locked := f.path("outer/inner/locked")
 	writeFixtureFile(t, filepath.Join(locked, "hidden.txt"), marker+"\n")
-	if err := os.Chmod(locked, 0); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	chmodUnreadableOrFatal(t, locked, 0)
 	setTestUserCache(t)
 	logs := captureTestLogs(t, slog.LevelWarn)
 	graphSearch(t, marker, f.path("outer"), f.path("outer/inner"))
@@ -355,9 +351,6 @@ func TestFolderUnreadableSubfolderWarnsOncePerCommand(t *testing.T) {
 // folder: the delta indexes it by name, so a file-name search finds it.
 func TestFolderUnreadableFileInWarmFolderByName(t *testing.T) {
 	requireTools(t)
-	if os.Geteuid() == 0 {
-		t.Skip("root reads a mode-000 file")
-	}
 	f := newGraphFixture(t)
 	f.graphFile("folder/a.txt", "zqwarmunreadablemarker")
 	setTestUserCache(t)
@@ -371,10 +364,7 @@ func TestFolderUnreadableFileInWarmFolderByName(t *testing.T) {
 	baseBefore := firstShardInfo(t, plans[0].indexDir)
 	locked := f.path("folder/zqlockedname.txt")
 	writeFixtureFile(t, locked, "secret\n")
-	if err := os.Chmod(locked, 0); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(locked, 0o644) })
+	chmodUnreadableOrFatal(t, locked, 0)
 	out, err := seek(t, "--lexical-only", "file:zqlockedname", f.path("folder"))
 	if err != nil || !strings.Contains(out, "zqlockedname.txt") {
 		t.Fatalf("output=%q err=%v, want the unreadable file by name", out, err)
@@ -392,9 +382,6 @@ func TestFolderUnreadableFileInWarmFolderByName(t *testing.T) {
 // exactly one warning.
 func TestFolderUnreadableTwoFoldersWarnOnce(t *testing.T) {
 	requireTools(t)
-	if os.Geteuid() == 0 {
-		t.Skip("root reads a mode-000 directory")
-	}
 	const marker = "zqtwounreadablemarker"
 	f := newGraphFixture(t)
 	f.graphFile("outer/z/ok.txt", marker)
@@ -402,10 +389,7 @@ func TestFolderUnreadableTwoFoldersWarnOnce(t *testing.T) {
 	for _, rel := range []string{"outer/z/locked", "outer/a/locked"} {
 		locked := f.path(rel)
 		writeFixtureFile(t, filepath.Join(locked, "h.txt"), marker+"\n")
-		if err := os.Chmod(locked, 0); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+		chmodUnreadableOrFatal(t, locked, 0)
 	}
 	setTestUserCache(t)
 	for run := range 3 {
@@ -471,6 +455,8 @@ func TestSFDatalessFlag(t *testing.T) {
 // with a FIFO just before the build opens it. The open does not block on the
 // FIFO, the build reads the file as removed, and the search finds the other
 // file. The query lists file names, so a FIFO indexed as an empty file shows.
+// A build that blocks on the FIFO runs until the go test timeout, which prints
+// each goroutine.
 func TestFolderFileReplacedByFIFOAfterWalkDoesNotBlock(t *testing.T) {
 	const marker = "zqfifomarker"
 	const query = "type:file txt"
@@ -478,7 +464,6 @@ func TestFolderFileReplacedByFIFOAfterWalkDoesNotBlock(t *testing.T) {
 	f.graphFile("folder/a.txt", marker)
 	f.graphFile("folder/b.txt", marker)
 	setTestUserCache(t)
-	fifo := f.path("folder/a.txt")
 	saved := folderOpenFile
 	var replaced bool
 	folderOpenFile = func(path string) (*os.File, error) {
@@ -494,27 +479,9 @@ func TestFolderFileReplacedByFIFOAfterWalkDoesNotBlock(t *testing.T) {
 		return saved(path)
 	}
 	t.Cleanup(func() { folderOpenFile = saved })
-	type result struct {
-		out string
-		err error
-	}
-	done := make(chan result, 1)
-	go func() {
-		out, err := seek(t, "--lexical-only", query, f.path("folder"))
-		done <- result{out, err}
-	}()
-	select {
-	case got := <-done:
-		if got.err != nil || !replaced || !strings.Contains(got.out, "b.txt") || strings.Contains(got.out, "a.txt") {
-			t.Fatalf("replaced=%t err=%v output:\n%s", replaced, got.err, got.out)
-		}
-	case <-time.After(10 * time.Second):
-		// Open the FIFO for writing so that the blocked open returns.
-		if writer, err := os.OpenFile(fifo, os.O_WRONLY|unix.O_NONBLOCK, 0); err == nil {
-			_ = writer.Close()
-		}
-		<-done
-		t.Fatal("the build blocked on the FIFO")
+	out, err := seek(t, "--lexical-only", query, f.path("folder"))
+	if err != nil || !replaced || !strings.Contains(out, "b.txt") || strings.Contains(out, "a.txt") {
+		t.Fatalf("replaced=%t err=%v output:\n%s", replaced, err, out)
 	}
 }
 

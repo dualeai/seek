@@ -405,8 +405,9 @@ func cachedLateOnProviderVerdict(model []byte) string {
 	return readLateOnProviderRecord(path).verdict
 }
 
-// verifyLateOnAcceleratedProvider reports whether the accelerated session
-// agrees with the CPU provider on the fixed probe batch.
+// verifyLateOnAcceleratedProvider reports whether selection keeps the
+// accelerated session. It keeps it when the session agrees with the CPU
+// provider on the fixed probe batch and no peer process rejected it.
 //
 // ONNX Runtime 1.30.0 returns wrong FP16 output from the Core ML MLProgram path
 // on macOS 15 ARM64: https://github.com/microsoft/onnxruntime/issues/32569. The
@@ -470,10 +471,6 @@ func verifyLateOnAcceleratedProvider(
 	if err != nil {
 		return true, "", fmt.Errorf("build the reference session: %w", err)
 	}
-	// Read the record again here, not at the top: the accelerated probe and
-	// this session build take long enough for a peer process to record a fault,
-	// and that fault must survive this write.
-	prior := readLateOnProviderRecord(verdictPath)
 	// Compare the reference output in place. Copying it would hold a second
 	// 3 MB batch alongside the accelerated one for no gain.
 	agree, difference := false, ""
@@ -490,7 +487,14 @@ func verifyLateOnAcceleratedProvider(
 	if closeErr != nil {
 		return true, "", fmt.Errorf("release the reference session: %w", closeErr)
 	}
-	verdict, reason := lateOnProbeVerdict(agree, difference, prior)
+	// Read the record again here, not at the top. A peer process can record a
+	// fault or a rejection while the two probes and the session build run. That
+	// record must survive this write. A peer record that
+	// lands between this read and the rename is lost, as in
+	// rejectLateOnAcceleratedProvider. That costs a delay: the next faults
+	// record it again.
+	prior := readLateOnProviderRecord(verdictPath)
+	verdict, keep, reason := lateOnProbeVerdict(agree, difference, prior)
 	writeLateOnProviderVerdict(verdictPath, verdict)
 	// Release the probe's own garbage now. The index build samples free memory
 	// to size its inference concurrency, and it samples after this returns, so
@@ -498,34 +502,42 @@ func verifyLateOnAcceleratedProvider(
 	// it. Two output batches plus one copy is about 9 MiB, against a probe that
 	// already cost a session build and two inferences.
 	runtime.GC()
-	return agree, reason, nil
+	return keep, reason, nil
 }
 
-// lateOnProbeVerdict gives the record that the provider probe stores, and the
-// reason to log, from the probe result and the record on disk before the
-// write. It reads and writes nothing, so a test can check the rule on every
-// host that builds this file, whatever the probe result on that host.
+// lateOnProbeVerdict gives the record that the provider probe stores, whether
+// selection keeps the accelerated provider, and the reason to log. It uses
+// the probe result and the record on disk before the write. It reads and
+// writes nothing. So a test can check the rule on every host that builds this
+// file, whatever the probe result on that host.
 //
 // Disagreement rejects the provider, and the difference is the reason.
 // Agreement with no fault on the record trusts it. Agreement after a fault
-// keeps the count: clearing it would stop a provider that passes the probe
-// batch and fails on real work from ever being demoted. It also keeps the
-// original timestamp: restamping would restart the window on every passing
+// keeps the count. Without the count, a provider that passes the probe batch
+// and fails on real work never gets a demotion. It also keeps the original
+// timestamp. A new timestamp would start the window again on every passing
 // probe, so the count would never expire and this host would probe on every
-// search.
+// search. Agreement after a peer process rejected the provider keeps the
+// rejection, as rejectLateOnAcceleratedProvider does. That peer saw two faults
+// on real work or a probe that disagreed, and one passing probe clears
+// neither. Selection keeps the provider only when the record is not a
+// rejection.
 func lateOnProbeVerdict(
 	agree bool,
 	difference string,
 	prior lateOnProviderRecord,
-) (verdict, reason string) {
+) (verdict string, keep bool, reason string) {
 	if !agree {
-		return lateOnVerdictRejected, difference
+		return lateOnVerdictRejected, false, difference
+	}
+	if prior.verdict == lateOnVerdictRejected {
+		return lateOnVerdictRejected, false, "a peer process rejected the provider during the probe"
 	}
 	if prior.faults > 0 {
-		return fmt.Sprintf("%s %d %d", lateOnVerdictRecheck, prior.faults, prior.at),
+		return fmt.Sprintf("%s %d %d", lateOnVerdictRecheck, prior.faults, prior.at), true,
 			"matches the CPU provider after an earlier fault"
 	}
-	return lateOnVerdictTrusted, "matches the CPU provider"
+	return lateOnVerdictTrusted, true, "matches the CPU provider"
 }
 
 // writeLateOnProviderVerdict stores the verdict beside the compiled model. A

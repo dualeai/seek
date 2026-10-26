@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -10,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 const (
@@ -415,27 +415,61 @@ func runCLIProcess(t *testing.T, dir string, args, extraEnv []string) cliProcess
 
 func runCLIProcessWithCache(t *testing.T, cacheDir, dir string, args, extraEnv []string) cliProcessResult {
 	t.Helper()
-	result, _ := runCLIProcessWithin(t, 0, cacheDir, dir, args, extraEnv)
-	return result
-}
-
-// runCLIProcessWithin runs the CLI process as runCLIProcessWithCache does. A
-// positive timeout kills a process that runs longer, and the second result
-// then is true.
-func runCLIProcessWithin(t *testing.T, timeout time.Duration, cacheDir, dir string, args, extraEnv []string) (cliProcessResult, bool) {
-	t.Helper()
-	ctx := t.Context()
-	if timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
-	}
-	commandArgs := append([]string{"-test.run=^TestCLIProcessHelper$", "--"}, args...)
-	cmd := exec.CommandContext(ctx, os.Args[0], commandArgs...)
-	cmd.Dir = dir
+	cmd := cliProcessCommand(t.Context(), cacheDir, dir, args, extraEnv)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+	return cliProcessResult{stdout: stdout.String(), stderr: stderr.String(), code: cliProcessExitCode(t, runErr)}
+}
+
+// runCLIProcessOnLine runs the CLI process as runCLIProcessWithCache does and
+// reads its stderr line by line. At the first line that match accepts, it
+// calls act with the process, once. The second result reports whether that
+// line came. The process writes the debug line of a lock wait (pollLock) only
+// with --verbose; lockWaitLine matches it.
+func runCLIProcessOnLine(t *testing.T, cacheDir, dir string, args []string, match func(line string) bool, act func(*os.Process)) (cliProcessResult, bool) {
+	t.Helper()
+	cmd := cliProcessCommand(t.Context(), cacheDir, dir, args, nil)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	seen := false
+	scanner := bufio.NewScanner(stderrPipe)
+	for scanner.Scan() {
+		stderr.WriteString(scanner.Text() + "\n")
+		if !seen && match(scanner.Text()) {
+			seen = true
+			act(cmd.Process)
+		}
+	}
+	waitErr := cmd.Wait()
+	return cliProcessResult{stdout: stdout.String(), stderr: stderr.String(), code: cliProcessExitCode(t, waitErr)}, seen
+}
+
+// lockWaitLine matches the stderr line of a lock wait of a CLI process: the
+// line holds reason, one of the lockWait constants, and the path of the lock.
+// So a wait on another lock does not match.
+func lockWaitLine(reason, lock string) func(line string) bool {
+	return func(line string) bool {
+		return strings.Contains(line, reason) && strings.Contains(line, lock)
+	}
+}
+
+// cliProcessCommand returns the command of the CLI helper process: it runs
+// args in dir, with cacheDir as its cache and extraEnv last in its
+// environment.
+func cliProcessCommand(ctx context.Context, cacheDir, dir string, args, extraEnv []string) *exec.Cmd {
+	commandArgs := append([]string{"-test.run=^TestCLIProcessHelper$", "--"}, args...)
+	cmd := exec.CommandContext(ctx, os.Args[0], commandArgs...)
+	cmd.Dir = dir
 	overrides := []string{
 		cliProcessHelperEnv + "=" + cliProcessTestMarker,
 		"SEEK_CACHE_DIR=" + cacheDir,
@@ -443,20 +477,21 @@ func runCLIProcessWithin(t *testing.T, timeout time.Duration, cacheDir, dir stri
 	}
 	overrides = append(overrides, extraEnv...)
 	cmd.Env = append(cmd.Environ(), overrides...)
-	runErr := cmd.Run()
-	result := cliProcessResult{stdout: stdout.String(), stderr: stderr.String()}
-	if runErr == nil {
-		return result, false
+	return cmd
+}
+
+// cliProcessExitCode returns the exit code of a CLI process from the error of
+// its Run or Wait. Any error other than an exit status fails the test.
+func cliProcessExitCode(t *testing.T, err error) int {
+	t.Helper()
+	if err == nil {
+		return 0
 	}
-	if timeout > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return result, true
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	if !ok {
+		t.Fatalf("run CLI helper: %v", err)
 	}
-	var exitErr *exec.ExitError
-	if !errors.As(runErr, &exitErr) {
-		t.Fatalf("run CLI helper: %v", runErr)
-	}
-	result.code = exitErr.ExitCode()
-	return result, false
+	return exitErr.ExitCode()
 }
 
 // TestCLIProcess_ContentRulesOnStdoutAndStderr checks the user-facing contract

@@ -363,15 +363,6 @@ func checkCtags() error {
 	}
 }
 
-// missingBlobRecheckTestHook runs after the missing-blob recheck and before
-// the builds read blobs. Only tests set it.
-var missingBlobRecheckTestHook func()
-
-// semanticPublishTestHook runs before the Git build publishes its base
-// generation; an error stops the publish as a kill there would. Only tests
-// set it.
-var semanticPublishTestHook func() error
-
 // build makes the joined Git index of store current with
 // separate build and publish locks. Zoekt covers committed and uncommitted
 // files. The semantic base generation covers the captured commit, and the
@@ -478,9 +469,6 @@ func (g *gitNode) buildLocked(
 		return gitCorpusError(repoDir, indexDir, err)
 	}
 	in.arrival = arrival
-	if missingBlobRecheckTestHook != nil {
-		missingBlobRecheckTestHook()
-	}
 	if gitBuildCurrent(in) {
 		return nil
 	}
@@ -831,9 +819,6 @@ func (g *gitNode) buildLocked(
 			// The pending record comes first, so a generation never exists
 			// without a record that names its missing blobs.
 			activationErr = writePendingMissingBlobRecord(cacheDir, semanticMissingBlobsFile, semanticSource, semanticMissing)
-			if activationErr == nil && semanticPublishTestHook != nil {
-				activationErr = semanticPublishTestHook()
-			}
 			if activationErr == nil {
 				activationErr = publishSemanticGeneration(indexDir, semanticStaging, semanticSource, arrival.semantic)
 			}

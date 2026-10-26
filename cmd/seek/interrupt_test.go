@@ -1,13 +1,10 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"log/slog"
 	"os"
-	"os/exec"
 	"strings"
 	"syscall"
 	"testing"
@@ -46,55 +43,10 @@ func TestCLIProcess_FirstInterruptEndsOnlyLockWaits(t *testing.T) {
 	}
 	defer releaseLock(holder)
 
-	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCLIProcessHelper$", "--",
-		"--lexical-only", "--verbose", "zqtwo", warm, cold)
-	cmd.Dir = t.TempDir()
-	cmd.Env = append(cmd.Environ(), cliProcessHelperEnv+"="+cliProcessTestMarker, "SEEK_CACHE_DIR="+cache, "CTAGS_COMMAND=")
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	var stderr strings.Builder
-	waiting := make(chan struct{})
-	readDone := make(chan struct{})
-	go func() {
-		defer close(readDone)
-		scanner := bufio.NewScanner(stderrPipe)
-		signaled := false
-		for scanner.Scan() {
-			stderr.WriteString(scanner.Text() + "\n")
-			if !signaled && strings.Contains(scanner.Text(), "Waiting for another build of the node") {
-				signaled = true
-				close(waiting)
-			}
-		}
-	}()
-	select {
-	case <-waiting:
-	case <-ctx.Done():
-		t.Fatal("the search never waited for the build lock")
-	}
-	if err := cmd.Process.Signal(os.Interrupt); err != nil {
-		t.Fatal(err)
-	}
-	<-readDone
-	err = cmd.Wait()
-	code := 0
-	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
-		code = exitErr.ExitCode()
-	} else if err != nil {
-		t.Fatal(err)
-	}
-	if code != 0 || !strings.Contains(stdout.String(), "warm.go") || strings.Contains(stdout.String(), "cold.go") ||
-		strings.Count(stderr.String(), "Skipped a search node") != 1 {
-		t.Fatalf("exit %d, want 0 with the warm hit and one skip:\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	code, stdout, stderr := interruptAtLockWait(t, cache, holder.Name(), "--lexical-only", "--verbose", "zqtwo", warm, cold)
+	if code != 0 || !strings.Contains(stdout, "warm.go") || strings.Contains(stdout, "cold.go") ||
+		strings.Count(stderr, "Skipped a search node") != 1 {
+		t.Fatalf("exit %d, want 0 with the warm hit and one skip:\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
 }
 
@@ -167,62 +119,26 @@ func TestCLIProcess_InterruptWithOnlyAWaitingNodeIsACancel(t *testing.T) {
 		t.Fatalf("hold the build lock: ok=%v err=%v", ok, err)
 	}
 	defer releaseLock(holder)
-	code, stdout, stderr := interruptAtLockWait(t, cache, "--lexical-only", "--verbose", "zqone", cold)
+	code, stdout, stderr := interruptAtLockWait(t, cache, holder.Name(), "--lexical-only", "--verbose", "zqone", cold)
 	if code != 2 || stdout != "" || !strings.Contains(stderr, "context canceled") {
 		t.Fatalf("exit %d, want 2 and a cancel:\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
 }
 
 // interruptAtLockWait runs the CLI with args, sends one SIGINT when it logs a
-// wait for a build lock, and returns the exit code and output.
-func interruptAtLockWait(t *testing.T, cache string, args ...string) (int, string, string) {
+// wait for the build lock at lock, and returns the exit code and output. A
+// CLI that ends with no such wait fails the test.
+func interruptAtLockWait(t *testing.T, cache, lock string, args ...string) (int, string, string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, os.Args[0], append([]string{"-test.run=^TestCLIProcessHelper$", "--"}, args...)...)
-	cmd.Dir = t.TempDir()
-	cmd.Env = append(cmd.Environ(), cliProcessHelperEnv+"="+cliProcessTestMarker, "SEEK_CACHE_DIR="+cache, "CTAGS_COMMAND=")
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	var stderr strings.Builder
-	waiting := make(chan struct{})
-	readDone := make(chan struct{})
-	go func() {
-		defer close(readDone)
-		scanner := bufio.NewScanner(stderrPipe)
-		signaled := false
-		for scanner.Scan() {
-			stderr.WriteString(scanner.Text() + "\n")
-			if !signaled && strings.Contains(scanner.Text(), "Waiting for another build of the node") {
-				signaled = true
-				close(waiting)
-			}
+	result, waited := runCLIProcessOnLine(t, cache, t.TempDir(), args, lockWaitLine(lockWaitBuild, lock), func(process *os.Process) {
+		if err := process.Signal(os.Interrupt); err != nil {
+			t.Fatal(err)
 		}
-	}()
-	select {
-	case <-waiting:
-	case <-ctx.Done():
-		t.Fatal("the search never waited for the build lock")
+	})
+	if !waited {
+		t.Fatalf("the search never waited for the build lock: exit %d\nstdout:\n%s\nstderr:\n%s", result.code, result.stdout, result.stderr)
 	}
-	if err := cmd.Process.Signal(os.Interrupt); err != nil {
-		t.Fatal(err)
-	}
-	<-readDone
-	err = cmd.Wait()
-	code := 0
-	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
-		code = exitErr.ExitCode()
-	} else if err != nil {
-		t.Fatal(err)
-	}
-	return code, stdout.String(), stderr.String()
+	return result.code, result.stdout, result.stderr
 }
 
 // TestLockWaitsEndOnlyTheRunningWaits ends the waits of a command while one
@@ -258,16 +174,20 @@ func TestLockWaitsEndOnlyTheRunningWaits(t *testing.T) {
 // ends the wait.
 func TestLockWaitIsCountedBeforeItsLogLine(t *testing.T) {
 	waits := newLockWaits()
-	// A wait that the interrupt cannot end gives up here, so the test fails
-	// instead of hanging.
-	deadline, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	canceled, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	ctx := withLockWaits(deadline, waits)
+	ctx := withLockWaits(canceled, waits)
 	counted := make(chan bool, 1)
 	old := slog.Default()
 	slog.SetDefault(slog.New(countingHandler{onRecord: func(message string) {
 		if message == "Waiting for a test lock" {
-			counted <- waits.endRunning()
+			ended := waits.endRunning()
+			if !ended {
+				// The interrupt cannot end a wait that is not counted: the
+				// context ends it, so the test fails instead of hanging.
+				cancel()
+			}
+			counted <- ended
 		}
 	}}))
 	t.Cleanup(func() { slog.SetDefault(old) })

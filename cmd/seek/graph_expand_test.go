@@ -18,29 +18,27 @@ import (
 
 // graphSearch runs a search and returns each fixture path that a match line
 // names (see graphFixture.graphFile), with the tags of its file header. A path
-// found twice fails the test.
+// found twice fails the test. printedResults drops the text before the first
+// header, so output that does not start with a header also fails the test.
 func graphSearch(t *testing.T, marker string, operands ...string) map[string]string {
 	t.Helper()
 	out, err := seek(t, slices.Concat([]string{"--lexical-only", marker}, operands)...)
 	if err != nil {
 		t.Fatalf("run %q: %v\n%s", operands, err, out)
 	}
+	if out != "" && !strings.HasPrefix(out, "## ") {
+		t.Fatalf("run %q: the output does not start with a result header:\n%s", operands, out)
+	}
 	hits := make(map[string]string)
 	pattern := regexp.MustCompile(regexp.QuoteMeta(marker) + ` (\S+)`)
-	tags := ""
-	for line := range strings.SplitSeq(out, "\n") {
-		if header, ok := strings.CutPrefix(line, "## "); ok {
-			tags = ""
-			if i := strings.Index(header, ") ["); i >= 0 {
-				tags = header[i+2:]
+	for _, result := range printedResults(out) {
+		for _, line := range result.body {
+			for _, match := range pattern.FindAllStringSubmatch(line, -1) {
+				if _, dup := hits[match[1]]; dup {
+					t.Fatalf("%s found twice:\n%s", match[1], out)
+				}
+				hits[match[1]] = result.tags
 			}
-			continue
-		}
-		for _, match := range pattern.FindAllStringSubmatch(line, -1) {
-			if _, dup := hits[match[1]]; dup {
-				t.Fatalf("%s found twice:\n%s", match[1], out)
-			}
-			hits[match[1]] = tags
 		}
 	}
 	return hits
@@ -349,13 +347,12 @@ func TestGraphAmbiguousBoundaryAsksGit(t *testing.T) {
 		})
 	}
 
+	// On a case-sensitive file system, the parent typed in another case
+	// names no file.
 	t.Run("nested repository below a parent typed in another case", func(t *testing.T) {
 		f := newGraphFixture(t)
 		repo := f.graphRepo("repoC", "c.txt", marker)
 		upper := filepath.Join(filepath.Dir(repo), "REPOC")
-		if _, err := os.Stat(upper); err != nil {
-			t.Skip("file system is case-sensitive")
-		}
 		// A separate Git directory makes the nested repository one that Git
 		// classifies.
 		if err := os.MkdirAll(f.path("meta"), 0o755); err != nil {
@@ -367,28 +364,36 @@ func TestGraphAmbiguousBoundaryAsksGit(t *testing.T) {
 		gitRunIn(t, nested, "add", "n.txt")
 		gitRunIn(t, nested, "commit", "-q", "-m", "nested")
 		setTestUserCache(t)
+		if _, err := os.Stat(upper); err != nil {
+			requireMissingOperand(t, upper)
+			return
+		}
 		got := slices.Sorted(maps.Keys(graphSearch(t, marker, upper)))
 		if want := []string{"repoC/c.txt", "repoC/nested/n.txt"}; !slices.Equal(got, want) {
 			t.Fatalf("found %q, want %q", got, want)
 		}
 	})
 
-	t.Run("upper-case .GIT on a case-insensitive file system", func(t *testing.T) {
+	// A case-insensitive file system maps ".GIT" to the Git directory, so Git
+	// hides the ignored file. On a case-sensitive file system, ".GIT" is no
+	// Git entry: the folder walk shows each file.
+	t.Run("upper-case .GIT", func(t *testing.T) {
 		f := newGraphFixture(t)
 		repo := f.graphRepo("folder/repo", "r.txt", marker)
 		if err := os.Rename(filepath.Join(repo, ".git"), filepath.Join(repo, ".GIT")); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := os.Stat(filepath.Join(repo, ".git")); err != nil {
-			t.Skip("file system is case-sensitive")
-		}
 		writeFixtureFile(t, filepath.Join(repo, ".gitignore"), "ign.txt\n")
-		gitRunIn(t, repo, "add", ".gitignore")
-		gitRunIn(t, repo, "commit", "-q", "-m", "ignore")
+		want := []string{"folder/repo/ign.txt", "folder/repo/r.txt"}
+		if _, err := os.Stat(filepath.Join(repo, ".git")); err == nil {
+			gitRunIn(t, repo, "add", ".gitignore")
+			gitRunIn(t, repo, "commit", "-q", "-m", "ignore")
+			want = []string{"folder/repo/r.txt"}
+		}
 		f.graphFile("folder/repo/ign.txt", marker)
 		setTestUserCache(t)
 		got := slices.Sorted(maps.Keys(graphSearch(t, marker, f.path("folder"))))
-		if want := []string{"folder/repo/r.txt"}; !slices.Equal(got, want) {
+		if !slices.Equal(got, want) {
 			t.Fatalf("found %q, want %q", got, want)
 		}
 	})

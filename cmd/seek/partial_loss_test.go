@@ -359,8 +359,6 @@ type plRow struct {
 	// untracked file). restorePristine rewinds only the cache, so such a row
 	// gets a private repository and cache instead of the shared fixture.
 	ownFixture bool
-	// slow marks a row that builds a second full family; skipped under -short.
-	slow bool
 	// damage mutates the corpus on disk between two seek invocations, exactly
 	// as an external process would.
 	damage func(t *testing.T, ctx context.Context, c *plCorpus)
@@ -513,7 +511,6 @@ func partialLossRows() []plRow {
 			// damaged family or return superseded content.
 			name:       "gap_then_commit_serves_stale_content",
 			ownFixture: true,
-			slow:       true,
 			damage: func(t *testing.T, ctx context.Context, c *plCorpus) {
 				plRemove(t, shardCarrying(t, c.plan.indexDir, "PL_SEED"))
 				// A commit that supersedes a live marker. After the rebuild
@@ -680,9 +677,6 @@ func TestPartialLoss_GitCommittedFamily(t *testing.T) {
 
 	for _, row := range partialLossRows() {
 		t.Run(row.name, func(t *testing.T) {
-			if row.slow && testing.Short() {
-				t.Skip("slow row: builds a second family")
-			}
 			c, guard := plPrepareRow(t, ctx, shared, row)
 			defer guard()
 			row.damage(t, ctx, c)

@@ -118,7 +118,7 @@ func TestFolderWalkerSkipsSymlinkedWorktree(t *testing.T) {
 	canonical := filepath.Join(root, "real")
 	writeMinimalGitRepo(t, canonical)
 	if err := os.Symlink(canonical, filepath.Join(root, "alias")); err != nil {
-		t.Skipf("symlink unsupported: %v", err)
+		t.Fatalf("make the symlink to the worktree: %v", err)
 	}
 	// The symlink points to the working tree, not to `.git`. The walk
 	// skips every symlink entry (folderWalker.visit), so it never reaches the

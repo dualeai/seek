@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -8,13 +9,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
-	"time"
 
 	"github.com/sourcegraph/zoekt/index"
 )
@@ -52,9 +51,6 @@ func TestNativeGitRecordParserAllocations(t *testing.T) {
 
 func installFakeGit(t *testing.T) {
 	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("fake Git fixture requires a POSIX shell")
-	}
 	binDir := t.TempDir()
 	script := `#!/bin/sh
 # The filter-driver read (git config --get-regexp) finds no driver, as in a
@@ -111,12 +107,14 @@ case "$FAKE_GIT_MODE" in
     printf '%s\n' "$$" > "$FAKE_GIT_PID_FILE"
     printf 'bad\0'
     trap 'exit 130' INT TERM
-    while :; do :; done
+    # Each hang loop ends with the test process. So a test that fails at the
+    # go test timeout leaves no busy process.
+    while kill -0 "$PPID" 2>/dev/null; do :; done
     ;;
   hang)
     printf '%s\n' "$$" > "$FAKE_GIT_PID_FILE"
     trap 'exit 130' INT TERM
-    while :; do :; done
+    while kill -0 "$PPID" 2>/dev/null; do :; done
     ;;
   batch_check_wrong_id)
     read_object_command
@@ -219,7 +217,7 @@ case "$FAKE_GIT_MODE" in
     printf '%s\n' "$$" > "$FAKE_GIT_PID_FILE"
     printf ':000000 100644 0000000000000000000000000000000000000000 0123456789abcdef0123456789abcdef01234567 A\0added.go\0'
     trap 'exit 130' INT TERM
-    while :; do :; done
+    while kill -0 "$PPID" 2>/dev/null; do :; done
     ;;
   diff_malformed)
     printf ':bad\0path\0'
@@ -262,13 +260,12 @@ func TestNativeGitBatchSessionFramesInfoContentsAndFlush(t *testing.T) {
 	}
 }
 
-func requireProcessGone(t *testing.T, pidFile string) {
+// requireProcessGone fails the test when the fake Git process of pidLine
+// still exists. Call it when the call that must kill and join the child
+// returns. The join reaps the child, so a live or zombie child is a defect.
+func requireProcessGone(t *testing.T, pidLine string) {
 	t.Helper()
-	raw, err := os.ReadFile(pidFile)
-	if err != nil {
-		t.Fatalf("read fake Git PID: %v", err)
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	pid, err := strconv.Atoi(strings.TrimSpace(pidLine))
 	if err != nil {
 		t.Fatalf("parse fake Git PID: %v", err)
 	}
@@ -276,19 +273,19 @@ func requireProcessGone(t *testing.T, pidFile string) {
 	if err != nil {
 		return
 	}
-	// The bound only stops a stuck test: the loop returns once the process
-	// is gone.
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		err = process.Signal(syscall.Signal(0))
-		if err != nil {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("fake Git process %d is still running", pid)
-		}
-		time.Sleep(10 * time.Millisecond)
+	if err := process.Signal(syscall.Signal(0)); err == nil {
+		t.Fatalf("fake Git process %d is still running", pid)
 	}
+}
+
+// readFakeGitPID returns the PID line that the fake Git wrote to pidFile.
+func readFakeGitPID(t *testing.T, pidFile string) string {
+	t.Helper()
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("read fake Git PID: %v", err)
+	}
+	return string(raw)
 }
 
 func TestParseGitObjectID(t *testing.T) {
@@ -484,7 +481,7 @@ func TestNativeGitTreeParseFailureKillsAndJoinsChild(t *testing.T) {
 	if err == nil {
 		t.Fatal("malformed tree succeeded")
 	}
-	requireProcessGone(t, pidFile)
+	requireProcessGone(t, readFakeGitPID(t, pidFile))
 }
 
 func TestNativeGitTreeCancellationAndDeadline(t *testing.T) {
@@ -518,34 +515,53 @@ func TestNativeGitTreeCancellationAndDeadline(t *testing.T) {
 			t.Setenv("FAKE_GIT_MODE", "hang")
 			ctx, end := test.context()
 			defer end()
-			stopWhenFakeGitStarts(t, pidFile, end)
+			pidLine := stopWhenFakeGitStarts(t, pidFile, end)
 			err := readNativeGitTreeRecords(ctx, t.TempDir(), []string{"ls-tree"}, func([]gitTreeEntry) error { return nil })
 			if !errors.Is(err, test.want) {
 				t.Fatalf("error=%v, want %v", err, test.want)
 			}
-			requireProcessGone(t, pidFile)
+			requireProcessGone(t, pidLine())
 		})
 	}
 }
 
-// stopWhenFakeGitStarts calls stop once the fake Git has written its whole
-// PID line to pidFile, so a test cancels the child only after it runs, however
-// slow the host is. The shell creates the file before it writes the PID, so
-// the file alone is not enough.
-func stopWhenFakeGitStarts(t *testing.T, pidFile string, stop func()) {
+// stopWhenFakeGitStarts makes pidFile a FIFO and calls stop when the fake Git
+// writes its PID line to it. So a test cancels the child only after it runs,
+// however slow the host is. The returned function gives that line. The test
+// holds the FIFO open for reading and writing. So the fake Git never waits for
+// a reader, and the cleanup ends a read that no fake Git ends.
+func stopWhenFakeGitStarts(t *testing.T, pidFile string, stop func()) (pidLine func() string) {
+	t.Helper()
+	if err := syscall.Mkfifo(pidFile, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Linux and macOS open a FIFO for reading and writing with no wait.
+	fifo, err := os.OpenFile(pidFile, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := make(chan string, 1)
+	exited := make(chan struct{})
 	go func() {
-		for {
-			if raw, err := os.ReadFile(pidFile); err == nil && strings.HasSuffix(string(raw), "\n") {
-				stop()
-				return
-			}
-			select {
-			case <-t.Context().Done():
-				return
-			case <-time.After(5 * time.Millisecond):
-			}
-		}
+		defer close(exited)
+		line, _ := bufio.NewReader(fifo).ReadString('\n')
+		lines <- line
+		stop()
 	}()
+	t.Cleanup(func() {
+		_, _ = fifo.Write([]byte("\n"))
+		<-exited
+		_ = fifo.Close()
+	})
+	return func() string {
+		select {
+		case line := <-lines:
+			return line
+		default:
+			t.Fatal("the fake Git wrote no PID, so the test did not stop it")
+			return ""
+		}
+	}
 }
 
 // expiringContext expires with context.DeadlineExceeded when expire is
@@ -692,9 +708,7 @@ func TestNativeGitBatchCheckExactLimitAndOversize(t *testing.T) {
 // against a fake Git that fills its output pipe before it reads all requests:
 // check must read while it writes.
 func TestNativeGitBatchCheckReadsAndWritesConcurrently(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	batch := startFakeNativeGitBatch(t, ctx, "batch_check_blocked_pipes")
+	batch := startFakeNativeGitBatch(t, t.Context(), "batch_check_blocked_pipes")
 	entries := make([]gitTreeEntry, gitObjectBatchSize)
 	for i := range entries {
 		entries[i] = fakeTreeEntry(nativeTestOID)
@@ -715,13 +729,13 @@ func TestNativeGitBatchCheckCancellationKillsChild(t *testing.T) {
 	t.Setenv("FAKE_GIT_PID_FILE", pidFile)
 	ctx := newExpiringContext()
 	defer ctx.expire()
-	stopWhenFakeGitStarts(t, pidFile, ctx.expire)
+	pidLine := stopWhenFakeGitStarts(t, pidFile, ctx.expire)
 	batch := startFakeNativeGitBatch(t, ctx, "hang")
 	_, err := batch.check([]gitTreeEntry{fakeTreeEntry(nativeTestOID)})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error=%v, want deadline", err)
 	}
-	requireProcessGone(t, pidFile)
+	requireProcessGone(t, pidLine())
 }
 
 func TestReadNativeGitBlobsReadsExactContent(t *testing.T) {
@@ -816,10 +830,8 @@ func TestReadNativeGitBlobsReadsAndWritesConcurrently(t *testing.T) {
 	for i := range infos {
 		infos[i] = gitBlobInfo{entry: fakeTreeEntry(nativeTestOID), size: 3}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	count := 0
-	err := readNativeGitBlobs(ctx, t.TempDir(), infos, func(document fileContent) error {
+	err := readNativeGitBlobs(t.Context(), t.TempDir(), infos, func(document fileContent) error {
 		count++
 		readSemaphore.Release(document.weight)
 		return nil
@@ -836,13 +848,13 @@ func TestReadNativeGitBlobCancellationKillsChild(t *testing.T) {
 	t.Setenv("FAKE_GIT_MODE", "hang")
 	ctx := newExpiringContext()
 	defer ctx.expire()
-	stopWhenFakeGitStarts(t, pidFile, ctx.expire)
+	pidLine := stopWhenFakeGitStarts(t, pidFile, ctx.expire)
 	info := gitBlobInfo{entry: fakeTreeEntry(nativeTestOID), size: 3}
 	err := readNativeGitBlobs(ctx, t.TempDir(), []gitBlobInfo{info}, func(fileContent) error { return nil })
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error=%v, want deadline", err)
 	}
-	requireProcessGone(t, pidFile)
+	requireProcessGone(t, pidLine())
 }
 
 func TestParseNativeGitDiffHeader(t *testing.T) {
@@ -903,7 +915,7 @@ func TestReadNativeGitDiffCapKillsChild(t *testing.T) {
 	if !errors.Is(err, errNativeGitDeltaTooLarge) {
 		t.Fatalf("error=%v, want delta cap", err)
 	}
-	requireProcessGone(t, pidFile)
+	requireProcessGone(t, readFakeGitPID(t, pidFile))
 }
 
 func TestReadNativeGitDiffCancellationKillsChild(t *testing.T) {
@@ -913,10 +925,10 @@ func TestReadNativeGitDiffCancellationKillsChild(t *testing.T) {
 	t.Setenv("FAKE_GIT_MODE", "hang")
 	ctx := newExpiringContext()
 	defer ctx.expire()
-	stopWhenFakeGitStarts(t, pidFile, ctx.expire)
+	pidLine := stopWhenFakeGitStarts(t, pidFile, ctx.expire)
 	_, err := readNativeGitDiff(ctx, t.TempDir(), gitObjectID(nativeTestOID), gitObjectID(strings.Repeat("a", 40)), 10)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error=%v, want deadline", err)
 	}
-	requireProcessGone(t, pidFile)
+	requireProcessGone(t, pidLine())
 }

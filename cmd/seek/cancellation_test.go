@@ -5,24 +5,23 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
-	"time"
 
 	"go.uber.org/goleak"
 )
 
 // TestEnsureFolderCorpusFresh_CancelAfterReadActivity starts an indexing
-// pass, waits until the semaphore probe observes read activity, then cancels
-// it. Every goroutine must stop, and the semaphore must return to its
-// starting balance. The pass can return nil or context.Canceled.
+// pass and cancels it while a reader holds its read weight: the first file
+// open waits for the cancel. Every goroutine must stop, and the semaphore
+// must return to its starting balance. The pass can return nil or
+// context.Canceled.
 //
 // goleak.VerifyNone catches any goroutine that stays blocked on Acquire, a
 // channel send, or builder I/O. It ignores only the goroutines that ran
 // before the test (goleak.IgnoreCurrent).
 func TestEnsureFolderCorpusFresh_CancelAfterReadActivity(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+	requireTools(t)
 	// IgnoreCurrent records the goroutines when this defer statement runs,
 	// at the top of the test, so a leaked reader is a new goroutine that
 	// VerifyNone reports. The test does not use
@@ -42,6 +41,20 @@ func TestEnsureFolderCorpusFresh_CancelAfterReadActivity(t *testing.T) {
 	root := writeRandomFolder(t, 12*1024*1024, 512*1024)
 	plan := planSynthCorpus(t, root)
 
+	// A reader opens a file after it takes its weight. The first open waits
+	// until the test cancels, and the other opens wait behind it.
+	reading, canceled := make(chan struct{}), make(chan struct{})
+	var first sync.Once
+	realOpen := folderOpenFile
+	t.Cleanup(func() { folderOpenFile = realOpen })
+	folderOpenFile = func(path string) (*os.File, error) {
+		first.Do(func() {
+			close(reading)
+			<-canceled
+		})
+		return realOpen(path)
+	}
+
 	ctx, cancel := context.WithCancel(t.Context())
 	var ensureErr error
 	done := make(chan struct{})
@@ -49,17 +62,14 @@ func TestEnsureFolderCorpusFresh_CancelAfterReadActivity(t *testing.T) {
 		_, ensureErr = ensureFolderCorpusFresh(ctx, plan)
 		close(done)
 	}()
-	// The TryAcquire probe reports activity. A queued waiter can also lower the
-	// result, so this broad lifecycle test does not infer exact ownership.
-	waitUntilSemaphoreBelow(t, readSemaphore, testBudget, 5*time.Second)
-	cancel()
-
 	select {
+	case <-reading:
 	case <-done:
-	case <-time.After(20 * time.Second):
-		dumpGoroutines(t)
-		t.Fatal("ensureFolderCorpusFresh did not unwind within 20s of cancel")
+		t.Fatalf("the pass ended before it read a file: %v", ensureErr)
 	}
+	cancel()
+	close(canceled)
+	<-done
 
 	if got := availableWeight(readSemaphore); got != testBudget {
 		t.Fatalf("semaphore leak after cancel: got=%d want=%d", got, testBudget)
@@ -91,6 +101,16 @@ func TestReadOneFolderFileStreaming_CancelWithoutReceiverReleasesWeight(t *testi
 	candidate := folderCandidate{name: "note.txt", path: path, size: int64(len(content))}
 	out := make(chan fileContent)
 
+	// The worker opens the file after it takes its weight. No receiver can
+	// accept the document.
+	opened := make(chan struct{})
+	realOpen := folderOpenFile
+	t.Cleanup(func() { folderOpenFile = realOpen })
+	folderOpenFile = func(path string) (*os.File, error) {
+		close(opened)
+		return realOpen(path)
+	}
+
 	ctx, cancel := context.WithCancel(t.Context())
 	// The build gives the reader a failure function; it cancels the read.
 	readCtx, fail := context.WithCancelCause(ctx)
@@ -100,17 +120,13 @@ func TestReadOneFolderFileStreaming_CancelWithoutReceiverReleasesWeight(t *testi
 		readOneFolderFileStreaming(readCtx, candidate, out, fail)
 		close(done)
 	}()
-	// One worker and a file that fits the budget mean a lower probe result
-	// identifies this worker's acquired weight. No receiver can accept it.
-	waitUntilSemaphoreBelow(t, readSemaphore, testBudget, 5*time.Second)
-	cancel()
-
 	select {
+	case <-opened:
 	case <-done:
-	case <-time.After(5 * time.Second):
-		dumpGoroutines(t)
-		t.Fatal("reader did not stop after cancellation")
+		t.Fatal("the reader stopped before it opened the file")
 	}
+	cancel()
+	<-done
 	select {
 	case item := <-out:
 		t.Fatalf("unexpected ownership transfer: %+v", item)
@@ -126,9 +142,7 @@ func TestReadOneFolderFileStreaming_CancelWithoutReceiverReleasesWeight(t *testi
 // This makes indexDocuments take its canceled range path and release
 // both documents' semaphore weight.
 func TestIndexDocuments_CancelDuringRange(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+	requireTools(t)
 	done := withReadSemLock(t)
 	defer done()
 
@@ -181,30 +195,15 @@ func TestIndexDocuments_CancelDuringRange(t *testing.T) {
 	case <-secondReady:
 	case err := <-producerDone:
 		t.Fatalf("producer stopped before second document was ready: %v", err)
-	case <-time.After(10 * time.Second):
-		dumpGoroutines(t)
-		t.Fatal("producer did not prepare the second document")
 	}
 	cancel()
 	close(transferSecond)
 
-	select {
-	case indexErr := <-indexDone:
-		if !errors.Is(indexErr, context.Canceled) {
-			t.Fatalf("indexDocuments error=%v, want context.Canceled", indexErr)
-		}
-	case <-time.After(15 * time.Second):
-		dumpGoroutines(t)
-		t.Fatal("indexDocuments did not unwind within 15s of cancel")
+	if indexErr := <-indexDone; !errors.Is(indexErr, context.Canceled) {
+		t.Fatalf("indexDocuments error=%v, want context.Canceled", indexErr)
 	}
-	select {
-	case err := <-producerDone:
-		if err != nil {
-			t.Fatalf("producer error: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		dumpGoroutines(t)
-		t.Fatal("producer did not stop")
+	if err := <-producerDone; err != nil {
+		t.Fatalf("producer error: %v", err)
 	}
 	// withReadSemLock done() asserts semaphore returned to baseline.
 }

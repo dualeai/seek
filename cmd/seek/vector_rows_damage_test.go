@@ -86,8 +86,8 @@ func repairWarnings(logs *testLogRecorder, from int) (shards, vectors, skips, re
 // query word, prints exactly when the search binds its rows. The first search
 // repairs the shards, finds the same mismatch on fresh shards, and unbinds the
 // vectors: one warning of each, the text hit, and no semantic.go. The next two
-// searches print semantic.go with no warning, and the third builds no folder
-// index.
+// searches print semantic.go with no warning, and the third makes no build
+// directory (newBuildDir), so it builds no folder index.
 func TestDamagedVectorRowsAreRepairedOnce(t *testing.T) {
 	requireTools(t)
 	for _, kind := range []string{"folder", "git"} {
@@ -108,9 +108,6 @@ func TestDamagedVectorRowsAreRepairedOnce(t *testing.T) {
 				t.Chdir(repo)
 			}
 			logs := captureTestLogs(t, slog.LevelWarn)
-			var builds atomic.Int32
-			folderBuildTestHook = func() { builds.Add(1) }
-			t.Cleanup(func() { folderBuildTestHook = nil })
 			search := func() string {
 				t.Helper()
 				output, _, err := stubSearch(t, payloadAccept, append([]string{"alpha beta"}, operands...)...)
@@ -134,14 +131,14 @@ func TestDamagedVectorRowsAreRepairedOnce(t *testing.T) {
 					shards, vectors, skips, output)
 			}
 			for run := 2; run <= 3; run++ {
-				builds.Store(0)
+				buildDirs := buildDirCounter.Load()
 				output := search()
 				shards, vectors, skips, next = repairWarnings(logs, next)
 				if shards+vectors+skips != 0 || !strings.Contains(output, "semantic.go") {
 					t.Fatalf("search %d: warnings %d/%d/%d, want none and the vector hit:\n%s", run, shards, vectors, skips, output)
 				}
-				if run == 3 && builds.Load() != 0 {
-					t.Fatalf("search 3 built the folder %d times, want none", builds.Load())
+				if built := buildDirCounter.Load() - buildDirs; run == 3 && kind == "folder" && built != 0 {
+					t.Fatalf("search 3 made %d build directories, want none", built)
 				}
 			}
 		})

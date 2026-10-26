@@ -16,10 +16,9 @@ func TestFolderCorpusState_DoesNotReadContents(t *testing.T) {
 	if err := os.WriteFile(path, []byte("folder_state_marker\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(path, 0o000); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.Chmod(path, 0o600) }()
+	// A user who can read the file would pass with no check: the state reads
+	// metadata only, so only an unreadable file proves it.
+	chmodUnreadableOrFatal(t, path, 0o000)
 
 	info, err := os.Lstat(root)
 	if err != nil {
@@ -43,10 +42,6 @@ func TestFolderCorpusState_DoesNotReadContents(t *testing.T) {
 }
 
 func TestFolderCorpusState_UnreadableDirectoryRootFails(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root can read chmod 000 directories")
-	}
-
 	root := t.TempDir()
 	info, err := os.Lstat(root)
 	if err != nil {
@@ -57,10 +52,7 @@ func TestFolderCorpusState_UnreadableDirectoryRootFails(t *testing.T) {
 		t.Fatalf("planFolderCorpus: %v", err)
 	}
 
-	if err := os.Chmod(root, 0o000); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.Chmod(root, 0o700) }()
+	chmodUnreadableOrFatal(t, root, 0)
 
 	_, _, err = folderCorpusState(context.Background(), plan)
 	if err == nil {

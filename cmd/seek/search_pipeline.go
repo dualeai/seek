@@ -27,24 +27,32 @@ import (
 // and has no ranked list.
 
 // Retrieval rule: a semantic hit is a row whose summed fine MaxSim F reaches
-// S0 + (tau_file - delta) * T (semanticRetrievalFloor), with S0 the
-// empty-document score of the query (semanticQueryEmbedding.emptyScore) and T
-// its token count. A file whose model lift (S - S0) / T passes tau_file then
-// has its rows within the radius while the fine vectors under-estimate the
-// model score S by at most delta per token.
+// S0 + (tau_file - delta) * T (semanticRetrievalFloor). S0 is the
+// empty-document score of the query (semanticQueryEmbedding.emptyScore), and T
+// is its token count. Take a file whose model lift (S - S0) / T passes
+// tau_file. Its rows are within the radius while the fine vectors
+// under-estimate the model score S by at most delta per token.
 //
-// delta comes from the earlier rule: the p99.9 of (model MeanMaxSim - fine
-// MeanMaxSim) over 18,856 window rows of a Kubernetes checkout with a model
-// MeanMaxSim of at least 0.55 (p50 0.008, p99 0.069, max 0.149). A per-token
-// coarse radius kept every Kubernetes file (delta p99 0.445), so it is not the
-// rule.
+// delta comes from the earlier rule. It is the p99.9 of (model MeanMaxSim -
+// fine MeanMaxSim) over 18,856 window rows of a Kubernetes checkout. Each row
+// had a model MeanMaxSim of at least 0.55. The gap had a p50 of 0.008, a p99
+// of 0.069 and a maximum of 0.149. A per-token coarse radius kept every
+// Kubernetes file (delta p99 0.445), so it is not the rule.
 //
-// The measurement of pipelineTauFile gives a larger p99.9, 0.1413, over the
-// rows of both corpora with a model lift of at least 0.15 (3,906 rows). But at
+// The measurement of pipelineTauFile gives a larger p99.9, 0.1413. It used
+// the 3,906 rows of both corpora with a model lift of at least 0.15. But at
 // tau_file 0.25, each delta from 0.10 to 0.15 kept a row of each admitted file
-// in the radius, and 0.1158 gives a short description 15.4 (Seek) and 9.4
-// (Kubernetes) candidate files against 26.8 and 27.7 at 0.1413. Fewer
+// in the radius. At 0.1158, a short description gets 15.4 (Seek) and 9.4
+// (Kubernetes) candidate files. At 0.1413, it gets 26.8 and 27.7. Fewer
 // candidates make a shorter search, so delta stays 0.1158.
+//
+// The gap has two causes. Each row stores 20 of a median 91 token vectors.
+// In 64 % of the rows, the row input also differs from the input that the
+// model scores. A measurement of 2026-10-26 on the whole Kubernetes checkout
+// tried a smaller gap with 20 descriptions. Rows built from the model's input
+// with 20 vectors (delta 0.06) lost 12 or 13 printed files. 48 vectors (delta
+// 0.04) lost 1 file and made a 51-word question 20 to 32 % slower. They also
+// grew the index from 4.2 to 7.6 GB. So the rows keep 20 vectors.
 const semanticRetrievalDelta float32 = 0.1158
 
 // pipelineTauFile is the per-file acceptance threshold: the lift of the model
@@ -53,20 +61,21 @@ const semanticRetrievalDelta float32 = 0.1158
 // TestRerankAcceptanceCalibrationContract on Core ML (the CPU provider
 // differs by at most 0.0005). The corpora were the 97 production files of
 // Seek (5,142 rows) and every 48th production Go file of Kubernetes at
-// 912ec3583d77 (298 files, 17,355 rows), with rows built with ctags symbols,
-// as the index builds them. The queries were 58 descriptions: 14 behaviors of
-// Seek in 3 lengths, 12 descriptions with no answer, 3 nonsense queries, and
-// a sentence of 51 tokens with no topic.
+// 912ec3583d77 (298 files, 17,355 rows). The rows had ctags symbols, as the
+// index builds them. The queries were 58 descriptions. 42 were 14 behaviors
+// of Seek in 3 lengths. 12 had no answer, 3 were nonsense, and 1 was a
+// sentence of 51 tokens with no topic.
 //
 // The descriptions from other projects (e-mail, HTML pages, images), the
 // nonsense, and the sentence with no topic must admit no file. Their largest
 // lift is 0.2002 (Kubernetes), so 0.25 admits none of them. At 0.25, the
 // descriptions of the 14 Seek behaviors find their files for 8 of 14 short
-// forms, 1 of 14 questions and 0 of 14 long forms, with 16 false files. The
-// earlier rule, 0.6 on the score per token, found 8, 8 and 14 with 1,418
-// false files: it admitted almost every file for a long query, because each
-// token with no topic adds to the score of any text. The lift per token falls
-// as the query grows, so a long description finds few files.
+// forms. They find them for 1 of 14 questions and 0 of 14 long forms, and
+// admit 16 false files. The earlier rule, 0.6 on the score per token, found 8,
+// 8 and 14 with 1,418 false files. It admitted almost every file for a long
+// query, because each token with no topic adds to the score of any text. The
+// lift per token falls as the query grows, so a long description finds few
+// files.
 //
 // A description of one or two words adds few files by meaning. T counts the
 // 3 special tokens of each window (CLS, the query marker, SEP). Their lift
@@ -76,17 +85,16 @@ const semanticRetrievalDelta float32 = 0.1158
 // found the files of 6 of 21 one-word and 9 of 17 two-word labelled
 // descriptions of the Seek behaviors. On a corpus of 222 Seek files, 15
 // one-word descriptions added 12 files by meaning (111 with the earlier
-// rule). A lift per content token (T without the special tokens, tau_file
-// 0.40) finds the files of 13 of the 21 and 13 of the 17 descriptions.
-// With it, the 15 one-word descriptions add 150 files. But a description
-// of 1 to 4 content tokens then scores more candidates, so it
-// is slower. On the whole Kubernetes checkout, "request authentication
-// flow" in staging/ takes 1.5 s against 1.0 s, and "logging" 2.8 s against
-// 1.1 s. Fewer candidates make a shorter search, so T counts every scoring
-// token.
+// rule). A lift per content token uses T without the special tokens and a
+// tau_file of 0.40. It finds the files of 13 of the 21 and 13 of the 17
+// descriptions. With it, the 15 one-word descriptions add 150 files. But a
+// description of 1 to 4 content tokens then scores more candidates, so it is
+// slower. On the whole Kubernetes checkout, "request authentication flow" in
+// staging/ takes 1.5 s against 1.0 s, and "logging" 2.8 s against 1.1 s.
+// Fewer candidates make a shorter search, so T counts every scoring token.
 //
 // On the whole Kubernetes checkout (31,250 files), warm, the earlier rule
-// gave a question of 51 words 24,138 candidates and 9.1 s; the lift gives 81
+// gave a question of 51 words 24,138 candidates and 9.1 s. The lift gives 81
 // candidates and 1.7 s. A short description with a filter gets 1 to 4 % more
 // candidates, with no change of time that the measurement can show.
 const pipelineTauFile float32 = 0.25
@@ -96,28 +104,29 @@ const pipelineTauFile float32 = 0.25
 const semanticRetrievalRadius = pipelineTauFile - semanticRetrievalDelta
 
 // semanticRetrievalFloor gives the summed fine MaxSim that a row reaches to be
-// a semantic hit: the empty-document score of the query plus the radius times
-// its scoring token count (semanticQueryTokenCount). The caller counts the
-// tokens once and also uses the count to turn sums into means.
+// a semantic hit. It is the empty-document score of the query plus the radius
+// times its scoring token count (semanticQueryTokenCount). The caller counts
+// the tokens once and also uses the count to turn sums into means.
 func semanticRetrievalFloor(emptyScore float32, tokens int) float32 {
 	return emptyScore + semanticRetrievalRadius*float32(tokens)
 }
 
 // semanticUSearchDeepenSimilarity is the coarse similarity down to which
 // USearch keeps returning keys for a token: an approximation parameter, not a
-// count. On a Kubernetes checkout (20 queries), with the radius of an earlier
-// rule (a fine MeanMaxSim of 0.4842 per token), 0.6 kept a median 0.998 (min
-// 0.985) of the files that an exact fine scan finds within the radius, and
-// the exact top 20 in every query; 0.7 reached the recall target (top-20
-// overlap of at least 0.95) only at its limit, 0.8 kept half. That
-// measurement read a 127^2 scale, 4.5 % below the cosine (an effective cosine
-// of about 0.627). The bound applies to USearch's cosine of the int8 codes.
-// For keys at a cosine of 0.5 or more, it differs from the f32 cosine by a
-// mean under 0.001 and by at most 0.012. So the bound keeps a few more rows
-// than measured. On the same checkout in October 2026, descriptions of 1 to
-// 51 words with no filter gave all 1,347,164 rows to the fine scan. 373 of
-// the 379 shards saturated, and the 6 smallest (4 to 598 rows) gave all
-// their rows. So the bound changed no result for them.
+// count. A measurement on a Kubernetes checkout used 20 queries and the radius
+// of an earlier rule (a fine MeanMaxSim of 0.4842 per token). At 0.6, USearch
+// kept a median 0.998 (min 0.985) of the files that an exact fine scan finds
+// within the radius. It also kept the exact top 20 in every query. 0.7
+// reached the recall target (top-20 overlap of at least 0.95) only at its
+// limit, and 0.8 kept half. That measurement read a 127^2 scale, 4.5 % below
+// the cosine (an effective cosine of about 0.627). The bound applies to
+// USearch's cosine of the int8 codes. For keys at a cosine of 0.5 or more, it
+// differs from the f32 cosine by a mean under 0.001 and by at most 0.012. So
+// the bound keeps a few more rows than measured. On the same checkout in
+// October 2026, descriptions of 1 to 51 words with no filter gave all
+// 1,347,164 rows to the fine scan. 373 of the 379 shards saturated, and the 6
+// smallest (4 to 598 rows) gave all their rows. So the bound changed no
+// result for them.
 var semanticUSearchDeepenSimilarity float32 = 0.6
 
 // nodeHit is one file of one node: the unit of merge, duplicate collapse,

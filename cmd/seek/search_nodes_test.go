@@ -9,18 +9,21 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
+	"testing/synctest"
+
+	"golang.org/x/sys/unix"
 )
 
 // TestSearchNodesRunsAPhysicalCorpusOnce reaches one corpus through two
 // plans: it runs once.
 func TestSearchNodesRunsAPhysicalCorpusOnce(t *testing.T) {
-	defer goroutineLeakGuard(t, defaultLeakTimeout)()
+	defer goroutineLeakGuard(t)()
 	var calls atomic.Int32
 	plans := []node{{id: "dup"}, {id: "dup"}, {id: "other"}}
 	results, _, err := searchNodes(t.Context(), plans, func(_ context.Context, plan node) ([]corpusSearchResult, dirtyFileSet, error) {
@@ -35,7 +38,7 @@ func TestSearchNodesRunsAPhysicalCorpusOnce(t *testing.T) {
 // TestSearchNodesSkipsAFailedNodeWithOneWarning fails one node of three, the
 // start node or a found one alike: one warning, the others answer, no error.
 func TestSearchNodesSkipsAFailedNodeWithOneWarning(t *testing.T) {
-	defer goroutineLeakGuard(t, defaultLeakTimeout)()
+	defer goroutineLeakGuard(t)()
 	logs := captureTestLogs(t, slog.LevelWarn)
 	plans := []node{{id: "a", displayRoot: "/a"}, {id: "b", displayRoot: "/b"}, {id: "c", displayRoot: "/c"}}
 	results, _, err := searchNodes(t.Context(), plans, func(_ context.Context, plan node) ([]corpusSearchResult, dirtyFileSet, error) {
@@ -56,7 +59,7 @@ func TestSearchNodesSkipsAFailedNodeWithOneWarning(t *testing.T) {
 // TestSearchNodesStopsOnASearchError returns an error that is not a node
 // failure (a query error): the search stops with it.
 func TestSearchNodesStopsOnASearchError(t *testing.T) {
-	defer goroutineLeakGuard(t, defaultLeakTimeout)()
+	defer goroutineLeakGuard(t)()
 	logs := captureTestLogs(t, slog.LevelWarn)
 	want := errors.New("search: got nil (sub)query")
 	_, _, err := searchNodes(t.Context(), []node{{id: "a"}, {id: "b", displayRoot: "/b"}}, func(ctx context.Context, plan node) ([]corpusSearchResult, dirtyFileSet, error) {
@@ -79,7 +82,7 @@ func TestSearchNodesStopsOnASearchError(t *testing.T) {
 // returns the cancellation once, with no warning per node, and cannot
 // return success.
 func TestSearchNodesCancellationIsSilent(t *testing.T) {
-	defer goroutineLeakGuard(t, defaultLeakTimeout)()
+	defer goroutineLeakGuard(t)()
 	logs := captureTestLogs(t, slog.LevelWarn)
 	ctx, cancel := context.WithCancel(t.Context())
 	plans := make([]node, 8)
@@ -184,71 +187,96 @@ func TestCommandWindowFollowsTheGraph(t *testing.T) {
 }
 
 // TestConcurrentCommandsShareTheReadBudget runs the builds of two commands in
-// one process: a one-node command's build takes the whole budget, so a build
-// of another command waits for it; the windows never pass the budget.
+// one process. The build of a one-node command takes the whole budget. So a
+// build of another command waits for it and starts when it ends, and the
+// windows never pass the budget. In the synctest bubble, synctest.Wait returns
+// when the second build waits in the slot queue.
 func TestConcurrentCommandsShareTheReadBudget(t *testing.T) {
-	one := withIndexWindow(t.Context(), 1)
-	release, err := acquireBuildSlot(one)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// A failed check gives the slot back, so later slot tests do not wait
-	// for it.
-	released := false
-	defer func() {
-		if !released {
-			release()
+	synctest.Test(t, func(t *testing.T) {
+		release, err := acquireBuildSlot(withIndexWindow(t.Context(), 1))
+		if err != nil {
+			t.Fatal(err)
 		}
-	}()
-	many := withIndexWindow(t.Context(), 1<<20)
-	ctx, cancel := context.WithTimeout(many, 50*time.Millisecond)
-	defer cancel()
-	if second, err := acquireBuildSlot(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		if err == nil {
-			second()
+		// A failed check gives the slot back, so later slot tests do not
+		// wait for it.
+		release = sync.OnceFunc(release)
+		defer release()
+		type slot struct {
+			release func()
+			err     error
 		}
-		t.Fatalf("a second command's build ran beside a whole-budget build: %v", err)
+		second := make(chan slot, 1)
+		go func() {
+			release, err := acquireBuildSlot(withIndexWindow(t.Context(), 1<<20))
+			second <- slot{release: release, err: err}
+		}()
+		synctest.Wait()
+		select {
+		case got := <-second:
+			if got.err == nil {
+				got.release()
+			}
+			t.Fatalf("a second command's build ran beside a whole-budget build: %v", got.err)
+		default:
+		}
+		release()
+		got := <-second
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		got.release()
+	})
+}
+
+// awaitBuildSlotWaiter returns with waited true when a build waits for a slot
+// in buildWindows. When ended gives a value first, the build did not wait:
+// it returns that value with waited false. A waiter makes TryAcquire(0) fail
+// and changes no weight, so the loop reads the state of the semaphore, not a
+// clock. A test whose build runs ctags and Git processes uses it: such a
+// build cannot run in a synctest bubble.
+func awaitBuildSlotWaiter[T any](ended <-chan T) (value T, waited bool) {
+	for {
+		select {
+		case value = <-ended:
+			return value, false
+		default:
+		}
+		if !buildWindows.TryAcquire(0) {
+			return value, true
+		}
+		runtime.Gosched()
 	}
-	release()
-	released = true
-	waitCtx, waitCancel := context.WithTimeout(many, 10*time.Second)
-	defer waitCancel()
-	second, err := acquireBuildSlot(waitCtx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second()
 }
 
 // TestRunSizesTheWindowFromTheGraph runs a search of one node: its build takes
 // the whole build budget, so while it runs, the build of a command with many
-// nodes waits for a slot.
+// nodes cannot take a slot. The test holds a read lock on the node, so the
+// build waits to publish while it holds its slot. During that wait, the test
+// tries the slot of the other command.
 func TestRunSizesTheWindowFromTheGraph(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
 	f.graphFile("one/a.txt", "zqwindowmarker")
 	setTestUserCache(t)
-	var ran, waited bool
-	folderBuildTestHook = func() {
-		ran = true
-		ctx, cancel := context.WithTimeout(withIndexWindow(context.Background(), 1<<20), 50*time.Millisecond)
-		defer cancel()
-		release, err := acquireBuildSlot(ctx)
-		if err == nil {
-			release()
-		}
-		waited = errors.Is(err, context.DeadlineExceeded)
+	plans, err := planCorpora(t.Context(), []string{f.path("one")})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%d err=%v", len(plans), err)
 	}
-	t.Cleanup(func() { folderBuildTestHook = nil })
+	release := holdReadLock(t, plans[0].cacheDir)
+	_, waiting := captureTestLogsWithSignal(t, slog.LevelWarn, lockWaitReaders, filepath.Join(plans[0].cacheDir, lockFile))
+	// A build takes the two windows of its command (acquireBuildSlot).
+	other := 2 * indexWindow(withIndexWindow(context.Background(), 1<<20))
+	acted := onLockWait(t, waiting, func() error {
+		if buildWindows.TryAcquire(other) {
+			buildWindows.Release(other)
+			return errors.New("a build of another command took a slot beside a one-node build")
+		}
+		return nil
+	}, release)
 	if _, err := seek(t, "--lexical-only", "zqwindowmarker", f.path("one")); err != nil {
 		t.Fatal(err)
 	}
-	if !ran {
-		t.Fatal("the build hook did not run, so the test proves nothing")
-	}
-	if !waited {
-		t.Fatal("a build of another command took a slot beside a one-node build")
-	}
+	lockWaitActed(t, acted)
 }
 
 // TestBuildsWithFewLargeDocumentTokensFinish builds 12 folder nodes at once
@@ -257,14 +285,15 @@ func TestRunSizesTheWindowFromTheGraph(t *testing.T) {
 // builds finish and give all weight back. Builds share no large-document
 // token: with shared tokens, a consumer that waits for a token keeps its
 // document while the token holders wait for readers that the read budget
-// blocks, so the builds can hang under load.
+// blocks, so the builds can hang under load. The test sets GOMAXPROCS, so each
+// build has more readers than tokens on every host. A hang runs until the go
+// test timeout, which prints each goroutine.
 func TestBuildsWithFewLargeDocumentTokensFinish(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
-	if indexParallelism() <= 4 {
-		t.Skip("needs more readers than large-document tokens")
-	}
+	requireTools(t)
+	const tokens = 4
+	saved := runtime.GOMAXPROCS(2 * tokens)
+	t.Cleanup(func() { runtime.GOMAXPROCS(saved) })
+	defer goroutineLeakGuard(t)()
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 	const nodes = 12
@@ -275,9 +304,8 @@ func TestBuildsWithFewLargeDocumentTokensFinish(t *testing.T) {
 	restoreWindow := swapIndexWindowBytesForTest(window)
 	defer restoreWindow()
 	oldShardMax, oldTokens := shardMax, largeDocumentParallelism
-	shardMax, largeDocumentParallelism = int(doc/3), 4
+	shardMax, largeDocumentParallelism = int(doc/3), tokens
 	defer func() { shardMax, largeDocumentParallelism = oldShardMax, oldTokens }()
-	defer goroutineLeakGuard(t, 60*time.Second)()
 
 	plans := make([]node, nodes)
 	for index := range plans {
@@ -287,9 +315,7 @@ func TestBuildsWithFewLargeDocumentTokensFinish(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
-	if _, _, err := searchNodes(ctx, plans, func(nodeCtx context.Context, plan node) ([]corpusSearchResult, dirtyFileSet, error) {
+	if _, _, err := searchNodes(t.Context(), plans, func(nodeCtx context.Context, plan node) ([]corpusSearchResult, dirtyFileSet, error) {
 		return prepareAndSearchCorpus(nodeCtx, plan, nil, userQ, defaultSearchConfig())
 	}); err != nil {
 		t.Fatalf("the builds did not finish: %v", err)
@@ -301,7 +327,8 @@ func TestBuildsWithFewLargeDocumentTokensFinish(t *testing.T) {
 
 // TestSearchesTakeNoBuildSlot holds every build slot, as builders of other
 // nodes would: a search of a ready node still finishes, and a node that must
-// build waits for a slot.
+// build waits for a slot. A warm search that waits for a slot runs until the
+// go test timeout, which prints each goroutine.
 func TestSearchesTakeNoBuildSlot(t *testing.T) {
 	requireTools(t)
 	const marker = "zqslotmarker"
@@ -318,9 +345,7 @@ func TestSearchesTakeNoBuildSlot(t *testing.T) {
 	}
 	release := holdEveryBuildSlot(t)
 	for _, warm := range []string{f.path("warm"), warmRepo} {
-		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-		out, err := captureStdout(t, func() error { return seekRoot(ctx, t, nil, "--lexical-only", marker, warm) })
-		cancel()
+		out, err := seek(t, "--lexical-only", marker, warm)
 		if err != nil || !strings.Contains(out, "a.txt") && !strings.Contains(out, "w.txt") {
 			t.Fatalf("the warm search of %s did not finish while the slots were taken: err=%v\n%s", warm, err, out)
 		}
@@ -332,10 +357,8 @@ func TestSearchesTakeNoBuildSlot(t *testing.T) {
 			_, err := seek(t, "--lexical-only", marker, cold)
 			done <- err
 		}()
-		select {
-		case err := <-done:
+		if err, waited := awaitBuildSlotWaiter(done); !waited {
 			t.Fatalf("a cold build of %s ran with no free slot: %v", cold, err)
-		case <-time.After(500 * time.Millisecond):
 		}
 		release()
 		if err := <-done; err != nil {
@@ -346,53 +369,64 @@ func TestSearchesTakeNoBuildSlot(t *testing.T) {
 }
 
 // TestBuildSlotsLimitConcurrentBuilds takes every build slot with blocked
-// builds: one more build waits, and the held builds overlap.
+// builds: the held builds overlap, and one more build waits until a held
+// build ends. In the synctest bubble, a holder that gets no slot makes the
+// bubble deadlock at once.
 func TestBuildSlotsLimitConcurrentBuilds(t *testing.T) {
-	// Outside a command a build takes the two windows of a full set of slots.
-	slots := buildSlotLimit(readBudgetBytes)
-	gate := make(chan struct{})
-	var held sync.WaitGroup
-	var active atomic.Int32
-	// Every holder gives its slot back, also when a check fails.
-	var openGate sync.Once
-	defer func() {
-		openGate.Do(func() { close(gate) })
-		held.Wait()
-	}()
-	holderCtx, cancelHolders := context.WithCancel(t.Context())
-	defer cancelHolders()
-	for range slots {
-		held.Add(1)
-		go func() {
-			defer held.Done()
-			release, err := acquireBuildSlot(holderCtx)
-			if err != nil {
-				return
-			}
-			active.Add(1)
-			<-gate
-			release()
+	synctest.Test(t, func(t *testing.T) {
+		// Outside a command a build takes the two windows of a full set of
+		// slots.
+		slots := buildSlotLimit(readBudgetBytes)
+		gate := make(chan struct{})
+		var held sync.WaitGroup
+		// Every holder gives its slot back, also when a check fails.
+		openGate := sync.OnceFunc(func() { close(gate) })
+		defer func() {
+			openGate()
+			held.Wait()
 		}()
-	}
-	for deadline := time.Now().Add(10 * time.Second); active.Load() != int32(slots); time.Sleep(time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatalf("only %d of %d builds took a slot", active.Load(), slots)
+		took := make(chan error, slots)
+		for range slots {
+			held.Go(func() {
+				release, err := acquireBuildSlot(t.Context())
+				took <- err
+				if err != nil {
+					return
+				}
+				<-gate
+				release()
+			})
 		}
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
-	defer cancel()
-	if extra, err := acquireBuildSlot(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		if err == nil {
-			extra()
+		for range slots {
+			if err := <-took; err != nil {
+				t.Fatalf("a build of %d did not take a slot: %v", slots, err)
+			}
 		}
-		t.Fatalf("a build ran beyond %d slots: %v", slots, err)
-	}
+		extra := make(chan error, 1)
+		held.Go(func() {
+			release, err := acquireBuildSlot(t.Context())
+			if err == nil {
+				release()
+			}
+			extra <- err
+		})
+		synctest.Wait()
+		select {
+		case err := <-extra:
+			t.Fatalf("a build ran beyond %d slots: %v", slots, err)
+		default:
+		}
+		openGate()
+		if err := <-extra; err != nil {
+			t.Fatalf("the extra build did not take a freed slot: %v", err)
+		}
+	})
 }
 
 // TestSearchNodesCollectsEveryNode runs more nodes than build slots: every
 // node's results reach the merged list.
 func TestSearchNodesCollectsEveryNode(t *testing.T) {
-	defer goroutineLeakGuard(t, defaultLeakTimeout)()
+	defer goroutineLeakGuard(t)()
 	plans := make([]node, 3*buildSlotLimit(readBudgetBytes)+1)
 	for index := range plans {
 		plans[index] = node{id: corpusID(fmt.Sprintf("plan-%03d", index))}
@@ -405,13 +439,15 @@ func TestSearchNodesCollectsEveryNode(t *testing.T) {
 	}
 }
 
-// TestSearchNodesRealIndexingBeyondTheWindow builds four folder nodes at once
-// whose content is larger than the window: at least two builds overlap, each
-// node publishes its shards, and the read budget gets all its weight back.
+// TestSearchNodesRealIndexingBeyondTheWindow builds four folder nodes whose
+// content is larger than the window. The builds overlap, each node publishes
+// its shards, and the read budget gets all its weight back. The test holds a
+// read lock on the first node, so its build waits to publish while it holds
+// its slot. The three other builds start only during that wait, and must run
+// to their end. If they cannot, the test runs until the go test timeout,
+// which prints each goroutine.
 func TestSearchNodesRealIndexingBeyondTheWindow(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+	requireTools(t)
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
@@ -425,7 +461,7 @@ func TestSearchNodesRealIndexingBeyondTheWindow(t *testing.T) {
 	defer restore()
 	restoreWindow := swapIndexWindowBytesForTest(testWindow)
 	defer restoreWindow()
-	defer goroutineLeakGuard(t, 120*time.Second)()
+	defer goroutineLeakGuard(t)()
 
 	plans := make([]node, 4)
 	for index := range plans {
@@ -435,36 +471,32 @@ func TestSearchNodesRealIndexingBeyondTheWindow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
-	defer cancel()
-	var peak atomic.Int32
-	stop := make(chan struct{})
-	sampled := make(chan struct{})
-	go func() {
-		defer close(sampled)
-		for {
-			select {
-			case <-stop:
-				return
-			case <-time.After(100 * time.Microsecond):
-			}
-			// Each build outside a command takes two test windows.
-			if held := int32((buildWindowBytes - availableWeight(buildWindows)) / (2 * testWindow)); held > peak.Load() {
-				peak.Store(held)
-			}
+	release := holdReadLock(t, plans[0].cacheDir)
+	_, waiting := captureTestLogsWithSignal(t, slog.LevelWarn, lockWaitReaders, filepath.Join(plans[0].cacheDir, lockFile))
+	// The other builds start at the publish wait of the first build. If the
+	// first build ends with no wait, they start then, and lockWaitActed fails.
+	firstWaits := make(chan struct{})
+	startOthers := sync.OnceFunc(func() { close(firstWaits) })
+	var others sync.WaitGroup
+	others.Add(len(plans) - 1)
+	acted := onLockWait(t, waiting, func() error {
+		startOthers()
+		others.Wait()
+		return nil
+	}, release)
+	_, _, err = searchNodes(t.Context(), plans, func(nodeCtx context.Context, plan node) ([]corpusSearchResult, dirtyFileSet, error) {
+		if plan.id == plans[0].id {
+			defer startOthers()
+		} else {
+			defer others.Done()
+			<-firstWaits
 		}
-	}()
-	_, _, err = searchNodes(ctx, plans, func(nodeCtx context.Context, plan node) ([]corpusSearchResult, dirtyFileSet, error) {
 		return prepareAndSearchCorpus(nodeCtx, plan, nil, userQ, defaultSearchConfig())
 	})
-	close(stop)
-	<-sampled
 	if err != nil {
 		t.Fatal(err)
 	}
-	if peak.Load() < 2 {
-		t.Fatalf("peak builds=%d, want the four builds to overlap", peak.Load())
-	}
+	lockWaitActed(t, acted)
 	for index, plan := range plans {
 		if shards := repositoryShardCount(plan.indexDir, folderRepoName(plan)); shards < 1 {
 			t.Fatalf("plan %d: no shard", index)
@@ -501,8 +533,12 @@ func TestPipelinePreparesEachNodeOnce(t *testing.T) {
 }
 
 // TestCancelDuringGraphSearch cancels when the first node build reads its
-// content: the search returns the cancellation once, warns for no node,
-// publishes no index state, and leaves no goroutine.
+// content. The search returns the cancellation once, warns for no node,
+// publishes no index state, and leaves no goroutine. The Git shim signals the
+// content read when it opens a FIFO to write. Then it fills the FIFO and waits
+// until a signal stops it or the test closes the FIFO. It keeps the output pipe
+// of Git open, so the build waits for its output. A search that does not stop
+// its build runs until the go test timeout, which prints each goroutine.
 func TestCancelDuringGraphSearch(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -514,11 +550,13 @@ func TestCancelDuringGraphSearch(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := filepath.Join(t.TempDir(), "build-started")
+	if err := unix.Mkfifo(started, 0o600); err != nil {
+		t.Fatalf("make the FIFO that signals the content read: %v", err)
+	}
 	shimDir := t.TempDir()
 	shim := "#!/bin/sh\n" + gitShimSubcommand +
 		"if [ \"$subcommand\" = cat-file ]; then\n" +
-		"  : > \"$SEEK_TEST_BUILD_STARTED\"\n" +
-		"  sleep 30\n" +
+		"  exec cat /dev/zero 4>&1 > \"$SEEK_TEST_BUILD_STARTED\"\n" +
 		"fi\n" +
 		"exec \"$SEEK_TEST_REAL_GIT\" \"$@\"\n"
 	if err := os.WriteFile(filepath.Join(shimDir, "git"), []byte(shim), 0o755); err != nil {
@@ -527,27 +565,34 @@ func TestCancelDuringGraphSearch(t *testing.T) {
 	t.Setenv("SEEK_TEST_REAL_GIT", realGit)
 	t.Setenv("SEEK_TEST_BUILD_STARTED", started)
 	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	defer goroutineLeakGuard(t, 30*time.Second)()
+	defer goroutineLeakGuard(t)()
 	logs := captureTestLogs(t, slog.LevelWarn)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
+	opened := make(chan *os.File, 1)
 	go func() {
-		for ctx.Err() == nil {
-			if _, err := os.Stat(started); err == nil {
-				cancel()
-				return
-			}
-			time.Sleep(5 * time.Millisecond)
+		// The open waits until a shim opens the FIFO to write.
+		signal, err := os.Open(started)
+		if err == nil {
+			cancel()
+		}
+		opened <- signal
+	}()
+	// A search that ends before any content read leaves the open waiting:
+	// a writer that does not wait ends it. The close of the read end stops a
+	// shim that still writes.
+	defer func() {
+		if writer, err := os.OpenFile(started, os.O_WRONLY|unix.O_NONBLOCK, 0); err == nil {
+			_ = writer.Close()
+		}
+		if signal := <-opened; signal != nil {
+			_ = signal.Close()
 		}
 	}()
-	begin := time.Now()
 	err = seekRoot(ctx, t, nil, "--lexical-only", "zqcancelmarker", f.path("folder"))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err=%v, want the cancellation", err)
-	}
-	if elapsed := time.Since(begin); elapsed > 20*time.Second {
-		t.Fatalf("the cancelled search ran %s", elapsed)
 	}
 	if records := logs.Records(); len(records) != 0 {
 		t.Fatalf("a cancelled search warned: %v", records)
@@ -567,10 +612,11 @@ func TestCancelDuringGraphSearch(t *testing.T) {
 	}
 }
 
-// TestPartialFailureContract searches a folder with an unreadable subfolder, a
-// nested repository with a bad HEAD, one with a corrupt index, and one whose
-// build cannot read its content, with a one-word and a two-word query: the
-// readable content returns, each failure warns once, and the exit is 0.
+// TestPartialFailureContract searches a folder with a one-word and a two-word
+// query. The folder has an unreadable subfolder and three nested repositories.
+// One has a bad HEAD, one has a corrupt index, and the build of the third
+// cannot read its content. The readable content returns, each failure warns
+// once, and the exit is 0.
 // Root, or any user who can read a mode-000 folder, reads the locked folder.
 // The test then removes it and expects the 3 other warnings.
 func TestPartialFailureContract(t *testing.T) {
@@ -886,8 +932,8 @@ func TestDescriptionSearchWhileAPeerBuilds(t *testing.T) {
 }
 
 // TestDescriptionReadRetriesAfterADirtyFileChanges edits a dirty file after
-// the build read it and before the vectors bind. The read sees that the work
-// tree no longer holds the published state, prepares the node again, and
+// the build read it and before the build publishes. The read sees that the
+// work tree no longer holds the published state, prepares the node again, and
 // finds the new text.
 func TestDescriptionReadRetriesAfterADirtyFileChanges(t *testing.T) {
 	requireTools(t)
@@ -896,23 +942,24 @@ func TestDescriptionReadRetriesAfterADirtyFileChanges(t *testing.T) {
 	writeFixtureFile(t, filepath.Join(repo, "a.txt"), "zqretry alpha\n")
 	writeFixtureFile(t, filepath.Join(repo, "b.txt"), "zqretry old\n")
 	setTestUserCache(t)
-	var hookCalls atomic.Int32
-	var editErr error
-	// The hook runs under the publish lock after .state and before the
-	// vectors bind, so both readers of b.txt in the build (the text index
-	// and the overlay) have read the old bytes.
-	semanticPublishTestHook = func() error {
-		if hookCalls.Add(1) == 1 {
-			editErr = os.WriteFile(filepath.Join(repo, "b.txt"), []byte("zqretry fresh\n"), 0o644)
-		}
-		return nil
+	plans, err := planCorpora(t.Context(), []string{repo})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%d err=%v", len(plans), err)
 	}
-	t.Cleanup(func() { semanticPublishTestHook = nil })
+	// The test holds a read lock, so the build waits to publish. Both readers
+	// of b.txt in the build (the text index and the overlay) read the old
+	// bytes before that wait. The test edits b.txt during the wait.
+	release := holdReadLock(t, plans[0].cacheDir)
+	_, waiting := captureTestLogsWithSignal(t, slog.LevelWarn, lockWaitReaders, filepath.Join(plans[0].cacheDir, lockFile))
+	acted := onLockWait(t, waiting, func() error {
+		return os.WriteFile(filepath.Join(repo, "b.txt"), []byte("zqretry fresh\n"), 0o644)
+	}, release)
 	before := nodePreparations.Load()
 	out, _, err := stubSearch(t, payloadFar, "zqretry fresh", repo)
-	if err != nil || editErr != nil || hookCalls.Load() == 0 {
-		t.Fatalf("err=%v edit=%v hook calls=%d", err, editErr, hookCalls.Load())
+	if err != nil {
+		t.Fatal(err)
 	}
+	lockWaitActed(t, acted)
 	// The first preparation, then the one after the read saw the change.
 	if got := nodePreparations.Load() - before; got != 2 {
 		t.Fatalf("preparations=%d, want 2", got)

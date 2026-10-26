@@ -170,16 +170,21 @@ func TestBareWordKeepsFileNameRankBelowCwd(t *testing.T) {
 
 // TestWrongCaseOperandKeepsRelativeHeaders types a folder operand in another
 // case on a case-insensitive file system: the header keeps the typed form and
-// file: reads it.
+// file: reads it. A case-sensitive file system has no folder in the other
+// case: the operand does not resolve.
 func TestWrongCaseOperandKeepsRelativeHeaders(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
 	writeFixtureFile(t, f.path("work/sub/a.txt"), "zqcasemarker\n")
-	if _, err := os.Stat(f.path("work/SUB")); err != nil {
-		t.Skip("case-sensitive file system")
-	}
 	setTestUserCache(t)
 	t.Chdir(f.path("work"))
+	if _, err := os.Stat("SUB"); err != nil {
+		_, err := seek(t, "--lexical-only", "zqcasemarker", "SUB")
+		if want := `seek: path does not exist: "SUB"`; err == nil || formatCLIError(err) != want {
+			t.Fatalf("err=%v, want %q", err, want)
+		}
+		return
+	}
 	if _, headers := searchHeaders(t, "zqcasemarker", "SUB"); len(headers) != 1 || headers[0] != "SUB/a.txt" {
 		t.Fatalf("headers=%v, want SUB/a.txt", headers)
 	}

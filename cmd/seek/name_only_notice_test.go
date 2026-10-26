@@ -68,7 +68,8 @@ func TestNameOnlyNoticeCountsOversizedFiles(t *testing.T) {
 // TestNameOnlyNoticeCountRows proves the count rules: a name-only file that
 // already prints is not counted again, Zoekt's own too-small files are not
 // counted, a real text file that starts with the marker is not counted, and an
-// unreadable file is.
+// unreadable file is. A user who ignores file modes, as root does, reads the
+// mode-000 file: it then prints as a match, and no file is counted.
 func TestNameOnlyNoticeCountRows(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
@@ -81,16 +82,24 @@ func TestNameOnlyNoticeCountRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(filepath.Join(folder, "locked.txt"), 0o644) })
+	unreadable := true
 	if f, err := os.Open(filepath.Join(folder, "locked.txt")); err == nil {
 		_ = f.Close()
-		t.Skip("the test user can read a mode-000 file")
+		unreadable = false
 	}
 	setTestUserCache(t)
 	t.Chdir(folder)
 	// zqrowmarker.bin prints by its name; locked.txt is the one file that
 	// could also match.
-	if out, notice := nameOnlyNotice(t, "zqrowmarker"); !strings.HasPrefix(notice, "1 name-only file ") || !strings.Contains(out, "zqrowmarker.bin") {
+	out, notice := nameOnlyNotice(t, "zqrowmarker")
+	if !strings.Contains(out, "zqrowmarker.bin") {
+		t.Fatalf("want zqrowmarker.bin printed by its name:\n%s", out)
+	}
+	if unreadable && !strings.HasPrefix(notice, "1 name-only file ") {
 		t.Fatalf("want the unreadable file counted once and nothing else:\n%s", out)
+	}
+	if !unreadable && (notice != "" || !strings.Contains(out, "## locked.txt (")) {
+		t.Fatalf("want the readable mode-000 file printed and no file counted:\n%s", out)
 	}
 }
 

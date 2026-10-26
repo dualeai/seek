@@ -1,12 +1,10 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 // TestIndexFolderDocumentsDelta_FallsBackOnOversizePayload checks the payload
@@ -29,9 +27,7 @@ import (
 //
 // The test uses the real folder pipeline and mocks no changed documents.
 func TestIndexFolderDocumentsDelta_FallsBackOnOversizePayload(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+	requireTools(t)
 	for _, dropManifest := range []bool{false, true} {
 		t.Run(fmt.Sprintf("drop manifest %t", dropManifest), func(t *testing.T) {
 			checkOversizePayloadFallsBack(t, dropManifest)
@@ -46,7 +42,7 @@ func checkOversizePayloadFallsBack(t *testing.T, dropManifest bool) {
 	const testBudget int64 = 4 * 1024 * 1024 // 4 MiB → window = 2 MiB
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
-	defer goroutineLeakGuard(t, 60*time.Second)()
+	defer goroutineLeakGuard(t)()
 
 	root := t.TempDir()
 	const fileCount = 8
@@ -65,9 +61,7 @@ func checkOversizePayloadFallsBack(t *testing.T, dropManifest bool) {
 	}
 
 	plan := planSynthCorpus(t, root)
-
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
+	ctx := t.Context()
 
 	// First pass — establishes initial shards + manifest.
 	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {

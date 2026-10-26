@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -167,19 +168,24 @@ func TestRun_WarnsOnlyForUnindexedExactFiles(t *testing.T) {
 		expectWarnings(t, got, nulFile)
 	})
 
-	t.Run("wrong-case operands on a case-insensitive file system", func(t *testing.T) {
-		probe := filepath.Join(t.TempDir(), "Probe.bin")
-		writeFileAt(t, filepath.Dir(probe), filepath.Base(probe), "x")
-		if _, err := os.Stat(filepath.Join(filepath.Dir(probe), "probe.bin")); err != nil {
-			t.Skip("the file system is case-sensitive")
-		}
+	// A case-insensitive file system maps each operand to Upper.bin. A
+	// case-sensitive one has no upper.bin: each operand does not resolve.
+	t.Run("wrong-case operands", func(t *testing.T) {
 		setTestUserCache(t)
 		folder := t.TempDir()
 		writeFileAt(t, folder, "Upper.bin", nul)
 		typed := filepath.Join(folder, "upper.bin")
-		expectWarnings(t, runCapturingWarnings(t, t.TempDir(), absent, []string{typed}), typed)
-
 		repo := initGitRepoNoRemote(t, "Upper.bin", nul)
+		if _, err := os.Stat(typed); err != nil {
+			for _, run := range []struct{ dir, operand string }{{t.TempDir(), typed}, {repo, "upper.bin"}} {
+				_, err := searchFrom(t, run.dir, absent, []string{run.operand})
+				if want := "seek: path does not exist: " + strconv.Quote(run.operand); err == nil || formatCLIError(err) != want {
+					t.Fatalf("err=%v, want %q", err, want)
+				}
+			}
+			return
+		}
+		expectWarnings(t, runCapturingWarnings(t, t.TempDir(), absent, []string{typed}), typed)
 		expectWarnings(t, runCapturingWarnings(t, repo, absent, []string{"upper.bin"}), filepath.Join(repo, "Upper.bin"))
 	})
 

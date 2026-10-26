@@ -27,7 +27,7 @@ func TestResolveOperands(t *testing.T) {
 	repoX := f.GitRepo("repoX", "x.txt", "x\n")
 	link := filepath.Join(repoX, "link")
 	if err := os.Symlink(filepath.Join(repoY, "sub"), link); err != nil {
-		t.Skipf("symlink unsupported: %v", err)
+		t.Fatal(err)
 	}
 
 	// A symlinked .git: Git follows it, so the repository owns its files.
@@ -148,20 +148,20 @@ func TestFailureClasses(t *testing.T) {
 			if strings.Contains(tc.name, "unreadable objects") {
 				// Git says "not a git repository"; the file-system rule still
 				// rejects it, so its config is never shown.
-				if os.Geteuid() == 0 {
-					t.Skip("root reads a mode-000 directory")
-				}
 				objects := filepath.Join(bare, "objects")
 				if err := os.Chmod(objects, 0); err != nil {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() { _ = os.Chmod(objects, 0o755) })
+				if _, err := os.ReadDir(objects); err == nil {
+					t.Fatal("the test user lists a mode-000 directory, so Git can read the objects")
+				}
 			}
 			if strings.Contains(tc.name, "dubious owner") {
 				// Git refuses the repository; it stays a Git directory.
 				t.Setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
 				if err := exec.Command("git", "-C", bare, "rev-parse").Run(); err == nil {
-					t.Skip("the installed Git ignores GIT_TEST_ASSUME_DIFFERENT_OWNER")
+					t.Fatal("the installed Git ignores GIT_TEST_ASSUME_DIFFERENT_OWNER, so it accepts the repository")
 				}
 			}
 			setTestUserCache(t)
@@ -192,9 +192,6 @@ func TestFailureClasses(t *testing.T) {
 			// The start operand exists but cannot be read.
 			name: "cwd mode 000",
 			setup: func(t *testing.T, f *graphFixture) ([]string, string) {
-				if os.Geteuid() == 0 {
-					t.Skip("root reads a mode-000 directory")
-				}
 				locked := f.path("locked")
 				f.graphFile("locked/a.txt", nodeMarker)
 				t.Chdir(locked)
@@ -202,6 +199,9 @@ func TestFailureClasses(t *testing.T) {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+				if _, err := os.ReadDir(locked); err == nil {
+					t.Fatal("the test user lists a mode-000 directory, so the node cannot fail")
+				}
 				return []string{"."}, "."
 			},
 		},
@@ -210,9 +210,6 @@ func TestFailureClasses(t *testing.T) {
 			// process; the warning names the canonical path.
 			name: "operand mode 000",
 			setup: func(t *testing.T, f *graphFixture) ([]string, string) {
-				if os.Geteuid() == 0 {
-					t.Skip("root reads a mode-000 directory")
-				}
 				locked := f.path("locked")
 				f.graphFile("locked/a.txt", nodeMarker)
 				f.graphFile("plain/b.txt", nodeMarker)
@@ -220,6 +217,9 @@ func TestFailureClasses(t *testing.T) {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+				if _, err := os.ReadDir(locked); err == nil {
+					t.Fatal("the test user lists a mode-000 directory, so the node cannot fail")
+				}
 				return []string{locked, f.path("plain")}, canonicalCorpusPath(locked)
 			},
 			found: []string{"plain/b.txt"},
@@ -229,9 +229,6 @@ func TestFailureClasses(t *testing.T) {
 			// A folder operand that cannot be listed fails its node.
 			name: "folder operand mode 0311",
 			setup: func(t *testing.T, f *graphFixture) ([]string, string) {
-				if os.Geteuid() == 0 {
-					t.Skip("root lists a mode-0311 directory")
-				}
 				noRead := f.path("noread")
 				f.graphFile("noread/a.txt", nodeMarker)
 				f.graphFile("plain/b.txt", nodeMarker)
@@ -239,6 +236,9 @@ func TestFailureClasses(t *testing.T) {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() { _ = os.Chmod(noRead, 0o755) })
+				if _, err := os.ReadDir(noRead); err == nil {
+					t.Fatal("the test user lists a mode-0311 directory, so the node cannot fail")
+				}
 				return []string{noRead, f.path("plain")}, noRead
 			},
 			found: []string{"plain/b.txt"},
@@ -247,9 +247,6 @@ func TestFailureClasses(t *testing.T) {
 			// A file operand that cannot be read fails its node.
 			name: "file operand mode 000",
 			setup: func(t *testing.T, f *graphFixture) ([]string, string) {
-				if os.Geteuid() == 0 {
-					t.Skip("root reads a mode-000 file")
-				}
 				locked := f.path("d/locked.txt")
 				f.graphFile("d/locked.txt", nodeMarker)
 				f.graphFile("plain/b.txt", nodeMarker)
@@ -257,6 +254,9 @@ func TestFailureClasses(t *testing.T) {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() { _ = os.Chmod(locked, 0o644) })
+				if _, err := os.ReadFile(locked); err == nil {
+					t.Fatal("the test user reads a mode-000 file, so the node cannot fail")
+				}
 				return []string{locked, f.path("plain")}, locked
 			},
 			found: []string{"plain/b.txt"},
@@ -269,7 +269,7 @@ func TestFailureClasses(t *testing.T) {
 				writeFixtureFile(t, filepath.Join(repo, "secret.env"), nodeMarker)
 				t.Setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
 				if err := exec.Command("git", "-C", repo, "status").Run(); err == nil {
-					t.Skip("the installed Git ignores GIT_TEST_ASSUME_DIFFERENT_OWNER")
+					t.Fatal("the installed Git ignores GIT_TEST_ASSUME_DIFFERENT_OWNER, so it accepts the repository")
 				}
 				return []string{repo}, repo
 			},
@@ -327,7 +327,7 @@ func TestFailureClasses(t *testing.T) {
 				writeFixtureFile(t, filepath.Join(repo, "sub", "secret.env"), nodeMarker)
 				t.Setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
 				if err := exec.Command("git", "-C", repo, "status").Run(); err == nil {
-					t.Skip("the installed Git ignores GIT_TEST_ASSUME_DIFFERENT_OWNER")
+					t.Fatal("the installed Git ignores GIT_TEST_ASSUME_DIFFERENT_OWNER, so it accepts the repository")
 				}
 				return []string{filepath.Join(repo, "sub")}, repo
 			},
@@ -373,9 +373,6 @@ func TestFailureClasses(t *testing.T) {
 		want  string
 	}{
 		{name: "cache directory cannot be written", setup: func(t *testing.T, f *graphFixture) {
-			if os.Geteuid() == 0 {
-				t.Skip("root writes a mode-555 directory")
-			}
 			cache := f.path("ro-cache")
 			if err := os.MkdirAll(cache, 0o755); err != nil {
 				t.Fatal(err)
@@ -385,6 +382,11 @@ func TestFailureClasses(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = os.Chmod(cache, 0o755) })
+			probe := filepath.Join(cache, "probe")
+			if err := os.WriteFile(probe, nil, 0o644); err == nil {
+				_ = os.Remove(probe)
+				t.Fatal("the test user adds a file to a mode-0555 directory, so the cache can be written")
+			}
 		}, want: "cache directory"},
 		{name: "no cache location", setup: func(t *testing.T, f *graphFixture) {
 			t.Setenv("SEEK_CACHE_DIR", "")
@@ -423,15 +425,15 @@ func TestFailureClasses(t *testing.T) {
 		{
 			name: "unreadable .git",
 			setup: func(t *testing.T, f *graphFixture, project string) {
-				if os.Geteuid() == 0 {
-					t.Skip("root reads a mode-000 directory")
-				}
 				gitRunIn(t, f.root, "init", "-q", project)
 				gitDir := filepath.Join(project, ".git")
 				if err := os.Chmod(gitDir, 0); err != nil {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() { _ = os.Chmod(gitDir, 0o755) })
+				if _, err := os.ReadDir(gitDir); err == nil {
+					t.Fatal("the test user lists a mode-000 directory, so Git can read the repository")
+				}
 			},
 			warn:   true,
 			absent: "folder/project/node_modules/dep.js",
@@ -442,7 +444,7 @@ func TestFailureClasses(t *testing.T) {
 				gitRunIn(t, f.root, "init", "-q", project)
 				t.Setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
 				if err := exec.Command("git", "-C", project, "status").Run(); err == nil {
-					t.Skip("the installed Git ignores GIT_TEST_ASSUME_DIFFERENT_OWNER")
+					t.Fatal("the installed Git ignores GIT_TEST_ASSUME_DIFFERENT_OWNER, so it accepts the repository")
 				}
 			},
 			warn:   true,

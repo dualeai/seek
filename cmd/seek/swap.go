@@ -395,10 +395,6 @@ func seedFamilyFiles(buildDir string, srcs []string) error {
 
 var buildDirCounter atomic.Uint64
 
-// afterAsideBeforeRenameHook lets tests pause publication after the live
-// shards move aside and before the rename. It is nil in production.
-var afterAsideBeforeRenameHook func()
-
 // newBuildDir creates a unique temporary directory under indexDir. This keeps
 // publication renames on one filesystem. Maintenance scans skip the dot prefix.
 func newBuildDir(indexDir string) (string, error) {
@@ -518,10 +514,6 @@ func swapFiles(indexDir, buildDir string, live, incoming []string) (published []
 			return rollBack(fmt.Errorf("move live shard %s aside: %w", f, err))
 		}
 		moved = append(moved, f)
-	}
-	// Let tests pause while the exclusive publish lock protects a partial swap.
-	if afterAsideBeforeRenameHook != nil {
-		afterAsideBeforeRenameHook()
 	}
 	published = make([]string, 0, len(incoming))
 	for _, f := range incoming {

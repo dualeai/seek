@@ -11,7 +11,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/query"
@@ -577,23 +576,23 @@ func TestFullBuildLaterWindowWithNullRecordIsNoCrash(t *testing.T) {
 	go func() {
 		// The channel closes after the write, so the last Finish reads it.
 		defer close(files)
+		large := []byte(strings.Repeat("large text line\n", 200))
 		files <- makeFileContent(t, "small.go", []byte("package small\nfunc Small() {}\n"))
-		files <- makeFileContent(t, "large.txt", []byte(strings.Repeat("large text line\n", 200)))
-		shard := filepath.Join(indexDir, "window_repo_v16.00000.zoekt")
-		for range 500 {
-			if _, err := os.Stat(shard); err == nil {
-				break
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-		writeFixtureFile(t, shard+".meta", "null")
+		files <- makeFileContent(t, "large.txt", large)
+		// The build takes the next document only after it finished the first
+		// window and added large.txt, so the first shard and its record exist
+		// when this send returns. With a parallelism of 3, the second large
+		// document stays in the open window, and no Finish runs before the
+		// channel closes.
+		files <- makeFileContent(t, "large2.txt", large)
+		writeFixtureFile(t, filepath.Join(indexDir, "window_repo_v16.00000.zoekt.meta"), "null")
 	}()
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			t.Fatalf("the full build panicked: %v", recovered)
 		}
 	}()
-	if _, err := indexDocuments(t.Context(), indexDir, "window_repo", source, files, 2); !errors.Is(err, errShardUnloadable) {
+	if _, err := indexDocuments(t.Context(), indexDir, "window_repo", source, files, 3); !errors.Is(err, errShardUnloadable) {
 		t.Fatalf("the build gave %v, want index damage", err)
 	}
 }

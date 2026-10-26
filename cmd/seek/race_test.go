@@ -4,13 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -92,49 +93,45 @@ func TestFix_SharedLockBlocksSearchDuringIndexing(t *testing.T) {
 	if err := lockFileExclusive(holder); err != nil {
 		t.Fatal(err)
 	}
+	_, waiting := captureTestLogsWithSignal(t, slog.LevelWarn, lockWaitPublish, lockPath)
 
-	var sharedAcquiredAt atomic.Int64
-	done := make(chan struct{})
+	var released, acquiredAfterRelease atomic.Bool
+	done := make(chan error, 1)
 
 	// Goroutine tries to acquire shared lock — polls until LOCK_EX released
 	go func() {
-		defer close(done)
 		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 		if err != nil {
+			done <- err
 			return
 		}
 		defer func() {
 			unlockFile(f)
 			_ = f.Close()
 		}()
-		// This polls until LOCK_EX is released
-		if err := acquireReadLock(context.Background(), f); err != nil {
-			return
-		}
-		sharedAcquiredAt.Store(time.Now().UnixNano())
+		err = acquireReadLock(context.Background(), f)
+		acquiredAfterRelease.Store(released.Load())
+		done <- err
 	}()
 
-	// Wait to confirm LOCK_SH is blocked
-	time.Sleep(50 * time.Millisecond)
-	if sharedAcquiredAt.Load() != 0 {
+	// The debug line of the wait shows that LOCK_SH waits while LOCK_EX is
+	// held.
+	select {
+	case <-waiting:
+	case err := <-done:
 		unlockFile(holder)
 		_ = holder.Close()
-		t.Fatal("LOCK_SH should block while LOCK_EX is held")
+		t.Fatalf("LOCK_SH should block while LOCK_EX is held (err=%v)", err)
 	}
 
-	// Release LOCK_EX and record when
-	releaseTime := time.Now().UnixNano()
+	released.Store(true)
 	unlockFile(holder)
 	_ = holder.Close()
 
-	// Wait for goroutine to complete
-	<-done
-
-	acquiredTime := sharedAcquiredAt.Load()
-	if acquiredTime == 0 {
-		t.Fatal("LOCK_SH should have been acquired after LOCK_EX release")
+	if err := <-done; err != nil {
+		t.Fatalf("LOCK_SH should have been acquired after LOCK_EX release: %v", err)
 	}
-	if acquiredTime < releaseTime {
+	if !acquiredAfterRelease.Load() {
 		t.Fatal("LOCK_SH acquired before LOCK_EX was released")
 	}
 }
@@ -213,12 +210,9 @@ func TestFix_ConcurrentSearchDuringReindex_Stress(t *testing.T) {
 		}
 	}()
 
-	for i := range iterations {
-		wg.Add(1)
-		go func(iter int) {
-			defer wg.Done()
+	for range iterations {
+		wg.Go(func() {
 			<-start
-			time.Sleep(time.Duration(1+iter%5) * time.Millisecond)
 			res, err := searchPlannedCorpusForTest(ctx, plan, "always_findable_fix_test")
 			if err != nil {
 				searchErrors.Add(1)
@@ -227,7 +221,7 @@ func TestFix_ConcurrentSearchDuringReindex_Stress(t *testing.T) {
 			if len(res) == 0 {
 				missedContent.Add(1)
 			}
-		}(i)
+		})
 	}
 	close(start)
 	wg.Wait()
@@ -255,16 +249,19 @@ func TestFix_ConcurrentSearchDuringReindex_Stress(t *testing.T) {
 	}
 }
 
-// TestFix_ConcurrentSearchDuringCommittedSwap makes the swap of the committed
-// family (swapFiles moves the live family aside, then renames the new files
-// in) overlap live searches: the builder commits a new file in each
-// iteration, so HEAD moves and each committed build swaps the family. Each
-// concurrent search must find a stable committed marker: the publish lock
-// (LOCK_EX) keeps readers out of the swap, which is not atomic. The other
-// TestFix_* tests only edit the working tree (HEAD stays), so they never test
-// this path. Each swap stays open for 20 ms and the searches run until the
-// last build ends, so a search that does not wait for the publish lock meets
-// the torn family. The test fails when no build swapped the family.
+// TestFix_ConcurrentSearchDuringCommittedSwap holds a read of the node while
+// a new commit builds. Its publish swaps the committed family: swapFiles moves
+// the live family aside, then renames the new files in. The swap is not
+// atomic, so the publish must wait for the read (LOCK_EX against LOCK_SH). The
+// wait writes its debug line before any shard moves. While the publish waits,
+// the held read finds the committed marker. When the read ends, the publish
+// runs and the new commit is searchable. The other TestFix_* tests only edit
+// the working tree (HEAD stays), so they never test this path.
+//
+// The publish must also keep its lock through the swap. Two FIFOs stop it
+// under that lock: the .swapping marker before the first move, and the family
+// manifest after the last move. When the read of the first FIFO ends, the
+// publish runs between the two FIFOs, so a shared lock must fail.
 func TestFix_ConcurrentSearchDuringCommittedSwap(t *testing.T) {
 	requireTools(t)
 	dir := initGitRepo(t, "stable.go", "package main\n// always_committed_marker\n")
@@ -275,84 +272,128 @@ func TestFix_ConcurrentSearchDuringCommittedSwap(t *testing.T) {
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, st, gitCorpusStateHash(paths, st)); err != nil {
 		t.Fatalf("initial committed index: %v", err)
 	}
-
-	var missed, searchErr atomic.Int64
-	var wg sync.WaitGroup
-	start := make(chan struct{})
-	built := make(chan struct{})
-	var swaps atomic.Int32
-	afterAsideBeforeRenameHook = func() {
-		swaps.Add(1)
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Cleanup(func() { afterAsideBeforeRenameHook = nil })
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer close(built)
-		<-start
-		for i := 0; i < 20; i++ {
-			writeTrackedFile(t, dir, fmt.Sprintf("c_%d.go", i), fmt.Sprintf("package main\n// commit_%d\n", i))
-			s, err := gitRepoStateIn(ctx, dir)
-			if err != nil {
-				t.Errorf("read repository state: %v", err)
-				return
-			}
-			_ = runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, s, gitCorpusStateHash(paths, s))
+	markerFIFO := filepath.Join(plan.cacheDir, swappingMarkerFile+".tmp")
+	manifestFIFO := filepath.Join(plan.indexDir, familyManifestFile+".tmp")
+	for _, fifo := range []string{markerFIFO, manifestFIFO} {
+		if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+			t.Fatal(err)
 		}
+	}
+	_, waiting := captureTestLogsWithSignal(t, slog.LevelWarn, lockWaitReaders, filepath.Join(plan.cacheDir, lockFile))
+	read, readCtx, err := openNodeRead(ctx, plan, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTrackedFile(t, dir, "c.go", "package main\n// new_commit_marker\n")
+	s := mustGitRepoStateIn(t, ctx, dir)
+	built := make(chan error, 1)
+	go func() {
+		built <- runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, s, gitCorpusStateHash(paths, s))
 	}()
+	select {
+	case <-waiting:
+	case err := <-built:
+		read.close()
+		t.Fatalf("the build published while a read held the node (err=%v)", err)
+	}
+	marker, err := parseSearchQuery("always_committed_marker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := read.search(readCtx, marker, defaultSearchConfig())
+	read.close()
+	if err != nil || len(files) == 0 {
+		t.Fatalf("the held read lost the committed marker while the publish waited: files=%d err=%v", len(files), err)
+	}
+	if label := readPublishFIFO(t, markerFIFO, built); label != familyCommitted.label() {
+		t.Fatalf(".swapping=%q, want %q", label, familyCommitted.label())
+	}
+	probe, err := os.OpenFile(filepath.Join(plan.cacheDir, lockFile), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockErr := lockFileSharedNB(probe)
+	_ = probe.Close()
+	readPublishFIFO(t, manifestFIFO, built)
+	if err := <-built; err != nil {
+		t.Fatalf("build after the read: %v", err)
+	}
+	if !errors.Is(lockErr, syscall.EWOULDBLOCK) {
+		t.Fatalf("a shared lock during the swap: %v, want EWOULDBLOCK: the publish freed its lock before the swap", lockErr)
+	}
+	if files, err := searchPlannedCorpusForTest(ctx, plan, "new_commit_marker"); err != nil || len(files) == 0 {
+		t.Fatalf("the new commit is not searchable after the publish: files=%d err=%v", len(files), err)
+	}
+}
 
-	for r := 0; r < 24; r++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			for {
-				// Search until the last build ends. The pause leaves moments
-				// with no reader, so a swap can take the publish lock.
-				select {
-				case <-built:
-					return
-				case <-time.After(100 * time.Millisecond):
+// readPublishFIFO opens the FIFO at path and reads it to its end. A build
+// writes the file at path with writeCacheFile, so its open of the FIFO waits
+// for this open: the build stops there. When the read ends, the build has
+// written the file. A build that ends while the FIFO is still at path did not
+// write the file, and the test fails with the build's result. When the build
+// ended after its write, its result goes back on built. A build that skips
+// the write and stops at a later FIFO makes the test wait until the go test
+// timeout.
+func readPublishFIFO(t *testing.T, path string, built chan error) string {
+	t.Helper()
+	type result struct {
+		data []byte
+		err  error
+	}
+	read := make(chan result, 1)
+	go func() {
+		fifo, err := os.Open(path)
+		if err != nil {
+			read <- result{err: err}
+			return
+		}
+		data, err := io.ReadAll(fifo)
+		_ = fifo.Close()
+		read <- result{data: data, err: err}
+	}()
+	var got result
+	select {
+	case got = <-read:
+	case err := <-built:
+		// A build that opened the FIFO renamed it before it ended.
+		if info, statErr := os.Lstat(path); statErr == nil && info.Mode()&os.ModeNamedPipe != 0 {
+			// An open to write ends the open of the read goroutine.
+			go func() {
+				if fifo, openErr := os.OpenFile(path, os.O_WRONLY, 0); openErr == nil {
+					_ = fifo.Close()
 				}
-				res, err := searchPlannedCorpusForTest(ctx, plan, "always_committed_marker")
-				if err != nil {
-					searchErr.Add(1)
-					return
-				}
-				if len(res) == 0 {
-					missed.Add(1)
-				}
-			}
-		}()
+			}()
+			<-read
+			t.Fatalf("the build ended before it wrote %s: %v", filepath.Base(path), err)
+		}
+		built <- err
+		got = <-read
 	}
-	close(start)
-	wg.Wait()
-
-	if swaps.Load() == 0 {
-		t.Fatal("no build swapped the committed family, so the test proves nothing")
+	if got.err != nil {
+		t.Fatalf("read %s: %v", filepath.Base(path), got.err)
 	}
-	if missed.Load() > 0 {
-		t.Errorf("committed shard gap during swap: %d misses (reader saw no committed shards mid-swap)", missed.Load())
-	}
-	if searchErr.Load() > 0 {
-		t.Errorf("%d search errors during committed swap", searchErr.Load())
-	}
+	return string(got.data)
 }
 
 // TestDescriptionReadDuringRepublish_Stress runs description reads in 8
 // readers while commits republish the committed family, one publish per
 // commit. Every read must find the strict hit, a committed file. The test
 // model makes every row a scan hit, so target.go and dirty.go, which hold no
-// query word, are the scan hits of the base and the overlay. A read that binds
-// vectors binds the base and the overlay of one state, so it finds both scan
-// hits; most reads meet a peer's build and read text only, with neither.
+// query word, are the scan hits of the base and the overlay. A read that
+// binds vectors binds the base and the overlay of one state, so it finds both
+// scan hits. A read that meets a peer's build reads text only, with neither.
 // A read that sees the state move (errGitIndexStateChanged) is counted, not
-// failed. The swaps stay open for 20 ms, so a read that does not wait for the
-// publish lock meets the torn family. The test fails when no swap ran or no
-// read found both scan hits. 8 commits keep the run near 30 s with -race:
-// each publish builds vectors.
+// failed. Each reader stops after 2 reads, so a publish that waits for the
+// readers runs.
+//
+// After each publish, the test takes the publish lock and moves the committed
+// family aside. A swap does the same before it renames the new family in. Then
+// two reads start, and a read must wait for the publish lock before it reads,
+// which its debug line shows. A read whose prepare builds the node waits to
+// publish instead, so the test starts two reads. A read that does not wait
+// reads the torn family and finds no committed file. The test fails when that
+// wait is missing or no read found both scan hits. 8 commits keep the run near
+// 20 s with -race: each publish builds vectors.
 func TestDescriptionReadDuringRepublish_Stress(t *testing.T) {
 	requireTools(t)
 	dir := initGitRepo(t, "stable.go", "package main\n// zqstress anchor committed\n")
@@ -379,116 +420,120 @@ func TestDescriptionReadDuringRepublish_Stress(t *testing.T) {
 	if strict, base, overlay := found(hits); err != nil || !strict || !base || !overlay {
 		t.Fatalf("the first read must find the strict and both scan hits: strict=%t base=%t overlay=%t err=%v", strict, base, overlay, err)
 	}
+	_, publishWaits := captureTestLogsWithSignal(t, slog.LevelWarn, lockWaitPublish, filepath.Join(plan.cacheDir, lockFile))
 
-	var swaps atomic.Int32
-	afterAsideBeforeRenameHook = func() {
-		swaps.Add(1)
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Cleanup(func() { afterAsideBeforeRenameHook = nil })
-
-	errs := make(chan error, 1024)
-	// report never blocks: a defect that fails every read must fail the
-	// test, not fill the channel and hang it.
+	var mu sync.Mutex
+	var failures []error
 	report := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		failures = append(failures, err)
+	}
+	var consistent, moved atomic.Int32
+	// read runs one description read, as one command does: it has its own
+	// record of prepared nodes.
+	read := func() {
+		reader := execution
+		reader.opened = &openedNodes{}
+		hits, _, err := retrieveNode(ctx, plan, qp, defaultSearchConfig(), reader)
+		switch strict, base, overlay := found(hits); {
+		case errors.Is(err, errGitIndexStateChanged):
+			moved.Add(1)
+		case err != nil:
+			report(fmt.Errorf("read: %w", err))
+		case !strict:
+			// The committed family holds stable.go in every commit.
+			report(errors.New("a read found no committed file: it read a torn family"))
+		case base && overlay:
+			consistent.Add(1)
+		case base || overlay:
+			report(fmt.Errorf("the read bound one generation of two: base=%t overlay=%t", base, overlay))
+		}
+	}
+	for i := range 8 {
+		writeTrackedFile(t, dir, fmt.Sprintf("c_%d.go", i), fmt.Sprintf("package main\n// commit_%d\n", i))
+		state := mustGitRepoStateIn(t, ctx, dir)
+		preState := gitCorpusStateHash(paths, state)
+		var readers sync.WaitGroup
+		for range 8 {
+			readers.Go(func() {
+				for range 2 {
+					read()
+				}
+			})
+		}
+		// A reader's build can hold the build lock, so this build serves the
+		// current shards. Build until the commit is published, by this build
+		// or a reader's, and wait for the build lock between tries.
+		for readStateFile(plan.cacheDir) != preState {
+			peer, err := (&gitNode{paths: paths}).build(ctx, plan.corpusStore, state, preState, execution)
+			if err != nil {
+				t.Fatalf("build %d: %v", i, err)
+			}
+			if peer {
+				waitForBuildLock(t, plan.cacheDir)
+			}
+		}
+		readers.Wait()
+
+		pub, err := acquirePublishLock(ctx, plan.cacheDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		restore := tearFamily(t, plan, familyCommitted)
+		// Drop the signal of a read that waited and ended before the tear.
 		select {
-		case errs <- err:
+		case <-publishWaits:
 		default:
 		}
-	}
-	built := make(chan struct{})
-	var consistent, moved atomic.Int32
-	var wg sync.WaitGroup
-	wg.Go(func() {
-		defer close(built)
-		for i := range 8 {
-			name := fmt.Sprintf("c_%d.go", i)
-			if err := os.WriteFile(filepath.Join(dir, name), []byte(fmt.Sprintf("package main\n// commit_%d\n", i)), 0o644); err != nil {
-				report(err)
-				return
-			}
-			for _, args := range [][]string{{"add", name}, {"commit", "-q", "-m", name}} {
-				if err := gitRetryIndexLock(dir, args...); err != nil {
-					report(err)
-					return
-				}
-			}
-			state, err := gitRepoStateIn(ctx, dir)
-			if err != nil {
-				report(err)
-				return
-			}
-			// A reader's build can hold the build lock, so this build skips;
-			// build until the commit is published, by this build or a
-			// reader's. The next commit then waits for this publish.
-			preState := gitCorpusStateHash(paths, state)
-			deadline := time.Now().Add(2 * time.Minute)
-			for readStateFile(plan.cacheDir) != preState {
-				if time.Now().After(deadline) {
-					report(fmt.Errorf("commit %d is never published", i))
-					return
-				}
-				if _, err := (&gitNode{paths: paths}).build(ctx, plan.corpusStore, state, preState, execution); err != nil {
-					report(fmt.Errorf("build %d: %w", i, err))
-					return
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
+		ended := make(chan struct{}, 2)
+		for range 2 {
+			go func() {
+				read()
+				ended <- struct{}{}
+			}()
 		}
-	})
-	for range 8 {
-		wg.Go(func() {
-			for {
-				select {
-				case <-built:
-					return
-				case <-time.After(10 * time.Millisecond):
-				}
-				// Each read is one command, so it has its own record of
-				// prepared nodes. A read that meets a peer's build reads
-				// text only.
-				reader := execution
-				reader.opened = &openedNodes{}
-				hits, _, err := retrieveNode(ctx, plan, qp, defaultSearchConfig(), reader)
-				switch strict, base, overlay := found(hits); {
-				case errors.Is(err, errGitIndexStateChanged):
-					moved.Add(1)
-				case err != nil:
-					report(fmt.Errorf("read: %w", err))
-				case !strict:
-					// The committed family holds stable.go in every commit.
-					report(errors.New("a read found no committed file: it read a torn family"))
-				case base && overlay:
-					consistent.Add(1)
-				case base || overlay:
-					report(fmt.Errorf("the read bound one generation of two: base=%t overlay=%t", base, overlay))
-				}
-			}
-		})
+		pending := 2
+		select {
+		case <-publishWaits:
+		case <-ended:
+			pending--
+			report(fmt.Errorf("commit %d: a read ended while the test held the publish lock", i))
+		}
+		restore()
+		releaseLock(pub)
+		for range pending {
+			<-ended
+		}
 	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
+	for _, err := range failures {
 		t.Error(err)
 	}
-	if swaps.Load() == 0 || consistent.Load() == 0 {
-		t.Fatalf("swaps=%d consistent reads=%d moved=%d: the test proves nothing", swaps.Load(), consistent.Load(), moved.Load())
+	if consistent.Load() == 0 {
+		t.Fatalf("consistent reads=%d moved=%d: the test proves nothing", consistent.Load(), moved.Load())
 	}
 }
 
-// gitRetryIndexLock runs git in dir and retries while another git process
-// holds index.lock: a reader's git status takes Git's optional index lock.
-func gitRetryIndexLock(dir string, args ...string) error {
-	for attempt := 0; ; attempt++ {
-		out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
-		if err == nil {
-			return nil
-		}
-		if attempt == 100 || !strings.Contains(string(out), "index.lock") {
-			return fmt.Errorf("git %v: %w: %s", args, err, out)
-		}
-		time.Sleep(10 * time.Millisecond)
+// waitForBuildLock waits until no build holds the build lock of the node in
+// cacheDir. It takes the lock with a blocking flock, so the wait ends when the
+// build that holds the lock ends, and frees it at once.
+func waitForBuildLock(t *testing.T, cacheDir string) {
+	t.Helper()
+	lock, err := os.OpenFile(filepath.Join(cacheDir, buildLockFile), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
 	}
+	for {
+		err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX)
+		if !errors.Is(err, syscall.EINTR) {
+			break
+		}
+	}
+	if err != nil {
+		_ = lock.Close()
+		t.Fatalf("wait for the build lock: %v", err)
+	}
+	releaseLock(lock)
 }
 
 // TestGC_SkipsCorpusWithBuildInProgress verifies that GC honors .build.lock
@@ -519,11 +564,18 @@ func TestGC_SkipsCorpusWithBuildInProgress(t *testing.T) {
 
 // TestEvictionDuringBuildPerKind evicts the node's cache directory during its
 // build, as gc does (a rename to a trash name), and checks the result for
-// each node kind. Git: the publish sees the eviction and the build returns
-// nil; the read finds an index with no shard, which is damage, so the repair
-// prepares the node again in the same command and finds the edit. Folder: the
-// read cannot open its lock, so the node is skipped with a warning and no path
-// is made again; the next search builds again and finds the edit.
+// each node kind. The test holds a lock that the build waits for, evicts the
+// node when the wait writes its debug line, then frees the lock. Git: the
+// first search of the node waits for the build lock. The build then makes the
+// index directory again, and its publish sees the eviction: the build returns
+// nil. The read finds an index with no shard, which is damage. So the repair
+// prepares the node again in the same command and finds the file. Folder: the
+// publish of an edit waits for a read lock. The publish sees the eviction
+// when it checks the index directory under its lock, so it makes no path
+// again. The read cannot open its lock, so the node is skipped with one
+// warning whose cause is that open. A publish that misses the eviction fails
+// the build, and the cause of the skip is then the build's error. The next
+// search builds again and finds the edit.
 func TestEvictionDuringBuildPerKind(t *testing.T) {
 	requireTools(t)
 	for _, kind := range []string{"git", "folder"} {
@@ -538,46 +590,51 @@ func TestEvictionDuringBuildPerKind(t *testing.T) {
 				t.Helper()
 				return seek(t, "--lexical-only", "zqevict", root)
 			}
-			if _, err := search(); err != nil {
-				t.Fatal(err)
-			}
-			writeFileAt(t, root, "a.txt", "zqevict alpha edited\n")
 			plans, err := planCorpora(t.Context(), []string{root})
 			if err != nil || len(plans) != 1 {
 				t.Fatalf("plans=%d err=%v", len(plans), err)
 			}
 			cacheDir := plans[0].cacheDir
-			hook := &folderBuildTestHook
+			var release func()
+			wait, waitLock := lockWaitBuild, filepath.Join(cacheDir, buildLockFile)
 			if kind == "git" {
-				hook = &missingBlobRecheckTestHook
-			}
-			var evicted bool
-			*hook = func() {
-				if !evicted {
-					evicted = os.Rename(cacheDir, cacheDir+".trash") == nil
+				if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+					t.Fatal(err)
 				}
+				lock, held, err := tryBuildLock(cacheDir)
+				if err != nil || !held {
+					t.Fatalf("hold the build lock: held=%t err=%v", held, err)
+				}
+				release = sync.OnceFunc(func() { releaseLock(lock) })
+				t.Cleanup(release)
+			} else {
+				if _, err := search(); err != nil {
+					t.Fatal(err)
+				}
+				writeFileAt(t, root, "a.txt", "zqevict alpha edited\n")
+				release = holdReadLock(t, cacheDir)
+				wait, waitLock = lockWaitReaders, filepath.Join(cacheDir, lockFile)
 			}
-			t.Cleanup(func() { *hook = nil })
-			logs := captureTestLogs(t, slog.LevelWarn)
+			logs, waiting := captureTestLogsWithSignal(t, slog.LevelWarn, wait, waitLock)
+			acted := onLockWait(t, waiting, func() error { return os.Rename(cacheDir, cacheDir+".trash") }, release)
 			before := nodePreparations.Load()
 			out, err := search()
 			preparations := nodePreparations.Load() - before
-			*hook = nil
-			if !evicted {
-				t.Fatal("the hook did not evict the node")
-			}
+			lockWaitActed(t, acted)
 			var skipped, damage int
+			var causes []string
 			for _, record := range logs.Records() {
 				switch {
 				case strings.Contains(record.Message, "Skipped a search node"):
 					skipped++
+					causes = append(causes, fmt.Sprint(testLogAttrs(record)["cause"]))
 				case strings.Contains(record.Message, "Index damage detected"):
 					damage++
 				}
 			}
 			switch kind {
 			case "git":
-				if err != nil || !strings.Contains(out, "edited") || preparations != 2 || damage != 1 || skipped != 0 {
+				if err != nil || !strings.Contains(out, "zqevict alpha") || preparations != 2 || damage != 1 || skipped != 0 {
 					t.Fatalf("git: err=%v preparations=%d damage=%d skipped=%d output:\n%s", err, preparations, damage, skipped, out)
 				}
 				if _, err := os.Stat(filepath.Join(cacheDir, lockFile)); err != nil {
@@ -585,8 +642,8 @@ func TestEvictionDuringBuildPerKind(t *testing.T) {
 				}
 			case "folder":
 				_, lockErr := os.Stat(filepath.Join(cacheDir, lockFile))
-				if skipped != 1 || !os.IsNotExist(lockErr) {
-					t.Fatalf("folder: err=%v skipped=%d lock=%v output:\n%s", err, skipped, lockErr, out)
+				if skipped != 1 || !strings.Contains(causes[0], "open search lock") || !os.IsNotExist(lockErr) {
+					t.Fatalf("folder: err=%v skipped=%d causes=%q lock=%v output:\n%s", err, skipped, causes, lockErr, out)
 				}
 				if out, err = search(); err != nil || !strings.Contains(out, "edited") {
 					t.Fatalf("the next search must find the edit: err=%v output:\n%s", err, out)

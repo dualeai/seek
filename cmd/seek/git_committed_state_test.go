@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
-	"time"
 )
 
 func TestCommittedGitStateEncodingAndDamage(t *testing.T) {
@@ -256,7 +255,8 @@ exec "$SEEK_TEST_REAL_GIT" "$@"
 // TestWarmSearchReadsNoCommittedState replaces the committed state of a built
 // node with a FIFO. A warm search that opened it for reading would wait for a
 // writer, so the search must end with no read of it: only a committed build
-// reads the state, to admit a delta.
+// reads the state, to admit a delta. A search that waits stops the test at
+// the go test timeout.
 func TestWarmSearchReadsNoCommittedState(t *testing.T) {
 	requireTools(t)
 	dir := initGitRepo(t, "warm.go", "package warm\n// warm_state_marker\n")
@@ -283,30 +283,7 @@ func TestWarmSearchReadsNoCommittedState(t *testing.T) {
 	if err := syscall.Mkfifo(statePath, 0o644); err != nil {
 		t.Fatal(err)
 	}
-
-	done := make(chan error, 1)
-	go func() {
-		_, err := search()
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("warm search: %v", err)
-		}
-	case <-time.After(30 * time.Second):
-		// Each read of the FIFO waits for a writer, and the search can read it
-		// more than once. A non-blocking open for writing ends each blocked
-		// read, and it fails at once when no read waits, so the test ends.
-		for {
-			if writer, err := os.OpenFile(statePath, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
-				_ = writer.Close()
-			}
-			select {
-			case err := <-done:
-				t.Fatalf("the warm search opened the committed state (error=%v)", err)
-			case <-time.After(50 * time.Millisecond):
-			}
-		}
+	if out, err := search(); err != nil {
+		t.Fatalf("warm search: %v\n%s", err, out)
 	}
 }

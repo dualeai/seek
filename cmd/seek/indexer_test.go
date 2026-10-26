@@ -73,7 +73,7 @@ func TestFallbackGitRepositoryName_StableOpaqueAndShardSafe(t *testing.T) {
 
 	link := filepath.Join(t.TempDir(), "repo-link")
 	if err := os.Symlink(root, link); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
+		t.Fatal(err)
 	}
 	if got := fallbackGitRepositoryName(link); got != name {
 		t.Fatalf("fallback name should use canonical path: symlink=%q root=%q", got, name)
@@ -567,9 +567,6 @@ func TestShardsExist_NonexistentDir(t *testing.T) {
 // --- checkCtags detection tests ---
 
 func TestCheckCtags_CTAGS_COMMAND_Executable(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("temporary executable fixture requires a Unix executable file")
-	}
 	ctags := writeCtagsTestExecutable(t, t.TempDir(), "configured-ctags", "#!/bin/sh\nexit 0\n")
 	t.Setenv("CTAGS_COMMAND", ctags)
 	t.Setenv("PATH", t.TempDir())
@@ -579,9 +576,6 @@ func TestCheckCtags_CTAGS_COMMAND_Executable(t *testing.T) {
 }
 
 func TestCheckCtags_CTAGS_COMMAND_TakesPrecedence(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("temporary executable fixture requires a Unix executable file")
-	}
 	binDir := t.TempDir()
 	fallback := filepath.Join(binDir, "universal-ctags")
 	if err := os.WriteFile(fallback, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
@@ -598,9 +592,6 @@ func TestCheckCtags_CTAGS_COMMAND_TakesPrecedence(t *testing.T) {
 }
 
 func TestCheckCtags_CTAGS_COMMAND_NonExecutable(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Unix executable permissions are not available")
-	}
 	command := filepath.Join(t.TempDir(), "ctags")
 	if err := os.WriteFile(command, []byte("not executable\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -624,9 +615,6 @@ func TestCheckCtags_MissingReturnsTypedError(t *testing.T) {
 }
 
 func TestCheckCtags_FindsUniversalCtagsNameOnPATH(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("temporary executable fixture requires a Unix executable file")
-	}
 	binDir := t.TempDir()
 	writeCtagsTestExecutable(t, binDir, "universal-ctags", "#!/bin/sh\nexit 0\n")
 	t.Setenv("CTAGS_COMMAND", "")
@@ -640,9 +628,6 @@ func TestCheckCtags_FindsUniversalCtagsNameOnPATH(t *testing.T) {
 }
 
 func TestCheckCtags_AcceptsVerifiedCtagsFallbackFromPATH(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("temporary executable fixture requires a Unix executable file")
-	}
 	binDir := t.TempDir()
 	ctags := writeCtagsTestExecutable(t, binDir, "ctags", "#!/bin/sh\nprintf '%s\\n' 'Universal Ctags 6.0'\n")
 	t.Setenv("CTAGS_COMMAND", "")
@@ -657,9 +642,6 @@ func TestCheckCtags_AcceptsVerifiedCtagsFallbackFromPATH(t *testing.T) {
 }
 
 func TestCheckCtags_FallbackVersionFailureReturnsTypedError(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("temporary executable fixture requires a Unix executable file")
-	}
 	binDir := t.TempDir()
 	writeCtagsTestExecutable(t, binDir, "ctags", "#!/bin/sh\nexit 7\n")
 	t.Setenv("CTAGS_COMMAND", "")
@@ -890,7 +872,7 @@ func TestIndexBuildOptions_SizeMaxIsTheContentLimit(t *testing.T) {
 func requireGit(tb testing.TB) {
 	tb.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
-		tb.Skip("requires git on PATH")
+		tb.Fatal("requires git on PATH")
 	}
 }
 
@@ -1079,13 +1061,17 @@ func TestStreamDirtyFiles_HighParallelism(t *testing.T) {
 }
 
 func TestStreamDirtyFiles_PermissionDenied(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("test requires non-root user")
-	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "secret.go")
 	_ = os.WriteFile(path, []byte("secret"), 0o000)
 	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	// Root opens the mode-000 file, so for root the reader keeps its
+	// content as for any readable file.
+	unreadable := true
+	if file, err := os.Open(path); err == nil {
+		_ = file.Close()
+		unreadable = false
+	}
 
 	_ = os.WriteFile(filepath.Join(dir, "ok.go"), []byte("ok"), 0o644)
 
@@ -1101,8 +1087,12 @@ func TestStreamDirtyFiles_PermissionDenied(t *testing.T) {
 				t.Errorf("ok.go content=%q", result.content)
 			}
 		case "secret.go":
-			if len(result.content) != 0 || result.skipReason != seekNoBytesReason {
-				t.Errorf("secret.go is not name-only: %+v", result)
+			if unreadable {
+				if len(result.content) != 0 || result.skipReason != seekNoBytesReason {
+					t.Errorf("secret.go is not name-only: %+v", result)
+				}
+			} else if string(result.content) != "secret" {
+				t.Errorf("secret.go content=%q, want the content that root reads", result.content)
 			}
 		default:
 			t.Errorf("unexpected result %s", result.name)
@@ -1887,6 +1877,12 @@ func TestRepoStateFingerprint_ManyFilesDeterministicAndSensitive(t *testing.T) {
 		files[i] = name
 		_ = os.WriteFile(filepath.Join(dir, name), []byte(fmt.Sprintf("package f%d\n", i)), 0o644)
 	}
+	// An old mtime makes sure that the edit below gives a new mtime.
+	edited := filepath.Join(dir, files[n/2])
+	initialTime := time.Unix(1_700_000_000, 0)
+	if err := os.Chtimes(edited, initialTime, initialTime); err != nil {
+		t.Fatal(err)
+	}
 
 	state := repoState{
 		RawOutput: "# branch.oid abc\x00",
@@ -1899,8 +1895,7 @@ func TestRepoStateFingerprint_ManyFilesDeterministicAndSensitive(t *testing.T) {
 		t.Error("fingerprint not deterministic with 100 files")
 	}
 
-	time.Sleep(10 * time.Millisecond)
-	if err := os.WriteFile(filepath.Join(dir, files[n/2]), []byte("changed\n"), 0o644); err != nil {
+	if err := os.WriteFile(edited, []byte("changed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	changed := repoStateFingerprint(dir, state)
@@ -1911,7 +1906,13 @@ func TestRepoStateFingerprint_ManyFilesDeterministicAndSensitive(t *testing.T) {
 
 func TestRepoStateFingerprint_MixedDeletedAndExistingIsSensitive(t *testing.T) {
 	dir := t.TempDir()
-	_ = os.WriteFile(filepath.Join(dir, "exists.go"), []byte("x"), 0o644)
+	exists := filepath.Join(dir, "exists.go")
+	_ = os.WriteFile(exists, []byte("x"), 0o644)
+	// An old mtime makes sure that the edit below gives a new mtime.
+	initialTime := time.Unix(1_700_000_000, 0)
+	if err := os.Chtimes(exists, initialTime, initialTime); err != nil {
+		t.Fatal(err)
+	}
 	// "gone.go" does not exist
 
 	state := repoState{
@@ -1933,8 +1934,7 @@ func TestRepoStateFingerprint_MixedDeletedAndExistingIsSensitive(t *testing.T) {
 		t.Fatal("expected restoring a deleted file to change the fingerprint")
 	}
 
-	time.Sleep(10 * time.Millisecond)
-	if err := os.WriteFile(filepath.Join(dir, "exists.go"), []byte("changed\n"), 0o644); err != nil {
+	if err := os.WriteFile(exists, []byte("changed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	withChangedExistingFile := repoStateFingerprint(dir, state)
@@ -2011,7 +2011,7 @@ func TestRepoStateFingerprint_SymlinkInFingerprint(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(target, link); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
+		t.Fatal(err)
 	}
 
 	state := repoState{
@@ -2359,10 +2359,6 @@ func TestFileReadWorkerCount(t *testing.T) {
 }
 
 func TestStreamingMemoryBounded(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping memory stress test in short mode")
-	}
-
 	dir := t.TempDir()
 	const numFiles = 50
 	const fileSize = 5 * 1024 * 1024 // 5 MB each → 250 MB total on disk
@@ -2402,10 +2398,6 @@ func TestStreamingMemoryBounded(t *testing.T) {
 }
 
 func TestStreamingMemoryDoesNotScaleWithInput(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping memory scaling test in short mode")
-	}
-
 	const fileSize = 5 * 1024 * 1024 // 5 MB per file
 	const parallelism = 4
 

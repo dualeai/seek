@@ -35,6 +35,19 @@ func requireTools(tb testing.TB) {
 	}
 }
 
+// requireMissingOperand searches operand, which names no file, and requires
+// exit 2 with the missing-path error. On a case-sensitive file system, an
+// operand typed in another letter case names no file, and Seek never maps it
+// to the file on disk.
+func requireMissingOperand(t *testing.T, operand string) {
+	t.Helper()
+	err := seekRoot(t.Context(), t, nil, "--lexical-only", "zqmissingoperand", operand)
+	want := "seek: path does not exist: " + strconv.Quote(operand)
+	if code, got := exitCodeForError(err), formatCLIError(err); code != 2 || got != want {
+		t.Fatalf("operand %q: exit=%d message=%q, want exit 2 and %q", operand, code, got, want)
+	}
+}
+
 func initEmptyGitRepo(tb testing.TB) string {
 	tb.Helper()
 	dir := initEmptyGitRepoNoRemote(tb)
@@ -196,21 +209,11 @@ func runSeekInRepo(t *testing.T, repoDir, pattern string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return formattedOutputFileNamesForTest(out), nil
-}
-
-func formattedOutputFileNamesForTest(output string) []string {
 	var fileNames []string
-	for _, line := range strings.Split(output, "\n") {
-		if !strings.HasPrefix(line, "## ") {
-			continue
-		}
-		header := strings.TrimPrefix(line, "## ")
-		if name, _, ok := strings.Cut(header, " ("); ok {
-			fileNames = append(fileNames, name)
-		}
+	for _, result := range printedResults(out) {
+		fileNames = append(fileNames, result.path)
 	}
-	return fileNames
+	return fileNames, nil
 }
 
 // runSeekInPlannedGitCorpus is a white-box helper for tests and benchmarks that
@@ -1839,7 +1842,7 @@ func TestRun_SymlinkPathOperandFollowsTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(target, link); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
+		t.Fatal(err)
 	}
 
 	setTestUserCache(t)
@@ -1875,7 +1878,7 @@ func TestRun_ExternalFolderSymlinkDedupesWithTarget(t *testing.T) {
 	}
 	link := filepath.Join(root, "link")
 	if err := os.Symlink(targetDir, link); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
+		t.Fatal(err)
 	}
 
 	setTestUserCache(t)
@@ -1900,7 +1903,7 @@ func TestRun_ExternalFolderWalkSkipsDiscoveredSymlinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(target, link); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
+		t.Fatal(err)
 	}
 
 	setTestUserCache(t)
@@ -1924,7 +1927,7 @@ func TestRun_SymlinkInsideWorktreeSearchesResolvedFile(t *testing.T) {
 	dir := initScopedGitRepo(t, "git_symlink_inside_marker")
 	link := filepath.Join(dir, "a-link")
 	if err := os.Symlink(filepath.Join(dir, "a", "app.go"), link); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
+		t.Fatal(err)
 	}
 
 	setTestUserCache(t)
@@ -1954,7 +1957,7 @@ func TestRun_GitScopeSymlinkOutsideWorktreeRoutedExternal(t *testing.T) {
 	}
 	link := filepath.Join(dir, "outside-link")
 	if err := os.Symlink(externalFile, link); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
+		t.Fatal(err)
 	}
 
 	setTestUserCache(t)
@@ -2110,7 +2113,7 @@ func TestRun_EmptyNativeGitSnapshotsDoNotRequireCtags(t *testing.T) {
 				dir := t.TempDir()
 				cmd := exec.Command("git", "init", "--object-format=sha256", dir)
 				if out, err := cmd.CombinedOutput(); err != nil {
-					t.Skipf("installed Git does not support SHA-256 repositories: %v: %s", err, out)
+					t.Fatalf("the installed Git cannot make a SHA-256 repository: %v: %s", err, out)
 				}
 				gitRun(t, dir, "config", "user.email", "test@test.com")
 				gitRun(t, dir, "config", "user.name", "Test")
@@ -3073,20 +3076,21 @@ func TestRun_TrackedAndIgnoredFileOperandsBothSearchedOnce(t *testing.T) {
 }
 
 // On a case-insensitive filesystem, a file operand with different letter case
-// must resolve to the on-disk name used by the Git corpus scope.
+// must resolve to the on-disk name used by the Git corpus scope. On a
+// case-sensitive filesystem, the other letter case names no file.
 func TestRun_CaseMismatchedFileOperandStillFound(t *testing.T) {
 	requireTools(t)
 
 	repo := initGitRepo(t, "readme.md", "MARKER_CASE_FIX\n")
-	// On a case-sensitive filesystem, the other letter case is a different
-	// path.
-	if _, err := os.Stat(filepath.Join(repo, "README.md")); err != nil {
-		t.Skip("case-sensitive filesystem; mistyped operand cannot resolve")
-	}
 	setTestUserCache(t)
 	t.Chdir(repo)
+	mistyped := filepath.Join(repo, "README.md")
+	if _, err := os.Stat(mistyped); err != nil {
+		requireMissingOperand(t, mistyped)
+		return
+	}
 
-	out, err := seek(t, "--lexical-only", "MARKER_CASE_FIX", filepath.Join(repo, "README.md"))
+	out, err := seek(t, "--lexical-only", "MARKER_CASE_FIX", mistyped)
 	if err != nil {
 		t.Fatalf("case-mismatched file operand should be found through the Git corpus: %v", err)
 	}
@@ -3243,31 +3247,14 @@ func TestRun_ScopedSearchesShareCommittedIndex(t *testing.T) {
 	}
 }
 
-// resultFileBasenames extracts the set of file basenames from seek's output
-// headers ("## <path> (<Lang>)[ [uncommitted]]"). A scoped header starts with
-// the operand as typed, and an unscoped header is repo-relative, so the tests
-// compare basenames (unique per file in the equivalence fixtures).
-func resultFileBasenames(out string) map[string]bool {
-	set := map[string]bool{}
-	for _, line := range strings.Split(out, "\n") {
-		if !strings.HasPrefix(line, "## ") {
-			continue
-		}
-		rest := strings.TrimPrefix(line, "## ")
-		if i := strings.Index(rest, " ("); i >= 0 {
-			rest = rest[:i]
-		}
-		set[filepath.Base(strings.TrimSpace(rest))] = true
-	}
-	return set
-}
-
 // TestScoped_EqualsUnscopedIntersectScope checks that a scoped result set is
 // the unscoped result set limited to that scope. For six query forms (a word,
 // content:, lang:, file:, type:file, and sym:), it compares the scoped and the
 // unscoped result files with expected lists. The fixture holds committed,
 // modified, deleted, untracked, and renamed files, plus a matching sibling
-// outside the scope.
+// outside the scope. A scoped header starts with the operand as typed, and an
+// unscoped header is repo-relative. So the test compares basenames, which are
+// unique in the fixture.
 func TestScoped_EqualsUnscopedIntersectScope(t *testing.T) {
 	requireTools(t)
 
@@ -3292,6 +3279,13 @@ func TestScoped_EqualsUnscopedIntersectScope(t *testing.T) {
 
 	setTestUserCache(t)
 	t.Chdir(repo)
+	basenames := func(out string) map[string]bool {
+		set := map[string]bool{}
+		for _, path := range headerPaths(out) {
+			set[filepath.Base(path)] = true
+		}
+		return set
+	}
 
 	cases := []struct {
 		name           string
@@ -3361,8 +3355,8 @@ func TestScoped_EqualsUnscopedIntersectScope(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unscoped search %q: %v", tc.query, err)
 			}
-			scoped := resultFileBasenames(scopedOut)
-			unscoped := resultFileBasenames(unscopedOut)
+			scoped := basenames(scopedOut)
+			unscoped := basenames(unscopedOut)
 			for _, f := range tc.scopedHave {
 				if !scoped[f] {
 					t.Errorf("query %q: scoped missing in-scope %q\n%s", tc.query, f, scopedOut)
@@ -3387,30 +3381,9 @@ func TestScoped_EqualsUnscopedIntersectScope(t *testing.T) {
 	}
 }
 
-// resultFileOrder returns result-header basenames in output (rank) order,
-// de-duplicated keeping first occurrence.
-func resultFileOrder(out string) []string {
-	var order []string
-	seen := map[string]bool{}
-	for _, line := range strings.Split(out, "\n") {
-		if !strings.HasPrefix(line, "## ") {
-			continue
-		}
-		rest := strings.TrimPrefix(line, "## ")
-		if i := strings.Index(rest, " ("); i >= 0 {
-			rest = rest[:i]
-		}
-		base := filepath.Base(strings.TrimSpace(rest))
-		if !seen[base] {
-			seen[base] = true
-			order = append(order, base)
-		}
-	}
-	return order
-}
-
 // Because scoped and unscoped searches read the same combined shards, scoped
-// ranking equals unscoped ranking restricted to the scope.
+// ranking equals unscoped ranking restricted to the scope. The test compares
+// the basenames of the result headers in print (rank) order.
 func TestScoped_RankingEqualsUnscopedIntersectScope(t *testing.T) {
 	requireTools(t)
 
@@ -3434,10 +3407,17 @@ func TestScoped_RankingEqualsUnscopedIntersectScope(t *testing.T) {
 		t.Fatalf("unscoped search: %v", err)
 	}
 
-	scopedOrder := resultFileOrder(scopedOut)
+	resultOrder := func(out string) []string {
+		var order []string
+		for _, result := range printedResults(out) {
+			order = append(order, filepath.Base(result.path))
+		}
+		return order
+	}
+	scopedOrder := resultOrder(scopedOut)
 	inScope := map[string]bool{"many.go": true, "few.go": true, "mid.go": true}
 	var unscopedInScope []string
-	for _, f := range resultFileOrder(unscopedOut) {
+	for _, f := range resultOrder(unscopedOut) {
 		if inScope[f] {
 			unscopedInScope = append(unscopedInScope, f)
 		}
@@ -3467,7 +3447,11 @@ func TestScoped_FileOperandRegexpEqualsFileNameSet(t *testing.T) {
 		if err != nil {
 			t.Fatalf("file-operand search: %v", err)
 		}
-		return resultFileBasenames(out)
+		set := map[string]bool{}
+		for _, path := range headerPaths(out) {
+			set[filepath.Base(path)] = true
+		}
+		return set
 	}
 
 	old := maxRegexpFileOperands

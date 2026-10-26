@@ -1,13 +1,11 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 // TestReadUncommittedCandidates_BoundedDrainOnOversize checks that
@@ -43,7 +41,7 @@ func TestReadUncommittedCandidates_BoundedDrainOnOversize(t *testing.T) {
 		{name: "mid-drain", writeFiles: true, candidateSize: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			defer goroutineLeakGuard(t, 30*time.Second)()
+			defer goroutineLeakGuard(t)()
 			repoDir := t.TempDir()
 			candidates := make([]uncommittedCandidate, fileCount)
 			for i := 0; i < fileCount; i++ {
@@ -63,10 +61,7 @@ func TestReadUncommittedCandidates_BoundedDrainOnOversize(t *testing.T) {
 				_, candidates[i].ino, candidates[i].mtime = fileInfoIdentity(info)
 			}
 
-			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
-			defer cancel()
-
-			docs, _, err := readUncommittedCandidates(ctx, repoDir, candidates)
+			docs, _, err := readUncommittedCandidates(t.Context(), repoDir, candidates)
 			if !errors.Is(err, errDeltaPayloadExceedsWindow) {
 				t.Fatalf("expected errDeltaPayloadExceedsWindow, got err=%v docs=%d", err, len(docs))
 			}
@@ -91,7 +86,7 @@ func TestReadUncommittedCandidates_SmallPayloadFitsBudget(t *testing.T) {
 	const testBudget int64 = 8 * 1024 * 1024 // 8 MiB → window = 4 MiB
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
-	defer goroutineLeakGuard(t, 15*time.Second)()
+	defer goroutineLeakGuard(t)()
 
 	repoDir := t.TempDir()
 	const fileCount = 4

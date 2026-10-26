@@ -180,9 +180,6 @@ func randomWordText(seed uint64, size int, needle string) []byte {
 // must report it, and every other document must stay searchable.
 func TestRun_ShardGuardKeepsOversizedShardsNameOnly(t *testing.T) {
 	requireTools(t)
-	if testing.Short() {
-		t.Skip("indexes 3.75 MiB of text per build")
-	}
 	// The same fitting and wrapping documents as the builder-level guard tests.
 	const fitsNeedle, wrapsNeedle = "guard_fits_needle", "guard_wraps_needle"
 	docs := guardDocs("fits.txt", "wraps.txt")

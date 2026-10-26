@@ -1,13 +1,11 @@
 package main
 
 import (
-	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 // TestRun_GitlinkReplacedByFileIsSearched replaces a checked-out submodule with
@@ -44,6 +42,7 @@ func TestRun_GitlinkReplacedByFileIsSearched(t *testing.T) {
 // TestGitlinkSymlinkIsNoEdge replaces a checked-out submodule with a symlink:
 // to its own repository (a cycle), and to a repository outside the search.
 // A symlink is no edge: the search ends, and the outside files stay absent.
+// A search that follows the cycle stops the test at the go test timeout.
 func TestGitlinkSymlinkIsNoEdge(t *testing.T) {
 	requireTools(t)
 	const marker = "zqgitlinksymlinkmarker"
@@ -67,10 +66,8 @@ func TestGitlinkSymlinkIsNoEdge(t *testing.T) {
 				t.Fatal(err)
 			}
 			setTestUserCache(t)
-			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-			defer cancel()
 			out, err := captureStdout(t, func() error {
-				return seekRoot(ctx, t, nil, "--lexical-only", marker, parent)
+				return seekRoot(t.Context(), t, nil, "--lexical-only", marker, parent)
 			})
 			if err != nil {
 				t.Fatalf("run: %v\n%s", err, out)

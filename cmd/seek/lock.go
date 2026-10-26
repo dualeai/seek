@@ -122,6 +122,15 @@ var errCorpusEvicted = errors.New("corpus evicted during build")
 // queue: a publish waits while readers overlap. That delays a new index only:
 // a search of a node that has shards reads them and never waits for its build.
 
+// The reasons of the three lock waits. pollLock writes the reason as the
+// message of the wait's debug line, with the lock path in its "lock"
+// attribute. Tests find a wait by this message and path.
+const (
+	lockWaitBuild   = "Waiting for another build of the node"
+	lockWaitReaders = "Waiting for the readers of the node"
+	lockWaitPublish = "Waiting for a publish of the node"
+)
+
 type readLockHeldKey struct{}
 
 // withReadLockHeld marks a context whose goroutine holds a read lock.
@@ -164,7 +173,7 @@ func (store corpusStore) acquireBuildLock(ctx context.Context) (*os.File, bool, 
 			_ = f.Close()
 			return nil, false, nil
 		}
-		if perr := pollLock(ctx, lockPath, "Waiting for another build of the node", func() error { return lockFileExclusive(f) }, 100*time.Millisecond, 2*time.Second); perr != nil {
+		if perr := pollLock(ctx, lockPath, lockWaitBuild, func() error { return lockFileExclusive(f) }, 100*time.Millisecond, 2*time.Second); perr != nil {
 			_ = f.Close()
 			return nil, false, perr
 		}
@@ -245,7 +254,7 @@ func acquirePublishLock(ctx context.Context, cacheDir string) (*os.File, error) 
 	if err := lockFileExclusive(f); err == nil {
 		return f, nil
 	}
-	if err := pollLock(ctx, lockPath, "Waiting for the readers of the node", func() error { return lockFileExclusive(f) }, 20*time.Millisecond, 500*time.Millisecond); err != nil {
+	if err := pollLock(ctx, lockPath, lockWaitReaders, func() error { return lockFileExclusive(f) }, 20*time.Millisecond, 500*time.Millisecond); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
@@ -260,7 +269,7 @@ func acquireReadLock(ctx context.Context, f *os.File) error {
 	if err := lockFileSharedNB(f); err == nil {
 		return nil
 	}
-	return pollLock(ctx, f.Name(), "Waiting for a publish of the node", func() error { return lockFileSharedNB(f) }, 20*time.Millisecond, 500*time.Millisecond)
+	return pollLock(ctx, f.Name(), lockWaitPublish, func() error { return lockFileSharedNB(f) }, 20*time.Millisecond, 500*time.Millisecond)
 }
 
 // lockFileExclusive attempts a non-blocking exclusive lock on f.

@@ -88,10 +88,6 @@ func seedFolderDelta(buildDir, repoName string, paths []string) bool {
 	return true
 }
 
-// folderBuildTestHook runs after the index builds and before the publish. Only
-// tests set it.
-var folderBuildTestHook func()
-
 // folderFamilyUsable checks the current shard family after the build lock is
 // acquired. A peer can publish after the pre-lock scan. One surviving shard is
 // not sufficient because the manifest can record more family members.
@@ -336,9 +332,6 @@ func ensureFolderCorpusFreshWithExecution(
 		}
 	}
 	runJoinedIndexBuilds(lexicalBuild, semanticBuild)
-	if folderBuildTestHook != nil {
-		folderBuildTestHook()
-	}
 	if lexicalErr != nil {
 		dropStateUnlessPublished()
 		return corpusSearchable, folderCorpusError(plan, lexicalErr)

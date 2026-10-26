@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -173,49 +177,185 @@ func TestAcquireReadLock_SharedConcurrent(t *testing.T) {
 
 // TestAcquireReadLock_WaitsForPublishUntilCancel holds the publish lock as a
 // wedged publish would: the read waits until its context ends, with no
-// unlocked read of the remaining shards.
+// unlocked read of the remaining shards. Once the publish ends, the same wait
+// gets the lock, however long the publish took. The test runs in a synctest
+// bubble, so each hold lasts lockWaitProof of fake time: a wait deadline
+// fails the test.
 func TestAcquireReadLock_WaitsForPublishUntilCancel(t *testing.T) {
-	dir := t.TempDir()
-	lockPath := filepath.Join(dir, lockFile)
-	indexDir := filepath.Join(dir, "index")
-	if err := os.MkdirAll(indexDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(indexDir, "x_v16.00000.zoekt"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := lockFileExclusive(holder); err != nil {
-		t.Fatalf("hold exclusive lock: %v", err)
-	}
-	reader, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = reader.Close() }()
-	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
-	defer cancel()
-	if err := acquireReadLock(ctx, reader); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("read under a wedged publish: %v, want the context's end", err)
-	}
-	// Once the publish ends, the same wait gets the lock, however long the
-	// publish took: a wait deadline would fail here.
-	done := make(chan error, 1)
-	go func() { done <- acquireReadLock(t.Context(), reader) }()
-	time.Sleep(lockWaitProof)
-	releaseLock(holder)
-	if err := <-done; err != nil {
-		t.Fatalf("read after the publish: %v", err)
-	}
-	unlockFile(reader)
+	synctest.Test(t, func(t *testing.T) {
+		dir := t.TempDir()
+		lockPath := filepath.Join(dir, lockFile)
+		indexDir := filepath.Join(dir, "index")
+		if err := os.MkdirAll(indexDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(indexDir, "x_v16.00000.zoekt"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := lockFileExclusive(holder); err != nil {
+			t.Fatalf("hold exclusive lock: %v", err)
+		}
+		reader, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = reader.Close() }()
+		_, waiting := captureTestLogsWithSignal(t, slog.LevelWarn, lockWaitPublish, lockPath)
+		read := make(chan error, 1)
+		// holdAgainst starts a read with ctx, and holds the publish lock for
+		// lockWaitProof after the read writes the debug line of its wait.
+		holdAgainst := func(ctx context.Context) {
+			t.Helper()
+			go func() { read <- acquireReadLock(ctx, reader) }()
+			<-waiting
+			time.Sleep(lockWaitProof)
+			synctest.Wait()
+			select {
+			case err := <-read:
+				t.Fatalf("the read ended while the publish held the lock: %v", err)
+			default:
+			}
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		holdAgainst(ctx)
+		cancel()
+		if err := <-read; !errors.Is(err, context.Canceled) {
+			t.Fatalf("read under a wedged publish: %v, want the context's end", err)
+		}
+		holdAgainst(t.Context())
+		releaseLock(holder)
+		if err := <-read; err != nil {
+			t.Fatalf("read after the publish: %v", err)
+		}
+		unlockFile(reader)
+	})
 }
 
-// lockWaitProof is how long the lock tests hold a lock that another wait
-// needs, so that a lock wait with a deadline fails them.
-const lockWaitProof = 3 * time.Second
+// lockWaitProof is how long, in the fake time of a synctest bubble, a lock
+// test holds a lock that another wait needs, so that a lock wait with a
+// deadline fails the test.
+const lockWaitProof = time.Hour
+
+// TestAcquireBuildLock_WaitsForAnotherBuildUntilCancel holds the build lock
+// of a node with no shard through a second open file, as another build does.
+// flock locks an open file, so one process can hold the lock against itself.
+// The build waits until its context ends, with no deadline. Once the other
+// build ends, the same wait gets the lock, however long that build took. The
+// test runs in a synctest bubble, so each hold lasts lockWaitProof of fake
+// time: a wait deadline fails the test.
+func TestAcquireBuildLock_WaitsForAnotherBuildUntilCancel(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		dir := t.TempDir()
+		store := corpusStore{cacheDir: dir, indexDir: filepath.Join(dir, "index")}
+		holder, err := os.OpenFile(filepath.Join(dir, buildLockFile), os.O_CREATE|os.O_RDWR, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := lockFileExclusive(holder); err != nil {
+			t.Fatalf("hold the build lock: %v", err)
+		}
+		_, waiting := captureTestLogsWithSignal(t, slog.LevelWarn, lockWaitBuild, holder.Name())
+		type result struct {
+			lock     *os.File
+			acquired bool
+			err      error
+		}
+		built := make(chan result, 1)
+		// holdAgainst starts a build wait with ctx, and holds the build lock
+		// for lockWaitProof after the wait writes its debug line.
+		holdAgainst := func(ctx context.Context) {
+			t.Helper()
+			go func() {
+				lock, acquired, err := store.acquireBuildLock(ctx)
+				built <- result{lock: lock, acquired: acquired, err: err}
+			}()
+			<-waiting
+			time.Sleep(lockWaitProof)
+			synctest.Wait()
+			select {
+			case got := <-built:
+				t.Fatalf("the build wait ended while another build held the lock: acquired=%t err=%v", got.acquired, got.err)
+			default:
+			}
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		holdAgainst(ctx)
+		cancel()
+		if got := <-built; got.acquired || !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("build wait after a cancel: acquired=%t err=%v, want context.Canceled", got.acquired, got.err)
+		}
+		holdAgainst(t.Context())
+		releaseLock(holder)
+		got := <-built
+		if !got.acquired || got.err != nil {
+			t.Fatalf("build wait after the other build: acquired=%t err=%v", got.acquired, got.err)
+		}
+		releaseLock(got.lock)
+	})
+}
+
+// TestLockWaitSignalNamesTheLock holds the publish locks of two nodes, and a
+// read of each node waits. The signal of the first lock does not come for
+// the wait on the second lock, and comes for the wait on its own lock. So a
+// test that acts at a lock wait acts only at the wait for the lock it holds.
+// The stderr line of the second wait, as a CLI process writes it with
+// --verbose (newCLILogger), matches lockWaitLine for its own lock only.
+func TestLockWaitSignalNamesTheLock(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		dir := t.TempDir()
+		var readers []*os.File
+		for _, name := range []string{"a.lock", "b.lock"} {
+			holder, err := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_RDWR, 0o644)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer releaseLock(holder)
+			if err := lockFileExclusive(holder); err != nil {
+				t.Fatalf("hold %s: %v", name, err)
+			}
+			reader, err := os.OpenFile(holder.Name(), os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = reader.Close() }()
+			readers = append(readers, reader)
+		}
+		logs, waiting := captureTestLogsWithSignal(t, slog.LevelDebug, lockWaitPublish, readers[0].Name())
+		ctx, cancel := context.WithCancel(t.Context())
+		reads := make(chan error, 2)
+		go func() { reads <- acquireReadLock(ctx, readers[1]) }()
+		synctest.Wait()
+		select {
+		case <-waiting:
+			t.Fatal("a wait on another lock sent the signal")
+		default:
+		}
+		records := logs.Records()
+		if len(records) != 1 {
+			t.Fatalf("records=%d, want the debug line of one wait", len(records))
+		}
+		var stderr bytes.Buffer
+		if err := newCLILogger(&stderr, true).Handler().Handle(ctx, records[0]); err != nil {
+			t.Fatal(err)
+		}
+		line := stderr.String()
+		if lockWaitLine(lockWaitPublish, readers[0].Name())(line) || !lockWaitLine(lockWaitPublish, readers[1].Name())(line) {
+			t.Fatalf("the stderr line %q matches the wrong lock", line)
+		}
+		go func() { reads <- acquireReadLock(ctx, readers[0]) }()
+		<-waiting
+		cancel()
+		for range 2 {
+			if err := <-reads; !errors.Is(err, context.Canceled) {
+				t.Fatalf("read after a cancel: %v, want context.Canceled", err)
+			}
+		}
+	})
+}
 
 // TestLockOrderNoReadLockWhileWaitingForPublish proves that a build or
 // publish lock wait under a read lock fails as a Seek defect, so any route
@@ -276,10 +416,10 @@ func TestTwoColdSearchesSameNode(t *testing.T) {
 }
 
 // TestColdSearchWaitsForAnotherProcessBuild holds the build lock of a cold
-// node for lockWaitProof while a search process reads the node: the process
-// waits on the lock with no deadline, then builds and answers. In one process,
-// the buildWindows semaphore orders two builds before the build lock does, so
-// the test uses a second process.
+// node while a search process reads the node. The test frees the lock only at
+// the debug line of the process's lock wait: the process waits on the lock,
+// then builds and answers. In one process, the buildWindows semaphore orders
+// two builds before the build lock does, so the test uses a second process.
 func TestColdSearchWaitsForAnotherProcessBuild(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
@@ -300,15 +440,12 @@ func TestColdSearchWaitsForAnotherProcessBuild(t *testing.T) {
 	if err := lockFileExclusive(holder); err != nil {
 		t.Fatalf("hold the build lock: %v", err)
 	}
-	done := make(chan cliProcessResult, 1)
-	go func() {
-		done <- runCLIProcessWithCache(t, cacheDir, folder, []string{"--lexical-only", "zqprocesswait"}, nil)
-	}()
-	time.Sleep(lockWaitProof)
-	releaseLock(holder)
-	result := <-done
-	if result.code != 0 || !strings.Contains(result.stdout, "a.txt") {
-		t.Fatalf("code=%d stdout=%q stderr=%q", result.code, result.stdout, result.stderr)
+	release := sync.OnceFunc(func() { releaseLock(holder) })
+	t.Cleanup(release)
+	result, waited := runCLIProcessOnLine(t, cacheDir, folder, []string{"--lexical-only", "--verbose", "zqprocesswait"},
+		lockWaitLine(lockWaitBuild, holder.Name()), func(*os.Process) { release() })
+	if !waited || result.code != 0 || !strings.Contains(result.stdout, "a.txt") {
+		t.Fatalf("waited=%t code=%d stdout=%q stderr=%q", waited, result.code, result.stdout, result.stderr)
 	}
 }
 
@@ -363,10 +500,11 @@ func TestPollLockRetriesOnlyAHeldLock(t *testing.T) {
 	}
 }
 
-// TestReaderDoesNotWaitForAFullRebuild holds a full uncommitted rebuild for
-// lockWaitProof on one file read, in this process: the family builds before
-// the publish lock, so a search in another process reads the live index at
-// once.
+// TestReaderDoesNotWaitForAFullRebuild holds a full uncommitted rebuild on
+// one file read, in this process, until a search in another process ends: the
+// family builds before the publish lock, so the search reads the live index
+// at once. A search that waits for a lock writes the debug line of its wait;
+// the test then ends the hold, so it fails instead of hanging.
 func TestReaderDoesNotWaitForAFullRebuild(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -388,10 +526,16 @@ func TestReaderDoesNotWaitForAFullRebuild(t *testing.T) {
 	}
 	realOpen := dirtyOpenFile
 	t.Cleanup(func() { dirtyOpenFile = realOpen })
-	var slow sync.Once
+	reading, held := make(chan struct{}), make(chan struct{})
+	endHold := sync.OnceFunc(func() { close(held) })
+	t.Cleanup(endHold)
+	var hold sync.Once
 	dirtyOpenFile = func(path string) (*os.File, error) {
 		if filepath.Base(path) == "b.txt" {
-			slow.Do(func() { time.Sleep(lockWaitProof) })
+			hold.Do(func() {
+				close(reading)
+				<-held
+			})
 		}
 		return realOpen(path)
 	}
@@ -400,15 +544,25 @@ func TestReaderDoesNotWaitForAFullRebuild(t *testing.T) {
 		_, err := seek(t, "--lexical-only", "zqreader", repo)
 		built <- err
 	}()
-	time.Sleep(500 * time.Millisecond)
-	started := time.Now()
-	result := runCLIProcessWithCache(t, cacheDir, repo, []string{"--lexical-only", "zqreader"}, nil)
-	elapsed := time.Since(started)
+	select {
+	case <-reading:
+	case err := <-built:
+		t.Fatalf("the rebuild ended before it read b.txt: %v", err)
+	}
+	// Each lock wait ends the hold, so a reader that waits fails the test.
+	anyWait := func(line string) bool {
+		return slices.ContainsFunc([]string{lockWaitBuild, lockWaitReaders, lockWaitPublish}, func(reason string) bool {
+			return strings.Contains(line, reason)
+		})
+	}
+	result, waited := runCLIProcessOnLine(t, cacheDir, repo, []string{"--lexical-only", "--verbose", "zqreader"},
+		anyWait, func(*os.Process) { endHold() })
+	endHold()
 	if err := <-built; err != nil {
 		t.Fatal(err)
 	}
-	if result.code != 0 || !strings.Contains(result.stdout, "b.txt") || elapsed > lockWaitProof-time.Second {
-		t.Fatalf("reader: code=%d after %v, want the live index at once:\n%s%s", result.code, elapsed, result.stdout, result.stderr)
+	if waited || result.code != 0 || !strings.Contains(result.stdout, "b.txt") {
+		t.Fatalf("reader: waited=%t code=%d, want the live index at once:\n%s%s", waited, result.code, result.stdout, result.stderr)
 	}
 }
 
@@ -435,8 +589,18 @@ func TestOpenNodeReadLock(t *testing.T) {
 		t.Fatalf("exclusive lock during the read: err=%v, want held", err)
 	}
 	// The lock is shared: a second read opens while the first one holds it.
-	secondCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	// A second read that waits ends at the debug line of its wait, so the
+	// test fails instead of hanging.
+	_, waiting := captureTestLogsWithSignal(t, slog.LevelWarn, lockWaitPublish, filepath.Join(cacheDir, lockFile))
+	secondCtx, cancel := context.WithCancel(t.Context())
 	defer cancel()
+	go func() {
+		select {
+		case <-waiting:
+			cancel()
+		case <-secondCtx.Done():
+		}
+	}()
 	second, _, err := openNodeRead(secondCtx, plan, nil)
 	if err != nil {
 		t.Fatalf("a second read during the first: %v", err)
@@ -446,5 +610,63 @@ func TestOpenNodeReadLock(t *testing.T) {
 	read.close()
 	if err := lockFileExclusive(other); err != nil {
 		t.Fatalf("exclusive lock after close: %v", err)
+	}
+}
+
+// holdReadLock takes the shared lock on cacheDir/.lock, as the read of a
+// search does (acquireReadLock), so a publish of the node waits for it. It
+// makes cacheDir for a node that no search has built. The returned release
+// frees the lock; it runs once, and the test cleanup also runs it.
+func holdReadLock(t *testing.T, cacheDir string) (release func()) {
+	t.Helper()
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.OpenFile(filepath.Join(cacheDir, lockFile), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := acquireReadLock(t.Context(), lock); err != nil {
+		_ = lock.Close()
+		t.Fatalf("hold the read lock: %v", err)
+	}
+	release = sync.OnceFunc(func() { releaseLock(lock) })
+	t.Cleanup(release)
+	return release
+}
+
+// onLockWait waits in a new goroutine for a value on waiting: the debug line
+// of a lock wait (captureTestLogsWithSignal). Then it runs act and sends its
+// error on the returned channel. Only then does it call release, which ends
+// the hold that the wait is for. So when the waiting command returns, the
+// channel holds the error of act (lockWaitActed). The goroutine stops when the
+// test ends first.
+func onLockWait(t *testing.T, waiting <-chan struct{}, act func() error, release func()) <-chan error {
+	t.Helper()
+	acted := make(chan error, 1)
+	go func() {
+		select {
+		case <-waiting:
+		case <-t.Context().Done():
+			return
+		}
+		acted <- act()
+		release()
+	}()
+	return acted
+}
+
+// lockWaitActed fails the test when act of onLockWait did not run or failed.
+// Call it after the command that waits for the lock returns. If the command
+// waited, release ran after the send, so the receive cannot miss it.
+func lockWaitActed(t *testing.T, acted <-chan error) {
+	t.Helper()
+	select {
+	case err := <-acted:
+		if err != nil {
+			t.Fatalf("act at the lock wait: %v", err)
+		}
+	default:
+		t.Fatal("the command did not wait for the lock of the test, so the test did not act")
 	}
 }

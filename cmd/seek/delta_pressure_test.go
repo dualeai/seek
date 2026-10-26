@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 	"testing"
-	"time"
+	"testing/synctest"
 )
 
 // TestIndexDeltaDocuments_LargeBatchHoldsBudget checks a large delta in one
@@ -17,19 +17,17 @@ import (
 // indexDocuments.
 //
 // The test indexes 12 documents of 512 KiB with an 8 MiB budget. It checks
-// that (a) the delta completes within the 30 s guard deadline, (b) the
-// semaphore has its full budget after Finish, and (c) no goroutine leaks.
+// that (a) the delta completes, (b) the semaphore has its full budget after
+// Finish, and (c) no goroutine leaks.
 func TestIndexDeltaDocuments_LargeBatchHoldsBudget(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+	requireTools(t)
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
 	const testBudget int64 = 8 * 1024 * 1024
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
-	defer goroutineLeakGuard(t, 30*time.Second)()
+	defer goroutineLeakGuard(t)()
 
 	indexDir := t.TempDir()
 	source := t.TempDir()
@@ -71,121 +69,115 @@ func TestIndexDeltaDocuments_LargeBatchHoldsBudget(t *testing.T) {
 // that release. The select at the end fails when the Acquire completes while
 // the delta still runs, so it catches a change to a release per document.
 func TestIndexDeltaDocuments_BlocksConcurrentReader(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+	requireTools(t)
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
 	const testBudget int64 = 4 * 1024 * 1024 // 4 MiB
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
-	defer goroutineLeakGuard(t, 30*time.Second)()
+	defer goroutineLeakGuard(t)()
 
-	indexDir := t.TempDir()
-	source := t.TempDir()
+	synctest.Test(t, func(t *testing.T) {
+		indexDir := t.TempDir()
+		source := t.TempDir()
 
-	// Seed prior shard so the delta builder has something to chain on.
-	{
-		seed := make(chan fileContent, 1)
-		seed <- makeFileContent(t, "seed.go", []byte("package seed\nfunc Seed() {}\n"))
-		close(seed)
-		if _, err := indexDocuments(t.Context(), indexDir, "delta_pressure_repo", source, seed, 1); err != nil {
-			t.Fatalf("seed: %v", err)
-		}
-	}
-
-	// Build a delta payload that consumes most of the budget.
-	const docCount = 3
-	const docSize int64 = 1 * 1024 * 1024 // 1 MiB each → 3 MiB total
-	docs := make([]fileContent, docCount)
-	changed := make([]string, docCount)
-	payload := bytes.Repeat([]byte("a"), int(docSize))
-	for i := 0; i < docCount; i++ {
-		name := fmt.Sprintf("delta_%d.go", i)
-		docs[i] = makeFileContent(t, name, append([]byte("package x\n"), payload...))
-		changed[i] = name
-	}
-
-	acquireDone := make(chan error, 1)
-
-	// Background concurrent Acquire — wants 2 MiB. The makeFileContent
-	// calls above already pre-Acquired 3 MiB, so the remaining budget
-	// is 1 MiB and this Acquire blocks immediately. It can only proceed
-	// after indexDeltaDocuments returns its weight via the bulk-Release
-	// after Finish.
-	//
-	// The channels acquireDone and deltaDone give the order of the two
-	// events. Time stamps cannot: after a correct release after Finish, the
-	// Acquire can complete before indexDeltaDocuments returns.
-	goroutineStarted := make(chan struct{})
-	go func() {
-		close(goroutineStarted)
-		if err := readSemaphore.Acquire(t.Context(), 2*1024*1024); err != nil {
-			acquireDone <- err
-			return
-		}
-		readSemaphore.Release(2 * 1024 * 1024)
-		acquireDone <- nil
-	}()
-	<-goroutineStarted
-	// Wait until the Acquire waits in the queue before indexDeltaDocuments
-	// runs: with a waiter, TryAcquire fails, so availableWeight reads 0.
-	// Otherwise the goroutine could run after the delta finishes, succeed at
-	// once, and pass the order check falsely.
-	waitUntilSemaphoreBelow(t, readSemaphore, 1, 5*time.Second)
-
-	deltaDone := make(chan error, 1)
-	go func() {
-		_, err := indexDeltaDocuments(indexDir, "delta_pressure_repo", source, docs, indexParallelism(), changed)
-		deltaDone <- err
-	}()
-
-	select {
-	case err := <-acquireDone:
-		if err != nil {
-			t.Fatalf("concurrent Acquire: %v", err)
-		}
-		select {
-		case err := <-deltaDone:
-			if err != nil {
-				t.Fatalf("indexDeltaDocuments: %v", err)
+		// Seed prior shard so the delta builder has something to chain on.
+		{
+			seed := make(chan fileContent, 1)
+			seed <- makeFileContent(t, "seed.go", []byte("package seed\nfunc Seed() {}\n"))
+			close(seed)
+			if _, err := indexDocuments(t.Context(), indexDir, "delta_pressure_repo", source, seed, 1); err != nil {
+				t.Fatalf("seed: %v", err)
 			}
-		default:
-			err := <-deltaDone
-			if err != nil {
-				t.Fatalf("indexDeltaDocuments: %v", err)
+		}
+
+		// Build a delta payload that consumes most of the budget.
+		const docCount = 3
+		const docSize int64 = 1 * 1024 * 1024 // 1 MiB each → 3 MiB total
+		docs := make([]fileContent, docCount)
+		changed := make([]string, docCount)
+		payload := bytes.Repeat([]byte("a"), int(docSize))
+		for i := 0; i < docCount; i++ {
+			name := fmt.Sprintf("delta_%d.go", i)
+			docs[i] = makeFileContent(t, name, append([]byte("package x\n"), payload...))
+			changed[i] = name
+		}
+
+		acquireDone := make(chan error, 1)
+
+		// Background concurrent Acquire — wants 2 MiB. The makeFileContent
+		// calls above already pre-Acquired 3 MiB, so the remaining budget
+		// is 1 MiB and this Acquire blocks immediately. It can only proceed
+		// after indexDeltaDocuments returns its weight via the bulk-Release
+		// after Finish.
+		//
+		// The channels acquireDone and deltaDone give the order of the two
+		// events. Time stamps cannot: after a correct release after Finish, the
+		// Acquire can complete before indexDeltaDocuments returns.
+		goroutineStarted := make(chan struct{})
+		go func() {
+			close(goroutineStarted)
+			if err := readSemaphore.Acquire(t.Context(), 2*1024*1024); err != nil {
+				acquireDone <- err
+				return
 			}
-			t.Fatal("concurrent Acquire completed while delta indexing was still running")
-		}
-	case err := <-deltaDone:
-		if err != nil {
-			t.Fatalf("indexDeltaDocuments: %v", err)
-		}
+			readSemaphore.Release(2 * 1024 * 1024)
+			acquireDone <- nil
+		}()
+		<-goroutineStarted
+		// In the bubble, synctest.Wait returns when the Acquire waits in the
+		// semaphore queue.
+		synctest.Wait()
+
+		deltaDone := make(chan error, 1)
+		go func() {
+			_, err := indexDeltaDocuments(indexDir, "delta_pressure_repo", source, docs, indexParallelism(), changed)
+			deltaDone <- err
+		}()
+
 		select {
 		case err := <-acquireDone:
 			if err != nil {
 				t.Fatalf("concurrent Acquire: %v", err)
 			}
-		case <-time.After(5 * time.Second):
-			t.Fatal("concurrent Acquire did not complete after delta returned its weight")
+			select {
+			case err := <-deltaDone:
+				if err != nil {
+					t.Fatalf("indexDeltaDocuments: %v", err)
+				}
+			default:
+				err := <-deltaDone
+				if err != nil {
+					t.Fatalf("indexDeltaDocuments: %v", err)
+				}
+				t.Fatal("concurrent Acquire completed while delta indexing was still running")
+			}
+		case err := <-deltaDone:
+			if err != nil {
+				t.Fatalf("indexDeltaDocuments: %v", err)
+			}
+			// The delta returned its weight, so the Acquire must complete.
+			if err := <-acquireDone; err != nil {
+				t.Fatalf("concurrent Acquire: %v", err)
+			}
 		}
-	}
 
-	if got := availableWeight(readSemaphore); got != testBudget {
-		t.Fatalf("semaphore leak after delta: got=%d want=%d", got, testBudget)
-	}
+		if got := availableWeight(readSemaphore); got != testBudget {
+			t.Fatalf("semaphore leak after delta: got=%d want=%d", got, testBudget)
+		}
 
-	// indexDeltaDocuments uses bulk-Release-after-Finish by design (the
-	// payload size is bounded by the delta guards upstream). Therefore
-	// a concurrent Acquire that exceeds the remaining budget MUST wait
-	// for the delta to return its weight. The select above allows the
-	// legitimate edge where Release happens after Finish but just before
-	// the delta goroutine sends deltaDone; it fails only if Acquire wins
-	// while delta indexing is still running.
-	//
-	// If indexDeltaDocuments is ever refactored to streaming-Release,
-	// this test should move to an explicit early-unblock assertion.
+		// indexDeltaDocuments uses bulk-Release-after-Finish by design (the
+		// payload size is bounded by the delta guards upstream). Therefore
+		// a concurrent Acquire that exceeds the remaining budget MUST wait
+		// for the delta to return its weight. The select above allows the
+		// legitimate edge where Release happens after Finish but just before
+		// the delta goroutine sends deltaDone; it fails only if Acquire wins
+		// while delta indexing is still running.
+		//
+		// If indexDeltaDocuments is ever refactored to streaming-Release,
+		// this test should move to an explicit early-unblock assertion.
+	})
 }
 
 // TestIndexDeltaDocuments_ReleasesOnNewBuilderError gives indexDeltaDocuments
@@ -193,9 +185,7 @@ func TestIndexDeltaDocuments_BlocksConcurrentReader(t *testing.T) {
 // return of indexDeltaDocumentsWithRepository must release each pre-acquired
 // weight once; withReadSemLock checks the weight at the end.
 func TestIndexDeltaDocuments_ReleasesOnNewBuilderError(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+	requireTools(t)
 	done := withReadSemLock(t)
 	defer done()
 

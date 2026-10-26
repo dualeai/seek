@@ -409,21 +409,32 @@ func TestLateOnProbeVerdict(t *testing.T) {
 		agree   bool
 		prior   lateOnProviderRecord
 		verdict string
+		keep    bool
 	}{
 		{
 			name:    "a passing probe keeps the fault and its time",
 			agree:   true,
 			prior:   fault,
 			verdict: fmt.Sprintf("%s 1 %d", lateOnVerdictRecheck, at),
+			keep:    true,
 		},
-		{name: "a passing probe with no fault trusts", agree: true, verdict: lateOnVerdictTrusted},
+		{name: "a passing probe with no fault trusts", agree: true, verdict: lateOnVerdictTrusted, keep: true},
 		{name: "a failing probe rejects", verdict: lateOnVerdictRejected},
 		{name: "a failing probe after a fault rejects", prior: fault, verdict: lateOnVerdictRejected},
+		{
+			name:    "a passing probe keeps a peer's rejection",
+			agree:   true,
+			prior:   lateOnProviderRecord{verdict: lateOnVerdictRejected},
+			verdict: lateOnVerdictRejected,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			verdict, reason := lateOnProbeVerdict(test.agree, "token 3 differs", test.prior)
+			verdict, keep, reason := lateOnProbeVerdict(test.agree, "token 3 differs", test.prior)
 			if verdict != test.verdict {
 				t.Fatalf("verdict = %q, want %q", verdict, test.verdict)
+			}
+			if keep != test.keep {
+				t.Fatalf("keep = %v, want %v", keep, test.keep)
 			}
 			if !test.agree && reason != "token 3 differs" {
 				t.Fatalf("reason = %q, want the difference", reason)
@@ -434,11 +445,12 @@ func TestLateOnProbeVerdict(t *testing.T) {
 
 // TestProviderProbeStoresTheRuleVerdict runs the real provider probe with one
 // fault on the record. The probe agrees on a host where Core ML gives correct
-// output, and disagrees on a host where it does not (macOS 15 ARM64, ONNX
-// Runtime issue 32569). When the probe finishes, selection keeps Core ML if and
-// only if the probe agreed. So the test gets the probe result from the
-// selected provider and requires the record that lateOnProbeVerdict must give
-// for it: the kept fault on the first kind of host, a rejection on the second.
+// output. It disagrees on a host where Core ML does not (macOS 15 ARM64, ONNX
+// Runtime issue 32569). No peer process writes the record here, so selection
+// keeps Core ML if and only if the probe agreed. The test gets the probe
+// result from the selected provider. It requires the record that
+// lateOnProbeVerdict must give for that result: the kept fault on the first
+// kind of host, a rejection on the second.
 // On macOS 26 and later, the test also requires Core ML.
 func TestProviderProbeStoresTheRuleVerdict(t *testing.T) {
 	// The probe runs only with the automatic choice, so no pin may come from

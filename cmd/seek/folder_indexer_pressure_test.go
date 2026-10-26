@@ -1,22 +1,17 @@
 package main
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 // TestEnsureFolderCorpusFresh_BeyondInFlightBudget — synthesise a
 // folder whose cumulative selected bytes exceed the test-local
 // readSemaphore budget, then index via the real folder pipeline.
 // The consumer must release weight before the terminal Finish so reading
-// proceeds; the goroutineLeakGuard trips its watchdog if it does not.
-//
-// testing.Short() routes writeRandomFolder through sparse files
-// (os.Truncate). Lstat.Size drives the Acquire weight, so behaviour
-// matches the dense small-vocabulary files that CI writes.
+// proceeds; else the build waits until the go test timeout, which prints
+// each goroutine.
 func TestEnsureFolderCorpusFresh_BeyondInFlightBudget(t *testing.T) {
 	const testBudget int64 = 4 * 1024 * 1024  // 4 MiB
 	const fileSize int64 = 512 * 1024         // 512 KiB
@@ -81,8 +76,7 @@ func testFolderIndexUnderBudgetPressure(
 	}
 	plan := planSynthCorpus(t, root)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
-	defer cancel()
+	ctx := t.Context()
 	state, err := ensureFolderCorpusFresh(ctx, plan)
 	if err != nil {
 		t.Fatalf("ensureFolderCorpusFresh: %v", err)
@@ -129,8 +123,7 @@ func TestEnsureFolderCorpusFresh_SparseFiles(t *testing.T) {
 
 	plan := planSynthCorpus(t, root)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
-	defer cancel()
+	ctx := t.Context()
 	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 		t.Fatalf("ensureFolderCorpusFresh: %v", err)
 	}

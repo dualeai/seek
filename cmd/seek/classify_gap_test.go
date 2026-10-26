@@ -168,7 +168,9 @@ func TestPlanCorpora_TrackedAndIgnoredFileSameRepoSplit(t *testing.T) {
 
 // realCaseWithin must preserve a correctly-typed path exactly, and on a
 // case/normalization-insensitive filesystem correct a mistyped one to the
-// real on-disk name (so the byte-exact git scope matches).
+// real on-disk name (so the byte-exact git scope matches). On a
+// case-sensitive file system the mistyped path names no file, so it stays as
+// typed.
 func TestRealCaseWithin(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "Sub"), 0o755); err != nil {
@@ -181,13 +183,13 @@ func TestRealCaseWithin(t *testing.T) {
 	if got := realCaseWithin(root, exact, dirListings{}); got != exact {
 		t.Fatalf("exact path must be preserved: got %q want %q", got, exact)
 	}
-	// Only meaningful where the FS resolves a different-case path.
 	wrong := filepath.Join(root, "sub", "real.txt")
+	want := exact
 	if _, err := os.Stat(wrong); err != nil {
-		t.Skip("case-sensitive filesystem; correction path not exercisable")
+		want = wrong
 	}
-	if got := realCaseWithin(root, wrong, dirListings{}); got != exact {
-		t.Errorf("case correction: got %q want %q", got, exact)
+	if got := realCaseWithin(root, wrong, dirListings{}); got != want {
+		t.Errorf("case correction: got %q want %q", got, want)
 	}
 }
 

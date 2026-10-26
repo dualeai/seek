@@ -4,13 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
-	"time"
 )
 
 // ===========================================================================
@@ -376,33 +377,23 @@ func TestStreamDirtyFiles_FIFOSkipped(t *testing.T) {
 	// Create a FIFO — collectStreamFilesForTest should not block on it.
 	// Lstat returns ModeNamedPipe, so the reader skips it before any open:
 	// only a regular file passes. A plain open of a FIFO with no writer
-	// blocks.
+	// blocks, so a reader that opens it stops the test at the go test
+	// timeout.
 	fifoPath := filepath.Join(dir, "fifo")
-	cmd := exec.Command("mkfifo", fifoPath)
-	if err := cmd.Run(); err != nil {
-		t.Skipf("mkfifo not available: %v", err)
+	if err := syscall.Mkfifo(fifoPath, 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	// Use a timeout to detect if collectStreamFilesForTest blocks on FIFO
-	done := make(chan []fileContent, 1)
-	go func() {
-		done <- collectStreamFilesForTest(t, t.Context(), dir, []string{"regular.go", "fifo"}, 2)
-	}()
-
-	select {
-	case results := <-done:
-		// Should have at least the regular file
-		found := false
-		for _, r := range results {
-			if r.name == "regular.go" {
-				found = true
-			}
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"regular.go", "fifo"}, 2)
+	// Should have at least the regular file
+	found := false
+	for _, r := range results {
+		if r.name == "regular.go" {
+			found = true
 		}
-		if !found {
-			t.Error("expected regular.go in results")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("collectStreamFilesForTest blocked — likely stuck reading FIFO")
+	}
+	if !found {
+		t.Error("expected regular.go in results")
 	}
 }
 
@@ -417,7 +408,7 @@ func TestStreamDirtyFiles_HardlinkContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Link(src, link); err != nil {
-		t.Skipf("hardlinks not supported: %v", err)
+		t.Fatal(err)
 	}
 
 	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"source.go", "hardlink.go"}, 2)
@@ -444,7 +435,7 @@ func TestRepoStateFingerprint_HardlinkSameInode(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Link(src, link); err != nil {
-		t.Skipf("hardlinks not supported: %v", err)
+		t.Fatal(err)
 	}
 
 	state := repoState{
@@ -679,8 +670,7 @@ func TestParseGitStatusV2_MassiveFileList(t *testing.T) {
 }
 
 // TestRepoStateFingerprint_ManyDeletedFiles verifies fingerprinting with
-// a large number of deleted files (all hitting the error path) is fast
-// and correct.
+// a large number of deleted files (all hitting the error path) is correct.
 func TestRepoStateFingerprint_ManyDeletedFiles(t *testing.T) {
 	dir := t.TempDir()
 	files := make([]string, 1000)
@@ -692,19 +682,12 @@ func TestRepoStateFingerprint_ManyDeletedFiles(t *testing.T) {
 		Files:     files,
 	}
 
-	start := time.Now()
 	fp := repoStateFingerprint(dir, state)
-	elapsed := time.Since(start)
-
 	if fp == state.RawOutput {
 		t.Fatal("expected deleted files to affect fingerprint")
 	}
 	if fp != repoStateFingerprint(dir, state) {
 		t.Fatal("expected many-deleted-files fingerprint to be deterministic")
-	}
-	// Should be fast (< 500ms for 1000 Lstats on non-existent files)
-	if elapsed > 500*time.Millisecond {
-		t.Errorf("fingerprinting 1000 deleted files took %v (expected < 500ms)", elapsed)
 	}
 }
 
@@ -794,6 +777,8 @@ func TestStreamDirtyFiles_RacyDeletion(t *testing.T) {
 
 // TestAcquireBuildLock_ContextCancellation verifies that build-lock acquisition
 // respects context cancellation during the polling loop (cold path, no shards).
+// At the debug line of the wait, the test cancels the context. The test keeps
+// the lock until it ends, so the wait can end only through the context.
 func TestAcquireBuildLock_ContextCancellation(t *testing.T) {
 	dir := t.TempDir()
 	indexDir := filepath.Join(dir, "index")
@@ -812,22 +797,18 @@ func TestAcquireBuildLock_ContextCancellation(t *testing.T) {
 	}
 
 	// No shards — acquireBuildLock will poll (not skip).
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
+	_, waiting := captureTestLogsWithSignal(t, slog.LevelWarn, lockWaitBuild, filepath.Join(dir, buildLockFile))
+	acted := onLockWait(t, waiting, func() error { return nil }, cancel)
 
-	start := time.Now()
 	_, acquired, err := corpusStore{cacheDir: dir, indexDir: indexDir}.acquireBuildLock(ctx)
-	elapsed := time.Since(start)
-
+	lockWaitActed(t, acted)
 	if acquired {
 		t.Error("should not have acquired build lock while held")
 	}
-	if err == nil {
-		t.Error("expected error on timeout")
-	}
-	// Should respect the 200ms context timeout: the wait itself has no limit.
-	if elapsed > 2*time.Second {
-		t.Errorf("took %v to timeout, expected ~200ms", elapsed)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err=%v, want context.Canceled", err)
 	}
 }
 

@@ -261,7 +261,7 @@ func TestNativeGitIndexer_VisibleContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink("regular.go", filepath.Join(repoDir, "link.go")); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
+		t.Fatal(err)
 	}
 	oversize := filepath.Join(repoDir, "oversize.dat")
 	if err := os.WriteFile(oversize, nil, 0o644); err != nil {

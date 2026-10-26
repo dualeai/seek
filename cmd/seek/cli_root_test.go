@@ -216,17 +216,21 @@ func printedLineNumbers(t *testing.T, folder string, flags ...string) ([]int, er
 	if err != nil {
 		return nil, err
 	}
+	// printedResults skips text before the first header, so read that text
+	// here: each printed line must be a header or a numbered line.
+	if out != "" && !strings.HasPrefix(out, "## ") {
+		t.Fatalf("output starts with text before the first header:\n%s", out)
+	}
 	var numbers []int
-	for line := range strings.Lines(out) {
-		if strings.HasPrefix(line, "## ") {
-			continue
+	for _, result := range printedResults(out) {
+		for _, line := range result.body {
+			field, _, _ := strings.Cut(line, " ")
+			number, convErr := strconv.Atoi(field)
+			if convErr != nil {
+				t.Fatalf("output line %q has no line number:\n%s", line, out)
+			}
+			numbers = append(numbers, number)
 		}
-		field, _, _ := strings.Cut(line, " ")
-		number, convErr := strconv.Atoi(field)
-		if convErr != nil {
-			t.Fatalf("output line %q has no line number:\n%s", line, out)
-		}
-		numbers = append(numbers, number)
 	}
 	return numbers, nil
 }
