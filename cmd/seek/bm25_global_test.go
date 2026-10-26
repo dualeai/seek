@@ -16,8 +16,8 @@ import (
 )
 
 // TestBM25LayoutIndependent searches the same files as one folder node and as
-// three folder nodes whose files have unequal lengths: one global average
-// file length gives the same strict order.
+// three folder nodes of unequal file lengths. One global average file length
+// gives both the same strict order.
 func TestBM25LayoutIndependent(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -70,10 +70,10 @@ func TestBM25NameAtomUnicodeName(t *testing.T) {
 	}
 }
 
-// bm25ContextFixture writes 40 short files to short, and to long a 52-byte
-// file with one "foo" and context lines around it (b1.go) and a 200-byte file
-// with three (b2.go). Beside b2.go alone, or with b1.go only, b2.go ranks
-// first; under the average of all 42 files b1.go does.
+// bm25ContextFixture writes 40 short files to short. To long it writes b1.go,
+// 52 bytes with one "foo" between context lines, and b2.go, 200 bytes with
+// three. Beside b2.go alone, or with b1.go only, b2.go ranks first; under the
+// average of all 42 files, b1.go does.
 func bm25ContextFixture(t *testing.T, short, long string) {
 	t.Helper()
 	for index := range 40 {
@@ -83,9 +83,9 @@ func bm25ContextFixture(t *testing.T, short, long string) {
 	writeFixtureFile(t, filepath.Join(long, "b2.go"), "foo foo foo\n"+strings.Repeat("x\n", 94))
 }
 
-// TestBM25ContextFollowsTheFinalScore runs -n 1 where the rescore reorders
-// the files: the printed file keeps its context lines, in a command of two
-// nodes and in one Git node with a committed and an uncommitted shard.
+// TestBM25ContextFollowsTheFinalScore runs -n 1 on files that the rescore
+// reorders. The printed file keeps its context lines in a command of two
+// nodes, and in one Git node with a committed and an uncommitted shard.
 func TestBM25ContextFollowsTheFinalScore(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -172,6 +172,8 @@ func bm25NodeScores(t *testing.T, pattern string, operands ...string) map[string
 // it searches the nodes of operands with searchNodes and strictNode, then
 // rescores the hits. The output hides the scores, so the test reads them
 // here. It returns each file's score by path and the command's BM25 state.
+// TestBM25LayoutIndependent and TestBM25ContextFollowsTheFinalScore check
+// through seek that runSearchCommand runs the same route.
 func bm25NodeSearch(t *testing.T, pattern string, operands ...string) (map[string]float64, *bm25Command) {
 	t.Helper()
 	ctx := withSkippedNodes(context.Background())
@@ -206,11 +208,15 @@ func bm25NodeSearch(t *testing.T, pattern string, operands ...string) (map[strin
 	return scores, command
 }
 
-// TestBM25RescoreIsExact gives each query shape's hits, searched as two
-// nodes, the score that Zoekt gives them in one node of one shard: the
-// rebuild keys every candidate as Zoekt does (regexps share one key, a regexp
-// equal to substrings takes theirs, short atoms are regexps), drops
-// overlapping file-name candidates, and counts a multi-line candidate once.
+// TestBM25RescoreIsExact searches each query shape as two nodes: each hit must
+// get the score that Zoekt gives it in one node of one shard. The rebuild keys
+// every candidate as Zoekt does:
+//   - regexps share one key;
+//   - a regexp equal to substrings takes their keys;
+//   - short atoms are regexps.
+//
+// It also drops overlapping file-name candidates and counts a multi-line
+// candidate once.
 func TestBM25RescoreIsExact(t *testing.T) {
 	requireTools(t)
 	root := t.TempDir()
@@ -250,21 +256,21 @@ func TestBM25RescoreIsExact(t *testing.T) {
 	}
 }
 
-// Zoekt's scores of the hand-made hits below, from its tfScore
-// 2.2f / (1.2(0.25 + 0.75L) + f) (index/score.go), worked out by hand: the
+// These are Zoekt's scores of the hand-made hits below, worked out by hand
+// from its tfScore 2.2f / (1.2(0.25 + 0.75L) + f) (index/score.go). The
 // rebuild must match Zoekt, not its own formula.
 const (
-	// The line "func bar(foo int)\n" (L = 0.18) with one term on a symbol
-	// (f = 5) and one not (f = 1): 11/5.462 + 2.2/1.462.
+	// The line "func bar(foo int)\n" at L = 0.18 has one term on a symbol
+	// (f = 5) and one not (f = 1). Its score is 11/5.462 + 2.2/1.462.
 	bm25SymbolLineScore = 3.51870227879627
 	// The line "bar\n" (L = 0.04) with f = 1: 2.2/1.336.
 	bm25BarLineScore = 1.6467065868263473
 )
 
 // TestBM25LineSplitAmbiguity rebuilds a hit with a line where either of two
-// terms can be the symbol: the line gives two splits, and the file's printed
-// length ratio picks the one that Zoekt counted; a ratio that no split fits
-// keeps Zoekt's score.
+// terms can be the symbol, so the line gives two splits. The printed length
+// ratio of the file picks the split that Zoekt counted. A ratio that no split
+// fits keeps Zoekt's score.
 func TestBM25LineSplitAmbiguity(t *testing.T) {
 	bq := compileBM25Query(query.NewAnd(
 		&query.Substring{Pattern: "bar", Content: true, CaseSensitive: true},
@@ -311,9 +317,10 @@ func TestBM25LineSplitAmbiguity(t *testing.T) {
 }
 
 // TestBM25ShardCountsIgnoreTombstones edits a dirty file, so a delta shard
-// tombstones it in the older uncommitted shard: a fresh listing of that shard
-// still counts the tombstoned file, as Zoekt's average does, and a record
-// entry of another shard file with the same name and size is listed again.
+// tombstones it in the older uncommitted shard. A fresh listing of that shard
+// still counts the tombstoned file, as Zoekt's average does. A record entry of
+// another shard file with the same name and size makes the search list the
+// shard again.
 func TestBM25ShardCountsIgnoreTombstones(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -386,9 +393,10 @@ func TestBM25ShardCountsIgnoreTombstones(t *testing.T) {
 	}
 }
 
-// TestBM25NameCandidateEdges gives both keys of a name range that two atoms
-// with other keys match, for the ratio to pick (Zoekt's unstable sort keeps
-// either), and takes the offsets of a non-ASCII name from the name itself.
+// TestBM25NameCandidateEdges checks two edges of the file-name candidates.
+// When two atoms with different keys match one name range, both keys stay as
+// options: Zoekt's unstable sort keeps either, and the ratio picks one. The
+// offsets of a non-ASCII name come from the name itself.
 func TestBM25NameCandidateEdges(t *testing.T) {
 	regexp, err := query.RegexpQuery("fo+", true, true)
 	if err != nil {
@@ -455,9 +463,9 @@ func TestBM25InPlaceAverageReadsItsOwnShards(t *testing.T) {
 
 // TestBM25FileAtomTermInAnyLayout searches with explicit file: atoms as one
 // node whose headers are its index paths and as two nodes whose headers are
-// not. In both, Zoekt scores the atom on the index path (through the clause
-// atom-or-not-atom beside the header set), so the scores are the same, for
-// filter-only queries too.
+// not. In both, Zoekt scores the atom on the index path, through the clause
+// atom-or-not-atom beside the header set. So the scores are the same, also
+// for filter-only queries.
 func TestBM25FileAtomTermInAnyLayout(t *testing.T) {
 	requireTools(t)
 	root := t.TempDir()
@@ -487,9 +495,9 @@ func TestBM25FileAtomTermInAnyLayout(t *testing.T) {
 	}
 }
 
-// TestBM25ManySplitsAndLongLines rebuilds a hit whose 13 lines each allow two
-// symbol splits (8,192 combinations, 14 distinct sets) and a hit whose one
-// line holds 20,000 matches of one term.
+// TestBM25ManySplitsAndLongLines rebuilds two hits. In the first, each of 13
+// lines allows two symbol splits: 8,192 combinations and 14 distinct sets. The
+// second has one line with 20,000 matches of one term.
 func TestBM25ManySplitsAndLongLines(t *testing.T) {
 	bq := compileBM25Query(query.NewAnd(
 		&query.Substring{Pattern: "bar", Content: true, CaseSensitive: true},
@@ -547,8 +555,8 @@ func TestBM25ManySplitsAndLongLines(t *testing.T) {
 }
 
 // TestBM25FileAtomTermBelowTheCwd searches a Git repository from its root and
-// from a subfolder, whose headers drop the subfolder: a file: atom scores the
-// files of the subfolder alike in both.
+// from a subfolder, whose headers drop the subfolder. A file: atom gives the
+// files of the subfolder the same scores in both.
 func TestBM25FileAtomTermBelowTheCwd(t *testing.T) {
 	requireTools(t)
 	repo := filepath.Join(t.TempDir(), "repo")

@@ -116,12 +116,12 @@ func TestSearchNodesEmptyPlans(t *testing.T) {
 	}
 }
 
-// TestBuildSlotsFromReadBudget pins the build slot rule over read budgets: the
-// slot limit and the window for one node and for all slots, and the deadlock
-// proof (2 windows per build + 2 maximum-weight documents <= budget, a window
-// of at least one such document) for every build count. The budgets are
-// literal: 600 MiB is the smallest budget, and the others are a quarter of
-// 8, 64 and 256 GiB hosts.
+// TestBuildSlotsFromReadBudget pins the build slot rule over read budgets. It
+// checks the slot limit, and the window for one node and for all slots. For
+// every build count, it checks the deadlock proof. 2 windows per build plus 2
+// maximum-weight documents fit the budget. A window holds at least one such
+// document. The budgets are literal: 600 MiB is the smallest budget, and
+// the others are a quarter of 8, 64 and 256 GiB hosts.
 func TestBuildSlotsFromReadBudget(t *testing.T) {
 	const mib = 1 << 20
 	for _, tc := range []struct {
@@ -154,14 +154,14 @@ func TestBuildSlotsFromReadBudget(t *testing.T) {
 	}
 }
 
-// TestCommandWindowFollowsTheGraph sizes the window for a command: one node
-// gets the whole budget, many nodes share it by the slot limit, and a build
+// TestCommandWindowFollowsTheGraph sizes the window for a command. One node
+// gets the whole budget, and many nodes share it by the slot limit. A build
 // outside a command uses indexWindowBytes.
 func TestCommandWindowFollowsTheGraph(t *testing.T) {
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
-	// A fixed 2 GiB read budget (the 2048 MiB row of
-	// TestBuildSlotsFromReadBudget) gives windows computed by hand: 9 slots
+	// A fixed 2 GiB read budget is the 2048 MiB row of
+	// TestBuildSlotsFromReadBudget. Its windows are computed by hand: 9 slots
 	// share (2048 - 200) MiB, two windows for each build.
 	oldBudget := readBudgetBytes
 	readBudgetBytes = 2 << 30
@@ -248,8 +248,8 @@ func awaitBuildSlotWaiter[T any](ended <-chan T) (value T, waited bool) {
 	}
 }
 
-// TestRunSizesTheWindowFromTheGraph runs a search of one node: its build takes
-// the whole build budget, so while it runs, the build of a command with many
+// TestRunSizesTheWindowFromTheGraph runs a search of one node. Its build takes
+// the whole build budget. So while it runs, the build of a command with many
 // nodes cannot take a slot. The test holds a read lock on the node, so the
 // build waits to publish while it holds its slot. During that wait, the test
 // tries the slot of the other command.
@@ -279,15 +279,15 @@ func TestRunSizesTheWindowFromTheGraph(t *testing.T) {
 	lockWaitActed(t, acted)
 }
 
-// TestBuildsWithFewLargeDocumentTokensFinish builds 12 folder nodes at once
-// whose files each fill a shard of their own, with 4 large documents per
-// window, more readers than that per build, and the indexWindowFor budget: the
-// builds finish and give all weight back. Builds share no large-document
-// token: with shared tokens, a consumer that waits for a token keeps its
-// document while the token holders wait for readers that the read budget
-// blocks, so the builds can hang under load. The test sets GOMAXPROCS, so each
-// build has more readers than tokens on every host. A hang runs until the go
-// test timeout, which prints each goroutine.
+// TestBuildsWithFewLargeDocumentTokensFinish builds 12 folder nodes at once.
+// Each file fills a shard of its own, and a window holds 4 large documents.
+// Each build has more readers than that, and the read budget is the one that
+// the indexWindowFor proof needs. The builds must finish and give all weight
+// back. Builds share no large-document token. With shared tokens, a consumer
+// that waits for a token keeps its document. The token holders wait for
+// readers that the read budget blocks, so the builds can hang under load. The
+// test sets GOMAXPROCS, so each build has more readers than tokens on every
+// host. A hang runs until the go test timeout, which prints each goroutine.
 func TestBuildsWithFewLargeDocumentTokensFinish(t *testing.T) {
 	requireTools(t)
 	const tokens = 4
@@ -326,7 +326,7 @@ func TestBuildsWithFewLargeDocumentTokensFinish(t *testing.T) {
 }
 
 // TestSearchesTakeNoBuildSlot holds every build slot, as builders of other
-// nodes would: a search of a ready node still finishes, and a node that must
+// nodes would. A search of a ready node still finishes. A node that must
 // build waits for a slot. A warm search that waits for a slot runs until the
 // go test timeout, which prints each goroutine.
 func TestSearchesTakeNoBuildSlot(t *testing.T) {
@@ -508,8 +508,8 @@ func TestSearchNodesRealIndexingBeyondTheWindow(t *testing.T) {
 }
 
 // TestPipelinePreparesEachNodeOnce runs a description over two nodes, with a
-// model that accepts every row: the command prepares each node once (2
-// preparations), and one model session serves the command, with one prepared
+// model that accepts every row. The command prepares each node once (2
+// preparations). One model session serves the command, with one prepared
 // query.
 func TestPipelinePreparesEachNodeOnce(t *testing.T) {
 	requireTools(t)
@@ -731,9 +731,9 @@ func TestOneFailedNodeWarnsOnce(t *testing.T) {
 
 // TestPersistentShardDamageFailsOnce damages an uncommitted shard and holds
 // the node's build lock, as a peer builder would, so that the repair cannot
-// rebuild it. A description over that node and a folder fails the node once:
-// 3 preparations (the repo and its repair, the folder once), one damage
-// notice, and one skipped node.
+// rebuild it. A description over that node and a folder fails the node once.
+// The command has 3 preparations (the repo and its repair, the folder once),
+// one damage notice, and one skipped node.
 func TestPersistentShardDamageFailsOnce(t *testing.T) {
 	requireTools(t)
 	const words = "zqpersistent damage"
@@ -819,7 +819,7 @@ func TestPersistentShardDamageFailsOnce(t *testing.T) {
 
 // TestCommittedShardDamageRepairsOnce damages the committed shards of a clean
 // repository with bytes of the same size. The family manifest holds names and
-// sizes only, so the warm path trusts it; the read fails, the repair removes
+// sizes only, so the warm path trusts it. The read fails, the repair removes
 // the manifest and rebuilds, and the second read finds the file. The command
 // has two preparations and one damage notice.
 func TestCommittedShardDamageRepairsOnce(t *testing.T) {
@@ -877,12 +877,12 @@ func TestCommittedShardDamageRepairsOnce(t *testing.T) {
 }
 
 // TestDescriptionSearchWhileAPeerBuilds holds the build lock of a Git node
-// and a folder node, as a peer builder would, and searches after an edit of
+// and a folder node, as a peer builder would. It searches after an edit of
 // each, with a model that accepts every row. Each node serves its last
-// complete index (corpusStale), so the description reads its text index only:
-// one preparation per node, no warning, the old files found, and no vector
-// hit. The first search, with no peer, prints a.txt, which holds no
-// query word, through vectors; the second does not.
+// complete index (corpusStale), so the description reads its text index only.
+// The command has one preparation per node, no warning, the old files, and no
+// vector hit. a.txt holds no query word. The first search, with no peer,
+// prints it through vectors; the second does not.
 func TestDescriptionSearchWhileAPeerBuilds(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -933,8 +933,8 @@ func TestDescriptionSearchWhileAPeerBuilds(t *testing.T) {
 
 // TestDescriptionReadRetriesAfterADirtyFileChanges edits a dirty file after
 // the build read it and before the build publishes. The read sees that the
-// work tree no longer holds the published state, prepares the node again, and
-// finds the new text.
+// work tree does not hold the published state now. It prepares the node
+// again and finds the new text.
 func TestDescriptionReadRetriesAfterADirtyFileChanges(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -991,11 +991,11 @@ func TestInterruptedChildIsACancellation(t *testing.T) {
 }
 
 // TestBuildsUseTheCommandWindow shrinks the window outside a command to
-// 32 KiB, then runs one-node commands, whose window is the whole budget: the
-// full build writes one shard, and 80 KiB deltas stay deltas at the folder,
-// the committed Git, and the uncommitted Git admission. A build that read the
-// global window would refuse each 80 KiB delta as larger than the window and
-// rebuild in full. A delta adds one shard to the family; a full rebuild of
+// 32 KiB, then runs one-node commands, whose window is the whole budget. The
+// full build writes one shard. 80 KiB deltas stay deltas at the folder, the
+// committed Git, and the uncommitted Git admission. A build that reads the
+// global window refuses each 80 KiB delta as larger than the window, and
+// rebuilds in full. A delta adds one shard to the family; a full rebuild of
 // this content writes one shard.
 func TestBuildsUseTheCommandWindow(t *testing.T) {
 	requireTools(t)

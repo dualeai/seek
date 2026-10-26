@@ -8,21 +8,22 @@ import (
 	"strings"
 )
 
-// classifyVisibility classifies every path against the single repo rooted at
-// repoRoot. paths must be canonical absolute paths; callers must group by
-// repo root and not mix roots in one call. Every input path appears in the
+// classifyVisibility classifies every path against the one repository at
+// repoRoot. paths must be canonical absolute paths. Callers group them by
+// repository root and give one root per call. Every input path appears in the
 // returned map. True means that the path is indexable content of the
-// repository (tracked, or untracked and not ignored): the Git corpus holds it,
-// and the search scopes inside its index. False means that the path is
-// ignored, outside the worktree, or inside a nested submodule: a folder or
-// file corpus searches its content. git check-ignore exit 1 (nothing ignored)
-// and an exit 128 that names a submodule boundary or a path outside the
-// repository are normal signals. Any other failure is an error: Seek never
-// searches a repository that Git cannot read as a folder. It owns no boundary
-// discovery (that is detectGitBoundary) and constructs no corpora.
+// repository: tracked, or untracked and not ignored. The Git corpus holds it,
+// and the search scopes inside its index. False means that the path is ignored,
+// outside the worktree, or inside a nested submodule. A folder or file corpus
+// then searches its content. git check-ignore exit 1 (nothing ignored) is a
+// normal signal. So is an exit 128 that names a submodule boundary or a path
+// outside the repository. Any other failure is an error: Seek never searches
+// a repository that Git cannot read as a folder. Boundary discovery belongs
+// to detectGitBoundary, and this function makes no corpus.
 func classifyVisibility(ctx context.Context, repoRoot string, paths []string) (map[string]bool, error) {
 	out := make(map[string]bool, len(paths))
-	relOf := make(map[string]string, len(paths)) // slash-relative -> canonical abs
+	// relOf maps a slash-relative path to its canonical absolute path.
+	relOf := make(map[string]string, len(paths))
 	within := make([]string, 0, len(paths))
 	for _, p := range paths {
 		rel, ok := relWithin(repoRoot, p)
@@ -53,9 +54,9 @@ func classifyVisibility(ctx context.Context, repoRoot string, paths []string) (m
 		return out, nil
 	}
 
-	// The batch hit a 128: a within-worktree path crosses a submodule
-	// boundary or leaves the repository, and aborted the whole run. Re-query
-	// each path alone so one offending path cannot misclassify the rest.
+	// The batch got exit 128: a path in the worktree crosses a submodule
+	// boundary or leaves the repository, and Git stopped the whole run. Ask
+	// for each path alone, so that one such path cannot change the rest.
 	for rel, p := range relOf {
 		ign, aborted1, err := checkGitIgnore(ctx, repoRoot, []string{rel})
 		if err != nil {
@@ -67,23 +68,24 @@ func classifyVisibility(ctx context.Context, repoRoot string, paths []string) (m
 	return out, nil
 }
 
-// checkGitIgnore runs `git check-ignore -z --stdin` in DEFAULT (index-aware)
-// mode over rels (repo-root-relative, slash form) and returns the set of
-// ignored rels. aborted is true when git exits 128 because a path crosses a
-// submodule boundary or leaves the repo; the batch output is then unusable
-// and the caller must fall back per path. Any other exit 128 (a corrupt
-// index, a dubious owner) is an error.
+// checkGitIgnore runs `git check-ignore -z --stdin` in the default mode,
+// which reads the Git index, over rels. rels are relative to the repository
+// root, in slash form. It returns the set of ignored rels. aborted is true
+// when Git exits 128 because a path crosses a submodule boundary or leaves
+// the repository. The batch output is then not usable, and the caller asks
+// for each path alone. Any other exit 128 (a corrupt index, a dubious owner)
+// is an error.
 //
-// DEFAULT mode is deliberate — never pass --no-index. A tracked file that
-// also matches a .gitignore pattern is reported NOT ignored (exit 1),
-// which is correct: it is in the index and therefore indexed by the git
-// corpus. --no-index would wrongly report it ignored.
+// Never pass --no-index. In the default mode, Git reports a tracked file that
+// also matches a .gitignore pattern as not ignored (exit 1). That is correct:
+// the file is in the Git index, so the Git corpus indexes it. --no-index
+// would report it as ignored.
 //
-// Each entry is sent as "./"+rel so git treats it as a literal path, not a
-// pathspec. Without this, an operand whose repo-relative path starts with
-// ':' would be parsed as pathspec magic — ":weird" reads as not-ignored
-// (wrong), ":(...)"/":!" abort the batch with exit 128. git echoes the
-// "./" back verbatim; collectIgnoredRels strips it.
+// Each entry goes to Git as "./"+rel, so Git reads it as a literal path, not
+// a pathspec. Else Git reads a leading ':' as pathspec magic. Then ":weird"
+// reads as not ignored, which is wrong, and ":(...)" or ":!" stops the batch
+// with exit 128. Git echoes the "./" back as it is; collectIgnoredRels
+// removes it.
 func checkGitIgnore(ctx context.Context, repoDir string, rels []string) (map[string]bool, bool, error) {
 	dotted := make([]string, len(rels))
 	for i, rel := range rels {
@@ -110,8 +112,8 @@ func checkGitIgnore(ctx context.Context, repoDir string, rels []string) (map[str
 }
 
 // collectIgnoredRels splits NUL-terminated check-ignore output into a set of
-// repo-relative names, stripping the "./" literal-path prefix added by
-// checkGitIgnore and dropping the trailing empty element after the final NUL.
+// names relative to the repository root. It removes the "./" prefix that
+// checkGitIgnore adds, and drops the empty element after the last NUL.
 func collectIgnoredRels(raw string) map[string]bool {
 	set := make(map[string]bool)
 	for _, entry := range strings.Split(raw, "\x00") {

@@ -15,13 +15,13 @@ import (
 )
 
 // lockWaits lets the user end the lock waits of one command. A wait has no
-// deadline (another process can hold a lock until the user stops it), and the
+// deadline: another process can hold a lock until the user stops it. The
 // command prints after every node returns, so one wait would hide the results
-// of every other node. The first interrupt then ends the waits that run at
-// that time (watchInterrupts): each such node is skipped with one warning, as
-// a failed node is, and the others print. A wait that starts later, such as
-// the publish of a build that was running, waits as usual. ended records that
-// a wait ended this way (noMatchOrInterrupted).
+// of every other node. So the first interrupt ends the waits that run at that
+// time (watchInterrupts). The search skips each such node with one warning, as
+// it skips a failed node, and the others print. A wait that starts later, such
+// as the publish of a build that was running, waits as usual. ended records
+// that a wait ended this way (noMatchOrInterrupted).
 type lockWaits struct {
 	mu      sync.Mutex
 	end     chan struct{}
@@ -91,13 +91,12 @@ func lockWaitsOf(ctx context.Context) *lockWaits {
 
 // errCorpusEvicted is the error of acquirePublishLock and publishGeneration
 // when the corpus directory no longer exists. GC can remove it during a build
-// outside the publish lock.
-// The caller discards its temporary build and does not make the lock file
-// again. The read of a Git node opens .lock with O_CREATE, finds no shard,
-// and repairs: the node is rebuilt in the same command, with an "Index damage
-// detected" warning. A folder node whose read cannot open .lock is skipped
-// with a warning, and the next search builds it
-// (TestEvictionDuringBuildPerKind).
+// outside the publish lock. The caller discards its temporary build and does
+// not make the lock file again. The read of a Git node opens .lock with
+// O_CREATE, finds no shard, and repairs. So the same command builds the node
+// again, with an "Index damage detected" warning. The search skips a folder
+// node whose read cannot open .lock, with a warning, and the next search
+// builds it (TestEvictionDuringBuildPerKind).
 var errCorpusEvicted = errors.New("corpus evicted during build")
 
 // The build and publish locks have separate scopes:
@@ -112,15 +111,15 @@ var errCorpusEvicted = errors.New("corpus evicted during build")
 //
 // Every wait lasts until the lock is free or the user cancels: a search waits
 // for another process's build of the same node. This lock order keeps every
-// wait finite: a goroutine that holds a read lock never waits for a build or
-// a publish lock (withReadLockHeld marks its context, and such a wait fails as
-// a Seek defect). The pipeline prepares a node, which builds and publishes,
-// before its read takes the read lock, and a retry prepares again only after
-// the read returned it (openNode). So each read lock is released after a
-// search of bounded time, and each build wait ends when the build before it
-// publishes or fails, in this process and across processes. flock keeps no
-// queue: a publish waits while readers overlap. That delays a new index only:
-// a search of a node that has shards reads them and never waits for its build.
+// wait finite. A goroutine that holds a read lock never waits for a build or a
+// publish lock. withReadLockHeld marks its context, and such a wait fails as a
+// Seek defect. The pipeline prepares a node, which builds and publishes, before
+// its read takes the read lock. A retry prepares again only after the read
+// returned the lock (openNode). So each read lock is free again after a search
+// of bounded time. Each build wait ends when the build before it publishes or
+// fails, in this process and across processes. flock keeps no queue: a publish
+// waits while readers overlap. That delays a new index only: a search of a node
+// that has shards reads them and never waits for its build.
 
 // The reasons of the three lock waits. pollLock writes the reason as the
 // message of the wait's debug line, with the lock path in its "lock"
@@ -178,24 +177,24 @@ func (store corpusStore) acquireBuildLock(ctx context.Context) (*os.File, bool, 
 			return nil, false, perr
 		}
 	}
-	// Ensure the publish lock file exists so acquirePublishLock (which opens it
-	// without O_CREATE) can distinguish a first build (file present, lockable)
-	// from a gc-evicted corpus (file gone → errCorpusEvicted).
+	// Make sure that the publish lock file exists. acquirePublishLock opens it
+	// without O_CREATE, so it can tell a first build (the file is present) from
+	// a corpus that gc evicted (no file: errCorpusEvicted).
 	if lf, lerr := os.OpenFile(filepath.Join(store.cacheDir, lockFile), os.O_CREATE|os.O_RDWR, 0o644); lerr == nil {
 		_ = lf.Close()
 	}
-	// Mark the corpus as used when the build starts, so a concurrent gc does
+	// Mark the corpus as used when the build starts. Then a concurrent gc does
 	// not evict it between the release of this lock and the search's open of
-	// the publish lock (an open in the trashed directory fails with ENOENT).
-	// gc keeps a corpus whose readUsedAt time is after its cutoff (gc.go).
+	// the publish lock. An open in the trashed directory fails with ENOENT. gc
+	// keeps a corpus whose readUsedAt time is after its cutoff (gc.go).
 	touchUsed(store.cacheDir)
 	return f, true, nil
 }
 
 // tryBuildLock tries a non-blocking LOCK_EX on cacheDir/.build.lock. It returns
-// (fd, true, nil) when it gets the lock, (nil, false, nil) when a builder holds
-// it or flock fails, and the error when the lock file does not open. gc and
-// removeDamagedVectors use it to skip a corpus whose build runs.
+// (fd, true, nil) when it gets the lock. It returns (nil, false, nil) when a
+// builder holds it or flock fails, and the error when the lock file does not
+// open. gc and removeDamagedVectors use it to skip a corpus whose build runs.
 func tryBuildLock(cacheDir string) (*os.File, bool, error) {
 	lockPath := filepath.Join(cacheDir, buildLockFile)
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
@@ -226,8 +225,8 @@ func (store corpusStore) lockBuild(ctx context.Context) (unlock func(), acquired
 }
 
 // servesStale reports whether a node whose update failed with err serves its
-// published shards: it warns once, as the stale-index notice, when shards
-// exist; with none the error fails the node.
+// published shards. When shards exist, it writes the stale-index warning once.
+// With no shard, the error fails the node.
 func (store corpusStore) servesStale(err error) bool {
 	if !shardsExist(store.indexDir) {
 		return false
@@ -296,10 +295,11 @@ func unlockFile(f *os.File) {
 
 // pollLock retries lockFn with exponential backoff and jitter until it
 // succeeds, ctx ends, or the user ends the command's lock waits (lockWaits).
-// It counts the wait, then writes reason as one debug line: a reader of that
-// line can end the wait. Jitter (up to 50% of backoff) keeps processes that
-// poll the same lock from retrying at the same time. Only a held lock is
-// retried: any other flock error never clears, so it returns at once.
+// It counts the wait before it writes reason as one debug line, so an
+// interrupt after that line ends this wait. Jitter (up to 50% of backoff)
+// keeps processes that poll the same lock from retrying at the same time. It
+// retries only a held lock: any other flock error does not clear, so it
+// returns at once.
 func pollLock(ctx context.Context, path, reason string, lockFn func() error, initialBackoff, maxBackoff time.Duration) error {
 	var ended <-chan struct{}
 	waits := lockWaitsOf(ctx)

@@ -54,24 +54,51 @@ func testSemanticNumKongBackends(t *testing.T) []int {
 	return backends
 }
 
+// semanticNumKongFamilySpeed ranks each kernel family that Seek can use, from
+// the slowest. Serial is the slowest. Then come the base family of the
+// architecture and the family with more CPU features.
+var semanticNumKongFamilySpeed = map[string]int{
+	"serial": 0,
+	"neon":   1, "neonfhm": 2,
+	"haswell": 1, "skylake": 2,
+}
+
+// TestSemanticNumKongBestBackendIsTheFastestSupported checks the families that
+// the host supports against semanticNumKongFamilySpeed. The list starts with
+// serial and goes from the slowest to the fastest family. The best backend is
+// the fastest family of the list.
 func TestSemanticNumKongBestBackendIsTheFastestSupported(t *testing.T) {
 	backends := testSemanticNumKongBackends(t)
-	if len(backends) == 0 || backends[0] != 0 || semanticNumKongBackendName(0) != "serial" {
-		t.Fatalf("supported backends=%v, want the serial backend first", backends)
-	}
-	best, err := semanticNumKongBackend()
-	if err != nil || best != backends[len(backends)-1] {
-		t.Fatalf("best backend=%d err=%v, want %d of %v", best, err, backends[len(backends)-1], backends)
-	}
 	names := make([]string, len(backends))
 	for index, backend := range backends {
 		names[index] = semanticNumKongBackendName(backend)
 	}
+	if len(backends) == 0 || backends[0] != 0 || names[0] != "serial" {
+		t.Fatalf("supported families=%v, want serial first", names)
+	}
+	fastest := names[0]
+	for index, name := range names {
+		rank, known := semanticNumKongFamilySpeed[name]
+		if !known {
+			t.Fatalf("supported families=%v: %q has no speed rank", names, name)
+		}
+		if index > 0 && rank <= semanticNumKongFamilySpeed[names[index-1]] {
+			t.Fatalf("supported families=%v, want the slowest first", names)
+		}
+		if rank > semanticNumKongFamilySpeed[fastest] {
+			fastest = name
+		}
+	}
+	best, err := semanticNumKongBackend()
+	if err != nil || semanticNumKongBackendName(best) != fastest {
+		t.Fatalf("best backend=%q err=%v, want the fastest supported family %q of %v",
+			semanticNumKongBackendName(best), err, fastest, names)
+	}
 	// Every arm64 CPU that Seek supports has NEON.
 	if runtime.GOARCH == "arm64" && !slices.Contains(names, "neon") {
-		t.Fatalf("backend names=%v, want neon on arm64", names)
+		t.Fatalf("supported families=%v, want neon on arm64", names)
 	}
-	t.Logf("NumKong backends: %v, best %s", names, semanticNumKongBackendName(best))
+	t.Logf("NumKong families: %v, best %s", names, fastest)
 }
 
 // TestSemanticNumKongAllowedCapabilitiesNeedEveryTarget gives the gate fake
@@ -139,8 +166,8 @@ func TestSemanticNumKongAllowedCapabilitiesNeedEveryTarget(t *testing.T) {
 }
 
 // TestSemanticFineKernelMatchesFloat64Oracle scores random rows with every
-// kernel family that the host can run, for whole ranges and for rows with
-// gaps, and compares each score with a float64 oracle of the stored codes.
+// kernel family that the host can run, in whole ranges and in rows with gaps.
+// It compares each score with a float64 oracle of the stored codes.
 func TestSemanticFineKernelMatchesFloat64Oracle(t *testing.T) {
 	random := rand.New(rand.NewPCG(21, 22))
 	const rowCount = 700

@@ -7,10 +7,9 @@ import (
 	"testing"
 )
 
-// TestCommittedShardHead_ReportsThePublishedCommit checks that the helper reads
-// the commit from the shards themselves, for a full build and after a later
-// commit, and that it reports "unknown" rather than a wrong answer when no
-// committed shard exists.
+// TestCommittedShardHead_ReportsThePublishedCommit checks that
+// committedShardHead reads the commit from committed shard 0, after the first
+// build and after the build of a later commit.
 func TestCommittedShardHead_ReportsThePublishedCommit(t *testing.T) {
 	requireTools(t)
 
@@ -66,9 +65,10 @@ func TestCommittedShardHead_ReportsThePublishedCommit(t *testing.T) {
 	}
 }
 
-// TestCommittedShardHead_UnknownWithoutACommittedShard checks the "unknown"
-// answer. A caller must keep the answer it has; it must never read this as
-// stale.
+// TestCommittedShardHead_UnknownWithoutACommittedShard checks the three cases
+// where committedShardHead answers "unknown". They are an empty scan, a file
+// that is not a numbered shard, and a shard 0 with metadata that it cannot
+// read. A caller keeps the answer it has, and never reads "unknown" as stale.
 func TestCommittedShardHead_UnknownWithoutACommittedShard(t *testing.T) {
 	if _, ok := committedShardHead(familyScan{}); ok {
 		t.Fatal("an empty scan reported a commit")
@@ -91,13 +91,12 @@ func TestCommittedShardHead_UnknownWithoutACommittedShard(t *testing.T) {
 		t.Fatal("an unnumbered file reported a commit")
 	}
 
-	// A real shard 0 whose bytes stop being a zoekt index must reach
-	// index.ReadMetadataPathAlive and still report "unknown". This is the case
-	// committedSnapshotReady relies on to keep today's answer.
+	// A real shard 0 whose bytes are not a Zoekt index must reach the
+	// metadata read (zoektReadMetadata) and report "unknown".
+	// committedSnapshotReady then keeps the answer that the corpus gives.
 	//
-	// Build a real corpus and damage its shard rather than writing a file with
-	// a hand-written name: the name then comes from the indexer, so this case
-	// keeps testing the metadata read even if the naming ever changes.
+	// The test damages the shard of a real build, so the indexer gives the
+	// shard name. A change of the name rule then cannot skip the metadata read.
 	requireTools(t)
 	repo := initGitRepo(t, "app.go", "package main\n// DAMAGED_SHARD_MARKER\n")
 	ctx := context.Background()

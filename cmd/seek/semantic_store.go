@@ -26,10 +26,11 @@ import (
 
 const (
 	semanticFormatVersion = 6
-	// Compatibility revisions are cache barriers for behavior that asset hashes
-	// and typed format settings cannot describe. anchored-spherical-v2 adds
-	// normalization for finite values whose scale cannot fit in float32.
-	// semanticVectorCodec identifies fine-vector encoding separately.
+	// A compatibility revision changes the generation key for behavior that
+	// the asset hashes and the typed format settings cannot describe.
+	// anchored-spherical-v2 includes the normalization of finite values whose
+	// scale float32 cannot hold. semanticVectorCodec names the fine-vector
+	// encoding on its own.
 	semanticRepresentationRevision = "anchored-spherical-v2"
 	semanticModelAlgorithmRevision = "lateon-code-edge-proxy-no-symbol-centroids-v5"
 	semanticGenerationPrefix       = "semantic-"
@@ -45,17 +46,19 @@ const (
 	semanticMetadataFieldMax       = 1 << 20
 )
 
-// semanticRowsHashedBytes counts the rows.bin bytes that a full check read,
-// and semanticShardsHashed counts the USearch shards that a check hashed; tests
-// read them to see that a search trusts a checked file.
+// semanticRowsHashed counts the full checks of rows.bin, and
+// semanticShardsHashed the USearch shards that a check hashed. A full check
+// reads the whole file, which a warm search must not do again. Each count is
+// one atomic add next to that read, so it costs nothing. Tests read the counts
+// to prove that a search trusts a checked file.
 var (
-	semanticRowsHashedBytes atomic.Int64
-	semanticShardsHashed    atomic.Int64
+	semanticRowsHashed   atomic.Int64
+	semanticShardsHashed atomic.Int64
 )
 
-// semanticNormalizedSquaredNormTolerance limits accepted float32 centroid and
-// query squared norms. The stored-vector tolerances of the SNORM16 and binary16
-// codecs are derived from it.
+// semanticNormalizedSquaredNormTolerance limits the squared norms of accepted
+// float32 centroids and query tokens. The stored-vector tolerances of the
+// SNORM16 and binary16 codecs come from it.
 const semanticNormalizedSquaredNormTolerance = 1e-3
 
 var semanticModelCompatibility = sync.OnceValue(func() string {
@@ -93,15 +96,16 @@ type semanticArtifact struct {
 	SHA256 string `json:"sha256"`
 }
 
-// semanticSizedArtifact records the exact length of rebuildable vector data.
-// It has no whole-file checksum, so open cannot detect all same-length content
-// changes. Hash validation would add an index-sized read.
+// semanticSizedArtifact records the exact length of vector data that a build
+// can make again. It has no checksum of the whole file, so an open cannot find
+// every change that keeps the length. A hash check would read the whole file
+// at each open, a read of about the size of the index.
 type semanticSizedArtifact struct {
 	Bytes uint64 `json:"bytes"`
 }
 
 // semanticUSearchShard records one graph shard. ID identifies its graph
-// (semanticUSearchShardID): a later build that gets the same ID reuses the
+// (semanticUSearchShardID). A later build that gets the same ID reuses the
 // file and does not build it again.
 type semanticUSearchShard struct {
 	Name  string `json:"name"`
@@ -113,9 +117,9 @@ type semanticUSearchShard struct {
 	Check semanticRowsCheck `json:"check"`
 }
 
-// semanticRowsCheck records a file as the full check at build saw it: a later
+// semanticRowsCheck records a file as the full check at build saw it. A later
 // open that finds the same length, device, inode, mtime, and ctime trusts the
-// file; any other value runs the full check again.
+// file. Any other value runs the full check again.
 type semanticRowsCheck struct {
 	Device  uint64 `json:"device"`
 	Inode   uint64 `json:"inode"`
@@ -125,12 +129,12 @@ type semanticRowsCheck struct {
 
 // semanticManifest binds the semantic artifacts to their exact formats.
 // VectorCodec identifies the fine-vector byte encoding. VectorStride is the
-// byte width of one semantic row, including all fine centroids, not one
-// centroid vector. Runtime is the bundled ONNX Runtime version that produced
-// the vectors; see semanticInferenceRuntime for why a run-time upgrade must not
-// reuse them.
-// USearchShardRows is the shard size of the cut (semanticUSearchShardRowsFor);
-// it comes from the host, so it is not in the generation key.
+// byte width of one semantic row with all its fine centroids, not of one
+// centroid vector. Runtime is the bundled ONNX Runtime version that made the
+// vectors. semanticInferenceRuntime tells why a new run time must not reuse
+// them. USearchShardRows is the shard size of the cut
+// (semanticUSearchShardRowsFor). It comes from the host, so it is not in the
+// generation key.
 type semanticManifest struct {
 	Format           uint32                 `json:"format"`
 	Source           string                 `json:"source"`
@@ -150,7 +154,7 @@ type semanticManifest struct {
 	USearchShardRows uint64                 `json:"usearch_shard_rows"`
 	USearchFiles     []semanticUSearchShard `json:"usearch_files"`
 	// ModelPathBase is the model path base of the node that built the rows
-	// (modelPathBase): the rows' windows name each file's path from it.
+	// (modelPathBase). The rows' windows name each file's path from it.
 	ModelPathBase string `json:"model_path_base,omitempty"`
 }
 
@@ -176,23 +180,22 @@ type semanticUSearchValidation struct {
 }
 
 // semanticInferenceRuntime reports the bundled ONNX Runtime version. It reads
-// the embedded runtime manifest, so it neither initializes the run time nor
-// decodes the model, and it is safe on lexical-only paths that never load
-// either.
+// the embedded runtime manifest, so it starts no run time and decodes no
+// model. So it is safe on lexical-only paths that never load either.
 //
-// The version belongs in the generation key because a run-time upgrade can
-// change the numbers that the model gives: a change to its graph
-// optimizations, such as reshape fusion or constant folding, changes how the
-// graph is partitioned and so the stored vectors. An index outlives the
-// binary that wrote it, so without the version a new run time would query
-// vectors that an older one made.
+// The version is in the generation key because a new run time can change the
+// numbers that the model gives. A change to its graph optimizations, such as
+// reshape fusion or constant folding, changes how it splits the graph. That
+// changes the stored vectors. An index lives longer than the binary that
+// wrote it. Without the version, a new run time would query vectors that an
+// older one made.
 //
-// The key holds no execution provider. To resolve the provider needs the
-// compiled model cache directory, which needs the model bytes, and to decode
-// them on a lexical-only search would undo the work that keeps that path free
-// of model cost. A provider that passes the run-time comparison in
-// verifyLateOnAcceleratedProvider meets much tighter limits than this key could
-// check.
+// The key holds no execution provider. The provider needs the compiled model
+// cache directory, which needs the model bytes. A decode of those bytes on a
+// lexical-only search would add the model cost that this path avoids. A
+// provider that passes the run-time comparison in
+// verifyLateOnAcceleratedProvider meets much tighter limits than this key
+// could check.
 var semanticInferenceRuntime = sync.OnceValue(func() string {
 	bundle, err := lateOnRuntimeForPlatform()
 	if err != nil || bundle.version == "" {
@@ -310,12 +313,16 @@ func writeSemanticGenerationFromParts(
 	return manifest, nil
 }
 
-// The stored row layout starts with magic and a little-endian uint64 row count.
-// Each row then stores row, start, and end as uint64 values; three SHA-256
-// values (unit ID, content ID, window key); path, language and symbol lengths
-// as uint32; and kind and parser result as bytes. The path, language, and
-// symbol bytes follow in that order with no padding. Keep readSemanticRowsFrom
-// and checkedSemanticRowsMinimumBytes in sync with this layout.
+// writeSemanticRows writes the rows file. It starts with the magic and a
+// little-endian uint64 row count. Then each row stores these fields:
+//   - row, start, and end as uint64 values;
+//   - three SHA-256 values (unit ID, content ID, window key);
+//   - the path, language, and symbol lengths as uint32;
+//   - kind and parser result as bytes.
+//
+// The path, language, and symbol bytes follow in that order with no padding.
+// readSemanticRowsFrom and checkedSemanticRowsMinimumBytes must match this
+// layout.
 func writeSemanticRows(path string, units []semanticUnit) (semanticArtifact, error) {
 	return writeSemanticArtifact(path, func(writer io.Writer) error {
 		buffered := bufio.NewWriterSize(writer, 256<<10)
@@ -408,15 +415,15 @@ func inspectSemanticArtifact(path string) (semanticArtifact, error) {
 }
 
 // openSemanticGenerationForSearch trusts a rows.bin whose length, device,
-// inode, mtime, and ctime match the recorded check; it hashes no graph shard
+// inode, mtime, and ctime match the recorded check. It hashes no graph shard
 // until a native plan needs it.
 func openSemanticGenerationForSearch(dir, source string) (*semanticGeneration, error) {
 	return openSemanticGenerationWithOptions(dir, source, false)
 }
 
-// openSemanticGenerationRows opens a generation for its rows and vectors
-// only (reuse, the unit store): it reads no USearch shard, so a generation
-// that an older build made with another graph rule still gives its rows.
+// openSemanticGenerationRows opens a generation for its rows and vectors only
+// (reuse, the unit store). It neither checks nor reads a USearch shard, so a
+// damaged graph shard does not stop its rows.
 func openSemanticGenerationRows(dir, source string) (*semanticGeneration, error) {
 	return openSemanticGenerationWithOptions(dir, source, true)
 }
@@ -483,8 +490,8 @@ func (generation *semanticGeneration) validateUSearchShard(index int) error {
 	validation := &generation.usearchValidation[index]
 	validation.once.Do(func() {
 		shard := generation.manifest.USearchFiles[index]
-		// A shard that the check at build saw is trusted, as rows.bin is;
-		// any other file is hashed in full.
+		// A shard that the check at build saw is trusted, as rows.bin is.
+		// Any other file gets a full hash.
 		if info, err := os.Lstat(generation.usearch[index]); err == nil && info.Mode().IsRegular() &&
 			uint64(info.Size()) == shard.Bytes && semanticRowsCheckOf(info) == shard.Check {
 			return
@@ -501,14 +508,14 @@ func (generation *semanticGeneration) validateUSearchShard(index int) error {
 	return nil
 }
 
-// readSemanticManifest reads and checks the manifest of dir, its USearch
-// shard list included: the build gate and the open apply one rule.
+// readSemanticManifest reads and checks the manifest of dir, with its USearch
+// shard list. So the build gate and the open apply one rule.
 func readSemanticManifest(dir, source string) (semanticManifest, error) {
 	return readSemanticManifestChecked(dir, source, true)
 }
 
-// readSemanticManifestChecked reads and checks the manifest of dir; graph also
-// checks its USearch shard list.
+// readSemanticManifestChecked reads and checks the manifest of dir. With graph,
+// it also checks its USearch shard list.
 func readSemanticManifestChecked(dir, source string, graph bool) (semanticManifest, error) {
 	manifest, err := readSemanticManifestUnchecked(dir)
 	if err != nil {
@@ -527,8 +534,8 @@ func readSemanticManifestChecked(dir, source string, graph bool) (semanticManife
 	return manifest, nil
 }
 
-// readSemanticManifestUnchecked decodes the manifest of dir without checking
-// its source, so a build can name the source of another generation; the open
+// readSemanticManifestUnchecked decodes the manifest of dir and does not check
+// its source. So a build can name the source of another generation. The open
 // that follows checks the manifest in full.
 func readSemanticManifestUnchecked(dir string) (semanticManifest, error) {
 	file, err := openRegularSemanticFile(filepath.Join(dir, semanticManifestFile))
@@ -691,8 +698,8 @@ func semanticUSearchShardName(index int) string {
 }
 
 // validateSemanticUSearchShardMetadata checks that the shards cover every
-// row, each in at most shardRows rows (a power of two from 256 to 4,096), or
-// that a generation with no graph has none.
+// row, each with at most shardRows rows (a power of two from 256 to 4,096). A
+// generation with no graph must have no shard.
 func validateSemanticUSearchShardMetadata(rows, shardRows uint64, shards []semanticUSearchShard, graph bool) error {
 	if rows == 0 || !graph {
 		if len(shards) != 0 || shardRows != 0 {
@@ -806,9 +813,9 @@ func validateSemanticArtifact(path string, want semanticArtifact) error {
 	return nil
 }
 
-// readCheckedSemanticRows reads rows.bin. A file whose device, inode, mtime,
-// or ctime differs from the recorded check is hashed against the manifest; a
-// file that the check saw is trusted.
+// readCheckedSemanticRows reads rows.bin. A file that the recorded check saw
+// is trusted. When the device, inode, mtime, or ctime differs, it hashes the
+// file and compares the hash with the manifest.
 func readCheckedSemanticRows(
 	path string,
 	want semanticArtifact,
@@ -845,9 +852,9 @@ func refreshSemanticRowsCheck(dir string, check semanticRowsCheck) {
 	})
 }
 
-// rewriteSemanticManifest reads the manifest of dir, lets update change it,
-// and writes it again when update returns true: a temporary file renamed over
-// the manifest, so a reader sees the old or the new one.
+// rewriteSemanticManifest reads the manifest of dir and lets update change it.
+// When update returns true, it writes a temporary file and renames it over the
+// manifest. So a reader sees the old manifest or the new one.
 func rewriteSemanticManifest(dir string, update func(*semanticManifest) bool) {
 	manifest, err := readSemanticManifestUnchecked(dir)
 	if err != nil || !update(&manifest) {
@@ -878,10 +885,9 @@ func readVerifiedSemanticRows(
 	wantSHA256 string,
 	count uint64,
 ) ([]semanticUnit, error) {
+	semanticRowsHashed.Add(1)
 	hash := sha256.New()
-	counted := &semanticCountingReader{reader: io.TeeReader(reader, hash)}
-	rows, err := readSemanticRowsFrom(counted, count, true)
-	semanticRowsHashedBytes.Add(counted.bytes)
+	rows, err := readSemanticRowsFrom(io.TeeReader(reader, hash), count, true)
 	if err != nil {
 		return nil, err
 	}
@@ -891,20 +897,9 @@ func readVerifiedSemanticRows(
 	return rows, nil
 }
 
-type semanticCountingReader struct {
-	reader io.Reader
-	bytes  int64
-}
-
-func (r *semanticCountingReader) Read(p []byte) (int, error) {
-	n, err := r.reader.Read(p)
-	r.bytes += int64(n)
-	return n, err
-}
-
-// readSemanticRowsFrom parses rows. verifyIDs recomputes each unit ID: the
-// full check does it; a file that the recorded check saw is trusted, so its
-// open hashes nothing.
+// readSemanticRowsFrom parses rows. verifyIDs computes each unit ID again,
+// which the full check does. A file that the recorded check saw is trusted, so
+// its open hashes nothing.
 func readSemanticRowsFrom(reader io.Reader, count uint64, verifyIDs bool) ([]semanticUnit, error) {
 	buffered := bufio.NewReaderSize(reader, 256<<10)
 	var header [semanticRowsHeaderBytes]byte
@@ -993,9 +988,9 @@ func internSemanticRowLanguage(interned map[string]string, raw []byte) string {
 }
 
 // mapSemanticVectors checks the exact payload length and maps its bytes
-// directly as binary16 rows. This view requires a little-endian target. It does
-// not validate component codes; exactSemanticRange validates each vector before
-// scoring it.
+// directly as binary16 rows. This view needs a little-endian target. It does
+// not check the component codes; exactSemanticRange checks each vector before
+// it scores it.
 func mapSemanticVectors(file *os.File, count uint64) ([]semanticFineF16Vectors, []byte, error) {
 	wantBytes, ok := checkedSemanticVectorBytes(count)
 	if !ok {
@@ -1054,8 +1049,8 @@ func exactSemanticSearch(
 	return exactSemanticRowSelection(ctx, vectors, queryVectors, nil, floor)
 }
 
-// exactSemanticSortedCandidates scores a sorted set of unique row IDs. Search
-// planning already produces this order, which keeps vector reads sequential.
+// exactSemanticSortedCandidates scores a sorted set of unique row IDs. The
+// search plan gives this order, which keeps the vector reads sequential.
 func exactSemanticSortedCandidates(
 	ctx context.Context,
 	vectors []semanticFineF16Vectors,
@@ -1163,8 +1158,8 @@ func validateNormalizedSemanticVector(vector *semanticVector) error {
 	return nil
 }
 
-// prepareSemanticFineQuery validates each normalized query token, rounds it to
-// binary16 as the stored rows are, and packs the tokens for the fastest kernel
+// prepareSemanticFineQuery checks each normalized query token and rounds it to
+// binary16, as the stored rows are. It packs the tokens for the fastest kernel
 // family of the host CPU. The query buffer does not change.
 func prepareSemanticFineQuery(query []semanticVector) (semanticNumKongPack, error) {
 	backend, err := semanticNumKongBackend()
@@ -1190,8 +1185,8 @@ func prepareSemanticFineQueryFor(backend int, query []semanticVector) (semanticN
 }
 
 // semanticFineBlockRows gives the rows of one kernel call: about 4,096
-// row-token pairs, within 16 to 512 rows, so the dot products of a block stay
-// in the CPU cache and a canceled search stops after one block.
+// row-token pairs, within 16 to 512 rows. So the dot products of a block stay
+// in the CPU cache, and a canceled search stops after one block.
 func semanticFineBlockRows(tokens int) int {
 	return max(16, min(512, 4096/max(1, tokens)))
 }

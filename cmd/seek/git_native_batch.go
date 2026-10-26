@@ -35,6 +35,8 @@ type nativeGitBatch struct {
 	missing  int
 }
 
+// startNativeGitBatch starts `git cat-file --batch-command --buffer` in
+// repoDir.
 func startNativeGitBatch(ctx context.Context, repoDir string) (*nativeGitBatch, error) {
 	cmd := newGitCommand(ctx, repoDir, "cat-file", "--batch-command", "--buffer")
 	stdin, err := cmd.StdinPipe()
@@ -63,8 +65,8 @@ func startNativeGitBatch(ctx context.Context, repoDir string) (*nativeGitBatch, 
 }
 
 // writeCommands writes while the caller reads replies. Git can fill its output
-// pipe before it has read a full 8,192-object input group, so serial write then
-// read can deadlock even with explicit protocol flushes.
+// pipe before it has read a full input group of 8,192 objects. So a write and
+// then a read in series can deadlock, also with explicit protocol flushes.
 func (b *nativeGitBatch) writeCommands(verb string, ids []gitObjectID) <-chan error {
 	done := make(chan error, 1)
 	go func() {
@@ -111,7 +113,7 @@ func (b *nativeGitBatch) abort(writeDone <-chan error) {
 
 // check reads the size of the blob of each entry. In a partial clone, a
 // missing blob gives a name-only info and counts toward the warning that close
-// writes; in any other repository, a missing blob fails the batch.
+// writes. In any other repository, a missing blob fails the batch.
 func (b *nativeGitBatch) check(entries []gitTreeEntry) ([]gitBlobInfo, error) {
 	if len(entries) == 0 {
 		return nil, nil

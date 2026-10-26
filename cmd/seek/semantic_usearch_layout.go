@@ -18,7 +18,7 @@ import (
 // A USearch graph shard holds the coarse vectors of whole files. Its keys
 // start at 0 in each shard (semanticUSearchVectorKey of the row in the shard),
 // and the search adds the shard's first row. So the bytes of a shard depend
-// only on its own rows, and a new generation can reuse the graph file of each
+// only on its own rows. A new generation can reuse the graph file of each
 // shard whose rows did not change. One shard costs 0.44 to 0.67 s of CPU to
 // build. With one key space for the whole generation, a one-file commit moved
 // every later key and rebuilt all 329 shards of a Kubernetes checkout. Now
@@ -44,11 +44,11 @@ const (
 )
 
 // semanticUSearchShardRowsFor gives the shard size of a generation of rows
-// rows on cpus CPUs: the largest power of two from 256 to 4,096 that is at
-// most rows / cpus. So a small generation builds its graphs on all CPUs: one
-// shard of 4,096 rows takes 436 ms on one CPU, 16 shards of 256 rows take
-// 17 ms on 16 CPUs. A power of two keeps the size, and so the cut, the same
-// when a commit adds or removes a few rows.
+// rows on cpus CPUs. It is the largest power of two from 256 to 4,096 that is
+// at most rows / cpus. So a small generation builds its graphs on all CPUs.
+// One shard of 4,096 rows takes 436 ms on one CPU, and 16 shards of 256 rows
+// take 17 ms on 16 CPUs. A power of two keeps the size, and so the cut, the
+// same when a commit adds or removes a few rows.
 func semanticUSearchShardRowsFor(rows uint64, cpus int) uint64 {
 	perCPU := rows / uint64(max(1, cpus))
 	size := uint64(semanticUSearchMaxShardRows)
@@ -58,8 +58,8 @@ func semanticUSearchShardRowsFor(rows uint64, cpus int) uint64 {
 	return size
 }
 
-// semanticUSearchShardPlan is one shard of a generation: its rows from start,
-// and the digest of the model input key and the unit ID of each row.
+// semanticUSearchShardPlan is one shard of a generation: its rows from start.
+// digest hashes the model input key and the unit ID of each row.
 type semanticUSearchShardPlan struct {
 	start  uint64
 	rows   uint64
@@ -69,6 +69,8 @@ type semanticUSearchShardPlan struct {
 // semanticUSearchPlanRow is the model input key and the unit ID of one row.
 type semanticUSearchPlanRow [2 * sha256.Size]byte
 
+// semanticUSearchPlanFile is the rows of one file, from row start, and the
+// anchor hash of its path (semanticUSearchCutAnchor).
 type semanticUSearchPlanFile struct {
 	anchor uint64
 	start  uint64
@@ -88,22 +90,23 @@ type semanticUSearchPlanFile struct {
 //   - After a file, the open shard closes when it holds at least 15/16 of the
 //     shard size and the file is an anchor.
 //
-// A file is an anchor when a hash of its path, read as a fraction, is below
-// its rows divided by 1/32 of the shard size. The path, not the content,
-// decides the hash, so an edit does not move the anchors. An edit that adds
-// or removes rows moves the cuts only up to the next anchor that both layouts
-// reach. The shards after that anchor keep their rows, so their graphs stay.
+// A file is an anchor when a hash of its path, read as a fraction, is below a
+// limit. The limit is its rows divided by 1/32 of the shard size. The path,
+// not the content, decides the hash, so an edit does not move the anchors. An
+// edit that adds or removes rows moves the cuts only up to the next anchor
+// that both layouts reach. The shards after that anchor keep their rows, so
+// their graphs stay.
 //
 // On a Kubernetes checkout (1,347,164 rows in 30,194 files), the rule gives
 // 379 shards of 3,555 rows on average. A cut that fills each shard until the
 // next file does not fit gives 373 shards, but its cuts drift after an edit.
 // In a simulation of 400 changes, an edited file changed 1.06 shards on
-// average (99th percentile 3), a new file 1.55 and a removed file 1.46. A
-// lower bound of half the size gives 470 shards. Each shard adds a cost to
-// every search: one view and one search for each query token. The 379 shards
-// cost no measurable search time against the 329 shards of a fixed cut. In ten
-// paired rounds of six queries, the graph stage was faster in five rounds, and
-// the median change was +8 ms for the six queries.
+// average (99th percentile 3). A new file changed 1.55, and a removed file
+// 1.46. A lower bound of half the size gives 470 shards. Each shard adds a
+// cost to every search: one view and one search for each query token. The 379
+// shards cost no measurable search time against the 329 shards of a fixed
+// cut. In ten paired rounds of six queries, the graph stage was faster in five
+// rounds. The median change was +8 ms for the six queries.
 type semanticUSearchShardPlanner struct {
 	cpus     int
 	size     uint64
@@ -233,18 +236,18 @@ func semanticUSearchCutAnchor(path string) uint64 {
 }
 
 // semanticUSearchCutAnchorHit reports whether a file of rows rows with the
-// path hash anchor is an anchor: rows / spacing is its chance, so the anchors
+// path hash anchor is an anchor. Its chance is rows / spacing, so the anchors
 // come about every spacing rows, whatever the file sizes.
 func semanticUSearchCutAnchorHit(anchor, rows, spacing uint64) bool {
 	spacing = max(1, spacing)
 	return rows >= spacing || anchor < rows*(math.MaxUint64/spacing)
 }
 
-// semanticUSearchShardID identifies the graph of one shard: the USearch
-// runtime and layout, the row count, the key and unit ID of each row, and the
-// coarse vectors that the graph holds. The vectors are in the ID because two
-// generations can hold one key with other vectors (another model provider);
-// a graph file with this ID holds exactly these vectors under these keys.
+// semanticUSearchShardID identifies the graph of one shard. It hashes the
+// USearch runtime and layout, and the row count. It also hashes the key, the
+// unit ID, and the coarse vectors of each row. Two generations can hold one
+// key with other vectors (another model provider), so the vectors are in the
+// ID. A graph file with this ID holds exactly these vectors under these keys.
 func semanticUSearchShardID(
 	compatibility string,
 	plan semanticUSearchShardPlan,
@@ -272,10 +275,10 @@ func semanticUSearchShardID(
 
 // semanticUSearchShardSource is a graph shard of a published generation that
 // a build can reuse. link is true when the build's bind removes the source's
-// generation: a link then shares the file with no copy, and the bind records
-// the new checks (refreshSemanticUSearchChecks). A source in another corpus is
-// copied: a link changes the ctime of its file, and that corpus would then
-// hash the file again at each search until its next bind.
+// generation. A link then shares the file with no copy, and the bind records
+// the new checks (refreshSemanticUSearchChecks). A build copies a source in
+// another corpus. A link would change the ctime of its file. That corpus would
+// then hash the file again at each search until its next bind.
 type semanticUSearchShardSource struct {
 	path  string
 	shard semanticUSearchShard
@@ -380,11 +383,12 @@ func copySemanticUSearchShard(source semanticUSearchShardSource, path string) (s
 }
 
 // refreshSemanticUSearchChecks records a new check for each graph shard of
-// the generation in dir whose file changed after its check, when the full
-// hash still matches. A link and an unlink change the ctime of a reused file.
-// So after a bind removes the generation that a build linked from, every
-// reused shard fails its check, and each search process would hash it again
-// (1.06 GB for a Kubernetes checkout). A failure keeps the old checks.
+// the generation in dir whose file changed after its check. It does so only
+// when the full hash still matches. A link and an unlink change the ctime of a
+// reused file. So after a bind removes the generation that a build linked
+// from, every reused shard fails its check. Each search process would then
+// hash it again (1.06 GB for a Kubernetes checkout). A failure keeps the old
+// checks.
 func refreshSemanticUSearchChecks(dir string) {
 	manifest, err := readSemanticManifestUnchecked(dir)
 	if err != nil || len(manifest.USearchFiles) == 0 {

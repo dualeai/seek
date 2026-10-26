@@ -3,6 +3,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -121,7 +122,7 @@ func TestLateOnRejectedVerdictSelectsCPUProvider(t *testing.T) {
 	if !ok {
 		t.Fatalf("model type is %T, want *lateOnModel", rawModel)
 	}
-	if err := os.WriteFile(verdict, []byte(lateOnVerdictRejected+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(verdict, []byte("rejected\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	encoder, err := lateOn.semanticRowEncoder(t.Context(), false)
@@ -133,8 +134,10 @@ func TestLateOnRejectedVerdictSelectsCPUProvider(t *testing.T) {
 		t.Fatalf("provider = %q, want %q; verdict %q content=%q err=%v",
 			got, lateOnCPUProviderName, verdict, string(after), readErr)
 	}
-	// A CPU call must reserve CPU in the shared gate. Zero is the accelerator
-	// reservation and would let the scheduler oversubscribe the host.
+	// A CPU call must count its CPUs toward semanticModelCallLimit. A cost of
+	// 0, as for an accelerated call, lets one call run for each CPU. A CPU
+	// call can use several threads, so these calls could then use more CPUs
+	// than the host has.
 	if encoder.CallCPUs() < 1 {
 		t.Fatalf("CallCPUs() = %d, want at least 1 for the CPU provider", encoder.CallCPUs())
 	}
@@ -161,7 +164,7 @@ func TestFolderBuildFaultRecordsProviderRejection(t *testing.T) {
 		t.Fatalf("the build did not record a provider rejection: %v", err)
 	}
 	if fields := strings.Fields(string(stored)); len(fields) != 3 ||
-		fields[0] != lateOnVerdictRecheck || fields[1] != "1" {
+		fields[0] != "recheck" || fields[1] != "1" {
 		t.Fatalf("first fault verdict = %q, want one stamped fault", string(stored))
 	}
 	// A second fault, with the recheck already on disk, demotes for good.
@@ -170,8 +173,8 @@ func TestFolderBuildFaultRecordsProviderRejection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(string(stored)) != lateOnVerdictRejected {
-		t.Fatalf("second fault verdict = %q, want %q", string(stored), lateOnVerdictRejected)
+	if strings.TrimSpace(string(stored)) != "rejected" {
+		t.Fatalf("second fault verdict = %q, want rejected", string(stored))
 	}
 }
 
@@ -196,8 +199,8 @@ func TestRunCoreMLCacheDirectoryIsStableAcrossCacheRoots(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The resolved key is reused for the whole process, but the cache root is
-	// read on every call, so a changed root must still be honoured.
+	// The process keeps the resolved key, but each call reads the cache root
+	// again. So a call after a change of the root must use the new root.
 	firstRoot := t.TempDir()
 	t.Setenv("SEEK_CACHE_DIR", firstRoot)
 	first, err := lateOnRunCoreMLCacheDirectory(model)
@@ -232,7 +235,7 @@ func TestRejectedModelStopsRefreshingItsAccessMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	verdict := filepath.Join(directory, lateOnProviderVerdictFile)
-	if err := os.WriteFile(verdict, []byte(lateOnVerdictRejected+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(verdict, []byte("rejected\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := lateOnCoreMLCacheDirectoryForKey(key); err != nil {
@@ -242,7 +245,7 @@ func TestRejectedModelStopsRefreshingItsAccessMarker(t *testing.T) {
 		t.Fatalf("a rejected model kept refreshing its access marker: %v", err)
 	}
 	// A trusted model still refreshes it.
-	if err := os.WriteFile(verdict, []byte(lateOnVerdictTrusted+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(verdict, []byte("trusted\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := lateOnCoreMLCacheDirectoryForKey(key); err != nil {
@@ -256,9 +259,9 @@ func TestRejectedModelStopsRefreshingItsAccessMarker(t *testing.T) {
 func TestSearchFallbacksRecordAProviderFault(t *testing.T) {
 	// A wrong provider on an already-built index makes the search fall back to
 	// strict order. The fallback must record one provider fault, or the
-	// provider never earns a demotion. The query model, the re-rank model and
-	// the vector scan each fail with degenerate output on the second search;
-	// the first search builds the vectors with a working model.
+	// provider is never demoted. The first search builds the vectors with a
+	// working model. On the second search, the query model, the re-rank model
+	// or the vector scan fails with degenerate output.
 	for _, test := range []struct {
 		name string
 		fail func(*hybridTestScorer, error)
@@ -300,8 +303,8 @@ func TestSearchFallbacksRecordAProviderFault(t *testing.T) {
 }
 
 func TestRecordFaultOnlyActsOnProviderFaults(t *testing.T) {
-	// Every search-path fallback funnels through this, so it decides whether a
-	// wrong provider on an already-built index is ever recorded.
+	// Every fallback on the search path calls recordFault, so it decides
+	// whether Seek records a wrong provider on an index that is already built.
 	path := pinAcceleratedProviderForTest(t)
 	future := &semanticModelFuture{}
 
@@ -315,22 +318,20 @@ func TestRecordFaultOnlyActsOnProviderFaults(t *testing.T) {
 	}
 }
 
-// pinAcceleratedProviderForTest arranges the state a real selection leaves —
-// the accelerated provider in use, with its verdict at a known path — and
-// returns that path. Many tests need it, and the save and restore is easy to
-// get subtly wrong in each of them.
+// pinAcceleratedProviderForTest sets the state that a real selection leaves:
+// the accelerated provider in use, and its verdict at a path in a temporary
+// folder. It returns that path. When the test ends, it puts back the values
+// that were set before. An atomic.Value cannot hold nil again, so a value that
+// was not set becomes an empty string. rejectLateOnAcceleratedProvider then
+// finds no provider in use and no verdict path, as before the call.
 func pinAcceleratedProviderForTest(t *testing.T) string {
 	t.Helper()
 	verdict := filepath.Join(t.TempDir(), lateOnProviderVerdictFile)
 	previousProvider := lateOnSelectedProvider.Load()
 	previousLocation := lateOnVerdictLocation.Load()
 	t.Cleanup(func() {
-		if previousProvider != nil {
-			lateOnSelectedProvider.Store(previousProvider)
-		}
-		if previousLocation != nil {
-			lateOnVerdictLocation.Store(previousLocation)
-		}
+		lateOnSelectedProvider.Store(cmp.Or[any](previousProvider, ""))
+		lateOnVerdictLocation.Store(cmp.Or[any](previousLocation, ""))
 	})
 	lateOnSelectedProvider.Store(lateOnAcceleratedProviderName)
 	lateOnVerdictLocation.Store(verdict)
@@ -364,15 +365,15 @@ func TestReadLateOnProviderRecordRejectsMalformedRecords(t *testing.T) {
 	}
 	now := time.Now().Unix()
 	for _, stored := range []string{
-		lateOnVerdictTrusted,
-		lateOnVerdictRejected,
+		"trusted",
+		"rejected",
 		"",
-		lateOnVerdictRecheck,
-		fmt.Sprintf("%s 1", lateOnVerdictRecheck),
-		fmt.Sprintf("%s not-a-number %d", lateOnVerdictRecheck, now),
-		fmt.Sprintf("%s -3 %d", lateOnVerdictRecheck, now),
-		fmt.Sprintf("%s 0 %d", lateOnVerdictRecheck, now),
-		fmt.Sprintf("%s 1 not-a-time", lateOnVerdictRecheck),
+		"recheck",
+		"recheck 1",
+		fmt.Sprintf("recheck not-a-number %d", now),
+		fmt.Sprintf("recheck -3 %d", now),
+		fmt.Sprintf("recheck 0 %d", now),
+		"recheck 1 not-a-time",
 	} {
 		if err := os.WriteFile(path, []byte(stored+"\n"), 0o600); err != nil {
 			t.Fatal(err)
@@ -381,7 +382,7 @@ func TestReadLateOnProviderRecordRejectsMalformedRecords(t *testing.T) {
 			t.Fatalf("record %q counted %d faults, want 0", stored, got)
 		}
 	}
-	if err := os.WriteFile(path, fmt.Appendf(nil, "%s 1 %d\n", lateOnVerdictRecheck, now), 0o600); err != nil {
+	if err := os.WriteFile(path, fmt.Appendf(nil, "recheck 1 %d\n", now), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if got := readLateOnProviderRecord(path).faults; got != 1 {
@@ -390,7 +391,7 @@ func TestReadLateOnProviderRecordRejectsMalformedRecords(t *testing.T) {
 	// A lone old fault expires, so a host that saw one benign cancellation
 	// stops paying for a probe on every search.
 	expired := time.Now().Add(-lateOnProviderFaultWindow - time.Hour).Unix()
-	if err := os.WriteFile(path, fmt.Appendf(nil, "%s 1 %d\n", lateOnVerdictRecheck, expired), 0o600); err != nil {
+	if err := os.WriteFile(path, fmt.Appendf(nil, "recheck 1 %d\n", expired), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if got := readLateOnProviderRecord(path).faults; got != 0 {
@@ -400,8 +401,9 @@ func TestReadLateOnProviderRecordRejectsMalformedRecords(t *testing.T) {
 
 func TestLateOnProbeVerdict(t *testing.T) {
 	// A provider that agrees on the fixed probe batch but fails on real work
-	// must still earn a demotion. If a passing probe cleared the count, the two
-	// records would alternate for ever and nothing would change.
+	// must still be demoted. If a passing probe cleared the count, the two
+	// records would alternate and the provider would stay in use. The wanted
+	// records are literals: they are the on-disk format that an upgrade reads.
 	const at = 1_700_000_000
 	fault := lateOnProviderRecord{faults: 1, at: at}
 	for _, test := range []struct {
@@ -415,17 +417,17 @@ func TestLateOnProbeVerdict(t *testing.T) {
 			name:    "a passing probe keeps the fault and its time",
 			agree:   true,
 			prior:   fault,
-			verdict: fmt.Sprintf("%s 1 %d", lateOnVerdictRecheck, at),
+			verdict: "recheck 1 1700000000",
 			keep:    true,
 		},
-		{name: "a passing probe with no fault trusts", agree: true, verdict: lateOnVerdictTrusted, keep: true},
-		{name: "a failing probe rejects", verdict: lateOnVerdictRejected},
-		{name: "a failing probe after a fault rejects", prior: fault, verdict: lateOnVerdictRejected},
+		{name: "a passing probe with no fault trusts", agree: true, verdict: "trusted", keep: true},
+		{name: "a failing probe rejects", verdict: "rejected"},
+		{name: "a failing probe after a fault rejects", prior: fault, verdict: "rejected"},
 		{
 			name:    "a passing probe keeps a peer's rejection",
 			agree:   true,
 			prior:   lateOnProviderRecord{verdict: lateOnVerdictRejected},
-			verdict: lateOnVerdictRejected,
+			verdict: "rejected",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -458,7 +460,7 @@ func TestProviderProbeStoresTheRuleVerdict(t *testing.T) {
 	t.Setenv(lateOnProviderEnv, "")
 	rawModel, _, path := newModelWithVerdictPath(t)
 	prior := lateOnProviderRecord{faults: 1, at: time.Now().Unix()}
-	written := fmt.Sprintf("%s %d %d\n", lateOnVerdictRecheck, prior.faults, prior.at)
+	written := fmt.Sprintf("recheck 1 %d\n", prior.at)
 	if err := os.WriteFile(path, []byte(written), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -489,9 +491,10 @@ func TestProviderProbeStoresTheRuleVerdict(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := strings.TrimSpace(string(stored))
-	// The records are fixed values, not a call to lateOnProbeVerdict, so a
-	// fault in that rule also fails this test.
-	want := lateOnVerdictRejected
+	// The records are literals, not a call to lateOnProbeVerdict or its
+	// constants. So a fault in that rule, or another spelling of the on-disk
+	// format, also fails this test.
+	want := "rejected"
 	if provider == lateOnAcceleratedProviderName {
 		// Agreement after a fault keeps the count and its time.
 		want = strings.TrimSpace(written)
@@ -525,7 +528,7 @@ func macOSMajorVersion(t *testing.T) int {
 
 func TestRejectDoesNotDowngradeASettledRejection(t *testing.T) {
 	path := pinAcceleratedProviderForTest(t)
-	if err := os.WriteFile(path, []byte(lateOnVerdictRejected+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("rejected\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	rejectLateOnAcceleratedProvider("a later fault")
@@ -533,22 +536,24 @@ func TestRejectDoesNotDowngradeASettledRejection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(string(stored)) != lateOnVerdictRejected {
+	if strings.TrimSpace(string(stored)) != "rejected" {
 		t.Fatalf("a peer's settled rejection was downgraded to %q", string(stored))
 	}
 }
 
 func TestRecheckVerdictMakesTheNextProcessMeasureAgain(t *testing.T) {
 	_, model, path := newModelWithVerdictPath(t)
+	// The stored records are literals, as an earlier version wrote them: an
+	// upgrade must read the same verdicts.
 	for _, test := range []struct {
 		stored string
 		want   string
 	}{
-		{stored: lateOnVerdictTrusted, want: lateOnVerdictTrusted},
-		{stored: lateOnVerdictRejected, want: lateOnVerdictRejected},
+		{stored: "trusted", want: "trusted"},
+		{stored: "rejected", want: "rejected"},
 		// A recheck and an unreadable value both mean measure again, so one bad
 		// batch cannot settle the question on its own.
-		{stored: lateOnVerdictRecheck + " 1 1", want: ""},
+		{stored: "recheck 1 1", want: ""},
 		{stored: "something else", want: ""},
 		{stored: "", want: ""},
 	} {
@@ -561,12 +566,10 @@ func TestRecheckVerdictMakesTheNextProcessMeasureAgain(t *testing.T) {
 	}
 }
 
-// newModelWithVerdictPath builds the model under a fresh cache, then returns
-// the decoded model bytes and the path its provider verdict will live at.
-// Several tests need exactly this preamble, and it has an ordering trap: the
-// cache key carries the ONNX Runtime version, which is empty until the model
-// initializes the run time, so resolving the directory first yields a different
-// key.
+// newModelWithVerdictPath builds the model under a new cache. It returns the
+// model, the decoded model bytes, and the path of the provider verdict. It
+// builds the model first: the cache key carries the ONNX Runtime version, and
+// lateOnRunCoreMLCacheDirectory fails until the model starts the runtime.
 func newModelWithVerdictPath(t *testing.T) (semanticModel, []byte, string) {
 	t.Helper()
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
@@ -590,8 +593,8 @@ func newModelWithVerdictPath(t *testing.T) (semanticModel, []byte, string) {
 	return built, model, filepath.Join(directory, lateOnProviderVerdictFile)
 }
 
-// TestOverlayScanFaultIsRecorded searches a repository with no commit, whose
-// vectors are an overlay only, with a zero query token: the overlay scan
+// TestOverlayScanFaultIsRecorded searches a repository with no commit, so its
+// vectors are an overlay only. The query token is zero. The overlay scan
 // fails on degenerate output and records one provider fault.
 func TestOverlayScanFaultIsRecorded(t *testing.T) {
 	requireTools(t)

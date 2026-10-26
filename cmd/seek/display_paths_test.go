@@ -10,8 +10,9 @@ import (
 	"github.com/sourcegraph/zoekt"
 )
 
-// searchHeaders runs query on operands from the cwd and returns the output
-// and the path of each result header, in print order.
+// searchHeaders runs a text search of query (--lexical-only) on operands from
+// the cwd. It returns the output and the path of each result header, in print
+// order.
 func searchHeaders(t *testing.T, query string, operands ...string) (string, []string) {
 	t.Helper()
 	out, err := seek(t, slices.Concat([]string{"--lexical-only", query}, operands)...)
@@ -70,8 +71,8 @@ func TestRunSubfolderHeaderIsCwdRelative(t *testing.T) {
 
 // TestSemanticFileFilterIsSearchRootRelative runs a description with a
 // search-root file: filter. The test model accepts every row, so the printed
-// set is the set of rows that the filter keeps: semantic retrieval reads the
-// same path rule, so exactly the files of gitA answer.
+// files are the rows that the filter keeps. Semantic retrieval reads the same
+// path rule, so exactly the files of gitA answer.
 func TestSemanticFileFilterIsSearchRootRelative(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -132,8 +133,8 @@ func TestOutsideOperandHeadersAsTyped(t *testing.T) {
 }
 
 // TestBareWordKeepsZoektFileNameMeaning searches a word that only the typed
-// operand holds: the file-name half of a bare word reads the node path, so it
-// matches nothing; an explicit file: reads the header.
+// operand holds. The file-name half of a bare word reads the node path, so it
+// matches nothing. An explicit file: reads the header.
 func TestBareWordKeepsZoektFileNameMeaning(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -232,8 +233,8 @@ func TestHeadersArePathsForTypedSubpaths(t *testing.T) {
 }
 
 // TestExplicitFileAtomInOrReadsTheHeader pairs an explicit file: atom with a
-// content atom of the same pattern: it still reads the header, so a wider
-// query never gives fewer files.
+// content atom of the same pattern. The file: atom still reads the header, so
+// a wider query never gives fewer files.
 func TestExplicitFileAtomInOrReadsTheHeader(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -251,9 +252,9 @@ func TestExplicitFileAtomInOrReadsTheHeader(t *testing.T) {
 	}
 }
 
-// TestFileNameLineMarksBelowTheCwd rewrites the file-name line of a hit
-// whose header drops the start of its node path (the cwd is below the node
-// root): a highlight in the shared part moves into the header, one in the
+// TestFileNameLineMarksBelowTheCwd rewrites the file-name line of a hit whose
+// header drops the start of its node path, because the cwd is below the node
+// root. A highlight in the kept part moves into the header. A highlight in the
 // dropped part goes.
 func TestFileNameLineMarksBelowTheCwd(t *testing.T) {
 	root := canonicalCorpusPath(t.TempDir())

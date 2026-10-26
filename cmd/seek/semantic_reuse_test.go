@@ -41,8 +41,8 @@ func reuseSearchWith(t *testing.T, model semanticModel, query string, root strin
 	return slices.Clone(observed.units), output
 }
 
-// TestCacheKeyIncludesModelInput checks that the key follows the model input:
-// the same bytes under two path tails give two keys; the same bytes and tail
+// TestCacheKeyIncludesModelInput checks that the key follows the model input.
+// The same bytes under two path tails give two keys. The same bytes and tail
 // in two repositories give one key.
 func TestCacheKeyIncludesModelInput(t *testing.T) {
 	tokenizer, err := lateOnTokenizers.take(t.Context())
@@ -167,8 +167,8 @@ func TestRunFolderChangeEmbedsOnlyChangedFile(t *testing.T) {
 }
 
 // TestRowsIntegrityCheckedOnceAtBind builds a generation, then opens it for a
-// search: the open hashes no rows.bin byte. A touched rows.bin runs the full
-// check again.
+// search: the open runs no full check of rows.bin. A touched rows.bin runs the
+// full check again.
 func TestRowsIntegrityCheckedOnceAtBind(t *testing.T) {
 	units, embeddings := testSemanticRowsAndVectors(t)
 	dir := filepath.Join(t.TempDir(), "semantic")
@@ -177,22 +177,22 @@ func TestRowsIntegrityCheckedOnceAtBind(t *testing.T) {
 	}
 	open := func() int64 {
 		t.Helper()
-		before := semanticRowsHashedBytes.Load()
+		before := semanticRowsHashed.Load()
 		generation, err := openSemanticGenerationForSearch(dir, "head")
 		if err != nil {
 			t.Fatal(err)
 		}
 		_ = generation.Close()
-		return semanticRowsHashedBytes.Load() - before
+		return semanticRowsHashed.Load() - before
 	}
-	if hashed := open(); hashed != 0 {
-		t.Fatalf("a search open hashed %d bytes, want 0", hashed)
+	if checks := open(); checks != 0 {
+		t.Fatalf("a search open ran %d full checks, want 0", checks)
 	}
 	later := time.Now().Add(time.Minute)
 	if err := os.Chtimes(filepath.Join(dir, semanticRowsFile), later, later); err != nil {
 		t.Fatal(err)
 	}
-	if hashed := open(); hashed == 0 {
+	if checks := open(); checks == 0 {
 		t.Fatal("a touched rows.bin opened with no full check")
 	}
 }
@@ -200,10 +200,10 @@ func TestRowsIntegrityCheckedOnceAtBind(t *testing.T) {
 // TestFileReuseRowsMatchFreshRows builds a generation for one file, then asks
 // the reuse index for the same content under another root with the same
 // path tail. A second build, with no reuse index, stores that file under the
-// new path. The copied rows equal the rows of that fresh build, and each
-// copied row reads the vectors that the fresh build stores for it, so file
-// reuse changes no stored byte. The test model gives each window a vector of
-// its own model input, so a row that reads the vectors of another row shows.
+// new path. The copied rows equal the rows of that fresh build. Each copied
+// row reads the vectors that the fresh build stores for it, so file reuse
+// changes no stored byte. The test model gives each window a vector of its own
+// model input, so a row that reads the vectors of another row shows.
 func TestFileReuseRowsMatchFreshRows(t *testing.T) {
 	requireTools(t)
 	content := longSemanticFunction(6_000)
@@ -259,7 +259,7 @@ func TestFileReuseRowsMatchFreshRows(t *testing.T) {
 }
 
 // TestBranchSwitchEmbedsNothingNew searches branch A, then branch B with 5
-// changed files, then branch A again: the third search copies every window
+// changed files, then branch A again. The third search copies every window
 // from the unit store and embeds nothing.
 func TestBranchSwitchEmbedsNothingNew(t *testing.T) {
 	requireTools(t)
@@ -340,6 +340,8 @@ func TestDamagedSourceRowIsNotCopied(t *testing.T) {
 	}
 }
 
+// fileRowCount returns the row count of the generation in dir, from its
+// manifest.
 func fileRowCount(t *testing.T, dir string) int {
 	t.Helper()
 	manifest, err := readSemanticManifestUnchecked(dir)
@@ -362,24 +364,24 @@ func TestRowsCheckRefreshedAfterAFullCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 	for index, wantHashed := range []bool{true, false} {
-		before := semanticRowsHashedBytes.Load()
+		before := semanticRowsHashed.Load()
 		generation, err := openSemanticGenerationForSearch(dir, "head")
 		if err != nil {
 			t.Fatal(err)
 		}
 		_ = generation.Close()
-		if hashed := semanticRowsHashedBytes.Load() > before; hashed != wantHashed {
+		if hashed := semanticRowsHashed.Load() > before; hashed != wantHashed {
 			t.Fatalf("open %d hashed=%t, want %t", index, hashed, wantHashed)
 		}
 	}
 }
 
 // TestColdFolderReadsNoOtherCorpus searches a Git repository and a folder,
-// then a new folder, all three with the same file at the same path tail, so
+// then a new folder. All three hold the same file at the same path tail, so
 // its rows have the same keys in each. A Git lineage shares nothing with a
-// folder, and a folder whose root neither holds nor sits in another root
-// shares no lineage, so each build reads no generation of another corpus,
-// copies no row from one, and embeds the file.
+// folder. A folder whose root neither holds nor sits in another root shares no
+// lineage. So each build reads no generation of another corpus, copies no row
+// from one, and embeds the file.
 func TestColdFolderReadsNoOtherCorpus(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -401,10 +403,11 @@ func TestColdFolderReadsNoOtherCorpus(t *testing.T) {
 }
 
 // TestReuseIndexesOnlyRowsOfTheNodeTails adds the generation of a folder to
-// the reuse index of a node below it: with the node's names, only the rows
-// whose model path tail is the tail of a node file are indexed, also outside
-// the node's root (a copy keeps the last 4 path parts); with an empty name
-// set, no row is; with no name set (nil), every row is.
+// the reuse index of a node below it. With the node's names, the index holds
+// only the rows whose model path tail is the tail of a node file. That holds
+// also outside the node's root, because a copy keeps the last 4 path parts.
+// With an empty name set, the index holds no row. With no name set (nil), it
+// holds every row.
 func TestReuseIndexesOnlyRowsOfTheNodeTails(t *testing.T) {
 	paths := []string{"other/b.go", "sub/a.go", "a/src/pkg/x/f.go", "b/a.go"}
 	for _, row := range []struct {
@@ -461,8 +464,8 @@ func TestReuseIndexesOnlyRowsOfTheNodeTails(t *testing.T) {
 }
 
 // TestSkippedRangesStopAtGapsAndGenerations adds two folder generations for
-// a node's tails: a kept row between two skipped rows splits their range, and
-// a skipped range of the second generation that starts where the first one's
+// a node's tails. A kept row between two skipped rows splits their range. A
+// skipped range of the second generation that starts where the first one's
 // ends stays apart. The fill then indexes exactly the skipped row keys.
 func TestSkippedRangesStopAtGapsAndGenerations(t *testing.T) {
 	row := func(path string, key byte) semanticUnit {
@@ -494,9 +497,9 @@ func TestSkippedRangesStopAtGapsAndGenerations(t *testing.T) {
 }
 
 // TestGenerationShapeSamplesTailsThatAreNotPlain counts the files of a
-// generation of 64 files, one row each but 3 for every 4th, and estimates the
-// files and rows whose tail is not plain from every 16th file (0, 16, 32 and
-// 48, of 3 rows each), so it sees the files of those places only.
+// generation of 64 files: one row each, but 3 for every 4th file. It estimates
+// the files and rows whose tail is not plain from every 16th file (0, 16, 32
+// and 48, of 3 rows each). So it sees the files of those places only.
 func TestGenerationShapeSamplesTailsThatAreNotPlain(t *testing.T) {
 	for _, row := range []struct {
 		name        string
@@ -533,11 +536,11 @@ func TestGenerationShapeSamplesTailsThatAreNotPlain(t *testing.T) {
 // TestReuseLoadIndexesTheNodeTailsOfOtherCorpora searches a folder of 42
 // files of several rows each, then loads the reuse index of nodes in other
 // corpora. A file root at its top level indexes the one file by file and by
-// row key, and keeps the folder's other row keys pending: a file that can
-// match another tail (matchesOtherTails) indexes those others. So do names
-// that cover half of the folder's files (21). More names (22, still fewer
-// than half of the rows), no names, or a node whose root holds the folder,
-// index every row at once. The file matches by file through its shallow name.
+// row key. It keeps the folder's other row keys pending: a file that can match
+// another tail (matchesOtherTails) indexes those others. Names that cover half
+// of the folder's files (21) do the same. More names (22, still fewer than
+// half of the rows) index every row at once. So do no names, and a node whose
+// root holds the folder. The file matches by file through its shallow name.
 func TestReuseLoadIndexesTheNodeTailsOfOtherCorpora(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -608,10 +611,10 @@ func TestReuseLoadIndexesTheNodeTailsOfOtherCorpora(t *testing.T) {
 }
 
 // TestMarkReusedLooksUpPendingKeysOnlyForOtherTails gives a reuse index one
-// skipped range: a file whose header holds its whole plain tail cannot
-// match a pending row, whose tail is plain too, and indexes nothing more; a
-// cut path or a tail that is not plain (semanticPlainTail) indexes the
-// pending row keys.
+// skipped range. A file whose header holds its whole plain tail cannot match
+// a pending row, whose tail is plain too, so it indexes nothing more. A cut
+// path or a tail that is not plain (semanticPlainTail) indexes the pending
+// row keys.
 func TestMarkReusedLooksUpPendingKeysOnlyForOtherTails(t *testing.T) {
 	generation := &semanticGeneration{rows: []semanticUnit{{path: "a.go", key: semanticRowKey{1}}, {path: "b.go", key: semanticRowKey{2}}}}
 	for _, row := range []struct {
@@ -634,8 +637,8 @@ func TestMarkReusedLooksUpPendingKeysOnlyForOtherTails(t *testing.T) {
 }
 
 // TestSkippedTailsThatAreNotPlainStayIndexed adds a folder generation for a
-// node's tails: a row of another tail that is not plain stays indexed by row
-// key, because a plain node file can share its key; a plain one waits.
+// node's tails. A row of another tail that is not plain stays indexed by row
+// key, because a plain node file can share its key. A plain one waits.
 func TestSkippedTailsThatAreNotPlainStayIndexed(t *testing.T) {
 	for _, row := range []struct {
 		other string
@@ -658,9 +661,9 @@ func TestSkippedTailsThatAreNotPlainStayIndexed(t *testing.T) {
 }
 
 // TestMarkReusedRunsInParallel calls markReused from 32 workers, as the build
-// does: files that can match another tail index the pending row keys once
-// while the others read only the first index, and each such file sees its
-// pending row key. Run with -race.
+// does. Files that can match another tail index the pending row keys once,
+// while the others read only the first index. Each such file sees its pending
+// row key. Run with -race.
 func TestMarkReusedRunsInParallel(t *testing.T) {
 	generation := &semanticGeneration{}
 	for index := range 1_000 {
@@ -684,9 +687,9 @@ func TestMarkReusedRunsInParallel(t *testing.T) {
 }
 
 // TestRenamedLongTailFileReusesItsRows renames a file whose model path tail
-// is longer than the window header keeps, then searches the subfolder that
-// holds it: no file key matches the new name, but its windows have the keys
-// of the old rows (the folder's pending row keys), so the build embeds
+// is longer than the window header keeps. Then it searches the subfolder that
+// holds the file. No file key matches the new name. But its windows have the
+// keys of the old rows (the folder's pending row keys), so the build embeds
 // nothing.
 func TestRenamedLongTailFileReusesItsRows(t *testing.T) {
 	requireTools(t)
@@ -713,13 +716,13 @@ func TestRenamedLongTailFileReusesItsRows(t *testing.T) {
 }
 
 // TestSemanticModelPathTailIsTheTailOfTheModelPath compares the tail with the
-// last 4 parts of the joined model path for names of 1 to 6 parts and every
-// kind of base: none (Git), the root folder, and short and deep folders. Odd
-// paths check rerankPathTail alone.
+// last 4 parts of the joined model path. It uses names of 1 to 6 parts and
+// every kind of base: none (Git), the root folder, and short and deep
+// folders. Odd paths check rerankPathTail alone.
 func TestSemanticModelPathTailIsTheTailOfTheModelPath(t *testing.T) {
 	lastParts := func(value string) string {
 		parts := strings.Split(value, "/")
-		return strings.Join(parts[max(len(parts)-rerankPathComponentLimit, 0):], "/")
+		return strings.Join(parts[max(len(parts)-4, 0):], "/")
 	}
 	for _, base := range []string{"", "/", "/h", "/h/i", "/a/b/c/d/e"} {
 		for _, name := range []string{"f.go", "a/f.go", "a/b/f.go", "a/b/c/f.go", "a/b/c/d/f.go", "a/b/c/d/e/f.go"} {
@@ -736,8 +739,8 @@ func TestSemanticModelPathTailIsTheTailOfTheModelPath(t *testing.T) {
 }
 
 // TestCopiedOrMovedSubfolderReusesTheFolderRows searches a folder, then copies
-// or moves one of its deep subfolders inside it and searches the subfolder:
-// its files keep the last 4 path parts and the content, so the build copies
+// or moves one of its deep subfolders inside it and searches the subfolder.
+// Its files keep the last 4 path parts and the content, so the build copies
 // their rows from the folder's generation. Only a file whose tail names the
 // moved folder embeds again.
 func TestCopiedOrMovedSubfolderReusesTheFolderRows(t *testing.T) {
@@ -777,9 +780,9 @@ func TestCopiedOrMovedSubfolderReusesTheFolderRows(t *testing.T) {
 	}
 }
 
-// TestUnitStoreSegmentsStayFew changes one file in 16 searches in a row: each
+// TestUnitStoreSegmentsStayFew changes one file in 16 searches in a row. Each
 // bind archives that file's old window, and the store merges its segments, so
-// it holds few segments; an old version still comes back with no new
+// it holds few segments. An old version still comes back with no new
 // embedding. One segment per bind would grow the store without end.
 func TestUnitStoreSegmentsStayFew(t *testing.T) {
 	requireTools(t)

@@ -6,7 +6,7 @@ import (
 )
 
 // TestLargeDocumentKeepsContentAndSymbolSearch indexes one document larger
-// than shardMax and reads the node: its content and its symbol stay
+// than shardMax and searches the index: its content and its symbol stay
 // searchable.
 func TestLargeDocumentKeepsContentAndSymbolSearch(t *testing.T) {
 	requireTools(t)

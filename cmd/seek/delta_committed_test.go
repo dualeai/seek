@@ -5,13 +5,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 )
 
-// reindexGit runs one full indexing cycle for the committed and uncommitted
-// families in the given repository and node.
+// reindexGit runs one build of the Git node at plan for the current state of
+// the repository. It passes the state hash that a search gives the build. The
+// build picks a committed delta or a full build.
 func reindexGit(t *testing.T, ctx context.Context, paths gitPaths, plan node) {
 	t.Helper()
 	state := mustGitRepoStateIn(t, ctx, paths.RepoDir)
@@ -56,10 +58,8 @@ func TestDeltaCommitted_ModifyFileTombstonesOldContent(t *testing.T) {
 		t.Fatalf("v2 must be findable post-delta: results=%d err=%v", len(v2), err)
 	}
 
-	// Delta-path proof: each delta cycle stacks exactly one new shard on
-	// top of the existing set when the Zoekt builder finishes. A silent
-	// fallback to a non-delta rebuild would leave shardsAfter == shardsBefore
-	// because the old shard would be replaced rather than supplemented.
+	// A delta adds one shard to the family. A full build replaces the family,
+	// so the count would stay the same.
 	shardsAfter := committedShardCount(t, plan.indexDir)
 	if shardsAfter != shardsBefore+1 {
 		t.Fatalf("expected delta path to stack +1 shard (before=%d, after=%d) — non-delta rebuild would replace rather than append", shardsBefore, shardsAfter)
@@ -139,7 +139,7 @@ func TestDeltaCommitted_HeadRewindFallsBackCleanly(t *testing.T) {
 		reindexGit(t, ctx, paths, plan)
 	}
 
-	// At HEAD we should find everything.
+	// Before the reset, each step is found.
 	for i := range 5 {
 		pat := fmt.Sprintf("rewind_step_%d", i)
 		results, _ := searchPlannedCorpusForTest(ctx, plan, pat)
@@ -148,17 +148,16 @@ func TestDeltaCommitted_HeadRewindFallsBackCleanly(t *testing.T) {
 		}
 	}
 
-	// Delta-path proof: five HEAD-advancing reindex cycles must have stacked
-	// shards (one per delta). A non-delta build would replace shards each
-	// time, leaving the count at 1.
+	// The first cycle builds in full, and each later cycle adds one delta
+	// shard. A full build in each cycle would leave one shard.
 	shardsBefore := committedShardCount(t, plan.indexDir)
 	if shardsBefore < 2 {
 		t.Fatalf("expected delta accumulation across 5 commits, got %d shard(s) — delta path may have silently fallen back", shardsBefore)
 	}
 
-	// Hard reset to step 0 (HEAD~4). The prior indexed commits still exist in
-	// the repository's reflog, so native delta admission can compare them.
-	// After the reset, the content of 4 commits must leave the index.
+	// Reset to step 0 (HEAD~4). The indexed commit stays in the object store,
+	// so the native delta can diff it against the new HEAD. The content of the
+	// 4 later commits must leave the index.
 	gitRun(t, dir, "reset", "--hard", "HEAD~4")
 	reindexGit(t, ctx, paths, plan)
 
@@ -168,8 +167,8 @@ func TestDeltaCommitted_HeadRewindFallsBackCleanly(t *testing.T) {
 		if err != nil {
 			t.Fatalf("post-rewind search %s: %v", pat, err)
 		}
-		// Only step_0 (HEAD after reset) should remain. Steps 1..4 were
-		// rolled back, their files no longer exist on disk.
+		// Only step 0, at the new HEAD, stays. The reset removed the files
+		// of steps 1 to 4.
 		if i == 0 {
 			if len(results) == 0 {
 				t.Fatalf("step 0 must remain after rewind to HEAD~4")
@@ -194,8 +193,8 @@ func TestDeltaCommitted_RebaseLeavesNoDuplicateHits(t *testing.T) {
 	paths, plan := planGitTestCorpus(t, dir)
 	reindexGit(t, ctx, paths, plan)
 
-	// Build a 10-commit chain. Indexing after each commit exercises the
-	// delta path and accumulates shards.
+	// Make 10 commits, with a build after each: each build is a delta and
+	// adds a shard.
 	for i := range 10 {
 		name := fmt.Sprintf("step%d.go", i)
 		body := fmt.Sprintf("package main\n// rebase_step_%d\n", i)
@@ -212,12 +211,10 @@ func TestDeltaCommitted_RebaseLeavesNoDuplicateHits(t *testing.T) {
 		t.Fatalf("setup must accumulate multiple delta shards (got %d) — delta path may not be engaged", shardsBefore)
 	}
 
-	// Squash and recommit equivalent content under a new history. The prior
-	// indexed commits remain reachable through the reflog, so native delta
-	// admission succeeds. The working tree content is unchanged, so diff-tree
-	// reports no changed files and the cycle does little work.
-	// The invariant we care about is search correctness: every previously
-	// committed marker still resolves to exactly one file.
+	// Squash the 10 commits into one new commit with the same tree. The
+	// indexed commit stays in the object store, so the native delta can diff
+	// it against the new HEAD, and the diff is empty. Each marker must still
+	// give exactly one file.
 	gitRun(t, dir, "reset", "--soft", "HEAD~10")
 	gitRun(t, dir, "commit", "-m", "squashed steps")
 	reindexGit(t, ctx, paths, plan)
@@ -242,12 +239,8 @@ func TestDeltaCommitted_ShardThresholdTriggersFullRebuild(t *testing.T) {
 	paths, plan := planGitTestCorpus(t, dir)
 	reindexGit(t, ctx, paths, plan)
 
-	// Produce maxCommittedDeltaShards + 2 commits, indexing after each.
-	// Record shard count every cycle so we can prove three things:
-	//   (a) delta path is engaged and stacks shards (count grows past 1)
-	//   (b) shard count reaches the threshold (proves seek's growth path)
-	//   (c) the cycle after the cap drops the count to a small number (proves
-	//       Seek's native admission selected a full build instead of stacking).
+	// Make maxCommittedDeltaShards + 2 commits, with a build after each, and
+	// record the committed shard count after each build.
 	cycles := maxCommittedDeltaShards + 2
 	shardSeries := make([]int, 0, cycles)
 	for i := range cycles {
@@ -262,33 +255,21 @@ func TestDeltaCommitted_ShardThresholdTriggersFullRebuild(t *testing.T) {
 		shardSeries = append(shardSeries, committedShardCount(t, plan.indexDir))
 	}
 
-	peak := 0
-	for _, n := range shardSeries {
-		if n > peak {
-			peak = n
-		}
+	// The full build of the seed gives one shard, and each delta adds one.
+	// The check permits a delta while the family holds at most
+	// maxCommittedDeltaShards delta shards, so that delta takes the family
+	// above the threshold. The next build is a full build of one shard.
+	want := make([]int, 0, cycles)
+	for i := range maxCommittedDeltaShards + 1 {
+		want = append(want, i+2)
 	}
-	if peak <= 1 {
-		t.Fatalf("delta path never stacked extra shards (series=%v) — silent fallback likely", shardSeries)
-	}
-	if peak < maxCommittedDeltaShards-1 {
-		// Allow one shard of slack, but the run must climb at least near the
-		// cap to prove the threshold path is meaningful.
-		t.Fatalf("peak shard count %d never approached threshold %d — series=%v", peak, maxCommittedDeltaShards, shardSeries)
-	}
-	finalShards := shardSeries[len(shardSeries)-1]
-	if finalShards == 0 {
-		t.Fatal("expected at least one committed shard after threshold rebuild")
-	}
-	if finalShards > maxCommittedDeltaShards {
-		t.Fatalf("shard count %d exceeds threshold %d — fallback did not trigger (series=%v)", finalShards, maxCommittedDeltaShards, shardSeries)
-	}
-	if finalShards >= peak {
-		t.Fatalf("threshold trip should drop shard count (peak=%d, final=%d, series=%v)", peak, finalShards, shardSeries)
+	want = append(want, 1)
+	if !slices.Equal(shardSeries, want) {
+		t.Fatalf("committed shard counts=%v, want %v", shardSeries, want)
 	}
 
-	// Search across the threshold boundary: the freshest and oldest cycles
-	// must both be findable, proving the rebuild absorbed prior deltas.
+	// The full build holds the content of the earlier deltas: the first, a
+	// middle, and the last cycle are found.
 	for _, i := range []int{0, cycles / 2, cycles - 1} {
 		pat := fmt.Sprintf("threshold_cycle_%d", i)
 		results, _ := searchPlannedCorpusForTest(ctx, plan, pat)

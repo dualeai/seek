@@ -10,10 +10,10 @@ import (
 const (
 	// These values define the stored representation. Each unit puts four
 	// once-refined centroids in USearch and stores 20 direct centroids for
-	// exact scoring. semanticRepresentationCompatibility and
-	// semanticUSearchLayout include them, so a change cannot reuse an old
-	// generation. The coarse count must stay a power of two for the key shift
-	// of the bitmap filter (semanticUSearchCentroidShift).
+	// exact scoring. semanticRepresentationCompatibility includes them all,
+	// and semanticUSearchLayout includes the coarse count. So a change cannot
+	// reuse an old generation. The coarse count must stay a power of two for
+	// the key shift of the bitmap filter (semanticUSearchCentroidShift).
 	semanticCoarseCentroidsPerUnit = 4
 	semanticFineCentroidsPerUnit   = 20
 	semanticCoarseRefinementPasses = 1
@@ -23,6 +23,8 @@ const (
 type semanticCoarseVectors [semanticCoarseCentroidsPerUnit]semanticVector
 type semanticFineVectors [semanticFineCentroidsPerUnit]semanticVector
 
+// semanticUnitEmbedding is the stored vectors of one row: the coarse
+// centroids for the USearch graph and the fine centroids for exact scoring.
 type semanticUnitEmbedding struct {
 	coarse semanticCoarseVectors
 	fine   semanticFineVectors
@@ -54,6 +56,8 @@ func (set semanticCoarseSet) At(row int) (*semanticCoarseVectors, bool) {
 	return &set.batches[batch][offset], true
 }
 
+// semanticCentroidWorkspace holds the buffers of one centroid build, so a
+// worker reuses them for each row.
 type semanticCentroidWorkspace struct {
 	tokens  [lateOnSequenceLength]semanticVector
 	nearest [lateOnSequenceLength]float32
@@ -61,6 +65,9 @@ type semanticCentroidWorkspace struct {
 	members [semanticFineCentroidsPerUnit]int
 }
 
+// makeUnitEmbedding builds the centroids of one model output row. The coarse
+// centroids start from the first fine centroids and get
+// semanticCoarseRefinementPasses passes.
 func (workspace *semanticCentroidWorkspace) makeUnitEmbedding(
 	embeddings []float32,
 	mask []bool,
@@ -87,6 +94,8 @@ func (workspace *semanticCentroidWorkspace) makeUnitEmbedding(
 	return result, nil
 }
 
+// loadTokens copies the normalized vectors of the tokens that mask keeps in
+// row into the workspace, and returns their count.
 func (workspace *semanticCentroidWorkspace) loadTokens(
 	embeddings []float32,
 	mask []bool,
@@ -157,11 +166,11 @@ func (workspace *semanticCentroidWorkspace) selectCentroids(
 	return nil
 }
 
-// refineCentroids runs refinements passes on centroids. In each pass, every
-// token after the first joins the most similar of the other centroids, and
-// each centroid with members becomes the normalized mean of its members. A
-// centroid with no members keeps its value. Centroid zero stays anchored to
-// the first scoreable token.
+// refineCentroids runs a number of passes (refinements) on centroids. In each
+// pass, every token after the first joins the most similar of the other
+// centroids. Then each centroid with members becomes the normalized mean of
+// its members. A centroid with no members keeps its value. Centroid zero stays
+// on the first scoreable token.
 func (workspace *semanticCentroidWorkspace) refineCentroids(
 	tokens []semanticVector,
 	centroids []semanticVector,
@@ -226,12 +235,14 @@ func normalizedLateOnSemanticTokens(
 	return append([]semanticVector(nil), workspace.tokens[:count]...), nil
 }
 
-// errDegenerateSemanticVector marks model output that carries no usable
-// direction. The run-time provider check samples one row once, so an
-// input-dependent provider fault can still reach the index build. Callers use
-// this to record a provider rejection instead of only failing the build.
+// errDegenerateSemanticVector marks model output that has no usable
+// direction. The run-time provider check tests one row once, so a provider
+// fault that depends on the input can still reach the index build. Callers use
+// this error to record a provider rejection, not only to fail the build.
 var errDegenerateSemanticVector = errors.New("model output is degenerate")
 
+// normalizeSemanticVector scales vector to unit length. A non-finite value or
+// a zero norm gives errDegenerateSemanticVector.
 func normalizeSemanticVector(vector *semanticVector) error {
 	var squaredNorm float64
 	for _, value := range vector {
@@ -246,9 +257,9 @@ func normalizeSemanticVector(vector *semanticVector) error {
 	scale64 := 1 / math.Sqrt(squaredNorm)
 	scale32 := float32(scale64)
 	if !math.IsInf(float64(scale32), 0) {
-		// Keep the established float32 operation for normal model output.
-		// This preserves its bytes while the float64 path handles a scale that
-		// cannot fit in float32.
+		// Normal model output takes the float32 product, which gives the
+		// stored bytes. The float64 path handles a scale that float32 cannot
+		// hold.
 		for dimension := range vector {
 			vector[dimension] *= scale32
 		}

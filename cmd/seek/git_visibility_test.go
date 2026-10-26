@@ -7,19 +7,21 @@ import (
 	"testing"
 )
 
-// TestClassifyVisibility_Matrix exercises every routing cell against a real
-// git repo: tracked, tracked-but-ignored, untracked-visible, untracked-
-// ignored, fully- vs partially-ignored dirs, force-added files under an
-// ignored dir, a non-existent path matching an ignore rule, the worktree
-// root, and a path outside the worktree.
+// TestClassifyVisibility_Matrix checks every routing case against a real Git
+// repository. The cases are:
+//   - tracked, tracked and ignored, untracked, and untracked and ignored files;
+//   - fully and partly ignored directories;
+//   - force-added files under an ignored directory;
+//   - a path that does not exist and matches an ignore rule;
+//   - the worktree root, and a path outside the worktree.
 func TestClassifyVisibility_Matrix(t *testing.T) {
 	requireGit(t)
 
 	repo := initGitRepoNoRemote(t, "tracked.go", "package main\n")
 
-	// Second commit: a file that will later be matched by .gitignore
-	// (tracked-but-ignored) and a tracked file inside a dir that also holds
-	// ignored content (partially-ignored dir).
+	// The second commit adds a file that .gitignore matches later (tracked and
+	// ignored). It also adds a tracked file in a directory that will also hold
+	// ignored content (a partly ignored directory).
 	writeFileAt(t, repo, "config.yaml", "k: v\n")
 	writeFileAt(t, repo, "keepdir/keep.go", "package keep\n")
 	gitRunIn(t, repo, "add", ".")
@@ -94,9 +96,9 @@ func TestClassifyVisibility_Matrix(t *testing.T) {
 	}
 }
 
-// TestGitVisibility_SubmoduleInteriorRoutesOutside covers the exit-128 path:
-// a path inside a submodule aborts the batch check, and the per-path retry
-// classifies it false (the caller then routes it to a folder corpus).
+// TestGitVisibility_SubmoduleInteriorRoutesOutside covers the exit-128 path.
+// A path inside a submodule aborts the batch check, and the retry of each
+// path classifies it false. The caller then routes it to a folder corpus.
 func TestGitVisibility_SubmoduleInteriorRoutesOutside(t *testing.T) {
 	requireGit(t)
 
@@ -155,9 +157,9 @@ func TestGitVisibility_AllPrefilteredNoSubprocess(t *testing.T) {
 }
 
 // TestGitVisibility_LeadingColonOperands checks that check-ignore does not
-// parse an operand whose repo-relative path starts with ':' as a git pathspec
-// (":weird" is a real file, ":!evil" looks like exclude magic). Both must
-// classify by their actual ignore status.
+// read an operand whose repository-relative path starts with ':' as a Git
+// pathspec. ":weird" is a real file, and ":!evil" looks like exclude magic.
+// Both must classify by their real ignore status.
 func TestGitVisibility_LeadingColonOperands(t *testing.T) {
 	requireGit(t)
 

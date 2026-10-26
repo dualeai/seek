@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -103,6 +105,10 @@ func TestFolderCorpusState_OversizeNameOnlyFileChangesFingerprint(t *testing.T) 
 	}
 }
 
+// TestStreamFolderFiles_OutputChannelUnbuffered checks that the stream sends
+// each document on a channel with no buffer. A buffer would hold documents
+// that no worker holds. Then the worker count would no longer limit the
+// documents that are read and not yet consumed (streamFolderFilesWithMarkers).
 func TestStreamFolderFiles_OutputChannelUnbuffered(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "note.txt")
@@ -191,6 +197,9 @@ func TestFolderCorpusState_SkipsGitMetadataOnly(t *testing.T) {
 	}
 }
 
+// TestFolderCorpusFingerprintMatchesFullState checks that the walk with no
+// file list gives the state and file count of the full walk. The warm path
+// compares the fingerprint with the state that the last build stored.
 func TestFolderCorpusFingerprintMatchesFullState(t *testing.T) {
 	root := t.TempDir()
 	for _, path := range []string{
@@ -252,154 +261,100 @@ func TestFstatatRegularFileModeMatchesFileInfo(t *testing.T) {
 	}
 }
 
+// folderSearchNames runs a lexical search of root through the root command.
+// It returns the base name of each printed file, or none when the search ends
+// with exit status 1.
+func folderSearchNames(t *testing.T, root, pattern string) []string {
+	t.Helper()
+	output, err := seek(t, "--lexical-only", pattern, root)
+	if errors.Is(err, errNoMatch) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("search %s: %v\n%s", pattern, err, output)
+	}
+	var names []string
+	for _, path := range headerPaths(output) {
+		names = append(names, filepath.Base(path))
+	}
+	return names
+}
+
+// requireFolderSearchNames fails unless each pattern of want finds the files
+// that want gives it, with a search of root through the root command.
+func requireFolderSearchNames(t *testing.T, root string, want map[string][]string) {
+	t.Helper()
+	for pattern, names := range want {
+		if got := folderSearchNames(t, root, pattern); !slices.Equal(got, names) {
+			t.Fatalf("%s matches %v, want %v", pattern, got, names)
+		}
+	}
+}
+
+// TestFolderCorpusRefreshUpdatesChangedFile edits one file of a folder
+// between two searches. The second search finds the new text and not the old
+// text, and it still finds the file that did not change.
 func TestFolderCorpusRefreshUpdatesChangedFile(t *testing.T) {
 	requireTools(t)
-
-	ctx := context.Background()
+	setTestUserCache(t)
 	root := t.TempDir()
-	changedPath := filepath.Join(root, "changed.go")
-	unchangedPath := filepath.Join(root, "unchanged.go")
-	if err := os.WriteFile(changedPath, []byte("package main\n\nfunc Changed() string { return \"folder_delta_old\" }\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(unchangedPath, []byte("package main\n\nfunc Unchanged() string { return \"folder_delta_keep\" }\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeFileAt(t, root, "changed.go", "package main\n\nfunc Changed() string { return \"folder_delta_old\" }\n")
+	writeFileAt(t, root, "unchanged.go", "package main\n\nfunc Unchanged() string { return \"folder_delta_keep\" }\n")
+	requireFolderSearchNames(t, root, map[string][]string{"folder_delta_old": {"changed.go"}})
 
-	plan := planFolderTestCorpus(t, root)
-
-	if state, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
-		t.Fatalf("initial ensureFolderCorpusFresh: %v", err)
-	} else if state == corpusKnownEmpty {
-		t.Fatal("folder should not be empty")
-	}
-	if err := os.WriteFile(changedPath, []byte("package main\n\nfunc Changed() string { return \"folder_delta_new\" }\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if state, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
-		t.Fatalf("delta ensureFolderCorpusFresh: %v", err)
-	} else if state == corpusKnownEmpty {
-		t.Fatal("folder should not be empty after delta")
-	}
-
-	oldResults, err := searchPlannedCorpusForTest(ctx, plan, "folder_delta_old")
-	if err != nil {
-		t.Fatalf("search old marker: %v", err)
-	}
-	if len(oldResults) != 0 {
-		t.Fatalf("old marker should be tombstoned, got %d results", len(oldResults))
-	}
-	for _, pattern := range []string{"folder_delta_new", "folder_delta_keep"} {
-		results, err := searchPlannedCorpusForTest(ctx, plan, pattern)
-		if err != nil {
-			t.Fatalf("search %s: %v", pattern, err)
-		}
-		if len(results) == 0 {
-			t.Fatalf("expected result for %s", pattern)
-		}
-	}
+	writeFileAt(t, root, "changed.go", "package main\n\nfunc Changed() string { return \"folder_delta_new\" }\n")
+	requireFolderSearchNames(t, root, map[string][]string{
+		"folder_delta_old":  nil,
+		"folder_delta_new":  {"changed.go"},
+		"folder_delta_keep": {"unchanged.go"},
+	})
 }
 
+// TestFolderCorpusRepeatedRefreshMaintainsSearchability edits one file of a
+// folder five times, with a search after each edit. Each search finds the
+// last text. At the end, no older text matches, and the file that did not
+// change still matches.
 func TestFolderCorpusRepeatedRefreshMaintainsSearchability(t *testing.T) {
 	requireTools(t)
-
-	ctx := context.Background()
+	setTestUserCache(t)
 	root := t.TempDir()
-	changedPath := filepath.Join(root, "changed.go")
-	unchangedPath := filepath.Join(root, "unchanged.go")
-	if err := os.WriteFile(changedPath, []byte("package main\n\nfunc Changed() string { return \"folder_delta_cleanup_0\" }\n"), 0o644); err != nil {
-		t.Fatal(err)
+	marker := func(i int) string { return fmt.Sprintf("folder_delta_cleanup_%d", i) }
+	write := func(i int) {
+		writeFileAt(t, root, "changed.go", fmt.Sprintf("package main\n\nfunc Changed() string { return %q }\n", marker(i)))
 	}
-	if err := os.WriteFile(unchangedPath, []byte("package main\n\nfunc Unchanged() string { return \"folder_delta_cleanup_keep\" }\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	plan := planFolderTestCorpus(t, root)
-	if state, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
-		t.Fatalf("initial ensureFolderCorpusFresh: %v", err)
-	} else if state == corpusKnownEmpty {
-		t.Fatal("folder should not be empty")
-	}
+	write(0)
+	writeFileAt(t, root, "unchanged.go", "package main\n\nfunc Unchanged() string { return \"folder_delta_cleanup_keep\" }\n")
+	requireFolderSearchNames(t, root, map[string][]string{marker(0): {"changed.go"}})
 
 	for i := 1; i <= 5; i++ {
-		content := fmt.Sprintf("package main\n\nfunc Changed() string { return \"folder_delta_cleanup_%d\" }\n", i)
-		if err := os.WriteFile(changedPath, []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if state, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
-			t.Fatalf("delta %d ensureFolderCorpusFresh: %v", i, err)
-		} else if state == corpusKnownEmpty {
-			t.Fatalf("folder should not be empty after delta %d", i)
-		}
+		write(i)
+		requireFolderSearchNames(t, root, map[string][]string{marker(i): {"changed.go"}})
 	}
-
-	latestResults, err := searchPlannedCorpusForTest(ctx, plan, "folder_delta_cleanup_5")
-	if err != nil {
-		t.Fatalf("search latest marker: %v", err)
+	want := map[string][]string{"folder_delta_cleanup_keep": {"unchanged.go"}}
+	for i := range 5 {
+		want[marker(i)] = nil
 	}
-	if len(latestResults) == 0 {
-		t.Fatal("expected latest changed marker to be searchable")
-	}
-	oldResults, err := searchPlannedCorpusForTest(ctx, plan, "folder_delta_cleanup_1")
-	if err != nil {
-		t.Fatalf("search old marker: %v", err)
-	}
-	if len(oldResults) != 0 {
-		t.Fatalf("old marker should be tombstoned, got %d results", len(oldResults))
-	}
-	keptResults, err := searchPlannedCorpusForTest(ctx, plan, "folder_delta_cleanup_keep")
-	if err != nil {
-		t.Fatalf("search kept marker: %v", err)
-	}
-	if len(keptResults) == 0 {
-		t.Fatal("expected unchanged marker to remain searchable")
-	}
+	requireFolderSearchNames(t, root, want)
 }
 
+// TestFolderCorpusReindexRemovesDeletedFile deletes one file of a folder
+// between two searches. The second search does not find its text, and it
+// still finds the other file.
 func TestFolderCorpusReindexRemovesDeletedFile(t *testing.T) {
 	requireTools(t)
-
-	ctx := context.Background()
+	setTestUserCache(t)
 	root := t.TempDir()
-	deletedPath := filepath.Join(root, "deleted.go")
-	keptPath := filepath.Join(root, "kept.go")
-	if err := os.WriteFile(deletedPath, []byte("package main\n\nfunc Deleted() string { return \"folder_delta_deleted\" }\n"), 0o644); err != nil {
+	writeFileAt(t, root, "deleted.go", "package main\n\nfunc Deleted() string { return \"folder_delta_deleted\" }\n")
+	writeFileAt(t, root, "kept.go", "package main\n\nfunc Kept() string { return \"folder_delta_survives\" }\n")
+	requireFolderSearchNames(t, root, map[string][]string{"folder_delta_deleted": {"deleted.go"}})
+
+	if err := os.Remove(filepath.Join(root, "deleted.go")); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(keptPath, []byte("package main\n\nfunc Kept() string { return \"folder_delta_survives\" }\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	plan := planFolderTestCorpus(t, root)
-
-	if state, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
-		t.Fatalf("initial ensureFolderCorpusFresh: %v", err)
-	} else if state == corpusKnownEmpty {
-		t.Fatal("folder should not be empty")
-	}
-	if err := os.Remove(deletedPath); err != nil {
-		t.Fatal(err)
-	}
-	if state, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
-		t.Fatalf("delete ensureFolderCorpusFresh: %v", err)
-	} else if state == corpusKnownEmpty {
-		t.Fatal("folder should not be empty after delete")
-	}
-
-	deletedResults, err := searchPlannedCorpusForTest(ctx, plan, "folder_delta_deleted")
-	if err != nil {
-		t.Fatalf("search deleted marker: %v", err)
-	}
-	if len(deletedResults) != 0 {
-		t.Fatalf("deleted marker should be tombstoned, got %d results", len(deletedResults))
-	}
-	keptResults, err := searchPlannedCorpusForTest(ctx, plan, "folder_delta_survives")
-	if err != nil {
-		t.Fatalf("search kept marker: %v", err)
-	}
-	if len(keptResults) == 0 {
-		t.Fatal("expected kept marker to remain searchable")
-	}
+	requireFolderSearchNames(t, root, map[string][]string{
+		"folder_delta_deleted":  nil,
+		"folder_delta_survives": {"kept.go"},
+	})
 }
 
 // TestFolderCorpusRemovalOnlyDeltaKeepsShards removes one small file of a
@@ -444,8 +399,8 @@ func TestFolderCorpusRemovalOnlyDeltaKeepsShards(t *testing.T) {
 // live ones, so the build replaces the family (deltaNeedsCompaction).
 func TestFolderCorpusTombstonedBytesCompactTheFamily(t *testing.T) {
 	requireTools(t)
-	// A small shardMax puts the floor of deltaNeedsCompaction below the
-	// byte counts of these files (634 bytes each).
+	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
+	// shard) below the bytes of two fixture files of 634 bytes.
 	swapShardMaxForTest(t, 1024)
 	ctx := context.Background()
 	root := t.TempDir()
@@ -488,12 +443,12 @@ func TestFolderCorpusTombstonedBytesCompactTheFamily(t *testing.T) {
 // TestFolderCorpusWithNoManifestCountsDeadBytesFromShards removes the folder
 // manifest before each delta. Removing 2 of 10 files of one size stays a delta
 // and records the dead bytes that the shards list. Removing 3 more builds the
-// folder in full, because the shards then list 5 dead files against 5 live
-// ones (deltaNeedsCompaction), and the full build records zero.
+// folder in full: the shards then list 5 dead files against 5 live ones
+// (deltaNeedsCompaction). The full build records zero dead bytes.
 func TestFolderCorpusWithNoManifestCountsDeadBytesFromShards(t *testing.T) {
 	requireTools(t)
-	// A small shardMax puts the floor of deltaNeedsCompaction below the
-	// byte counts of these files (634 bytes each).
+	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
+	// shard) below the bytes of two fixture files of 634 bytes.
 	swapShardMaxForTest(t, 1024)
 	ctx := context.Background()
 	root := t.TempDir()
@@ -547,13 +502,13 @@ func TestFolderCorpusWithNoManifestCountsDeadBytesFromShards(t *testing.T) {
 
 // TestFolderCorpusBinaryFilesCountTheirMarker removes 8 of 10 text files
 // beside a binary file of 8,000 bytes, with the folder manifest and without
-// it. The binary file counts as its marker on both paths, so 8 dead text files
-// against 2 live ones and the marker build the folder in full, and the full
-// build records no dead bytes (deltaNeedsCompaction).
+// it. The binary file counts as its marker on both paths. So 8 dead text files
+// reach 2 live ones and the marker, and the folder builds in full
+// (deltaNeedsCompaction). The full build records no dead bytes.
 func TestFolderCorpusBinaryFilesCountTheirMarker(t *testing.T) {
 	requireTools(t)
-	// A small shardMax puts the floor of deltaNeedsCompaction below the
-	// byte counts of these files (634 bytes each).
+	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
+	// shard) below the bytes of two fixture files of 634 bytes.
 	swapShardMaxForTest(t, 1024)
 	ctx := context.Background()
 	for _, dropManifest := range []bool{false, true} {
@@ -597,13 +552,13 @@ func TestFolderCorpusBinaryFilesCountTheirMarker(t *testing.T) {
 // TestFolderCorpusTextFileThatBecomesBinaryCompacts removes 2 of 10 text files
 // beside a text file of 8,000 bytes, then makes that file binary, with the
 // folder manifest. Before the reads, the file counts at its size, so the rule
-// keeps a delta. After the reads, it counts as its 36-byte marker: 2 dead text
-// files and its old 8,000 bytes then reach the 8 live text files and the
-// marker, so the folder builds in full (deltaNeedsCompaction).
+// keeps a delta. After the reads, it counts as its 36-byte marker. Then 2 dead
+// text files and its old 8,000 bytes reach the 8 live text files and the
+// marker. So the folder builds in full (deltaNeedsCompaction).
 func TestFolderCorpusTextFileThatBecomesBinaryCompacts(t *testing.T) {
 	requireTools(t)
-	// A small shardMax puts the floor of deltaNeedsCompaction below the
-	// byte counts of these files (634 bytes each).
+	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
+	// shard) below the bytes of two fixture files of 634 bytes.
 	swapShardMaxForTest(t, 1024)
 	ctx := context.Background()
 	root := t.TempDir()
@@ -637,15 +592,16 @@ func TestFolderCorpusTextFileThatBecomesBinaryCompacts(t *testing.T) {
 	requireFullRebuild(t, before, readShardFileState(t, plan.indexDir, folderRepoName(plan)))
 }
 
-// TestFolderCorpusBinaryFileThatBecomesTextStaysADelta removes 4 of 10 text
-// files beside a binary file, then 2 more while the binary file becomes 20,280
-// bytes of text, with the folder manifest. Before the reads, the changed file
-// counts at an upper bound of its shard bytes, not at its old marker, so the
-// rule keeps the delta that the read bytes keep (deltaNeedsCompaction).
+// TestFolderCorpusBinaryFileThatBecomesTextStaysADelta keeps the folder
+// manifest. It removes 4 of 10 text files beside a binary file. Then it
+// removes 2 more, while the binary file becomes 20,280 bytes of text. Before
+// the reads, the changed file counts at an upper bound of its shard bytes, not
+// at its old marker. So the rule keeps the delta that the read bytes keep
+// (deltaNeedsCompaction).
 func TestFolderCorpusBinaryFileThatBecomesTextStaysADelta(t *testing.T) {
 	requireTools(t)
-	// A small shardMax puts the floor of deltaNeedsCompaction below the
-	// byte counts of these files (634 bytes each).
+	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
+	// shard) below the bytes of two fixture files of 634 bytes.
 	swapShardMaxForTest(t, 1024)
 	ctx := context.Background()
 	root := t.TempDir()
@@ -684,13 +640,13 @@ func TestFolderCorpusBinaryFileThatBecomesTextStaysADelta(t *testing.T) {
 
 // TestFolderCorpusWithNoManifestTinyFilesStayADelta adds one file to a folder
 // of 2 text files and 100 one-byte files, with no manifest. Before the reads,
-// each file counts at an upper bound of its shard bytes, so the 38-byte marker
+// each file counts at an upper bound of its shard bytes. So the 38-byte marker
 // of a one-byte file does not count as dead content, and the folder stays a
 // delta (deltaNeedsCompaction).
 func TestFolderCorpusWithNoManifestTinyFilesStayADelta(t *testing.T) {
 	requireTools(t)
-	// A small shardMax puts the floor of deltaNeedsCompaction below the
-	// byte counts of these files (634 bytes each).
+	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
+	// shard) below the bytes of two fixture files of 634 bytes.
 	swapShardMaxForTest(t, 1024)
 	ctx := context.Background()
 	root := t.TempDir()
@@ -721,66 +677,31 @@ func TestFolderCorpusWithNoManifestTinyFilesStayADelta(t *testing.T) {
 	requireTombstoneOnlyDeltaOrNewShard(t, before, readShardFileState(t, plan.indexDir, folderRepoName(plan)))
 }
 
+// TestFolderCorpusRefreshHandlesAddedChangedDeletedFiles adds, edits, and
+// deletes one file each between two searches of a folder. The second search
+// finds the new texts and the file that did not change. It does not find the
+// old text or the text of the deleted file.
 func TestFolderCorpusRefreshHandlesAddedChangedDeletedFiles(t *testing.T) {
 	requireTools(t)
-
-	ctx := context.Background()
+	setTestUserCache(t)
 	root := t.TempDir()
-	deletedPath := filepath.Join(root, "deleted.go")
-	changedPath := filepath.Join(root, "changed.go")
-	unchangedPath := filepath.Join(root, "unchanged.go")
-	addedPath := filepath.Join(root, "added.go")
-	if err := os.WriteFile(deletedPath, []byte("package main\n\nfunc Deleted() string { return \"folder_delta_combo_deleted\" }\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(changedPath, []byte("package main\n\nfunc Changed() string { return \"folder_delta_combo_old\" }\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(unchangedPath, []byte("package main\n\nfunc Unchanged() string { return \"folder_delta_combo_keep\" }\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeFileAt(t, root, "deleted.go", "package main\n\nfunc Deleted() string { return \"folder_delta_combo_deleted\" }\n")
+	writeFileAt(t, root, "changed.go", "package main\n\nfunc Changed() string { return \"folder_delta_combo_old\" }\n")
+	writeFileAt(t, root, "unchanged.go", "package main\n\nfunc Unchanged() string { return \"folder_delta_combo_keep\" }\n")
+	requireFolderSearchNames(t, root, map[string][]string{"folder_delta_combo": {"changed.go", "deleted.go", "unchanged.go"}})
 
-	plan := planFolderTestCorpus(t, root)
-	if state, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
-		t.Fatalf("initial ensureFolderCorpusFresh: %v", err)
-	} else if state == corpusKnownEmpty {
-		t.Fatal("folder should not be empty")
-	}
-
-	if err := os.Remove(deletedPath); err != nil {
+	if err := os.Remove(filepath.Join(root, "deleted.go")); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(changedPath, []byte("package main\n\nfunc Changed() string { return \"folder_delta_combo_new\" }\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(addedPath, []byte("package main\n\nfunc Added() string { return \"folder_delta_combo_added\" }\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if state, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
-		t.Fatalf("delta ensureFolderCorpusFresh: %v", err)
-	} else if state == corpusKnownEmpty {
-		t.Fatal("folder should not be empty after delta")
-	}
-
-	for _, pattern := range []string{"folder_delta_combo_deleted", "folder_delta_combo_old"} {
-		results, err := searchPlannedCorpusForTest(ctx, plan, pattern)
-		if err != nil {
-			t.Fatalf("search %s: %v", pattern, err)
-		}
-		if len(results) != 0 {
-			t.Fatalf("%s should be tombstoned, got %d results", pattern, len(results))
-		}
-	}
-
-	for _, pattern := range []string{"folder_delta_combo_new", "folder_delta_combo_added", "folder_delta_combo_keep"} {
-		results, err := searchPlannedCorpusForTest(ctx, plan, pattern)
-		if err != nil {
-			t.Fatalf("search %s: %v", pattern, err)
-		}
-		if len(results) == 0 {
-			t.Fatalf("expected result for %s", pattern)
-		}
-	}
+	writeFileAt(t, root, "changed.go", "package main\n\nfunc Changed() string { return \"folder_delta_combo_new\" }\n")
+	writeFileAt(t, root, "added.go", "package main\n\nfunc Added() string { return \"folder_delta_combo_added\" }\n")
+	requireFolderSearchNames(t, root, map[string][]string{
+		"folder_delta_combo_deleted": nil,
+		"folder_delta_combo_old":     nil,
+		"folder_delta_combo_new":     {"changed.go"},
+		"folder_delta_combo_added":   {"added.go"},
+		"folder_delta_combo_keep":    {"unchanged.go"},
+	})
 }
 
 // TestFolderFamilyUsable checks the post-lock family scan. A peer can publish

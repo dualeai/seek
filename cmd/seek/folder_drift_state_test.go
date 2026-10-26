@@ -2,22 +2,22 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 
 	"github.com/sourcegraph/zoekt/query"
 )
 
 // TestFolderDrift_NextBuildIndexesTheDrift adds a file while a folder build
-// runs. The build succeeds with the state of its walk; the file is a change
+// runs. The build succeeds with the state of its walk. The file is a change
 // for the next build, which is a delta on the published family. A change
 // during a build is not an error.
 //
-// The builds are text builds. The drift comes from the folder read hook
-// (folderOpenFile): the build opens each file after its walk, and the hook
-// writes the new file when the build opens second.go.
+// The builds are text builds. The test holds a read lock, so the build waits
+// to publish after its walk and its reads. The test adds the file during that
+// wait.
 func TestFolderDrift_NextBuildIndexesTheDrift(t *testing.T) {
 	requireTools(t)
 
@@ -38,30 +38,24 @@ func TestFolderDrift_NextBuildIndexesTheDrift(t *testing.T) {
 	}
 
 	// Add a file while the build runs.
-	var once sync.Once
-	realOpen := folderOpenFile
-	t.Cleanup(func() { folderOpenFile = realOpen })
-	folderOpenFile = func(path string) (*os.File, error) {
-		if filepath.Base(path) == "second.go" {
-			once.Do(func() {
-				writeFileAt(t, folder, "late.go", "package sample\n// arrived during the build\n")
-			})
-		}
-		return realOpen(path)
-	}
 	writeFileAt(t, folder, "second.go", "package sample\n// forces a rebuild\n")
+	release := holdReadLock(t, plan.cacheDir)
+	_, waiting := captureTestLogsWithSignal(t, slog.LevelWarn, lockWaitReaders, filepath.Join(plan.cacheDir, lockFile))
+	acted := onLockWait(t, waiting, func() error {
+		return os.WriteFile(filepath.Join(folder, "late.go"), []byte("package sample\n// arrived during the build\n"), 0o644)
+	}, release)
 
 	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 		t.Fatalf("the drifted build failed: %v", err)
 	}
-	folderOpenFile = realOpen
+	lockWaitActed(t, acted)
 	if got := readStateFile(plan.cacheDir); got == "" || got == published {
 		t.Fatalf("the drifted build published no new state: %q", got)
 	}
 
-	// The next build indexes the late file as a delta: a delta seeds the prior
-	// shards with hard links, so the base shard stays the same file. A full
-	// rebuild writes a new one.
+	// The next build indexes the late file as a delta. A delta seeds the
+	// prior shards with hard links, so the base shard stays the same file. A
+	// full rebuild writes a new one.
 	baseBefore := firstShardInfo(t, plan.indexDir)
 	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 		t.Fatalf("next build: %v", err)
@@ -74,7 +68,7 @@ func TestFolderDrift_NextBuildIndexesTheDrift(t *testing.T) {
 		t.Fatal("the next build left no state")
 	}
 	// The corpus answers for the file that arrived during the build. The
-	// search reads the node under its read lock, as a search does.
+	// search reads the node under its read lock (searchPlannedCorpusParsed).
 	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 		t.Fatalf("warm build: %v", err)
 	}

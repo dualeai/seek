@@ -28,9 +28,10 @@ func longSemanticFunction(size int) []byte {
 	return []byte(content + "//" + strings.Repeat("x", size-len(content)-3) + "\n")
 }
 
-// TestLongUnitEmbedsEveryWindow builds a 15,191-byte function: it gives at
-// least three rows, the rows cover every byte of the file in order, each model
-// input fits one model row, and the model embeds every row.
+// TestLongUnitEmbedsEveryWindow builds a 15,191-byte file of one long
+// function. It gives at least three rows, and the rows cover every byte of the
+// file in order. Each model input fits one model row, and the model embeds
+// every row.
 func TestLongUnitEmbedsEveryWindow(t *testing.T) {
 	requireTools(t)
 	content := longSemanticFunction(15_191)
@@ -86,9 +87,9 @@ func TestLongUnitEmbedsEveryWindow(t *testing.T) {
 	}
 }
 
-// TestWindowsRepeatTheHeaderAndKeepTheirUnit splits one unit: every window
-// starts with the same path and language header, and keeps the unit's kind
-// and symbol: a window holds one unit only. Each window ID matches its span.
+// TestWindowsRepeatTheHeaderAndKeepTheirUnit splits one unit. Every window
+// starts with the same path and language header and keeps the unit's kind and
+// symbol: a window holds one unit only. Each window ID matches its span.
 func TestWindowsRepeatTheHeaderAndKeepTheirUnit(t *testing.T) {
 	content := longSemanticFunction(6_000)
 	units := extractSemanticUnits("pkg/long.go", content, []*ctags.Entry{
@@ -143,10 +144,10 @@ func TestUnitScoreIsBestWindow(t *testing.T) {
 }
 
 // TestWindowsEndAtWordStartsAndKeepRunes splits a long ASCII unit and a long
-// CJK and emoji unit: every inner window edge sits at white space, no window
-// splits a rune, and the final scorer's document of each window fits one
-// model row with no truncation. Each unit body is one line of words that take
-// several tokens each, so no window has a line start to end at and the word
+// CJK and emoji unit. Every inner window edge sits at white space, and no
+// window splits a rune. The final scorer's document of each window fits one
+// model row with no truncation. Each unit body is one line of words of
+// several tokens each. So no window has a line start to end at, and the word
 // start rule sets every edge.
 func TestWindowsEndAtWordStartsAndKeepRunes(t *testing.T) {
 	tokenizer, err := lateOnTokenizers.take(t.Context())
@@ -336,10 +337,10 @@ func TestEmbedUsesTheWindowModelInput(t *testing.T) {
 }
 
 // TestWindowHeaderMatchesScorerDocument checks that the final scorer reads
-// the lines that the window header of a file's rows holds, for a folder node
-// (model path base, absolute) and for a Git node (none): the vectors and the
-// final score then describe the same model input. The folder header names the
-// last 4 parts of the absolute path.
+// the lines that the window header of a file's rows holds. Then the vectors
+// and the final score describe the same model input. The test checks a folder
+// node (an absolute model path base) and a Git node (no base). The folder
+// header names the last 4 parts of the absolute path.
 func TestWindowHeaderMatchesScorerDocument(t *testing.T) {
 	unit := semanticUnit{path: "notes/c.go", language: "Go", symbol: "func Handle"}
 	for _, base := range []string{"/Users/someone/Dev", ""} {
@@ -355,10 +356,11 @@ func TestWindowHeaderMatchesScorerDocument(t *testing.T) {
 }
 
 // TestScorerDocumentsNameTheModelPathBase searches a folder with a strict hit
-// and a vector-only hit, and a Git repository: every document that the final
-// scorer reads names the base that the rows' windows name, the folder's
-// absolute path, and none for the Git node. The test model accepts every row,
-// so semantic.go, which holds no query word, reaches the scorer from its rows.
+// and a vector-only hit, and a Git repository. Every document that the final
+// scorer reads names the base that the rows' windows name. For the folder, it
+// is the absolute path with its symlinks resolved; the Git node has none. The
+// test model accepts every row, so semantic.go, which holds no query word,
+// reaches the scorer from its rows.
 func TestScorerDocumentsNameTheModelPathBase(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -366,8 +368,12 @@ func TestScorerDocumentsNameTheModelPathBase(t *testing.T) {
 	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
 	writeFileAt(t, folder, "semantic.go", "package sample\n// dispatches a request\n")
 	repo := initGitRepo(t, "strict.go", "package sample\n// alpha beta\n")
+	realFolder, err := filepath.EvalSymlinks(folder)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for operand, want := range map[string]string{
-		folder: filepath.ToSlash(canonicalCorpusPath(folder)),
+		folder: filepath.ToSlash(realFolder),
 		repo:   "",
 	} {
 		_, scorer, err := stubSearch(t, payloadAccept, "alpha beta", operand)
@@ -390,9 +396,9 @@ func TestScorerDocumentsNameTheModelPathBase(t *testing.T) {
 	}
 }
 
-// TestWindowHeaderMarksACutPath windows units whose header passes the token
-// share of the metadata in the path line or after it, and a unit whose header
-// fits: only a cut inside the path line marks the windows.
+// TestWindowHeaderMarksACutPath windows units whose header passes the
+// metadata's token share, in the path line or after it, and a unit whose
+// header fits. Only a cut inside the path line marks the windows.
 func TestWindowHeaderMarksACutPath(t *testing.T) {
 	tokenizer, err := lateOnTokenizers.take(t.Context())
 	if err != nil {
@@ -422,12 +428,13 @@ func TestWindowHeaderMarksACutPath(t *testing.T) {
 }
 
 // TestEqualPathLineKeysAreMarkedCut windows the same content under a name and
-// under that name with ".orig", for names of 1 to 80 bytes below a long
-// folder, so the path line crosses the header's token share. When the two
-// keys are equal, the header did not hold the whole path line, and both rows
-// must mark the cut; the boundary is a line that fills the share up to its
-// newline. Each row marks the cut exactly when its path line through the
-// newline passes the share. The lengths must give equal keys and uncut names.
+// under that name with ".orig". The base names have 1 to 80 bytes before
+// ".go", below a long folder, so the path line crosses the header's token
+// share. When the two keys are equal, the header did not hold the whole path
+// line, and both rows must mark the cut. The boundary is a line that fills the
+// share up to its newline. Each row marks the cut exactly when its path line
+// through the newline passes the share. The lengths must give equal keys and
+// uncut names.
 func TestEqualPathLineKeysAreMarkedCut(t *testing.T) {
 	tokenizer, err := lateOnTokenizers.take(t.Context())
 	if err != nil {
@@ -443,9 +450,10 @@ func TestEqualPathLineKeysAreMarkedCut(t *testing.T) {
 		}
 		return makeSemanticRowKey(windows[0].input), windows[0].pathCut
 	}
-	// lineTokens counts the header tokens of the path line through its
-	// newline, which the pre-tokenizer splits from the next line: the line is
-	// whole when they fit the header's share of the content tokens.
+	// lineTokens gives the tokens of the path line through its newline, and the
+	// header's share of the content tokens. The pre-tokenizer splits the
+	// newline from the next line, so the line alone gives the tokens that it
+	// gives in the header. The line is whole when its tokens fit the share.
 	lineTokens := func(name string) (int, int) {
 		t.Helper()
 		ids, _, err := tokenizer.encode(lateOnDocumentPrefix+"path: "+name+"\n", true, true)
@@ -479,7 +487,7 @@ func TestEqualPathLineKeysAreMarkedCut(t *testing.T) {
 }
 
 // TestFoldedTailsAreNotPlain windows pairs of tails that the tokenizer gives
-// one key, as the reuse rule expects (semanticPlainTail): NFC maps the Kelvin
+// one key, as the reuse rule expects (semanticPlainTail). NFC maps the Kelvin
 // sign to "K", and [MASK] strips the white space before it. In each pair, one
 // tail is not plain.
 func TestFoldedTailsAreNotPlain(t *testing.T) {

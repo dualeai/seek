@@ -2,10 +2,10 @@ package main
 
 import "testing"
 
-// TestDecideGitBuild checks the Git build's decisions under its lock, with no
-// Git and no file system: what makes a node current, and what each change
-// builds. It also checks which plans read the commit and which plans make a
-// build directory.
+// TestDecideGitBuild checks the decisions of the Git build under its lock. It
+// uses no Git and no file system. It checks what makes a node current and
+// what each change builds. It also checks which plans read the commit and
+// which plans make a build directory.
 func TestDecideGitBuild(t *testing.T) {
 	// warm is a clean node whose index holds its commit.
 	warm := gitBuildInputs{
@@ -72,9 +72,9 @@ func TestDecideGitBuild(t *testing.T) {
 	}
 }
 
-// TestDecideFolderBuild checks the folder build's decisions with no file
-// system: an unchanged folder builds nothing, a change takes a delta on a
-// usable family, and a torn family rebuilds in full and loses .state on a
+// TestDecideFolderBuild checks the decisions of the folder build with no file
+// system. An unchanged folder builds nothing. A change takes a delta on a
+// usable family. A torn family rebuilds in full and loses .state on a
 // failure. The vector generation builds only when it is missing.
 func TestDecideFolderBuild(t *testing.T) {
 	unchanged := folderBuildInputs{stateHash: "s1", currentState: "s1", hasShard: true, intact: true}

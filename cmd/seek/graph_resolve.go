@@ -34,6 +34,7 @@ type externalGitRoot struct {
 	// failed, and has no plan.
 	state    repoState
 	children []string
+	// emitted holds the children that childrenInScope already returned.
 	emitted  map[string]struct{}
 	captured bool
 }
@@ -44,9 +45,8 @@ type externalRoot struct {
 	info os.FileInfo
 }
 
-// resolvedOperand is an operand after its canonical path and owning Git
-// worktree (if any) have been determined, but before the ignore-aware
-// routing decision is made.
+// resolvedOperand is an operand with its canonical path and its owning Git
+// worktree (if any). Git visibility then routes it to a Git or a folder seed.
 type resolvedOperand struct {
 	canonical string
 	info      os.FileInfo
@@ -109,7 +109,7 @@ func statOperand(operand string) (string, os.FileInfo, error) {
 }
 
 // resolveOperands resolves each explicit operand to its canonical path, its
-// owning Git worktree, and its Git visibility, then groups the operands into
+// owning Git worktree, and its Git visibility. Then it groups the operands into
 // the seeds of the graph expansion: Git roots and folder roots. An operand that
 // exists but that Seek cannot read, or whose repository Git cannot use or
 // classify, is a node failure with one warning. Any other stat error, and an
@@ -117,9 +117,9 @@ func statOperand(operand string) (string, os.FileInfo, error) {
 func resolveOperands(ctx context.Context, operands []string) (plannedExternalOperands, error) {
 	var result plannedExternalOperands
 
-	// Resolve each operand to its canonical path and owning Git worktree. A file
-	// operand is resolved through its parent directory. Group in-repo operands
-	// by repository so visibility needs one Git check per root.
+	// Resolve each operand to its canonical path and owning Git worktree. A
+	// file operand is resolved through its parent directory. Group in-repo
+	// operands by repository so visibility needs one Git check per root.
 	resolved := make([]resolvedOperand, 0, len(operands))
 	pathsByRepo := make(map[string][]string)
 	listings := make(dirListings)
@@ -164,10 +164,10 @@ func resolveOperands(ctx context.Context, operands []string) (plannedExternalOpe
 			ro.repo = &repo
 			repoRoot := canonicalCorpusPath(paths.RepoDir)
 			// Correct the operand to its real on-disk byte name before it
-			// drives the byte-exact Git scope. On case- or normalization-
-			// insensitive filesystems os.Stat accepts a mistyped name, but
+			// sets the byte-exact Git scope. On case- or normalization-
+			// insensitive file systems, os.Stat accepts a mistyped name. But
 			// the Git scope query (gitScopeSpec.query) is exact, so the
-			// wrong-case name would silently match nothing.
+			// wrong-case name would match nothing and give no error.
 			ro.canonical = realCaseWithin(repoRoot, canonical, listings)
 			pathsByRepo[repoRoot] = append(pathsByRepo[repoRoot], ro.canonical)
 		}
@@ -219,12 +219,14 @@ func resolveOperands(ctx context.Context, operands []string) (plannedExternalOpe
 }
 
 // operandRepo returns the Git node that holds probe. It walks up and decides
-// each `.git` entry by the expansion's rule (classifyGitDir): a confirmed
-// boundary needs no subprocess; a stray entry names no repository, so the walk
-// goes on to the parent; an entry that points to another work tree's Git
-// directory, or that Git refuses, is a node failure and never a folder. Git
-// runs in the boundary directory, so all operands of one repository share one
-// read of its filter drivers (readRepoGitConfig).
+// each `.git` entry by the expansion's rule (classifyGitDir):
+//   - A confirmed boundary needs no Git process.
+//   - A stray entry names no repository, so the walk goes on to the parent.
+//   - An entry that points to another work tree's Git directory, or that Git
+//     refuses, is a node failure and never a folder.
+//
+// Git runs in the boundary directory, so all operands of one repository share
+// one read of its filter drivers (readRepoGitConfig).
 func operandRepo(ctx context.Context, probe string) (gitPaths, bool, error) {
 	for dir := probe; ; {
 		if paths, ok, err := classifyGitDir(ctx, dir); ok || err != nil {
@@ -238,9 +240,9 @@ func operandRepo(ctx context.Context, probe string) (gitPaths, bool, error) {
 	}
 }
 
-// gitDirectoryOperand reports a path at or below a Git directory: a .git
-// directory, a bare repository (HEAD that Git accepts, objects, and refs), or
-// anything inside one. The walk up stops at the first directory that holds a
+// gitDirectoryOperand reports a path at or below a Git directory. That is a
+// .git directory, a bare repository (HEAD that Git accepts, objects, and refs),
+// or anything inside one. The walk up stops at the first directory that holds a
 // `.git` entry: below it lies a work tree, even inside a bare repository. The
 // rule is the folder walk's file-system rule, with no Git process: a Git
 // directory that Git refuses or cannot read stays a Git directory.

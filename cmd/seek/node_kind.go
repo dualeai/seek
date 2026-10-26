@@ -6,9 +6,9 @@ import "context"
 // node's kind field (corpusKind) is the data tag for display, the corpus ID
 // and dedup.
 type nodeKind interface {
-	// prepare makes the node's index current, or keeps the last complete
-	// one after a failed build or during a peer's build (corpusStale), and
-	// returns what its read needs.
+	// prepare makes the node's index current and returns what its read
+	// needs. After a failed build or during a peer's build, it keeps the
+	// last complete index (corpusStale).
 	prepare(ctx context.Context, plan node, execution searchExecution) (openedNode, error)
 	// estimate gives the cache bytes of the node's next generation and
 	// whether the search rebuilds it (cache_budget.go).
@@ -33,7 +33,7 @@ func (g *gitNode) prepare(ctx context.Context, plan node, execution searchExecut
 		plan:       plan,
 		state:      state,
 		indexState: indexState,
-		// The capture's dirty files, also for a stale index: the committed
+		// The capture's dirty files, also for a stale index. The committed
 		// copy of a file that is dirty now is old text, so it stays hidden.
 		dirty: dirtyFileSetFromState(state),
 		// The hash runs at read time: it stats the dirty files again, so a
@@ -61,10 +61,10 @@ func (*folderNode) prepare(ctx context.Context, plan node, execution searchExecu
 		indexState = corpusStale
 	}
 	capture := plan.folder
-	// After a tree change the shared capture is stale, and this prepare walked
-	// the folder again: the index's state file then holds the state that it
-	// built or checked. Without this state, a node read again after a save
-	// during its build would get no vector hit.
+	// After a tree change, the shared capture is stale, and this prepare
+	// walked the folder again. The index's state file then holds the state
+	// that it built or checked. Without this state, a node read again after a
+	// save during its build would get no vector hit.
 	built := ""
 	if indexState != corpusStale {
 		built = readStateFile(plan.cacheDir)

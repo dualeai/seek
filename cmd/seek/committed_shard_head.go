@@ -11,18 +11,18 @@ import (
 // records for its HEAD branch.
 //
 // The shards are the authority on which commit they hold. The .head sidecar
-// can disagree with them after a crash between the shard swap and the receipt
-// writes, so a freshness check that reads the shard cannot be fooled by a stale
+// can disagree with them after a crash between the shard swap and the writes
+// of .state and .head. A freshness check that reads the shard ignores a stale
 // .head file. Zoekt keeps this record inside the shard for a full build and in
-// a ".meta" file beside it for a delta build; its reader prefers the ".meta"
+// a ".meta" file beside it for a delta build. Its reader prefers the ".meta"
 // file, so one call covers both shapes.
 //
-// ok is false when no committed shard 0 exists, when the shard does not hold
-// one live repository with one HEAD branch, or when the metadata cannot be
-// read. The caller must then keep the answer it already has. A read failure
-// means "unknown", never "stale": this runs outside the publish lock, so a
-// peer can replace the file while it is read, and a rebuild on every read
-// error would livelock.
+// ok is false when no committed shard 0 exists, or when the shard does not
+// hold one live repository with one HEAD branch. It is also false when the
+// metadata cannot be read. The caller must then keep the answer it already
+// has. A read failure means "unknown", never "stale". This runs outside the
+// publish lock, so a peer can replace the file while it is read. A rebuild on
+// every read error could then repeat with no end.
 func committedShardHead(scan familyScan) (string, bool) {
 	path, ok := committedShardZeroPath(scan)
 	if !ok {
@@ -37,7 +37,7 @@ func committedShardHead(scan familyScan) (string, bool) {
 }
 
 // recordedHeadVersion returns the commit a shard's repository record holds for
-// its HEAD branch. Seek indexes one branch named HEAD, so any other shape
+// its HEAD branch. Seek indexes one branch named HEAD. So any other shape
 // belongs to a shard this build did not write, and the caller must not trust
 // it. The delta path applies the same rule before it reuses a base.
 func recordedHeadVersion(repository *zoekt.Repository) (string, bool) {
@@ -51,9 +51,9 @@ func recordedHeadVersion(repository *zoekt.Repository) (string, bool) {
 }
 
 // committedShardZeroPath returns the path of the committed family's shard 0.
-// Zoekt keeps the repository metadata in every committed shard, and a delta
-// build updates the record of each old shard too, so one read of shard 0
-// answers the commit question.
+// Zoekt keeps the repository metadata in every committed shard. A delta build
+// updates the record of each old shard too, so one read of shard 0 answers the
+// commit question.
 func committedShardZeroPath(scan familyScan) (string, bool) {
 	for _, m := range scan.members {
 		if m.shard && !m.uncommitted && m.numbered && m.num == 0 {

@@ -58,10 +58,10 @@ func (f *graphFixture) graphRepo(rel, file, marker string) string {
 	return f.GitRepo(rel, file, marker+" "+rel+"/"+file+"\n")
 }
 
-// F6 builds a folder and Git graph with each edge kind of the graph
+// edgeGraph builds a folder and Git graph with each edge kind of the graph
 // expansion. Each file holds marker and its fixture path. It returns the files
 // that a search of "." from the root finds, each with its corpus tag.
-func (f *graphFixture) F6(marker string) map[string]string {
+func (f *graphFixture) edgeGraph(marker string) map[string]string {
 	f.t.Helper()
 	repoA := f.graphRepo("repoA", "a.txt", marker)
 	writeFixtureFile(f.t, filepath.Join(repoA, ".gitignore"), "ignored/\n")

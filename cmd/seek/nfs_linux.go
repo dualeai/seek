@@ -3,9 +3,9 @@ package main
 import "syscall"
 
 // Linux statfs f_type magic numbers of network file systems. The list includes
-// FUSE because sshfs, rclone, and other FUSE file systems act as network file
-// systems do: no flock guarantee, no atomic rename across clients, and mtime
-// skew.
+// FUSE, because sshfs, rclone, and other FUSE file systems act as network file
+// systems do. They give no flock guarantee and no atomic rename across
+// clients, and their mtimes can skew.
 const (
 	nfsSuperMagic  = 0x6969
 	smbSuperMagic  = 0x517B

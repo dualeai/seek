@@ -27,10 +27,14 @@ import (
 
 const lateOnProviderHasAccelerator = true
 
-// lateOnAcceleratedProviderName identifies the accelerated provider in logs and
-// in the provider verdict. Change it when the provider options change meaning.
+// lateOnAcceleratedProviderName names the accelerated provider in logs and in
+// the values of SEEK_PROVIDER. Change it when the provider options change
+// meaning.
 const lateOnAcceleratedProviderName = "coreml-mlprogram-static"
 
+// configureLateOnProvider adds the Core ML provider to options, with its
+// model cache directory. The CPU part of the session keeps one thread, so it
+// ignores the CPU count of a call.
 func configureLateOnProvider(options *ort.SessionOptions, _ int, model []byte) error {
 	if err := configureLateOnCPUProvider(options, 1); err != nil {
 		return err
@@ -58,18 +62,19 @@ func lateOnCoreMLProviderOptions() map[string]string {
 	}
 }
 
-// lateOnRunCoreMLCacheDirectory resolves the cache directory once for this
-// process. The key hashes the whole decoded model, which takes about 10 ms,
-// and three call sites need the directory on one cold start: the session
-// configuration, the provider check, and the cached-verdict read.
+// lateOnRunCoreMLCacheDirectory computes the cache key once for this process
+// and returns the cache directory. The key hashes the whole decoded model,
+// which takes about 10 ms. Three call sites need the directory on one cold
+// start: the session configuration, the provider check, and the cached-verdict
+// read.
 //
 // The key also carries ort.GetVersion(), which is empty until
 // ensureLateOnEnvironment runs. Every caller reaches this through
 // newLateOnRowEncoder, which a *lateOnModel owns, and that model cannot exist
-// before the environment is ready. Refusing an empty version keeps that
-// requirement loud: caching one would send writers and readers to different
-// directories, and the only symptom would be a probe that silently repeats on
-// every invocation.
+// before the environment is ready. An empty version is an error, so a broken
+// order fails at once. A key with an empty version would send writers and
+// readers to different directories. The only symptom would be a probe that
+// repeats on every run with no message.
 func lateOnRunCoreMLCacheDirectory(model []byte) (string, error) {
 	lateOnRunCoreMLCache.mutex.Lock()
 	defer lateOnRunCoreMLCache.mutex.Unlock()
@@ -157,9 +162,9 @@ func lateOnProbeSession(
 	consume func([]float32) error,
 ) error {
 	// Borrow from the encoder's tensor pool. The probe runs twice and each
-	// output is 3 MB, so allocating its own would make 6 MB of garbage and then
-	// leave the encoder to allocate its first output again on the first real
-	// batch. takeOutput needs no session, only the pool fields.
+	// output is 3 MB. Its own outputs would make 6 MB of garbage, and the
+	// encoder would allocate its first output again on the first real batch.
+	// takeOutput needs no session, only the pool fields.
 	output, err := pool.takeOutput()
 	if err != nil {
 		return fmt.Errorf("create probe output: %w", err)
@@ -205,15 +210,14 @@ func lateOnRunProbe(
 const providerArtifactTouchInterval = 24 * time.Hour
 
 // touchProviderArtifactUse records that this compiled model is still wanted.
-// Nothing else writes into the directory after the compile and the single
-// verdict write, and neither MkdirAll nor Chmod moves a directory's
-// modification time, so without this a model used every day ages exactly like
-// an abandoned one and the collector removes it — costing a recompile AND a
-// fresh provider check. It refreshes at most once a day, so a search does not
-// pay a write.
+// After the compile, only the rare verdict writes change the directory.
+// MkdirAll and Chmod do not change its modification time. Without the marker,
+// a model used every day ages like an unused one. The collector then removes
+// it, which costs a new compile AND a new provider check. It refreshes at most
+// once a day, so most searches pay no write.
 //
-// It skips a rejected model, which this host will never read again and the
-// collector must be free to reclaim. That check sits after the interval test,
+// It skips a rejected model, which this host does not read again and the
+// collector must be free to remove. That check comes after the interval test,
 // so a warm run pays one stat and no verdict read.
 func touchProviderArtifactUse(directory string) {
 	marker := filepath.Join(directory, providerArtifactUsedFile)
@@ -221,12 +225,9 @@ func touchProviderArtifactUse(directory string) {
 		time.Since(info.ModTime()) < providerArtifactTouchInterval {
 		return
 	}
-	// Do not refresh the marker for a model this host has stopped using. A
-	// rejected verdict means every later run takes the CPU provider without
-	// reading the compiled model, so refreshing it would pin tens of megabytes
-	// the collector could never reclaim — on exactly the hosts this check
-	// exists for. The stat above runs first, so a warm run never reads the
-	// verdict here.
+	// A rejected verdict means every later run takes the CPU provider and does
+	// not read the compiled model. A refresh would keep tens of megabytes that
+	// the collector could never remove, on the hosts that this check is for.
 	verdict := filepath.Join(directory, lateOnProviderVerdictFile)
 	if readLateOnProviderRecord(verdict).verdict == lateOnVerdictRejected {
 		return
@@ -242,12 +243,13 @@ func touchProviderArtifactUse(directory string) {
 	_ = os.Chtimes(marker, now, now)
 }
 
-// These three complete the on-disk record format whose two shared spellings
-// semantic_encoder.go declares. They live here because this file holds the only
-// parser and the only writer. Do not move them beside those two: that file also
-// compiles where no accelerator exists, and there these three are unused. A
-// second accelerated target would need a file tagged for both targets, not the
-// shared encoder.
+// lateOnVerdictRecheck, lateOnVerdictFaultsBeforeRejection and
+// lateOnProviderFaultWindow complete the on-disk record format whose two shared
+// spellings semantic_encoder.go declares. They live here because this file
+// holds the only parser and the only writer. Do not move them beside those
+// two. That file also compiles where no accelerator exists, and there these
+// three are unused. A second accelerated target would need a file tagged for
+// both targets, not the shared encoder.
 
 // lateOnVerdictRecheck records real work that produced unusable output the
 // fixed probe batch does not reproduce. The record reads "recheck <count>
@@ -256,10 +258,10 @@ func touchProviderArtifactUse(directory string) {
 // cancels exactly, which a healthy provider can produce. The next process
 // measures again rather than trusting one sample.
 //
-// The count must survive a passing probe. Without that, a provider that agrees
-// on the probe and fails on real work would alternate between the two records
-// for ever and never earn a demotion, so the continuous guards would report the
-// same fault on every build and nothing would change.
+// The count must survive a passing probe. Else a provider that agrees on the
+// probe and fails on real work would alternate between the two records
+// forever, and never get a demotion. The continuous guards would then report
+// the same fault on every build, and nothing would change.
 //
 // Keep the spelling stable, the way the shared verdicts are kept: a machine
 // that upgrades Seek keeps the record its previous version wrote.
@@ -271,37 +273,38 @@ const lateOnVerdictRecheck = "recheck"
 const lateOnVerdictFaultsBeforeRejection = 2
 
 // lateOnProviderFaultWindow is how long one fault stays on the record. Two
-// faults inside it demote the provider; a lone fault outside it expires, so a
-// host that saw one benign cancellation returns to the cached-verdict path
-// instead of paying a second session and two full batches on every search.
+// faults inside it demote the provider. A lone fault outside it expires. So a
+// host that saw one benign fault (a vector whose norm cancels to zero) returns
+// to the cached-verdict path. It then does not pay a second session and two
+// full batches on every search.
 const lateOnProviderFaultWindow = 7 * 24 * time.Hour
 
-// lateOnProviderVerdictFile names the cached probe result. It sits in the Core
-// ML model cache directory, whose key already covers the model bytes, the ONNX
-// Runtime version, the provider options and the operating system build, so the
-// verdict expires exactly when any of those change.
+// lateOnProviderVerdictFile names the cached probe result. It is in the Core
+// ML model cache directory. The key of that directory covers the model bytes,
+// the ONNX Runtime version, the provider options and the operating system
+// build. So the verdict expires when any of those change.
 const lateOnProviderVerdictFile = "provider-verdict"
 
-// lateOnVerdictLocation remembers where the verdict for the provider in use
-// lives. rejectLateOnAcceleratedProvider runs long after selection, after a
-// vector build, scan, or ranking fault (semanticModelFuture.recordFault), and
-// this spares it decoding the model again only to rebuild a path selection
-// already knew. Selection stores it; an empty value means no provider
-// check has run in this process, so there is nothing to reject.
+// lateOnVerdictLocation holds the path of the verdict for the provider in use.
+// rejectLateOnAcceleratedProvider runs long after selection, after a vector
+// build, scan, or ranking fault (semanticModelFuture.recordFault). This path
+// saves it from decoding the model again to rebuild a path that selection
+// knew. Selection stores it. An empty value means that selection read no
+// verdict in this process (a pinned provider), so there is nothing to reject.
 var lateOnVerdictLocation atomic.Value
 
 // rejectLateOnAcceleratedProvider records that the accelerated provider
 // produced unusable output on real work.
 //
 // It does NOT demote on the first fault. One fault writes a counted recheck,
-// and the next process measures again rather than trusting a single sample,
-// because normalizeSemanticVector also rejects a vector whose norm cancels
-// exactly, which a healthy provider can produce. A second fault inside
-// lateOnProviderFaultWindow writes the demotion, and only then does the next
-// process take the CPU provider without building an accelerated session.
+// and the next process measures again. One sample is not proof:
+// normalizeSemanticVector also rejects a vector whose norm cancels to zero,
+// which a healthy provider can produce. A second fault inside
+// lateOnProviderFaultWindow writes the demotion. Only then does the next
+// process take the CPU provider without an accelerated session.
 //
-// It only acts when the accelerated provider is the one in use, it never
-// downgrades a demotion a peer process already settled, and it never fails a
+// It acts only when the accelerated provider is the one in use. It never
+// changes a demotion that a peer process already wrote, and it never fails a
 // search.
 func rejectLateOnAcceleratedProvider(reason string) {
 	if semanticProviderName() != lateOnAcceleratedProviderName {
@@ -312,8 +315,8 @@ func rejectLateOnAcceleratedProvider(reason string) {
 		return
 	}
 	// One fault asks for another measurement. A second one, after a probe
-	// that passed in between, is a provider that agrees on the probe batch and
-	// fails on real work, so demote it for good.
+	// that passed in between, shows a provider that agrees on the probe batch
+	// and fails on real work. So demote it for good.
 	record := readLateOnProviderRecord(path)
 	if record.verdict == lateOnVerdictRejected {
 		// A peer process already settled this. Rewriting the record would
@@ -321,10 +324,10 @@ func rejectLateOnAcceleratedProvider(reason string) {
 		return
 	}
 	// Read and write are not one step. Two searches that fault at the same
-	// moment both read the same count and both write one more, so the record
-	// advances by one rather than two and the demotion needs one further fault.
-	// Faults are rare and the window is a week, so the cost is a delay, never a
-	// wrong demotion. So this path takes no lock: a reader always sees a whole
+	// moment both read the same count and both write one more. The record then
+	// goes up by one, not two, and the demotion needs one more fault. Faults
+	// are rare and the window is a week, so the cost is a delay, never a wrong
+	// demotion. So this path takes no lock: a reader always sees a whole
 	// record, because each write is a rename (writeLateOnProviderVerdict).
 	faults := record.faults + 1
 	verdict := fmt.Sprintf("%s %d %d", lateOnVerdictRecheck, faults, time.Now().Unix())
@@ -354,8 +357,8 @@ type lateOnProviderRecord struct {
 // only place that parses it. One reader serves every caller, so each caller
 // reads the same record format.
 //
-// A fault older than lateOnProviderFaultWindow expires, which is what stops one
-// benign cancellation from costing a probe on every search for ever.
+// A fault older than lateOnProviderFaultWindow expires. So one benign fault
+// does not cost a probe on every search forever.
 func readLateOnProviderRecord(path string) lateOnProviderRecord {
 	stored, err := os.ReadFile(path)
 	if err != nil {
@@ -389,11 +392,11 @@ func readLateOnProviderRecord(path string) lateOnProviderRecord {
 	return lateOnProviderRecord{faults: faults, at: seconds}
 }
 
-// cachedLateOnProviderVerdict reads a recorded verdict. The cache directory is
-// a pure function of the model bytes, the provider options, the ONNX Runtime
-// version and the operating system build, so this needs no session. Reading it
-// before the accelerated session is built keeps a rejected host from compiling
-// and destroying a Core ML model on every run.
+// cachedLateOnProviderVerdict reads a recorded verdict. The cache key
+// depends only on the model bytes, the provider options, the ONNX Runtime
+// version and the operating system build. So this needs no session. It runs
+// before the accelerated session exists, so a rejected host does not compile
+// and destroy a Core ML model on every run.
 func cachedLateOnProviderVerdict(model []byte) string {
 	directory, err := lateOnRunCoreMLCacheDirectory(model)
 	if err != nil {
@@ -411,9 +414,9 @@ func cachedLateOnProviderVerdict(model []byte) string {
 //
 // ONNX Runtime 1.30.0 returns wrong FP16 output from the Core ML MLProgram path
 // on macOS 15 ARM64: https://github.com/microsoft/onnxruntime/issues/32569. The
-// session still builds and reports no error, so only its numbers reveal the
-// fault. Comparing against the CPU provider on this host avoids a stored
-// reference vector, which would have to be re-pinned whenever the model, the
+// session still builds and reports no error, so only its numbers show the
+// fault. A comparison with the CPU provider on this host needs no stored
+// reference vector. Such a vector would need an update whenever the model, the
 // tokenizer or the run time changes.
 //
 // No branch here selects a provider from the operating system version. The
@@ -434,10 +437,9 @@ func verifyLateOnAcceleratedProvider(
 	}
 	verdictPath := filepath.Join(directory, lateOnProviderVerdictFile)
 	lateOnVerdictLocation.Store(verdictPath)
-	// This re-read is not the one cachedLateOnProviderVerdict already did. A
-	// Core ML compile takes long enough that a peer process can finish its own
-	// check and record a verdict while this one waits, and honouring it saves a
-	// second probe.
+	// This read is not the one that cachedLateOnProviderVerdict did. During a
+	// Core ML compile, a peer process can finish its own check and record a
+	// verdict. Using that verdict saves a second probe.
 	switch readLateOnProviderRecord(verdictPath).verdict {
 	case lateOnVerdictTrusted:
 		return true, "cached verdict", nil
@@ -460,9 +462,9 @@ func verifyLateOnAcceleratedProvider(
 			return err
 		}
 		// This session runs once and is destroyed. Its arena would keep the
-		// activation memory for a full batch — measured at about 617 MiB — for
-		// the life of the process, on hosts that then do all their real work
-		// through the accelerator and would never have grown one.
+		// activation memory of a full batch (measured at about 617 MiB) for
+		// the life of the process. These hosts then do all their real work
+		// through the accelerator and would never grow such an arena.
 		if err := options.SetCpuMemArena(false); err != nil {
 			return fmt.Errorf("disable the reference CPU arena: %w", err)
 		}
@@ -489,18 +491,17 @@ func verifyLateOnAcceleratedProvider(
 	}
 	// Read the record again here, not at the top. A peer process can record a
 	// fault or a rejection while the two probes and the session build run. That
-	// record must survive this write. A peer record that
-	// lands between this read and the rename is lost, as in
-	// rejectLateOnAcceleratedProvider. That costs a delay: the next faults
-	// record it again.
+	// record must survive this write. A peer record that lands between this
+	// read and the rename is lost, as in rejectLateOnAcceleratedProvider. That
+	// costs a delay: the next faults record it again.
 	prior := readLateOnProviderRecord(verdictPath)
 	verdict, keep, reason := lateOnProbeVerdict(agree, difference, prior)
 	writeLateOnProviderVerdict(verdictPath, verdict)
 	// Release the probe's own garbage now. The index build samples free memory
-	// to size its inference concurrency, and it samples after this returns, so
-	// probe buffers still held would make that reading low and then rise under
-	// it. Two output batches plus one copy is about 9 MiB, against a probe that
-	// already cost a session build and two inferences.
+	// after this returns, to size its inference concurrency. Probe buffers
+	// still held would make that reading low, and the free memory would then
+	// rise under it. Two output batches plus one copy is about 9 MiB, against
+	// a probe that already cost a session build and two inferences.
 	runtime.GC()
 	return keep, reason, nil
 }
@@ -516,8 +517,8 @@ func verifyLateOnAcceleratedProvider(
 // keeps the count. Without the count, a provider that passes the probe batch
 // and fails on real work never gets a demotion. It also keeps the original
 // timestamp. A new timestamp would start the window again on every passing
-// probe, so the count would never expire and this host would probe on every
-// search. Agreement after a peer process rejected the provider keeps the
+// probe. The count would then never expire, and this host would probe on
+// every search. Agreement after a peer process rejected the provider keeps the
 // rejection, as rejectLateOnAcceleratedProvider does. That peer saw two faults
 // on real work or a probe that disagreed, and one passing probe clears
 // neither. Selection keeps the provider only when the record is not a

@@ -6,7 +6,7 @@ import (
 )
 
 // The coarse.snorm16 payload has no header or padding. It stores rows in row
-// order, then centroids and dimensions within each row. Each input vector must
+// order, then centroids and dimensions in each row. Each input vector must
 // have finite components in [-1, 1] and a squared norm within 0.001 of 1. Each
 // component is a little-endian int16 equal to
 // math.RoundToEven(float64(value) * 32767). Valid codes are -32767 through
@@ -26,8 +26,8 @@ const (
 
 type semanticSNORM16Vector [semanticEmbeddingDimensions]int16
 
-// semanticCoarseSNORM16Vectors is one row's stored coarse centroids. The
-// USearch shards are built from their decoded values, so a row that a build
+// semanticCoarseSNORM16Vectors is one row's stored coarse centroids. A build
+// makes the USearch shards from their decoded values. So a row that a build
 // copies gives the same shard input as a row that the model embeds.
 type semanticCoarseSNORM16Vectors [semanticCoarseCentroidsPerUnit]semanticSNORM16Vector
 

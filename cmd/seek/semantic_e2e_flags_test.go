@@ -15,7 +15,7 @@ import (
 )
 
 // e2eFlagQuery is a description of two words that no fixture file or file
-// name holds, so every result of it comes from vector search, unless a test
+// name holds. So every result of it comes from vector search, unless a test
 // writes a text file that holds both words. The flag tests run it with the
 // test model (hybridTestScorer), whose mode, not the text, accepts or rejects
 // every file. Thus they prove which files and lines the flags print, not which
@@ -82,10 +82,10 @@ func (file e2eFlagContextFile) span(first, last int) string {
 }
 
 // e2eFlagContextShapes returns the three file shapes of the context tests.
-// Each shape holds tag, the name of the file, so no two files have the same
-// content. The package unit starts on line 1, and each func starts a unit:
-// line 2 of 6 in "start", lines 7 and 14 of 16 in "mid", and line 7 of 7 in
-// "end".
+// Each shape holds tag, so files with different tags differ in content, and
+// the output prints none of them as a copy of another. The package unit starts
+// on line 1, and each func starts a unit. These are line 2 of 6 in "start",
+// lines 7 and 14 of 16 in "mid", and line 7 of 7 in "end".
 func e2eFlagContextShapes(tag string) map[string]e2eFlagContextFile {
 	return map[string]e2eFlagContextFile{
 		"start": {units: []int{1, 2}, lines: []string{
@@ -270,9 +270,9 @@ func TestE2EFlagNoBeforeContextFlag(t *testing.T) {
 // vector hits are in a folder node, and in a Git node's committed rows and
 // dirty overlay. The test also needs one text hit: a file with three lines
 // that hold both description words. The test model accepts every file. A
-// vector hit is one match: with -C 0 it prints one line, and each -m of 1 or
-// more prints its block as -m 0 does with the same context. -m cuts only the
-// text file to its first matches.
+// vector hit is one match. With -C 0 it prints one line. Each -m of 1 or more
+// prints its block as -m 0 does with the same context. -m cuts only the text
+// file to its first matches.
 func TestE2EFlagMaxMatchesKeepsEachVectorHit(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -361,8 +361,8 @@ func TestE2EFlagMaxMatchesKeepsEachVectorHit(t *testing.T) {
 
 // TestE2EFlagRootGivesLimitAndMaxMatchesToTheSearch checks that the root
 // command gives -n to the file limit and -m to the match limit of a one-word
-// search. Each of three files holds the word three times, ten lines apart, so
-// each file is a strict hit and no context line holds a match. The test model
+// search. Each of three files holds the word three times, ten lines apart. So
+// each file is a strict hit, and no context line holds a match. The test model
 // in its far mode adds no file by meaning, so only the strict hits print. The
 // expected counts and footers come from the fixture by hand.
 func TestE2EFlagRootGivesLimitAndMaxMatchesToTheSearch(t *testing.T) {
@@ -423,8 +423,9 @@ func TestE2EFlagRootGivesLimitAndMaxMatchesToTheSearch(t *testing.T) {
 // (tree/repo/committed.go). Two are in its dirty overlay: an untracked file
 // and a modified file. These files hold no description word. text holds the
 // content of tree/repo/text.go, or no file when it is empty. The tree has no
-// README, because the test model prints every file. It returns the tree.
-func e2eFlagTargetTree(t *testing.T, text string) string {
+// README, because the test model prints every file. It makes the tree the
+// working directory.
+func e2eFlagTargetTree(t *testing.T, text string) {
 	t.Helper()
 	f := newGraphFixture(t)
 	repo := f.GitRepo("tree/repo", "committed.go", "package p\n// committed\n")
@@ -438,7 +439,6 @@ func e2eFlagTargetTree(t *testing.T, text string) string {
 	writeFixtureFile(t, filepath.Join(repo, "modified.go"), "package p\n// work tree copy\n")
 	writeFixtureFile(t, filepath.Join(repo, "untracked.go"), "package p\n// untracked\n")
 	t.Chdir(f.path("tree"))
-	return f.path("tree")
 }
 
 // e2eFlagSemanticCachePaths returns the cache paths of meaning-based data and
@@ -579,8 +579,8 @@ func TestE2EFlagColorOfAVectorHit(t *testing.T) {
 // TestE2EFlagNoVectorResultExitsOneWithNoOutput runs the root command where
 // vector search finds no file to print. The files are in a folder node, and
 // in a Git node's committed rows and dirty overlay. The test model makes
-// every unit a candidate and rejects every file, and it scores every live
-// file: the model's verdict, not an empty candidate set, empties the output.
+// every unit a candidate, scores every live file, and rejects each one. So
+// the model's verdict, not an empty candidate set, empties the output.
 // The search prints nothing, ends with exit status 1, and reports no error.
 // This is also true with -n, -m and -C, on a cold and on a warm cache. The
 // test model cannot put a unit just outside the retrieval radius, so this
@@ -620,16 +620,16 @@ func TestE2EFlagNoVectorResultExitsOneWithNoOutput(t *testing.T) {
 
 // TestE2EFlagPathOperandsScopeVectorHits runs a description from inside a Git
 // repository with path operands. The operands are a subdirectory of the
-// repository (the path-operand scope, row T39 of querySupport), exact files,
-// and an external folder outside the Git worktree. They are also an exact
-// file there, Git and folder operands together, symlinked operands, and an
-// operand given twice. Every file holds the word zqopmark, and the test model
-// accepts every file. A one-word text search with the same operands is the
-// oracle: the vector results must have its header lines, with their
-// [uncommitted] tags, and the hand-made set of files. The model scores only
-// those files, so it never scores a file that the scope drops. The Git node
-// has committed, modified, untracked, deleted, and changed-away files. The
-// warm search embeds no unit.
+// repository (the querySupport row "path-operand scope"), exact files, and an
+// external folder outside the Git worktree. They are also an exact file there,
+// Git and folder operands together, symlinked operands, and an operand given
+// twice. Every file holds the word zqopmark, and the test model accepts every
+// file. A one-word text search with the same operands is the oracle. The
+// vector results must have its header lines, with their [uncommitted] tags,
+// and the hand-made set of files. The model scores only those files, so it
+// never scores a file that the scope drops. The Git node has committed,
+// modified, untracked, deleted, and changed-away files. The warm search embeds
+// no unit.
 //
 // An exact file outside Git is a folder node of one file. The README says
 // that every searched folder adds files by meaning. An exact file in Git

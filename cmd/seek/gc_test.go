@@ -50,6 +50,10 @@ func seedCorpus(tb testing.TB, cacheRoot, hash string, usedAt time.Time) string 
 	return dir
 }
 
+// cacheRootForTest gives the test a new user cache with the default GC
+// interval and a cache budget of 1P (setTestUserCache). It creates the cache
+// root and returns it. A test that needs a corpus over the budget sets a
+// smaller budget.
 func cacheRootForTest(tb testing.TB) string {
 	tb.Helper()
 	clearGCEnvForTest(tb)
@@ -69,9 +73,10 @@ func clearGCEnvForTest(tb testing.TB) {
 	tb.Setenv(envGCInterval, "")
 }
 
+// resetNFSCheck clears the NFS check that touchUsed does once per process, now
+// and when the test ends.
 func resetNFSCheck(tb testing.TB) {
 	tb.Helper()
-	// Reset the process-lifetime NFS-detection gate used by touchUsed.
 	nfsCheckOnce = sync.Once{}
 	nfsCached = false
 	tb.Cleanup(func() {
@@ -147,7 +152,7 @@ func TestGC_ThrottleGate_SkipsWhenStampFresh(t *testing.T) {
 	t.Setenv(envCacheBudget, "1")
 	dir := seedCorpus(t, root, fakeCorpusHash(1), time.Now().Add(-30*24*time.Hour))
 
-	// Fresh stamp (now) — should block GC.
+	// A fresh stamp (now) must block GC.
 	if err := os.WriteFile(filepath.Join(root, gcStampFile), nil, 0o644); err != nil {
 		t.Fatalf("write stamp: %v", err)
 	}
@@ -260,7 +265,7 @@ func TestGC_CrashRecovery_DrainsTrash(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(trashEntry, "index"), 0o755); err != nil {
 		t.Fatalf("seed trash: %v", err)
 	}
-	// Add a file to verify RemoveAll actually descends.
+	// The entry holds a file, so only a recursive removal drains it.
 	if err := os.WriteFile(filepath.Join(trashEntry, "marker"), []byte("x"), 0o644); err != nil {
 		t.Fatalf("seed trash marker: %v", err)
 	}
@@ -342,7 +347,7 @@ func TestGC_PerCorpusActive_SkipsLockedCorpus(t *testing.T) {
 	t.Setenv(envCacheBudget, "1")
 	dir := seedCorpus(t, root, fakeCorpusHash(9), time.Now().Add(-30*24*time.Hour))
 
-	// Externally hold the corpus .lock LOCK_EX.
+	// Hold the corpus .lock exclusive, as a publish does.
 	lockPath := filepath.Join(dir, lockFile)
 	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
@@ -369,8 +374,8 @@ func TestGC_TOCTOU_RefreshedUsedUnderLock_SkipsEvict(t *testing.T) {
 	// and before evictCorpus takes the corpus lock. evictCorpus reads .used
 	// again under the lock and must keep the corpus.
 	//
-	// An in-process race is hard to time, so the test calls evictCorpus
-	// directly with a corpusDirEntry that holds the old time while .used on
+	// An in-process race is hard to time. So the test calls evictCorpus
+	// directly with a corpusDirEntry that holds the old time, while .used on
 	// disk is fresh.
 	entry := corpusDirEntry{name: corpusID(hash), path: dir, usedAt: time.Now().Add(-30 * 24 * time.Hour)}
 	now := time.Now()
@@ -520,9 +525,9 @@ func TestGCCmd_All_BypassesThrottle(t *testing.T) {
 	requireRow(t, out, hash, "evicted")
 }
 
-// TestGCCmd_Force_PrintsLiveTable confirms the manual `seek gc --force` path
-// streams a banner + header + summary to stdout, and a row for the evicted
-// corpus.
+// TestGCCmd_Force_PrintsLiveTable checks that `seek gc --force` prints the
+// banner, the column header, a row for the evicted corpus, and the summary
+// line.
 func TestGCCmd_Force_PrintsLiveTable(t *testing.T) {
 	root := cacheRootForTest(t)
 	// Over the budget, so GC evicts every corpus that no search holds.
@@ -544,9 +549,9 @@ func TestGCCmd_Force_PrintsLiveTable(t *testing.T) {
 	requireRow(t, out, hash, "evicted")
 }
 
-// TestGCCmd_LiveTable_ShowsLockedAction confirms a corpus whose per-corpus
-// .lock is held by an indexer/searcher shows up in the live table with
-// ACTION=locked rather than being silently skipped.
+// TestGCCmd_LiveTable_ShowsLockedAction holds the .lock of a corpus, as a
+// publish does. The live table must show the corpus with the action "locked",
+// and not leave out its row.
 func TestGCCmd_LiveTable_ShowsLockedAction(t *testing.T) {
 	root := cacheRootForTest(t)
 	// Over the budget, so GC evicts every corpus that no search holds.
@@ -571,11 +576,10 @@ func TestGCCmd_LiveTable_ShowsLockedAction(t *testing.T) {
 	requireRow(t, out, hash, "locked")
 }
 
-// TestGCCmd_LiveTable_NoCorpora confirms a fresh cache with zero corpora
-// still prints the banner and a friendly "no corpora" line — not silence —
-// AND still stamps .last-gc. After the banner the live path goes on to
-// touchStamp; an early return, as in the dry-run caller (reportGCPlan), would
-// skip the stamp and run GC again at every search.
+// TestGCCmd_LiveTable_NoCorpora runs `seek gc --force` on a cache with no
+// corpus. The output has the banner and the "no corpora" line, and the run
+// writes .last-gc. reportGCPlan returns after the banner. A live run that did
+// the same would skip the stamp, and GC would run again at every search.
 func TestGCCmd_LiveTable_NoCorpora(t *testing.T) {
 	root := cacheRootForTest(t)
 	out := runGCCapture(t, "--force")
@@ -590,9 +594,9 @@ func TestGCCmd_LiveTable_NoCorpora(t *testing.T) {
 	}
 }
 
-// TestGCCmd_OpportunisticPath_StaysSilent guards the contract that the
-// post-search opportunistic GC (invoked by main) never writes to stdout —
-// only the manual `seek gc` path does.
+// TestGCCmd_OpportunisticPath_StaysSilent checks that the GC that main runs
+// after a search (runOpportunisticGC) writes nothing to stdout. Only
+// `seek gc` prints.
 func TestGCCmd_OpportunisticPath_StaysSilent(t *testing.T) {
 	root := cacheRootForTest(t)
 	seedCorpus(t, root, fakeCorpusHash(42), time.Now().Add(-30*24*time.Hour))
@@ -628,12 +632,11 @@ func TestGCCmd_LockContention_PrintsSkipMessage(t *testing.T) {
 	}
 }
 
-// TestGCCmd_CtxCanceled_SummaryUsesRenderedCount confirms a pre-canceled
-// context breaks the loop before it evicts or measures a row. Asserts both the
-// observable side effect (all stale corpus dirs survive on disk — the
-// strong behavior contract) and that the summary line does not claim work
-// that did not happen: it counts the rendered rows (gcTableStats.rendered),
-// not len(entries), and with no row it is omitted.
+// TestGCCmd_CtxCanceled_SummaryUsesRenderedCount runs `seek gc --force` with a
+// context canceled before the call. The loop must stop before it evicts or
+// measures a row, so every corpus stays on disk. The summary counts the
+// printed rows (gcTableStats.rendered), not the corpora found. With no row,
+// the summary line is not printed.
 func TestGCCmd_CtxCanceled_SummaryUsesRenderedCount(t *testing.T) {
 	root := cacheRootForTest(t)
 	// Over the budget, so an uncanceled run evicts every corpus.
@@ -651,13 +654,13 @@ func TestGCCmd_CtxCanceled_SummaryUsesRenderedCount(t *testing.T) {
 		}
 	})
 
-	// Strong contract: stale corpora must survive when ctx pre-canceled.
+	// No corpus is evicted.
 	for i, dir := range dirs {
 		if _, err := os.Stat(dir); err != nil {
 			t.Fatalf("ctx pre-cancel should have prevented eviction of corpus %d: %v", i, err)
 		}
 	}
-	// Regression guard on the summary line wording.
+	// The summary does not count corpora that the loop did not reach.
 	if strings.Contains(out, "5 corpora") {
 		t.Fatalf("summary must not name unprocessed corpora; got:\n%s", out)
 	}
@@ -760,37 +763,31 @@ func TestRace_ConcurrentGCInvocations(t *testing.T) {
 	}
 }
 
-// TestRace_GCDuringIndexing holds the corpus .lock as an indexer does: a GC
-// over the budget must keep the corpus.
-func TestRace_GCDuringIndexing(t *testing.T) {
+// TestGC_SearchReadLock_SkipsCorpus holds the shared lock on the corpus .lock,
+// as a search does while it reads shards (acquireReadLock). A GC over the
+// budget must keep the corpus. TestGC_PerCorpusActive_SkipsLockedCorpus holds
+// the exclusive lock of a publish, so it passes when GC takes a shared lock in
+// place of the exclusive one. This test then fails.
+func TestGC_SearchReadLock_SkipsCorpus(t *testing.T) {
 	root := cacheRootForTest(t)
 	// Over the budget, so the GC would evict the corpus unless the guard
 	// under test holds it.
 	t.Setenv(envCacheBudget, "1")
-	hash := fakeCorpusHash(200)
-	dir := seedCorpus(t, root, hash, time.Now().Add(-30*24*time.Hour))
+	dir := seedCorpus(t, root, fakeCorpusHash(200), time.Now().Add(-30*24*time.Hour))
 
-	// Simulated indexer holds LOCK_EX.
-	lockPath := filepath.Join(dir, lockFile)
-	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	reader, err := os.OpenFile(filepath.Join(dir, lockFile), os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		t.Fatalf("open lock: %v", err)
 	}
-	defer func() { unlockFile(holder); _ = holder.Close() }()
-	if err := lockFileExclusive(holder); err != nil {
-		t.Fatalf("hold lock: %v", err)
+	defer func() { unlockFile(reader); _ = reader.Close() }()
+	if err := acquireReadLock(t.Context(), reader); err != nil {
+		t.Fatalf("hold the read lock: %v", err)
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		runGC(context.Background(), gcOptions{skipThrottle: true})
-	}()
-	wg.Wait()
+	runGC(context.Background(), gcOptions{skipThrottle: true})
 
 	if _, err := os.Stat(dir); err != nil {
-		t.Fatalf("corpus must survive while indexer holds lock: %v", err)
+		t.Fatalf("GC evicted a corpus that a search reads: %v", err)
 	}
 }
 
@@ -836,9 +833,8 @@ func TestGC_DisplayName_EmptyCorpus(t *testing.T) {
 	}
 }
 
-// TestGC_DisplayName_ReadsRepositorySourceFromShard exercises the real zoekt
-// metadata read against a corpus built by the production indexer. Confirms
-// the data is already on disk — no new schema required.
+// TestGC_DisplayName_ReadsRepositorySourceFromShard builds a corpus with the
+// production indexer and reads Repository.Source back from its shard.
 func TestGC_DisplayName_ReadsRepositorySourceFromShard(t *testing.T) {
 	requireTools(t)
 	resetNFSCheck(t)
@@ -865,10 +861,10 @@ func TestGC_DisplayName_ReadsRepositorySourceFromShard(t *testing.T) {
 	}
 }
 
-// TestGC_PickDisplayShard covers the picker's filename-prefix semantics.
-// Substring "uncommitted" inside a real repo name (e.g.
-// github.com/foo/uncommitted-tool) must not cause skipping; only the exact
-// zoekt-generated `uncommitted_v<format>.<seq>.zoekt` filename qualifies.
+// TestGC_PickDisplayShard checks that pickDisplayShard skips only a shard
+// whose file name starts with `uncommitted_v` (isUncommittedShard). A
+// repository name that contains "uncommitted", such as
+// github.com/foo/uncommitted-tool, must not make it skip that shard.
 func TestGC_PickDisplayShard(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -910,12 +906,9 @@ func TestGC_PickDisplayShard(t *testing.T) {
 			want: "/c/index/github.com%2Ffoo%2Fbar_v17.00000.zoekt",
 		},
 		{
-			// Distinguishes HasPrefix from a buggy substring match:
-			// substring would skip BOTH (uncommitted_… AND
-			// github.com%2F…%2Funcommitted-tool_…) and fall back to
-			// shards[0] = uncommitted_…, displaying the wrong path.
-			// HasPrefix correctly skips only the real uncommitted_
-			// filename and returns the substring-containing real repo.
+			// A substring match skips both shards and falls back to
+			// shards[0], the uncommitted shard. The prefix match skips
+			// only the uncommitted shard.
 			name: "uncommitted first + real has 'uncommitted' substring — picker must return real",
 			shards: []string{
 				"/c/index/uncommitted_v17.00000.zoekt",
@@ -932,8 +925,8 @@ func TestGC_PickDisplayShard(t *testing.T) {
 	}
 }
 
-// TestGC_DisplayName_GoneFlag tests the [gone] detection: build a corpus,
-// rm -rf the source, confirm gone=true. Source path still returned.
+// TestGC_DisplayName_GoneFlag builds a corpus and removes its source folder.
+// readCorpusDisplayInfo must then set gone and keep the source path.
 func TestGC_DisplayName_GoneFlag(t *testing.T) {
 	requireTools(t)
 	resetNFSCheck(t)
@@ -965,7 +958,8 @@ func TestGC_DisplayName_GoneFlag(t *testing.T) {
 	}
 }
 
-// TestGC_FormatRoot covers the column-width truncation + special markers.
+// TestGC_FormatRoot checks the ROOT cell: the [empty] and [gone] markers, and
+// the cut of a long path to the column width.
 func TestGC_FormatRoot(t *testing.T) {
 	cases := []struct {
 		info  corpusDisplayInfo
@@ -990,10 +984,9 @@ func TestGC_FormatRoot(t *testing.T) {
 	}
 }
 
-// TestGC_FireOpportunisticGC_FastReturn confirms the orchestration doesn't
-// wait the full timeout when the GC function returns quickly. If someone
-// removes the done select arm, the caller would block until the deadline
-// fires every time.
+// TestGC_FireOpportunisticGC_FastReturn checks that fireOpportunisticGC
+// returns when runFn returns, not at the timeout. Without the done case of the
+// select, each call would wait until the deadline.
 func TestGC_FireOpportunisticGC_FastReturn(t *testing.T) {
 	var called atomic.Int32
 	runFn := func(_ context.Context) {
@@ -1011,15 +1004,16 @@ func TestGC_FireOpportunisticGC_FastReturn(t *testing.T) {
 	}
 }
 
-// TestGC_FireOpportunisticGC_TimeoutBoundsHang ensures a runaway GC cannot
-// hold the caller indefinitely. If the select-on-ctx-Done arm is removed,
-// this test hangs forever (caught by `go test -timeout`).
+// TestGC_FireOpportunisticGC_TimeoutBoundsHang gives a runFn that does not
+// return: fireOpportunisticGC must return at the timeout. Without the ctx.Done
+// case of the select, every goroutine of the synctest bubble blocks, and
+// synctest.Test fails at once with a deadlock.
 func TestGC_FireOpportunisticGC_TimeoutBoundsHang(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		released := make(chan struct{})
 		defer close(released)
 		runFn := func(_ context.Context) {
-			<-released // simulate hang; runs in goroutine, freed at test end
+			<-released // The deferred close frees it when the test ends.
 		}
 		start := time.Now()
 		fireOpportunisticGC(runFn, 100*time.Millisecond)
@@ -1029,10 +1023,9 @@ func TestGC_FireOpportunisticGC_TimeoutBoundsHang(t *testing.T) {
 	})
 }
 
-// TestGC_FireOpportunisticGC_PassesContextWithDeadline confirms the runFn
-// receives a context whose deadline matches the requested timeout. Without
-// this, the runFn would believe it has unbounded time and any inner
-// ctx.Err() checks would never fire.
+// TestGC_FireOpportunisticGC_PassesContextWithDeadline checks that runFn gets
+// a context whose deadline is the timeout. Without a deadline, the ctx.Err()
+// checks in runGC never stop a GC that runs too long.
 func TestGC_FireOpportunisticGC_PassesContextWithDeadline(t *testing.T) {
 	var observedDeadlineSet atomic.Bool
 	var observedRemaining atomic.Int64
@@ -1049,14 +1042,14 @@ func TestGC_FireOpportunisticGC_PassesContextWithDeadline(t *testing.T) {
 	}
 	rem := time.Duration(observedRemaining.Load())
 	if rem != 200*time.Millisecond {
-		t.Fatalf("deadline remaining out of bounds: %v", rem)
+		t.Fatalf("deadline in %v of fake time, want 200ms", rem)
 	}
 }
 
-// TestGC_RunGC_CtxCanceledBreaksLoop verifies the eviction loop honors
-// ctx.Err() and exits early. Without this check, an opportunistic GC whose
-// context ends would still try to evict every planned corpus and run past
-// its 5 s budget (gcRunTimeout).
+// TestGC_RunGC_CtxCanceledBreaksLoop checks that the eviction loop stops when
+// its context ends. Without this check, an opportunistic GC whose context ends
+// would still evict every planned corpus and run past its 5 s limit
+// (gcRunTimeout).
 func TestGC_RunGC_CtxCanceledBreaksLoop(t *testing.T) {
 	resetNFSCheck(t)
 	root := cacheRootForTest(t)
@@ -1078,8 +1071,8 @@ func TestGC_RunGC_CtxCanceledBreaksLoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enumerate: %v", err)
 	}
-	if len(entries) < 50 {
-		t.Fatalf("ctx-canceled GC should leave most corpora intact; have %d / 50", len(entries))
+	if len(entries) != 50 {
+		t.Fatalf("a canceled GC evicted %d of 50 corpora, want none", 50-len(entries))
 	}
 }
 
@@ -1112,8 +1105,8 @@ func TestGC_FireOpportunisticGC_Composition(t *testing.T) {
 }
 
 // TestGC_FireOpportunisticGC_ZeroTimeout gives a timeout of 0: the context
-// ends at once, and fireOpportunisticGC must return within 200 ms. runFn can
-// fail to run; when it runs, it must not panic.
+// ends at once, and fireOpportunisticGC must return with no fake time passed.
+// runFn can run after the call returns; the bubble waits for it.
 func TestGC_FireOpportunisticGC_ZeroTimeout(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		start := time.Now()
@@ -1137,7 +1130,8 @@ func TestGC_FireOpportunisticGC_RunFnReturnsAfterTimeout(t *testing.T) {
 		completed := make(chan struct{})
 		start := time.Now()
 		fireOpportunisticGC(func(_ context.Context) {
-			// runFn ends only when the test releases it, after the call returns.
+			// runFn ends only when the test releases it, after the call
+			// returns.
 			<-release
 			close(completed)
 		}, 50*time.Millisecond)
@@ -1151,13 +1145,20 @@ func TestGC_FireOpportunisticGC_RunFnReturnsAfterTimeout(t *testing.T) {
 
 // TestGC_FireOpportunisticGC_Sequential calls fireOpportunisticGC five times
 // in a row: no state of one call (context, channel, goroutine) stops the next,
-// so runFn runs five times.
+// so runFn runs five times. The synctest bubble moves time only when every
+// goroutine blocks, so a slow scheduler cannot fire the timeout first.
 func TestGC_FireOpportunisticGC_Sequential(t *testing.T) {
 	var ran atomic.Int32
 	runFn := func(_ context.Context) { ran.Add(1) }
-	for i := 0; i < 5; i++ {
-		fireOpportunisticGC(runFn, 200*time.Millisecond)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		for i := 0; i < 5; i++ {
+			start := time.Now()
+			fireOpportunisticGC(runFn, 200*time.Millisecond)
+			if elapsed := time.Since(start); elapsed != 0 {
+				t.Fatalf("call %d took %v of fake time, want none", i+1, elapsed)
+			}
+		}
+	})
 	if ran.Load() != 5 {
 		t.Fatalf("want 5 runs, got %d", ran.Load())
 	}
@@ -1184,11 +1185,9 @@ func TestGC_FireOpportunisticGC_RunFnReadsCtxMidExecution(t *testing.T) {
 // panic.
 func TestGC_RunGC_CtxCanceledEmptyCorpora(t *testing.T) {
 	resetNFSCheck(t)
-	root := cacheRootForTest(t)
-	_ = root
+	cacheRootForTest(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	// Must complete without panic; nothing to evict.
 	runGC(ctx, gcOptions{skipThrottle: true})
 }
 
@@ -1209,11 +1208,11 @@ func TestGC_RunGC_CtxCancelMidLoop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Cancel on the FIRST eviction that the poll sees, not on a timer. GC
+	// Cancel on the first eviction that the poll sees, not on a timer. GC
 	// setup on a loaded runner (lock, drainTrash, enumerate) can use up a
 	// fixed delay, so a timer can fire before any eviction. The poll reads
-	// the corpora count again and again, so it sees the count drop below the
-	// seeded total long before a full sweep of 100 evictions ends.
+	// the corpora count again and again. So it sees the count drop below the
+	// seeded total before the sweep of 100 evictions ends.
 	done := make(chan struct{})
 	go func() {
 		runGC(ctx, gcOptions{skipThrottle: true})
@@ -1237,8 +1236,8 @@ poll:
 	if err != nil {
 		t.Fatalf("enumerate: %v", err)
 	}
-	// All seeded corpora are over the budget, so an uncancelled run evicts
-	// everything; cancelling on the first eviction must spare the remainder.
+	// All seeded corpora are over the budget, so a run that is not canceled
+	// evicts all of them. A cancel at the first eviction must keep the rest.
 	if len(entries) == 0 {
 		t.Fatalf("mid-loop cancel should leave some corpora intact; all evicted")
 	}
@@ -1247,11 +1246,11 @@ poll:
 	}
 }
 
-// TestGC_Integration_DryRunShowsRealPath wires reportGCPlan against a real
-// corpus and asserts the recovered Repository.Source appears in the output.
-// Without this, a mutation that replaces formatRoot(readCorpusDisplayInfo(...))
-// with truncateHash(e.name) (regressing to hash-only display) would silently
-// pass every other test in the file.
+// TestGC_Integration_DryRunShowsRealPath builds a real corpus with a search,
+// then runs `seek gc --dry-run`. The ROOT column must show the repository path
+// from the shard, not [empty]. The display-name tests above call
+// readCorpusDisplayInfo directly; only this test checks that the table prints
+// it.
 func TestGC_Integration_DryRunShowsRealPath(t *testing.T) {
 	requireTools(t)
 	resetNFSCheck(t)
@@ -1277,10 +1276,9 @@ func TestGC_Integration_DryRunShowsRealPath(t *testing.T) {
 	}
 }
 
-// TestGC_IsOnNFS_LocalTempDir_ReturnsFalse exercises the real isOnNFS
-// function. Without this, a regression that makes isOnNFS always return true
-// (silently disabling GC everywhere) would be invisible to the rest of the
-// test suite — every other NFS-related test pokes the cached nfsCached bool.
+// TestGC_IsOnNFS_LocalTempDir_ReturnsFalse checks that isOnNFS reports a local
+// temporary folder as local. A true result turns off GC and the .used marker;
+// the eviction tests then fail too, but this test names the cause.
 func TestGC_IsOnNFS_LocalTempDir_ReturnsFalse(t *testing.T) {
 	tmp := t.TempDir()
 	if isOnNFS(tmp) {
@@ -1288,10 +1286,10 @@ func TestGC_IsOnNFS_LocalTempDir_ReturnsFalse(t *testing.T) {
 	}
 }
 
-// TestGC_IsCorpusHashName_AcceptsProductionHash couples the enumerator's
-// filter to the real corpus-ID generator. If newCorpusID ever changes its
-// output shape (length, charset), enumerateCorpusDirs would silently filter
-// every real corpus and GC would no-op. This test breaks loudly instead.
+// TestGC_IsCorpusHashName_AcceptsProductionHash checks that isCorpusHashName
+// accepts an id from newCorpusID. If the two disagree on the length or the
+// characters, enumerateCorpusDirs skips every real corpus and GC removes
+// nothing.
 func TestGC_IsCorpusHashName_AcceptsProductionHash(t *testing.T) {
 	id := string(newCorpusID("kind", "git", "root", "/x", "extra", "y"))
 	if !isCorpusHashName(id) {
@@ -1301,9 +1299,9 @@ func TestGC_IsCorpusHashName_AcceptsProductionHash(t *testing.T) {
 
 // TestGC_Integration_PrepareAndSearchTouchesUsed checks that a warm search
 // marks its corpus as used. The first search builds, and the build also
-// touches .used, so the test ages .used and searches again: that search
-// builds nothing, and only the touch of the search path (strictNode) can
-// make .used fresh.
+// touches .used. So the test ages .used and searches again. That search
+// builds nothing, and only the touch of the search path (strictNode) can make
+// .used fresh.
 func TestGC_Integration_PrepareAndSearchTouchesUsed(t *testing.T) {
 	requireTools(t)
 	resetNFSCheck(t)
@@ -1333,70 +1331,39 @@ func TestGC_Integration_PrepareAndSearchTouchesUsed(t *testing.T) {
 	}
 }
 
-// TestGC_Integration_RunFlowEvictsStale runs a real search through the root command,
-// then triggers GC through the same env-driven entry point used by main().
-// Verifies: (1) the real search path touches .used so its corpus survives,
-// (2) an alongside-seeded stale corpus is evicted by the env-configured GC.
-// Couples the production code path end-to-end: search → touchUsed →
-// runOpportunisticGC → evictCorpus.
+// TestGC_Integration_RunFlowEvictsStale runs searches as CLI processes, so
+// main runs the automatic GC after each search, as for a user. A first search
+// builds the corpus with a 1P budget. Then the cache gets a stale 1 MiB
+// corpus. A warm search reads a GC interval of 0s and a 512K budget from its
+// environment. It publishes nothing, so its budget check (enforceCacheBudget)
+// evicts nothing. Only the GC of main can evict the stale corpus to fit the
+// budget, and it must keep the corpus that the search used. main waits for
+// the GC (fireOpportunisticGC), so the cache is final when the process exits.
 func TestGC_Integration_RunFlowEvictsStale(t *testing.T) {
 	requireTools(t)
-	resetNFSCheck(t)
-
 	repoDir := initGitRepo(t, "app.go", "package main\n// e2e_marker\n")
-	t.Chdir(repoDir)
-	ensureTestUserCache(t)
-
-	// Force GC to run on every invocation; the budget holds the real corpus
-	// but not the 1 MiB fake one.
-	t.Setenv(envGCInterval, "0s")
-	t.Setenv(envCacheBudget, "512K")
-
-	// Seed a stale fake corpus alongside the real one. Its hash shape
-	// matches what newCorpusID produces.
-	cacheRoot, err := seekUserCacheRoot()
-	if err != nil {
-		t.Fatalf("seekUserCacheRoot: %v", err)
+	cacheRoot := t.TempDir()
+	search := func(env ...string) {
+		t.Helper()
+		result := runCLIProcessWithCache(t, cacheRoot, repoDir, []string{"--lexical-only", "e2e_marker"}, env)
+		if result.code != 0 || !strings.Contains(result.stdout, "e2e_marker") {
+			t.Fatalf("search: code=%d stdout=%q stderr=%q", result.code, result.stdout, result.stderr)
+		}
 	}
-	if err := os.MkdirAll(cacheRoot, 0o755); err != nil {
-		t.Fatalf("mkdir cache root: %v", err)
-	}
-	staleHash := string(newCorpusID("stale", "fake"))
-	staleDir := seedCorpus(t, cacheRoot, staleHash, time.Now().Add(-2*time.Hour))
-
-	// Execute the real search flow.
-	if _, err := runSeekInRepo(t, repoDir, "e2e_marker"); err != nil {
-		t.Fatalf("runSeekInRepo: %v", err)
-	}
-
-	// Real corpus' .used must exist (proof that touchUsed wiring fired).
-	plan, err := planGitCorpus(mustResolveGitPaths(t, repoDir), nil)
-	if err != nil {
-		t.Fatalf("planGitCorpus: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(plan.cacheDir, usedFile)); err != nil {
-		t.Fatalf("real corpus .used missing after the search: %v", err)
-	}
-
-	// The root command does not fire opportunistic GC inline — main() does. Test the
-	// env-driven entry point that main wraps.
-	runOpportunisticGC(context.Background())
-
+	search(envCacheBudget + "=1P")
+	staleDir := seedCorpus(t, cacheRoot, string(newCorpusID("stale", "fake")), time.Now().Add(-2*time.Hour))
+	// An interval of 0s lets GC run at every call. The budget holds the
+	// searched corpus but not the 1 MiB stale one.
+	search(envGCInterval+"=0s", envCacheBudget+"=512K")
 	if _, err := os.Stat(staleDir); !os.IsNotExist(err) {
-		t.Fatalf("stale corpus must be evicted by runOpportunisticGC: err=%v", err)
+		t.Fatalf("the GC after the search kept the stale corpus: err=%v", err)
 	}
-	if _, err := os.Stat(plan.cacheDir); err != nil {
-		t.Fatalf("real corpus must survive (recently used): %v", err)
+	// The stale corpus is gone, so the one .used marker left is the marker
+	// that the search wrote in its own corpus.
+	used := cachePathsMatching(t, cacheRoot, func(name string) bool { return name == usedFile })
+	if len(used) != 1 || filepath.Dir(filepath.Dir(used[0])) != corporaDir {
+		t.Fatalf("corpus .used markers %v, want only the marker of the searched corpus", used)
 	}
-}
-
-func mustResolveGitPaths(t *testing.T, dir string) gitPaths {
-	t.Helper()
-	paths, err := resolveGitPaths(context.Background(), dir)
-	if err != nil {
-		t.Fatalf("resolveGitPaths: %v", err)
-	}
-	return paths
 }
 
 // TestRace_TrashDrainConcurrent puts 100 entries in the trash and runs 5 GCs at
@@ -1551,9 +1518,10 @@ func TestGCDryRunReportsProviderArtifacts(t *testing.T) {
 }
 
 func TestRunGCCollectsCompiledModelsAndRuntimes(t *testing.T) {
-	// The helpers are tested directly elsewhere; this proves runGC calls both
-	// sweeps with the 14-day bound: an item of 15 days goes and one of 13 days
-	// stays, so a call site that is removed or has another bound fails.
+	// Other tests check the helpers directly. This test proves that runGC
+	// calls both sweeps with the 14-day bound. An item of 15 days goes and one
+	// of 13 days stays, so a call site that is removed or has another bound
+	// fails.
 	cacheRoot := t.TempDir()
 	t.Setenv("SEEK_CACHE_DIR", cacheRoot)
 	aged := plantProviderArtifact(t, cacheRoot, "22222222222222222222222222222222", 15*24*time.Hour)
@@ -1603,9 +1571,9 @@ func TestSweepSkipsAModelAnotherSearchJustUsed(t *testing.T) {
 }
 
 func TestGCDryRunListsCompiledModelsAndRuntimes(t *testing.T) {
-	// The plans are tested directly elsewhere; this proves the dry-run command
-	// calls both with the 14-day bound (an item of 15 days is listed, one of 13
-	// days is not) and removes nothing.
+	// Other tests check the plans directly. This test proves that the dry-run
+	// command calls both with the 14-day bound and removes nothing. It lists
+	// an item of 15 days, and not one of 13 days.
 	cacheRoot := t.TempDir()
 	t.Setenv("SEEK_CACHE_DIR", cacheRoot)
 	aged := plantProviderArtifact(t, cacheRoot, "44444444444444444444444444444444", 15*24*time.Hour)
@@ -1635,8 +1603,8 @@ func TestGCDryRunListsCompiledModelsAndRuntimes(t *testing.T) {
 }
 
 // TestGCAllRemovesCompiledModelsAndOtherVersionsRuntimes plans and runs gc
-// --all: a compiled model that a search used one day ago and a runtime of
-// another version that is one day old go too.
+// --all: a compiled model and a runtime of another version, both one day old,
+// go too.
 func TestGCAllRemovesCompiledModelsAndOtherVersionsRuntimes(t *testing.T) {
 	cacheRoot := t.TempDir()
 	t.Setenv("SEEK_CACHE_DIR", cacheRoot)
@@ -1744,8 +1712,9 @@ func plantProviderArtifact(tb testing.TB, cacheRoot, key string, age time.Durati
 }
 
 // TestOrphanManifestTmpNames checks the temp names that the orphan sweep
-// removes: the fixed .tmp name of the family manifest, and the temp files of
-// writeSharedCacheFile (.bm25-v2, .size). The records and .state stay.
+// removes. They are the fixed .tmp name of the family manifest and the temp
+// files of writeSharedCacheFile (.bm25-v2, .size). The records and .state
+// stay.
 func TestOrphanManifestTmpNames(t *testing.T) {
 	for name, want := range map[string]bool{
 		familyManifestFile + ".tmp":           true,
@@ -1762,8 +1731,8 @@ func TestOrphanManifestTmpNames(t *testing.T) {
 }
 
 // TestSweepCorpusOrphansRemovesOldSharedTmpFiles runs the orphan sweep on a
-// corpus that holds the temp files of killed writers: the files older than one
-// hour go; a fresh temp file and the records stay.
+// corpus that holds the temp files of killed writers. The files older than
+// one hour go. A fresh temp file and the records stay.
 func TestSweepCorpusOrphansRemovesOldSharedTmpFiles(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()

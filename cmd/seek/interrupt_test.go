@@ -95,8 +95,8 @@ func TestWatchInterruptsEndsWaitsThenTheCommand(t *testing.T) {
 
 // TestCLIProcess_InterruptWithOnlyAWaitingNodeIsACancel searches one cold
 // folder whose build lock another process holds. The interrupt ends the
-// wait, and no node gave an answer: the command ends as cancelled (exit 2),
-// not as a search with no result (exit 1).
+// wait, and no node gives an answer. So the command ends as canceled (exit
+// 2), not as a search with no result (exit 1).
 func TestCLIProcess_InterruptWithOnlyAWaitingNodeIsACancel(t *testing.T) {
 	requireTools(t)
 	cache := t.TempDir()
@@ -125,9 +125,9 @@ func TestCLIProcess_InterruptWithOnlyAWaitingNodeIsACancel(t *testing.T) {
 	}
 }
 
-// interruptAtLockWait runs the CLI with args, sends one SIGINT when it logs a
-// wait for the build lock at lock, and returns the exit code and output. A
-// CLI that ends with no such wait fails the test.
+// interruptAtLockWait runs the CLI with args and sends one SIGINT when it logs
+// a wait for the build lock at lock. It returns the exit code and the output.
+// A CLI that ends with no such wait fails the test.
 func interruptAtLockWait(t *testing.T, cache, lock string, args ...string) (int, string, string) {
 	t.Helper()
 	result, waited := runCLIProcessOnLine(t, cache, t.TempDir(), args, lockWaitLine(lockWaitBuild, lock), func(process *os.Process) {
@@ -142,8 +142,8 @@ func interruptAtLockWait(t *testing.T, cache, lock string, args ...string) (int,
 }
 
 // TestLockWaitsEndOnlyTheRunningWaits ends the waits of a command while one
-// wait runs: that wait ends, and a wait that starts later, such as the
-// publish of a build that was running, waits until its lock is free.
+// wait runs. That wait ends. A wait that starts later, such as the publish of
+// a build that was running, waits until its lock is free.
 func TestLockWaitsEndOnlyTheRunningWaits(t *testing.T) {
 	waits := newLockWaits()
 	running := waits.start()
@@ -169,9 +169,9 @@ func TestLockWaitsEndOnlyTheRunningWaits(t *testing.T) {
 	}
 }
 
-// TestLockWaitIsCountedBeforeItsLogLine checks that a wait is counted when
-// its debug line is written, so an interrupt that a reader of the line sends
-// ends the wait.
+// TestLockWaitIsCountedBeforeItsLogLine checks that a wait counts when its
+// debug line is written. So an interrupt that a reader of the line sends ends
+// the wait.
 func TestLockWaitIsCountedBeforeItsLogLine(t *testing.T) {
 	waits := newLockWaits()
 	canceled, cancel := context.WithCancel(t.Context())

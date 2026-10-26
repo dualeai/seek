@@ -8,14 +8,15 @@ import (
 	"testing"
 )
 
-// TestCommittedShards_FromAnotherCommitAreNotServed reproduces the state a
-// crash leaves between the shard swap and the receipt writes: the index holds
-// one commit's shards while every receipt still names the previous commit.
+// TestCommittedShards_FromAnotherCommitAreNotServed makes the state that a
+// crash leaves between the shard swap and the writes of the state files. The
+// index holds the shards of one commit. Every state file still names the
+// commit before it.
 //
-// Nothing in the cache is invented here. The shards and the manifest come from
-// a real build at the second commit; the receipts come from a real build at the
-// first. Seek must notice that the shards hold another commit and rebuild,
-// rather than answer from them.
+// The test invents nothing in the cache. The shards and the manifest come
+// from a real build at the second commit; the state files come from a real
+// build at the first. Seek must see that the shards hold another commit and
+// rebuild, and not answer from them.
 func TestCommittedShards_FromAnotherCommitAreNotServed(t *testing.T) {
 	requireTools(t)
 
@@ -28,7 +29,7 @@ func TestCommittedShards_FromAnotherCommitAreNotServed(t *testing.T) {
 		t.Fatalf("build at the first commit: files=%v err=%v", files, err)
 	}
 	first := mustGitRepoStateIn(t, ctx, dir)
-	receipts := saveReceipts(t, plan.cacheDir)
+	stateFiles := saveStateFiles(t, plan.cacheDir)
 
 	// Second commit, and a real build of it.
 	if err := os.WriteFile(
@@ -44,10 +45,10 @@ func TestCommittedShards_FromAnotherCommitAreNotServed(t *testing.T) {
 		t.Fatalf("build at the second commit: files=%v err=%v", files, err)
 	}
 
-	// Put the working tree back on the first commit and restore its receipts,
-	// leaving the second commit's shards and manifest in place.
+	// Put the working tree back on the first commit and restore its state
+	// files. The shards and the manifest of the second commit stay.
 	gitRunIn(t, dir, "reset", "--hard", first.HeadSHA)
-	restoreReceipts(t, plan.cacheDir, receipts)
+	restoreStateFiles(t, plan.cacheDir, stateFiles)
 
 	onDisk, err := os.ReadFile(filepath.Join(dir, file))
 	if err != nil {
@@ -59,7 +60,7 @@ func TestCommittedShards_FromAnotherCommitAreNotServed(t *testing.T) {
 
 	files, err := runSeekInPlannedGitCorpus(ctx, "gamma", paths, plan)
 	if err != nil {
-		t.Fatalf("search after the restored receipts: %v", err)
+		t.Fatalf("search after the restored state files: %v", err)
 	}
 	if len(files) != 0 {
 		t.Fatalf("served content from another commit: %v", files)
@@ -70,11 +71,11 @@ func TestCommittedShards_FromAnotherCommitAreNotServed(t *testing.T) {
 	}
 }
 
-// saveReceipts copies every receipt file at the top level of a corpus
-// directory. It enumerates what the build wrote rather than naming the files,
-// so this test keeps describing a whole crash state when the set of receipts
-// changes. The index directory is a subdirectory and is not touched.
-func saveReceipts(tb testing.TB, cacheDir string) map[string][]byte {
+// saveStateFiles copies every file at the top level of a corpus directory. It
+// lists what the build wrote and does not name the files. So the test keeps a
+// whole crash state when the set of state files changes. It does not copy the
+// index directory, a subdirectory.
+func saveStateFiles(tb testing.TB, cacheDir string) map[string][]byte {
 	tb.Helper()
 	entries, err := os.ReadDir(cacheDir)
 	if err != nil {
@@ -92,14 +93,15 @@ func saveReceipts(tb testing.TB, cacheDir string) map[string][]byte {
 		saved[entry.Name()] = data
 	}
 	if len(saved) == 0 {
-		tb.Fatal("the first build wrote no receipts")
+		tb.Fatal("the first build wrote no state files")
 	}
 	return saved
 }
 
-// restoreReceipts puts the saved receipts back and removes any that appeared
-// after the snapshot, so the corpus directory matches the moment it was taken.
-func restoreReceipts(tb testing.TB, cacheDir string, saved map[string][]byte) {
+// restoreStateFiles puts the saved state files back. It removes each
+// top-level file that the save did not hold, so the corpus directory has the
+// state files of the save.
+func restoreStateFiles(tb testing.TB, cacheDir string, saved map[string][]byte) {
 	tb.Helper()
 	entries, err := os.ReadDir(cacheDir)
 	if err != nil {

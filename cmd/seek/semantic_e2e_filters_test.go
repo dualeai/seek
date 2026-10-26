@@ -19,9 +19,9 @@ import (
 // (payloadAccept), so a description prints every live file that its filters
 // keep. The tests prove the filters, the routes and the text that the model
 // reads; they prove nothing about meaning, tau, the retrieval radius or rank.
-// The oracle of a filter is the one-word text search "zqmark <filter>" with
-// --lexical-only (Zoekt's own rule), and a file set worked out by hand from
-// the fixture.
+// A filter has two oracles. One is the text search "zqmark <filter>" with
+// --lexical-only, which applies Zoekt's own rule. The other is a file set
+// worked out by hand from the fixture.
 
 // e2eFilterRun is the outcome of one search command, with the record of its
 // test model in accept mode. A test with it proves which files the filters
@@ -92,7 +92,8 @@ type e2eFilterRow struct {
 // e2eFilterExpect checks one filter from the current folder on ".". The text
 // search "zqmark <filter>" must keep the hand set. The description
 // "zqalpha zqbeta <filter>" must print the same files through vector search,
-// and the model must score no other file. It returns the description output.
+// and the model must score no other file. It returns the run of the
+// description.
 func e2eFilterExpect(t *testing.T, row e2eFilterRow) e2eFilterRun {
 	t.Helper()
 	want := slices.Sorted(slices.Values(row.want))
@@ -151,10 +152,10 @@ func e2eFilterCheckTable(t *testing.T, rows []e2eFilterRow) {
 // repository filters, and makes it the current folder. The tree has three
 // nodes:
 //
-//   - repo, a Git node with zoekt.archived=1, which Seek does not read:
-//     clean.go is committed and clean; mod.go is modified, and its work-tree
-//     copy changes every attribute of its committed copy; gone.go, which has
-//     every attribute, is deleted from the work tree; new.go is untracked.
+//   - repo, a Git node with zoekt.archived=1, which Seek does not read.
+//     clean.go is committed and clean. mod.go is modified: its work-tree copy
+//     changes every attribute of its committed copy. gone.go has every
+//     attribute and is deleted from the work tree. new.go is untracked.
 //   - the tree itself, a folder node with loose/loose.go.
 //   - other, a Git node with zoekt.name=zqnamed, which Seek does not read:
 //     other.go is committed in the repository with the opaque name.
@@ -301,9 +302,9 @@ func TestE2EFilterContentSymbolBranchRepo(t *testing.T) {
 	})
 }
 
-// TestE2EFilterPathFilters runs descriptions with file:, -file:, and their f:
-// aliases, as substrings and regular expressions, with Zoekt's case rules,
-// and with -lang:, or groups, and -( ... ) groups. The patterns read the
+// TestE2EFilterPathFilters runs descriptions with file:, -file: and their f:
+// aliases, as substrings and regular expressions, with Zoekt's case rules.
+// Other rows add -lang:, or groups and -( ... ) groups. The patterns read the
 // header path from the search root. The fixture has a Git node with a dirty
 // overlay, a folder node, and a second Git node.
 func TestE2EFilterPathFilters(t *testing.T) {
@@ -341,12 +342,21 @@ func TestE2EFilterPathFilters(t *testing.T) {
 }
 
 // TestE2EFilterDescriptionAtomsReachTheModel runs descriptions in each
-// description form: a quoted phrase, a bare regular expression token, regex:,
-// a backslash escape, smart case, programming names, an unknown prefix, a
-// plain OR, a token with no letter or digit, and parentheses. Each query takes
-// the vector route on every node kind. The model reads the hand-written text,
-// and with a model that accepts every row, the results are the files that the
-// filters keep.
+// description form:
+//   - a quoted phrase;
+//   - a bare regular expression token;
+//   - a regex: prefix;
+//   - a backslash escape;
+//   - smart case;
+//   - programming names;
+//   - an unknown prefix;
+//   - a plain OR;
+//   - a token with no letter or digit;
+//   - parentheses.
+//
+// Each query takes the vector route on every node kind. The model reads the
+// hand-written text. With a model that accepts every row, the results are the
+// files that the filters keep.
 func TestE2EFilterDescriptionAtomsReachTheModel(t *testing.T) {
 	requireTools(t)
 	e2eFilterPathTree(t)
@@ -365,7 +375,7 @@ func TestE2EFilterDescriptionAtomsReachTheModel(t *testing.T) {
 		// Zoekt rejects X[]: Seek quotes the name and parses again.
 		{"zqindex X[] zqbeta", "zqindex X[] zqbeta", e2eFilterPathLive},
 		// Zoekt accepts a::b() as a regular expression: the model reads the
-		// token text (rows T02 and T31).
+		// token text (the querySupport rows T02 and T31).
 		{"zqcall a::b() zqbeta", "zqcall a::b() zqbeta", e2eFilterPathLive},
 		// l: is no Zoekt prefix: the Python files stay.
 		{"zqalpha l:go", "zqalpha l:go", e2eFilterPathLive},
@@ -409,12 +419,18 @@ func TestE2EFilterDescriptionAtomsReachTheModel(t *testing.T) {
 
 // TestE2EFilterEveryFormUsesVectors runs the query forms on a fresh cache.
 // A query of negations only gives the model no text: it starts no model,
-// writes no vectors, and prints what --lexical-only prints. Every other form
-// (one description atom, with and without filters, a lone quoted phrase, an or
-// between descriptions, an or that binds the whole query, and filters alone)
-// prepares one model query. With a model that accepts every row, it prints
-// every live file that its filters keep, and so every file of the strict
-// search.
+// writes no vectors, and prints what --lexical-only prints. Each other form
+// prepares one model query:
+//   - one description atom, with and without filters;
+//   - a lone quoted phrase;
+//   - an or between descriptions;
+//   - an or that binds the whole query;
+//   - filters alone.
+//
+// With a model that accepts every row, a form prints every live file that its
+// filters keep, and so every file of the strict search. Both file sets are
+// worked out by hand; the filters alone with --lexical-only must keep the same
+// files.
 func TestE2EFilterEveryFormUsesVectors(t *testing.T) {
 	requireTools(t)
 	home := e2eFilterPathTree(t)
@@ -439,22 +455,29 @@ func TestE2EFilterEveryFormUsesVectors(t *testing.T) {
 		query string
 		// want holds the files that the strict search keeps; nil keeps none.
 		want []string
-		// filters is the filter part of the query; the search prints every
-		// live file that it keeps. Empty: the query has no filter, and the
-		// search prints every live file.
+		// filters is the filter part of the query. Empty: the query has no
+		// filter.
 		filters string
+		// allowed holds every live file that filters keeps: the search prints
+		// these files. nil: the query has no filter, and the search prints
+		// every live file.
+		allowed []string
 	}{
-		{"zqalpha", nil, ""},
-		{"zqalpha lang:go -file:loose", nil, "lang:go -file:loose"},
-		{`"zqalpha zqbeta"`, nil, ""},
-		{"zqalpha or zqbeta", nil, ""},
-		{"(zqalpha or zqbeta) lang:go", nil, "lang:go"},
+		{"zqalpha", nil, "", nil},
+		{"zqalpha lang:go -file:loose", nil, "lang:go -file:loose", []string{"clean.go", "mod_test.go", "other.go"}},
+		{`"zqalpha zqbeta"`, nil, "", nil},
+		{"zqalpha or zqbeta", nil, "", nil},
+		{"(zqalpha or zqbeta) lang:go", nil, "lang:go", []string{"clean.go", "mod_test.go", "loose.go", "other.go"}},
 		// The or binds the whole query: (zqalpha zqbeta file:zqlow) or
 		// file:other.
-		{"zqalpha zqbeta file:zqlow or file:other", []string{"other.go"}, "file:zqlow or file:other"},
-		{"zqmark -lang:go", []string{"new.py", "loose_test.py", "zqbare"}, "-lang:go"},
-		{"lang:go -file:_test", []string{"clean.go", "loose.go", "other.go"}, "lang:go -file:_test"},
-		{"file:ZqUp", []string{"clean.go", "new.py", "loose_test.py"}, "file:ZqUp"},
+		{"zqalpha zqbeta file:zqlow or file:other", []string{"other.go"}, "file:zqlow or file:other",
+			[]string{"mod_test.go", "loose.go", "other.go"}},
+		{"zqmark -lang:go", []string{"new.py", "loose_test.py", "zqbare"}, "-lang:go",
+			[]string{"new.py", "loose_test.py", "zqbare"}},
+		{"lang:go -file:_test", []string{"clean.go", "loose.go", "other.go"}, "lang:go -file:_test",
+			[]string{"clean.go", "loose.go", "other.go"}},
+		{"file:ZqUp", []string{"clean.go", "new.py", "loose_test.py"}, "file:ZqUp",
+			[]string{"clean.go", "new.py", "loose_test.py"}},
 	} {
 		t.Run(test.query, func(t *testing.T) {
 			run := e2eFilterSearch(t, test.query, ".")
@@ -474,8 +497,11 @@ func TestE2EFilterEveryFormUsesVectors(t *testing.T) {
 			}
 			allowed := slices.Sorted(slices.Values(e2eFilterPathLive))
 			if test.filters != "" {
-				allowedText, _ := e2eFilterText(t, test.filters, ".")
-				allowed = e2eFilterNames(allowedText)
+				allowed = slices.Sorted(slices.Values(test.allowed))
+				allowedText, err := e2eFilterText(t, test.filters, ".")
+				if oracle := e2eFilterNames(allowedText); err != nil || !slices.Equal(oracle, allowed) {
+					t.Fatalf("text oracle %q kept %v (err=%v), want %v:\n%s", test.filters, oracle, err, allowed, allowedText)
+				}
 			}
 			if !slices.Equal(got, allowed) {
 				t.Fatalf("the model route printed %v, want every live file that %q keeps %v:\n%s",
@@ -507,9 +533,9 @@ func e2eFilterSemanticDirs(t *testing.T, root string) []string {
 
 // TestE2EFilterLongQueryKeepsEveryTerm runs a description of 130 words with a
 // -file: filter. The model reads the 130 words once, in order, with no filter
-// text, and with a model that accepts every row, the results are the files
-// that the filter keeps, on every node kind. The test proves that a long
-// description reaches the model whole and that its filters stay out; it
+// text. With a model that accepts every row, the results are the files that
+// the filter keeps, on every node kind. The test proves that a long
+// description reaches the model whole and that its filters stay out. It
 // proves nothing about how a long real query ranks files.
 func TestE2EFilterLongQueryKeepsEveryTerm(t *testing.T) {
 	requireTools(t)
@@ -538,11 +564,11 @@ func TestE2EFilterLongQueryKeepsEveryTerm(t *testing.T) {
 }
 
 // TestE2EFilterTypeFilePrintsNamesOnly runs descriptions with type:file and
-// its spellings, alone and with filters. Vector search, with a model that
-// accepts every row, finds each file that the filters keep, and the search
-// prints only the name line of each file, as the text oracle does.
-// A negated -type:file fails the search of each node: Seek warns once for
-// each node and finds nothing.
+// its spellings, alone and with filters. With a model that accepts every row,
+// vector search finds each file that the filters keep. The search prints only
+// the name line of each file, as the text oracle does. A negated -type:file
+// fails the search of each node: Seek warns once for each node and finds
+// nothing.
 func TestE2EFilterTypeFilePrintsNamesOnly(t *testing.T) {
 	requireTools(t)
 	e2eFilterContentTree(t)
@@ -591,8 +617,8 @@ func TestE2EFilterTypeFilePrintsNamesOnly(t *testing.T) {
 // TestE2EFilterUpstreamPanicForms runs descriptions with type:filematch,
 // type:repo, their t: spellings, and a negated -case: in the real process.
 // Zoekt's per-shard searcher panics on these atoms (an upstream bug). Seek
-// recovers the panic at the shard: the node is skipped with one warning that
-// names the panic, and with no other node the search prints nothing and ends
+// recovers the panic at the shard and skips the node with one warning that
+// names the panic. With no other node, the search prints nothing and ends
 // with exit code 1. The type: rows keep strict ranking, so the search writes
 // no vectors.
 func TestE2EFilterUpstreamPanicForms(t *testing.T) {

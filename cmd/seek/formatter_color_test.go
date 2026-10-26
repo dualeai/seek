@@ -9,7 +9,8 @@ import (
 	"github.com/sourcegraph/zoekt"
 )
 
-// ansiCodeRE matches any SGR escape, for proving color is presentation-only.
+// ansiCodeRE matches any SGR escape. The tests remove these escapes to show
+// that color changes the presentation only.
 var ansiCodeRE = regexp.MustCompile("\x1b\\[[0-9;]*m")
 
 // fmtOneFile formats a single git-corpus file match with the given palette and
@@ -79,10 +80,9 @@ func TestColor_MultibyteAroundMatchNotSplit(t *testing.T) {
 	}
 }
 
-// TestColor_AnsiPaletteCodes pins the literal escape sequences. Without this,
-// the behavioral color tests (which reference ansiPalette.* by name) would
-// still pass if the palette were set to wrong/empty codes — this is their
-// oracle.
+// TestColor_AnsiPaletteCodes checks the literal escape sequences. The other
+// color tests read ansiPalette by name, so they pass with wrong or empty
+// codes; this test holds the codes for them.
 func TestColor_AnsiPaletteCodes(t *testing.T) {
 	want := palette{file: "\x1b[36m", lineNo: "\x1b[2m", match: "\x1b[1;31m", reset: "\x1b[0m"}
 	if ansiPalette != want {
@@ -109,7 +109,7 @@ func TestColor_AnsiStrippedEqualsPlain(t *testing.T) {
 }
 
 func TestColor_NonAdjacentMatchesBothColored(t *testing.T) {
-	// "x ONE y TWO z": ONE@2, TWO@8 — separated, both must be colored.
+	// "x ONE y TWO z": ONE@2 and TWO@8 are apart, and both must be colored.
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("x ONE y TWO z\n", 1, frag(2, 3), frag(8, 3))}}
 	out := fmtOneFile(fm, ansiPalette)
@@ -130,7 +130,7 @@ func TestLongLine_MatchDeepStaysVisible(t *testing.T) {
 		LineMatches: []zoekt.LineMatch{lineMatch(line, 1, frag(2000, 6))}}
 	out := fmtOneFile(fm, plainPalette)
 	// Worked out by hand: the window keeps 512 source bytes on each side of the
-	// match, so 2000-512 bytes drop at each end of the 4006-byte line.
+	// match. So 2000-512 bytes drop at each end of the 4006-byte line.
 	want := "## min.js (JavaScript)\n1 …+1488 bytes " + strings.Repeat("x", 512) + "NEEDLE" +
 		strings.Repeat("y", 512) + " …+1488 bytes\n"
 	if out != want {
@@ -335,7 +335,7 @@ func TestSanitize_BidiOverridesStripped(t *testing.T) {
 }
 
 func TestSanitize_ZeroWidthJoinerKept(t *testing.T) {
-	// ZWJ (U+200D) is NOT stripped — legitimate in emoji/script sequences.
+	// The sanitizer keeps ZWJ (U+200D): emoji and script sequences use it.
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("x = \"a\u200Db\"\n", 1)}}
 	out := fmtOneFile(fm, plainPalette)
@@ -348,7 +348,8 @@ func TestSanitize_ZeroWidthJoinerKept(t *testing.T) {
 
 func TestColor_UnsortedFragmentsNoSpanLoss(t *testing.T) {
 	// "aXbbbY c": X@1, Y@5. Deliver fragments OUT OF ORDER (Y then X). Without
-	// the defensive sort the second span would be silently coalesced away.
+	// the defensive sort, span coalescing would drop the second span with no
+	// error.
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("aXbbbY c\n", 1, frag(5, 1), frag(1, 1))}}
 	out := fmtOneFile(fm, ansiPalette)
@@ -379,9 +380,8 @@ func TestColor_UnsortedFragmentsManyOutOfOrder(t *testing.T) {
 }
 
 func TestColor_OverlappingFragmentsCoalesce(t *testing.T) {
-	// Overlapping (not merely adjacent) spans [0,5) and [2,7) must merge into a
-	// single [0,7) run — catches a merge that uses sp.start instead of
-	// max(end).
+	// The overlapping spans [0,5) and [2,7) must merge into one [0,7) run. A
+	// merge that keeps the end of the first span fails here.
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("0123456789\n", 1, frag(0, 5), frag(2, 5))}}
 	out := fmtOneFile(fm, ansiPalette)
@@ -450,9 +450,8 @@ func TestStripRune(t *testing.T) {
 	}
 }
 
-// --- Companion to BenchmarkCorpusFormatting_Palettes: the benchmark only
-// MEASURES the realistic fixture; this VERIFIES its output is correct.
-
+// TestCorpusFormatting_Realistic checks the output of the fixture that
+// BenchmarkCorpusFormatting_Palettes times: the benchmark does not check it.
 func TestCorpusFormatting_Realistic(t *testing.T) {
 	results := benchmarkGitResults(benchmarkRealisticFiles(2))
 	plain := formatCorpusResultsWithContext(results, 0, 0, hideCorpusContext, plainPalette)

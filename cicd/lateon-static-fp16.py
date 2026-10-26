@@ -70,9 +70,9 @@ def make_model(source):
     set_dimension(dimensions[1], SEQUENCE_TOKENS)
     set_dimension(dimensions[2], EMBEDDING_DIMENSIONS)
     # The source graph keeps the shapes it was exported with. Pinning the model
-    # interface above does not update them, so symbolic dimensions survive inside
+    # interface above does not update them, so symbolic dimensions stay inside
     # the graph. The Core ML provider tests every node input, not the model
-    # interface, and rejects a node whose input shape is not static, so each
+    # interface. It rejects a node whose input shape is not static. So each
     # symbolic shape splits the graph into smaller Core ML partitions.
     #
     # data_prop carries constant values through Shape, Gather and Concat chains.

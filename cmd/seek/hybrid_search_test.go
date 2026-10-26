@@ -21,13 +21,16 @@ import (
 	ctags "github.com/sourcegraph/go-ctags"
 )
 
-// hybridTestScorer is the test model. It runs no inference, and the mode, not
-// the text, sets the direction of every unit and the verdict on every
-// document; the model input changes only small offsets that keep the rows
-// distinct. A test that uses it proves the plumbing: which rows a build
-// writes, keeps, repairs and searches, which documents the model scores, and
-// which files print. It cannot prove meaning, the acceptance threshold (tau),
-// the retrieval radius, the document cut or rank.
+// hybridTestScorer is the test model. It runs no inference. The mode, not the
+// text, sets the direction of every unit and the verdict on every document.
+// The model input changes only small offsets that keep the rows distinct. A
+// test that uses it proves the data flow:
+//   - which rows a build writes, keeps, repairs and searches;
+//   - which documents the model scores;
+//   - which files print.
+//
+// It cannot prove meaning, the acceptance threshold (tau), the retrieval
+// radius, the document cut or rank.
 type hybridTestScorer struct {
 	prepareCalls atomic.Int32
 	embedCalls   atomic.Int32
@@ -57,8 +60,8 @@ const (
 	// payloadFar, the zero value, puts every unit near axis 1, orthogonal to
 	// the query, and scores every document 0: no row is a candidate.
 	payloadFar payloadMode = iota
-	// payloadAccept puts every unit near the query and gives every document
-	// the kept-token count of the query, a MeanMaxSim of 1: every row is a
+	// payloadAccept puts every unit near the query. It gives every document
+	// the kept-token count of the query, a MeanMaxSim of 1. So every row is a
 	// candidate, and the model accepts every candidate.
 	payloadAccept
 	// payloadReject puts every unit near the query and scores every document
@@ -97,11 +100,12 @@ func (scorer *hybridTestScorer) EmbedSemanticUnits(
 	return vectors, nil
 }
 
-// payloadUnitVector is the vector of unit in mode: near axis 1, orthogonal to
-// the query, in the far mode, and near the query axis 0 in the other modes.
-// The offsets come from the unit's model input. Rows with equal model input
-// get equal vectors, and the path header in the input gives two copies of one
-// text at two paths different vectors, as with the real model.
+// payloadUnitVector is the vector of unit in mode. In the far mode it is near
+// axis 1, orthogonal to the query; in the other modes it is near the query
+// axis 0. The offsets come from the model input of the unit, so rows with
+// equal model input get equal vectors. The input holds the path header, so
+// two copies of one text at two paths get different vectors, as with the real
+// model.
 func payloadUnitVector(unit semanticUnit, mode payloadMode) semanticVector {
 	axis := 0
 	if mode == payloadFar {
@@ -114,17 +118,15 @@ func payloadUnitVector(unit semanticUnit, mode payloadMode) semanticVector {
 	return testAxisVector(axis, input)
 }
 
-// testAxisVector puts a vector near axis. Small offsets on four more axes,
-// chosen from a hash of seed, keep the vectors of different seeds distinct,
-// also after USearch's int8 cast: USearch's graph can leave keys with one
-// shared vector unreachable
+// testAxisVector puts a vector near axis, with small offsets on four more axes
+// chosen from a hash of seed. The offsets keep the vectors of different seeds
+// distinct, also after USearch's int8 cast, which merges small offsets on few
+// axes. USearch's graph can leave keys with one shared vector unreachable
 // (https://github.com/unum-cloud/USearch/issues/815). Equal seeds give equal
 // vectors. The offsets keep the cosine with the axis above 0.99.
 func testAxisVector(axis int, seed []byte) semanticVector {
 	first := sha256.Sum256(seed)
 	sum := first[:]
-	// Four offset axes keep the vectors distinct also after USearch's int8
-	// cast, which merges small offsets on few axes.
 	var vector semanticVector
 	vector[axis] = 1
 	for index, offsets := 0, 0; offsets < 4; index += 3 {
@@ -208,10 +210,10 @@ func (scorer *hybridTestScorer) Close() error {
 func (*hybridTestScorer) SemanticCallCPUs(context.Context) int { return 1 }
 
 // TestSemanticEvidenceReadsTheShardCopy reads the text of semantic hits from
-// a Git node's shards. A hit shows the line where its unit starts, its context
-// and no literal fragment, with Zoekt's language in the result and in the
-// model document. A row that does not match its shard copy and a row with no
-// document are index damage. A file that Zoekt keeps by name only gives no
+// a Git node's shards. A hit shows the line where its unit starts and its
+// context, with no literal fragment. The result and the model document name
+// Zoekt's language. A row that does not match its shard copy and a row with
+// no document are index damage. A file that Zoekt keeps by name only gives no
 // hit.
 func TestSemanticEvidenceReadsTheShardCopy(t *testing.T) {
 	requireTools(t)
@@ -292,7 +294,8 @@ func TestSemanticEvidenceReadsTheShardCopy(t *testing.T) {
 // TestVectorHitPrintsZoektLanguage finds a shell file that holds no query
 // word, with a model that accepts every row, so the file prints by its vectors
 // only. Each embedded unit of the file, its header and its model document name
-// Zoekt's language (Shell), as for a strict hit, not the ctags name (Sh).
+// Zoekt's language (Shell), not the ctags name (Sh). A strict hit does the
+// same.
 func TestVectorHitPrintsZoektLanguage(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -333,9 +336,9 @@ func TestVectorHitPrintsZoektLanguage(t *testing.T) {
 
 // TestRunDefaultJoinedSearchAddsSemanticOnlyFile searches a Git node with a
 // model that accepts every row. The file with every query word and the file
-// with no query word both print: the vector hit joins the strict hit in one
-// model session, and the build publishes the joined generation of the commit.
-// The test proves the plumbing, not what the file means.
+// with no query word both print. The vector hit joins the strict hit in one
+// model session. The build publishes the joined generation of the commit. The
+// test proves the data flow, not what the file means.
 func TestRunDefaultJoinedSearchAddsSemanticOnlyFile(t *testing.T) {
 	requireTools(t)
 	repo := initEmptyGitRepo(t)
@@ -391,9 +394,9 @@ func TestRunDefaultJoinedSearchAddsSemanticOnlyFile(t *testing.T) {
 }
 
 // TestRunDefaultFolderJoinedSearchAddsSemanticOnlyFile is the folder form of
-// TestRunDefaultJoinedSearchAddsSemanticOnlyFile, with a model that accepts
-// every row: the file with no query word prints, and the search keeps the
-// joined generation of the folder state.
+// TestRunDefaultJoinedSearchAddsSemanticOnlyFile. With a model that accepts
+// every row, the file with no query word prints. The search keeps the joined
+// generation of the folder state.
 func TestRunDefaultFolderJoinedSearchAddsSemanticOnlyFile(t *testing.T) {
 	requireTools(t)
 	t.Chdir(t.TempDir())
@@ -423,8 +426,8 @@ func TestRunDefaultFolderJoinedSearchAddsSemanticOnlyFile(t *testing.T) {
 
 // TestRunDefaultFilteredNativeFailureRecoversExactly damages the USearch graph
 // of a folder, then runs a filtered search with a model that accepts every
-// row. The native search fails, and the exact recovery over the rows that the
-// filters keep finds every kept file and no other: the printed set and the
+// row. The native search fails. The exact recovery over the rows that the
+// filters keep finds every kept file and no other. The printed set and the
 // scored set are the kept files.
 func TestRunDefaultFilteredNativeFailureRecoversExactly(t *testing.T) {
 	requireTools(t)
@@ -442,9 +445,9 @@ func TestRunDefaultFilteredNativeFailureRecoversExactly(t *testing.T) {
 	writeFileAt(t, folder, "allowed/leak_test.go", "package sample\n// alpha beta TEST_LEAK\n")
 	writeFileAt(t, folder, "allowed/leak.py", "# alpha beta LANGUAGE_LEAK\n")
 	writeFileAt(t, folder, "blocked/leak.go", "package sample\n// alpha beta PATH_LEAK\n")
-	// Two files with no query word that only vectors find: only the exact
-	// recovery over the allowed rows can add the allowed one, and it must not
-	// add the blocked one.
+	// Two files have no query word, so only vectors find them. Only the exact
+	// recovery over the allowed rows can add the allowed one. It must not add
+	// the blocked one.
 	writeFileAt(t, folder, "allowed/meaning.go", "package sample\n// dispatches a request\n")
 	writeFileAt(t, folder, "blocked/meaning.go", "package sample\n// PATH_LEAK dispatches a request\n")
 	plan := planFolderTestCorpus(t, folder)
@@ -541,8 +544,9 @@ func TestRunDefaultFilteredNativeFailureRecoversExactly(t *testing.T) {
 	if !slices.Equal(scored, kept) {
 		t.Fatalf("scored documents=%v, want the %d kept files", scored, len(kept))
 	}
-	// The --verbose record proves that the damaged graph failed, so the
-	// semantic-only file above came from the exact recovery.
+	// The debug record proves that the damaged graph failed. So
+	// allowed/meaning.go, which has no query word, came from the exact
+	// recovery.
 	foundRecoveryLog := false
 	for _, record := range logs.Records() {
 		if record.Message == "Filtered USearch search failed; using exact vectors" {
@@ -560,8 +564,8 @@ func TestRunDefaultFilteredNativeFailureRecoversExactly(t *testing.T) {
 // test model sets where the rows lie and what the model says. A row far from
 // the query is no candidate: the build writes it, and the model scores
 // nothing. A row near the query is a candidate: the model scores the document
-// of the file, and the file prints only when the model accepts it. A search
-// that prints nothing exits 1. The test model reads no text, so the test
+// of the file. The file prints only when the model accepts it. A search that
+// prints nothing exits 1. The test model reads no text, so the test
 // proves the path from the rows to the output, not what the file means.
 func TestVectorOnlyFilePrintsOnlyWhenTheModelAcceptsIt(t *testing.T) {
 	requireTools(t)
@@ -609,6 +613,9 @@ func TestVectorOnlyFilePrintsOnlyWhenTheModelAcceptsIt(t *testing.T) {
 	}
 }
 
+// TestRunDefaultRepairsDamagedSemanticGeneration damages the manifest of the
+// semantic generation of a folder. The next search builds the vectors again,
+// prints the same output, and activates the joined generation.
 func TestRunDefaultRepairsDamagedSemanticGeneration(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
@@ -657,12 +664,12 @@ func TestRunDefaultRepairsDamagedSemanticGeneration(t *testing.T) {
 }
 
 // TestRunDefaultRerankFallbackLogsCause runs the default search with the real
-// model and a score fault. relaxed.go holds only some of the query words; its
+// model and a score fault. relaxed.go holds only some of the query words. Its
 // rows are in the retrieval radius of the real model, so the search sends it
 // to the score stage beside strict.go. The search falls back to the strict
-// order: it prints the file that holds every query word, drops relaxed.go,
+// order. It prints the file that holds every query word, drops relaxed.go,
 // and writes a debug record with the cause. The real model builds the vectors
-// and the query; the fault stops the score stage before the model runs it, so
+// and the query. The fault stops the score stage before the model runs it, so
 // the test costs two model batches. The folder has fixed path parts
 // (stableModelRoot), so the model reads the same paths in each run.
 func TestRunDefaultRerankFallbackLogsCause(t *testing.T) {
@@ -781,6 +788,10 @@ func requireSearchableGeneration(t *testing.T, plan node, source string) {
 	}
 }
 
+// TestRunDefaultSemanticQueryFailureUsesLexicalOutput fails the query
+// preparation of the model. The search prints the lexical output and writes
+// a debug record with the cause. The build still embeds the folder, and no
+// document reaches the score stage.
 func TestRunDefaultSemanticQueryFailureUsesLexicalOutput(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
@@ -816,11 +827,11 @@ func TestRunDefaultSemanticQueryFailureUsesLexicalOutput(t *testing.T) {
 }
 
 // TestDirtyGitSearchUsesCommittedVectors searches a dirty work tree with a
-// model that accepts every row: the node builds or reuses the generation of
-// its commit, the clean file with no query word prints through it, the dirty
-// file shows its uncommitted bytes, and the next clean search embeds nothing
-// new. The dirty bytes reach vectors through the overlay, whose one embed
-// call holds only the units of the dirty file.
+// model that accepts every row. The node builds or reuses the generation of
+// its commit, and the clean file with no query word prints through it. The
+// dirty file shows its uncommitted bytes, and the next clean search embeds
+// nothing new. The dirty bytes reach vectors through the overlay, whose one
+// embed call holds only the units of the dirty file.
 func TestDirtyGitSearchUsesCommittedVectors(t *testing.T) {
 	requireTools(t)
 	for _, seeded := range []bool{false, true} {
@@ -898,6 +909,8 @@ func TestDirtyGitSearchUsesCommittedVectors(t *testing.T) {
 	}
 }
 
+// assertTestLogError fails the test unless logs holds a record with message
+// whose error attribute wraps want.
 func assertTestLogError(
 	t *testing.T,
 	logs *testLogRecorder,
@@ -918,6 +931,10 @@ func assertTestLogError(
 	t.Fatalf("missing debug record %q", message)
 }
 
+// TestDefaultFolderBuildPublishesAndUpdatesJoinedGeneration builds a folder
+// with a model, then changes its file and builds again. Each build activates
+// the joined generation of its state, and only the current generation
+// directory stays.
 func TestDefaultFolderBuildPublishesAndUpdatesJoinedGeneration(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
@@ -962,6 +979,10 @@ func TestDefaultFolderBuildPublishesAndUpdatesJoinedGeneration(t *testing.T) {
 	}
 }
 
+// TestLexicalOnlyFolderBuildStartsNoModelAndWritesNoSemanticData gives the
+// folder build a model and asks for vectors, with the lexical-only policy.
+// The policy alone keeps the build from starting the model and from writing
+// semantic data.
 func TestLexicalOnlyFolderBuildStartsNoModelAndWritesNoSemanticData(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
@@ -989,9 +1010,9 @@ func TestLexicalOnlyFolderBuildStartsNoModelAndWritesNoSemanticData(t *testing.T
 // TestRunDefaultFolderJoinedSearchKeepsGuardedFileByName forces the shard
 // guard on one large file, with a model that accepts every row, so each unit
 // of the file is a candidate. Zoekt keeps only its name, and a vector hit
-// shows the text that Zoekt keeps, so the description search prints no vector
-// hit of the file and reports no index damage. The name-only notice counts it,
-// as for a strict search.
+// shows the text that Zoekt keeps. So the description search prints no vector
+// hit of the file and reports no index damage. The name-only notice counts
+// it, as for a strict search.
 func TestRunDefaultFolderJoinedSearchKeepsGuardedFileByName(t *testing.T) {
 	requireTools(t)
 	swapGuardLimitsForTest(t)
@@ -1034,8 +1055,8 @@ func TestRunDefaultFolderJoinedSearchKeepsGuardedFileByName(t *testing.T) {
 // TestEditDuringSearchShowsInTheNextSearch edits a tracked file after the
 // graph expansion captured the repository, while a warm descriptive search
 // runs (the model factory runs after planning). The search reads one capture
-// per node (one git status per node per command), so it shows the captured
-// content; the next search captures the edit and shows it.
+// per node, from one git status per node per command, so it shows the
+// captured content. The next search captures the edit and shows it.
 func TestEditDuringSearchShowsInTheNextSearch(t *testing.T) {
 	requireTools(t)
 	repo := initGitRepo(t, "a.go", "package sample\n// alpha beta original line\n")
@@ -1061,7 +1082,7 @@ func TestEditDuringSearchShowsInTheNextSearch(t *testing.T) {
 // TestFolderFileSavedDuringTheBuildIsATreeChange saves a folder file between
 // the two reads of one build: Zoekt indexes the old bytes and the vectors the
 // new ones. With a model that accepts every row, the search sees a tree
-// change, not index damage: it reads the node again and shows the vector hit
+// change, not index damage. It reads the node again and shows the vector hit
 // with the new text, with no damage warning.
 func TestFolderFileSavedDuringTheBuildIsATreeChange(t *testing.T) {
 	requireTools(t)
@@ -1113,7 +1134,7 @@ func TestFolderFileSavedDuringTheBuildIsATreeChange(t *testing.T) {
 // between the two reads of every build, as a log or an autosave does. The
 // model accepts every row, so the file would print if its rows were searched.
 // The retry cannot tell that edit from damage, so the file gives no vector
-// hit, and the node keeps its strict hit with no damage warning and no skip.
+// hit. The node keeps its strict hit, with no damage warning and no skip.
 func TestFolderFileWrittenDuringEveryBuildKeepsTheNode(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)

@@ -6,8 +6,11 @@ import (
 	"testing"
 )
 
+// FuzzParseGitStatusV2 checks that parseGitStatusV2 does not panic on any
+// input, always gives a HEAD value, and lists no empty path.
 func FuzzParseGitStatusV2(f *testing.F) {
-	// Seed with realistic v2 -z outputs (NUL-terminated records)
+	// The seeds are git status --porcelain=v2 -z outputs: NUL-terminated
+	// records.
 	f.Add("# branch.oid abc123\x00# branch.head main\x00")
 	f.Add("# branch.oid abc123\x001 .M N... 100644 100644 100644 abc def src/main.go\x00")
 	f.Add("# branch.oid abc123\x00? new_file.txt\x00")
@@ -16,14 +19,12 @@ func FuzzParseGitStatusV2(f *testing.F) {
 	f.Add("")
 	f.Add("\x00\x00\x00")
 	f.Add("# branch.oid abc\x00\x00? \x00")
+	f.Add("# branch.oid \x00")
 	f.Fuzz(func(t *testing.T, raw string) {
-		// Must never panic
 		state := parseGitStatusV2(raw)
-		// HeadSHA must always be non-empty
 		if state.HeadSHA == "" {
 			t.Error("HeadSHA must never be empty")
 		}
-		// Files must not contain empty strings
 		for _, f := range state.Files {
 			if f == "" {
 				t.Error("file path must not be empty")
@@ -32,6 +33,8 @@ func FuzzParseGitStatusV2(f *testing.F) {
 	})
 }
 
+// FuzzExtractV2Path checks that extractV2Path does not panic on any entry and
+// field count.
 func FuzzExtractV2Path(f *testing.F) {
 	f.Add("1 .M N... 100644 100644 100644 abc def src/main.go", 8)
 	f.Add("u UU N... 100644 100644 100644 100644 abc def ghi conflict.go", 10)
@@ -40,17 +43,17 @@ func FuzzExtractV2Path(f *testing.F) {
 	f.Add("a b c", 100)
 	f.Fuzz(func(t *testing.T, entry string, skipFields int) {
 		if skipFields < 0 {
-			return // negative skip is not meaningful
+			return // A porcelain entry has no negative field count.
 		}
-		// Must never panic
 		_ = extractV2Path(entry, skipFields)
 	})
 }
 
-// FuzzDetectGitBoundary feeds random bytes as the contents of a `.git`
-// worktree pointer file. detectGitBoundary must never panic and must never
-// OOM regardless of input. Each input gets its own fixture directory.
+// FuzzDetectGitBoundary writes random bytes as the content of a `.git`
+// worktree pointer file: detectGitBoundary must not panic on any content.
+// Each input gets its own fixture directory.
 func FuzzDetectGitBoundary(f *testing.F) {
+	f.Add([]byte("gitdir: ../real-git\n"))
 	f.Add([]byte("gitdir: ./real-git\n"))
 	f.Add([]byte("gitdir: /absolute/path\n"))
 	f.Add([]byte("gitdir: ./real-git\r\n"))
@@ -63,7 +66,8 @@ func FuzzDetectGitBoundary(f *testing.F) {
 	f.Fuzz(func(t *testing.T, payload []byte) {
 		root := t.TempDir()
 		realGitDir := filepath.Join(root, "real-git")
-		// Build a valid triad so a well-formed pointer can resolve.
+		// A Git directory with the full triad beside the worktree, so the
+		// pointer "gitdir: ../real-git" resolves to it.
 		if err := os.MkdirAll(filepath.Join(realGitDir, "objects"), 0o755); err != nil {
 			t.Fatal(err)
 		}

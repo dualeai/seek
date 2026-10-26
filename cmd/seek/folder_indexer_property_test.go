@@ -9,13 +9,14 @@ import (
 	"strconv"
 	"testing"
 	"testing/quick"
+	"testing/synctest"
 
 	"github.com/sourcegraph/zoekt/index"
 )
 
-// TestEnsureFolderCorpusFresh_RandomDistribution checks with testing/quick that
-// a build of random file sizes (each at most a quarter of the test budget)
-// completes and gives back all readSemaphore weight.
+// TestEnsureFolderCorpusFresh_RandomDistribution builds folders of random
+// file sizes with testing/quick. Each file is at most a quarter of the test
+// budget. Each build must complete and give back all readSemaphore weight.
 //
 // Sparse files limit fixture I/O. A small test-local readSemaphore budget lets
 // small payloads put back pressure on the readers.
@@ -32,10 +33,9 @@ func TestEnsureFolderCorpusFresh_RandomDistribution(t *testing.T) {
 	// quarter-budget limit lets up to four readers hold weight at the same
 	// time.
 	const perFileCap = testBudget / 4
-	// Total corpus cap = a multiple of testBudget so the reads pass the budget
-	// several times across the run. Kept modest (8×) because each iteration
-	// does a real zoekt index build; under -race + coverage this test is the
-	// suite's slowest, so larger volumes risk the package test timeout.
+	// Each folder holds at most 8 budgets, so its reads fill the budget
+	// several times. Each iteration runs a real Zoekt build, so a larger
+	// folder makes the test slow under -race and coverage.
 	const totalCap = 8 * testBudget
 
 	check := func(seed uint64, n uint8, maxSize uint32) bool {
@@ -75,9 +75,9 @@ func TestEnsureFolderCorpusFresh_RandomDistribution(t *testing.T) {
 // FuzzReadOneFolderFileStreaming_Sizes checks the per-file size boundary of
 // readOneFolderFileStreaming. The fuzzer's size folds into
 // [0, testDocumentContentLimit+1], so every input tests a size. For each size,
-// the function must either
-// (a) send exactly one fileContent with weight=size and never leak,
-// or (b) send one name-only document without touching the semaphore.
+// the function sends exactly one document and leaks no weight. A file within
+// the limit gives a document with weight=size. A larger file gives a name-only
+// document with no weight.
 //
 // The test uses writeSparseFile to limit fixture I/O. It keeps the shared
 // readSemaphore at the production budget and swaps in a small content limit.
@@ -129,15 +129,8 @@ func FuzzReadOneFolderFileStreaming_Sizes(f *testing.F) {
 			}
 			readSemaphore.Release(fc.weight)
 		}
-		switch {
-		case oversize:
-			if sent != 1 {
-				t.Fatalf("oversize candidate must send one name-only document, got sent=%d", sent)
-			}
-		default:
-			if sent != 1 {
-				t.Fatalf("expected exactly one delivery, got sent=%d", sent)
-			}
+		if sent != 1 {
+			t.Fatalf("size %d sent %d documents, want 1", size, sent)
 		}
 		if got := availableWeight(readSemaphore); got != before {
 			t.Fatalf("semaphore leak: before=%d after=%d", before, got)
@@ -145,11 +138,17 @@ func FuzzReadOneFolderFileStreaming_Sizes(f *testing.F) {
 	})
 }
 
-// TestEnsureFolderCorpusFresh_SingleFileAroundReadWeightCap builds a folder
-// with one file of maxReadWeightBytes, and then of one byte more, next to a
-// 16-byte file. The production semaphore (not swapped) must admit the first
-// size and clamp the weight of the second, with no hang and no leaked weight.
-// A hang runs until the go test timeout, which prints each goroutine.
+// TestEnsureFolderCorpusFresh_SingleFileAroundReadWeightCap reads a file of
+// maxReadWeightBytes (100 MiB), and then of one byte more. The reader takes
+// 100 MiB of weight for each size before it reads the file, because readWeight
+// stops there. The read runs in a synctest bubble on a budget of 100 MiB that
+// the test holds. The test changes the head of the file while the reader waits
+// for its weight, and then frees the budget. So the sent document has the new
+// head and 100 MiB of weight. A larger weight waits forever, and the bubble
+// fails as a deadlock. Then the test builds a folder of that file and a
+// 16-byte file with the production semaphore (not swapped): no hang and no
+// leaked weight. A hang runs until the go test timeout, which prints each
+// goroutine.
 func TestEnsureFolderCorpusFresh_SingleFileAroundReadWeightCap(t *testing.T) {
 	requireTools(t)
 	for _, size := range []int64{maxReadWeightBytes, maxReadWeightBytes + 1} {
@@ -159,12 +158,51 @@ func TestEnsureFolderCorpusFresh_SingleFileAroundReadWeightCap(t *testing.T) {
 			defer goroutineLeakGuard(t)()
 
 			root := t.TempDir()
-			writeSparseFile(t, filepath.Join(root, "huge.bin"), size)
+			huge := filepath.Join(root, "huge.bin")
+			writeSparseFile(t, huge, size)
 			writeSparseFile(t, filepath.Join(root, "tiny.bin"), 16)
+			before := availableWeight(readSemaphore)
+
+			info, err := os.Lstat(huge)
+			if err != nil {
+				t.Fatal(err)
+			}
+			synctest.Test(t, func(t *testing.T) {
+				defer swapReadSemaphoreForTest(maxReadWeightBytes)()
+				// Busy readers hold the whole budget, so the reader waits for
+				// its weight.
+				if !readSemaphore.TryAcquire(maxReadWeightBytes) {
+					t.Fatal("cannot hold the test read budget")
+				}
+				out := make(chan fileContent, 1)
+				ctx, fail := context.WithCancelCause(t.Context())
+				defer fail(nil)
+				go readOneFolderFileStreaming(ctx, newFolderCandidate("huge.bin", huge, info), out, fail)
+				synctest.Wait()
+				file, err := os.OpenFile(huge, os.O_WRONLY, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = file.WriteAt([]byte("y"), 0)
+				if closeErr := file.Close(); err == nil {
+					err = closeErr
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				readSemaphore.Release(maxReadWeightBytes)
+				document := <-out
+				held := maxReadWeightBytes - availableWeight(readSemaphore)
+				readSemaphore.Release(document.weight)
+				if document.weight != 100<<20 || held != 100<<20 {
+					t.Fatalf("the read of %d bytes holds %d bytes of weight (document %d), want 100 MiB", size, held, document.weight)
+				}
+				if len(document.content) == 0 || document.content[0] != 'y' {
+					t.Fatalf("the read of %d bytes ran before the reader took its weight: head %q", size, document.content[:min(len(document.content), 1)])
+				}
+			})
 
 			plan := planSynthCorpus(t, root)
-
-			before := availableWeight(readSemaphore)
 			if _, err := ensureFolderCorpusFresh(t.Context(), plan); err != nil {
 				t.Fatalf("ensureFolderCorpusFresh: %v", err)
 			}

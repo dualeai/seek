@@ -10,13 +10,13 @@ import (
 
 // TestReadUncommittedCandidates_BoundedDrainOnOversize checks that
 // readUncommittedCandidates returns errDeltaPayloadExceedsWindow and releases
-// every pre-acquired weight when the candidate set reaches the window. It
-// covers both guards:
-//   - pre-flight: no file exists, so only the lstat-sum short-circuit
-//     can return the error; it reads no file.
-//   - mid-drain: each candidate states 1 byte, so the pre-flight sum
-//     passes and the real reads cross the window; the drain must then
-//     release the weight of every read.
+// every acquired weight when the candidates reach the window. It covers both
+// guards:
+//   - pre-flight: no file exists, so only the check of the stat sizes can
+//     return the error. It reads no file.
+//   - mid-drain: each candidate states 1 byte, so the stat sizes pass and the
+//     reads reach the window. The drain must then release the weight of every
+//     read.
 func TestReadUncommittedCandidates_BoundedDrainOnOversize(t *testing.T) {
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
@@ -25,7 +25,8 @@ func TestReadUncommittedCandidates_BoundedDrainOnOversize(t *testing.T) {
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
 
-	// Fixture: 12 files × 512 KiB = 6 MiB cumulative > window (= 2 MiB).
+	// 12 files of 512 KiB hold 6 MiB, above the 2 MiB window of the 4 MiB
+	// budget.
 	const fileCount = 12
 	const fileSize = 512 * 1024
 	payload := make([]byte, fileSize)
@@ -75,15 +76,14 @@ func TestReadUncommittedCandidates_BoundedDrainOnOversize(t *testing.T) {
 	}
 }
 
-// TestReadUncommittedCandidates_SmallPayloadFitsBudget — control: a
-// payload that fits within the window threshold returns docs and nil
-// error. Confirms the bounded-drain guard does NOT trip on benign
-// inputs.
+// TestReadUncommittedCandidates_SmallPayloadFitsBudget checks that a payload
+// below the window gives every document and no error: the guards do not stop
+// a small delta.
 func TestReadUncommittedCandidates_SmallPayloadFitsBudget(t *testing.T) {
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
-	const testBudget int64 = 8 * 1024 * 1024 // 8 MiB → window = 4 MiB
+	const testBudget int64 = 8 * 1024 * 1024 // 8 MiB, so the window is 4 MiB
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
 	defer goroutineLeakGuard(t)()

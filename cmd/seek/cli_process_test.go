@@ -13,17 +13,23 @@ import (
 	"testing"
 )
 
+// cliProcessHelperEnv set to cliProcessTestMarker makes the test binary run
+// as the CLI (TestCLIProcessHelper).
 const (
 	cliProcessHelperEnv  = "SEEK_TEST_CLI_PROCESS_HELPER"
 	cliProcessTestMarker = "1"
 )
 
+// cliProcessResult is the output and the exit code of one CLI process.
 type cliProcessResult struct {
 	stdout string
 	stderr string
 	code   int
 }
 
+// TestCLIProcessHelper is the CLI process that cliProcessCommand starts. With
+// cliProcessHelperEnv set to cliProcessTestMarker, it runs main with the
+// arguments after "--". In a normal test run it returns at once.
 func TestCLIProcessHelper(t *testing.T) {
 	if os.Getenv(cliProcessHelperEnv) != cliProcessTestMarker {
 		return
@@ -136,7 +142,7 @@ func TestCLIProcess_MissingGitSkipsTheNode(t *testing.T) {
 		t.Fatalf("stdout=%q stderr=%q code=%d, want one warning and code 1", result.stdout, result.stderr, result.code)
 	}
 	// No path is the same as ".", so the warning names the resolved root.
-	for _, want := range []string{"level=WARN", "root=" + canonicalCorpusPath(repo), "Git is required but was not found", "install Git and ensure git is on PATH"} {
+	for _, want := range []string{"level=WARN", "root=" + resolvedPath(t, repo), "Git is required but was not found", "install Git and ensure git is on PATH"} {
 		if !strings.Contains(result.stderr, want) {
 			t.Fatalf("stderr=%q, want %q", result.stderr, want)
 		}
@@ -315,21 +321,20 @@ func TestCLIProcess_LexicalOnlySkipsSemanticCacheAndModel(t *testing.T) {
 // a symbol filter and a description reach it; a query of negations only gives
 // the model no text, so it builds none.
 //
-// This sits at process level beside the --lexical-only test because it makes
-// the same kind of claim: a command either leaves semantic data in the cache or
-// it does not. The in-process tests cover why; this covers what a user sees.
-// The symbol lookup expects the model to add no file, so the folder has a
-// fixed model path (stableModelRoot) and the score does not change from run
-// to run.
+// The test runs the real process, as the --lexical-only test does. Both check
+// whether a command leaves semantic data in the cache. The in-process tests
+// check why; this test checks what a user sees. The symbol lookup expects the
+// model to add no file. So the folder has a fixed model path
+// (stableModelRoot), and the score is the same in each run.
 func TestCLIProcess_QueryShapeDecidesSemanticCache(t *testing.T) {
 	requireTools(t)
 	folder := stableModelRoot(t)
 	writeFileAt(t, folder, "app.go", "package sample\n// alpha beta gamma describes the sample\n")
 
-	// wantCode guards this table against a vacuous pass: a case that expects no
-	// results and no vectors would also hold if the command crashed, so every
-	// case pins the documented exit code. 0 is a match, 1 is no match, and 2 is
-	// an error that must never appear here.
+	// wantCode keeps a case from a false pass. A case with no results and no
+	// vectors would also pass if the command crashed, so each case sets the
+	// exit code. 0 is a match, 1 is no match, and 2 is an error that must not
+	// occur here.
 	for _, testCase := range []struct {
 		name        string
 		query       string
@@ -408,11 +413,14 @@ func cachePathsMatching(tb testing.TB, cacheDir string, match func(name string) 
 	return found
 }
 
+// runCLIProcess runs args in dir as a CLI process with a new empty cache.
 func runCLIProcess(t *testing.T, dir string, args, extraEnv []string) cliProcessResult {
 	t.Helper()
 	return runCLIProcessWithCache(t, t.TempDir(), dir, args, extraEnv)
 }
 
+// runCLIProcessWithCache runs args in dir as a CLI process with cacheDir as
+// its cache and extraEnv last in its environment.
 func runCLIProcessWithCache(t *testing.T, cacheDir, dir string, args, extraEnv []string) cliProcessResult {
 	t.Helper()
 	cmd := cliProcessCommand(t.Context(), cacheDir, dir, args, extraEnv)
@@ -454,9 +462,9 @@ func runCLIProcessOnLine(t *testing.T, cacheDir, dir string, args []string, matc
 	return cliProcessResult{stdout: stdout.String(), stderr: stderr.String(), code: cliProcessExitCode(t, waitErr)}, seen
 }
 
-// lockWaitLine matches the stderr line of a lock wait of a CLI process: the
-// line holds reason, one of the lockWait constants, and the path of the lock.
-// So a wait on another lock does not match.
+// lockWaitLine matches the stderr line of a lock wait of a CLI process. The
+// line holds reason, one of the lockWait constants, and the path of the lock,
+// so a wait on another lock does not match.
 func lockWaitLine(reason, lock string) func(line string) bool {
 	return func(line string) bool {
 		return strings.Contains(line, reason) && strings.Contains(line, lock)
@@ -494,11 +502,11 @@ func cliProcessExitCode(t *testing.T, err error) int {
 	return exitErr.ExitCode()
 }
 
-// TestCLIProcess_ContentRulesOnStdoutAndStderr checks the user-facing contract
-// on the real process: content past Zoekt's default trigram cap matches and
-// stdout ends with one newline; a file whose content is not in the index gets
-// one warning on stderr with Zoekt's reason and exit status 1. The in-process
-// tests cover which operands get a warning.
+// TestCLIProcess_ContentRulesOnStdoutAndStderr checks the output rules on the
+// real process. Content past Zoekt's default trigram cap matches, and stdout
+// ends with one newline. A file whose content is not in the index gets one
+// warning on stderr with Zoekt's reason, and the exit status is 1. The
+// in-process tests check which operands get a warning.
 func TestCLIProcess_ContentRulesOnStdoutAndStderr(t *testing.T) {
 	requireTools(t)
 	const warning = "File content is not searchable"

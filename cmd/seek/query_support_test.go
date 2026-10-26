@@ -61,12 +61,14 @@ func TestQuerySupportRowsCoverInventory(t *testing.T) {
 	}
 }
 
-// TestQuerySupportRowsRoute parses each row's example next to two description
-// words (or alone, when the example holds them) and checks that the planner
-// gives the row's role: a description adds its text to the model query, a
-// filter adds no model text and changes the relaxed query, and a modifier
-// leaves the plan of the two words unchanged. The filter rows in
-// strictFilterRows must keep strict ranking.
+// TestQuerySupportRowsRoute parses the example of each row next to two
+// description words, or alone when the example holds them. The planner must
+// give the row its role:
+//   - a description adds its text to the model query;
+//   - a filter adds no model text and changes the relaxed query;
+//   - a modifier leaves the plan of the two words as it is.
+//
+// The filter rows in strictFilterRows must keep strict ranking.
 func TestQuerySupportRowsRoute(t *testing.T) {
 	base := planFor(t, "alpha beta")
 	for _, row := range querySupport {
@@ -120,8 +122,8 @@ func TestQuerySupportRowsRoute(t *testing.T) {
 	}
 }
 
-// TestPlannerIgnoresSpelling checks that the route follows Zoekt's parsed tree:
-// a parse directive changes nothing, and punctuation in a word keeps the
+// TestPlannerIgnoresSpelling checks that the route follows Zoekt's parsed
+// tree. A parse directive changes nothing, and punctuation in a word keeps the
 // query on the model routes.
 func TestPlannerIgnoresSpelling(t *testing.T) {
 	plain := planFor(t, "x y")
@@ -142,9 +144,9 @@ func TestPlannerIgnoresSpelling(t *testing.T) {
 	}
 }
 
-// TestCppFallbackKeepsFilters checks that a programming name that Zoekt
-// rejects does not drop the filters next to it, and that the name parses
-// next to a negation or an OR.
+// TestCppFallbackKeepsFilters gives a programming name that Zoekt rejects.
+// The filters next to it stay, and the name also parses next to a negation or
+// an OR.
 func TestCppFallbackKeepsFilters(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)

@@ -11,11 +11,11 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-// makeFileContent fabricates a fileContent that mimics a reader-side
-// Acquire: it Acquires `size` weight against the shared readSemaphore
-// so subsequent indexDocuments / indexDeltaDocuments accounting can
-// validate that exactly that weight gets Released. Callers MUST hold
-// testReadSemMu for the duration of any accounting comparison.
+// makeFileContent returns a fileContent of payload that holds its read
+// weight, as a reader sends it. It takes len(payload) weight from the shared
+// readSemaphore, so a test can check that indexDocuments or
+// indexDeltaDocuments releases exactly that weight. The caller must hold
+// testReadSemMu while it compares the weights.
 func makeFileContent(t *testing.T, name string, payload []byte) fileContent {
 	t.Helper()
 	weight := int64(len(payload))
@@ -25,9 +25,10 @@ func makeFileContent(t *testing.T, name string, payload []byte) fileContent {
 	return fileContent{name: name, content: payload, weight: weight}
 }
 
-// withReadSemLock serializes accounting tests that observe the shared
-// readSemaphore via availableWeight. It returns a function that checks the
-// final weight and unlocks the test mutex.
+// withReadSemLock locks testReadSemMu for a test that checks the weight of
+// the shared readSemaphore (availableWeight). It returns a function that fails
+// the test when the available weight differs from its start value, and then
+// unlocks.
 func withReadSemLock(t *testing.T) func() {
 	t.Helper()
 	testReadSemMu.Lock()
@@ -44,7 +45,8 @@ func withReadSemLock(t *testing.T) func() {
 }
 
 // TestIndexDocuments_ReleaseAccounting_Success indexes three documents with
-// no error: every acquired byte is released when indexDocuments returns.
+// no error: indexDocuments releases every byte of their weight before it
+// returns.
 func TestIndexDocuments_ReleaseAccounting_Success(t *testing.T) {
 	requireTools(t)
 	done := withReadSemLock(t)
@@ -71,8 +73,8 @@ func TestIndexDocuments_ReleaseAccounting_Success(t *testing.T) {
 	}
 }
 
-// TestIndexDocuments_EmptyChannel_NoLeak — zero docs received → no
-// Acquire happened on this path → no Release should fire.
+// TestIndexDocuments_EmptyChannel_NoLeak gives indexDocuments no document:
+// it releases no weight.
 func TestIndexDocuments_EmptyChannel_NoLeak(t *testing.T) {
 	done := withReadSemLock(t)
 	defer done()
@@ -87,13 +89,10 @@ func TestIndexDocuments_EmptyChannel_NoLeak(t *testing.T) {
 	}
 }
 
-// TestIndexDocuments_BuilderInitFail_ReleasesWeight — when NewBuilder
-// fails (indexDir is a regular file), every already-queued doc must
-// still have its weight Released.
-//
-// Fatal (not Skip) if NewBuilder unexpectedly succeeds: that would
-// mean Zoekt got more permissive and we lost the precondition that
-// makes this test meaningful.
+// TestIndexDocuments_BuilderInitFail_ReleasesWeight makes NewBuilder fail,
+// because indexDir is a regular file. indexDocuments must still release the
+// weight of each queued document. The test fails when NewBuilder succeeds,
+// because it then checks no error path.
 func TestIndexDocuments_BuilderInitFail_ReleasesWeight(t *testing.T) {
 	requireTools(t)
 	done := withReadSemLock(t)
@@ -115,14 +114,15 @@ func TestIndexDocuments_BuilderInitFail_ReleasesWeight(t *testing.T) {
 	}
 }
 
-// TestIndexDeltaDocuments_ReleaseAccounting_Success — same accounting
-// check for the delta entry point.
+// TestIndexDeltaDocuments_ReleaseAccounting_Success indexes two documents in
+// a delta with no error: indexDeltaDocuments releases every byte of their
+// weight before it returns.
 func TestIndexDeltaDocuments_ReleaseAccounting_Success(t *testing.T) {
 	requireTools(t)
 	indexDir := t.TempDir()
 	source := t.TempDir()
 
-	// Seed a prior shard (delta builder requires one).
+	// Seed a prior shard for the delta to build on.
 	{
 		testReadSemMu.Lock()
 		seedCh := make(chan fileContent, 1)
@@ -147,8 +147,9 @@ func TestIndexDeltaDocuments_ReleaseAccounting_Success(t *testing.T) {
 	}
 }
 
-// TestIndexDeltaDocuments_BuilderInitFail_ReleasesWeight — delta-side
-// counterpart. Fatal if NewBuilder doesn't fail.
+// TestIndexDeltaDocuments_BuilderInitFail_ReleasesWeight makes the NewBuilder
+// of indexDeltaDocuments fail, because indexDir is a regular file. The weight
+// of each document must return. The test fails when NewBuilder succeeds.
 func TestIndexDeltaDocuments_BuilderInitFail_ReleasesWeight(t *testing.T) {
 	requireTools(t)
 	done := withReadSemLock(t)
@@ -168,19 +169,18 @@ func TestIndexDeltaDocuments_BuilderInitFail_ReleasesWeight(t *testing.T) {
 	}
 }
 
-// TestIndexDocuments_StressNoLeakUnderRace drives the reader and consumer with
-// cumulative content above a test-local semaphore budget.
-//
-// Uses swapReadSemaphoreForTest so the test stays cheap (~12 MiB of
-// payload) while still driving Acquire queueing through the real
-// production consumer (indexDocuments).
+// TestIndexDocuments_StressNoLeakUnderRace reads 12 MiB of files with the
+// dirty reader into indexDocuments, under a read budget of 4 MiB. The readers
+// queue their Acquires, and the whole budget must return at the end.
+// swapReadSemaphoreForTest sets the small budget, so 12 MiB of files fill it
+// 3 times.
 func TestIndexDocuments_StressNoLeakUnderRace(t *testing.T) {
 	requireTools(t)
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
 	const testBudget int64 = 4 * 1024 * 1024 // 4 MiB
-	const fileSize = 256 * 1024              // 256 KiB → 12 MiB total > budget
+	const fileSize = 256 * 1024              // 48 files of 256 KiB: 12 MiB
 	const numFiles = 48
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
@@ -211,9 +211,9 @@ func TestIndexDocuments_StressNoLeakUnderRace(t *testing.T) {
 	}
 }
 
-// TestReader_ContextCancelled_NoLeak — cancel before any worker starts.
-// Workers must observe ctx.Err() from Acquire and return without
-// touching the semaphore.
+// TestReader_ContextCancelled_NoLeak cancels the context before the dirty
+// reader starts. The Acquire of each worker then fails, and the worker returns
+// with no weight.
 func TestReader_ContextCancelled_NoLeak(t *testing.T) {
 	done := withReadSemLock(t)
 	defer done()
@@ -230,12 +230,12 @@ func TestReader_ContextCancelled_NoLeak(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // already done before any worker starts
+	cancel()
 
-	// Drain whatever races through (a few may have Acquired before
-	// cancel propagated). Release those weights so the accounting
-	// balances. The channel closes after every worker exits, so their
-	// deferred Releases have fired when the loop ends.
+	// A document that arrives holds its weight. The loop releases it, so
+	// done() checks only the weight that the workers keep. The channel closes
+	// after every worker exits, so their deferred releases have run when the
+	// loop ends.
 	documents, check := streamDirtyFilesAsTextIndex(t, ctx, dir, files, 4)
 	for fc := range documents {
 		readSemaphore.Release(fc.weight)
@@ -243,10 +243,10 @@ func TestReader_ContextCancelled_NoLeak(t *testing.T) {
 	check()
 }
 
-// TestReader_OpenFails_NoLeak — a file that passes Lstat but fails
-// Open must Release its Acquired weight via the worker sentinel.
-// Reliable trigger: a regular file chmod-ed to 0 (unreadable for
-// non-root processes on Linux and macOS).
+// TestReader_OpenFails_NoLeak reads a file whose Lstat passes and whose open
+// fails: a regular file with mode 000. The worker must release the weight that
+// it took for the file. The test fails when the test user can open the file,
+// as root can.
 func TestReader_OpenFails_NoLeak(t *testing.T) {
 	done := withReadSemLock(t)
 	defer done()
@@ -278,12 +278,12 @@ func TestReader_OpenFails_NoLeak(t *testing.T) {
 		got[0].skipReason != seekNoBytesReason {
 		t.Fatalf("documents=%+v, want one name-only document for the unreadable file", got)
 	}
-	// withReadSemLock's done() asserts the semaphore returned to baseline.
+	// done() checks that the readSemaphore weight returned to its start value.
 }
 
-// TestReader_SymlinkRejected_NoLeak — symlinks must be skipped before
-// Acquire (they fail the IsRegular check in readOneDirtyFile). No
-// weight should be Acquired and no release needed.
+// TestReader_SymlinkRejected_NoLeak reads a symlink. readOneDirtyFile skips
+// it before Acquire, because it is not a regular file. So the reader sends no
+// document and takes no weight.
 func TestReader_SymlinkRejected_NoLeak(t *testing.T) {
 	done := withReadSemLock(t)
 	defer done()
@@ -306,36 +306,37 @@ func TestReader_SymlinkRejected_NoLeak(t *testing.T) {
 	check()
 }
 
-// TestReader_BackPressureQueuesAcquires tests the contract of
-// streamDirtyFiles: when the bytes in flight reach the budget, the readers
-// queue their Acquires, and every file still reaches the channel. The test is
-// the consumer: it keeps each document with its weight, and releases the
-// weight of a full round at once. It is not the production consumer
-// indexDocuments, which releases the weight of a normal document when
-// Builder.Add returns, so this is not an end-to-end semaphore test.
+// TestReader_BackPressureQueuesAcquires tests the contract of streamDirtyFiles.
+// When the weight that the documents hold reaches the budget, the readers queue
+// their Acquires, and every file still reaches the channel. The test is the
+// consumer: it keeps each document with its weight, and releases the weight of
+// a full round at once. The production consumer indexDocuments releases the
+// weight of a normal document when Builder.Add returns. So this is no
+// end-to-end semaphore test.
 //
 // TestEnsureFolderCorpusFresh_ManySmallFilesOverBudget (end to end) and
-// TestIndexDocuments_ReadsBeyondTheBudget (consumer only) cover the
+// TestIndexDocuments_ReadsBeyondTheBudget (consumer only) test the
 // production reader and consumer under back-pressure.
 //
-// A test semaphore with a small budget (swapReadSemaphoreForTest) forces
-// the queue without writing hundreds of MiB to disk. The read runs in a
-// synctest bubble, where synctest.Wait returns only when each reader waits on
-// its send or its Acquire. So when no document is ready after synctest.Wait,
-// the readers wait for weight, and the test holds the documents that fill the
+// A test semaphore with a small budget (swapReadSemaphoreForTest) makes the
+// readers queue with only 64 MiB of files. The read runs in a synctest
+// bubble, where synctest.Wait returns only when each reader waits on its send
+// or its Acquire. So when no document is ready after synctest.Wait, the
+// readers wait for weight, and the test holds the documents that fill the
 // budget.
 //
-// All bounds derive from `testBudget` and `fileSize`, so the assertions
-// stay consistent when these constants change.
+// All bounds come from testBudget and fileSize, so the checks stay true when
+// these constants change.
 func TestReader_BackPressureQueuesAcquires(t *testing.T) {
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
 	const testBudget = 16 * 1024 * 1024 // 16 MiB
-	const fileSize = 4 * 1024 * 1024    // 4 MiB → budget/file = 4
+	const fileSize = 4 * 1024 * 1024    // 4 MiB: 4 files fill the budget
 	const expectedPeakLimit = testBudget / fileSize
-	const parallelism = 2 * expectedPeakLimit // 8 → forces queueing
-	const numFiles = 4 * expectedPeakLimit    // 16 → multiple rounds
+	// 8 readers: twice what the budget holds.
+	const parallelism = 2 * expectedPeakLimit
+	const numFiles = 4 * expectedPeakLimit // 16 files: 4 rounds
 
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
@@ -399,16 +400,14 @@ func TestReader_BackPressureQueuesAcquires(t *testing.T) {
 	})
 }
 
-// swapReadSemaphoreForTest replaces the package-level readSemaphore
-// with a fresh one of the given budget for the test's lifetime.
-// Caller MUST hold testReadSemMu — both for accounting comparisons
-// AND for the swap itself: production goroutines reading readSemaphore
-// concurrently with this reassignment would be a data race. Tests
-// that use this helper are serialized by the lock by convention.
+// swapReadSemaphoreForTest replaces readSemaphore with a new semaphore of
+// budget until the returned function restores it. The caller must hold
+// testReadSemMu for the swap and for each weight check. A production goroutine
+// that reads readSemaphore during the swap would race with it.
 //
-// Also shrinks indexWindowBytes proportionally, so the large-document
-// windows, the delta payload limits, and the build slots fit the new
-// (smaller) budget.
+// It also sets the build slots to budget and the index window
+// (indexWindowBytes) to half of budget. So the large-document windows, the
+// delta payload limits, and the build slots fit the small budget.
 func swapReadSemaphoreForTest(budget int64) func() {
 	mustHoldTestReadSemMu()
 	old := readSemaphore
@@ -426,11 +425,9 @@ func swapReadSemaphoreForTest(budget int64) func() {
 	}
 }
 
-// mustHoldTestReadSemMu panics if testReadSemMu is not held by some
-// goroutine. Catches the "forgot the lock" bug that would silently
-// race readSemaphore swaps with concurrent production reads if a
-// future test added t.Parallel(). TryLock is reverse-logic: success
-// means nobody held the lock when we tried.
+// mustHoldTestReadSemMu panics when no goroutine holds testReadSemMu. A swap
+// without the lock would race with the production reads of a parallel test.
+// A TryLock that succeeds proves that no goroutine held the lock.
 func mustHoldTestReadSemMu() {
 	if testReadSemMu.TryLock() {
 		testReadSemMu.Unlock()
@@ -438,12 +435,10 @@ func mustHoldTestReadSemMu() {
 	}
 }
 
-// swapIndexWindowBytesForTest sets the index window (indexWindowBytes) for
-// the duration of a test. swapReadSemaphoreForTest calls it with half of
-// the test budget.
-//
-// Caller MUST hold testReadSemMu for the entire swap → action → restore
-// sequence.
+// swapIndexWindowBytesForTest sets the index window (indexWindowBytes) until
+// the returned function restores it. swapReadSemaphoreForTest calls it with
+// half of the test budget. The caller must hold testReadSemMu from the swap to
+// the restore.
 func swapIndexWindowBytesForTest(window int64) func() {
 	mustHoldTestReadSemMu()
 	old := indexWindowBytes
@@ -451,9 +446,10 @@ func swapIndexWindowBytesForTest(window int64) func() {
 	return func() { indexWindowBytes = old }
 }
 
-// setupPressureTest bundles the boilerplate every pressure test repeats:
-// require ctags, hold testReadSemMu, swap the readSemaphore + window
-// budget, and check for leaked goroutines. It returns the restore function.
+// setupPressureTest prepares a pressure test. It requires the tools
+// (requireTools), locks testReadSemMu, sets a read budget of budget
+// (swapReadSemaphoreForTest), and starts goroutineLeakGuard. It returns the
+// function that undoes these steps:
 //
 //	defer setupPressureTest(t, testBudget)()
 func setupPressureTest(t *testing.T, budget int64) func() {
@@ -469,21 +465,19 @@ func setupPressureTest(t *testing.T, budget int64) func() {
 	}
 }
 
-// TestFolderReader_FileGrew_NoLeak — when readFolderFile detects that the
-// file grew past its walk size during the read, it returns
-// errFolderFileGrew. streamFolderFilesWithMarkers must release the semaphore
-// weight it Acquired for the pre-read size (readWeight). The error is
-// lasting (folderReadIsLasting), so it does not stop the read, and the file
-// stays searchable by name only.
+// TestFolderReader_FileGrew_NoLeak reads a file that is larger than its walk
+// size, so readFolderFile returns errFolderFileGrew.
+// streamFolderFilesWithMarkers must release the weight that it took for the
+// walk size (readWeight). The error is lasting (folderReadIsLasting). So the
+// read continues, and the file stays searchable by name only.
 func TestFolderReader_FileGrew_NoLeak(t *testing.T) {
 	done := withReadSemLock(t)
 	defer done()
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "grew.go")
-	// Write more bytes than the candidate claims, so readFolderFile's
-	// post-read extra-byte check trips the "file grew beyond its stat size"
-	// branch.
+	// Write more bytes than the candidate states, so the extra-byte check of
+	// readFolderFile finds the growth.
 	const claimedSize = 16
 	if err := os.WriteFile(path, []byte("package grew_more_than_claimed\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -497,7 +491,7 @@ func TestFolderReader_FileGrew_NoLeak(t *testing.T) {
 		name:  "grew.go",
 		path:  path,
 		mode:  info.Mode(),
-		size:  claimedSize, // lies about size to trigger the grew check
+		size:  claimedSize, // smaller than the file
 		mtime: mtime,
 		dev:   dev,
 		ino:   ino,
@@ -521,7 +515,7 @@ func TestFolderReader_FileGrew_NoLeak(t *testing.T) {
 	}
 }
 
-// testFileName returns a short per-test filename.
+// testFileName returns the file name <prefix>_<i>.go.
 func testFileName(prefix string, i int) string {
 	return prefix + "_" + strconv.Itoa(i) + ".go"
 }

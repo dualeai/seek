@@ -47,8 +47,8 @@ func TestFolderBusyWriterColdSearchSucceeds(t *testing.T) {
 }
 
 // TestFolderUnreadableSubfolderWarns walks a folder with an unreadable
-// subfolder: the other files are found, and one WARN gives the count and the
-// first path.
+// subfolder. The search finds the other files, and one WARN gives the count
+// and the first path, with its symlinks resolved.
 func TestFolderUnreadableSubfolderWarns(t *testing.T) {
 	requireTools(t)
 	const marker = "zqunreadablemarker"
@@ -56,6 +56,10 @@ func TestFolderUnreadableSubfolderWarns(t *testing.T) {
 	f.graphFile("folder/ok.txt", marker)
 	f.graphFile("folder/locked/hidden.txt", marker)
 	locked := f.path("folder/locked")
+	realLocked, err := filepath.EvalSymlinks(locked)
+	if err != nil {
+		t.Fatal(err)
+	}
 	chmodUnreadableOrFatal(t, locked, 0)
 	setTestUserCache(t)
 	logs := captureTestLogs(t, slog.LevelWarn)
@@ -68,8 +72,8 @@ func TestFolderUnreadableSubfolderWarns(t *testing.T) {
 		attrs := testLogAttrs(record)
 		if strings.Contains(record.Message, "could not be read") {
 			warnings = append(warnings, record.Message)
-			if attrs["folders"] != int64(1) || attrs["first"] != canonicalCorpusPath(locked) {
-				t.Fatalf("warning attrs=%v, want folders=1 first=%s", attrs, locked)
+			if attrs["folders"] != int64(1) || attrs["first"] != realLocked {
+				t.Fatalf("warning attrs=%v, want folders=1 first=%s", attrs, realLocked)
 			}
 		}
 	}
@@ -80,7 +84,7 @@ func TestFolderUnreadableSubfolderWarns(t *testing.T) {
 
 // TestFolderWalkVisitedSet reports two sibling directories with one
 // (dev, ino), as two mounts of one directory would. The walk keeps the one
-// with the smallest path, every time.
+// with the smallest path, and gives the same state hash, every time.
 func TestFolderWalkVisitedSet(t *testing.T) {
 	root := canonTempDir(t)
 	writeFixtureFile(t, filepath.Join(root, "a", "x.txt"), "x\n")
@@ -119,7 +123,8 @@ func TestFolderWalkVisitedSet(t *testing.T) {
 }
 
 // TestFolderDatalessNameOnly marks a file as cloud-only (SF_DATALESS). The
-// walk never reads it: it is searchable by name only, and counted.
+// build never reads its bytes: the file is searchable by name only, and the
+// name-only notice counts it.
 func TestFolderDatalessNameOnly(t *testing.T) {
 	requireTools(t)
 	const marker = "zqdatalessmarker"
@@ -376,8 +381,8 @@ func TestFolderUnreadableFileInWarmFolderByName(t *testing.T) {
 	}
 }
 
-// TestFolderUnreadableTwoFoldersWarnOnce seeds outer and outer/z with an
-// unreadable folder under each of outer/a and outer/z: only the kept node
+// TestFolderUnreadableTwoFoldersWarnOnce seeds outer and outer/z, with an
+// unreadable folder under each of outer/a and outer/z. Only the kept node
 // (outer) warns, once, whatever the name order. Each of three searches gives
 // exactly one warning.
 func TestFolderUnreadableTwoFoldersWarnOnce(t *testing.T) {
@@ -451,12 +456,27 @@ func TestSFDatalessFlag(t *testing.T) {
 	}
 }
 
+// onColdBuildWait runs act while a cold search of folder waits for the build
+// lock that the test holds. The search waits after its walk and before its
+// build opens a file. It returns the channel that lockWaitActed reads.
+func onColdBuildWait(t *testing.T, folder string, act func() error) <-chan error {
+	t.Helper()
+	plans, err := planCorpora(t.Context(), []string{folder})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%d err=%v", len(plans), err)
+	}
+	release := holdBuildLock(t, plans[0].cacheDir)
+	_, waiting := captureTestLogsWithSignal(t, slog.LevelWarn, lockWaitBuild, filepath.Join(plans[0].cacheDir, buildLockFile))
+	return onLockWait(t, waiting, act, release)
+}
+
 // TestFolderFileReplacedByFIFOAfterWalkDoesNotBlock replaces a walked file
-// with a FIFO just before the build opens it. The open does not block on the
-// FIFO, the build reads the file as removed, and the search finds the other
-// file. The query lists file names, so a FIFO indexed as an empty file shows.
-// A build that blocks on the FIFO runs until the go test timeout, which prints
-// each goroutine.
+// with a FIFO before the build opens it: the test does it while the cold
+// search waits for the build lock. The open does not block on the FIFO, the
+// build reads the file as removed, and the search finds the other file. The
+// query lists file names, so a FIFO indexed as an empty file shows. A build
+// that blocks on the FIFO runs until the go test timeout, which prints each
+// goroutine.
 func TestFolderFileReplacedByFIFOAfterWalkDoesNotBlock(t *testing.T) {
 	const marker = "zqfifomarker"
 	const query = "type:file txt"
@@ -464,32 +484,26 @@ func TestFolderFileReplacedByFIFOAfterWalkDoesNotBlock(t *testing.T) {
 	f.graphFile("folder/a.txt", marker)
 	f.graphFile("folder/b.txt", marker)
 	setTestUserCache(t)
-	saved := folderOpenFile
-	var replaced bool
-	folderOpenFile = func(path string) (*os.File, error) {
-		if filepath.Base(path) == "a.txt" && !replaced {
-			replaced = true
-			if err := os.Remove(path); err != nil {
-				return nil, err
-			}
-			if err := unix.Mkfifo(path, 0o644); err != nil {
-				return nil, err
-			}
+	path := f.path("folder/a.txt")
+	acted := onColdBuildWait(t, f.path("folder"), func() error {
+		if err := os.Remove(path); err != nil {
+			return err
 		}
-		return saved(path)
-	}
-	t.Cleanup(func() { folderOpenFile = saved })
+		return unix.Mkfifo(path, 0o644)
+	})
 	out, err := seek(t, "--lexical-only", query, f.path("folder"))
-	if err != nil || !replaced || !strings.Contains(out, "b.txt") || strings.Contains(out, "a.txt") {
-		t.Fatalf("replaced=%t err=%v output:\n%s", replaced, err, out)
+	lockWaitActed(t, acted)
+	if err != nil || !strings.Contains(out, "b.txt") || strings.Contains(out, "a.txt") {
+		t.Fatalf("err=%v output:\n%s", err, out)
 	}
 }
 
-// TestFolderFileReplacedAfterWalkReadsAsRemoved replaces a walked file just
-// before the build opens it: with a socket, with a symlink, or with a file in
-// place of its directory. The open fails before any fstat; the build reads
-// the file as removed and the search finds the other file. The query lists
-// file names, so a file indexed by name only shows.
+// TestFolderFileReplacedAfterWalkReadsAsRemoved replaces a walked file before
+// the build opens it: the test does it while the cold search waits for the
+// build lock. The replacement is a socket, a symlink, or a file in place of
+// its directory. The open fails before any fstat. The build reads the file as
+// removed, and the search finds the other file. The query lists file names, so
+// a file indexed by name only shows.
 func TestFolderFileReplacedAfterWalkReadsAsRemoved(t *testing.T) {
 	const marker = "zqreplacedmarker"
 	const query = "type:file txt"
@@ -531,21 +545,11 @@ func TestFolderFileReplacedAfterWalkReadsAsRemoved(t *testing.T) {
 			setTestUserCache(t)
 			folder := f.path("folder")
 			t.Chdir(folder)
-			saved := folderOpenFile
-			var replaced bool
-			folderOpenFile = func(path string) (*os.File, error) {
-				if filepath.Base(path) == test.target && !replaced {
-					replaced = true
-					if err := test.replace(t, folder); err != nil {
-						return nil, err
-					}
-				}
-				return saved(path)
-			}
-			t.Cleanup(func() { folderOpenFile = saved })
+			acted := onColdBuildWait(t, folder, func() error { return test.replace(t, folder) })
 			out, err := seek(t, "--lexical-only", query, folder)
-			if err != nil || !replaced || !strings.Contains(out, "b.txt") || strings.Contains(out, test.target) {
-				t.Fatalf("replaced=%t err=%v output:\n%s", replaced, err, out)
+			lockWaitActed(t, acted)
+			if err != nil || !strings.Contains(out, "b.txt") || strings.Contains(out, test.target) {
+				t.Fatalf("err=%v output:\n%s", err, out)
 			}
 		})
 	}

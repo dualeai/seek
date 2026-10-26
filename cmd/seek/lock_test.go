@@ -235,14 +235,15 @@ func TestAcquireReadLock_WaitsForPublishUntilCancel(t *testing.T) {
 	})
 }
 
-// lockWaitProof is how long, in the fake time of a synctest bubble, a lock
-// test holds a lock that another wait needs, so that a lock wait with a
-// deadline fails the test.
+// lockWaitProof is how long a lock test holds a lock that another wait needs,
+// in the fake time of a synctest bubble. So a lock wait with a deadline fails
+// the test.
 const lockWaitProof = time.Hour
 
 // TestAcquireBuildLock_WaitsForAnotherBuildUntilCancel holds the build lock
-// of a node with no shard through a second open file, as another build does.
-// flock locks an open file, so one process can hold the lock against itself.
+// of a node with no shard, as another build does. It holds the lock through a
+// second open file. flock locks an open file, so one process can hold the
+// lock against itself.
 // The build waits until its context ends, with no deadline. Once the other
 // build ends, the same wait gets the lock, however long that build took. The
 // test runs in a synctest bubble, so each hold lasts lockWaitProof of fake
@@ -358,7 +359,7 @@ func TestLockWaitSignalNamesTheLock(t *testing.T) {
 }
 
 // TestLockOrderNoReadLockWhileWaitingForPublish proves that a build or
-// publish lock wait under a read lock fails as a Seek defect, so any route
+// publish lock wait under a read lock fails as a Seek defect. So any route
 // that takes that order fails the suite.
 func TestLockOrderNoReadLockWhileWaitingForPublish(t *testing.T) {
 	dir := t.TempDir()
@@ -384,7 +385,7 @@ func TestLockOrderNoReadLockWhileWaitingForPublish(t *testing.T) {
 }
 
 // TestTwoColdSearchesSameNode runs two searches of one cold node at the same
-// time: one builds, the other waits for that build with no deadline, and both
+// time. One builds, the other waits for that build with no deadline, and both
 // answer.
 func TestTwoColdSearchesSameNode(t *testing.T) {
 	requireTools(t)
@@ -449,9 +450,10 @@ func TestColdSearchWaitsForAnotherProcessBuild(t *testing.T) {
 	}
 }
 
-// TestAcquireBuildLock_TouchesUsedAtStart proves that a build bumps the
-// corpus .used at start so a concurrent gc cannot evict it in the window
-// between the build releasing the lock and the search re-opening the corpus.
+// TestAcquireBuildLock_TouchesUsedAtStart proves that a build touches the
+// .used file of the corpus when it starts. So a concurrent gc cannot evict
+// the corpus between the lock release of the build and the next open by the
+// search.
 func TestAcquireBuildLock_TouchesUsedAtStart(t *testing.T) {
 	dir := t.TempDir()
 	indexDir := filepath.Join(dir, "index")
@@ -500,18 +502,20 @@ func TestPollLockRetriesOnlyAHeldLock(t *testing.T) {
 	}
 }
 
-// TestReaderDoesNotWaitForAFullRebuild holds a full uncommitted rebuild on
-// one file read, in this process, until a search in another process ends: the
-// family builds before the publish lock, so the search reads the live index
-// at once. A search that waits for a lock writes the debug line of its wait;
-// the test then ends the hold, so it fails instead of hanging.
+// TestReaderDoesNotWaitForAFullRebuild holds a full uncommitted rebuild in
+// this process until a search in another process ends. The hold is in the
+// debug line of the failed open of locked.txt, a dirty file of mode 000. The
+// family builds before the publish lock, so the search reads the live index at
+// once. A search that waits for a lock writes the debug line of its wait. The
+// test then ends the hold, so it fails and does not hang.
 func TestReaderDoesNotWaitForAFullRebuild(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
 	repo := f.GitRepo("repo", "a.txt", "committed\n")
-	for _, name := range []string{"a.txt", "b.txt"} {
+	for _, name := range []string{"a.txt", "b.txt", "locked.txt"} {
 		writeFixtureFile(t, filepath.Join(repo, name), "zqreader "+name+"\n")
 	}
+	chmodUnreadableOrFatal(t, filepath.Join(repo, "locked.txt"), 0)
 	cacheDir := t.TempDir()
 	t.Setenv("SEEK_CACHE_DIR", cacheDir)
 	if _, err := seek(t, "--lexical-only", "zqreader", repo); err != nil {
@@ -524,21 +528,13 @@ func TestReaderDoesNotWaitForAFullRebuild(t *testing.T) {
 	if err := os.Remove(filepath.Join(plans[0].cacheDir, stateFile)); err != nil {
 		t.Fatal(err)
 	}
-	realOpen := dirtyOpenFile
-	t.Cleanup(func() { dirtyOpenFile = realOpen })
 	reading, held := make(chan struct{}), make(chan struct{})
 	endHold := sync.OnceFunc(func() { close(held) })
 	t.Cleanup(endHold)
-	var hold sync.Once
-	dirtyOpenFile = func(path string) (*os.File, error) {
-		if filepath.Base(path) == "b.txt" {
-			hold.Do(func() {
-				close(reading)
-				<-held
-			})
-		}
-		return realOpen(path)
-	}
+	captureTestLogsWithAction(t, slog.LevelWarn, "Indexing an unreadable uncommitted file by name only", func() {
+		close(reading)
+		<-held
+	})
 	built := make(chan error, 1)
 	go func() {
 		_, err := seek(t, "--lexical-only", "zqreader", repo)
@@ -547,7 +543,7 @@ func TestReaderDoesNotWaitForAFullRebuild(t *testing.T) {
 	select {
 	case <-reading:
 	case err := <-built:
-		t.Fatalf("the rebuild ended before it read b.txt: %v", err)
+		t.Fatalf("the rebuild ended before it read locked.txt: %v", err)
 	}
 	// Each lock wait ends the hold, so a reader that waits fails the test.
 	anyWait := func(line string) bool {
@@ -629,6 +625,29 @@ func holdReadLock(t *testing.T, cacheDir string) (release func()) {
 	if err := acquireReadLock(t.Context(), lock); err != nil {
 		_ = lock.Close()
 		t.Fatalf("hold the read lock: %v", err)
+	}
+	release = sync.OnceFunc(func() { releaseLock(lock) })
+	t.Cleanup(release)
+	return release
+}
+
+// holdBuildLock takes the build lock of cacheDir, as another build of the node
+// does (acquireBuildLock). A build of a node with no shard waits for it before
+// it reads a file. It makes cacheDir for a node that no search has built. The
+// returned release frees the lock; it runs once, and the test cleanup also
+// runs it.
+func holdBuildLock(t *testing.T, cacheDir string) (release func()) {
+	t.Helper()
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.OpenFile(filepath.Join(cacheDir, buildLockFile), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockFileExclusive(lock); err != nil {
+		_ = lock.Close()
+		t.Fatalf("hold the build lock: %v", err)
 	}
 	release = sync.OnceFunc(func() { releaseLock(lock) })
 	t.Cleanup(release)

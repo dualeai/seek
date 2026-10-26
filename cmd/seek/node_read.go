@@ -69,7 +69,8 @@ func openNodeRead(ctx context.Context, plan node, dirty dirtyFileSet) (*nodeRead
 
 // shards loads the node's shards once per read. The load starts at the first
 // search, so a read that returns before any search loads nothing. An index
-// with no shard gives an empty load: the search then reports the damage.
+// with no shard gives an empty load: the search then reports the damage. Each
+// load writes one debug line; tests count these lines.
 //
 // The read holds the read lock, so the shard list cannot interleave with a
 // successful swap; the folder delta lists its own build directory.
@@ -92,7 +93,6 @@ func (r *nodeRead) shards(ctx context.Context) (nodeShards, error) {
 			return
 		}
 		r.loaded = nodeShards{searchers: searchers, paths: paths, current: current}
-		nodeShardLoads.Add(1)
 		slog.Debug("Loaded the node's shards", "root", r.plan.displayRoot, "shards", len(searchers))
 	})
 	return r.loaded, r.loadErr

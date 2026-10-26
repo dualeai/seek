@@ -16,12 +16,12 @@ import (
 
 // This command protocol is the only reader for committed Git data. The full
 // and the delta committed builds both use it with captured full object IDs.
-// There is no go-git or zoekt/gitindex fallback. Git reads
-// the objects; index.Builder writes the resulting documents to staging.
+// There is no go-git or zoekt/gitindex fallback. Git reads the objects, and
+// index.Builder writes the documents to staging.
 //
-// Full scans use ls-tree, then one buffered batch-command session. `info`
-// gets blob sizes before `contents` asks for approved bodies. This keeps
-// oversize bodies out of the content stream. Each protocol window handles at
+// A full scan uses ls-tree, then one buffered batch-command session. `info`
+// gets the blob sizes before `contents` asks for the accepted bodies. So no
+// oversize body enters the content stream. Each protocol window handles at
 // most gitObjectBatchSize objects. A delta uses one session to size the new
 // blobs and read the old ones, and a second session to read the new bodies. A
 // malformed or short reply, a write error, or a failed child rejects the
@@ -41,16 +41,23 @@ const (
 // name only; in another repository, it is an error.
 var errGitBlobMissing = errors.New("git blob is missing locally")
 
+// errNativeGitDeltaTooLarge stops a diff with more entries than its limit
+// (readNativeGitDiff).
 var errNativeGitDeltaTooLarge = errors.New("native Git delta has too many changed paths")
 
+// gitObjectID is a full lowercase hexadecimal Git object ID: 40 characters
+// for SHA-1, 64 for SHA-256.
 type gitObjectID string
 
+// gitTreeEntry is one ls-tree record: the mode, the object ID, and the path.
 type gitTreeEntry struct {
 	mode string
 	oid  gitObjectID
 	path string
 }
 
+// gitBlobInfo is the `info` reply of one blob. oversize marks a blob too large
+// for the index; missing marks a blob that a partial clone does not have.
 type gitBlobInfo struct {
 	entry    gitTreeEntry
 	size     int64
@@ -64,8 +71,8 @@ func (info gitBlobInfo) nameOnly() bool {
 }
 
 // nameOnlyDocument is the index document of a blob whose content Seek does not
-// read: Seek's no-bytes reason for a missing blob, the too-large reason for
-// an oversize one.
+// read. A missing blob gets Seek's no-bytes reason, and an oversize one gets
+// the too-large reason.
 func (info gitBlobInfo) nameOnlyDocument() fileContent {
 	if info.missing {
 		return fileContent{name: info.entry.path, skipReason: seekNoBytesReason}
@@ -179,6 +186,8 @@ func (b *boundedGitStderr) String() string {
 	return strings.TrimSpace(out.String())
 }
 
+// nativeGitReadError wraps a read error of a Git child with operation. It
+// returns the context error when the search was canceled.
 func nativeGitReadError(ctx context.Context, operation string, err error) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
@@ -190,6 +199,8 @@ func waitNativeGitChild(ctx context.Context, cmd *exec.Cmd, operation string, st
 	return gitCommandError(ctx, operation, cmd.Wait(), stderr)
 }
 
+// abortNativeGitChild closes stdin when it is set, kills the Git child, and
+// waits for it.
 func abortNativeGitChild(cmd *exec.Cmd, stdin io.Closer) {
 	if stdin != nil {
 		_ = stdin.Close()
@@ -198,6 +209,8 @@ func abortNativeGitChild(cmd *exec.Cmd, stdin io.Closer) {
 	_ = cmd.Wait()
 }
 
+// readExactEOF reports an error unless reader is at its end, so trailing
+// output of Git fails the read.
 func readExactEOF(reader io.Reader) error {
 	var one [1]byte
 	n, err := reader.Read(one[:])
@@ -213,6 +226,9 @@ func readExactEOF(reader io.Reader) error {
 	}
 }
 
+// parseNativeGitTreeRecord parses one NUL-terminated `ls-tree -z` record. It
+// accepts the blob modes 100644, 100755, and 120000, and the submodule mode
+// 160000 with the type commit.
 func parseNativeGitTreeRecord(record []byte) (gitTreeEntry, error) {
 	if len(record) == 0 || record[len(record)-1] != 0 {
 		return gitTreeEntry{}, fmt.Errorf("git tree record has no final NUL")
@@ -253,6 +269,8 @@ func parseNativeGitTreeRecord(record []byte) (gitTreeEntry, error) {
 	return gitTreeEntry{mode: mode, oid: oid, path: string(path)}, nil
 }
 
+// readNativeGitTreeRecords runs the Git ls-tree command of args and passes its
+// records to consume in groups of at most gitObjectBatchSize.
 func readNativeGitTreeRecords(
 	ctx context.Context,
 	repoDir string,
@@ -386,12 +404,12 @@ func parseNativeGitBatchHeader(header []byte, want gitObjectID, wantSize *int64)
 	return size, nil
 }
 
-// readNativeGitBlobs emits entries in input order and does not request the
-// bodies of name-only blobs (oversize or missing). For each other document, it
-// acquires readSemaphore weight before it calls consume. A successful call
-// transfers release ownership to the consumer. A binary blob goes to consume
-// by name only, with its weight already released. This function releases the
-// current weight if reading or consuming fails.
+// readNativeGitBlobs gives the entries to consume in input order. It does not
+// ask for the bodies of name-only blobs (oversize or missing). For each other
+// document, it takes readSemaphore weight before it calls consume. After a
+// successful call, the consumer releases the weight. A binary blob goes to
+// consume by name only, with its weight already released. This function
+// releases the current weight when the read or consume fails.
 func readNativeGitBlobs(
 	ctx context.Context,
 	repoDir string,

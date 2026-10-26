@@ -12,8 +12,9 @@ type gitSnapshot struct {
 }
 
 // captureGitSnapshot verifies the form of a full SHA-1 or SHA-256 commit ID.
-// It runs no Git process: the git status call that captured the ID read the
-// commit and its tree, and it fails ("bad object HEAD") when either is missing.
+// It runs no Git process. The git status call that captured the ID read the
+// commit and its tree, and that call fails ("bad object HEAD") when either is
+// missing.
 // A commit that disappears after that call fails the build that reads it, and
 // the build then checks the commit (capturedCommitMissing). A separate check
 // here costs one Git process per committed build and delta. The "no-head"
@@ -71,10 +72,10 @@ func streamNativeGitDocuments(
 	return streamCountedNativeGitDocuments(ctx, repoDir, snapshot, missing, nil)
 }
 
-// streamCountedNativeGitDocuments is streamNativeGitDocuments that also adds
-// the content bytes that the shard documents of the sent documents hold
-// (heldContentBytes) to contentBytes, when it is set, before the error channel
-// gets its value. A binary blob then counts as its marker.
+// streamCountedNativeGitDocuments is streamNativeGitDocuments that also counts
+// content. When contentBytes is set, it adds the bytes that the shard documents
+// of the sent documents hold (heldContentBytes). It adds them before the error
+// channel gets its value. A binary blob then counts as its marker.
 func streamCountedNativeGitDocuments(
 	ctx context.Context,
 	repoDir string,

@@ -14,18 +14,18 @@ import (
 //
 // The fine scorer reads these values directly with NumKong's binary16 dot
 // products (semantic_numkong.go), and it rounds the query tokens to binary16
-// too. Against float64 scores of the float32 vectors, this rounding moved a
-// fine MeanMaxSim by at most 5.3e-5 at 13 query tokens and by at most 3.4e-5
-// at 32 tokens, in a measurement on 20,000 rows of random unit vectors.
+// too. A measurement on 20,000 rows of random unit vectors compared this
+// rounding with float64 scores of the float32 vectors. It moved a fine
+// MeanMaxSim by at most 5.3e-5 at 13 query tokens and 3.4e-5 at 32 tokens.
 const (
 	semanticVectorCodec            = "f16-le-rne-v1"
 	semanticFineVectorBytesPerUnit = semanticFineCentroidsPerUnit * semanticEmbeddingDimensions * 2
 	// semanticF16SquaredNormTolerance limits the squared norm of a stored
-	// vector. It covers the accepted input norm (0.001), the binary16 rounding
-	// (a relative error of at most 2^-11 for each component, so at most
-	// 0.000978 more), and the float32 sum of the check. The worst valid vector
-	// stays below 0.001982. TestSemanticF16NormToleranceCoversRounding checks
-	// the bound.
+	// vector. It covers three errors. An accepted input squared norm differs
+	// from 1 by up to 0.001. The binary16 rounding has a relative error of at
+	// most 2^-11 for each component, so it adds at most 0.000978. The check
+	// sums in float32. The worst valid vector stays below 0.001982.
+	// TestSemanticF16NormToleranceCoversRounding checks the bound.
 	semanticF16SquaredNormTolerance = 0.002
 )
 

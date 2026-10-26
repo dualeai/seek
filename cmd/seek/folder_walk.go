@@ -17,21 +17,21 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// gitEntryName is the name of the Git entry that no folder walk indexes: a Git
+// gitEntryName is the name of the Git entry that no folder walk indexes. A Git
 // directory holds Git internals, and a `.git` file only points to one. Names
 // compare without case: on a case-insensitive file system Git finds ".GIT".
 const gitEntryName = ".git"
 
 // folderCapture is what the graph expansion's walk of a folder node found. The
 // state and the files serve every preparation of the command until a route
-// sees the tree change; the skip set serves every walk of the node. The graph
+// sees the tree change. The skip set serves every walk of the node. The graph
 // expansion warns about the unreadable folders of a kept node only.
 type folderCapture struct {
 	folderWalk
 	stale atomic.Bool
 	// skipDirs are the directories below the root that hold no content of
-	// this node: Git nodes, failed nodes, bare repositories, and directories
-	// that the walk could not read (recordUnreadable).
+	// this node. They are Git nodes, failed nodes, bare repositories, and
+	// directories that the walk could not read (recordUnreadable).
 	skipDirs map[string]struct{}
 }
 
@@ -109,7 +109,9 @@ type dirIdentity struct {
 	dev, ino uint64
 }
 
-// folderDirIdentity reads the identity of an open directory. Tests replace it.
+// folderDirIdentity reads the identity of an open directory. Tests replace it
+// to give two directories one identity, as a bind mount of a directory does.
+// Only root can make a bind mount, so a test cannot make that tree on disk.
 var folderDirIdentity = func(f *os.File) (dirIdentity, error) {
 	var st unix.Stat_t
 	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
@@ -118,15 +120,17 @@ var folderDirIdentity = func(f *os.File) (dirIdentity, error) {
 	return dirIdentity{dev: uint64(st.Dev), ino: uint64(st.Ino)}, nil
 }
 
-// fileIsDataless reports a cloud-only file. Tests replace it.
+// fileIsDataless reports a cloud-only file (SF_DATALESS). Tests replace it to
+// mark a file as cloud-only. Only the macOS file provider sets that flag: the
+// kernel drops it from a chflags call, and Linux has no such flag.
 var fileIsDataless = func(_ string, st *unix.Stat_t) bool {
 	return statDataless(st)
 }
 
 // walkFolderNode walks one folder node. Directories go through one shared
 // queue that every worker takes from (GOMAXPROCS workers). Each directory gets
-// its own digest, and the state hash combines the digests in the order of
-// their relative paths, so worker timing never changes it. found is set only
+// its own digest. The state hash combines the digests in the order of their
+// relative paths, so worker timing never changes it. found is set only
 // for the graph expansion's walk, which records the boundaries; every later
 // walk skips the recorded directories.
 func walkFolderNode(ctx context.Context, plan node, collect bool, found *folderBoundaries) (folderWalk, error) {
@@ -192,9 +196,10 @@ type folderWalker struct {
 	pending int // queued and running jobs
 	err     error
 	// visited maps each directory identity to the smallest relative path
-	// that reached it. A loop is cut at its inner path, because an
-	// ancestor is always walked before its descendants; two other paths to one
-	// directory keep the smallest, so the result does not depend on timing.
+	// that reached it. The walk cuts a loop at its inner path, because it
+	// always walks an ancestor before its descendants. Of two other paths to
+	// one directory, it keeps the smallest, so timing does not change the
+	// result.
 	visited map[dirIdentity]string
 	dirs    []folderDirResult
 

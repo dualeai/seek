@@ -16,10 +16,10 @@ import (
 )
 
 // gitHardeningArgs keep repository configuration from running programs. Seek
-// runs Git in every repository below the search root, including repositories
-// the user did not choose, so it trusts no repository setting that names a
-// program: the fsmonitor hook, hooks, the signature verifier, the external
-// diff driver, the ssh command, and ext:: transports. The pager and
+// runs Git in every repository below the search root, also in repositories
+// that the user did not choose. So it trusts no repository setting that names
+// a program. These are the fsmonitor hook, hooks, the signature verifier, the
+// external diff driver, the ssh command, and ext:: transports. The pager and
 // replace-object flags make output depend only on the arguments and the object
 // database.
 var gitHardeningArgs = []string{
@@ -110,7 +110,7 @@ func gitHonorsNoLazyFetch(out []byte) bool {
 var gitVersions sync.Map
 
 // requireNoLazyFetch fails a partial clone's Git commands when the installed
-// Git ignores GIT_NO_LAZY_FETCH: such a Git would fetch missing blobs from the
+// Git ignores GIT_NO_LAZY_FETCH. Such a Git would fetch missing blobs from the
 // network during a search.
 func requireNoLazyFetch(ctx context.Context) error {
 	out, err := gitVersion(ctx)
@@ -313,8 +313,8 @@ func parseRepoGitConfig(out []byte) repoGitConfig {
 	return config
 }
 
-// gitConfigBool reads a value the way Git reads a boolean: a key with no value
-// is true; true, yes, on, and a nonzero integer are true.
+// gitConfigBool reads a value the way Git reads a boolean. A key with no value
+// is true, and so are true, yes, on, and a nonzero integer.
 func gitConfigBool(value string, hasValue bool) bool {
 	if !hasValue {
 		return true

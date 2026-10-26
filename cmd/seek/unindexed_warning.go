@@ -14,25 +14,24 @@ import (
 )
 
 // zoektNotIndexedMarker is the prefix that Zoekt stores in place of the content
-// of a document it did not index, followed by its reason (notIndexedMarker in
-// zoekt/index/shard_builder.go). Zoekt does not export it, so
-// TestZoektNotIndexedMarker pins the value.
+// of a document that it did not index. The reason follows it
+// (notIndexedMarker in zoekt/index/shard_builder.go). Zoekt does not export
+// it, so TestZoektNotIndexedMarker pins the value.
 const zoektNotIndexedMarker = "NOT-INDEXED: "
 
 // warnUnindexedFileOperands warns for each file named as an exact path operand
 // that has no content match and no searchable content. The index stores the
-// reason of each document kept by name only, whether Zoekt or a seek reader
-// chose it; this check only reads it back, so a new Zoekt skip reason needs no
-// change here. The documents that seek keeps by name because it has none of
-// their bytes carry seekNoBytesReason, which the warning words in seek's own
-// terms.
+// reason of each document kept by name only, from Zoekt or from a Seek reader.
+// This check only reads it back, so a new Zoekt skip reason needs no change
+// here. A document that Seek keeps by name because it has none of its bytes
+// carries seekNoBytesReason. The warning states that reason in Seek's own
+// words.
 //
 // The check searches only the nodes that this command opened (openedNodes). A
 // search with no failed node opens every plan.
 //
-// NOTE: folder and Git scopes get no such warning. Repositories with many
-// binary files (images, archives) would print it on every search. Review this
-// if users miss skipped content in those scopes.
+// Folder and Git scopes get no such warning: repositories with many binary
+// files (images, archives) would print it on every search.
 func warnUnindexedFileOperands(
 	ctx context.Context,
 	plans []node,
@@ -102,8 +101,8 @@ func warnUnindexedFileOperands(
 }
 
 // markerCheck holds the exact-file operands of one opened corpus that have no
-// content match: their corpus names and their paths, and the dirty files of
-// the corpus's capture for its node read.
+// content match: their corpus names and their paths. It also holds the dirty
+// files of the corpus's capture, for its node read.
 type markerCheck struct {
 	plan  node
 	dirty dirtyFileSet
@@ -111,8 +110,8 @@ type markerCheck struct {
 	paths []string
 }
 
-// reasons searches the current copies of the corpus for Zoekt's marker and
-// returns, for each name, Zoekt's stored reason, or "" when the file's content
+// reasons searches the current copies of the corpus for Zoekt's marker. For
+// each name, it returns Zoekt's stored reason, or "" when the file's content
 // is searchable. When the search fails, it returns nil and no file gets a
 // warning.
 func (check markerCheck) reasons(ctx context.Context) []string {
@@ -166,9 +165,9 @@ func hasContentResult(results []corpusSearchResult, id corpusID, name string) bo
 }
 
 // hasContentMatch reports whether a result matches file content, not only the
-// file name. Zoekt's stored marker is searchable text, so a query such as "bin"
-// matches it; a match on a marker line does not count, and unindexedReason
-// decides that case.
+// file name. Zoekt's stored marker is searchable text, so a query such as
+// "bin" matches it. A match on a marker line does not count, and
+// unindexedReason decides that case.
 func hasContentMatch(file zoekt.FileMatch) bool {
 	for _, match := range file.LineMatches {
 		if !match.FileName && !markerLine(match) {
@@ -198,9 +197,9 @@ func corpusFileName(plan node, path string) (string, bool) {
 
 // unindexedReason returns Zoekt's stored reason when the current copy of the
 // document for name holds only the not-indexed marker, and "" otherwise. The
-// results hold only current copies. A real file can hold the marker text: then
-// its stored line has a newline or the same bytes as the file on disk, and it
-// does not count.
+// results hold only current copies. A real file can hold the marker text.
+// Then its stored line has a newline or the same bytes as the file on disk,
+// and it does not count.
 func unindexedReason(results []corpusSearchResult, name string, path string) string {
 	for _, result := range results {
 		file := result.file

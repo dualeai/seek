@@ -45,6 +45,11 @@ func TestRunJoinedIndexBuildsStartsBothBranches(t *testing.T) {
 	})
 }
 
+// TestJoinedGenerationDescriptorBindsBothIndexParts writes the joined
+// descriptor of a state: it names the state, the SHA-256 of the family
+// manifest, and the semantic generation directory. A changed family or a
+// damaged semantic manifest stops the match. An open that finds damaged rows
+// removes the descriptor.
 func TestJoinedGenerationDescriptorBindsBothIndexParts(t *testing.T) {
 	root := t.TempDir()
 	cacheDir := filepath.Join(root, "cache")
@@ -136,6 +141,10 @@ func TestJoinedGenerationDescriptorBindsBothIndexParts(t *testing.T) {
 	}
 }
 
+// TestJoinedGenerationInvalidatesDescriptorOnLazyGraphDamage damages a graph
+// shard of a bound generation. The open does not hash the shard, so the
+// descriptor stays. The first check of the shard finds the damage and removes
+// the descriptor.
 func TestJoinedGenerationInvalidatesDescriptorOnLazyGraphDamage(t *testing.T) {
 	root := t.TempDir()
 	cacheDir := filepath.Join(root, "cache")
@@ -271,9 +280,9 @@ func TestJoinedGenerationBindsTheOverlay(t *testing.T) {
 }
 
 // TestOldOverlayWithAGraph reads an overlay generation that an older build
-// wrote with a USearch graph: the manifest check (the build gate) rejects it
-// as the open does, so the build replaces it before a search reads it, and
-// reuse still reads its rows.
+// wrote with a USearch graph. The manifest check of the build and of the open
+// rejects it, so the build replaces it before a search reads it. Reuse still
+// reads its rows.
 func TestOldOverlayWithAGraph(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "generation")
 	units, embeddings := testSemanticRowsAndVectors(t)

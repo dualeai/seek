@@ -23,14 +23,15 @@ import (
 // index" debug record.
 //
 // The route tests (mask kinds, saturated shard, dirty exclusion, shard plan)
-// use hybridTestScorer in its accept mode: every row is near the query, and
+// use hybridTestScorer in its accept mode. Every row is near the query, and
 // the model accepts every candidate. So each route must print exactly the
-// files that the filters and the scope keep. Every fixture file holds zqrow,
-// so the lexical-only search "zqrow <filters>" gives these files: the oracle.
+// files that the filters and the scope keep. Each case lists these files by
+// hand. Every fixture file holds zqrow, so the lexical-only search "zqrow
+// <filters>" must give them too: the text oracle.
 // The route tests prove which rows each route reads. They prove nothing about
-// meaning, the acceptance threshold, the radius or rank. With every row near
-// the query, each shard that a USearch route of these tests searches allows
-// more than 1,024 near coarse vectors, so the shard saturates: all of its
+// meaning, the acceptance threshold, the radius or rank. Every row is near the
+// query, so each shard that a USearch route of these tests searches allows
+// more than 1,024 near coarse vectors. So the shard saturates: all of its
 // allowed rows go to the exact fine scores. The radius test shows the radius
 // cut.
 //
@@ -46,24 +47,29 @@ import (
 const e2eRouteNear = "E2E_NEAR"
 
 // e2eRouteEmptyScore is the empty-document score of each scoring token of a
-// query of e2eRouteModel. A row near the query has a cosine of at least 0.85,
-// so it stays within the radius above this score; an orthogonal row does not.
+// query of e2eRouteModel. A row near the query has a cosine of at least 0.85.
+// So it stays within the radius above this score; an orthogonal row does not.
 const e2eRouteEmptyScore = 0.5
+
+// e2eRouteFloor is the fine cosine at the retrieval radius for one scoring
+// token of e2eRouteModel (semanticRetrievalFloor). It is the empty-document
+// score 0.5 plus the radius tau_file - delta = 0.25 - 0.1158.
+const e2eRouteFloor = 0.6342
 
 // e2eRouteModel is the chosen-geometry model of the radius, long-query and
 // model-order tests. The text of a row chooses its cosines, and the text of a
 // document chooses its score. So the tests prove the arithmetic of the radius
-// cut, the query windows and the fusion rule; they prove nothing about
+// cut, the query windows and the fusion rule. They prove nothing about
 // meaning, about where real vectors put a file, or about tau. Each row gets
 // its own unit vectors from its path, start, and text, so no two rows share a
 // vector. A row whose text holds E2E_NEAR is near query axis 0, with a cosine
 // from 0.85 to 0.95. Any other row is orthogonal to both query axes. Text
 // markers change a near row:
-//   - E2E_FINE_dddd sets the cosine of the fine vectors to dddd/10000; the
-//     coarse vectors keep their cosine;
+//   - E2E_FINE_dddd sets the cosine of the fine vectors to dddd/10000. The
+//     coarse vectors keep their cosine.
 //   - E2E_AXIS1 puts the coarse vectors near query axis 1, the first fine
-//     vector near axis 0, and the other fine vectors near axis 1;
-//   - E2E_MODEL_ddd sets the model score of the document to ddd; a document
+//     vector near axis 0, and the other fine vectors near axis 1.
+//   - E2E_MODEL_ddd sets the model score of the document to ddd. A document
 //     with E2E_NEAR and no such marker scores 100, any other 0.
 //
 // The query has one scoring token for each 128-token window that the bundled
@@ -283,13 +289,26 @@ func e2eRouteJoin(root string, rels ...string) []string {
 	return paths
 }
 
+// e2eRouteFiles returns the slash path that format gives for each number
+// from first to last, by step.
+func e2eRouteFiles(format string, first, last, step int) []string {
+	var files []string
+	for number := first; number <= last; number += step {
+		files = append(files, fmt.Sprintf(format, number))
+	}
+	return files
+}
+
 // e2eRouteCase is one description search of a route test. backends lists the
-// sorted semantic backends, one for each node that reads base rows.
+// sorted semantic backends, one for each node that reads base rows. want
+// lists the files that the search must print. The test works them out by
+// hand from the fixture and the filters, not with the Seek query parser.
 type e2eRouteCase struct {
 	name     string
 	filters  string
 	operands []string
 	backends []string
+	want     []string
 }
 
 // e2eRouteVerify checks one vector search against want. It checks the route,
@@ -327,17 +346,22 @@ func e2eRouteVerify(t *testing.T, run e2eRouteRun, want, backends []string) []st
 }
 
 // e2eRouteCheck runs the text oracle and the description of test with a model
-// that accepts every row, and checks that the description prints the files of
-// the oracle. The oracle of a route that reads rows must hold a file, so that
-// two empty results cannot pass.
+// that accepts every row. Both must print the files of test.want. Both
+// searches parse the filters with the Seek parser, so a parser fault moves
+// both. It does not move test.want. A route that reads rows must want a file,
+// so that two empty results cannot pass.
 func e2eRouteCheck(t *testing.T, test e2eRouteCase) e2eRouteRun {
 	t.Helper()
-	oracle := e2eRouteOracle(t, test.filters, test.operands...)
-	if len(oracle) == 0 && len(test.backends) > 0 {
-		t.Fatalf("the text oracle %q finds no file on a route that reads rows", test.filters)
+	want := slices.Sorted(slices.Values(test.want))
+	if len(want) == 0 && len(test.backends) > 0 {
+		t.Fatalf("the case with filters %q wants no file on a route that reads rows", test.filters)
+	}
+	if oracle := e2eRouteOracle(t, test.filters, test.operands...); !slices.Equal(oracle, want) {
+		t.Fatalf("the text oracle %q found %d files, want %d\ngot:  %v\nwant: %v",
+			test.filters, len(oracle), len(want), oracle, want)
 	}
 	run := e2eRouteSearch(t, &hybridTestScorer{mode: payloadAccept}, strings.TrimSpace("zqalpha zqbeta "+test.filters), test.operands...)
-	e2eRouteVerify(t, run, oracle, test.backends)
+	e2eRouteVerify(t, run, want, test.backends)
 	return run
 }
 
@@ -377,14 +401,15 @@ func e2eRouteBulk(pkg string, file, funcs int) string {
 //	tools/t0.rb-t7.rb     8 Ruby rows
 //
 // It sets GOMAXPROCS (setTestUSearchShardCPUs) so that the 2,138 rows get
-// shards of 2,048 rows. The cut gives two shards: shard 0 holds README.md,
-// dense/, few/, and filler/g0-g2 (1,678 rows), and shard 1 holds filler/g3.go
-// and tools/ (460 rows). e2eRouteRepoShards checks the row count of each shard
-// and the folders of its rows: with the rows in path order, the 452 filler
-// rows of shard 1 are the rows of filler/g3.go. A partial selection of up to
-// 256 rows takes the direct exact route. When each shard that it reads allows
-// at most a quarter of its rows (plus one), or at most 64 rows, it takes the
-// shard-exact route. Otherwise it takes the filtered USearch route.
+// shards of 2,048 rows. The cut gives two shards. Shard 0 holds README.md,
+// dense/, few/, and filler/g0-g2 (1,678 rows). Shard 1 holds filler/g3.go and
+// tools/ (460 rows). e2eRouteRepoShards checks the row count of each shard and
+// the folders of its rows. The rows are in path order, so the 452 filler rows
+// of shard 1 are the rows of filler/g3.go. A partial selection of up to 256
+// rows takes the direct exact route. A selection takes the shard-exact route
+// when each shard that it reads allows few rows. Few rows is at most 64, or at
+// most a quarter of its rows plus one. Otherwise it takes the filtered USearch
+// route.
 func e2eRouteRepo(t *testing.T, f *graphFixture) string {
 	t.Helper()
 	setTestUSearchShardCPUs(t, 2_138, 2_048)
@@ -410,10 +435,31 @@ func e2eRouteRepo(t *testing.T, f *graphFixture) string {
 	return repo
 }
 
+// e2eRouteRepoFiles holds the committed files of e2eRouteRepo by folder, as
+// slash paths. The route tests build their wanted file sets from it by hand.
+type e2eRouteRepoFiles struct {
+	dense, few, filler, tools []string
+}
+
+// newE2ERouteRepoFiles returns the files that e2eRouteRepo commits.
+func newE2ERouteRepoFiles() e2eRouteRepoFiles {
+	return e2eRouteRepoFiles{
+		dense:  e2eRouteFiles("dense/d%03d.py", 0, 299, 1),
+		few:    slices.Concat([]string{"few/extra.go"}, e2eRouteFiles("few/f%02d.go", 0, 19, 1)),
+		filler: e2eRouteFiles("filler/g%d.go", 0, 3, 1),
+		tools:  e2eRouteFiles("tools/t%d.rb", 0, 7, 1),
+	}
+}
+
+// all returns every committed file of the route repository.
+func (files e2eRouteRepoFiles) all() []string {
+	return slices.Concat([]string{"README.md"}, files.dense, files.few, files.filler, files.tools)
+}
+
 // e2eRouteRepoShards checks the shards of the e2eRouteRepo build, the one
-// semantic generation of the test's cache, and returns their count: 1,678 and
-// 460 rows, README.md, dense/ and few/ in shard 0, filler/ in both, and tools/
-// in shard 1.
+// semantic generation of the test's cache, and returns their count. The shards
+// hold 1,678 and 460 rows. README.md, dense/ and few/ are in shard 0, filler/
+// in both, and tools/ in shard 1.
 func e2eRouteRepoShards(t *testing.T) int {
 	t.Helper()
 	rows, shards := e2eRouteShards(t)
@@ -432,9 +478,10 @@ func e2eRouteRepoShards(t *testing.T) int {
 // and the filtered USearch route. It also runs the unfiltered routes of the
 // Git node and a folder node. Then it runs a filter that keeps every row, one
 // that keeps no row, and two nodes together. The model accepts every row, so
-// each route must print exactly the files of the oracle, the lexical-only
-// search with the same filters. The model scores only files that show, and
-// the two-node result is the union of the one-node results.
+// each route must print exactly the files that the case lists. The
+// lexical-only search with the same filters must print them too. The model
+// scores only files that show, and the two-node result is the union of the
+// one-node results.
 func TestE2ERouteMaskKindsTakeEveryRoute(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -448,25 +495,36 @@ func TestE2ERouteMaskKindsTakeEveryRoute(t *testing.T) {
 	setTestUserCache(t)
 	t.Chdir(t.TempDir())
 	in := func(rels ...string) []string { return e2eRouteJoin(repo, rels...) }
+	files := newE2ERouteRepoFiles()
+	at := func(sets ...[]string) []string { return e2eRouteJoin(repo, slices.Concat(sets...)...) }
+	notFew := slices.Concat([]string{"README.md"}, files.dense, files.filler, files.tools)
+	// -file:f0 drops few/f00.go to few/f09.go, and no filler file.
+	fewNoF0 := slices.Concat([]string{"few/extra.go"}, e2eRouteFiles("few/f%02d.go", 10, 19, 1))
+	looseFiles := e2eRouteJoin(loose, slices.Concat([]string{"extra.go"}, e2eRouteFiles("l%d.go", 0, 5, 1))...)
 	cases := []e2eRouteCase{
-		{"file/filtered-exact", "file:few/", []string{repo}, []string{"filtered-exact"}},
-		{"file/filtered-shard-exact", "file:dense/", []string{repo}, []string{"filtered-shard-exact"}},
-		{"negated-file/filtered-usearch", "-file:few/", []string{repo}, []string{"filtered-usearch"}},
-		{"lang/filtered-exact", "lang:ruby", []string{repo}, []string{"filtered-exact"}},
-		{"lang/filtered-shard-exact", "lang:python", []string{repo}, []string{"filtered-shard-exact"}},
-		{"lang/filtered-usearch", "lang:go", []string{repo}, []string{"filtered-usearch"}},
-		{"scope/filtered-exact", "", in("few"), []string{"filtered-exact"}},
-		{"scope/filtered-shard-exact", "", in("dense"), []string{"filtered-shard-exact"}},
-		{"scope/filtered-usearch", "", in("dense", "filler", "tools"), []string{"filtered-usearch"}},
-		{"combination/filtered-exact", "lang:go -file:f0", in("few"), []string{"filtered-exact"}},
-		{"combination/filtered-shard-exact", "lang:python -file:d29", in("dense", "tools"), []string{"filtered-shard-exact"}},
-		{"combination/filtered-usearch", "lang:go -file:f0", in("few", "filler"), []string{"filtered-usearch"}},
-		{"no-mask/usearch", "", []string{repo}, []string{"usearch"}},
-		{"filter-keeps-every-row/usearch", "-file:nomatchzq", []string{repo}, []string{"usearch"}},
-		{"filter-keeps-no-row", "file:nomatchzq", []string{repo}, nil},
-		{"folder/no-mask/exact", "", []string{loose}, []string{"exact"}},
-		{"folder/filter-keeps-every-row/exact", "lang:go", []string{loose}, []string{"exact"}},
-		{"folder/file/filtered-exact", "file:l[0-2]", []string{loose}, []string{"filtered-exact"}},
+		{"file/filtered-exact", "file:few/", []string{repo}, []string{"filtered-exact"}, at(files.few)},
+		{"file/filtered-shard-exact", "file:dense/", []string{repo}, []string{"filtered-shard-exact"}, at(files.dense)},
+		{"negated-file/filtered-usearch", "-file:few/", []string{repo}, []string{"filtered-usearch"}, at(notFew)},
+		{"lang/filtered-exact", "lang:ruby", []string{repo}, []string{"filtered-exact"}, at(files.tools)},
+		{"lang/filtered-shard-exact", "lang:python", []string{repo}, []string{"filtered-shard-exact"}, at(files.dense)},
+		{"lang/filtered-usearch", "lang:go", []string{repo}, []string{"filtered-usearch"}, at(files.few, files.filler)},
+		{"scope/filtered-exact", "", in("few"), []string{"filtered-exact"}, at(files.few)},
+		{"scope/filtered-shard-exact", "", in("dense"), []string{"filtered-shard-exact"}, at(files.dense)},
+		{"scope/filtered-usearch", "", in("dense", "filler", "tools"), []string{"filtered-usearch"},
+			at(files.dense, files.filler, files.tools)},
+		{"combination/filtered-exact", "lang:go -file:f0", in("few"), []string{"filtered-exact"}, at(fewNoF0)},
+		// -file:d29 drops dense/d290.py to dense/d299.py.
+		{"combination/filtered-shard-exact", "lang:python -file:d29", in("dense", "tools"), []string{"filtered-shard-exact"},
+			at(e2eRouteFiles("dense/d%03d.py", 0, 289, 1))},
+		{"combination/filtered-usearch", "lang:go -file:f0", in("few", "filler"), []string{"filtered-usearch"},
+			at(fewNoF0, files.filler)},
+		{"no-mask/usearch", "", []string{repo}, []string{"usearch"}, at(files.all())},
+		{"filter-keeps-every-row/usearch", "-file:nomatchzq", []string{repo}, []string{"usearch"}, at(files.all())},
+		{"filter-keeps-no-row", "file:nomatchzq", []string{repo}, nil, nil},
+		{"folder/no-mask/exact", "", []string{loose}, []string{"exact"}, looseFiles},
+		{"folder/filter-keeps-every-row/exact", "lang:go", []string{loose}, []string{"exact"}, looseFiles},
+		{"folder/file/filtered-exact", "file:l[0-2]", []string{loose}, []string{"filtered-exact"},
+			e2eRouteJoin(loose, "l0.go", "l1.go", "l2.go")},
 	}
 	for index, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
@@ -483,7 +541,8 @@ func TestE2ERouteMaskKindsTakeEveryRoute(t *testing.T) {
 	// union of the one-node results.
 	t.Run("two-nodes", func(t *testing.T) {
 		const filters = "-file:few/"
-		test := e2eRouteCase{"two-nodes", filters, []string{repo, loose}, []string{"exact", "filtered-usearch"}}
+		test := e2eRouteCase{"two-nodes", filters, []string{repo, loose}, []string{"exact", "filtered-usearch"},
+			slices.Concat(at(notFew), looseFiles)}
 		run := e2eRouteCheck(t, test)
 		var union []string
 		for _, operand := range test.operands {
@@ -506,17 +565,19 @@ func TestE2ERouteMaskKindsTakeEveryRoute(t *testing.T) {
 // shards hold 6,712 and 1,840 near keys, and 6,628 keys of shard 0 stay when
 // -file:few/ drops the few/ files. The query tokens still reach the deepen
 // bound after 1,024 keys, so each shard saturates and every allowed row goes
-// to the exact fine scores. The output must then hold every file of the
-// oracle and no other file, with and without the filter.
+// to the exact fine scores. The output must then hold every file that the
+// case lists and no other file, with and without the filter.
 func TestE2ERouteSaturatedShardGivesEveryAllowedRow(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
 	repo := e2eRouteRepo(t, f)
 	setTestUserCache(t)
 	t.Chdir(t.TempDir())
+	files := newE2ERouteRepoFiles()
+	notFew := slices.Concat([]string{"README.md"}, files.dense, files.filler, files.tools)
 	for _, test := range []e2eRouteCase{
-		{"no-mask/usearch", "", []string{repo}, []string{"usearch"}},
-		{"negated-file/filtered-usearch", "-file:few/", []string{repo}, []string{"filtered-usearch"}},
+		{"no-mask/usearch", "", []string{repo}, []string{"usearch"}, e2eRouteJoin(repo, files.all()...)},
+		{"negated-file/filtered-usearch", "-file:few/", []string{repo}, []string{"filtered-usearch"}, e2eRouteJoin(repo, notFew...)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			run := e2eRouteCheck(t, test)
@@ -528,15 +589,15 @@ func TestE2ERouteSaturatedShardGivesEveryAllowedRow(t *testing.T) {
 }
 
 // TestE2ERouteDirtyExclusionTakesEveryRoute makes a Git node dirty in three
-// steps. In each step the dirty-file exclusion of the base rows alone takes
-// another route: the filtered USearch route, the shard-exact route, and the
-// direct exact route. The committed rows hold the version mark zqv1, and the
-// edited and untracked files zqv2. The dirty files are three edited files, a
-// deleted file, and two untracked files; then the filler files are edited and
-// 80 dense files are deleted. The model accepts every row. At each step the
-// output must equal the lexical-only search on the work tree. The model never
-// scores a deleted file or the zqv1 text of an edited file, and no edited file
-// shows a zqv1 line.
+// steps. In each step, the dirty-file exclusion of the base rows alone takes
+// another route: the filtered USearch, the shard-exact, and the direct exact
+// route. The committed rows hold the version mark zqv1, and the edited and
+// untracked files zqv2. The dirty files are three edited files, a deleted
+// file, and two untracked files. Then the filler files are edited and 80 dense
+// files are deleted. The model accepts every row. At each step the output
+// must print the files of the work tree that the case lists, as the
+// lexical-only search does. The model never scores a deleted file or the zqv1
+// text of an edited file, and no edited file shows a zqv1 line.
 func TestE2ERouteDirtyExclusionTakesEveryRoute(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -558,6 +619,13 @@ func TestE2ERouteDirtyExclusionTakesEveryRoute(t *testing.T) {
 	writeFixtureFile(t, filepath.Join(repo, "tools/t8.rb"), "# zqrow tool untracked zqv2\n")
 	edited := []string{"few/f00.go", "few/f02.go", "few/extra.go"}
 	gone := []string{"few/f01.go"}
+	// The work tree now has no few/f01.go, and it has few/u00.go and
+	// tools/t8.rb.
+	files := newE2ERouteRepoFiles()
+	at := func(sets ...[]string) []string { return e2eRouteJoin(repo, slices.Concat(sets...)...) }
+	few := slices.Concat([]string{"few/extra.go", "few/f00.go"}, e2eRouteFiles("few/f%02d.go", 2, 19, 1), []string{"few/u00.go"})
+	tools := e2eRouteFiles("tools/t%d.rb", 0, 8, 1)
+	tree := slices.Concat([]string{"README.md"}, files.dense, few, files.filler, tools)
 	check := func(t *testing.T, test e2eRouteCase) e2eRouteRun {
 		t.Helper()
 		run := e2eRouteCheck(t, test)
@@ -583,9 +651,9 @@ func TestE2ERouteDirtyExclusionTakesEveryRoute(t *testing.T) {
 
 	// Four committed files are dirty: 2,134 base rows stay.
 	for index, test := range []e2eRouteCase{
-		{"few-dirty/filtered-usearch", "", []string{repo}, []string{"filtered-usearch"}},
-		{"few-dirty-and-file/filtered-exact", "file:few/", []string{repo}, []string{"filtered-exact"}},
-		{"few-dirty-scope-and-lang/filtered-exact", "lang:ruby", e2eRouteJoin(repo, "tools"), []string{"filtered-exact"}},
+		{"few-dirty/filtered-usearch", "", []string{repo}, []string{"filtered-usearch"}, at(tree)},
+		{"few-dirty-and-file/filtered-exact", "file:few/", []string{repo}, []string{"filtered-exact"}, at(few)},
+		{"few-dirty-scope-and-lang/filtered-exact", "lang:ruby", e2eRouteJoin(repo, "tools"), []string{"filtered-exact"}, at(tools)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			run := check(t, test)
@@ -603,7 +671,7 @@ func TestE2ERouteDirtyExclusionTakesEveryRoute(t *testing.T) {
 		edited = append(edited, rel)
 	}
 	t.Run("filler-dirty/filtered-shard-exact", func(t *testing.T) {
-		check(t, e2eRouteCase{"", "", []string{repo}, []string{"filtered-shard-exact"}})
+		check(t, e2eRouteCase{"", "", []string{repo}, []string{"filtered-shard-exact"}, at(tree)})
 	})
 
 	// 80 dense files are deleted too: 246 base rows stay.
@@ -615,7 +683,8 @@ func TestE2ERouteDirtyExclusionTakesEveryRoute(t *testing.T) {
 		gone = append(gone, rel)
 	}
 	t.Run("dense-deleted/filtered-exact", func(t *testing.T) {
-		check(t, e2eRouteCase{"", "", []string{repo}, []string{"filtered-exact"}})
+		check(t, e2eRouteCase{"", "", []string{repo}, []string{"filtered-exact"},
+			at([]string{"README.md"}, e2eRouteFiles("dense/d%03d.py", 80, 299, 1), few, files.filler, tools)})
 	})
 }
 
@@ -664,8 +733,9 @@ func e2eRouteShards(t *testing.T) ([]uint64, map[string][]int) {
 // The files of a/anear lie in shard 0, and those of b/near in shard 1. Each
 // filter allows rows in some shards only. So the shard plan skips a shard,
 // searches a whole shard with no bitmap, scores a shard directly, or uses the
-// bitmap. The model accepts every row, so each route must print exactly the
-// files of the lexical-only search with the same filter.
+// bitmap. The model accepts every row. So each route must print exactly the
+// files that the case lists, and the lexical-only search with the same filter
+// prints them too.
 func TestE2ERouteFilterInSomeUSearchShards(t *testing.T) {
 	requireTools(t)
 	setTestUSearchShardCPUs(t, 4_963, semanticUSearchMaxShardRows)
@@ -689,11 +759,16 @@ func TestE2ERouteFilterInSomeUSearchShards(t *testing.T) {
 	t.Chdir(t.TempDir())
 
 	// Rows: README 1, a/anear 240, a/bulk 4,020 (402 for each file), b/near
-	// 300, b/zfar 402. The cut falls after a/bulk08.go, the first file after
-	// which shard 0 holds 3,840 rows (15/16 of 4,096); a file of 402 rows is
-	// always an anchor. So shard 0 holds rows 0-3,858; shard 1 holds
+	// 300, b/zfar 402. A file of 402 rows is always an anchor. The cut falls
+	// after a/bulk08.go, the first file after which shard 0 holds 3,840 rows
+	// (15/16 of 4,096). So shard 0 holds rows 0-3,858; shard 1 holds
 	// a/bulk09.go, b/near, and b/zfar: 1,104 rows.
-	cold := e2eRouteCheck(t, e2eRouteCase{"", "", []string{repo}, []string{"usearch"}})
+	anear := e2eRouteFiles("a/anear/n%03d.go", 0, 239, 1)
+	bulk := e2eRouteFiles("a/bulk%02d.go", 0, 9, 1)
+	near := e2eRouteFiles("b/near/m%03d.go", 0, 299, 1)
+	at := func(sets ...[]string) []string { return e2eRouteJoin(repo, slices.Concat(sets...)...) }
+	cold := e2eRouteCheck(t, e2eRouteCase{"", "", []string{repo}, []string{"usearch"},
+		at([]string{"README.md"}, anear, bulk, near, []string{"b/zfar/z0.go"})})
 	e2eRouteColdWarm(t, &hybridTestScorer{mode: payloadAccept}, cold, "zqalpha zqbeta", repo)
 	rows, shards := e2eRouteShards(t)
 	if len(rows) != 2 || !slices.Equal(shards["a/anear"], []int{0}) || !slices.Equal(shards["b/near"], []int{1}) {
@@ -702,16 +777,18 @@ func TestE2ERouteFilterInSomeUSearchShards(t *testing.T) {
 	for _, test := range []e2eRouteCase{
 		// Shard 0 has no allowed row; 300 of shard 1's 1,104 rows take the
 		// bitmap search.
-		{"second-shard-only/filtered-usearch", "file:b/near/", []string{repo}, []string{"filtered-usearch"}},
+		{"second-shard-only/filtered-usearch", "file:b/near/", []string{repo}, []string{"filtered-usearch"}, at(near)},
 		// 120 rows of shard 0 and 150 rows of shard 1: each at most a
 		// quarter of its shard, so both score directly.
-		{"both-shards-direct/filtered-shard-exact", `file:near/ file:[02468]\.go$`, []string{repo}, []string{"filtered-shard-exact"}},
+		{"both-shards-direct/filtered-shard-exact", `file:near/ file:[02468]\.go$`, []string{repo}, []string{"filtered-shard-exact"},
+			at(e2eRouteFiles("a/anear/n%03d.go", 0, 238, 2), e2eRouteFiles("b/near/m%03d.go", 0, 298, 2))},
 		// Shard 0 scores its 240 rows directly; shard 1 takes the bitmap
 		// search.
-		{"direct-and-bitmap/filtered-usearch", "file:near/", []string{repo}, []string{"filtered-usearch"}},
+		{"direct-and-bitmap/filtered-usearch", "file:near/", []string{repo}, []string{"filtered-usearch"}, at(anear, near)},
 		// Shard 0 is whole, so its search has no bitmap; shard 1 takes the
 		// bitmap search for the 402 rows of a/bulk09.go.
-		{"whole-first-shard/filtered-usearch", "-file:b/", []string{repo}, []string{"filtered-usearch"}},
+		{"whole-first-shard/filtered-usearch", "-file:b/", []string{repo}, []string{"filtered-usearch"},
+			at([]string{"README.md"}, anear, bulk)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			e2eRouteCheck(t, test)
@@ -720,21 +797,20 @@ func TestE2ERouteFilterInSomeUSearchShards(t *testing.T) {
 }
 
 // TestE2ERouteRadiusBoundsEveryRoute gives a folder node and a Git node files
-// just inside the retrieval radius (a fine lift 0.0018 above it) and just
-// outside it (0.0018 under it). The lift is the fine cosine minus the
-// empty-document score of the one query token, so a scan that leaves out that
+// near the retrieval radius. Their fine lift is 0.0018 above it (inside) or
+// 0.0018 under it (outside). The lift is the fine cosine minus the
+// empty-document score of the one query token. So a scan that leaves out that
 // score takes the outside files too. All have near coarse vectors, so USearch
 // returns each of them; only the radius tells them apart. The Git node has an
 // inside and an outside file in its committed rows and in its untracked
 // overlay. The model would accept every one of them. On every route the
 // inside files show, and the outside files never reach the model. The cosines
-// are chosen. The test proves the radius cut on each route; it proves neither
+// are chosen. The test proves the radius cut on each route. It proves neither
 // where real vectors put a file nor that tau or delta are right.
 func TestE2ERouteRadiusBoundsEveryRoute(t *testing.T) {
 	requireTools(t)
 	const margin = 0.0018
-	// floor is the fine cosine at the radius for a query of one token.
-	floor := e2eRouteEmptyScore + float64(semanticRetrievalRadius)
+	const floor = e2eRouteFloor
 	// The index stores the fine vectors as binary16. Its step at the floor
 	// must be under the margin, so that the cast keeps each file on its side.
 	code := semanticF16FromFloat32(float32(floor))
@@ -797,15 +873,14 @@ func TestE2ERouteRadiusBoundsEveryRoute(t *testing.T) {
 }
 
 // TestE2ERouteLongQueryWindowsOnEveryRoute runs a 130-word description. The
-// bundled tokenizer splits it into W query windows (5), and e2eRouteModel gives
+// bundled tokenizer splits it into W query windows (5). e2eRouteModel gives
 // each window one scoring token: window 0 on the first axis, the other windows
 // on the second. The w/b files have their coarse vectors on the second axis
-// and a fine vector on each axis, so only the tokens of windows 1 and up find
+// and a fine vector on each axis. So only the tokens of windows 1 and up find
 // them in USearch. The w/s files lie on the first axis only. Each row has the
-// fine cosine c, chosen so that c/W < floor < c, with floor the
-// empty-document score plus the radius per token. Over the W tokens a w/b row
-// has a fine MeanMaxSim of about c, in the radius, and a w/s row about c/W,
-// outside it. On every route the long query returns every w/b file and no
+// fine cosine c, chosen so that c/W < e2eRouteFloor < c. Over the W tokens, a
+// w/b row has a fine MeanMaxSim of about c, in the radius. A w/s row has about
+// c/W, outside it. On every route the long query returns every w/b file and no
 // other file. A two-word description has one window, and on the exact route
 // it returns both kinds. The cosines are chosen; only the window count comes
 // from the tokenizer.
@@ -830,7 +905,7 @@ func TestE2ERouteLongQueryWindowsOnEveryRoute(t *testing.T) {
 	if windows < 2 {
 		t.Fatalf("the long query has %d windows, want 2 or more", windows)
 	}
-	floor := e2eRouteEmptyScore + float64(semanticRetrievalRadius)
+	const floor = e2eRouteFloor
 	high := min(1, float64(windows)*floor)
 	if high-floor < 0.01 {
 		t.Fatalf("no fine cosine c gives c/%d < %.4f < c with a margin", windows, floor)

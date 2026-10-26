@@ -56,6 +56,18 @@ func newSemanticRegexpFilter(node *query.Regexp) (semanticPathFilter, error) {
 	return semanticPathFilter{regexp: compiled}, nil
 }
 
+// newSemanticPathFilter builds the filter of one file: atom, a substring or a
+// regular expression (fileNameAtom).
+func newSemanticPathFilter(atom query.Q) (semanticPathFilter, error) {
+	switch typed := atom.(type) {
+	case *query.Substring:
+		return newSemanticSubstringFilter(typed)
+	case *query.Regexp:
+		return newSemanticRegexpFilter(typed)
+	}
+	return semanticPathFilter{}, fmt.Errorf("file atom %s is %T, not a substring or a regular expression", atom, atom)
+}
+
 // matches reports whether path matches the filter. A long case-insensitive
 // substring uses Zoekt's fold: strings.ToLower maps each rune with
 // unicode.ToLower and each invalid byte to U+FFFD, as Zoekt's toLower does.
@@ -79,10 +91,11 @@ const (
 	semanticFilterPartial
 )
 
-// semanticFilterMask has one bit for each global semantic row. ALL and NONE
-// omit bits and shardAllowed. PARTIAL owns exactly (rows+7)/8 bitmap bytes and
-// one count for each USearch shard in manifest order. allowed counts rows.
-// exactRows contains the complete sorted selection only when its length equals
+// semanticFilterMask has one bit for each global semantic row. The modes
+// semanticFilterAll and semanticFilterNone have no bits and no shardAllowed. A
+// semanticFilterPartial mask has (rows+7)/8 bitmap bytes and one count for each
+// USearch shard, in manifest order. allowed counts the selected rows.
+// exactRows holds the complete sorted selection only when its length equals
 // allowed.
 type semanticFilterMask struct {
 	mode         semanticFilterMode

@@ -14,18 +14,18 @@ import (
 const (
 	// uncommittedManifestFileName stores the list of dirty files that the
 	// last build put in the "uncommitted" Zoekt repo. Each entry binds a path
-	// to its working-tree identity, so the next build finds the added,
+	// to its working-tree identity. So the next build finds the added,
 	// changed, and removed files without a full rebuild of the shard family.
 	uncommittedManifestFileName = ".uncommitted-manifest-v1"
 	uncommittedManifestVersion  = 4
-	// maxUncommittedDeltaShards caps stacked delta shards before falling
-	// back to a full rebuild. Lower than the committed cap because the
-	// uncommitted set churns one file per save in editors, and each shard
-	// costs every search an open and a lookup. A delta of removals only adds
-	// no shard: deltaNeedsCompaction bounds the dead content instead. A delta
-	// of kept files alone passes the cap, by at most one shard per kept file,
-	// so a file that stays unreadable does not rebuild the family on each
-	// search.
+	// maxUncommittedDeltaShards is the most shards that the uncommitted family
+	// can hold before a delta; above it, the build does a full rebuild. It is
+	// lower than the committed cap (maxCommittedDeltaShards) for two reasons.
+	// An editor changes one dirty file per save, and each shard costs every
+	// search an open and a lookup. A delta of removals only adds no shard:
+	// deltaNeedsCompaction bounds the dead content instead. A delta of kept
+	// files alone passes the cap, by at most one shard per kept file. So a file
+	// that stays unreadable does not rebuild the family on each search.
 	maxUncommittedDeltaShards = 32
 )
 
@@ -48,20 +48,20 @@ type uncommittedManifestEntry struct {
 	Mode  uint32 `json:"mode"`
 	Ctime int64  `json:"ctime"`
 	// Marker is the size of the NOT-INDEXED marker that the shard holds
-	// instead of the content, as the read found it (nameOnlyMarkerBytes):
-	// a skip reason from the reader, or content with a NUL byte or of one or
-	// two bytes. Zero means the read found no marker; heldBytes then still
-	// counts a marker for a kept file (size -1) or a file too large for the
-	// index.
+	// instead of the content, as the read found it (nameOnlyMarkerBytes).
+	// The marker comes from a skip reason of the reader, or from content with
+	// a NUL byte or of one or two bytes. Zero means the read found no marker.
+	// heldBytes then still counts a marker for a kept file (size -1) or a
+	// file too large for the index.
 	Marker int64 `json:"marker,omitempty"`
 }
 
 // readUncommittedManifest returns the manifest persisted at cacheDir when it
-// matches expectedState. Returns ok=false on any mismatch, missing file, or
-// unmarshal error; callers fall back to a full rebuild in that case.
-// A manifest with no state is pending: a build kept some dirty files by name
-// and wrote no state, and the manifest marks those files kept (size -1), so a
-// search with no state finds it and reads only them.
+// matches expectedState. ok is false on any mismatch, a missing file, or an
+// unmarshal error; callers then do a full rebuild. A manifest with no state is
+// pending: a build kept some dirty files by name and wrote no state. The
+// manifest marks those files kept (size -1). So a search with no state finds
+// the manifest and reads only those files.
 func readUncommittedManifest(cacheDir, expectedState string) (uncommittedManifest, bool) {
 	var manifest uncommittedManifest
 	data, err := os.ReadFile(filepath.Join(cacheDir, uncommittedManifestFileName))
@@ -92,8 +92,8 @@ func deleteUncommittedManifest(cacheDir string) {
 	_ = os.Remove(filepath.Join(cacheDir, uncommittedManifestFileName+".tmp"))
 }
 
-// uncommittedCandidate describes one dirty file at lstat-time. Used to diff
-// against the manifest before reading content.
+// uncommittedCandidate describes one dirty file at lstat time. The diff
+// against the manifest reads it before any content read.
 type uncommittedCandidate struct {
 	name  string
 	size  int64
@@ -132,8 +132,8 @@ func (c uncommittedCandidate) manifestEntry() uncommittedManifestEntry {
 }
 
 // statUncommittedCandidates lstats each dirty file under repoDir and returns
-// them sorted by name. Missing files are reported as gone entries so the diff
-// can emit tombstones. Files that are not regular files have no entry.
+// them sorted by name. A missing file gives a gone entry, so the diff can
+// tombstone its old copy. A file that is not a regular file has no entry.
 func statUncommittedCandidates(repoDir string, files []string) []uncommittedCandidate {
 	out := make([]uncommittedCandidate, 0, len(files))
 	for _, f := range files {
@@ -146,8 +146,8 @@ func statUncommittedCandidates(repoDir string, files []string) []uncommittedCand
 			continue
 		}
 		if stat.Mode&syscall.S_IFMT != syscall.S_IFREG {
-			// Non-regular files are skipped by streamDirtyFiles too; mirror the
-			// exclusion here so they never appear in the manifest.
+			// streamDirtyFiles also skips a file that is not regular. The
+			// same rule here keeps it out of the manifest.
 			continue
 		}
 		out = append(out, uncommittedCandidate{
@@ -163,15 +163,15 @@ func statUncommittedCandidates(repoDir string, files []string) []uncommittedCand
 	return out
 }
 
-// diffUncommittedAgainstManifest performs a sorted merge between the current
-// dirty-file candidates and the prior manifest. Returns the subset of
-// candidates whose content must be re-read for the delta shard, the paths
-// that the delta marks as changed or removed (additions, renames, content
-// changes, removals), and the bytes of the prior copies that the tombstones
-// hide.
+// diffUncommittedAgainstManifest merges the sorted current dirty-file
+// candidates with the prior manifest. It returns three values:
+//   - toRead: the candidates whose content the delta shard must read again.
+//   - changedPaths: the paths that the delta marks as changed or removed
+//     (additions, renames, content changes, removals).
+//   - tombstoned: the bytes of the prior copies that the tombstones hide.
 //
-// Algorithm mirrors changedFolderDocumentsFromManifest in
-// cmd/seek/folder_indexer.go. Both slices must already be sorted by name.
+// The merge follows changedFolderDocumentsFromManifest in folder_indexer.go.
+// Both slices must already be sorted by name.
 func diffUncommittedAgainstManifest(
 	candidates []uncommittedCandidate,
 	manifest uncommittedManifest,
@@ -219,11 +219,11 @@ func diffUncommittedAgainstManifest(
 	return toRead, changedPaths, tombstoned
 }
 
-// heldBytes is the content bytes that the shard document of the entry holds:
-// the NOT-INDEXED marker for a file kept by name only (Marker, a kept file of
-// size -1, or one too large for the index), else its size. An unread file
-// (unreadFileMarker) counts at the larger of that value and the largest marker
-// (maxNotIndexedMarkerBytes).
+// heldBytes is the content bytes that the shard document of the entry holds.
+// A file kept by name only holds its NOT-INDEXED marker. Such a file has a
+// Marker, a size of -1 (kept), or a size too large for the index. Any other
+// file holds its size. An unread file (unreadFileMarker) counts at the larger
+// of that value and the largest marker (maxNotIndexedMarkerBytes).
 func (e uncommittedManifestEntry) heldBytes() int64 {
 	switch {
 	case e.Marker == unreadFileMarker:
@@ -251,7 +251,7 @@ func uncommittedLiveBytes(entries []uncommittedManifestEntry) int64 {
 }
 
 // copyUncommittedMarkers sets the Marker of each unchanged entry from the
-// manifest entry of the same name, and unreadFileMarker for every other entry
+// manifest entry of the same name. Every other entry gets unreadFileMarker
 // until the delta reads it. Both slices are sorted by name.
 func copyUncommittedMarkers(entries []uncommittedManifestEntry, manifest uncommittedManifest) {
 	for i := range entries {

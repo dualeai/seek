@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -129,8 +130,9 @@ func TestKeptFileFailingAgainWritesNoShard(t *testing.T) {
 }
 
 // TestCancelDuringKeptDeltaKeepsChanges cancels a search while its delta
-// reads changed files and keeps one by name: the delta writes nothing, so the
-// next search reads every change.
+// reads changed files and keeps one by name. The cancel runs in the debug line
+// that keeps the file. The delta writes nothing, so the next search reads every
+// change.
 func TestCancelDuringKeptDeltaKeepsChanges(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -148,18 +150,15 @@ func TestCancelDuringKeptDeltaKeepsChanges(t *testing.T) {
 	hook := installDirtyEIO(t, "x2.txt")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	realLstat := dirtyLstat
-	t.Cleanup(func() { dirtyLstat = realLstat })
-	dirtyLstat = func(path string) (os.FileInfo, error) {
-		if filepath.Base(path) == "x3.txt" {
-			cancel()
-		}
-		return realLstat(path)
-	}
+	captureTestLogsWithAction(t, slog.LevelWarn, "Indexing an uncommitted file by name only after a read error", cancel)
+	// One read worker (indexParallelism follows GOMAXPROCS) reads the files in
+	// order: x1.txt, then x2.txt, which the delta keeps by name.
 	old := runtime.GOMAXPROCS(1)
 	_, _ = captureStdout(t, func() error { return seekRoot(ctx, t, nil, "--lexical-only", "zqcancel", repo) })
 	runtime.GOMAXPROCS(old)
-	dirtyLstat = realLstat
+	if ctx.Err() == nil {
+		t.Fatal("the delta did not keep x2.txt by name, so the test did not cancel")
+	}
 	hook.set(false)
 	for _, token := range []string{"zqnewx1", "zqnewx2", "zqnewx3"} {
 		if _, headers := searchHeaders(t, token, repo); len(headers) != 1 {
@@ -168,8 +167,8 @@ func TestCancelDuringKeptDeltaKeepsChanges(t *testing.T) {
 	}
 }
 
-// TestKeptBuildRecordsTheBudget keeps a dirty file by name on a cold node: the
-// build publishes with no state, and the budget still records the ledger and
+// TestKeptBuildRecordsTheBudget keeps a dirty file by name on a cold node. The
+// build publishes with no state. The budget still records the ledger and
 // evicts an older corpus.
 func TestKeptBuildRecordsTheBudget(t *testing.T) {
 	requireTools(t)

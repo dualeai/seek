@@ -24,14 +24,14 @@ import (
 // reads it to find the provider in use; they do not hold the encoder.
 var lateOnSelectedProvider atomic.Value
 
-// These are the two verdict spellings the selection path below compares
-// against. They are shared because this file also compiles where no
-// accelerator exists, and there cachedLateOnProviderVerdict returns an empty
-// string that matches neither, so the comparisons stand and no verdict file is
-// read or written.
+// lateOnVerdictTrusted and lateOnVerdictRejected are the two verdict spellings
+// that newLateOnRowEncoder compares. They are shared because this file also
+// compiles where no accelerator exists. There cachedLateOnProviderVerdict
+// returns an empty string that matches neither, so the comparisons stand and
+// Seek reads and writes no verdict file.
 //
-// The rest of the record format — the recheck spelling, the fault count and
-// the fault window — stays with the accelerated target, which holds the only
+// The rest of the record format (the recheck spelling, the fault count and the
+// fault window) stays with the accelerated target. That file holds the only
 // parser and the only writer. Anything else on disk counts as no verdict and
 // makes the next process measure again.
 //
@@ -51,9 +51,9 @@ const lateOnCPUProviderName = "cpu"
 // name one provider instead of whichever one this host selected. An empty
 // value, or "auto", keeps the automatic choice.
 //
-// A name this build cannot use stops a search, but not a command that never
-// loads the model: failing seek gc or a --lexical-only search over a setting
-// neither reads would turn a typo into an outage.
+// A name that this build cannot use stops a search. It does not stop seek gc
+// or a --lexical-only search. They do not load the model, so they do not read
+// the setting, and a typo in it must not stop them.
 const lateOnProviderEnv = "SEEK_PROVIDER"
 
 // lateOnForcedProvider returns the pinned provider name, or an empty string for
@@ -87,11 +87,11 @@ func lateOnForcedProvider() (string, error) {
 	)
 }
 
-// semanticProviderName reports the provider in use. It returns one of three
-// things: a provider name once an encoder has settled on one; "selecting:" and
-// the intended name while an encoder is being built, which is what the fallback
-// logs print when provider selection is itself what failed; and "unset" before
-// any encoder has been attempted. Log readers match on the prefix.
+// semanticProviderName reports the provider in use. After an encoder chose a
+// provider, it returns that name. While newLateOnRowEncoder runs, it returns
+// "selecting:" and the intended name. The fallback logs print that value when
+// provider selection itself failed. Before the first encoder attempt, it
+// returns "unset". Log readers match on the prefix.
 // rejectLateOnAcceleratedProvider compares it for equality, so a provider that
 // is still being selected does not count as the one in use.
 func semanticProviderName() string {
@@ -114,24 +114,24 @@ const lateOnProbeActiveTokens = 96
 //
 // The fault in https://github.com/microsoft/onnxruntime/issues/32569 changes
 // the length of the token vectors, not their direction, so a cosine does not
-// see it: lateOnProbeMagnitudeLimit measures it, in the same units as the
+// see it. lateOnProbeMagnitudeLimit measures it, in the same units as the
 // reported fault.
 const lateOnProbeAgreementLimit = 1e-3
 
 // lateOnProbeMagnitudeLimit bounds how far two providers may disagree on one
-// token magnitude, as a ratio minus one. Direction alone is not enough: MaxSim
-// scores raw, un-normalized output in lateOnMaxSimPrepared, so a provider that
-// shrinks every vector by the same factor keeps every cosine at 1 and still
-// depresses every score by that factor. The macOS 15 fault moves the leading
-// score about 13 percent. This limit sits well below that and far above the
+// token magnitude, as a ratio minus one. Direction alone is not enough:
+// lateOnMaxSimPrepared scores the raw output with no normalization. A provider
+// that shrinks every vector by the same factor keeps every cosine at 1, but
+// lowers every score by that factor. The macOS 15 fault moves the leading
+// score about 13 percent. This limit is well below that and far above the
 // measured agreement between healthy providers.
 const lateOnProbeMagnitudeLimit = 2e-2
 
-// lateOnProbeRows builds the fixed probe batch. Every row carries different
-// content: the model runs a fixed batch of semanticModelBatchRows whatever we
-// put in it, so filling only one row would pay for the whole batch and compare
-// a single row of it. Distinct rows make the comparison that follows sample
-// the whole batch for the cost of the arithmetic alone.
+// lateOnProbeRows builds the fixed probe batch. Every row holds different
+// content. The session always runs a static batch of semanticModelBatchRows
+// rows. A probe with one filled row would pay for the whole batch and compare
+// only one row. Distinct rows let the comparison sample the whole batch for
+// the cost of the arithmetic alone.
 //
 // It uses token identifiers directly, because the probe runs inside encoder
 // construction, where taking a tokenizer from the pool could deadlock.
@@ -162,20 +162,19 @@ func lateOnProbeRows() ([]int64, []int64) {
 // lateOnOutputsAgree reports whether two providers produced the same token
 // vectors across the probe batch. It tests direction and magnitude separately:
 // re-ranking scores raw output, so a uniform shrink is a real fault that leaves
-// every cosine at 1. It also rejects a token vector that has no direction at
-// all, which is the shape the macOS 15 fault takes when it returns a zero
-// vector.
+// every cosine at 1. It also rejects a token vector with no direction: the
+// macOS 15 fault can return a zero vector.
 func lateOnOutputsAgree(accelerated, reference []float32) (bool, string) {
 	want := semanticModelBatchRows * lateOnSequenceLength * semanticEmbeddingDimensions
 	if len(accelerated) < want || len(reference) < want {
 		return false, "probe output is too short"
 	}
-	// The body stays inline. Measured over 12,288 token comparisons,
-	// interleaved in one benchmark binary so thermal drift cannot favour one
-	// shape: this nested form runs in about 380 microseconds, a per-token
-	// helper in about 473, and one flattened counter that recovers the row and
-	// token with a division and a modulo in about 563. All three are far below
-	// the inference the probe already pays, so the clearest form costs nothing.
+	// The body stays inline. A benchmark measured 12,288 token comparisons,
+	// with the forms interleaved in one binary so thermal drift cannot favor
+	// one form. This nested form takes about 380 microseconds, and a per-token
+	// helper about 473. One flattened counter that gets the row and token with
+	// a division and a modulo takes about 563. All three are far below the
+	// inference the probe already pays, so the clearest form costs nothing.
 	for row := range semanticModelBatchRows {
 		for token := range lateOnProbeActiveTokens {
 			offset := (row*lateOnSequenceLength + token) * semanticEmbeddingDimensions
@@ -238,21 +237,24 @@ type lateOnStaticRowEncoder struct {
 // newLateOnRowEncoder builds the first encoder of a model and decides which
 // execution provider it uses.
 //
-// On a target with an accelerator the order is: a pinned provider wins
-// outright; otherwise a cached rejection skips the accelerated session
-// entirely; otherwise the accelerated session is built and, with no cached
-// trust, checked against the CPU provider, and a disagreement or a failed
-// session falls back to the CPU provider. Every path sets the CPU reservation
-// (callCPUs) that matches the provider actually chosen, because the build
-// scheduler freezes that value before its first batch and cannot revise it.
+// On a target with an accelerator, the order is:
+//   - A pinned provider wins.
+//   - Else a cached rejection skips the accelerated session.
+//   - Else it builds the accelerated session. With no cached trust, it checks
+//     that session against the CPU provider. A disagreement or a failed
+//     session falls back to the CPU provider.
 //
-// interactive reports a first use that is one call (a query or one batch of
-// scores) rather than the concurrent index build; it sets the CPU provider's
-// thread count, which a session keeps for its life.
+// Every path sets the CPU reservation (callCPUs) of the provider that it
+// chose. It must, because the build scheduler reads that value once, before
+// its first batch (SemanticCallCPUs), and cannot change it.
 //
-// The returned encoder is created before its session so the check can borrow
-// its tensor pool. The deferred release covers every failure after that point;
-// a success path fills the session in and the release becomes a no-op.
+// interactive marks a first use of one call at a time (a query or the scores
+// of a candidate set), not the concurrent index build. It sets the thread
+// count of a CPU session, which the session keeps for its life.
+//
+// The function creates the encoder before its session, so the provider check
+// can borrow its tensor pool. The deferred release covers every failure after
+// that point. On success, built is set and the release does nothing.
 func newLateOnRowEncoder(ctx context.Context, interactive bool) (built *lateOnStaticRowEncoder, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -265,10 +267,10 @@ func newLateOnRowEncoder(ctx context.Context, interactive bool) (built *lateOnSt
 	if forcedErr != nil {
 		return nil, forcedErr
 	}
-	// Record the intent before the first session attempt. A failure during
-	// construction is logged by the index and search paths, and those records
-	// carry the provider; without this they would all read "unset", which is
-	// least useful exactly when provider selection is what failed.
+	// Record the intent before the first session attempt. The index and
+	// search paths log a failure during construction with the provider.
+	// Without this record, those logs read "unset", which helps least when
+	// provider selection itself failed.
 	intent := lateOnAcceleratedProviderName
 	if !lateOnProviderHasAccelerator {
 		intent = lateOnCPUProviderName
@@ -282,9 +284,10 @@ func newLateOnRowEncoder(ctx context.Context, interactive bool) (built *lateOnSt
 	if lateOnProviderHasAccelerator && forced == "" {
 		cachedVerdict = cachedLateOnProviderVerdict(model)
 	}
-	// True only where an accelerator exists and we already know not to use it.
-	// On a target without one there is nothing to skip: the ordinary path below
-	// builds the CPU session through configureLateOnProvider.
+	// True only where an accelerator exists and a CPU pin or a cached
+	// rejection excludes it. On a target without one there is nothing to
+	// skip: the path below builds the CPU session through
+	// configureLateOnProvider.
 	skipAcceleratedSession := lateOnProviderHasAccelerator &&
 		(forced == lateOnCPUProviderName || cachedVerdict == lateOnVerdictRejected)
 	if !lateOnProviderHasAccelerator || skipAcceleratedSession {
@@ -424,9 +427,9 @@ func newLateOnRowEncoder(ctx context.Context, interactive bool) (built *lateOnSt
 	return encoder, nil
 }
 
-// newLateOnCPUBuildEncoder builds a CPU encoder with the index build's thread
-// count, with no provider selection: the model's first encoder is a CPU
-// session sized for one call, so the provider is chosen already.
+// newLateOnCPUBuildEncoder builds a CPU encoder with the thread count of the
+// index build. It makes no provider choice: semanticRowEncoder calls it only
+// after the first encoder chose a CPU session sized for one call.
 func newLateOnCPUBuildEncoder(ctx context.Context) (*lateOnStaticRowEncoder, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -444,11 +447,13 @@ func newLateOnCPUBuildEncoder(ctx context.Context) (*lateOnStaticRowEncoder, err
 }
 
 // newLateOnCPUSession builds a session on the CPU provider. Three paths need
-// one: a CPU pin or a cached rejection of the accelerated provider, a fallback
-// after the accelerated session proved unusable, and the index build session
-// (newLateOnCPUBuildEncoder). They must configure it identically, because the
-// reservation the build scheduler freezes is derived from the same thread
-// count.
+// one:
+//   - a CPU pin or a cached rejection of the accelerated provider;
+//   - a fallback after the accelerated session failed or the check rejected it;
+//   - the index build session (newLateOnCPUBuildEncoder).
+//
+// They configure it in the same way, because the build scheduler takes its
+// CPU reservation from the same thread count.
 func newLateOnCPUSession(model []byte, threads int) (*ort.DynamicAdvancedSession, error) {
 	return newLateOnStaticSession(model, func(options *ort.SessionOptions) error {
 		return configureLateOnCPUProvider(options, threads)
@@ -501,10 +506,12 @@ func lateOnCPUIntraOpThreads(cpuLimit int) int {
 }
 
 // lateOnCPUInteractiveThreads is the thread count of a session whose first
-// use is one call: a warm search that uses the model prepares one query and
-// scores one batch, so the index build's count leaves most CPUs idle. Measured
-// with Top-20 scoring on 18 CPUs: 828 ms on 3 threads, 559 ms on 6, 523 ms on
-// 12, and 624 ms on 18. So it takes two thirds of the CPUs, not all of them.
+// use is one call at a time. A warm search that uses the model prepares one
+// query, then scores its candidates in batches of semanticModelBatchRows rows.
+// The thread count of the index build leaves most CPUs idle for such a call.
+// On 18 CPUs, one batch of 20 documents took 828 ms on 3 threads and 559 ms
+// on 6. It took 523 ms on 12 threads and 624 ms on 18. So it takes two thirds
+// of the CPUs.
 func lateOnCPUInteractiveThreads(cpuLimit int) int {
 	return max(1, int(math.Round(float64(max(1, cpuLimit))*2/3)))
 }
@@ -518,6 +525,9 @@ func lateOnCPUThreads(interactive bool) int {
 	return lateOnCPUIntraOpThreads(runtime.GOMAXPROCS(0))
 }
 
+// CallCPUs reports the CPU cost of one Run call, which limits how many calls
+// run at the same time (semanticModelCallLimit). An accelerated session costs
+// 0.
 func (encoder *lateOnStaticRowEncoder) CallCPUs() int {
 	if encoder == nil {
 		return 1
@@ -525,6 +535,9 @@ func (encoder *lateOnStaticRowEncoder) CallCPUs() int {
 	return max(0, encoder.callCPUs)
 }
 
+// Run encodes the token rows in inputIDs and passes their output to consume.
+// It pads a short batch to semanticModelBatchRows rows, because the session
+// takes only that static shape. The output is valid only inside consume.
 func (encoder *lateOnStaticRowEncoder) Run(
 	ctx context.Context,
 	inputIDs []int64,

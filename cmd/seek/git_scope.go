@@ -12,10 +12,9 @@ import (
 	"github.com/sourcegraph/zoekt/query"
 )
 
-// This file builds the scope that restricts a Git corpus search to selected
-// paths. gitScopeSpec holds the parsed paths and builds the search-time filter.
-// The remaining helpers collapse and deduplicate the selection.
-
+// gitScopeSpec is the scope that restricts a Git corpus search to the selected
+// paths: the parsed directory and file operands, below the work-tree root.
+// rootIncluded selects the whole work tree.
 type gitScopeSpec struct {
 	dirs         []string
 	files        []string
@@ -24,12 +23,11 @@ type gitScopeSpec struct {
 
 // maxRegexpFileOperands is the largest number of file operands that become
 // anchored file-name regexps. Zoekt finds each such regexp through the
-// file-name trigram index, while a FileNameSet tests the name of every
-// document of each shard of the whole-repository index. Above this count, the
-// Or of that many regexp match trees costs more than one FileNameSet map, so
-// the scope uses the set. It is a var, not a const, so tests can force either
-// path.
-var maxRegexpFileOperands = 64
+// file-name trigram index. A FileNameSet tests the name of every document of
+// each shard of the whole-repository index. Above this count, the Or of that
+// many regexp match trees costs more than one FileNameSet map, so the scope
+// uses the set.
+const maxRegexpFileOperands = 64
 
 // query is the search-time filter of spec; nil covers the whole work tree.
 func (spec gitScopeSpec) query() (query.Q, error) {
@@ -41,8 +39,6 @@ func (spec gitScopeSpec) query() (query.Q, error) {
 	if n := len(spec.files); n > maxRegexpFileOperands {
 		queries = append(queries, query.NewFileNameSet(spec.files...))
 	} else if n > 0 {
-		// Anchored exact-path filename regexps are trigram-assisted on the
-		// combined whole-repo index; FileNameSet would scan every doc.
 		for _, file := range spec.files {
 			fileQ, err := query.RegexpQuery("^"+regexp.QuoteMeta(file)+"$", false, true)
 			if err != nil {
@@ -69,6 +65,9 @@ func (spec gitScopeSpec) query() (query.Q, error) {
 	}
 }
 
+// buildGitScopeSpec resolves the path operands below the work-tree root. An
+// operand at the root selects the whole work tree. A directory that another
+// directory holds, and a file that a directory holds, add nothing.
 func buildGitScopeSpec(root string, operands []string) (gitScopeSpec, error) {
 	root = canonicalCorpusPath(root)
 	fileSet := make(map[string]struct{})

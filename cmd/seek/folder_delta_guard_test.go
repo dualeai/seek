@@ -8,9 +8,9 @@ import (
 )
 
 // TestIndexFolderDocumentsDelta_FallsBackOnOversizePayload checks the payload
-// guard of a folder delta from end to end, with the manifest of the first
-// pass (changedFolderDocumentsFromManifest) and with no manifest
-// (changedFolderDocuments, which reads every file): each returns
+// guard of a folder delta from end to end. It runs with the manifest of the
+// first pass (changedFolderDocumentsFromManifest) and with no manifest
+// (changedFolderDocuments, which reads every file). Each returns
 // errDeltaPayloadExceedsWindow when the changed size reaches the window.
 //
 // Sequence:
@@ -21,9 +21,9 @@ import (
 //  3. Index again. indexFolderDocumentsDelta returns
 //     errDeltaPayloadExceedsWindow, and indexFolderDocuments then does a full
 //     rebuild through streamFolderFilesWithMarkers and indexDocuments.
-//  4. Check that the base shard file is replaced (a delta keeps it and adds
-//     shards; a full rebuild writes a new one), that a search finds the new
-//     content, and that the read semaphore has its full budget again.
+//  4. Check that the base shard file is replaced. A delta keeps it and adds
+//     shards; a full rebuild writes a new one. Check also that a search finds
+//     the new content, and that the read semaphore has its full budget again.
 //
 // The test uses the real folder pipeline and mocks no changed documents.
 func TestIndexFolderDocumentsDelta_FallsBackOnOversizePayload(t *testing.T) {
@@ -39,14 +39,14 @@ func checkOversizePayloadFallsBack(t *testing.T, dropManifest bool) {
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
-	const testBudget int64 = 4 * 1024 * 1024 // 4 MiB → window = 2 MiB
+	const testBudget int64 = 4 * 1024 * 1024 // 4 MiB: a 2 MiB window
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
 	defer goroutineLeakGuard(t)()
 
 	root := t.TempDir()
 	const fileCount = 8
-	const initialSize = 64 * 1024 // small initial — fits delta path
+	const initialSize = 64 * 1024
 	files := make([]string, fileCount)
 	for i := 0; i < fileCount; i++ {
 		name := testFileName("doc", i) + ".txt"
@@ -63,7 +63,6 @@ func checkOversizePayloadFallsBack(t *testing.T, dropManifest bool) {
 	plan := planSynthCorpus(t, root)
 	ctx := t.Context()
 
-	// First pass — establishes initial shards + manifest.
 	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 		t.Fatalf("initial ensureFolderCorpusFresh: %v", err)
 	}
@@ -77,8 +76,7 @@ func checkOversizePayloadFallsBack(t *testing.T, dropManifest bool) {
 		}
 	}
 
-	// Mutate every file with content size > window/fileCount each. Total
-	// = fileCount * 384 KiB = 3 MiB > 2 MiB window → guard trips.
+	// 8 files of 384 KiB: a 3 MiB change, above the 2 MiB window.
 	const grownSize = 384 * 1024
 	marker := []byte("MUTATED_BEACON_BAFFA\n")
 	for i, p := range files {
@@ -92,8 +90,6 @@ func checkOversizePayloadFallsBack(t *testing.T, dropManifest bool) {
 		}
 	}
 
-	// Second pass — delta would exceed window; guard trips; fallback to
-	// full rebuild via streamFolderFilesWithMarkers → windowed indexDocuments.
 	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 		t.Fatalf("post-mutation ensureFolderCorpusFresh: %v", err)
 	}
@@ -106,9 +102,6 @@ func checkOversizePayloadFallsBack(t *testing.T, dropManifest bool) {
 		t.Fatal("the base shard was kept after an oversize change: a delta ran, not the full rebuild")
 	}
 
-	// Verify the post-mutation content is actually in the new shards.
-	// searchPlannedCorpusForTest uses the production search path
-	// (searchPlannedCorpusParsed).
 	results, err := searchPlannedCorpusForTest(ctx, plan, "MUTATED_BEACON_BAFFA")
 	if err != nil {
 		t.Fatalf("search: %v", err)
@@ -120,8 +113,8 @@ func checkOversizePayloadFallsBack(t *testing.T, dropManifest bool) {
 
 // TestSeedFolderDeltaLinksOrFallsBack seeds a delta from a live family. When
 // every file links, the delta runs on the links. When one link fails (a shard
-// that went away), the delta does not run and the build directory is empty
-// again, so the full build starts from no seed.
+// that went away), the delta does not run. The build directory is then empty
+// again, so the full build starts with no seed.
 func TestSeedFolderDeltaLinksOrFallsBack(t *testing.T) {
 	live := t.TempDir()
 	shard := filepath.Join(live, "folder_x_v16.00000.zoekt")

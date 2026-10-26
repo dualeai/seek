@@ -44,14 +44,15 @@ func graphSearch(t *testing.T, marker string, operands ...string) map[string]str
 	return hits
 }
 
-// TestGraphEdgeTable searches "." from the root of the F6 graph: every edge
-// row is found once with its corpus tag, and the two "no" rows (a repository
-// in a Git-ignored folder, and a symlink) stay absent.
+// TestGraphEdgeTable searches "." from the root of the graph that edgeGraph
+// builds. Each file of each edge kind is found once with its corpus tag. The
+// files of a Git-ignored folder, which holds a repository, and the files behind
+// a symlink stay absent.
 func TestGraphEdgeTable(t *testing.T) {
 	requireTools(t)
 	const marker = "zqgraphedgemarker"
 	f := newGraphFixture(t)
-	want := f.F6(marker)
+	want := f.edgeGraph(marker)
 	setTestUserCache(t)
 	t.Chdir(f.root)
 	if got := graphSearch(t, marker, "."); !maps.Equal(got, want) {
@@ -59,14 +60,15 @@ func TestGraphEdgeTable(t *testing.T) {
 	}
 }
 
-// TestGraphExpandDotFromEveryFolder searches "." from each folder of the F6
-// graph. A search finds every file below its folder, except the files below a
-// Git-ignored folder, which only a search from inside that folder finds.
+// TestGraphExpandDotFromEveryFolder searches "." from each folder of the graph
+// that edgeGraph builds. A search finds every file below its folder, except
+// the files below a Git-ignored folder, which only a search from inside that
+// folder finds.
 func TestGraphExpandDotFromEveryFolder(t *testing.T) {
 	requireTools(t)
 	const marker = "zqgraphdotmarker"
 	f := newGraphFixture(t)
-	all := slices.Collect(maps.Keys(f.F6(marker)))
+	all := slices.Collect(maps.Keys(f.edgeGraph(marker)))
 	all = append(all, "repoA/ignored/loose.txt", "repoA/ignored/repoE/m.txt")
 	setTestUserCache(t)
 	for _, dir := range []string{
@@ -98,7 +100,7 @@ func TestGraphIgnoredFolderSearchedFromInside(t *testing.T) {
 	requireTools(t)
 	const marker = "zqgraphignoredmarker"
 	f := newGraphFixture(t)
-	f.F6(marker)
+	f.edgeGraph(marker)
 	setTestUserCache(t)
 	got := slices.Sorted(maps.Keys(graphSearch(t, marker, f.path("repoA/ignored"))))
 	if want := []string{"repoA/ignored/loose.txt", "repoA/ignored/repoE/m.txt"}; !slices.Equal(got, want) {
@@ -186,7 +188,7 @@ func TestGraphBareRepoRunsNoGit(t *testing.T) {
 		t.Fatal(err)
 	}
 	for dir := range strings.Lines(string(data)) {
-		if pathWithin(canonicalCorpusPath(bare), canonicalCorpusPath(strings.TrimSpace(dir))) {
+		if pathWithin(resolvedPath(t, bare), resolvedPath(t, strings.TrimSpace(dir))) {
 			t.Fatalf("Git ran in the bare repository: %s", data)
 		}
 	}
@@ -254,9 +256,9 @@ func TestGraphAmbiguousBoundaryAsksGit(t *testing.T) {
 		}
 	})
 
-	// A `.git` entry below a folder root that names another work tree's Git
-	// directory, in any form, is a failed node: the other repository's files
-	// stay absent.
+	// A `.git` entry below a folder root can name the Git directory of
+	// another work tree, in any form. Its node fails, and the files of the
+	// other repository stay absent.
 	for _, form := range []string{"file pointer", "pointer through a symlink", ".git symlink", "another worktree's admin dir", ".git directory with commondir"} {
 		t.Run("foreign Git directory: "+form, func(t *testing.T) {
 			f := newGraphFixture(t)
@@ -296,17 +298,23 @@ func TestGraphAmbiguousBoundaryAsksGit(t *testing.T) {
 			}
 			f.graphFile("dl/loose.txt", marker)
 			setTestUserCache(t)
-			// The WARN names the node and the cause.
-			logs := captureTestLogs(t, slog.LevelDebug)
+			logs := captureTestLogs(t, slog.LevelWarn)
 
 			got := slices.Sorted(maps.Keys(graphSearch(t, marker, f.path("dl"))))
 			if want := []string{"dl/loose.txt"}; !slices.Equal(got, want) {
 				t.Fatalf("found %q, want %q", got, want)
 			}
-			// The warning names the foreign Git directory, not a Git failure.
-			if !logsMention(logs.Records(), "Skipped a search node; its results are missing") ||
-				!logsMention(logs.Records(), "points to the Git directory of") {
-				t.Fatalf("no foreign-directory warning for a .git entry of another work tree: %v", logs.Records())
+			// The skipped node gets one WARN record whose cause names the
+			// foreign Git directory, not a Git failure.
+			var skipped []slog.Record
+			for _, record := range logs.Records() {
+				if record.Message == "Skipped a search node; its results are missing" {
+					skipped = append(skipped, record)
+				}
+			}
+			if len(skipped) != 1 || !logsMention(skipped, "points to the Git directory of") {
+				t.Fatalf("%d skip warnings, want one foreign-directory warning for a .git entry of another work tree: %v",
+					len(skipped), logs.Records())
 			}
 			if indexAfter, err := os.ReadFile(filepath.Join(victim, ".git", "index")); err != nil || !bytes.Equal(indexAfter, indexBefore) {
 				t.Fatalf("the search rewrote the other repository's index (err=%v)", err)
@@ -452,9 +460,9 @@ func TestGraphAmbiguousBoundaryAsksGit(t *testing.T) {
 }
 
 // TestGraphGitProcessCount runs a warm search over a folder with three
-// repositories, one of them with a submodule: one git status and one
-// git ls-files --stage per Git node per command, and no status recurses into
-// a submodule.
+// repositories, one of them with a submodule. The command runs one git status
+// and one git ls-files --stage per Git node. No status recurses into a
+// submodule.
 func TestGraphGitProcessCount(t *testing.T) {
 	requireTools(t)
 	const marker = "zqgraphprocessmarker"
@@ -491,9 +499,9 @@ func TestGraphGitProcessCount(t *testing.T) {
 }
 
 // TestGraphGitProcessCountCold counts Git processes on a cold search of a
-// folder with two repositories, with and without vectors (the vector run
-// searches one of them): one status and one index listing per Git node; the
-// cold build runs no second status.
+// folder with two repositories. It runs with and without vectors; the vector
+// run searches one of the repositories. Each Git node gets one status and one
+// index listing, and the cold build runs no second status.
 func TestGraphGitProcessCountCold(t *testing.T) {
 	requireTools(t)
 	const marker = "zqgraphcoldprocessmarker"
@@ -541,10 +549,10 @@ func TestGraphGitProcessCountCold(t *testing.T) {
 }
 
 // TestCapturedStateLastsUntilAChange checks the node captures of the graph
-// expansion: every preparation of the command uses them, so a search pays one
-// status and one walk per node, until a route sees the tree change; then
-// every later preparation reads the tree again, for the Git node and the
-// folder node alike.
+// expansion. Every preparation of the command uses them, so a search pays one
+// status and one walk per node. When a route sees the tree change
+// (treeChanged), every later preparation reads the tree again. This holds for
+// the Git node and the folder node alike.
 func TestCapturedStateLastsUntilAChange(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -719,8 +727,8 @@ func logsMention(records []slog.Record, text string) bool {
 }
 
 // TestBareRepoMarksAcceptSymbolicHead checks the two bare-repository checks
-// with a HEAD symlink, as old Git writes it: detectBareRepoAt accepts a link
-// into refs/ and refuses one elsewhere; gitListingMarks reads only the entry
+// with a HEAD symlink, as old Git writes it. detectBareRepoAt accepts a link
+// into refs/ and refuses one elsewhere. gitListingMarks reads only the entry
 // types, so it marks both as bare.
 func TestBareRepoMarksAcceptSymbolicHead(t *testing.T) {
 	for _, row := range []struct {

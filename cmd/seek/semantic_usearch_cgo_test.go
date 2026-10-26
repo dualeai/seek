@@ -19,10 +19,10 @@ import (
 )
 
 // TestSemanticUSearchCompatibilityUsesLoadedRuntime checks the identity that a
-// manifest stores: it names the version that the loaded runtime reports,
-// which must be the version that cicd/rerank-assets-upgrade.sh pins, and the
-// storage layout. The asset key, the directory of the extracted runtime,
-// follows the runtime bytes.
+// manifest stores. It names the version that the loaded runtime reports, and
+// the storage layout. That version must be the one that
+// cicd/rerank-assets-upgrade.sh pins. The asset key, the directory of the
+// extracted runtime, follows the runtime bytes.
 func TestSemanticUSearchCompatibilityUsesLoadedRuntime(t *testing.T) {
 	compatibility, err := semanticUSearchCompatibility()
 	if err != nil {
@@ -36,11 +36,16 @@ func TestSemanticUSearchCompatibilityUsesLoadedRuntime(t *testing.T) {
 	if pinned == nil {
 		t.Fatal("cicd/rerank-assets-upgrade.sh pins no USearch version")
 	}
-	// The layout settings of semantic_usearch_cgo.go: cosine (1), int8 (4),
-	// connectivity 16, expansions 128 and 64, one thread, four centroids, at
-	// most 4,096 rows per shard, shards cut at file boundaries with keys from
-	// 0, revision 3. A change to one of them, or to the library bytes, must
-	// change the identity, so that no generation reuses an incompatible graph.
+	// The layout settings of semantic_usearch_cgo.go are:
+	//   - cosine (1) and int8 (4);
+	//   - connectivity 16, and expansions 128 and 64;
+	//   - one thread and four centroids;
+	//   - at most 4,096 rows per shard, with shards cut at file boundaries and
+	//     keys from 0;
+	//   - revision 3.
+	//
+	// A change to one of them, or to the library bytes, must change the
+	// identity. So no generation reuses a graph of another layout.
 	want := "usearch-" + string(pinned[1]) + "-" + semanticUSearchAssetKey() + "-metric1-quant4-m16-add128-search64-threads1-c4-maxrows4096-filecut-v3"
 	if compatibility != want {
 		t.Fatalf("USearch compatibility=%q, want %q", compatibility, want)
@@ -669,12 +674,13 @@ func TestSemanticFilteredRouteBoundaryAndNativeFailure(t *testing.T) {
 
 // TestRunDefaultJoinedSearchUsesUSearchAboveExactThreshold searches a folder
 // with more rows than the exact route takes, so the search takes the USearch
-// route, and checks that the native graph returns the row nearest to an exact
-// query and that the file of that row prints. Vectors and scores are chosen:
-// each row gets a fixed vector, the query is the vector of the target row, and
-// the test model accepts every candidate. The test proves the route switch
-// above 256 rows and that the native graph finds the row nearest to an exact
-// query; it proves nothing about real vectors, tau or rank.
+// route. It checks that the native graph returns the row nearest to an exact
+// query, and that the file of that row prints. The test chooses the vectors
+// and scores. Each row gets a fixed vector, the query is the vector of the
+// target row, and the test model accepts every candidate. The test proves the
+// route switch above 256 rows. It also proves that the native graph finds the
+// row nearest to an exact query. It proves nothing about real vectors, tau or
+// rank.
 func TestRunDefaultJoinedSearchUsesUSearchAboveExactThreshold(t *testing.T) {
 	requireTools(t)
 	logs := captureTestLogs(t, slog.LevelDebug)
@@ -770,6 +776,11 @@ func TestRunDefaultJoinedSearchUsesUSearchAboveExactThreshold(t *testing.T) {
 	t.Fatal("joined command did not report the USearch retrieval backend")
 }
 
+// BenchmarkSemanticFilteredRetrieval times filtered retrieval of two full
+// shards at several allowed-row shares and query lengths. The planned route
+// is the production route (semanticUSearchFiltered). The forced-native and
+// forced-exact routes are the two pure policies that the plan chooses
+// between, as baselines. Each route reports its recall of the exact top hits.
 func BenchmarkSemanticFilteredRetrieval(b *testing.B) {
 	b.Setenv("SEEK_CACHE_DIR", b.TempDir())
 	embeddings := make([]semanticUnitEmbedding, semanticUSearchMaxShardRows*2)
@@ -947,6 +958,10 @@ func BenchmarkSemanticFilteredRetrieval(b *testing.B) {
 	}
 }
 
+// benchmarkForcedNativeSemanticFilter is the forced-native baseline of
+// BenchmarkSemanticFilteredRetrieval. It sends every shard with an allowed
+// row to native search, with the job limits of planSemanticUSearchShards.
+// Then it runs the production plan executor and exact scoring on the result.
 func benchmarkForcedNativeSemanticFilter(
 	ctx context.Context,
 	generation *semanticGeneration,
@@ -1028,6 +1043,8 @@ func BenchmarkPlanSemanticUSearchShardsScale(b *testing.B) {
 	}
 }
 
+// semanticUSearchTestVector returns a fixed unit vector for row, so each row
+// of a test generation has its own direction.
 func semanticUSearchTestVector(row int) semanticVector {
 	var vector semanticVector
 	var norm float64
@@ -1045,9 +1062,9 @@ func semanticUSearchTestVector(row int) semanticVector {
 }
 
 // TestSemanticUSearchSimilarityIsCosine builds one shard of keys near a
-// random query and reads every key: the hit score, USearch's cosine of the
-// int8 codes, estimates the f32 cosine with no scale bias, so a bound in
-// cosine units means what it says.
+// random query and reads every key. The hit score is the USearch cosine of
+// the int8 codes. It estimates the f32 cosine with no scale bias, so a bound
+// in cosine units means what it says.
 func TestSemanticUSearchSimilarityIsCosine(t *testing.T) {
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
 	if err := ensureSemanticUSearchRuntime(); err != nil {
@@ -1204,6 +1221,8 @@ func searchSemanticUSearchCandidates(
 	return result.rows, err
 }
 
+// searchSemanticUSearchFilteredCandidates is searchSemanticUSearchCandidates
+// with a partial filter mask.
 func searchSemanticUSearchFilteredCandidates(
 	ctx context.Context,
 	generation *semanticGeneration,
@@ -1218,7 +1237,7 @@ func searchSemanticUSearchFilteredCandidates(
 }
 
 // semanticUSearchFiltered searches the rows of the files that keep allows, as
-// scanNode does with the files that Zoekt selects: it builds the row mask,
+// scanNode does with the files that Zoekt selects. It builds the row mask,
 // then calls semanticUSearchMasked with no floor. It gives at most limit of the
 // best hits. A nil keep allows every row. No allowed row gives no hits.
 func semanticUSearchFiltered(

@@ -11,8 +11,12 @@ import (
 	"github.com/sourcegraph/zoekt/index"
 )
 
+// maxNativeGitDeltaPaths is the most changed paths of a commit range that a
+// delta takes (readNativeGitDiff). A larger range builds the family in full.
 const maxNativeGitDeltaPaths = gitObjectBatchSize
 
+// nativeGitDelta is an admitted delta of the committed family, from the
+// published commit to the target commit.
 type nativeGitDelta struct {
 	repository   zoekt.Repository
 	changedPaths []string
@@ -25,6 +29,8 @@ type nativeGitDelta struct {
 	oldBytes      int64
 }
 
+// nativeGitBlobMode reports a tree-entry mode of a blob that the index reads:
+// a regular file, an executable file, or a symlink.
 func nativeGitBlobMode(mode string) bool {
 	switch mode {
 	case "100644", "100755", "120000":
@@ -79,11 +85,16 @@ func nativeGitDeltaStaticMetadataEqual(existing, target *zoekt.Repository) bool 
 
 // prepareNativeGitDelta checks whether target can extend the published
 // committed family. eligible=false with no error selects native full indexing;
-// an error stops the build. It selects full indexing for an incomplete or
-// incompatible base, no usable Ctags, too many shards or paths, a missing base
-// commit, a delta payload that reaches the build's index window, or tombstoned
-// content that reaches both the live content and one shard
-// (deltaNeedsCompaction). No other committed-data backend is a fallback.
+// an error stops the build. It selects full indexing for:
+//   - an incomplete or incompatible base;
+//   - no usable Ctags;
+//   - too many shards or paths;
+//   - a missing base commit;
+//   - a delta payload that reaches the build's index window;
+//   - tombstoned content that reaches both the live content and one shard
+//     (deltaNeedsCompaction).
+//
+// No other committed-data backend is a fallback.
 func prepareNativeGitDelta(
 	ctx context.Context,
 	repoDir string,
@@ -204,14 +215,13 @@ func prepareNativeGitDelta(
 	}, true, nil
 }
 
-// scanNativeGitDeltaChanges checks the new blobs named by diff-tree, so delta
-// admission never enumerates the unchanged target tree. The same batch session
-// also reads the old blobs of the changed paths, with no other Git process,
-// and returns the bytes that their shard documents held (heldContentBytes),
-// which the delta tombstones (deltaNeedsCompaction). So an old binary blob
-// counts as its marker, not its size: a commit that changes only a binary
-// asset stays a delta. The read streams each old blob once, as the delta reads
-// each new one.
+// scanNativeGitDeltaChanges checks the new blobs that diff-tree names, so delta
+// admission never lists the unchanged target tree. The same batch session
+// also reads the old blobs of the changed paths, with no other Git process. It
+// returns the bytes that their shard documents held (heldContentBytes), which
+// the delta tombstones (deltaNeedsCompaction). So an old binary blob counts as
+// its marker, not its size: a commit that changes only a binary asset stays a
+// delta. The read streams each old blob once, as the delta reads each new one.
 func scanNativeGitDeltaChanges(
 	ctx context.Context,
 	repoDir string,
@@ -313,11 +323,14 @@ func indexNativeGitDelta(
 }
 
 // errNativeDeltaFallback marks a delta error after which buildCommittedGitStage
-// builds the family in full, as the folder delta does (seedFolderDelta): a
-// seed link error (a full build links no seed) and an error of the delta's
-// Zoekt Builder, such as a damaged base shard record that only its Finish
-// reads (a full build reads no base shard). An error that the full build gets
-// again, such as a ctags failure or a full disk, then costs each search the
-// delta and the failed full build until it ends: 463-556 ms against
-// 94-137 ms with no fallback, on a repository of 2,000 or 20,000 files.
+// builds the family in full, as the folder delta does (seedFolderDelta). Two
+// errors take it:
+//   - A seed link error: a full build links no seed.
+//   - A Zoekt Builder error of the delta, such as a damaged base shard record
+//     that only Finish reads: a full build reads no base shard.
+//
+// The full build can get the same error again, such as a ctags failure or a
+// full disk. Until that error ends, each search then pays for the delta and
+// the failed full build. On a repository of 2,000 or 20,000 files, that is
+// 463-556 ms against 94-137 ms with no fallback.
 var errNativeDeltaFallback = errors.New("native Git delta failed")

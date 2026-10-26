@@ -42,19 +42,19 @@ var processProviderPin = os.Getenv(lateOnProviderEnv)
 // does not use the model does not pay its start.
 //
 // A test that sets SEEK_PROVIDER to a value that is not the process value gets
-// an error at every call: the process model keeps the provider of its start,
-// so without the error the test would run that provider in silence.
+// an error at every call. The process model keeps the provider of its start.
+// Without the error, the test would run that provider with no sign of it.
 //
 // The start builds the query encoder and then the index-build encoder, under a
 // context that no test cancels. The model keeps the error of its first encoder
-// build for its life (semanticRowEncoder), so a lazy build in a test whose
+// build for its life (semanticRowEncoder). So a lazy build in a test whose
 // context ends would break the model for every later test. The query encoder
 // comes first, as in a search command, so the CPU sessions get the thread
 // counts of a search.
 //
-// Only a started model stays. A start that fails, for example in a test whose
-// cache root is not usable, returns its error, and the next call starts again,
-// so one bad start does not fail every later test.
+// Only a started model stays. A start that fails returns its error, for
+// example in a test whose cache root is not usable. The next call starts
+// again, so one bad start does not fail every later test.
 //
 // The runtime and the compiled model files go to the cache root of the test
 // that starts the model. The model reads them only while it starts. A test
@@ -130,8 +130,8 @@ func stableModelRoot(tb testing.TB) string {
 
 // observedScore is one document that the search sent to the model, with the
 // raw score that the model returned for it. The score is NaN when the call
-// failed or gave no score for each document. It does not hold the MeanMaxSim:
-// acceptance divides the score by its own rule, and a copy of that rule here
+// failed or gave no score for each document. It does not hold the MeanMaxSim.
+// Acceptance divides the score by its own rule, and a copy of that rule here
 // could show a value that acceptance does not use.
 type observedScore struct {
 	document rerankDocument
@@ -141,15 +141,15 @@ type observedScore struct {
 // observedModel passes every call to its model and records the call. Each
 // stage method counts the call and records its input before it does more, so
 // a test sees the input of a call that fails. Then the embed and score stages
-// run the hook of the stage if the test set one: a hook error that is not nil
+// run the hook of the stage if the test set one. A hook error that is not nil
 // is the result of the stage, and the model does not run. A hook can also act
 // during the call, for example edit a file, and return nil. The wrapper
 // changes no input and no result, so the inner model can be the real model
 // (sharedModel(t)) or a test model. Set the hooks before the search starts.
 //
 // Close counts the call and does nothing more, so the test controls the life
-// of the inner model: each command closes its model at its end, and a test can
-// give one observed model to more than one command.
+// of the inner model. Each command closes its model at its end, and a test
+// can give one observed model to more than one command.
 type observedModel struct {
 	semanticModel
 
@@ -159,9 +159,9 @@ type observedModel struct {
 	score func(ctx context.Context, documents []rerankDocument) error
 
 	mu sync.Mutex
-	// queries holds the text of each prepared query, units a copy of each
-	// unit to embed, and scored each document of each score call, all in call
-	// order.
+	// queries holds the text of each prepared query. units holds a copy of
+	// each unit to embed, and scored each document of each score call. All
+	// three are in call order.
 	queries []string
 	units   []semanticUnit
 	scored  []observedScore
@@ -190,7 +190,7 @@ func (o *observedModel) PrepareSemanticQuery(ctx context.Context, query string) 
 
 // EmbedSemanticUnits records a copy of each unit with its own text and model
 // input. The text of a unit is a view of the file bytes, which the build holds
-// only while a model call reads them, and the build clears both fields in the
+// only while a model call reads them. The build clears both fields in the
 // rows that it keeps.
 func (o *observedModel) EmbedSemanticUnits(ctx context.Context, units []semanticUnit) ([]semanticUnitEmbedding, error) {
 	o.embeds.Add(1)
@@ -256,9 +256,10 @@ func documentPaths(documents []rerankDocument) []string {
 }
 
 // scoredPaths returns the sorted, distinct node-relative paths of the
-// documents that the search sent to the model, the documents of a failed call
-// included, and, for a failure message, the provider of the process model and
-// the raw score of each document: NaN for a document of a failed call.
+// documents that the search sent to the model, with the documents of a failed
+// call. For a failure message, it also returns the provider of the process
+// model and the raw score of each document. The score is NaN for a document
+// of a failed call.
 func (o *observedModel) scoredPaths() (paths []string, report string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -288,9 +289,9 @@ func seekWith(t *testing.T, newModel semanticModelFactory, args ...string) (stri
 }
 
 // modelFactory returns a factory that gives model at each call. The command
-// closes the model at its end, and a test model keeps its counters and records
+// closes the model at its end. A test model keeps its counters and records
 // after Close, so the test reads them after the command. It is a function and
-// not a method of hybridTestScorer: a type that embeds hybridTestScorer would
+// not a method of hybridTestScorer. A type that embeds hybridTestScorer would
 // get the method, and the factory would give the inner model.
 func modelFactory(model semanticModel) semanticModelFactory {
 	return func(context.Context) (semanticModel, error) { return model, nil }
@@ -309,12 +310,15 @@ func failingModelFactory(starts *atomic.Int32) semanticModelFactory {
 
 // stubSearch runs args through the root command, as main does, with a new
 // hybridTestScorer in mode, and returns the output, the model and the error.
-// With payloadAccept every row is a candidate and the model accepts every
-// candidate, so a test proves which rows a search reads and which files print,
-// not which files a real model finds. With payloadReject every row is a
-// candidate and the model rejects each one, and with payloadFar no row is a
-// candidate: only the strict hits print, and a test proves which rows a build
-// writes and which documents the model scores.
+//   - With payloadAccept, every row is a candidate and the model accepts every
+//     candidate. A test proves which rows a search reads and which files
+//     print, not which files a real model finds.
+//   - With payloadReject, every row is a candidate and the model rejects each
+//     one.
+//   - With payloadFar, no row is a candidate.
+//
+// With payloadReject and payloadFar, only the strict hits print. A test
+// proves which rows a build writes and which documents the model scores.
 func stubSearch(t *testing.T, mode payloadMode, args ...string) (string, *hybridTestScorer, error) {
 	t.Helper()
 	scorer := &hybridTestScorer{mode: mode}
@@ -415,9 +419,9 @@ func headerTexts(output string) []string {
 	return headers
 }
 
-// firstRegions maps the header text of each result of output to the lines of
-// its body up to the first blank line, each with its newline: the "also:" line
-// and the first region of the file.
+// firstRegions maps the header text of each result of output to its body
+// lines up to the first blank line, each with its newline. These are the
+// "also:" line and the first region of the file.
 func firstRegions(output string) map[string]string {
 	regions := make(map[string]string)
 	for _, result := range printedResults(output) {
@@ -434,8 +438,9 @@ func firstRegions(output string) map[string]string {
 }
 
 // bodyTexts maps the path of each result of output to each line of its body
-// that is not blank, with its newline: the "also:" line and every region of
-// the file, and, for the last result, the footer and the notice after it.
+// that is not blank, with its newline. These are the "also:" line and every
+// region of the file. For the last result, they also hold the footer and the
+// notice after it.
 func bodyTexts(output string) map[string]string {
 	texts := make(map[string]string)
 	for _, result := range printedResults(output) {
@@ -464,13 +469,17 @@ func printedFiles(output string) []string {
 
 // TestPrintedResultsReadsSearchOutput parses the output of a search of a Git
 // node and a folder node, whose file names hold spaces. The output has each
-// form of result: the [uncommitted], [git] and [folder] tags, a language with
-// parentheses, an "also:" line, a name-only result (a binary file that
-// matches by name), and a file with two regions of lines. The description
-// takes the model route, where the copies with the same bytes print as one
-// result. The test model in its far mode adds no file, so the strict hits
-// print. A "-n 1" search then puts the footer in the body of its last result,
-// and a header with no text gives no panic.
+// form of result:
+//   - the [uncommitted], [git] and [folder] tags;
+//   - a language with parentheses;
+//   - an "also:" line;
+//   - a name-only result (a binary file that matches by name);
+//   - a file with two regions of lines.
+//
+// The description takes the model route, where the copies with the same bytes
+// print as one result. The test model in its far mode adds no file, so the
+// strict hits print. A "-n 1" search then puts the footer in the body of its
+// last result, and a header with no text gives no panic.
 func TestPrintedResultsReadsSearchOutput(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -534,17 +543,17 @@ var testLoggerMu sync.Mutex
 // seekRoot runs the root command as main does, under ctx: the separator splice,
 // the flag parse, PersistentPreRunE, PreRunE and RunE. It writes the results to
 // os.Stdout. Use it for a search that the test cancels or runs beside another
-// search: captureStdout changes the process stdout, so it cannot capture two
+// search. captureStdout changes the process stdout, so it cannot capture two
 // searches at the same time.
 //
 // A nil newModel gives the process model. Its factory starts the model only
 // when the search asks for it, so a lexical search pays nothing. A model that
-// cannot start fails tb: else the search would fall back to the strict order
+// cannot start fails tb. Else the search would fall back to the strict order
 // and could pass a test of a model result.
 //
 // The root command installs the CLI logger, which writes to the process
-// stderr. seekRoot puts back the logger of the test after PersistentPreRunE,
-// so captureTestLogs keeps its records and the log output that TestMain
+// stderr. seekRoot puts back the logger of the test after PersistentPreRunE.
+// So captureTestLogs keeps its records, and the log output that TestMain
 // discards stays discarded. The process tests test the CLI logger.
 func seekRoot(ctx context.Context, tb testing.TB, newModel semanticModelFactory, args ...string) error {
 	tb.Helper()

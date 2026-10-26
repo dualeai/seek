@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 #:HELP_BEGIN
-# bench-field.sh — Self-contained field benchmarks for `seek`.
+# bench-field.sh: self-contained field benchmarks for `seek`.
 #
 # Runs cold-index, warm-search, dirty-reindex (PR-scale mutations), and
-# token-count probes across real Git repos (cobra, prometheus, k8s, optionally
-# linux) and synthetic non-Git folders at 10k and 100k file scales.
+# token-count probes. The workloads are real Git repos (cobra, prometheus, k8s,
+# optionally linux) and synthetic non-Git folders of 10k and 100k files.
 #
-# Emits a Markdown table on stdout. Cache is sandboxed via SEEK_CACHE_DIR
-# so the script never touches the developer's real ~/Library/Caches/seek.
+# Writes a Markdown table on stdout. SEEK_CACHE_DIR points the cache into the
+# workdir, so the script never touches the developer's real
+# ~/Library/Caches/seek.
 #
 # Usage:
 #   ./cicd/bench-field.sh                # default workdir + all repos
@@ -16,15 +17,15 @@
 #   ./cicd/bench-field.sh --keep         # keep workdir for re-runs
 #
 # Builds this checkout by default. Set SEEK_BIN=/path/to/seek to compare
-# another binary. WORKDIR is scratch-owned; deletes, resets, cleans, and dirty
-# mutations are confined to workload subdirs under it.
+# another binary. The script owns WORKDIR; it deletes, resets, cleans, and
+# changes files only in the workload folders under it.
 #
 # The default exact query still builds or updates both index parts. Pass an
 # already-built binary through SEEK_BIN when the build tools are unavailable.
 #
 # Requires: git and universal-ctags. The default build also needs make, Go, and
 # a native C compiler. Set SEEK_BIN to skip that build.
-# Optional for token columns: uv (pulls tiktoken in an ephemeral env).
+# Optional for token columns: uv (gets tiktoken in a temporary env).
 #:HELP_END
 
 set -euo pipefail
@@ -155,7 +156,8 @@ count_tokens() {
   fi
 }
 
-# clear_cache wipes the sandboxed cache so cold-index runs honestly.
+# clear_cache removes the workdir cache, so a cold-index run starts with no
+# index.
 clear_cache() {
   rm -rf "$SEEK_CACHE_DIR" 2>/dev/null || true
   mkdir -p "$SEEK_CACHE_DIR"
@@ -174,15 +176,14 @@ clone_repo() {
   git -C "$dst" clean -fdx >/dev/null 2>&1
 }
 
-# synth_folder DIR COUNT: generate COUNT Go-ish files under DIR.
-# Files are ~250 bytes each with 5 functions per file so zoekt's
-# shardMax (10 MiB content) yields multiple shards at the 100k scale —
-# without this realism a single-shard fixture serializes the cold-index
-# build into one goroutine and skews bench numbers vs real repos
-# (see shardMax in cmd/seek/indexer.go).
+# synth_folder DIR COUNT: generate COUNT Go-like files under DIR.
+# Each file has about 250 bytes and 5 functions, so Zoekt's shardMax (10 MiB
+# of content, see cmd/seek/indexer.go) gives several shards at 100k files. A
+# fixture of one shard would run the cold-index build on one goroutine, and
+# its numbers would not match real repos.
 #
-# Uses printf (builtin) instead of `cat <<EOF` (subprocess fork per
-# file) — heredoc spawn cost is multi-minutes at 100k scale.
+# It uses the printf builtin, not `cat <<EOF`, which starts one process per
+# file. At 100k files, those processes cost several minutes.
 synth_folder() {
   local dir="$1" count="$2"
   rm -rf "$dir"

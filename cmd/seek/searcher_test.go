@@ -253,8 +253,8 @@ func TestSearchPlannedCorpusParsed_ContextModes(t *testing.T) {
 // committed and an uncommitted shard in one index directory, as a Git node
 // does, and reads the node. The read hides the committed copy of a.go,
 // because the uncommitted copy wins. With a context file limit of 1, only the
-// best file after the merge of the two shards keeps its context lines, in each
-// shard order.
+// best file after the merge of the two shards keeps its context lines. This
+// holds in each shard order.
 func TestSearchPlannedCorpusParsed_ContextFileSelectionAfterShardMerge(t *testing.T) {
 	requireTools(t)
 
@@ -368,7 +368,7 @@ func TestSearchPlannedCorpusParsed_ContextFileSelectionAfterShardMerge(t *testin
 }
 
 // TestNodeRead_FailsClosedOnPartialCorruptShard reads a node whose index
-// holds a good shard and a corrupt one: the read returns index damage, which
+// holds a good shard and a corrupt one. The read returns index damage, which
 // the caller repairs, and no partial result.
 func TestNodeRead_FailsClosedOnPartialCorruptShard(t *testing.T) {
 	requireTools(t)
@@ -410,8 +410,9 @@ func TestNodeRead_FailsClosedOnPartialCorruptShard(t *testing.T) {
 }
 
 // TestSearchLoadedShardsRecoversAShardPanic checks the two panic classes of a
-// shard search: a corrupt-shard panic is index damage that the node read
-// repairs, and any other panic is a plain error. The other shard still runs.
+// shard search. A panic that names a corrupt shard or index, or a Go runtime
+// error, is index damage that the node read repairs. Any other panic is a
+// plain error. The other shard still runs.
 func TestSearchLoadedShardsRecoversAShardPanic(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -458,9 +459,9 @@ func recoveredRuntimeError() (value any) {
 }
 
 // TestZoektShardCallsReturnPanicsAsErrors checks the reads that call a Zoekt
-// shard outside searchLoadedShards: the BM25 counts (a List, then a listing)
-// and the current-copy listing of an uncommitted shard. A shard whose calls
-// panic with a runtime error gives index damage, not a crash.
+// shard outside searchLoadedShards. They are the BM25 counts (a List, then a
+// listing) and the current-copy listing of an uncommitted shard. A shard whose
+// calls panic with a runtime error gives index damage, not a crash.
 func TestZoektShardCallsReturnPanicsAsErrors(t *testing.T) {
 	broken := &cancellationTestShard{search: func(context.Context) (*zoekt.SearchResult, error) {
 		panic(recoveredRuntimeError())
@@ -561,9 +562,9 @@ func TestDeltaBuilderWithNullShardMetadataIsNoCrash(t *testing.T) {
 }
 
 // TestFullBuildLaterWindowWithNullRecordIsNoCrash runs a full build whose
-// large document opens a second window, a delta Builder, and writes "null"
-// into the .meta file of the first window's shard before the input ends. The
-// second window's Finish reads that record through the shard-call guard: the
+// large document opens a second window, a delta Builder. Before the input
+// ends, it writes "null" into the .meta file of the first window's shard. The
+// second window's Finish reads that record through the shard-call guard. The
 // build fails as index damage, and the process keeps running.
 func TestFullBuildLaterWindowWithNullRecordIsNoCrash(t *testing.T) {
 	requireTools(t)
@@ -579,8 +580,8 @@ func TestFullBuildLaterWindowWithNullRecordIsNoCrash(t *testing.T) {
 		large := []byte(strings.Repeat("large text line\n", 200))
 		files <- makeFileContent(t, "small.go", []byte("package small\nfunc Small() {}\n"))
 		files <- makeFileContent(t, "large.txt", large)
-		// The build takes the next document only after it finished the first
-		// window and added large.txt, so the first shard and its record exist
+		// The build takes the next document only after it finishes the first
+		// window and adds large.txt. So the first shard and its record exist
 		// when this send returns. With a parallelism of 3, the second large
 		// document stays in the open window, and no Finish runs before the
 		// channel closes.

@@ -26,17 +26,19 @@ import (
 )
 
 // Zoekt scores BM25 per shard with that shard's average file length
-// (index/score.go scoreFileBM25, k = 1.2, b = 0.75), so the strict order
+// (index/score.go scoreFileBM25, k = 1.2, b = 0.75). So the strict order
 // depends on how the shards and the nodes split the files. Seek rescores every
 // strict hit with one average over all the shards that a command searches.
 // TODO(https://github.com/sourcegraph/zoekt/issues/1186): drop this rescore
 // once Zoekt lets the caller supply the average file length.
 //
-// The sources: Zoekt's score is exact in FileMatch.Score; the term
-// frequencies come from the matches Seek receives, with the file-name atoms run
-// on the name; DebugScore gives the low-priority flag and the sum to check;
-// the shard average is (ContentBytes - file-name bytes) / Documents; the file
-// length solves from the score.
+// The sources:
+//   - Zoekt's score is exact in FileMatch.Score.
+//   - The term frequencies come from the matches that Seek gets, with the
+//     file-name atoms run on the name.
+//   - DebugScore gives the low-priority flag and the sum to check.
+//   - The shard average is (ContentBytes - file-name bytes) / Documents.
+//   - The file length comes from the score.
 const (
 	bm25K         = 1.2
 	bm25B         = 0.75
@@ -75,7 +77,7 @@ type bm25CommandKey struct{}
 
 // bm25Command holds the shards that one command searches. With one node, one
 // search sees every shard of the command and gives each hit its final score
-// (final); the command rescore then has nothing to do.
+// (final). The command rescore then has nothing to do.
 type bm25Command struct {
 	mu     sync.Mutex
 	shards map[string]shardLengthStats
@@ -114,7 +116,7 @@ func (command *bm25Command) set(paths []string, shards []shardLengthStats) {
 }
 
 // shardsAverage is the average file length over shards, and whether they are
-// two or more: with one shard Zoekt's own average is the global one.
+// two or more. With one shard, Zoekt's own average is the global one.
 func shardsAverage(shards []shardLengthStats) (float64, bool) {
 	var docs, content int64
 	for _, stats := range shards {
@@ -128,7 +130,7 @@ func shardsAverage(shards []shardLengthStats) (float64, bool) {
 }
 
 // average is the global average file length, and whether the command searched
-// more than one shard: with one shard Zoekt's own average is the global one.
+// more than one shard. With one shard, Zoekt's own average is the global one.
 func (command *bm25Command) average() (float64, bool) {
 	command.mu.Lock()
 	defer command.mu.Unlock()
@@ -153,9 +155,9 @@ func readShardStatsRecord(indexDir string) *shardStatsRecord {
 	return record
 }
 
-// stats returns the counts of the shard at path, from the record when the
-// shard file is the same, else from the shard itself (a one-time listing of
-// its names).
+// stats returns the counts of the shard at path. It reads them from the
+// record when the shard file is the same. Else it reads them from the shard
+// itself, with one listing of its names.
 func (record *shardStatsRecord) stats(ctx context.Context, path string, searcher zoekt.Searcher) (shardLengthStats, error) {
 	var st syscall.Stat_t
 	if err := syscall.Stat(path, &st); err != nil {
@@ -206,7 +208,7 @@ func (record *shardStatsRecord) stats(ctx context.Context, path string, searcher
 }
 
 // openShardWithoutTombstones opens the shard at path under a name with no
-// ".meta" sidecar: Zoekt reads a shard's tombstones from "<name>.meta"
+// ".meta" sidecar. Zoekt reads a shard's tombstones from "<name>.meta"
 // (index/read.go), so this copy sees every file that the shard holds.
 func openShardWithoutTombstones(path string) (zoekt.Searcher, error) {
 	file, err := os.Open(path)
@@ -288,10 +290,10 @@ func parseZoektBM25Debug(debug string) (lowPriority bool, sum int, ratio float64
 // bm25Parts rebuilds the length and the term frequencies of one hit from shard
 // stats, and encodes them in its Debug field for the rescore. Each candidate
 // takes Zoekt's term key (bm25Query). The rebuild must give Zoekt's sum of
-// frequencies and, solved from the score, the length ratio that Zoekt prints
-// (two decimals); of the splits of lines that the line score cannot
-// tell apart, exactly one value set must fit. Any other hit keeps its score
-// (no parts).
+// frequencies. Solved from the score, it must also give the length ratio that
+// Zoekt prints (two decimals). The line score cannot tell some splits of a
+// line apart; of those, exactly one value set must fit. Any other hit keeps
+// its score (no parts).
 func bm25Parts(file *zoekt.FileMatch, bq bm25Query, average float64) bool {
 	debug := file.Debug
 	file.Debug = ""
@@ -341,9 +343,9 @@ func bm25Parts(file *zoekt.FileMatch, bq bm25Query, average float64) bool {
 			base[piece.key] += piece.frequency
 		}
 	}
-	// A file-name match has no fragment when the file has content matches:
-	// then the query's file-name atoms run on the name (Zoekt's file-name
-	// candidates, with its overlap rule).
+	// A file-name match has no fragment when the file has content matches.
+	// Then the query's file-name atoms run on the name: Zoekt's file-name
+	// candidates, with its overlap rule.
 	if !nameLine {
 		alternatives, ok := bq.nameCandidates(file.FileName)
 		if !ok {
@@ -430,9 +432,9 @@ func bm25Parts(file *zoekt.FileMatch, bq bm25Query, average float64) bool {
 // hit with more keeps Zoekt's score (no result is cut).
 const bm25MaxSplitStates = 4096
 
-// bm25GroupOptions joins the lines whose split lists are equal: k such lines
-// reach the sums of k picks among their splits, which the compositions of k
-// give in one step, where a line-by-line merge costs about k squared.
+// bm25GroupOptions joins the lines whose split lists are equal. k such lines
+// reach the sums of k picks among their splits. The compositions of k give
+// these sums in one step; a merge line by line costs about k squared.
 func bm25GroupOptions(options [][][]bm25Piece) ([][][]bm25Piece, bool) {
 	signature := func(splits [][]bm25Piece) string {
 		var key strings.Builder
@@ -525,11 +527,11 @@ func bm25StateKey(frequencies map[string]int) string {
 	return key.String()
 }
 
-// bm25Fit checks one rebuild against Zoekt's debug line: the sum of the
-// frequencies, and a length ratio within the two printed decimals that gives
-// the score. The score falls as the ratio grows, so two score calls at the
-// ends of the printed bracket check it. A hit with no term has a zero score
-// and no ratio to check.
+// bm25Fit checks one rebuild against Zoekt's debug line. It checks the sum of
+// the frequencies, and a length ratio within the two printed decimals that
+// gives the score. The score falls as the ratio grows, so two score calls at
+// the ends of the printed bracket check it. A hit with no term has a zero
+// score and no ratio to check.
 func bm25Fit(frequencies map[string]int, lowPriority bool, want int, printed, score float64) ([]int, bool) {
 	sum := 0
 	values := make([]int, 0, len(frequencies))
@@ -562,11 +564,11 @@ func bm25Fit(frequencies map[string]int, lowPriority bool, want int, printed, sc
 }
 
 // bm25Query is what the rebuild reads from a strict query: the atoms whose
-// candidates Zoekt counts (index/eval.go gatherMatches, which reads no atom
-// under a Not or a type:file), each with Zoekt's term key
-// (index/score.go calculateTermFrequency): the lowered pattern of a substring
-// atom of three or more runes, and "" for every regexp, word, sym: regexp, or
-// shorter substring atom.
+// candidates Zoekt counts. Zoekt reads no atom under a Not or a type:file
+// (index/eval.go gatherMatches). Each atom has Zoekt's term key
+// (index/score.go calculateTermFrequency). That key is the lowered pattern of
+// a substring atom of three or more runes. It is "" for every regexp, word,
+// sym: regexp, or shorter substring atom.
 type bm25Query struct {
 	names []bm25NameAtom
 	// substrings holds the lowered patterns of the content substring atoms,
@@ -695,10 +697,10 @@ type bm25Leaf struct {
 }
 
 // bm25RegexpSubstrings returns the substrings that Zoekt searches in place of
-// r, when its match tree equals r (index/eval.go regexpToMatchTreeRecursive):
-// a literal of bm25NgramSize or more runes, or an alternation of such
-// regexps, under captures, x+ and x{1,n}. Any other form, a concatenation of
-// two or more parts included, gives a tree that Zoekt marks as not equal.
+// r, when its match tree equals r (index/eval.go regexpToMatchTreeRecursive).
+// Such an r is a literal of bm25NgramSize or more runes, or an alternation of
+// such regexps, under captures, x+ and x{1,n}. Zoekt marks the tree of any
+// other form as not equal, also a concatenation of two or more parts.
 func bm25RegexpSubstrings(r *syntax.Regexp) ([]bm25Leaf, bool) {
 	switch r.Op {
 	case syntax.OpLiteral:
@@ -751,8 +753,8 @@ func (bq bm25Query) contentKey(text string) (string, bool) {
 }
 
 // nameKey returns the term key of a file-name fragment: a file-name atom's
-// key, or the whole name when no atom made it (Zoekt's candidate for a file
-// with no other match, whose key is the name).
+// key, or the whole name when no atom made it. That last case is Zoekt's
+// candidate for a file with no other match, and its key is the name.
 func (bq bm25Query) nameKey(text, name string) (string, bool) {
 	lowered := strings.ToLower(text)
 	keys := map[string]struct{}{}
@@ -778,10 +780,10 @@ func (bq bm25Query) nameKey(text, name string) (string, bool) {
 }
 
 // nameCandidates returns the key lists that Zoekt's file-name candidates on
-// name can give: every atom's matches, sorted by offset with the longer first,
-// with the overlapping ones dropped (index/eval.go gatherMatches). Two atoms
-// with other keys on one range give two lists: Zoekt's unstable sort keeps
-// either, and bm25Parts lets the length ratio pick.
+// name can give. These are every atom's matches, sorted by offset with the
+// longer first, less the overlapping ones (index/eval.go gatherMatches). Two
+// atoms with other keys on one range give two lists. Zoekt's unstable sort
+// keeps either, and bm25Parts lets the length ratio pick.
 func (bq bm25Query) nameCandidates(name string) ([][]string, bool) {
 	var candidates []bm25Candidate
 	for _, atom := range bq.names {
@@ -794,9 +796,9 @@ func (bq bm25Query) nameCandidates(name string) ([][]string, bool) {
 	return bm25CandidateKeys(candidates)
 }
 
-// bm25CandidateKeys applies Zoekt's overlap rule to file-name candidates and
-// returns the key lists that the survivors can give (one per choice among the
-// keys of a tied range).
+// bm25CandidateKeys applies Zoekt's overlap rule to file-name candidates. It
+// returns the key lists that the remaining candidates can give: one per
+// choice among the keys of a tied range.
 func bm25CandidateKeys(candidates []bm25Candidate) ([][]string, bool) {
 	slices.SortStableFunc(candidates, func(left, right bm25Candidate) int {
 		if left.at != right.at {
@@ -885,13 +887,13 @@ func bm25ASCII(name string) bool {
 	return true
 }
 
-// lineFrequencies returns the splits of one matched line into term
-// frequencies. A match on a symbol counts five, and Zoekt does not mark it on
-// the fragment, so the line's own BM25 score (line length over 100,
-// index/score.go scoreLineBM25) decides how many matches of each term were on
-// a symbol. Two or more splits can reach the line score; bm25Parts keeps the
-// one that the file's length ratio fits. A line of two or more terms that
-// needs more than 1<<14 search steps gives false: the hit keeps Zoekt's score.
+// lineFrequencies returns the splits of one matched line into term frequencies.
+// A match on a symbol counts five, and Zoekt does not mark it on the fragment.
+// So the line's own BM25 score (index/score.go scoreLineBM25, with the line
+// length over 100) decides how many matches of each term were on a symbol. Two
+// or more splits can reach the line score; bm25Parts keeps the one that the
+// file's length ratio fits. A line of two or more terms that needs more than
+// 1<<14 search steps gives false, and the hit keeps Zoekt's score.
 func (bq bm25Query) lineFrequencies(line zoekt.LineMatch, pieceKeys map[uint32]string) ([][]bm25Piece, bool) {
 	ratio := float64(len(line.Line)) / 100
 	counts := map[string]int{}
@@ -966,12 +968,13 @@ func (bq bm25Query) lineFrequencies(line zoekt.LineMatch, pieceKeys map[uint32]s
 }
 
 // multiLineMerges finds the multi-line candidates. Zoekt breaks a candidate on
-// newlines (index/matchtree.go breakOnNewlines): the first piece ends just
+// newlines (index/matchtree.go breakOnNewlines). The first piece ends just
 // before its line's newline, and the next starts at column 0. A piece that is
-// no candidate alone joins the next pieces, with the newlines between, until
-// the text is one candidate (or the text and the newline after it is). It
-// returns each piece's key (by offset) and the change that makes the candidate
-// count once: each piece counts on its line, as in Zoekt's line score.
+// no candidate alone joins the next pieces, with the newlines between. It
+// stops when the text is one candidate, or the text and the newline after it
+// is. It returns each piece's key (by offset), and the change that makes the
+// candidate count once. Each piece counts on its line, as in Zoekt's line
+// score.
 func (bq bm25Query) multiLineMerges(lines []zoekt.LineMatch) (map[string]int, map[uint32]string, bool) {
 	if !bq.multiLine {
 		return nil, nil, true
@@ -1088,8 +1091,9 @@ func solveBM25LengthRatio(frequencies []int, score float64) (float64, bool) {
 	return (low + high) / 2, true
 }
 
-// bm25Rescore returns the score of a hit under the global average from the
-// hit's Debug field, and false for a hit with no parts (Zoekt's score stays).
+// bm25Rescore returns the score of a hit under the global average, from the
+// hit's Debug field. It returns false for a hit with no parts, and Zoekt's
+// score stays.
 func bm25Rescore(debug string, average float64) (float64, bool) {
 	encoded, ok := strings.CutPrefix(debug, bm25PartsPrefix)
 	if !ok {
@@ -1113,10 +1117,10 @@ func bm25Rescore(debug string, average float64) (float64, bool) {
 	return bm25Score(length/average, frequencies), true
 }
 
-// rescoreAverage returns the global average for a rescore of the strict hits,
-// and false when no rescore is due: the command has counts of fewer than two
-// shards, or a one-node command rescored its hits in place. It logs the
-// in-place rescore.
+// rescoreAverage returns the global average for a rescore of the strict hits.
+// It returns false when no rescore is due. That is when the command has
+// counts of fewer than two shards, or when a one-node command rescored its
+// hits in place. It logs the rescore in place.
 func (command *bm25Command) rescoreAverage() (float64, bool) {
 	average, ok := command.average()
 	if !command.final.Load() {

@@ -11,22 +11,23 @@ import (
 // BenchmarkLargeRepo_CommittedAdvance measures the cost of reindexing after
 // the repo's HEAD advances by exactly one commit.
 //
-// Setup: capture a forward chain of recent commit SHAs ending at the current
-// HEAD, create a scratch clone under b.TempDir(), check out a local benchmark
-// branch at the oldest commit, build a base index, then reset the clone to each
-// next SHA and time the node refresh that a search runs (gitNode.refresh). The
-// sampled chain has at most ten advances. When b.Loop runs more rounds, the
-// benchmark resets the clone to the oldest commit, indexes it outside the
-// timer, and replays the chain. Each timed iteration advances by one real
-// commit; it is not a reflog oscillation between distant points.
+// The setup takes a forward chain of recent commit SHAs that ends at the
+// current HEAD. It makes a temporary clone under b.TempDir(), checks out a
+// local benchmark branch at the oldest commit, and builds a base index. Each
+// timed iteration resets the clone to the next SHA and times the node refresh
+// that a search runs (gitNode.refresh). The sampled chain has at most ten
+// advances. When b.Loop runs more rounds, the benchmark resets the clone to
+// the oldest commit, indexes it outside the timer, and replays the chain.
+// Each timed iteration advances by one real commit, not between two distant
+// commits.
 //
-// SEEK_BENCH_REPO is only used as a read-only source; hard resets happen in the
-// temp clone.
+// The benchmark only reads SEEK_BENCH_REPO; the hard resets change the
+// temporary clone.
 func BenchmarkLargeRepo_CommittedAdvance(b *testing.B) {
 	sourceRepo := requireBenchRepo(b)
 	commits := strings.Fields(gitOutputIn(b, sourceRepo, "rev-list", "--first-parent", "--reverse", "--max-count=11", "HEAD"))
 	if len(commits) < 2 {
-		b.Skipf("need at least 2 commits in SEEK_BENCH_REPO history, got %d", len(commits))
+		b.Fatalf("SEEK_BENCH_REPO needs at least 2 commits in its history, got %d", len(commits))
 	}
 	for i := 1; i < len(commits); i++ {
 		if parent := gitOutputIn(b, sourceRepo, "rev-parse", commits[i]+"^1"); parent != commits[i-1] {
@@ -49,7 +50,7 @@ func BenchmarkLargeRepo_CommittedAdvance(b *testing.B) {
 		b.StopTimer()
 		// chain[0] is one commit ahead of base; advance through the chain.
 		// When b.Loop() runs more rounds than the chain has advances, reset
-		// the scratch clone to base and replay.
+		// the temporary clone to base and replay.
 		idx := i % len(chain)
 		if idx == 0 && i > 0 {
 			gitRunIn(b, repoDir, "reset", "--hard", base)
@@ -83,10 +84,10 @@ func BenchmarkLargeRepo_CommittedAdvance(b *testing.B) {
 	}
 }
 
-// BenchmarkLargeRepo_UncommittedRealistic measures rapid editor saves through
+// BenchmarkLargeRepo_UncommittedRealistic measures quick editor saves through
 // the node refresh that a search runs (gitNode.refresh): git status, the index
-// checks, and the build. This is the workflow seek has to optimize: an editor
-// saving the same file in a loop.
+// checks, and the build. Seek must make this case fast: an editor that saves
+// one file again and again.
 func BenchmarkLargeRepo_UncommittedRealistic(b *testing.B) {
 	repoDir := cloneBenchRepoAt(b, requireBenchRepo(b), "HEAD")
 	ctx := context.Background()

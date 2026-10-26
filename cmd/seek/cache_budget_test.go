@@ -103,8 +103,8 @@ func TestCacheBudgetStopsBeforeBuild(t *testing.T) {
 }
 
 // TestCacheBudgetCountsBinaryAsZero puts a large binary file next to a small
-// text file: the binary file is indexed by name only, so it does not count
-// against the budget.
+// text file. The index keeps the binary file by name only, so it does not
+// count against the budget.
 func TestCacheBudgetCountsBinaryAsZero(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -118,8 +118,8 @@ func TestCacheBudgetCountsBinaryAsZero(t *testing.T) {
 }
 
 // TestCacheBudgetEvictsLRU fills the cache past its budget with two unused
-// corpora: after the search, the least recently used one is evicted, the
-// other stays, and the search's own corpus stays with its ledger entry.
+// corpora. After the search, the least recently used corpus is gone and the
+// other stays. The search's own corpus stays with its ledger entry.
 func TestCacheBudgetEvictsLRU(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -154,9 +154,9 @@ func TestCacheBudgetEvictsLRU(t *testing.T) {
 
 // TestBytecapFixtureSearchesToTheEnd puts 3 sparse 3.9 GiB files next to a
 // text file: no byte or file count stops the search. The sparse files hold
-// zeros, so they are indexed by name only; under a 1G budget the search passes
-// only through the estimate's head probe. A file system without sparse files
-// writes the 11.7 GiB.
+// zeros, so the index keeps them by name only. Under a 1G budget, only the
+// head probe of the estimate lets the search pass. A file system without
+// sparse files writes the 11.7 GiB.
 func TestBytecapFixtureSearchesToTheEnd(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -179,7 +179,7 @@ func TestBytecapFixtureSearchesToTheEnd(t *testing.T) {
 	}
 }
 
-// budgetFolder writes a folder of 41 Go files with about 100 KB of text.
+// budgetFolder writes 41 Go files with 109,749 bytes of text into dir.
 func budgetFolder(t *testing.T, dir string) {
 	t.Helper()
 	writeFileAt(t, dir, "strict.go", "package sample\n// alpha beta\n")
@@ -189,9 +189,12 @@ func budgetFolder(t *testing.T, dir string) {
 	}
 }
 
-// budgetGitKind makes the budget folder in dir the node of kind: "git" (all
-// files in one commit), "dirty" (a commit and one changed file), "no-head" (a
-// repository with no commit). Any other kind keeps a plain folder.
+// budgetGitKind makes the budget folder in dir a node of kind:
+//   - "git": a repository with all files in one commit.
+//   - "dirty": "git" with one changed file.
+//   - "no-head": a repository with no commit.
+//
+// Any other kind keeps a plain folder.
 func budgetGitKind(t *testing.T, dir, kind string) {
 	t.Helper()
 	switch kind {
@@ -205,11 +208,11 @@ func budgetGitKind(t *testing.T, dir, kind string) {
 	}
 }
 
-// TestCacheBudgetCountsVectorBuild warms a node with a lexical search, then
-// sets the budget just above its size: the first descriptive search would
-// add vectors (for a dirty Git node the commit's generation and the overlay,
-// with no commit the overlay alone), so it stops before any build, as a cold
-// one does.
+// TestCacheBudgetCountsVectorBuild warms a node with a lexical search and sets
+// the budget just above the node's size. The first search by meaning would
+// add vectors, so it stops before any build, as a cold search does. A dirty
+// Git node adds the vectors of the commit and of the overlay; a node with no
+// commit adds the overlay only.
 func TestCacheBudgetCountsVectorBuild(t *testing.T) {
 	requireTools(t)
 	for _, kind := range []string{"folder", "git", "dirty", "no-head"} {
@@ -259,9 +262,10 @@ func TestCacheLedgerMatchesDirAfterVectorBind(t *testing.T) {
 	if err != nil || len(plans) != 1 {
 		t.Fatalf("plans=%d err=%v", len(plans), err)
 	}
-	// Put the state of the text build one second before its ledger entry, so
-	// only the vector bind can make the entry stale. A bind in the time step
-	// of the entry also makes it stale: ledgerStale counts an equal time.
+	// Set the time of the text build's state file one second before its
+	// ledger entry, so only the vector bind can make the entry stale. A bind
+	// in the time step of the entry also makes it stale: ledgerStale counts
+	// an equal time.
 	ledger, err := os.Stat(filepath.Join(plans[0].cacheDir, corpusSizeFile))
 	if err != nil {
 		t.Fatalf("no ledger entry after the text build: %v", err)
@@ -287,8 +291,8 @@ func TestCacheLedgerMatchesDirAfterVectorBind(t *testing.T) {
 	}
 }
 
-// TestOpportunisticGCKeepsCorporaOfTheCommand runs the GC after a search
-// with a budget of 1 byte: the corpus that the command used stays.
+// TestOpportunisticGCKeepsCorporaOfTheCommand runs the GC with a budget of 1
+// byte after a search: the corpus that the command used stays.
 func TestOpportunisticGCKeepsCorporaOfTheCommand(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -336,9 +340,9 @@ func TestCacheBudgetCountsCommittedChangeAfterHeadMove(t *testing.T) {
 }
 
 // TestCacheBudgetBinaryCountsZeroEverywhere puts a 4 MB binary file in each
-// place that the estimate reads, under a 1 MB budget: a committed blob, a
-// dirty file, and a new file of a warm folder. Each is indexed by name only,
-// so no search stops.
+// place that the estimate reads, under a 1 MB budget. The places are a
+// committed blob, an untracked file of a warm repository, and a new file of a
+// warm folder. The index keeps each by name only, so no search stops.
 func TestCacheBudgetBinaryCountsZeroEverywhere(t *testing.T) {
 	requireTools(t)
 	binary := string(make([]byte, 4<<20))
@@ -369,43 +373,51 @@ func TestCacheBudgetBinaryCountsZeroEverywhere(t *testing.T) {
 	}
 }
 
-// TestCacheBudgetCountsVectorRatio compares the cold estimate of one node
-// with and without vectors: the ratio is (2.76 + 14.4) / 2.76, from the
-// measured index and vector bytes per content byte. A dirty Git node counts
-// the commit's generation and the overlay; with no commit, the overlay.
-func TestCacheBudgetCountsVectorRatio(t *testing.T) {
+// TestCacheBudgetCountsColdVectorBytes checks the cold estimate of one node,
+// with and without vectors, against hand-worked byte counts. budgetFolder
+// holds 109,749 bytes, and the dirty strict.go holds 35. The estimate counts
+// 2.76 index bytes and 14.4 vector bytes per content byte, rounded down. A
+// dirty Git node adds the vectors of the commit and of the overlay; a node
+// with no commit adds the overlay only.
+func TestCacheBudgetCountsColdVectorBytes(t *testing.T) {
 	requireTools(t)
-	for _, kind := range []string{"folder", "dirty", "no-head"} {
-		t.Run(kind, func(t *testing.T) {
+	for _, row := range []struct {
+		kind             string
+		lexical, vectors int64
+	}{
+		// 109,749 × 2.76 index bytes; 109,749 × (2.76 + 14.4) with vectors.
+		{kind: "folder", lexical: 302_907, vectors: 1_883_292},
+		// (109,749 + 35) × 2.76 index bytes; with vectors, add 109,749 × 14.4
+		// for the commit and 35 × 14.4 for the overlay.
+		{kind: "dirty", lexical: 303_003, vectors: 303_003 + 1_580_385 + 504},
+		// 109,749 × 2.76 index bytes; with vectors, add 109,749 × 14.4 for the
+		// overlay.
+		{kind: "no-head", lexical: 302_907, vectors: 302_907 + 1_580_385},
+	} {
+		t.Run(row.kind, func(t *testing.T) {
 			setTestUserCache(t)
 			root := t.TempDir()
 			budgetFolder(t, root)
-			budgetGitKind(t, root, kind)
+			budgetGitKind(t, root, row.kind)
 			plans, err := planCorpora(context.Background(), []string{root})
 			if err != nil || len(plans) != 1 {
 				t.Fatalf("plans=%d err=%v", len(plans), err)
 			}
 			lexical, _, err := plannedNodeBytes(t.Context(), plans[0], false, false)
-			if err != nil {
-				t.Fatal(err)
+			if err != nil || lexical != row.lexical {
+				t.Fatalf("lexical estimate %d (err=%v), want %d", lexical, err, row.lexical)
 			}
-			withVectors, rebuild, err := plannedNodeBytes(t.Context(), plans[0], true, false)
-			if err != nil || !rebuild {
-				t.Fatalf("rebuild=%t err=%v", rebuild, err)
-			}
-			// The measured ratios per content byte: 2.76 index bytes, and 14.4
-			// vector bytes more.
-			const want = (2.76 + 14.4) / 2.76
-			if got := float64(withVectors) / float64(lexical); got < want*0.99 || got > want*1.01 {
-				t.Fatalf("vector ratio %.3f, want %.3f", got, want)
+			vectors, rebuild, err := plannedNodeBytes(t.Context(), plans[0], true, false)
+			if err != nil || !rebuild || vectors != row.vectors {
+				t.Fatalf("estimate with vectors %d (rebuild=%t err=%v), want %d", vectors, rebuild, err, row.vectors)
 			}
 		})
 	}
 }
 
 // TestCacheBudgetMessageWhenFloorBinds checks the message of a stop that the
-// 5 % free-space floor sets: it names the new bytes and the disk, not a
-// larger override.
+// 5 % free-space floor sets. The message names the new bytes and the disk,
+// not a larger override.
 func TestCacheBudgetMessageWhenFloorBinds(t *testing.T) {
 	floor := formatCLIError(&cacheBudgetError{planned: 6 << 20, growth: 4 << 10, budget: 4 << 20, freeBound: true})
 	for _, want := range []string{"(4KB new)", "nearly full", "SEEK_CACHE_BUDGET"} {
@@ -422,9 +434,9 @@ func TestCacheBudgetMessageWhenFloorBinds(t *testing.T) {
 	}
 }
 
-// TestCacheBudgetStopNamesTextSearchWhenItFits searches a folder with a
-// budget that its text index fits and its vectors do not: the search stops,
-// and the hint names --lexical-only, which then runs.
+// TestCacheBudgetStopNamesTextSearchWhenItFits searches a folder under a
+// budget that fits its text index but not its vectors. The search stops, and
+// its hint names --lexical-only, which then runs.
 func TestCacheBudgetStopNamesTextSearchWhenItFits(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -490,7 +502,7 @@ func TestCacheBudgetHintFollowsTheTextSearch(t *testing.T) {
 }
 
 // TestGCCmd_DryRunWritesNothing runs `seek gc --dry-run` on a corpus with no
-// ledger entry: nothing is written into the cache.
+// ledger entry: the dry run writes nothing into the cache.
 func TestGCCmd_DryRunWritesNothing(t *testing.T) {
 	root := cacheRootForTest(t)
 	dir := seedCorpus(t, root, fakeCorpusHash(201), time.Now().Add(-time.Hour))
@@ -516,7 +528,7 @@ func TestGCCmd_DryRunWritesNothing(t *testing.T) {
 }
 
 // TestCorpusSizeRemeasuresStaleLedger writes a ledger older than the
-// corpus's state: the size is measured again.
+// corpus's state: corpusSize measures the directory again.
 func TestCorpusSizeRemeasuresStaleLedger(t *testing.T) {
 	dir := t.TempDir()
 	writeFileAt(t, dir, corpusSizeFile, "7")
@@ -585,9 +597,10 @@ func budgetSearchFiles(t *testing.T, marker string, operands ...string) int {
 	return strings.Count(out, "## ")
 }
 
-// TestCacheBudgetCleanAgainAfterDirtyBuildFits builds vectors, makes the repo
-// dirty and searches, then restores the file: the clean search binds the
-// generation that exists for HEAD, so it adds nothing and does not stop.
+// TestCacheBudgetCleanAgainAfterDirtyBuildFits builds vectors, searches the
+// repository with a changed file, and then restores the file. The clean search
+// binds the generation that exists for HEAD, so it adds nothing and does not
+// stop.
 func TestCacheBudgetCleanAgainAfterDirtyBuildFits(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -613,9 +626,9 @@ func TestCacheBudgetCleanAgainAfterDirtyBuildFits(t *testing.T) {
 	}
 }
 
-// TestCacheBudgetCountsDirtyAndFolderDelta adds 2 MB of new text to a warm
-// node, a dirty Git file or a new folder file, under a budget of the corpus
-// size plus 64 KiB: the estimate counts it and the search stops.
+// TestCacheBudgetCountsDirtyAndFolderDelta adds a new file with 2 MB of text
+// to a warm node: a Git repository or a folder. The budget is the corpus size
+// plus 64 KiB, so the estimate counts the file and the search stops.
 func TestCacheBudgetCountsDirtyAndFolderDelta(t *testing.T) {
 	requireTools(t)
 	text := strings.Repeat("zqdeltamarker plain text line\n", 72<<10)
@@ -680,9 +693,9 @@ func TestBudgetFloorBinds(t *testing.T) {
 }
 
 // TestFolderReaderTransientErrorOnWarmFolder changes a file of a warm folder
-// with vectors and makes its open fail with EMFILE: the lexical delta, the
-// full rebuild it falls back to, and the vector build publish nothing; the
-// next search indexes the content.
+// with vectors, and makes its open fail with EMFILE. The lexical delta, the
+// full rebuild that follows it, and the vector build publish nothing. The next
+// search indexes the content.
 func TestFolderReaderTransientErrorOnWarmFolder(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -721,10 +734,10 @@ func TestFolderReaderTransientErrorOnWarmFolder(t *testing.T) {
 }
 
 // TestDirtyReaderTransientErrorDoesNotPublish makes the open of a dirty Git
-// file fail with EMFILE: EMFILE is no property of the file, so the build stops
-// with the live family whole; the committed family publishes, and the command
-// warns and serves it; the next search indexes the dirty content, not the name
-// only.
+// file fail with EMFILE. EMFILE is no property of the file, so the build stops
+// and the live family stays whole. The committed family publishes, and the
+// command warns and serves it. The next search indexes the dirty content, not
+// the name only.
 func TestDirtyReaderTransientErrorDoesNotPublish(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -796,11 +809,11 @@ func TestDirtyFileReadAgainAfterChmod(t *testing.T) {
 }
 
 // TestDirtyDirectoryReplacedByFile replaces a tracked directory with a file of
-// the same name: Lstat of the deleted file gives ENOTDIR, which is a path
-// that is gone, not a read error, so both routes keep every dirty file. The
-// description runs with a model that accepts every row, so it prints each
-// file that has vectors: the new file docs, the edited keep.txt and the clean
-// clean.txt.
+// the same name. Lstat of the deleted file gives ENOTDIR: a path that is gone,
+// not a read error. So the lexical search and the description keep every
+// dirty file. The description runs with a model that accepts every row. So it
+// prints each file that has vectors: the new file docs, the edited keep.txt,
+// and clean.txt.
 func TestDirtyDirectoryReplacedByFile(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -832,13 +845,15 @@ func TestDirtyDirectoryReplacedByFile(t *testing.T) {
 }
 
 // TestDirtyReadErrorKeepsTheLiveFamily makes the read of one changed dirty
-// file fail with EIO: the build applies every other change and keeps that
-// file by name, so both routes show the other dirty files with the warning,
-// the notice counts the file, and the next search reads the change. The
-// description runs with a model that accepts every row, so a vector row of
-// the old b.txt would print. The vector build stops at the read error: no
-// vectors bind the state, the description prints exactly the other files, and
-// the next description embeds the change of b.txt.
+// file fail with EIO. The build applies every other change and keeps that file
+// by name. So the lexical search and the description show the other dirty
+// files, and the notice counts the kept file. The next search reads the
+// change.
+//
+// The description runs with a model that accepts every row, so a vector row
+// of the old b.txt would print. The vector build stops at the read error, and
+// no vectors bind the state. So the description prints exactly the other
+// files, and the next description embeds the change of b.txt.
 func TestDirtyReadErrorKeepsTheLiveFamily(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -900,9 +915,9 @@ func TestDirtyReadErrorKeepsTheLiveFamily(t *testing.T) {
 }
 
 // TestDirtyReadErrorPrintsNoStaleText reverts one dirty file, deletes an
-// untracked one, and makes the reads of two newly dirty files fail: the build
+// untracked one, and makes the reads of two newly dirty files fail. The build
 // applies the revert and the delete, so no search prints text that no file
-// holds, and the notice counts the two failed files by name.
+// holds. The notice counts the two failed files by name.
 func TestDirtyReadErrorPrintsNoStaleText(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -943,8 +958,8 @@ func TestDirtyReadErrorPrintsNoStaleText(t *testing.T) {
 }
 
 // TestDirtyLstatErrorKeepsTheName makes the Lstat of a dirty file fail with
-// EIO for one search: the file stays by name and no state is written, so the
-// next search reads it.
+// EIO for one search. The build keeps the file by name and writes no state, so
+// the next search reads it.
 func TestDirtyLstatErrorKeepsTheName(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -975,38 +990,43 @@ func TestDirtyLstatErrorKeepsTheName(t *testing.T) {
 	}
 }
 
-// TestUncommittedStageIsSwept leaves a full uncommitted stage behind, as a
-// crash does: it is a build directory of the index, so the gc sweep removes
-// it once it is old.
+// TestUncommittedStageIsSwept leaves a full uncommitted stage in the corpus of
+// a searched repository, as a crash does. The stage is a build directory of
+// the corpus index, so the GC removes it once it is old. The corpus stays.
 func TestUncommittedStageIsSwept(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
-	repo := f.GitRepo("repo", "a.txt", "committed\n")
-	writeFixtureFile(t, filepath.Join(repo, "a.txt"), "dirty\n")
-	cacheDir := filepath.Join(t.TempDir(), "corpus")
-	indexDir := filepath.Join(cacheDir, "index")
-	state := repoState{Files: []string{"a.txt"}}
-	stage, err := buildUncommittedStage(t.Context(), repo, indexDir, state, 2)
+	repo := f.GitRepo("repo", "a.txt", "zqstagesweep committed\n")
+	writeFixtureFile(t, filepath.Join(repo, "a.txt"), "zqstagesweep dirty\n")
+	setTestUserCache(t)
+	if got := budgetSearchFiles(t, "zqstagesweep", repo); got != 1 {
+		t.Fatalf("found %d files", got)
+	}
+	plans, err := planCorpora(t.Context(), []string{repo})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%d err=%v", len(plans), err)
+	}
+	stage, err := buildUncommittedStage(t.Context(), repo, plans[0].indexDir, repoState{Files: []string{"a.txt"}}, 2)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if filepath.Dir(stage.dir) != indexDir || !strings.HasPrefix(filepath.Base(stage.dir), buildDirPrefix) {
-		t.Fatalf("stage %s, want a build directory of %s", stage.dir, indexDir)
 	}
 	old := time.Now().Add(-2 * buildTmpMaxAge)
 	if err := os.Chtimes(stage.dir, old, old); err != nil {
 		t.Fatal(err)
 	}
-	sweepOrphanBuildDirs(indexDir, time.Now().Add(-buildTmpMaxAge))
+	runGC(t.Context(), gcOptions{skipThrottle: true})
 	if _, err := os.Stat(stage.dir); !os.IsNotExist(err) {
-		t.Fatalf("the sweep kept the stage: %v", err)
+		t.Fatalf("the GC kept the stage %s: %v", stage.dir, err)
+	}
+	if _, err := os.Stat(plans[0].cacheDir); err != nil {
+		t.Fatalf("the GC removed the corpus: %v", err)
 	}
 }
 
 // TestKeptFileReadAloneNextTime makes the read of one dirty file fail with
-// EIO: the build publishes the rest with a pending manifest, so the next
-// search opens only that file (a delta), and the committed family is not
-// built again.
+// EIO. The build publishes the rest with a pending manifest. So the next
+// search opens only that file (a delta) and does not build the committed
+// family again.
 func TestKeptFileReadAloneNextTime(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -1056,9 +1076,9 @@ func TestKeptFileReadAloneNextTime(t *testing.T) {
 }
 
 // TestEMFILEInAFullRebuildKeepsTheLiveFamily forces a full uncommitted
-// rebuild of a warm node while EMFILE fails the open of unchanged dirty
-// files: the build stops with the live family whole, the command warns and
-// serves it, and the next search shows them by content.
+// rebuild of a warm node while EMFILE fails the open of unchanged dirty files.
+// The build stops and the live family stays whole. The command warns and
+// serves it, and the next search shows the files by content.
 func TestEMFILEInAFullRebuildKeepsTheLiveFamily(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -1105,7 +1125,7 @@ func TestEMFILEInAFullRebuildKeepsTheLiveFamily(t *testing.T) {
 }
 
 // TestCacheBudgetEstimatesAnOrphanBranch warms a repository, then moves it to
-// an orphan branch: the commit range from the old head to no commit has no
+// an orphan branch. The commit range from the old head to no commit has no
 // tree, so the estimate must count it with no Git error.
 func TestCacheBudgetEstimatesAnOrphanBranch(t *testing.T) {
 	requireTools(t)
@@ -1129,9 +1149,9 @@ func TestCacheBudgetEstimatesAnOrphanBranch(t *testing.T) {
 }
 
 // TestCacheBudgetCountsOnlyVectorsForACurrentTextIndex warms a dirty
-// repository with a text search: its text index is current, so a first
-// search with vectors adds the vectors of the commit and of the dirty file,
-// and no text index bytes.
+// repository with a text search, so its text index is current. A first search
+// with vectors then adds the vectors of the commit and of the dirty file, and
+// no text index bytes.
 func TestCacheBudgetCountsOnlyVectorsForACurrentTextIndex(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -1162,9 +1182,9 @@ func TestCacheBudgetCountsOnlyVectorsForACurrentTextIndex(t *testing.T) {
 
 // TestCacheBudgetCountsVectorsBehindTheTextIndex builds the vectors of a
 // folder and of a Git node, adds a file (in a commit for Git), and runs a text
-// search: the text index holds the file, the vectors do not. The next search
-// with vectors must count the vectors of the new file: exactly for Git, and
-// at least that for the folder.
+// search. The text index holds the file, and the vectors do not. The next
+// search with vectors must count the vectors of the new file: exactly for Git,
+// and at least that for the folder.
 func TestCacheBudgetCountsVectorsBehindTheTextIndex(t *testing.T) {
 	requireTools(t)
 	for _, kind := range []string{"folder", "git"} {
@@ -1211,7 +1231,7 @@ func TestCacheBudgetCountsVectorsBehindTheTextIndex(t *testing.T) {
 }
 
 // TestCacheBudgetCountsTheChangedFilesOfABoundFolder builds a folder's vectors,
-// edits one file, and estimates the next search with vectors: the vectors hold
+// edits one file, and estimates the next search with vectors. The vectors hold
 // the published state, so the build adds the text and vectors of the edited
 // file only.
 func TestCacheBudgetCountsTheChangedFilesOfABoundFolder(t *testing.T) {
@@ -1241,10 +1261,10 @@ func TestCacheBudgetCountsTheChangedFilesOfABoundFolder(t *testing.T) {
 }
 
 // TestCacheBudgetCountsACommitAfterTheVectors builds a repository's text and
-// vectors, then commits a file: the text index and the vectors hold the old
-// commit, so the next search with vectors adds the text and vectors of the
-// commit range, the new file alone. The estimate runs one git diff-tree: the
-// vector figure reuses the text figure.
+// vectors, then commits a file. The text index and the vectors hold the old
+// commit. So the next search with vectors adds the text and vectors of the
+// commit range: the new file alone. The estimate runs one git diff-tree,
+// because the vector figure reuses the text figure.
 func TestCacheBudgetCountsACommitAfterTheVectors(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)

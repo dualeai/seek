@@ -3,22 +3,23 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
 	"testing/synctest"
 )
 
-// TestIndexDocuments_ReadsBeyondTheBudget drives the real indexDocuments
-// consumer with a hand-built fileCh whose cumulative weight exceeds the
-// readSemaphore budget. The consumer releases the weight of a normal document
-// when Builder.Add returns, so reading proceeds. A regression that keeps the
-// weight until the terminal Finish waits until the go test timeout, which
-// prints the stack of every goroutine.
+// TestIndexDocuments_ReadsBeyondTheBudget sends indexDocuments documents whose
+// total weight is three times the readSemaphore budget. The consumer releases
+// the weight of a normal document when Builder.Add returns, so the reads go
+// on. A consumer that keeps the weight until Finish blocks every goroutine of
+// the synctest bubble, and synctest.Test fails with a deadlock.
 //
-// Uses swapReadSemaphoreForTest so the fixture fits in ~12 MiB of
-// synthesised payload instead of >600 MiB.
+// swapReadSemaphoreForTest sets a 4 MiB budget, so 12 MiB of content is
+// enough. The default budget is at least 600 MiB.
 func TestIndexDocuments_ReadsBeyondTheBudget(t *testing.T) {
 	requireTools(t)
 	testReadSemMu.Lock()
@@ -41,9 +42,9 @@ func TestIndexDocuments_ReadsBeyondTheBudget(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
-		// Producer that mirrors readOneFolderFileStreaming: Acquire weight
-		// then send. When indexDocuments fails, the deferred cancel stops it
-		// before the goroutine guard counts goroutines.
+		// The producer takes the weight and then sends, as
+		// readOneFolderFileStreaming does. When indexDocuments fails, the
+		// deferred cancel stops it before the goroutine guard counts.
 		go func() {
 			defer close(fileCh)
 			payload := bytes.Repeat([]byte("a"), int(chunk))
@@ -79,15 +80,10 @@ func TestIndexDocuments_ReadsBeyondTheBudget(t *testing.T) {
 	})
 }
 
-// TestIndexDocuments_ReleasesWeightOnFinishError checks that a Finish error
-// still releases every acquired read weight. It forces a Finish error:
-// it writes into a read-only indexDir, with content large enough to make
-// Zoekt flush a shard during Add.
-//
-// TODO: the test accepts any error. A narrower check needs a Builder factory
-// to inject (the shard logic is inline in indexDocuments), or a test for
-// fs.ErrPermission, which depends on how Zoekt wraps its errors.
-func TestIndexDocuments_ReleasesWeightOnFinishError(t *testing.T) {
+// TestIndexDocuments_ReleasesWeightOnShardWriteError checks that a shard write
+// error still releases every acquired read weight. The indexDir is read-only,
+// so Zoekt cannot write the shard of the document.
+func TestIndexDocuments_ReleasesWeightOnShardWriteError(t *testing.T) {
 	requireTools(t)
 	done := withReadSemLock(t)
 	defer done()
@@ -104,10 +100,9 @@ func TestIndexDocuments_ReleasesWeightOnFinishError(t *testing.T) {
 	}
 	source := t.TempDir()
 
-	// Build a doc that will trigger an internal flush. shardMax=10 MiB,
-	// so a single 11 MiB doc forces flush inside Add → Zoekt's buildShard
-	// tries to write into a read-only dir → error propagates back through
-	// Add (or surfaces at Finish).
+	// One document of 11 MiB is above shardMax (10 MiB), so Add flushes it to
+	// a shard of its own. The shard write fails in the read-only indexDir, and
+	// Add returns the error.
 	payload := make([]byte, 11*1024*1024)
 	for i := range payload {
 		payload[i] = byte('p')
@@ -117,17 +112,17 @@ func TestIndexDocuments_ReleasesWeightOnFinishError(t *testing.T) {
 	close(ch)
 
 	_, err := indexDocuments(t.Context(), indexDir, "finishfail_repo", source, ch, 1)
-	if err == nil {
-		t.Fatal("indexDocuments wrote shards into the read-only indexDir, want a build error")
+	if !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("indexDocuments error=%v, want the permission error of the shard write", err)
 	}
-	// withReadSemLock done() asserts semaphore returned to baseline —
-	// proves the err-path Release fired despite the error.
+	// done checks that the semaphore has its start weight: the error path
+	// released the weight.
 }
 
-// TestIndexDocuments_NoConsumerWeightDoubleRelease — invariant test:
-// running indexDocuments back-to-back from the same baseline must end
-// at the same baseline. Catches a future fix that streaming-Releases
-// AND still calls bulk Release at the end.
+// TestIndexDocuments_NoConsumerWeightDoubleRelease runs indexDocuments three
+// times from one start weight, and withReadSemLock checks that the weight
+// ends there. A consumer that releases a weight at Add and again after Finish
+// fails it.
 func TestIndexDocuments_NoConsumerWeightDoubleRelease(t *testing.T) {
 	requireTools(t)
 	done := withReadSemLock(t)

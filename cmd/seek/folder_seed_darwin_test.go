@@ -9,13 +9,13 @@ import (
 )
 
 // TestFolderSeedThatWentAwayBuildsInFull builds a folder in full, then as a
-// delta, so the family has two shards or more. It adds a file and puts a
-// dangling symlink in place of the last live member, with a family manifest
-// that still matches: the delta's seed then fails to link it (link(2) follows
-// the symlink on darwin), as for a shard that went away between the scan and
-// the seed. The next build is then a full build: one debug line for the
-// seed failure, one shard, every current file found, the removed file not
-// found, and no warning.
+// delta, so the family has two shards or more. It then adds a file, puts a
+// dangling symlink in place of the last member, and writes a family manifest
+// that still matches. The seed of the next delta cannot link that member,
+// because link(2) follows the symlink on darwin. This is the case of a shard
+// that went away between the scan and the seed. The next build is then a full
+// build. It writes one debug line for the seed failure and no warning, and it
+// gives one shard. A search finds every current file and not the removed file.
 func TestFolderSeedThatWentAwayBuildsInFull(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()

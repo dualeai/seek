@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"math"
 	"os"
@@ -82,6 +84,8 @@ func collectTestRows(
 	return output, blocks, ctx.Err()
 }
 
+// testEmbeddedBatch returns a model batch with one unit for each of rows, each
+// embedded as vector.
 func testEmbeddedBatch(rows []uint64, vector semanticVector) semanticEncodedBatch {
 	batch := semanticEncodedBatch{}
 	for _, row := range rows {
@@ -92,9 +96,9 @@ func testEmbeddedBatch(rows []uint64, vector semanticVector) semanticEncodedBatc
 }
 
 // TestCollectSemanticBatchesWritesRowsAtOffsets mixes model rows, out of
-// order, with rows copied from a live generation: every row lands at its
-// offset in both vector files, and each 128-row block goes to the USearch
-// stream once.
+// order, with rows copied from a live generation. Every row lands at its
+// offset in both vector files. Each 128-row block goes to the USearch stream
+// once.
 func TestCollectSemanticBatchesWritesRowsAtOffsets(t *testing.T) {
 	source := &semanticGeneration{
 		vectors: testSemanticFineVectors([]semanticUnitEmbedding{
@@ -148,10 +152,12 @@ func TestCollectSemanticBatchesWritesRowsAtOffsets(t *testing.T) {
 	}
 }
 
-// TestCollectSemanticBatchesRejectsInvalidInput checks that a row written
-// twice, a missing row, a batch with mismatched embeddings, an empty or
-// oversize batch, a NaN vector, and a copied row with no source fail the build
-// and cancel it.
+// TestCollectSemanticBatchesRejectsInvalidInput checks that each of these
+// inputs fails the build and cancels it:
+//   - a row written twice, or a missing row;
+//   - a batch with mismatched embeddings, or an empty or oversize batch;
+//   - a NaN vector;
+//   - a copied row with no source.
 func TestCollectSemanticBatchesRejectsInvalidInput(t *testing.T) {
 	mismatched := testEmbeddedBatch([]uint64{0, 1}, semanticVector{0: 1})
 	mismatched.embeddings = mismatched.embeddings[:1]
@@ -214,8 +220,9 @@ func TestCollectSemanticBatchesCancelsAfterVectorCreationFailure(t *testing.T) {
 // calls with a live limit of 2. The second call is slow: it ends only after
 // the fourth call starts. The third call waits until the second starts. So
 // the scheduler must start the fourth call when the third ends, beside the
-// slow call. The test runs in a synctest bubble, so a scheduler that waits
-// for the slow call fails at once with a deadlock.
+// slow call. The test runs in a synctest bubble with no timer. When every
+// goroutine blocks, a scheduler that waits for the slow call has not started
+// the fourth call, so the check fails at once.
 func TestEncodeSemanticBatchesAdmitsReadyWorkAfterOneCallCompletes(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
@@ -273,7 +280,7 @@ func TestEncodeSemanticBatchesAdmitsReadyWorkAfterOneCallCompletes(t *testing.T)
 			close(done)
 		}()
 
-		// Wait until each goroutine of the bubble blocks: the slow call then
+		// Wait until each goroutine of the bubble blocks. The slow call then
 		// waits for its release, and a correct scheduler has started the
 		// fourth call beside it.
 		synctest.Wait()
@@ -293,7 +300,7 @@ func TestEncodeSemanticBatchesAdmitsReadyWorkAfterOneCallCompletes(t *testing.T)
 }
 
 // stepSemanticModelCalls runs in a synctest bubble, with a stub model whose
-// calls wait on step. It waits until each goroutine of the bubble blocks: the
+// calls wait on step. It waits until each goroutine of the bubble blocks. The
 // scheduler has then started each call that its live limit admits, and waits
 // for one to end. It then ends one call, and does this again until the
 // scheduler returns. So the calls in flight at each step are the scheduler's
@@ -508,6 +515,10 @@ func TestEncodeSemanticBatchesTracksLiveMemoryHeadroom(t *testing.T) {
 	})
 }
 
+// TestEncodeSemanticBatchesCancellationReleasesAllWeights fails every model
+// call of 4 batches that share one read-weight owner. The scheduler reports
+// the failure and cancels, and the deferred check finds all the read weight
+// released.
 func TestEncodeSemanticBatchesCancellationReleasesAllWeights(t *testing.T) {
 	checkWeight := withReadSemLock(t)
 	defer checkWeight()
@@ -557,6 +568,9 @@ func TestEncodeSemanticBatchesCancellationReleasesAllWeights(t *testing.T) {
 	}
 }
 
+// TestBuildSemanticGenerationReleasesSourceWeightOnModelFailure fails the
+// model call after the build owns the read weight of one document. The build
+// returns the model error, and the deferred check finds the weight released.
 func TestBuildSemanticGenerationReleasesSourceWeightOnModelFailure(t *testing.T) {
 	requireTools(t)
 	checkWeight := withReadSemLock(t)
@@ -593,6 +607,10 @@ func TestBuildSemanticGenerationReleasesSourceWeightOnModelFailure(t *testing.T)
 	}
 }
 
+// TestBuildSemanticGenerationKeepsCollectorErrorAfterInternalCancellation
+// puts a vector file in the build directory first. The collector fails with
+// os.ErrExist and cancels the build. The build returns that error, not the
+// cancellation, and publishes no manifest.
 func TestBuildSemanticGenerationKeepsCollectorErrorAfterInternalCancellation(t *testing.T) {
 	requireTools(t)
 	dir := t.TempDir()
@@ -632,6 +650,55 @@ func TestBuildSemanticGenerationKeepsCollectorErrorAfterInternalCancellation(t *
 	}
 }
 
+// TestBuildSemanticGenerationHashesRawContent builds a generation from one
+// file whose byte 0xff is not valid UTF-8. Each stored row must hold the
+// SHA-256 of the raw bytes, which the search computes from the shard copy
+// (checkedSemanticCandidate). The digest comes from "shasum -a 256", as in
+// TestSemanticContentIDUsesRawBytes.
+func TestBuildSemanticGenerationHashesRawContent(t *testing.T) {
+	requireTools(t)
+	want, err := hex.DecodeString("01ce0241d2a0e71a4fecd5a8d71157fe2787197732fc15d889cbcf36c38e3c68")
+	if err != nil {
+		t.Fatal(err)
+	}
+	documents := make(chan fileContent, 1)
+	documents <- fileContent{name: "raw.txt", content: []byte{'a', 0xff, 'b'}}
+	close(documents)
+	embedder := semanticBuildTestEmbedder{embed: func(_ context.Context, units []semanticUnit) ([]semanticUnitEmbedding, error) {
+		embeddings := make([]semanticUnitEmbedding, len(units))
+		for index := range embeddings {
+			embeddings[index] = testSemanticUnitEmbedding(semanticVector{0: 1})
+		}
+		return embeddings, nil
+	}}
+	dir := filepath.Join(t.TempDir(), "semantic")
+	manifest, err := buildSemanticGeneration(t.Context(), dir, "source-raw", embedder, searchResources{},
+		func(context.Context) (<-chan fileContent, func() error) {
+			return documents, func() error { return nil }
+		}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(filepath.Join(dir, semanticRowsFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := readSemanticRowsFrom(file, manifest.Rows, false)
+	_ = file.Close()
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("rows=%d err=%v, want the rows of raw.txt", len(rows), err)
+	}
+	for _, row := range rows {
+		if !bytes.Equal(row.contentID[:], want) {
+			t.Fatalf("row %d content ID %x, want the SHA-256 of the raw bytes %x", row.row, row.contentID, want)
+		}
+	}
+}
+
+// TestSemanticConcurrencyControllerProbesSafeWidthsAndRejectsSlowerWidth
+// doubles the width from 1 to 8 while each width is faster and the free
+// memory allows it. Width 8 is slower than width 4, so the controller goes
+// back to 4.
 func TestSemanticConcurrencyControllerProbesSafeWidthsAndRejectsSlowerWidth(t *testing.T) {
 	started := time.Unix(1, 0)
 	controller := newSemanticConcurrencyController(started, 5_000)
@@ -681,6 +748,9 @@ func TestSemanticConcurrencyControllerProbesSafeWidthsAndRejectsSlowerWidth(t *t
 	}
 }
 
+// TestSemanticConcurrencyControllerIgnoresSourceLimitedWindow checks that a
+// window starts only when the width is full. A window with a source gap
+// (noteStarved) ends with no measure and does not change the width.
 func TestSemanticConcurrencyControllerIgnoresSourceLimitedWindow(t *testing.T) {
 	started := time.Unix(1, 0)
 	controller := newSemanticConcurrencyController(started, 10_000)
@@ -722,6 +792,9 @@ func TestSemanticConcurrencyControllerIgnoresSourceLimitedWindow(t *testing.T) {
 	}
 }
 
+// TestSemanticConcurrencyControllerDoesNotLearnMemoryFromSourceGap measures a
+// memory drop over a window with a source gap. The controller learns no call
+// cost from that drop, so the width grows.
 func TestSemanticConcurrencyControllerDoesNotLearnMemoryFromSourceGap(t *testing.T) {
 	started := time.Unix(1, 0)
 	controller := &semanticConcurrencyController{
@@ -741,14 +814,17 @@ func TestSemanticConcurrencyControllerDoesNotLearnMemoryFromSourceGap(t *testing
 		controller.noteCompletion(128)
 	}
 	// The memory drop of 900 spans the source gap. Charged to the one added
-	// call, it is more than the 100 still free and cuts the width to 1; with
-	// the known cost of 7 per call, the width grows from 2 to 4.
+	// call, the drop is more than the 100 still free and would cut the width
+	// to 1. With the known cost of 7 per call, the width grows from 2 to 4.
 	controller.evaluate(started.Add(11*time.Second), 8, 100)
 	if got := controller.activeLimit(8); got != 4 {
 		t.Fatalf("source gap changed the width to %d, want 4", got)
 	}
 }
 
+// TestSemanticConcurrencyControllerReopensCeilingAfterSourceEpoch starts a new
+// epoch with a source gap. The controller drops the old ceiling and best rate,
+// and measures the widths again.
 func TestSemanticConcurrencyControllerReopensCeilingAfterSourceEpoch(t *testing.T) {
 	started := time.Unix(1, 0)
 	controller := &semanticConcurrencyController{
@@ -766,7 +842,7 @@ func TestSemanticConcurrencyControllerReopensCeilingAfterSourceEpoch(t *testing.
 	controller.noteStarved()
 
 	// The old curve stopped at width 8 with 1,024 rows/s. The new epoch
-	// measures 512 rows/s at width 8, then 768 at width 16: each width beats
+	// measures 512 rows/s at width 8, then 768 at width 16. Each width beats
 	// the best rate of its own epoch, so the width stays 16. The old ceiling
 	// would hold the width at 8; the old best rate would cut 16 back to 8.
 	controller.noteActive(8, started)
@@ -787,6 +863,9 @@ func TestSemanticConcurrencyControllerReopensCeilingAfterSourceEpoch(t *testing.
 	}
 }
 
+// TestSemanticConcurrencyControllerDoesNotChargeStableOutputGrowthToCalls
+// lowers the free memory while the width stays at 8. The controller charges
+// memory only to added calls, so the drop does not cut the width.
 func TestSemanticConcurrencyControllerDoesNotChargeStableOutputGrowthToCalls(t *testing.T) {
 	started := time.Unix(1, 0)
 	controller := newSemanticConcurrencyController(started, 1_000)
@@ -835,6 +914,10 @@ func TestSemanticConcurrencyControllerDoesNotChargeStableOutputGrowthToCalls(t *
 	}
 }
 
+// TestSemanticConcurrencyControllerUsesMeasuredMemoryAndLiveCPU keeps the
+// width at 1 while the measured call cost does not fit the free memory. It
+// grows the width to 8 when the memory recovers, and cuts it to the live CPU
+// limit.
 func TestSemanticConcurrencyControllerUsesMeasuredMemoryAndLiveCPU(t *testing.T) {
 	started := time.Unix(1, 0)
 	controller := newSemanticConcurrencyController(started, 100)
@@ -875,6 +958,9 @@ func TestSemanticConcurrencyControllerUsesMeasuredMemoryAndLiveCPU(t *testing.T)
 	}
 }
 
+// TestSemanticConcurrencyControllerRecalibratesAfterCPULimitChange changes the
+// CPU limit from 8 to 16. The controller drops the old window, ceiling and
+// best rate, and measures the widths again.
 func TestSemanticConcurrencyControllerRecalibratesAfterCPULimitChange(t *testing.T) {
 	started := time.Unix(1, 0)
 	controller := &semanticConcurrencyController{
@@ -902,7 +988,7 @@ func TestSemanticConcurrencyControllerRecalibratesAfterCPULimitChange(t *testing
 	}
 
 	// The old curve stopped at width 2 with 512 rows/s. The new curve
-	// measures 256 rows/s at width 2, then 384 at width 4: each width beats
+	// measures 256 rows/s at width 2, then 384 at width 4. Each width beats
 	// the best rate of the new curve, so the width grows to 8. The old
 	// ceiling would hold the width at 2; the old best rate would cut 4 back
 	// to 2.

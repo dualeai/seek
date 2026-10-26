@@ -27,15 +27,17 @@ const (
 	rootTypeDirectory rootType = "directory"
 	rootTypeFile      rootType = "file"
 
-	// v3 marks the corpora that have the published-family manifest. A corpus
-	// that an older binary built has no .family-v1, and to treat that as
-	// damage would rebuild every corpus on every machine at once. With a new
-	// ID, a binary that writes the manifest meets only corpora that it built.
-	// Two binary versions also do not share one corpus directory, so one of
-	// them does not publish with no manifest on every other run.
+	// seekIndexGeneration v3 marks the corpora that have the published-family
+	// manifest (.family-v1). A corpus that an older binary built has no
+	// manifest. To treat that as damage would rebuild every corpus on every
+	// machine at once. With a new ID, a binary that writes the manifest meets
+	// only corpora that it built. Two binary versions also do not share one
+	// corpus directory, so one of them does not publish with no manifest on
+	// every other run.
 	seekIndexGeneration = "v3"
-	// Bump once per release when a state-hash formula changes, so a new
-	// binary never reads a state file that an old one wrote.
+	// seekCacheLayoutVersion changes, once per release, when a state-hash
+	// formula changes. A new binary then never reads a state file that an old
+	// one wrote.
 	seekCacheLayoutVersion    = "v3"
 	seekDocumentNamingVersion = "slash-relative-v1"
 )
@@ -65,16 +67,16 @@ type node struct {
 	displayRoot string
 	// selectedFiles are the corpus-relative (slash) names that the user gave
 	// as file operands. A result with one of these names gets its base name
-	// as the fallback header (displayHeader). Formatter-only — never part of
-	// the corpus ID.
+	// as the fallback header (displayHeader). It is for display only and is
+	// never part of the corpus ID.
 	selectedFiles []string
 	corpusStore
 	// scope is the search-time filter for a scoped Git search. A scoped and an
 	// unscoped search of one repo read the same combined whole-repo index
 	// (cacheDir/indexDir); scope only limits which loaded documents match. The
 	// filter adds no BM25 term (searchShards), so each matched document gets
-	// the score of the unscoped search, and a scoped result set equals the
-	// unscoped result set intersected with it.
+	// the score of the unscoped search. A scoped result set is the part of the
+	// unscoped result set that the scope holds.
 	scope query.Q
 	// behavior is the kind's work (nodeKind); nil when the node only names a
 	// cache place, as for the error of a failed Git node (gitNodeError).
@@ -185,14 +187,14 @@ func planCorpora(ctx context.Context, operands []string) ([]node, error) {
 // buildGitCorpusPlan gives one physical repository one corpus identity, so
 // every route to it uses one cache directory.
 //
-// git_committed_backend=native-v1 is the committed-reader migration barrier.
-// It makes the first native request use a new cache, so native delta cannot
-// seed a shard family made by the removed reader.
+// The ID part git_committed_backend=native-v1 names the reader of committed
+// content. A corpus that another committed reader built has another ID, so a
+// native delta never extends a shard family that another reader made.
 //
-// rootTypeWorktree is the convention regardless of the on-disk layout: the
-// corpus models the working tree, not the .git layout. The identity is the
-// file identity (dev:ino) of the worktree and of the common directory, never a
-// path: the typed letter case or a symlink in the path does not change it.
+// The root type is rootTypeWorktree for every on-disk layout: the corpus
+// models the working tree, not the .git layout. The identity is the file
+// identity (dev:ino) of the worktree and of the common directory, never a
+// path. So the typed letter case or a symlink in the path does not change it.
 func buildGitCorpusPlan(repoDir, commonDir string) (node, error) {
 	root := canonicalCorpusPath(repoDir)
 	commonID, err := filesystemIdentity(canonicalCorpusPath(commonDir))
@@ -215,16 +217,20 @@ func planFolderCorpus(root string, info os.FileInfo) (node, error) {
 	}
 	plan.behavior = &folderNode{}
 	if rt == rootTypeFile {
-		// A single-file corpus indexes the file under its basename. Render
-		// results relative to the parent dir so the header reads as the file
-		// the user selected, and multi-corpus mode still joins to an
-		// absolute, directly-openable path.
+		// A single-file corpus indexes the file under its base name. Results
+		// show relative to the parent directory, so the header names the file
+		// that the user selected. With many corpora, the header is still an
+		// absolute path that opens directly.
 		plan.displayRoot = filepath.Dir(root)
 		plan.selectedFiles = []string{filepath.Base(root)}
 	}
 	return plan, nil
 }
 
+// newCorpusPlan gives the node of one corpus. Its ID hashes the kind, the root
+// type, the root's file identity, the format versions, the build options
+// (indexOptionsHash), and extraIDParts. statSubject names the root in a stat
+// error.
 func newCorpusPlan(kind corpusKind, rt rootType, root, statSubject string, extraIDParts ...string) (node, error) {
 	cacheRoot, err := seekUserCacheRoot()
 	if err != nil {
@@ -323,6 +329,8 @@ func seekUserCacheRoot() (string, error) {
 	return filepath.Join(dir, "seek"), nil
 }
 
+// filesystemIdentity returns the file identity of path as "dev:ino" in
+// decimal digits. It follows symlinks.
 func filesystemIdentity(path string) (string, error) {
 	var st syscall.Stat_t
 	if err := syscall.Stat(path, &st); err != nil {
@@ -332,6 +340,8 @@ func filesystemIdentity(path string) (string, error) {
 		strconv.FormatUint(uint64(st.Ino), 10), nil
 }
 
+// canonicalCorpusPath returns path with its symlinks resolved, or the clean
+// absolute path when a resolve fails.
 func canonicalCorpusPath(path string) string {
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		return resolved // EvalSymlinks returns a clean path.

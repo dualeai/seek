@@ -10,6 +10,10 @@ import (
 	"testing"
 )
 
+// TestCommittedGitStateEncodingAndDamage checks the bytes that
+// writeCommittedGitState writes, that readCommittedGitState rejects each
+// damaged or other-format record, and that only deleteCommittedGitState
+// removes the record.
 func TestCommittedGitStateEncodingAndDamage(t *testing.T) {
 	cacheDir := t.TempDir()
 	path := filepath.Join(cacheDir, committedGitStateFile)
@@ -33,8 +37,8 @@ func TestCommittedGitStateEncodingAndDamage(t *testing.T) {
 		t.Fatalf("encoded state=%q, want %q", raw, wantRaw)
 	}
 
-	// Write the valid record without the production writer so the reader has an
-	// independent input contract.
+	// Write the valid record with no use of the production writer, so the
+	// reader test does not depend on it.
 	if err := os.WriteFile(path, []byte(wantRaw), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -81,6 +85,9 @@ func TestCommittedGitStateEncodingAndDamage(t *testing.T) {
 	}
 }
 
+// TestPrepareNativeGitDeltaAcceptsLargeFullBase gives a full base of
+// maxCommittedDeltaShards+1 shards. The delta limit counts the shards above
+// the full base, so a commit on top of it still takes the delta path.
 func TestPrepareNativeGitDeltaAcceptsLargeFullBase(t *testing.T) {
 	repoDir, paths, plan := prepareNativeDeltaFixture(t)
 	scan, err := scanFamily(plan.indexDir)
@@ -254,7 +261,7 @@ exec "$SEEK_TEST_REAL_GIT" "$@"
 
 // TestWarmSearchReadsNoCommittedState replaces the committed state of a built
 // node with a FIFO. A warm search that opened it for reading would wait for a
-// writer, so the search must end with no read of it: only a committed build
+// writer, so the search must end with no read of it. Only a committed build
 // reads the state, to admit a delta. A search that waits stops the test at
 // the go test timeout.
 func TestWarmSearchReadsNoCommittedState(t *testing.T) {

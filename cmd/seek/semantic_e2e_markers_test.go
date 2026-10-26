@@ -21,8 +21,8 @@ import (
 // which nodes, files, tags and lines print; they prove nothing about meaning,
 // tau, the retrieval radius or rank. The real-model test proves that the model
 // chooses the files and the unit that print.
-// The oracle is a literal set from the fixture or a one-word text search with
-// no model on the same operands, and each fixture puts that word in every
+// The oracle is a literal set from the fixture, or a one-word text search
+// with no model on the same operands. Each fixture puts that word in every
 // file with content that must print.
 
 // e2eMarkerQuery is a description of two words that no fixture file holds.
@@ -62,9 +62,9 @@ func e2eMarkerModelPaths(scorer *hybridTestScorer) (embedded, scored []string) {
 }
 
 // e2eMarkerSameBlocks fails the test unless the text oracle prints at least
-// one file and the description output prints the same headers, tags and lines:
-// for each header, the "also:" line and the first region of the file
-// (firstRegions).
+// one file, and the description output prints the same headers, tags and
+// lines. For each header, it compares the "also:" line and the first region of
+// the file (firstRegions).
 func e2eMarkerSameBlocks(t *testing.T, label, description, oracle string) {
 	t.Helper()
 	got, want := firstRegions(description), firstRegions(oracle)
@@ -255,10 +255,10 @@ func TestE2EMarkerNodeTagsAcrossRoots(t *testing.T) {
 }
 
 // TestE2EMarkerVectorOnlyDuplicatesCollapse finds one content only through
-// vectors in a repository, its linked worktree, an untracked copy and a
-// folder, with a model that accepts every row. The copies print as one result
-// with an "also:" line, and the model scores one copy. An edited copy prints
-// as its own result. The search sorts the copies by score, then by path
+// vectors, with a model that accepts every row. The content is in a repository,
+// its linked worktree, an untracked copy and a folder. The copies print as one
+// result with an "also:" line, and the model scores one copy. An edited copy
+// prints as its own result. The search sorts the copies by score, then by path
 // (compareNodeHits): the first copy prints, and the others follow it on the
 // also: line. The test model gives each copy its own vector, because the path
 // header is in the model input, as with the real model. The test cannot know
@@ -329,14 +329,16 @@ func TestE2EMarkerVectorOnlyDuplicatesCollapse(t *testing.T) {
 	}
 }
 
-// TestE2EMarkerNameOnlyFilesNeverReachTheModel puts zqnamemark in binary
-// files (a NUL byte in the 8,000-byte probe and after it), a file above the
-// content limit, an unreadable file and a blob that a partial clone lacks,
-// beside three text files. The model accepts every row, but it never embeds
-// or scores the name-only files: only the text files print, and the name-only
-// notice counts all 10, as the text search does. A user who can read a
-// mode-000 file (root) cannot make an unreadable file, so the test then
-// removes that file and the notice counts 9.
+// TestE2EMarkerNameOnlyFilesNeverReachTheModel puts zqnamemark in files that
+// Seek indexes by name only, beside three text files:
+//   - binary files, with a NUL byte in the 8,000-byte probe or after it;
+//   - files above the content limit;
+//   - an unreadable file;
+//   - a blob that a partial clone lacks.
+//
+// The model accepts every row, but it never embeds or scores the name-only
+// files. Only the text files print, and the name-only notice counts all 10,
+// as the text search does.
 func TestE2EMarkerNameOnlyFilesNeverReachTheModel(t *testing.T) {
 	requireTools(t)
 	swapDocumentContentLimitForTest(t, 12<<10)
@@ -361,18 +363,8 @@ func TestE2EMarkerNameOnlyFilesNeverReachTheModel(t *testing.T) {
 	writeFixtureFile(t, filepath.Join(folder, "flate.bin"), late)
 	locked := filepath.Join(folder, "locked.txt")
 	writeFixtureFile(t, locked, "zqnamemark locked\n")
-	if err := os.Chmod(locked, 0); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(locked, 0o644) })
-	nameOnlyFiles := 10
-	if file, err := os.Open(locked); err == nil {
-		_ = file.Close()
-		if err := os.Remove(locked); err != nil {
-			t.Fatal(err)
-		}
-		nameOnlyFiles--
-	}
+	chmodUnreadableOrFatal(t, locked, 0)
+	const nameOnlyFiles = 10
 
 	source := f.GitRepo("names/source", "kept.go", "package source\n// zqnamemark kept\n")
 	writeFixtureFile(t, filepath.Join(source, "dir", "missing.go"), "package dir\n// zqnamemark missing\n")
@@ -587,9 +579,8 @@ func TestE2EMarkerStaleIndexAddsNoFilesByMeaning(t *testing.T) {
 // a commit of them and a deletion. Each step prints the files, tags and lines
 // that a text search prints. After the commit, no file keeps [uncommitted],
 // the deleted file is gone, and a warm search embeds nothing. Each file has
-// one unit and at most 4 lines, so the block of its vector hit and the block
-// of its text match are the full file: the test model chooses no unit by
-// meaning.
+// one unit and at most 4 lines. So the vector hit and the text match of a file
+// both print the full file: the test model chooses no unit by meaning.
 func TestE2EMarkerCommitMovesTheBaseAndTheOverlay(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -673,14 +664,14 @@ const e2eMarkerRetryQuery = "retry failed operations"
 // files.
 var e2eMarkerRetryDecoys = []string{"auth/token.go", "cache/lru.go", "db/migrate.go"}
 
-// e2eMarkerBackoffGo is a decoy on a near topic: it has a row in the
+// e2eMarkerBackoffGo is a decoy on a near topic. It has a row in the
 // retrieval radius, so the model scores it, but its lift does not pass
 // tau_file.
 const e2eMarkerBackoffGo = "package util\n\n// backoffDelay returns the wait before the next attempt: it doubles with each attempt.\nfunc backoffDelay(attempt int) time.Duration {\n\treturn time.Millisecond << attempt\n}\n"
 
 // e2eMarkerRetryFunction is the retry function of acceptanceRetryGo, with the
 // same doc comment and less code. A unit longer than one model input splits
-// into windows, and a later window can be the best row, so a hit could start
+// into windows. A later window can be the best row, so a hit could start
 // inside the function. This function and its header fit one window.
 // A symbol unit starts at the line of its symbol, so a doc comment above the
 // func line is in the unit of Before. The doc comment is thus the first line
@@ -706,8 +697,8 @@ func e2eMarkerRetryFile(pad int, tag string) string {
 }
 
 // e2eMarkerRetryBlock returns the lines that a hit on the retry function of
-// e2eMarkerRetryFile(pad, tag) prints: its first line with 3 lines of context
-// on each side, each after its line number.
+// e2eMarkerRetryFile(pad, tag) prints. They are its first line with 3 lines of
+// context on each side, each after its line number.
 func e2eMarkerRetryBlock(pad int, tag string) string {
 	lines := strings.Split(e2eMarkerRetryFile(pad, tag), "\n")
 	first := 7 + pad
@@ -720,37 +711,41 @@ func e2eMarkerRetryBlock(pad int, tag string) string {
 
 // TestE2EMarkerRealModelFindsTheRetryFunction searches with the real model for
 // e2eMarkerRetryQuery in a Git node and a folder node. Four files hold
-// e2eMarkerRetryFunction as the third of 4 units: a committed file, a file
-// that the work tree moves down 5 lines, an untracked file, and a folder file.
-// Four files are decoys: the 3 files of e2eMarkerRetryDecoys have no row in
-// the retrieval radius, and util/backoff.go has one, so the model scores it
-// and tau_file rejects it. No file holds the word "operations", so no file is
-// a strict match, and only a model that reads meaning can choose the files
-// and the unit that print. Four searches:
+// e2eMarkerRetryFunction as the third of 4 units:
+//   - a committed file;
+//   - a file that the work tree moves down 5 lines;
+//   - an untracked file;
+//   - a folder file.
 //
-//   - Cold: the model scores exactly the 4 retry files and util/backoff.go,
-//     the 4 retry files print with their tags, and no decoy prints.
-//     Each prints the first line of the retry function with 3 lines of
-//     context on each side, as a text search for the zqregionmark word of
-//     that line does. A text search for the description finds nothing, so
-//     the files come from the model.
+// Four files are decoys. The 3 files of e2eMarkerRetryDecoys have no row in
+// the retrieval radius. util/backoff.go has one, so the model scores it and
+// tau_file rejects it. No file holds the word "operations", so no file is a
+// strict match. Only a model that reads meaning can choose the files and the
+// unit that print. Four searches:
+//
+//   - Cold: the model scores exactly the 4 retry files and util/backoff.go.
+//     The 4 retry files print with their tags, and no decoy prints. Each
+//     prints the first line of the retry function with 3 lines of context on
+//     each side. A text search for the zqregionmark word of that line prints
+//     the same. A text search for the description finds nothing, so the
+//     files come from the model.
 //   - Warm, -n 2: the first 2 files of the cold order print, with a footer
-//     for the other 2, and the model scores the cold set: the limit cuts the
+//     for the other 2. The model scores the cold set: the limit cuts the
 //     output after the rank, not the candidates.
 //   - Warm, file:net/: the filtered route prints and scores the cold sets
 //     restricted to net/.
 //   - After a commit of the moved file, it prints with no [uncommitted] at
-//     its new line, and the build embeds nothing: it copies the rows of the
+//     its new line. The build embeds nothing: it copies the rows of the
 //     overlay by key.
 //
-// Lifts (S - S0) / T of the best row of each file, measured on 2026-10-22
-// with Core ML and with the CPU provider (the two agree within 0.0004); a
-// fine lift is the same value from the fine vectors of retrieval. The retry
-// files: 0.294 to 0.314, at least 0.044 above tau_file. util/backoff.go:
-// 0.154, 0.095 under tau_file, with a fine lift 0.020 above the radius. The
-// other decoys: fine lifts of at most 0.091, 0.043 under the radius. The test
-// costs about 11 model batches. A failure prints the provider and the raw
-// score of each scored document.
+// Each lift (S - S0) / T below is of the best row of a file, from runs on
+// 2026-10-22. The Core ML and the CPU providers agree within 0.0004. A fine
+// lift is the same value from the fine vectors of retrieval. The retry files:
+// 0.294 to 0.314, at least 0.044 above tau_file. util/backoff.go: 0.154,
+// 0.095 under tau_file, with a fine lift 0.020 above the radius. The other
+// decoys: fine lifts of at most 0.091, 0.043 under the radius. The test costs
+// about 11 model batches. A failure prints the provider and the raw score of
+// each scored document.
 func TestE2EMarkerRealModelFindsTheRetryFunction(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)

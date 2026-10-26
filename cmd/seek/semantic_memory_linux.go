@@ -11,6 +11,10 @@ import (
 	"strings"
 )
 
+// semanticHostAvailableMemory returns the bytes of memory that the host can
+// give now, for the concurrency of the semantic build. It takes the smaller of
+// MemAvailable and the room in the memory cgroups of this process. It returns
+// 0 when it finds neither value.
 func semanticHostAvailableMemory() int64 {
 	content, err := os.ReadFile("/proc/meminfo")
 	var hostAvailable int64
@@ -28,6 +32,8 @@ func semanticHostAvailableMemory() int64 {
 	}
 }
 
+// parseLinuxMemAvailable returns the MemAvailable bytes of /proc/meminfo
+// content, or 0.
 func parseLinuxMemAvailable(content []byte) int64 {
 	scanner := bufio.NewScanner(bytes.NewReader(content))
 	for scanner.Scan() {
@@ -44,6 +50,9 @@ func parseLinuxMemAvailable(content []byte) int64 {
 	return 0
 }
 
+// linuxCgroupAvailableMemory returns the smallest room (limit less use) of the
+// memory cgroups of this process and their parents. It returns 0 when no group
+// has a limit. A group at its limit gives 1, because 0 means no limit.
 func linuxCgroupAvailableMemory() int64 {
 	content, _ := os.ReadFile("/proc/self/cgroup")
 	var available int64
@@ -64,6 +73,10 @@ func linuxCgroupAvailableMemory() int64 {
 	return available
 }
 
+// linuxMemoryCgroupFiles returns the limit and use file pairs of the memory
+// cgroups that the /proc/self/cgroup content names. A "0::" line gives the
+// cgroup v2 hierarchy only. Else it gives the v2 root and the v1 memory
+// hierarchy.
 func linuxMemoryCgroupFiles(content []byte) [][2]string {
 	const root = "/sys/fs/cgroup"
 	var v1Path string
@@ -92,6 +105,8 @@ func linuxMemoryCgroupFiles(content []byte) [][2]string {
 	)...)
 }
 
+// linuxMemoryHierarchyFiles returns the limit and use file pairs of the
+// cgroup at relative below root, and of each parent up to root.
 func linuxMemoryHierarchyFiles(root, relative, limitName, usedName string) [][2]string {
 	relative = strings.TrimPrefix(filepath.Clean("/"+relative), "/")
 	files := make([][2]string, 0, strings.Count(relative, string(filepath.Separator))+1)
@@ -112,6 +127,8 @@ func linuxMemoryHierarchyFiles(root, relative, limitName, usedName string) [][2]
 	}
 }
 
+// readLinuxMemoryValue reads one cgroup memory value. It reports false when
+// the file is missing or the value means no limit.
 func readLinuxMemoryValue(path string) (int64, bool) {
 	content, err := os.ReadFile(path)
 	if err != nil {

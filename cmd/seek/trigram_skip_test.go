@@ -11,10 +11,11 @@ import (
 	"github.com/sourcegraph/zoekt/index"
 )
 
-// highTrigramContent returns text that Zoekt's default TrigramMax would skip.
-// Before seek set TrigramMax, Zoekt stored "NOT-INDEXED: contains too many
-// trigrams" in place of such a document, so an exact term in it had no match.
-// The needle comes last, after the point where the default count is exceeded.
+// highTrigramContent returns text that the default TrigramMax of Zoekt skips.
+// With the default, Zoekt stores "NOT-INDEXED: contains too many trigrams" in
+// place of the document, so an exact term in it has no match. Seek sets
+// TrigramMax to the content limit (indexBuildOptions). The needle comes last,
+// after the point where the text passes the default count.
 func highTrigramContent(tb testing.TB, needle string) []byte {
 	tb.Helper()
 	data := randomWordText(1, 96<<10, needle)
@@ -103,8 +104,8 @@ func TestRun_HighTrigramDocumentKeepsSearchableContent(t *testing.T) {
 }
 
 // TestRun_HighTrigramDocumentKeepsSearchableContentAfterDelta builds each index
-// with a small file first, so the second search adds the large document
-// through a delta build instead of a full build.
+// with a small file first. So the second search adds the large document
+// through a delta build, not a full build.
 func TestRun_HighTrigramDocumentKeepsSearchableContentAfterDelta(t *testing.T) {
 	requireTools(t)
 
@@ -187,9 +188,9 @@ func TestRun_ShardGuardKeepsOversizedShardsNameOnly(t *testing.T) {
 	small := []byte("guard_small_needle_marker\n")
 	swapGuardLimitsForTest(t)
 
-	// headerDir is the text that each header prints before the file name: the
-	// folder operand and a slash, or nothing for a search from the repository
-	// root.
+	// headerDir is the text that each header prints before the file name. It
+	// is the folder operand and a slash, or nothing for a search from the
+	// repository root.
 	check := func(t *testing.T, dir string, operands []string, headerDir, wrapsPath string) {
 		t.Helper()
 		expectSearchMatch(t, dir, operands, fitsNeedle, "## "+headerDir+"fits.txt")

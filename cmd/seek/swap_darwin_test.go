@@ -19,8 +19,8 @@ import (
 // an entry to that folder, so it works. The rename in removes an entry from
 // the build folder, and the move back removes an entry from the aside folder,
 // so both fail. The family is torn, and .swapping must name it for repair.
-// Linux has no such trigger for a user that is not root: one mode bit gives
-// the right to add and to remove an entry of a folder.
+// Linux has no such trigger for a user that is not root. There, one mode bit
+// gives the right to add and to remove an entry of a folder.
 func TestPublishMarksAFailedMoveBack(t *testing.T) {
 	const shard = "folder_x_v16.00000.zoekt"
 	store := corpusStore{cacheDir: t.TempDir(), indexDir: filepath.Join(t.TempDir(), "index")}
@@ -137,7 +137,7 @@ func TestPublishKeepsAFamilyWithAnImmutableShard(t *testing.T) {
 // TestUncommittedPublishKeepsAFamilyWithAnImmutableShard gives a Git node an
 // uncommitted family of two shards, makes the later one immutable, and
 // changes the dirty files. The build fails, and its swap moves the live
-// uncommitted shards back: the old family is whole and found, with no stale
+// uncommitted shards back. The old family is whole and found, with no stale
 // shard beside a new one. With the flag cleared, the next build publishes the
 // change.
 func TestUncommittedPublishKeepsAFamilyWithAnImmutableShard(t *testing.T) {
@@ -199,11 +199,11 @@ func TestUncommittedPublishKeepsAFamilyWithAnImmutableShard(t *testing.T) {
 }
 
 // TestNoDirtyCleanKeepsAFamilyWithAnImmutableShard changes an uncommitted file
-// twice, so a later shard holds its first copy under a tombstone record, then
+// twice, so a later shard holds its first copy under a tombstone record. It
 // makes that shard immutable and commits every file. With no dirty file, the
-// build removes the uncommitted family: the move fails and moves the family
-// back, so every shard and record stays and the first copy is not found.
-// With the flag cleared, the next build removes the family.
+// build removes the uncommitted family. The move fails and moves the family
+// back: every shard and record stays, and the first copy is not found. With
+// the flag cleared, the next build removes the family.
 func TestNoDirtyCleanKeepsAFamilyWithAnImmutableShard(t *testing.T) {
 	requireTools(t)
 	swapShardMaxForTest(t, 1024)
@@ -262,11 +262,11 @@ func TestNoDirtyCleanKeepsAFamilyWithAnImmutableShard(t *testing.T) {
 }
 
 // TestCommittedPublishIsRecordedWhenTheUncommittedStepFails commits a change
-// while an uncommitted shard is immutable and the dirty files change so that
-// the uncommitted family is swapped: the committed family publishes, then the
-// uncommitted swap fails. The records of the new committed family are written
-// right after its publish, so the next builds keep its shard (no full
-// committed rebuild), during the failure and after the flag clears.
+// while an uncommitted shard is immutable. The dirty files change so that the
+// build swaps the uncommitted family. The committed family publishes, then the
+// uncommitted swap fails. The build writes the records of the new committed
+// family right after its publish. So the next builds keep its shard, with no
+// full committed rebuild, during the failure and after the flag clears.
 func TestCommittedPublishIsRecordedWhenTheUncommittedStepFails(t *testing.T) {
 	requireTools(t)
 	swapShardMaxForTest(t, 1024)
@@ -343,11 +343,11 @@ func TestCommittedPublishIsRecordedWhenTheUncommittedStepFails(t *testing.T) {
 }
 
 // TestEarlyRecordKeepsADamagedUncommittedFamilyUnnamed removes a record of
-// the uncommitted family, so it does not match the family manifest, makes an
-// uncommitted shard immutable, and commits a change: the committed family
-// publishes and is recorded, then the uncommitted swap fails. The record names
-// no uncommitted member of a family that did not match, so the next build
-// still sees the damage.
+// the uncommitted family, so the family does not match the family manifest.
+// It makes an uncommitted shard immutable and commits a change. The committed
+// family publishes and is recorded, then the uncommitted swap fails. The
+// record names no uncommitted member of a family that did not match, so the
+// next build still sees the damage.
 func TestEarlyRecordKeepsADamagedUncommittedFamilyUnnamed(t *testing.T) {
 	requireTools(t)
 	swapShardMaxForTest(t, 1024)

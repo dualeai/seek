@@ -106,7 +106,7 @@ func testShardFiles(count int, seed uint64) []testShardFile {
 }
 
 // testShardUnits gives the rows of files, in order. The key and unit ID of a
-// row follow its file's path and version and its place in the file, so an
+// row come from its file's path and version and its place in the file. So an
 // unchanged file gives the same rows in every generation.
 func testShardUnits(files []testShardFile) []semanticUnit {
 	var units []semanticUnit
@@ -141,8 +141,8 @@ func testShardRows(files []testShardFile) ([]semanticUnit, []semanticUnitEmbeddi
 }
 
 // planTestShards runs the planner over units, one file at a time, on the CPU
-// count that gives shards of size rows: on len(units)/size CPUs, each CPU
-// gets from size to 2*size-1 rows. It fails if the planner cuts another size.
+// count that gives shards of size rows. On len(units)/size CPUs, each CPU gets
+// from size to 2*size-1 rows. It fails if the planner cuts another size.
 func planTestShards(t *testing.T, units []semanticUnit, size uint64) []semanticUSearchShardPlan {
 	t.Helper()
 	planner := newSemanticUSearchShardPlanner(max(1, len(units)/int(size)))
@@ -188,7 +188,7 @@ func TestSemanticUSearchShardRowsForSizesFromTheHost(t *testing.T) {
 }
 
 // TestSemanticUSearchShardPlannerCutsAtFileBoundaries checks the cut of 3,000
-// files: the shards follow each other with no gap, hold at most the shard
+// files. The shards follow each other with no gap, hold at most the shard
 // size, and end at a file boundary. A file of more rows than the shard size
 // gets shards of its own of equal size.
 func TestSemanticUSearchShardPlannerCutsAtFileBoundaries(t *testing.T) {
@@ -231,8 +231,8 @@ func TestSemanticUSearchShardPlannerCutsAtFileBoundaries(t *testing.T) {
 	}
 }
 
-// TestSemanticUSearchShardPlannerWaitsForTheHostSize gives two CPUs: the
-// planner holds the files until the rows reach 8,192, so a small generation
+// TestSemanticUSearchShardPlannerWaitsForTheHostSize gives two CPUs. The
+// planner holds the files until the rows reach 8,192. So a small generation
 // gets the size of its row count, and a large one gets shards before its end.
 func TestSemanticUSearchShardPlannerWaitsForTheHostSize(t *testing.T) {
 	small := testShardUnits([]testShardFile{{path: "a.go", rows: 3_000}, {path: "b.go", rows: 2_000}})
@@ -402,8 +402,8 @@ func TestBuildSemanticUSearchStreamReusesUnchangedShards(t *testing.T) {
 
 // TestBuildSemanticUSearchStreamRejectsADamagedSource damages one graph file
 // of a first build in place, with its length kept. The next build of the same
-// rows, with sources that it links or that it copies, hashes that file,
-// rejects it, and builds the shard again. It reuses every other file.
+// rows links or copies its sources. It hashes that file, rejects it, and
+// builds the shard again. It reuses every other file.
 func TestBuildSemanticUSearchStreamRejectsADamagedSource(t *testing.T) {
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
 	const size = 512
@@ -451,9 +451,9 @@ func TestBuildSemanticUSearchStreamRejectsADamagedSource(t *testing.T) {
 }
 
 // TestBuildSemanticUSearchStreamLinksNothingWhenItFails reuses every shard of
-// a first build, but the rows of the last shard never come. The stream fails,
-// and it links no file: each source file keeps its recorded check, so the
-// live generation hashes none of them at its next search.
+// a first build, but the rows of the last shard never come. The stream fails
+// and links no file. Each source file keeps its recorded check, so the live
+// generation hashes none of them at its next search.
 func TestBuildSemanticUSearchStreamLinksNothingWhenItFails(t *testing.T) {
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
 	units, embeddings := testShardRows(testShardFiles(100, 10))
@@ -485,7 +485,7 @@ func TestBuildSemanticUSearchStreamLinksNothingWhenItFails(t *testing.T) {
 
 // TestBuildSemanticUSearchStreamRebuildsForOtherVectors keeps the keys and
 // unit IDs of every row but changes their coarse vectors, as another model
-// provider can: no shard matches, and every graph builds again.
+// provider can. No shard matches, and every graph builds again.
 func TestBuildSemanticUSearchStreamRebuildsForOtherVectors(t *testing.T) {
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
 	units, embeddings := testShardRows(testShardFiles(100, 9))
@@ -591,8 +591,8 @@ func TestGraphShardsSurviveAOneFileCommit(t *testing.T) {
 
 // TestFolderOneFileChangeReusesGraphShards changes one file of a 1,200-file
 // folder. The folder build reads its files on several workers, but the vector
-// build gets them in walk order, so the rows of the unchanged shards stay the
-// same: at most the two shards around the changed file are built, and every
+// build gets them in walk order. So the rows of the unchanged shards stay the
+// same. At most the two shards around the changed file are built, and every
 // other shard links its old graph file.
 func TestFolderOneFileChangeReusesGraphShards(t *testing.T) {
 	requireTools(t)
@@ -626,9 +626,9 @@ func TestFolderOneFileChangeReusesGraphShards(t *testing.T) {
 		}
 		inodes[semanticRowsCheckOf(info).Inode] = true
 	}
-	// Set the mtime of the changed file 1 s after its old one, as an edit
-	// made later would: its stat then differs from the indexed one on any
-	// clock resolution, with no wait.
+	// Set the mtime of the changed file 1 s after its old one, as a later
+	// edit would. Its stat then differs from the indexed one on any clock
+	// resolution, with no wait.
 	changed := filepath.Join(folder, "pkg", "d12", "f0600.go")
 	old, err := os.Stat(changed)
 	if err != nil {
@@ -667,7 +667,7 @@ func TestFolderOneFileChangeReusesGraphShards(t *testing.T) {
 
 // TestWorktreeGraphSourceIsCopiedNotLinked builds a repository, then a second
 // worktree of it. The second build reuses the first worktree's graphs, which
-// its bind does not remove, so it copies them: a link would change their
+// its bind does not remove, so it copies them. A link would change their
 // ctime, and every warm search of the first worktree would then hash them
 // again.
 func TestWorktreeGraphSourceIsCopiedNotLinked(t *testing.T) {
@@ -746,9 +746,10 @@ func TestRefusedGraphLinkCopiesTheFile(t *testing.T) {
 }
 
 // TestDamagedGraphShardIsRebuiltOnce damages one graph shard of a folder node
-// and of a Git node in place, as a disk fault that also changes the file time
-// would. The next search hashes the shard, keeps its text hits (every file
-// holds the query words), and removes the vector generations: one warning.
+// and of a Git node in place. A disk fault that changes the file time can do
+// that.
+// The next search hashes the shard, keeps its text hits (every file holds the
+// query words), and removes the vector generations: one warning.
 // The search after it builds the graphs again, and a warm search then hashes
 // no shard and builds none.
 func TestDamagedGraphShardIsRebuiltOnce(t *testing.T) {

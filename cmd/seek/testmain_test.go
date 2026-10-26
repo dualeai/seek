@@ -8,12 +8,18 @@ import (
 	"testing"
 )
 
+// lateOnExtractHelperEnv marks a child process of
+// TestLateOnRuntimeCacheAcrossProcesses: with the value "1",
+// TestLateOnRuntimeExtractHelper extracts the runtime.
 const lateOnExtractHelperEnv = "SEEK_TEST_RERANK_EXTRACT"
 
+// TestMain runs the tests with no log output and with a new SEEK_CACHE_DIR,
+// which it removes at the end. A test cannot then read or change the cache of
+// the user.
 func TestMain(m *testing.M) {
 	log.SetOutput(io.Discard)
-	// A helper process ends with os.Exit, so it would leave a cache directory
-	// behind: it uses the cache of its parent or none.
+	// A helper process ends with os.Exit, so a cache directory of its own
+	// would stay on disk. It uses the cache of its parent or none.
 	if os.Getenv(cliProcessHelperEnv) == cliProcessTestMarker ||
 		os.Getenv(lateOnExtractHelperEnv) == "1" || os.Getenv(shardScanEnv) != "" {
 		os.Exit(m.Run())

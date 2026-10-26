@@ -11,12 +11,12 @@ import (
 	"github.com/sourcegraph/zoekt/query"
 )
 
-// The name-only notice is one line per search with the count of the name-only
-// files that could have matched: binary files, text files too large for the
-// shard format, and the files that Seek has no bytes of (cloud-only files,
-// missing Git blobs, unreadable files). Zoekt stores each of them with its
-// NOT-INDEXED marker as content, so one marker query per node counts them.
-// Zoekt's own too-small files (1 or 2 bytes) are not counted.
+// The name-only notice is one line per search. It gives the count of the
+// name-only files that could have matched. These are binary files and text
+// files too large for the shard format. They are also files with no bytes in
+// Seek: cloud-only files, missing Git blobs, and unreadable files. Zoekt stores
+// each of them with its NOT-INDEXED marker as content, so one marker query per
+// node counts them. Zoekt's own too-small files (1 or 2 bytes) are not counted.
 
 // countedSkipReasons are the marker explanations that the notice counts, as
 // Zoekt writes them (index/document.go; TestCountedSkipReasonsMatchZoekt).
@@ -45,9 +45,9 @@ func addNameOnlyFiles(ctx context.Context, files int64) {
 
 // nameOnlyFilter returns the filter subtree of q, and whether q has a content
 // atom. The atoms that content cannot change (file names, languages, sets)
-// keep their meaning. A content atom takes the value that lets a file match,
-// true where the query asks for it and false under a negation: content that is
-// not indexed could hold it or lack it.
+// keep their meaning. A content atom takes the value that lets a file match:
+// true where the query asks for it, and false under a negation. Content that
+// is not indexed could hold it or lack it.
 func nameOnlyFilter(q query.Q) (query.Q, bool) {
 	content := false
 	var walk func(q query.Q, positive bool) query.Q
@@ -88,9 +88,10 @@ func nameOnlyFilter(q query.Q) (query.Q, bool) {
 }
 
 // countNameOnlyFiles counts the node's name-only files that pass the filter
-// subtree of q and that q does not already match, through read, which holds
-// the node's read lock and searches only the current copy of each file. Only
-// a complete marker document counts. A failed count loses only the notice.
+// subtree of q and that q does not already match. It searches through read,
+// which holds the node's read lock and searches only the current copy of each
+// file. Only a complete marker document counts. A failed count loses only the
+// notice.
 func countNameOnlyFiles(
 	ctx context.Context,
 	read *nodeRead,

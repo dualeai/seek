@@ -64,10 +64,10 @@ func TestMissingBlobRecordDamaged(t *testing.T) {
 }
 
 // TestPendingMissingBlobRecordKeepsADamagedRecord writes the pending record
-// of a build over a live record: a valid one takes the union of both blob
-// sets with a store that forces a check, and a damaged one stays damaged, so
-// a stop before the publish still makes the next search rebuild the data,
-// whether the build read missing blobs or none.
+// of a build over a live record. A damaged live record stays damaged, whether
+// the build read missing blobs or none. So a stop before the publish still
+// makes the next search rebuild the data. A valid live record takes the union
+// of both blob sets, with a store that forces a check.
 func TestPendingMissingBlobRecordKeepsADamagedRecord(t *testing.T) {
 	head := strings.Repeat("b", 40)
 	live := missingBlob{oid: gitObjectID(strings.Repeat("a", 40)), path: "live.txt"}
@@ -106,8 +106,8 @@ func TestPendingMissingBlobRecordKeepsADamagedRecord(t *testing.T) {
 }
 
 // TestDeltaMissingBlobsDropsChangedPaths keeps the base blobs of the paths
-// that a delta did not change and adds the delta's own: the blob of a deleted
-// or changed path does not force a full build when it arrives.
+// that a delta did not change, and adds the blobs of the delta. The blob of a
+// deleted or changed path then does not force a full build when it arrives.
 func TestDeltaMissingBlobsDropsChangedPaths(t *testing.T) {
 	kept := missingBlob{oid: gitObjectID(strings.Repeat("a", 40)), path: "kept.txt"}
 	deleted := missingBlob{oid: gitObjectID(strings.Repeat("b", 40)), path: "gone.txt"}
@@ -122,8 +122,8 @@ func TestDeltaMissingBlobsDropsChangedPaths(t *testing.T) {
 }
 
 // TestObjectStoreFingerprintSeesAlternates gives a repository an alternate
-// object store: an object that arrives there changes the fingerprint, which
-// is a real one, not the always-checked unknown store.
+// object store. The fingerprint is a real one, not unknownObjectStore, and an
+// object that arrives in the alternate changes it.
 func TestObjectStoreFingerprintSeesAlternates(t *testing.T) {
 	requireGit(t)
 	repo := initGitRepo(t, "a.txt", "a\n")

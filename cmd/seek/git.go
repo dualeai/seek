@@ -18,9 +18,9 @@ type repoState struct {
 	Files     []string // paths of changed/untracked files
 	// Children are the paths of nested repositories in the work tree: an
 	// untracked repository (Git lists it as one "? dir/" entry) and a changed
-	// gitlink that is still a repository. Each child is its own graph node, so
-	// its records are not in Files or RawOutput: a commit in a child does not
-	// change the parent state.
+	// gitlink that is still a repository. Each child is its own graph node,
+	// and its records are not in Files or RawOutput. So a commit in a child
+	// does not change the parent state.
 	Children []string
 }
 
@@ -68,9 +68,9 @@ func gitRepoStateIn(ctx context.Context, dir string) (repoState, error) {
 }
 
 // untrackedBareRepos returns the untracked directories of a work tree that are
-// bare repositories: Git lists their files one by one, but they hold Git
-// internals, not content. Only a "? <dir>/HEAD" entry can name
-// one, so the check costs a few stats per such entry.
+// bare repositories. Git lists their files one by one, but they hold Git
+// internals, not content. Only a "? <dir>/HEAD" entry can name one, so the
+// check costs a few stats per such entry.
 func untrackedBareRepos(repoDir, raw string) []string {
 	var roots []string
 	for record := range strings.SplitSeq(raw, "\x00") {
@@ -136,7 +136,9 @@ func parseGitStatusV2Skipping(raw string, bareRepos []string) repoState {
 		if entry[0] == '#' {
 			if strings.HasPrefix(entry, "# branch.oid ") {
 				state.HeadSHA = entry[len("# branch.oid "):]
-				if state.HeadSHA == "(initial)" {
+				// Git writes "(initial)" before the first commit. An empty
+				// value names no object either, so it also means no HEAD.
+				if state.HeadSHA == "(initial)" || state.HeadSHA == "" {
 					state.HeadSHA = "no-head"
 				}
 			}
@@ -158,10 +160,10 @@ func parseGitStatusV2Skipping(raw string, bareRepos []string) repoState {
 			path = extractV2Path(entry, 8)
 			child = v2Field(entry, 5) == gitlinkMode
 		case '2': // renamed/copied: "2 XY sub mH mI mW hH hI Xscore <path>"
-			// With -z, rename entries emit an additional NUL-terminated
-			// record for the original path. Consume it so it's not
-			// misinterpreted as a separate entry. This should not occur
-			// with --no-renames but handles it defensively.
+			// With -z, a rename entry has one more NUL-terminated record
+			// for the original path. Skip it, so that the parser does not
+			// read it as a separate entry. --no-renames prevents rename
+			// entries, but the parser does not depend on that.
 			path = extractV2Path(entry, 9)
 			child = v2Field(entry, 5) == gitlinkMode
 			if nextEnd := strings.IndexByte(raw[pos:], 0); nextEnd >= 0 {

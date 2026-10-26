@@ -122,10 +122,11 @@ func runSemanticBuild(
 	return build(embedder)
 }
 
-// semanticConcurrencyController changes only the number of model calls in
-// flight. It measures one warm-up call, then probes wider calls while complete
-// throughput improves and live memory permits growth. Source-limited windows
-// do not describe model throughput and cannot reduce or increase the width.
+// semanticConcurrencyController changes only the number of model calls that
+// run at the same time. It measures one warm-up call. Then it probes wider
+// calls while the measured throughput improves and free memory allows more.
+// A window that waited for the source does not measure the model, so it does
+// not change the width.
 type semanticConcurrencyController struct {
 	limit              int
 	previousLimit      int
@@ -162,8 +163,8 @@ func (controller *semanticConcurrencyController) activeLimit(cpuLimit int) int {
 	if controller.performanceCPUs == 0 {
 		controller.performanceCPUs = ceiling
 	} else if controller.performanceCPUs != ceiling {
-		// A changed CPU allowance invalidates the old service curve. Probe the
-		// newly available widths instead of keeping a stale ceiling.
+		// A changed CPU allowance makes the old measurements wrong. Probe the
+		// widths that are now possible, and drop the old ceiling.
 		controller.performanceCeiling = 0
 		controller.performanceCPUs = ceiling
 		controller.bestRate = 0
@@ -196,8 +197,8 @@ func (controller *semanticConcurrencyController) noteStarved() {
 	controller.invalidateWindow()
 	controller.growthSampleValid = false
 	if controller.performanceCeiling > 0 {
-		// A source gap starts a new service epoch. Measure the retained width
-		// again, then allow a wider probe if prepared work becomes available.
+		// A gap in the source starts a new measurement. Measure the kept width
+		// again, then allow a wider probe when prepared work is available.
 		controller.performanceCeiling = 0
 		controller.bestRate = 0
 		controller.bestLimit = controller.limit
@@ -237,8 +238,9 @@ func (controller *semanticConcurrencyController) evaluate(
 	}
 	warmup := !controller.warmupDone
 	if warmup {
-		// Provider setup and specialization can dominate the first call. Use it
-		// to measure memory, but do not compare its rate with steady work.
+		// Provider setup and specialization can take most of the time of the
+		// first call. Use it to measure memory, but do not compare its rate
+		// with steady work.
 		controller.warmupDone = true
 	}
 
@@ -277,7 +279,7 @@ func (controller *semanticConcurrencyController) evaluate(
 	next := nextSemanticProbeWidth(limit, ceiling)
 	if available > 0 && controller.growthCost > 0 {
 		// The current width already fits. Free memory limits only added calls;
-		// retained index output must not be charged as fresh call memory.
+		// kept index output must not count as new call memory.
 		memoryLimit := limit + int(available/controller.growthCost)
 		next = min(next, memoryLimit)
 	}
@@ -346,10 +348,10 @@ func buildSemanticGitGeneration(
 
 // buildSemanticFolderGeneration embeds the selected files of a folder node
 // whose model path base is base. indexDir holds the node's previous
-// generations, whose rows the build copies; a node with none copies the rows
+// generations, whose rows the build copies. A node with none copies the rows
 // of the corpora of its lineage (the folders that hold it or that it holds).
-// A read error that may pass fails the build, so the next search reads the
-// file again.
+// A read error that can be temporary fails the build, so the next search reads
+// the file again.
 func buildSemanticFolderGeneration(
 	ctx context.Context,
 	selected []folderCandidate,
@@ -404,7 +406,7 @@ func buildSemanticGeneration(
 	for index := range parsers {
 		// TODO(https://github.com/sourcegraph/go-ctags/issues/27): go-ctags
 		// drops a tag whose reply line has 4,096 bytes or more, with no
-		// error, so such a symbol gets no unit of its own.
+		// error. Such a symbol then gets no unit of its own.
 		parser, err := ctags.New(ctags.Options{Bin: os.Getenv("CTAGS_COMMAND")})
 		if err != nil {
 			for _, opened := range parsers[:index] {
@@ -463,7 +465,7 @@ func buildSemanticGeneration(
 		cancel,
 		resources.withModelCallCost(embedder.SemanticCallCPUs(buildCtx)),
 	)
-	// An overlay gets no USearch graph: its search scores every row with the
+	// An overlay gets no USearch graph. Its search scores every row with the
 	// exact fine vectors, and the graph would be half the cost of a save.
 	// The planner cuts the rows into graph shards as the files come in order.
 	var coarseReady chan semanticCoarseBatch
@@ -625,10 +627,10 @@ func buildSemanticGeneration(
 			readSemaphore.Release(result.weight)
 		}
 	}
-	// These values are cumulative milestones from started. Extraction can block
-	// behind inference backpressure, so the first value is not isolated extractor
-	// CPU time. The second includes extraction, inference, vector collection, and
-	// USearch construction.
+	// These values are times since started. Extraction can wait for the model,
+	// so the first value is not the CPU time of extraction alone. The second
+	// includes extraction, inference, vector collection, and USearch
+	// construction.
 	elapsedToExtractionDrain := time.Since(started)
 	if !failed {
 		sendBatch()
@@ -654,8 +656,9 @@ func buildSemanticGeneration(
 	}
 	if streamErr != nil && errors.Is(streamErr, context.Canceled) &&
 		output.err != nil && !errors.Is(output.err, context.Canceled) {
-		// A collector failure cancels the internal source. Keep that first fatal
-		// error instead of replacing it with the resulting source cancellation.
+		// A collector failure cancels the internal source. Keep that first
+		// fatal error instead of replacing it with the resulting source
+		// cancellation.
 		return semanticManifest{}, output.err
 	}
 	if streamErr != nil {
@@ -868,7 +871,7 @@ func encodeSemanticBatches(
 		controller.noteActive(active, resources.currentTime())
 		go func() {
 			embeddings, err := embedder.EmbedSemanticUnits(ctx, batch.units)
-			// Give the lease back before the send: the loop of another build of
+			// Give the lease back before the send. The loop of another build of
 			// the command can wait for CPU while this result waits for this
 			// loop.
 			cpu.release()
@@ -919,7 +922,7 @@ func encodeSemanticBatches(
 	}
 	for input != nil || active > 0 {
 		limit := controller.activeLimit(resources.callLimit())
-		// Both cases have a call in flight: the loop condition covers a
+		// In both cases, at least one call runs: the loop condition covers a
 		// closed input, and activeLimit is at least 1.
 		if input == nil || active >= limit {
 			finish(<-completed)
@@ -933,7 +936,7 @@ func encodeSemanticBatches(
 		}
 		inputEmptyPolls++
 		controller.noteStarved()
-		// With no call in flight, nothing sends on completed, so this select
+		// With no running call, nothing sends on completed, so this select
 		// waits for input.
 		select {
 		case batch, ok := <-input:
@@ -958,13 +961,13 @@ func encodeSemanticBatches(
 }
 
 // collectSemanticBatches writes each row's fine and coarse vectors at the
-// row's offset: rows that the model embedded, out of order, and rows copied
-// from a live generation or the unit store. It sends the coarse vectors of
-// each complete 128-row block to the USearch stream after its writes succeed.
-// Both paths store the coarse vectors as SNORM16 and send their decoded
-// values, so a copied row gives the same bytes as an embedded one. On the
-// first collector error, it keeps that error, cancels shared build work, and
-// drains both inputs until their producers close them.
+// row's offset. The rows are those that the model embedded, out of order, and
+// those copied from a live generation or the unit store. It sends the coarse
+// vectors of each complete 128-row block to the USearch stream after its
+// writes succeed. Both paths store the coarse vectors as SNORM16 and send
+// their decoded values, so a copied row gives the same bytes as an embedded
+// one. On the first collector error, it keeps that error, cancels shared build
+// work, and drains both inputs until their producers close them.
 func collectSemanticBatches(
 	encoded <-chan semanticEncodedBatch,
 	copied <-chan []semanticCopiedRow,
@@ -1221,9 +1224,9 @@ func releaseSemanticBuildBatch(batch semanticBuildBatch) {
 
 // buildSemanticOverlayGeneration embeds the work-tree bytes of a Git node's
 // dirty files. Each file is read once, and its windows are keyed by the bytes
-// read: a window that a live generation or the unit store holds is copied, not
-// embedded again. Deleted files have no rows; the base rows of every dirty
-// path are masked at the read.
+// read. A window that a live generation or the unit store holds is copied, not
+// embedded again. Deleted files have no rows; the read masks the base rows of
+// every dirty path.
 func buildSemanticOverlayGeneration(
 	ctx context.Context,
 	repoDir string,

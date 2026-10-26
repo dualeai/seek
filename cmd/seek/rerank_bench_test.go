@@ -16,8 +16,12 @@ import (
 	"time"
 )
 
+// seekBenchmarkBinaryEnv names the seek executable that BenchmarkCLIProcess
+// runs (make test-bench builds it).
 const seekBenchmarkBinaryEnv = "SEEK_BENCH_BINARY"
 
+// The benchmarks store their last results here, so the compiler keeps each
+// timed call.
 var (
 	benchmarkLateOnScores    []float32
 	benchmarkLateOnInputIDs  []int64
@@ -25,11 +29,13 @@ var (
 	benchmarkLateOnScoreMask [][]bool
 )
 
+// BenchmarkCLIProcess times the production executable on 256 files. It times
+// a lexical-only search and a search that gives the model no text. It times
+// descriptions on a first use and with a provider check. It also times warm
+// descriptions: with the default context, with -C 0, and with vector hits.
 func BenchmarkCLIProcess(b *testing.B) {
 	binary := seekBenchmarkBinary(b)
-	if err := checkCtagsCached(); err != nil {
-		b.Skipf("ctags required: %v", err)
-	}
+	requireTools(b)
 
 	root := b.TempDir()
 	fixture := filepath.Join(root, "fixture")
@@ -57,9 +63,9 @@ func BenchmarkCLIProcess(b *testing.B) {
 	const queryText = "parse request handler"
 	lexicalArgs := []string{"--lexical-only", queryText, fixture}
 	// RerankIneligibleWarm times a strict search in the cache that holds
-	// vectors: a query of punctuation only gives the model no text (support
-	// table rows T36 and T41), so the command starts no model. It matches the
-	// "()" of every fixture function.
+	// vectors. A query of punctuation only gives the model no text (the
+	// querySupport rows T36 and T41). So the command starts no model. It
+	// matches the "()" of every fixture function.
 	ineligibleArgs := []string{`\(\)`, fixture}
 	if plan, err := planQuery(ineligibleArgs[0], defaultSearchPolicy()); err != nil || plan.model != nil {
 		b.Fatalf("%q plans a model route: model=%t err=%v", ineligibleArgs[0], plan.model != nil, err)
@@ -127,8 +133,8 @@ func BenchmarkCLIProcess(b *testing.B) {
 			b.StopTimer()
 			// Remove the extracted run time, which is what "first use"
 			// measures. Keep reranker/coreml: it holds the compiled Core ML
-			// model and the provider verdict, and rebuilding both on every
-			// iteration would measure the Core ML compiler rather than Seek.
+			// model and the provider verdict. A new compile in each iteration
+			// would measure the Core ML compiler, not Seek.
 			entries, err := os.ReadDir(filepath.Join(semanticCache, "reranker"))
 			if err != nil && !os.IsNotExist(err) {
 				b.Fatal(err)
@@ -146,12 +152,11 @@ func BenchmarkCLIProcess(b *testing.B) {
 		}
 	})
 	b.Run("RerankEligibleProviderCheck", func(b *testing.B) {
-		// RerankEligibleFirstUse deliberately keeps the compiled Core ML model,
-		// and the provider verdict lives in the same directory, so that case
-		// never runs the provider check. Remove the verdict alone to measure
-		// the check itself: a second session on the reference provider and one
-		// batch through each. Without this the only cost this feature adds has
-		// no benchmark at all.
+		// RerankEligibleFirstUse keeps the compiled Core ML model, and the
+		// provider verdict is in the same folder, so that case never runs the
+		// provider check. Remove the verdict alone to measure the check: a
+		// second session on the reference provider and one batch through each.
+		// No other benchmark measures this cost.
 		for b.Loop() {
 			b.StopTimer()
 			removeProviderVerdicts(b, semanticCache)

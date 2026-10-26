@@ -4,10 +4,10 @@ import (
 	"testing"
 )
 
-// TestSequentialCorpora_SemaphoreDrainsBetweenPlans — process plans
-// sequentially. Every plan must return the global semaphore to its
-// starting balance — otherwise plan N+1 starts with reduced budget
-// and may wedge once cumulative > remaining.
+// TestSequentialCorpora_SemaphoreDrainsBetweenPlans builds two folder plans,
+// one after the other, each with twice the read budget. Each build must give
+// back all its read weight. Else the next plan starts with less budget and
+// can block.
 func TestSequentialCorpora_SemaphoreDrainsBetweenPlans(t *testing.T) {
 	requireTools(t)
 	testReadSemMu.Lock()
@@ -15,7 +15,7 @@ func TestSequentialCorpora_SemaphoreDrainsBetweenPlans(t *testing.T) {
 
 	const testBudget int64 = 4 * 1024 * 1024
 	const fileSize int64 = 512 * 1024
-	const totalPerCorpus int64 = 8 * 1024 * 1024 // 2× budget per corpus
+	const totalPerCorpus int64 = 8 * 1024 * 1024 // twice the budget
 
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
@@ -66,8 +66,8 @@ func TestSequentialCorpora_ThreeWayMix(t *testing.T) {
 		if _, err := ensureFolderCorpusFresh(t.Context(), plan); err != nil {
 			t.Fatalf("corpus[%s]: %v", rc.label, err)
 		}
-		// Empty corpus produces 0 shards (zero-doc branch in
-		// indexDocuments); large/medium must produce >= 1.
+		// The empty folder gives no shard: no document reaches the build. The
+		// large and medium folders give one or more.
 		n := repositoryShardCount(plan.indexDir, folderRepoName(plan))
 		if rc.label == "empty" {
 			if n != 0 {

@@ -1,5 +1,7 @@
 package main
 
+// searchPolicy selects the search stages of one command. With semantic, a
+// query also uses the model; --lexical-only turns it off.
 type searchPolicy struct {
 	semantic bool
 }

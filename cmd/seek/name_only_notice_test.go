@@ -65,11 +65,11 @@ func TestNameOnlyNoticeCountsOversizedFiles(t *testing.T) {
 	}
 }
 
-// TestNameOnlyNoticeCountRows proves the count rules: a name-only file that
-// already prints is not counted again, Zoekt's own too-small files are not
-// counted, a real text file that starts with the marker is not counted, and an
-// unreadable file is. A user who ignores file modes, as root does, reads the
-// mode-000 file: it then prints as a match, and no file is counted.
+// TestNameOnlyNoticeCountRows proves the count rules. A name-only file that
+// already prints is not counted again. Zoekt's own too-small files are not
+// counted. A real text file that starts with the marker is not counted. An
+// unreadable file is counted. A user who ignores file modes, as root does,
+// reads the mode-000 file: it then prints as a match, and no file is counted.
 func TestNameOnlyNoticeCountRows(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
@@ -169,8 +169,8 @@ func TestCountedSkipReasonsMatchZoekt(t *testing.T) {
 }
 
 // TestGitDirtyDatalessFileNotRead marks an untracked file of a Git node as
-// cloud-only: the reader never opens it (the open would download it), its
-// content does not match, and the notice counts it.
+// cloud-only. The reader does not open it, because the open would download it.
+// So its content does not match, and the notice counts it.
 func TestGitDirtyDatalessFileNotRead(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)

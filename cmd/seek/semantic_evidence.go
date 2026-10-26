@@ -12,10 +12,10 @@ import (
 	"github.com/sourcegraph/zoekt/query"
 )
 
-// The evidence of a semantic hit: the pipeline reads the text of each file
-// that semantic retrieval found from the node's shards, checks it against the
-// row, and builds the display result and the model document from the bytes
-// that the vectors describe.
+// The evidence of a semantic hit. The pipeline reads the text of each file
+// that semantic retrieval found from the node's shards. It checks the text
+// against the row, and builds the display result and the model document from
+// the bytes that the vectors describe.
 
 // semanticFileCandidate is one file of a semantic hit: its best row, and once
 // its text is read, its display result and its model document.
@@ -41,9 +41,9 @@ type semanticFileCandidate struct {
 // A file whose shard copy does not match its row (content ID, unit identity)
 // is index damage. openNode then removes the family manifest and opens the
 // node once more from a new capture. evidenceMismatch judges each mismatch
-// first: an edit of a folder file since the walk is a tree change, and a
-// mismatch that the repair did not remove makes openNode rebuild the vectors
-// (nodeRepair); that file gives no vector hit. A shard copy that is a
+// first. An edit of a folder file since the walk is a tree change. A mismatch
+// that the repair did not remove makes openNode rebuild the vectors
+// (nodeRepair), and that file gives no vector hit. A shard copy that is a
 // NOT-INDEXED marker has no text to show, as for a strict search, so that file
 // gives no hit. The candidates must have different paths.
 func readSemanticEvidence(
@@ -129,7 +129,8 @@ const (
 	// walk: a tree change.
 	mismatchChangedFile
 	// mismatchChangedAgain is a folder file that changed again after the
-	// retry's build, as a log or an autosave does: it gives no vector hit.
+	// build that the read serves, as a log or an autosave does. It gives no
+	// vector hit.
 	mismatchChangedAgain
 	// mismatchDamagedRows is a mismatch that the repair or the new capture
 	// did not remove: the vector rows are the damaged side.
@@ -139,15 +140,15 @@ const (
 // evidenceMismatch judges a mismatch for the file at name in the read of
 // attempt. The check cannot tell which side is wrong, so the repair goes in
 // two steps. The first read rebuilds the shards (mismatchDamagedShard), unless
-// a folder file changed since the walk: a folder build reads each file once
-// for Zoekt and once for the vectors, so a save between the two reads gives a
+// a folder file changed since the walk. A folder build reads each file once
+// for Zoekt and once for the vectors. So a save between the two reads gives a
 // mismatch with no damage. A later read that still finds a mismatch on an
-// unchanged file has fresh shards, so the rows are damaged; a Git node has no
-// folder walk, and its files are blobs or the overlay of this capture. A folder
+// unchanged file has fresh shards, so the rows are damaged. A Git node has no
+// folder walk: its files are blobs or the overlay of this capture. A folder
 // file that differs from the published manifest changed again after the
 // build. A folder file also counts as changed again when the walk capture is
-// stale on the first read, or when a later read finds no readable manifest or
-// no manifest entry for it.
+// stale on the first read. The same holds when a later read finds no readable
+// manifest or no manifest entry for it.
 func evidenceMismatch(plan node, name string, attempt int) evidenceMismatchKind {
 	if plan.folder == nil {
 		if attempt == 0 {
@@ -229,9 +230,10 @@ func checkedSemanticCandidate(
 }
 
 // semanticEvidenceFileMatch gives the display result of a semantic hit from
-// the shard copy of its file: the line where the unit starts, with up to
-// contextLines lines on each side. The line has no fragment, because no query
-// term matched it. The result prints Zoekt's repository and language.
+// the shard copy of its file. The result is the line where the unit starts,
+// with up to contextLines lines on each side. The line has no fragment,
+// because no query term matched it. The result prints Zoekt's repository and
+// language.
 func semanticEvidenceFileMatch(
 	file *zoekt.FileMatch,
 	unit semanticUnit,

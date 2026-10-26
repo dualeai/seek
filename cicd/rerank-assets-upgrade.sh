@@ -31,7 +31,8 @@ usearch_linux_amd64_url="${usearch_release}/usearch_linux_amd64_${usearch_versio
 usearch_linux_arm64_url="${usearch_release}/usearch_linux_arm64_${usearch_version}.so"
 
 # The NumKong release libraries hold the vector kernels (semantic_numkong.go).
-# 7.8.4 is the latest release with libraries for the four release targets.
+# Seek pins 7.8.4: its release has a library for each of the four release
+# targets. 7.8.5 has none for three of them.
 # The digests are the ones that the GitHub release gives for each asset:
 # gh api repos/ashvardanian/NumKong/releases/tags/v${numkong_version}
 #   --jq '.assets[]|.name+" "+.digest'

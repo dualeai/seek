@@ -200,10 +200,11 @@ func TestParseGitStatusV2_HeadersOnly(t *testing.T) {
 	}
 }
 
+// TestParseGitStatusV2_BlankLineBetweenHeadersAndEntries puts an empty record
+// between the headers and the entries. Git does not write one, but the parser
+// must skip it and read the entries after it.
 func TestParseGitStatusV2_BlankLineBetweenHeadersAndEntries(t *testing.T) {
-	// With NUL-terminated records, blank lines are not expected, but
-	// the parser should handle entries mixed with headers gracefully.
-	raw := "# branch.oid abc123\x00# branch.head main\x00" +
+	raw := "# branch.oid abc123\x00# branch.head main\x00" + "\x00" +
 		"1 .M N... 100644 100644 100644 abc123 def456 file.go\x00" +
 		"? new.txt\x00"
 	state := parseGitStatusV2(raw)
@@ -275,7 +276,7 @@ func TestStateFile_WriteRemovesTmp(t *testing.T) {
 	}
 	// .state.tmp should not exist after successful atomic write (rename removes
 	// it)
-	if _, err := os.Stat(filepath.Join(dir, stateTmpFile)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dir, ".state.tmp")); !os.IsNotExist(err) {
 		t.Error("expected .state.tmp to not exist after successful write")
 	}
 	// .state should exist
@@ -288,14 +289,14 @@ func TestStateFile_Delete(t *testing.T) {
 	dir := t.TempDir()
 	// Write both files
 	_ = os.WriteFile(filepath.Join(dir, stateFile), []byte("x"), 0o644)
-	_ = os.WriteFile(filepath.Join(dir, stateTmpFile), []byte("y"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, ".state.tmp"), []byte("y"), 0o644)
 
 	deleteStateFiles(dir)
 
 	if _, err := os.Stat(filepath.Join(dir, stateFile)); !os.IsNotExist(err) {
 		t.Error("expected .state to be deleted")
 	}
-	if _, err := os.Stat(filepath.Join(dir, stateTmpFile)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dir, ".state.tmp")); !os.IsNotExist(err) {
 		t.Error("expected .state.tmp to be deleted")
 	}
 }
@@ -476,8 +477,8 @@ func TestStreamDirtyFiles_Parallelism1(t *testing.T) {
 // --- cleanUncommittedShards tests ---
 
 // TestCleanUncommittedShards_RemovesMatching removes the shards, records and
-// temporary shards (a Builder that stopped before its Finish renamed them) of
-// the uncommitted family, and keeps those of another repository.
+// temporary shards of the uncommitted family, and keeps those of another
+// repository. A Builder that stops before its Finish leaves temporary shards.
 func TestCleanUncommittedShards_RemovesMatching(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range []string{
@@ -787,19 +788,6 @@ func TestStreamDirtyFiles_LargeFileNameOnly(t *testing.T) {
 	t.Fatal("expected a name-only document for large.go")
 }
 
-func TestStreamDirtyFiles_ExactlyMaxSize(t *testing.T) {
-	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
-	dir := t.TempDir()
-	// Exactly at the limit — should NOT be skipped (guard is >)
-	data := make([]byte, testDocumentContentLimit)
-	_ = os.WriteFile(filepath.Join(dir, "exact.go"), data, 0o644)
-
-	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"exact.go"}, 1)
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result (exactly max size should be included), got %d", len(results))
-	}
-}
-
 func TestStreamDirtyFiles_JustOverMaxSize(t *testing.T) {
 	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	dir := t.TempDir()
@@ -846,8 +834,8 @@ func TestStateFile_ReadOnlyDir(t *testing.T) {
 }
 
 func TestComputeStateHash_VersionPrefix(t *testing.T) {
-	// Guard against accidental stateVersion changes — bumping the version
-	// invalidates all user caches, so it should be intentional.
+	// Guard against an accidental stateVersion change. A new version
+	// invalidates all user caches, so the change must be intentional.
 	if stateVersion != "v6\x00" {
 		t.Errorf("stateVersion changed unexpectedly: got %q, want %q — update this test if intentional", stateVersion, "v6\x00")
 	}
@@ -877,7 +865,7 @@ func requireGit(tb testing.TB) {
 }
 
 func TestComputeStateHash_LargeInput(t *testing.T) {
-	// 1MB of input — verify hash works and is deterministic
+	// 1 MiB of input: check that the hash works and is deterministic.
 	large := make([]byte, 1024*1024)
 	for i := range large {
 		large[i] = byte(i % 256)
@@ -905,7 +893,7 @@ func TestParseGitStatusV2_OnlyNulBytes(t *testing.T) {
 }
 
 func TestParseGitStatusV2_ShortEntries(t *testing.T) {
-	// Entry exactly 1 byte — should be skipped by len(entry) < 2 guard
+	// An entry of exactly 1 byte: the len(entry) < 2 guard must skip it.
 	raw := "# branch.oid abc\x00" + "1\x00"
 	state := parseGitStatusV2(raw)
 	if len(state.Files) != 0 {
@@ -914,7 +902,7 @@ func TestParseGitStatusV2_ShortEntries(t *testing.T) {
 }
 
 func TestParseGitStatusV2_UnknownEntryType(t *testing.T) {
-	// Entry type 'X' is not handled — should be silently skipped
+	// The parser does not handle entry type 'X', so it must skip the entry.
 	raw := "# branch.oid abc\x00" + "X some unknown entry\x00"
 	state := parseGitStatusV2(raw)
 	if len(state.Files) != 0 {
@@ -942,14 +930,15 @@ func TestParseGitStatusV2_RenameOrigPathNotMisinterpreted(t *testing.T) {
 		"2 R. N... 100644 100644 100644 abc def R100 new.go\x00? suspicious.go\x00" +
 		"? real_untracked.go\x00"
 	state := parseGitStatusV2(raw)
-	// "? suspicious.go" is the origPath of the rename — must be consumed.
-	// Only "new.go" (from rename) and "real_untracked.go" should appear.
+	// "? suspicious.go" is the origPath record of the rename: the parser
+	// consumes it. Only "new.go" (from the rename) and "real_untracked.go"
+	// are files.
 	if len(state.Files) != 2 {
 		t.Fatalf("expected 2 files, got %d: %v", len(state.Files), state.Files)
 	}
 	assertContains(t, state.Files, "new.go")
 	assertContains(t, state.Files, "real_untracked.go")
-	if containsStr(state.Files, "? suspicious.go") {
+	if containsStr(state.Files, "suspicious.go") {
 		t.Error("origPath record was misinterpreted as an untracked file")
 	}
 }
@@ -1135,11 +1124,11 @@ func TestStreamDirtyFiles_DuplicateNames(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// State caching scenarios — tests for post-indexing verification logic
+// State caching
 //
 // The Git build (gitNode.buildLocked, which runIndexingWithCache runs) decides
-// whether it writes the state file after indexing. These tests verify all
-// branches.
+// whether it writes the state file after indexing. These tests check that
+// decision.
 // ---------------------------------------------------------------------------
 
 // TestStateCaching_BothSucceed_StateStable verifies that successful committed
@@ -1164,7 +1153,7 @@ func TestStateCaching_BothSucceed_StateStable(t *testing.T) {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
-	// State file should exist — index is cached
+	// The state file must exist: the index is cached.
 	cached := readStateFile(plan.cacheDir)
 	if cached == "" {
 		t.Fatal("expected state file to be written after successful indexing")
@@ -1363,7 +1352,7 @@ func TestStateCaching_UntouchedDirtyFile(t *testing.T) {
 	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 
-	// Do NOT modify the file — indexing should detect no drift
+	// Do not change the file: indexing must find no drift.
 	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
@@ -1602,7 +1591,7 @@ func TestStateCaching_WithUncommittedFiles_BothSucceed(t *testing.T) {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
-	// Both steps succeeded — state file should be cached
+	// Both steps succeeded, so the state file must be cached.
 	cached := readStateFile(plan.cacheDir)
 	if cached == "" {
 		t.Fatal("expected state file to be written when both indexing steps succeed")
@@ -1696,9 +1685,9 @@ func TestStateCaching_DoubleCheck_SkipsRedundantIndex(t *testing.T) {
 	}
 }
 
-// TestStateCaching_StaleFallback_DoesNotWriteState verifies that when another
-// builder holds the build lock and a usable index exists, runIndexingWithCache
-// skips the build, serves current shards, and does not write state.
+// TestStateCaching_StaleFallback_DoesNotWriteState holds the build lock as
+// another builder, with a usable index. runIndexingWithCache skips the build
+// and writes no state, so the next search builds the change.
 func TestStateCaching_StaleFallback_DoesNotWriteState(t *testing.T) {
 	requireTools(t)
 
@@ -1763,7 +1752,7 @@ func TestStateCaching_StaleFallback_DoesNotWriteState(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// repoStateFingerprint — inode detection tests
+// repoStateFingerprint: inode detection tests
 // ---------------------------------------------------------------------------
 
 // TestRepoStateFingerprint_InodeChange_AtomicWrite verifies that a file
@@ -2161,8 +2150,9 @@ func TestIntegration_AtomicWriteDetected(t *testing.T) {
 	}
 }
 
-// TestIntegration_RapidEdits verifies that multiple rapid edits within the
-// same second are all detected (tests nanosecond mtime + inode together).
+// TestIntegration_RapidEdits makes five quick edits of one dirty file, each of
+// one size and in place: the search after each edit finds it. The nanosecond
+// mtime and the ctime tell the edits apart; the inode does not change.
 func TestIntegration_RapidEdits(t *testing.T) {
 	requireTools(t)
 
@@ -2275,7 +2265,7 @@ func TestStreamDirtyFiles_ParallelismOne(t *testing.T) {
 func TestStreamDirtyFiles_SingleFileExactlyMaxSize(t *testing.T) {
 	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	dir := t.TempDir()
-	// File exactly at testDocumentContentLimit — should be included
+	// A file of exactly testDocumentContentLimit bytes must be included.
 	data := make([]byte, testDocumentContentLimit)
 	for i := range data {
 		data[i] = 'x'
@@ -2376,8 +2366,8 @@ func TestStreamingMemoryBounded(t *testing.T) {
 	documents, check := streamDirtyFilesAsTextIndex(t, t.Context(), dir, files, parallelism)
 	for fc := range documents {
 		// The consumer releases the readSemaphore weight of each fileContent.
-		// In production indexDocuments releases it when Builder.Add returns
-		// (after Finish for a document that fills a shard of its own); the
+		// In production, indexDocuments releases it when Builder.Add returns,
+		// or after Finish for a document that fills a shard of its own. The
 		// test discards each document, so it releases at once.
 		readSemaphore.Release(fc.weight)
 	}
@@ -2481,11 +2471,11 @@ func TestIndexDocuments_WritesSearchableDocuments(t *testing.T) {
 // --- helpers ---
 
 // streamDirtyFilesAsTextIndex starts streamDirtyFiles with the failure rule
-// that the text index build gives it (buildUncommittedStage): a file with a
+// that the text index build gives it (buildUncommittedStage). A file with a
 // read error that may pass is kept by name, and EMFILE or ENFILE stops the
-// read. The caller must drain the channel or cancel ctx, and then call check.
-// check fails the test when the read stopped on an error or kept a file by
-// name after one.
+// read. The caller must drain the channel or cancel ctx, then call check.
+// check fails the test when the read stopped on an error. It also fails when
+// the read kept a file by name after an error.
 func streamDirtyFilesAsTextIndex(
 	tb testing.TB,
 	ctx context.Context,
@@ -2610,8 +2600,8 @@ func getInode(t *testing.T, path string) uint64 {
 
 // TestWriteSharedCacheFileConcurrentWriters writes one record from 800
 // goroutines (16 values, 50 writers each), as processes with a shared lock
-// do: every write succeeds, the record is one writer's whole value, and no
-// temp file stays.
+// do. Every write succeeds, the record is the whole value of one writer, and
+// no temp file stays.
 func TestWriteSharedCacheFileConcurrentWriters(t *testing.T) {
 	dir := t.TempDir()
 	values := make(map[string]bool, 16)
@@ -2641,11 +2631,12 @@ func TestWriteSharedCacheFileConcurrentWriters(t *testing.T) {
 }
 
 // TestPartialPrebuildKeepsADamagedFamilyUnnamed gives a Git node a dirty file
-// that fails with EIO (kept by name: no state), removes the record that
-// tombstones the first copy of u2.go, and builds with an EMFILE in the
-// prebuild: the partial build leaves the live uncommitted family as it was,
-// and its record must not name that damaged family. So the next builds
-// rebuild it, and the replaced first copy is not found.
+// that fails with EIO, so the build keeps it by name and writes no state. The
+// test removes the record that tombstones the first copy of u2.go. Then it
+// builds with an EMFILE in the prebuild. The partial build leaves the live
+// uncommitted family as it was, and the family manifest must not name that
+// damaged family. So the next builds rebuild it, and the search does not find
+// the replaced first copy.
 func TestPartialPrebuildKeepsADamagedFamilyUnnamed(t *testing.T) {
 	requireTools(t)
 	swapShardMaxForTest(t, 1024)
@@ -2701,9 +2692,9 @@ func TestPartialPrebuildKeepsADamagedFamilyUnnamed(t *testing.T) {
 }
 
 // TestCleanBuildLeavesNoBuildDirectory builds a Git node with a dirty file,
-// removes the file, and builds again: the build removes the uncommitted
-// family through a build directory, which goes after the publish lock, so no
-// build directory and no moved shard stays in the index directory.
+// removes the file, and builds again. The build removes the uncommitted
+// family through a build directory, which it removes after the publish lock.
+// So no build directory and no moved shard stays in the index directory.
 func TestCleanBuildLeavesNoBuildDirectory(t *testing.T) {
 	requireTools(t)
 	dir := initGitRepo(t, "app.go", "package main\n// zqcleandirapp\n")

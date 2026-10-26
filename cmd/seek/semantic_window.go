@@ -7,14 +7,14 @@ import (
 	"unicode/utf8"
 )
 
-// windowSemanticUnits splits each unit into rows of at most one model input:
-// every 128-token window of every unit is a row, so every byte reaches a
+// windowSemanticUnits splits each unit into rows of at most one model input.
+// Every 128-token window of every unit is a row, so every byte reaches a
 // vector. A window holds the tokens of one unit only. Each window repeats the
-// unit's header (semanticWindowHeader), and its row keeps the byte span of its
-// own body tokens, so the final model scores the window that the vector found:
-// a unit's score is its best window. A window ends at a line or word start
-// when one is in its second half. base is the model path base of the units'
-// node (modelPathBase).
+// unit's header (semanticWindowHeader). Its row keeps the byte span of its own
+// body tokens, so the final model scores the window that the vector found. A
+// unit's score is its best window. A window ends at a line or word start when
+// one is in its second half. base is the model path base of the units' node
+// (modelPathBase).
 func windowSemanticUnits(
 	ctx context.Context,
 	tokenizer *lateOnTokenizer,
@@ -48,6 +48,8 @@ func windowSemanticUnits(
 	return rows, nil
 }
 
+// semanticWindow is one window of a unit: the byte span [start, end) of its
+// body in the unit text, and its model input.
 type semanticWindow struct {
 	start int
 	end   int
@@ -83,16 +85,17 @@ func semanticUnitWindows(tokenizer *lateOnTokenizer, unit semanticUnit, base str
 	// scorer's truncation.
 	contentBudget := lateOnSequenceLength - prefixEnd - 1
 	metadataTokens := min(bodyStart-prefixEnd, contentBudget/4)
-	// The final scorer tokenizes a window's text again: a word cut at the
-	// window edge can take one more token, so the window keeps spare slots
+	// The final scorer tokenizes a window's text again. A word cut at the
+	// window edge can take one more token. So the window keeps spare slots,
 	// and the final model sees the whole window.
 	room := contentBudget - metadataTokens - semanticWindowSpareTokens
 	if room <= 0 {
 		return nil, fmt.Errorf("semantic window of %q has no room for content", unit.path)
 	}
-	// The header keeps its first metadataTokens tokens: when the first token
-	// it drops starts at or before the newline that ends the path line, the
-	// key does not hold the whole line, so a longer tail can share it.
+	// The header keeps its first metadataTokens tokens. The first token that
+	// it drops can start at or before the newline that ends the path line.
+	// Then the key does not hold the whole line, so a longer tail can share
+	// it.
 	pathCut := false
 	if kept := prefixEnd + metadataTokens; unit.path != "" && kept < bodyStart {
 		pathLine := sanitizeLateOnTokenizerInput("path: " + rerankPathTail(semanticModelPath(base, unit.path)))
@@ -158,9 +161,10 @@ func semanticUnitWindows(tokenizer *lateOnTokenizer, unit semanticUnit, base str
 // scorer's tokenization of its text.
 const semanticWindowSpareTokens = 2
 
-// semanticWindowCut picks the end of a window that would end at last: the
-// latest line start in the window's second half, else the latest word start,
-// else the latest valid cut; a window with no valid cut ends at last.
+// semanticWindowCut picks the end of a window that would end at last. It
+// takes the latest line start in the window's second half, else the latest
+// word start, else the latest valid cut. A window with no valid cut ends at
+// last.
 func semanticWindowCut(first, last, room int, valid, lineStart, wordStart func(int) bool) int {
 	for _, kind := range [...]func(int) bool{lineStart, wordStart, func(int) bool { return true }} {
 		for cut := last; cut > first+room/2; cut-- {
@@ -177,10 +181,10 @@ func isSemanticSpace(b byte) bool {
 }
 
 // semanticWindowHeader is the metadata that the model reads before each
-// window: the tail of the unit's model path (semanticModelPath with base),
-// Zoekt's language of the file (semanticFileLanguage), and the unit's symbol.
-// The final scorer's document of a semantic hit has the same lines, as a
-// strict hit does (checkedSemanticCandidate).
+// window. It holds the tail of the unit's model path (semanticModelPath with
+// base), Zoekt's language of the file (semanticFileLanguage), and the unit's
+// symbol. The final scorer's document of a semantic hit has the same lines,
+// as a strict hit does (checkedSemanticCandidate).
 func semanticWindowHeader(unit semanticUnit, base string) string {
 	var header strings.Builder
 	if unit.path != "" {

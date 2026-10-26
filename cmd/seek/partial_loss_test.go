@@ -10,16 +10,16 @@ package main
 //   - the first search repairs the damage; and
 //   - two later searches do not change the repaired shard family.
 //
-// Counting documents is not enough. A stale .meta keeps the document count
-// constant while serving content that exists nowhere in the tree, and a byte
-// flip keeps both count and size constant while hiding a live document. Only
-// a marker set proves what a user would actually get back.
+// A document count is not enough. A stale .meta keeps the document count and
+// serves content that exists nowhere in the tree. A byte flip keeps both the
+// count and the size and hides a live document. Only a marker set proves
+// what a user gets back.
 //
-// Isolation. Every in-process test here calls planGitTestCorpus /
-// planFolderTestCorpus, which call setTestUserCache, which t.Setenv HOME,
-// XDG_CACHE_HOME and an empty SEEK_CACHE_DIR. The process-level test gives
-// each CLI process its own SEEK_CACHE_DIR. Each test therefore owns a private
-// cache root, and t.Setenv forbids t.Parallel, so rows never race for a
+// Isolation. Every in-process test here calls planGitTestCorpus or
+// planFolderTestCorpus. These call setTestUserCache, which sets HOME,
+// XDG_CACHE_HOME and an empty SEEK_CACHE_DIR with t.Setenv. The process-level
+// test gives each CLI process its own SEEK_CACHE_DIR. So each test owns a
+// private cache root. t.Setenv forbids t.Parallel, so rows never race for a
 // corpus.
 
 import (
@@ -246,9 +246,9 @@ func plFamilyGlob(t *testing.T, indexDir, pattern string) []string {
 	return out
 }
 
-// shardCarrying returns the committed shard whose bytes contain token. Shard
-// numbering is a zoekt implementation detail, so rows address shards by the
-// marker they hold: "the shard that holds PL_MARK_1", never "shard 4".
+// shardCarrying returns the committed shard whose bytes contain token. Zoekt
+// owns the shard numbers, so rows name a shard by the marker that it holds:
+// "the shard that holds PL_MARK_1", never "shard 4".
 func shardCarrying(t *testing.T, indexDir, token string) string {
 	t.Helper()
 	for _, p := range committedShardPaths(t, indexDir) {
@@ -264,8 +264,8 @@ func shardCarrying(t *testing.T, indexDir, token string) string {
 	return ""
 }
 
-// plFamilySnapshot renders the family as a stable "name=size" list, used to
-// prove the build stopped moving once it converged.
+// plFamilySnapshot gives the family as a sorted "name=size" list, so a test
+// can show that the build no longer changes it after the repair.
 func plFamilySnapshot(t *testing.T, indexDir string) string {
 	t.Helper()
 	var parts []string
@@ -355,9 +355,9 @@ func plRemove(t *testing.T, paths ...string) {
 type plRow struct {
 	// name is the subtest name; keep it -run selectable.
 	name string
-	// ownFixture marks a row that mutates the repository (a commit or an
-	// untracked file). restorePristine rewinds only the cache, so such a row
-	// gets a private repository and cache instead of the shared fixture.
+	// ownFixture marks a row that changes the repository (a commit or an
+	// untracked file). restorePristine puts back only the cache. So such a
+	// row gets a private repository and cache, not the shared fixture.
 	ownFixture bool
 	// damage mutates the corpus on disk between two seek invocations, exactly
 	// as an external process would.
@@ -385,7 +385,7 @@ func partialLossRows() []plRow {
 			},
 		},
 		{
-			name: "incident_shape_all_but_shard_zero",
+			name: "all_but_shard_zero_deleted",
 			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
 				keep := shardCarrying(t, c.plan.indexDir, "PL_SEED")
 				for _, p := range committedShardPaths(t, c.plan.indexDir) {
@@ -565,8 +565,8 @@ func partialLossRows() []plRow {
 			},
 		},
 		{
-			// A delta family that lost its last shard must not stay current:
-			// the first shard tombstones the edited file, so the rest of the
+			// A delta family that lost its last shard must not stay current.
+			// The first shard tombstones the edited file, so the rest of the
 			// family hides that file with no warning.
 			name:       "uncommitted_trailing_shard_deleted",
 			ownFixture: true,
@@ -711,8 +711,8 @@ func TestPartialLoss_FolderFamily(t *testing.T) {
 
 	assertAll := func(label string) {
 		t.Helper()
-		// One refresh — the healing invocation — then read the family it
-		// published, exactly as the git matrix does.
+		// Run one refresh (the healing invocation). Then read the family that
+		// it published, exactly as the git matrix does.
 		if st, err := ensureFolderCorpusFresh(ctx, plan); err != nil || st != corpusSearchable {
 			t.Errorf("%s: folder refresh: st=%v err=%v", label, st, err)
 			return
@@ -798,7 +798,7 @@ func TestPartialLoss_ContentCorruptionIsNotDetected(t *testing.T) {
 			"If per-shard content hashes landed, move this row into "+
 			"partialLossRows and delete this test.", files)
 	}
-	// Documented limit: a live document silently disappeared, exit 0, no
+	// Documented limit: a live document disappeared with exit 0 and no
 	// warning, stable across searches.
 	if files, err := c.seekOnce(ctx, token); err != nil || len(files) != 0 {
 		t.Fatalf("behavior changed on the second search: files=%v err=%v", files, err)
@@ -831,8 +831,8 @@ func plSoleCorpusIndexDir(t *testing.T, cacheRoot string) string {
 }
 
 // TestPartialLoss_RouterContractOnRealProcess checks the process-level result
-// after a shard loss: exit 0, the restored match on stdout, no repair notice
-// on stdout, and the same result on the next run.
+// after a shard loss. It wants exit 0, the restored match on stdout, no
+// repair notice on stdout, and the same result on the next run.
 //
 // runCLIProcessWithCache starts the test binary as the CLI with an isolated
 // SEEK_CACHE_DIR. This lets the test check the exit code and output streams.
@@ -840,7 +840,6 @@ func plSoleCorpusIndexDir(t *testing.T, cacheRoot string) string {
 // The CLI also calls runOpportunisticGC after the search. The isolated cache
 // and .last-gc throttle keep that call inside the test fixture.
 func TestPartialLoss_RouterContractOnRealProcess(t *testing.T) {
-
 	requireTools(t)
 	cacheDir := t.TempDir()
 	repo := initGitRepo(t, "app.go", "package main\n// PL_CLI_BASE\n")

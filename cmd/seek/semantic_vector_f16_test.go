@@ -13,6 +13,10 @@ import (
 // semanticF16One is the binary16 code of 1.
 const semanticF16One = 0x3c00
 
+// testSemanticGoldenEmbedding returns the row of
+// TestSemanticF16LittleEndianGolden. Fine vector 0 is (-0.5, 0.5, sqrt(0.5)).
+// Fine vector c, for c from 1 to 18, is 1 at dimension c. Fine vector 19 is -1
+// at dimension 47. The coarse vectors copy the first fine vectors.
 func testSemanticGoldenEmbedding() semanticUnitEmbedding {
 	var embedding semanticUnitEmbedding
 	embedding.fine[0] = semanticVector{0: -0.5, 1: 0.5, 2: float32(math.Sqrt(0.5))}
@@ -253,7 +257,7 @@ func TestSemanticF16NormToleranceCoversRounding(t *testing.T) {
 	}
 
 	// 16 components of 0.25 * (1 + 2^-11 + 1e-6) have a squared norm within
-	// 0.001 of 1, and each rounds up to 0.25 * (1 + 2^-10).
+	// 0.001 of 1. Each rounds up to 0.25 * (1 + 2^-10).
 	var near semanticVector
 	for dimension := range 16 {
 		near[dimension] = float32(0.25 * (1 + math.Ldexp(1, -11) + 1e-6))

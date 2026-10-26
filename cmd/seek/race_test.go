@@ -16,21 +16,12 @@ import (
 	"time"
 )
 
-// ===========================================================================
-// Regression tests
-//
-// These tests verify that the shard swap and LOCK_SH search protection keep
-// search results stable across normal reindex boundaries.
-// ===========================================================================
+// The tests of this file check that the shard swap and the shared read lock
+// (LOCK_SH) keep search results stable while a node builds again.
 
-// ---------------------------------------------------------------------------
-// Locked shard swap: no gap during re-indexing
-//
-// Planned Git corpus search refreshes dirty content through the normal
-// freshness path before reading Zoekt shards, so there is no visible gap where
-// the old uncommitted marker disappears without the new one being searchable.
-// ---------------------------------------------------------------------------
-
+// TestFix_NoShardGapDuringReindexing edits a dirty file twice. A search of a
+// Git node refreshes the dirty content before it reads the shards. So each
+// search finds the new marker, and the old marker is gone.
 func TestFix_NoShardGapDuringReindexing(t *testing.T) {
 	requireTools(t)
 
@@ -73,19 +64,16 @@ func TestFix_NoShardGapDuringReindexing(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// acquireReadLock polls until LOCK_EX is released
-//
-// acquireReadLock is the lock primitive of every node read (openNodeRead).
-// The NB shared lock fails while any LOCK_EX is held, so a searcher waits for
-// an active publish (acquirePublishLock) to end before it reads shards.
-// ---------------------------------------------------------------------------
-
+// TestFix_SharedLockBlocksSearchDuringIndexing holds LOCK_EX while
+// acquireReadLock runs: the read lock waits until LOCK_EX is free.
+// acquireReadLock is the lock of every node read (openNodeRead). Its
+// non-blocking shared lock fails while a LOCK_EX is held, so a search waits
+// for a publish (acquirePublishLock) to end before it reads shards.
 func TestFix_SharedLockBlocksSearchDuringIndexing(t *testing.T) {
 	lockDir := t.TempDir()
 	lockPath := filepath.Join(lockDir, "test.lock")
 
-	// Acquire LOCK_EX (simulating an indexer)
+	// Take LOCK_EX, as a publish does.
 	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		t.Fatal(err)
@@ -98,7 +86,7 @@ func TestFix_SharedLockBlocksSearchDuringIndexing(t *testing.T) {
 	var released, acquiredAfterRelease atomic.Bool
 	done := make(chan error, 1)
 
-	// Goroutine tries to acquire shared lock — polls until LOCK_EX released
+	// The reader polls for LOCK_SH until LOCK_EX is free.
 	go func() {
 		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 		if err != nil {
@@ -136,13 +124,10 @@ func TestFix_SharedLockBlocksSearchDuringIndexing(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Concurrent search and reindex stress, with LOCK_SH protection
-//
-// Searches through the planned-corpus boundary while lower-level reindexing
-// updates shards and holds locks.
-// ---------------------------------------------------------------------------
-
+// TestFix_ConcurrentSearchDuringReindex_Stress runs 20 searches of a Git node
+// while a writer edits 20 files and builds the node after each edit. Each
+// search must find the committed marker with no error. At the end, the last
+// dirty marker is searchable.
 func TestFix_ConcurrentSearchDuringReindex_Stress(t *testing.T) {
 	requireTools(t)
 
@@ -378,10 +363,10 @@ func readPublishFIFO(t *testing.T, path string, built chan error) string {
 // TestDescriptionReadDuringRepublish_Stress runs description reads in 8
 // readers while commits republish the committed family, one publish per
 // commit. Every read must find the strict hit, a committed file. The test
-// model makes every row a scan hit, so target.go and dirty.go, which hold no
-// query word, are the scan hits of the base and the overlay. A read that
-// binds vectors binds the base and the overlay of one state, so it finds both
-// scan hits. A read that meets a peer's build reads text only, with neither.
+// model makes every row a scan hit. target.go and dirty.go hold no query word:
+// they are the scan hits of the base and the overlay. A read that binds
+// vectors binds the base and the overlay of one state, so it finds both scan
+// hits. A read that meets a peer's build reads text only, with neither.
 // A read that sees the state move (errGitIndexStateChanged) is counted, not
 // failed. Each reader stops after 2 reads, so a publish that waits for the
 // readers runs.
@@ -392,8 +377,8 @@ func readPublishFIFO(t *testing.T, path string, built chan error) string {
 // which its debug line shows. A read whose prepare builds the node waits to
 // publish instead, so the test starts two reads. A read that does not wait
 // reads the torn family and finds no committed file. The test fails when that
-// wait is missing or no read found both scan hits. 8 commits keep the run near
-// 20 s with -race: each publish builds vectors.
+// wait is missing or no read found both scan hits. Each publish builds
+// vectors, so 8 commits keep the run near 20 s with -race.
 func TestDescriptionReadDuringRepublish_Stress(t *testing.T) {
 	requireTools(t)
 	dir := initGitRepo(t, "stable.go", "package main\n// zqstress anchor committed\n")
@@ -563,8 +548,8 @@ func TestGC_SkipsCorpusWithBuildInProgress(t *testing.T) {
 }
 
 // TestEvictionDuringBuildPerKind evicts the node's cache directory during its
-// build, as gc does (a rename to a trash name), and checks the result for
-// each node kind. The test holds a lock that the build waits for, evicts the
+// build, as gc does (a rename to a trash name). It checks the result for each
+// node kind. The test holds a lock that the build waits for, evicts the
 // node when the wait writes its debug line, then frees the lock. Git: the
 // first search of the node waits for the build lock. The build then makes the
 // index directory again, and its publish sees the eviction: the build returns

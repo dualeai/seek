@@ -10,13 +10,13 @@ import (
 	"testing"
 )
 
-// planSynthCorpus plans root as a folder node with planFolderCorpus, checks
-// the plan, and then gives it new empty cache and index directories, so each
-// test starts with no index.
+// planSynthCorpus plans root as a folder node with planFolderCorpus and checks
+// the plan. Then it gives the plan new empty cache and index directories, so
+// each test starts with no index.
 //
-// The checks find a folder-plan regression (an empty root, an empty cache or
-// index directory, or one directory for both) that a caller that uses the plan
-// as an opaque value would not see.
+// The checks find a defect of the folder plan that a caller would not see.
+// The defects are an empty root, an empty cache or index directory, and one
+// directory for both.
 func planSynthCorpus(t *testing.T, root string) node {
 	t.Helper()
 	info, err := os.Lstat(root)
@@ -102,10 +102,11 @@ func writeRandomFolder(t *testing.T, total, fileSize int64) string {
 	return root
 }
 
-// writeSparseFile creates path with size bytes. It writes a text prefix past
-// the readers' binary probe, so readers read the file fully, and uses
-// os.Truncate for the rest, which uses almost no disk space. Tests that need
-// large files with little I/O use it: the property, pressure and soak tests.
+// writeSparseFile creates path with size bytes. It writes text in the first
+// 2*binaryProbeBytes bytes, past the binary probe of the readers, so the
+// readers read the whole file. os.Truncate makes the rest, which uses almost no
+// disk space. The property, pressure and soak tests use it for large files with
+// little I/O.
 func writeSparseFile(t *testing.T, path string, size int64) {
 	t.Helper()
 	prefix := bytes.Repeat([]byte("x"), int(min(size, 2*binaryProbeBytes)))

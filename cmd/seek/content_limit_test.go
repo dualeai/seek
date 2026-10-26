@@ -39,9 +39,9 @@ func swapDocumentContentLimitForTest(tb testing.TB, limit int64) {
 	swapForTest(tb, &documentContentLimit, limit)
 }
 
-// TestRun_ContentLimitChangeRebuildsIndex checks that a cached index built
-// under one content limit is not reused under another: the second search must
-// see the file's content, which the first index held by name only.
+// TestRun_ContentLimitChangeRebuildsIndex checks that a search does not reuse
+// a cached index built under another content limit. The first index holds the
+// file by name only; the second search must find its content.
 func TestRun_ContentLimitChangeRebuildsIndex(t *testing.T) {
 	requireTools(t)
 	const needle = "content_limit_rebuild_marker"

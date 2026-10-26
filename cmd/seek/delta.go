@@ -11,9 +11,9 @@ import (
 // deltaShardMin is the smallest shard target of a delta Builder. Each shard
 // starts its own ctags process and allocates its own postings, so a smaller
 // shard costs more time than it saves. Fewer shards also keep a family below
-// the delta shard caps for longer. Measured on an 11 MB folder delta with 18
-// CPUs: a 256 KiB floor was not faster and made 1.8 times the shards, and
-// 2 MiB and 4 MiB floors were 2 and 3 times slower than 1 MiB.
+// the delta shard caps for longer. On an 11 MB folder delta with 18 CPUs, a
+// 256 KiB floor was not faster and made 1.8 times the shards. Floors of 2 MiB
+// and 4 MiB were 2 and 3 times slower than 1 MiB.
 const deltaShardMin = 1 << 20 // 1 MiB
 
 // deltaShardMax returns the shard target of a delta Builder: the payload of
@@ -22,8 +22,8 @@ const deltaShardMin = 1 << 20 // 1 MiB
 // commit took 3.7 s as one 10 MB shard, and 1.2 to 1.5 s with this split. The
 // target is at least deltaShardMin and at most shardMax, the target of a full
 // build. The upper bound keeps a shard with no isolated document far below the
-// Zoekt shard format (guardWrappedShards). Zoekt does not hash ShardMax, so a
-// delta stays compatible with its base.
+// limit of the Zoekt shard format (guardWrappedShards). Zoekt does not hash
+// ShardMax, so a delta stays compatible with its base.
 func deltaShardMax(files []fileContent, parallelism int) int {
 	payload := 0
 	for _, doc := range files {
@@ -40,24 +40,24 @@ var errDeltaCompaction = errors.New("deltas tombstoned as many bytes as the fami
 // delta: tombstoned reaches both live and one full shard (shardMax).
 // tombstoned is the content bytes that deltas tombstoned since the last full
 // build, this delta included; live is the content bytes of the live files.
-// Both count the bytes that the shard documents hold (heldContentBytes): a
+// Both count the bytes that the shard documents hold (heldContentBytes). A
 // file kept by name only counts as its NOT-INDEXED marker, because a search
 // reads only that marker. A delta adds tombstones but never removes a
 // document, and a delta of removals only adds no shard, so the shard caps
 // never stop it. Without this rule, dead documents stay in every shard and
 // every .meta, and each search reads them. After a removal of 36,000 of 40,000
 // files (140 MB of dead content), a warm search took 63 ms and 155 MiB. After
-// the full build that this rule starts, it took 47 ms and 55 MiB, and the
-// index shrank from 396 MB to 38 MB; the full build took about 4 s once. That
-// is about 0.1 ms per dead MB, so less than one shard of dead content costs a
-// search less than about 1 ms, and a delta of a small family stays a delta.
+// the full build that this rule starts, it took 47 ms and 55 MiB. The index
+// shrank from 396 MB to 38 MB, and the full build took about 4 s once. That
+// is about 0.1 ms per dead MB. So less than one shard of dead content costs a
+// search less than about 1 ms. A delta of a small family stays a delta.
 func deltaNeedsCompaction(tombstoned, live int64) bool {
 	return tombstoned >= max(live, int64(shardMax))
 }
 
 // notIndexedMarkerBytes is the length of the content that Zoekt stores for a
-// document that it keeps by name only: "NOT-INDEXED: " and the explanation of
-// reason (zoekt/index/document.go, SkipReason.explanation).
+// document that it keeps by name only. That content is "NOT-INDEXED: " and
+// the explanation of reason (zoekt/index/document.go, SkipReason.explanation).
 func notIndexedMarkerBytes(reason index.SkipReason) int64 {
 	explanation := "unknown skip reason"
 	switch reason {
@@ -75,10 +75,10 @@ func notIndexedMarkerBytes(reason index.SkipReason) int64 {
 
 // unreadFileMarker is the marker value of a file that a delta has not read
 // yet. Such a file counts at an upper bound of its shard bytes: its size or
-// the largest marker (maxNotIndexedMarkerBytes), whichever is larger. The live
-// bytes before the reads are then never below the exact ones, so the rule of
-// deltaNeedsCompaction never fires before the reads when the read bytes would
-// keep a delta. A manifest never stores this value.
+// the largest marker (maxNotIndexedMarkerBytes), whichever is larger. So the
+// live bytes before the reads are never below the exact ones. The rule of
+// deltaNeedsCompaction then never fires before the reads when the read bytes
+// would keep a delta. A manifest never stores this value.
 const unreadFileMarker int64 = -1
 
 // maxNotIndexedMarkerBytes is the largest marker that Zoekt stores for a
@@ -86,11 +86,11 @@ const unreadFileMarker int64 = -1
 var maxNotIndexedMarkerBytes = notIndexedMarkerBytes(index.SkipReasonTooLarge)
 
 // nameOnlyMarkerBytes returns the bytes of the marker that the shard document
-// of doc holds instead of its content, or zero when the shard holds the
-// content. The skip reason comes from the reader, or from Zoekt's own check
-// that Builder.Add applies: content with a NUL byte, or of one or two bytes.
-// A binary file of any size then counts as its marker in deltaNeedsCompaction,
-// because a search reads only that marker.
+// of doc holds in place of its content. It returns zero when the shard holds
+// the content. The skip reason comes from the reader, or from Zoekt's own
+// check that Builder.Add applies. That check catches content with a NUL byte,
+// or of one or two bytes. A binary file of any size then counts as its marker
+// in deltaNeedsCompaction, because a search reads only that marker.
 func nameOnlyMarkerBytes(doc fileContent) int64 {
 	reason := doc.skipReason
 	if reason == index.SkipReasonNone {
@@ -126,10 +126,10 @@ func indexDeltaDocuments(
 	return indexDeltaDocumentsWithRepository(indexDir, repository, files, parallelism, changedPaths)
 }
 
-// indexDeltaDocumentsWithRepository writes fresh content and tombstones for
-// changedPaths to one delta Builder, and returns true once it has created the
-// Builder. The Builder builds up to parallelism shards at the same time, as a
-// full build does, with the shard target of deltaShardMax, which states the
+// indexDeltaDocumentsWithRepository writes new content and tombstones for
+// changedPaths to one delta Builder, and returns true once it has made the
+// Builder. As in a full build, the Builder builds up to parallelism shards at
+// the same time. Its shard target comes from deltaShardMax, which states the
 // measured gain of one shard job per CPU.
 //
 // files can be empty: Zoekt accepts a delta with no documents and then writes
@@ -194,8 +194,8 @@ func indexDeltaDocumentsWithRepository(
 		return err
 	})
 	if err != nil {
-		// NewBuilder failed before any Add: Zoekt holds no Content refs,
-		// safe to release immediately.
+		// NewBuilder failed before any Add, so Zoekt holds no Content
+		// reference, and the weights can go now.
 		releaseFileContentWeights(files)
 		return false, fmt.Errorf("create delta builder: %w", err)
 	}
@@ -214,15 +214,15 @@ func indexDeltaDocumentsWithRepository(
 	finishErr := zoektShardCall(builder.Finish)
 	if finishErr != nil {
 		// A Finish that stops part way, as on a damaged record, leaves its
-		// shards under their temporary names; a delta can write into the
-		// live family (the uncommitted one), so they go now.
+		// shards under their temporary names. A delta can write into the live
+		// family (the uncommitted one), so they go now.
 		removeRepositoryShardTemps(indexDir, repository.Name)
 	}
 	if addErr == nil && finishErr == nil {
 		finishErr = guardWrappedShards(opts, firstShard, isolated, later)
 	}
 
-	// Zoekt and the shard guard no longer read the document content, so
+	// Zoekt and the shard guard are done with the document content, so
 	// release the reserved readSemaphore weight here.
 	releaseFileContentWeights(files)
 

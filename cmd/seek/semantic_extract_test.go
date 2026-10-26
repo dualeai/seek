@@ -131,10 +131,10 @@ func TestSemanticBuildSkipsBinaryContent(t *testing.T) {
 	}
 }
 
-// TestSemanticBuildSkipsZoektNameOnlyContent builds vectors for files at
-// Zoekt's content limits: a file of 1 or 2 bytes and a file with a NUL byte
-// past its start keep only their names in Zoekt, so they get no rows. A file
-// of 3 bytes gets rows.
+// TestSemanticBuildSkipsZoektNameOnlyContent builds vectors for files at the
+// content limits of Zoekt. Zoekt keeps only the name of a file of 1 or 2
+// bytes, and of a file with a NUL byte past its start. These files get no
+// rows. A file of 3 bytes gets rows.
 func TestSemanticBuildSkipsZoektNameOnlyContent(t *testing.T) {
 	units := buildSemanticTestUnits(t, map[string][]byte{
 		"one.txt":   []byte("x"),

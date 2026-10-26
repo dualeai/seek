@@ -15,6 +15,9 @@ import (
 	"github.com/sourcegraph/zoekt/query"
 )
 
+// TestPlanRerankQuery plans a plain three-word description. The model reads
+// the whole text, the plan keeps no filter, and relaxed retrieval is an or of
+// the three words as content atoms.
 func TestPlanRerankQuery(t *testing.T) {
 	raw, _, err := parseSearchQueryForms("Handle shell completion")
 	if err != nil {
@@ -46,6 +49,9 @@ func TestPlanRerankQuery(t *testing.T) {
 	}
 }
 
+// TestPlanRerankQueryAcceptsPlainProgrammingName plans descriptions that hold
+// programming names such as from_json, operator[], at() and std::vector. The
+// model reads each description whole.
 func TestPlanRerankQueryAcceptsPlainProgrammingName(t *testing.T) {
 	for _, pattern := range []string{
 		"how from_json populates a custom C++ type from JSON",
@@ -169,6 +175,9 @@ func TestPlanRerankQueryAcceptsFileAndLanguageFilters(t *testing.T) {
 	}
 }
 
+// TestPlanRerankQueryUsesZoektNormalizedTree plans spellings that Zoekt's
+// parser normalizes: the f: alias, case:, regex: and parentheses. Each plan
+// gives the model "alpha beta" and keeps the file filter.
 func TestPlanRerankQueryUsesZoektNormalizedTree(t *testing.T) {
 	for _, pattern := range []string{
 		"alpha beta f:go",
@@ -206,9 +215,9 @@ func TestPlainDescriptionFallbackRejectsMalformedSyntax(t *testing.T) {
 	}
 }
 
-// TestPlanRerankQueryRejectsSyntax plans queries that give the model no text:
-// one that matches nothing, one of a result type other than files, negations
-// only, and punctuation only. They keep strict ranking.
+// TestPlanRerankQueryRejectsSyntax plans queries that give the model no text.
+// One matches nothing, one asks for a result type other than files, one holds
+// negations only, and one holds punctuation only. They keep strict ranking.
 func TestPlanRerankQueryRejectsSyntax(t *testing.T) {
 	tests := []string{
 		"alpha beta lang:definitely-not-a-language",
@@ -230,9 +239,9 @@ func TestPlanRerankQueryRejectsSyntax(t *testing.T) {
 }
 
 // TestPlanRerankQueryEveryShapeUsesTheModel plans one word, a phrase, an
-// identifier, filters, an or of descriptions and punctuation: each gives the
-// model its description atoms in query order, and a query of filters only
-// gives it the text of its positive patterns.
+// identifier, filters, an or of descriptions and punctuation. Each gives the
+// model its description atoms in query order. A query of filters only gives
+// the model the text of its positive patterns.
 func TestPlanRerankQueryEveryShapeUsesTheModel(t *testing.T) {
 	for pattern, model := range map[string]string{
 		"single":                       "single",
@@ -262,10 +271,11 @@ func TestPlanRerankQueryEveryShapeUsesTheModel(t *testing.T) {
 }
 
 // TestPlanRerankQueryKeepsZoektFiltersOutOfModelText plans descriptions with
-// filters other than a positive lang: or file: (a negated language, sym:,
-// content:, repo:, and an or group): the model reads only the description,
-// and the plan keeps each filter for the per-node Zoekt mask, which applies
-// it to semantic retrieval (TestLanguageFilterKeepsTheVectorHitsOfThatLanguage,
+// filters other than a positive lang: or file:. These are a negated language,
+// sym:, content:, repo:, and an or group. The model reads only the
+// description. The plan keeps each filter for the per-node Zoekt mask, which
+// applies it to semantic retrieval
+// (TestLanguageFilterKeepsTheVectorHitsOfThatLanguage,
 // TestPassThroughAtomMasksSemantic).
 func TestPlanRerankQueryKeepsZoektFiltersOutOfModelText(t *testing.T) {
 	for _, pattern := range []string{
@@ -333,8 +343,8 @@ func TestRerankModelSearchConfigClearsDisplayLimitsAndAddsInternalContext(t *tes
 }
 
 // TestRunRerankAcceptanceWithoutStrictResults searches two folders where no
-// file holds both words: a relaxed match alone is a rank signal, not a
-// candidate, so the search has no match and the model scores nothing. The
+// file holds both words. A relaxed match alone is a rank signal, not a
+// candidate. So the search has no match, and the model scores nothing. The
 // build fails on purpose, so no vector exists.
 func TestRunRerankAcceptanceWithoutStrictResults(t *testing.T) {
 	requireTools(t)
@@ -351,10 +361,10 @@ func TestRunRerankAcceptanceWithoutStrictResults(t *testing.T) {
 	}
 }
 
-// TestRunRerankStrictEvidenceContract searches a strict all-word file and a
-// relaxed-only file: the strict file is admitted and model-scored, the
-// relaxed-only file is no candidate. The build fails on purpose, so no vector
-// exists.
+// TestRunRerankStrictEvidenceContract searches a file that holds both words
+// and a file that holds one. The search prints the first file, and the model
+// scores it. The second file is no candidate. The build fails on purpose, so
+// no vector exists.
 func TestRunRerankStrictEvidenceContract(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -373,6 +383,10 @@ func TestRunRerankStrictEvidenceContract(t *testing.T) {
 	}
 }
 
+// TestNewRerankDocumentUsesBestMatchAndThreeLineContext builds the model
+// document of a file with two matches. The document holds the best match with
+// three context lines on each side, its symbol, and the bounds of the matched
+// text.
 func TestNewRerankDocumentUsesBestMatchAndThreeLineContext(t *testing.T) {
 	symbol := &zoekt.Symbol{Sym: "Serve", Kind: "method", Parent: "API"}
 	const matchedText = "Serve"
@@ -417,6 +431,10 @@ func TestNewRerankDocumentUsesBestMatchAndThreeLineContext(t *testing.T) {
 	}
 }
 
+// TestSerializeLateOnDocumentIncludesCompactMetadata serializes a document
+// with a long and with a short path. The metadata names the last 4 parts of
+// the path, the language and the symbol, and the match bounds select the
+// match.
 func TestSerializeLateOnDocumentIncludesCompactMetadata(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -471,6 +489,10 @@ func TestSerializeLateOnDocumentIncludesCompactMetadata(t *testing.T) {
 	}
 }
 
+// TestSerializeLateOnDocumentKeepsMatchWithinByteLimit serializes documents
+// larger than maxRerankDocumentBytes: one with large UTF-8 metadata and
+// context, and one whose match starts after the first maxRerankDocumentBytes
+// bytes. The text is valid UTF-8 within the limit and keeps the match.
 func TestSerializeLateOnDocumentKeepsMatchWithinByteLimit(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -519,6 +541,10 @@ func TestSerializeLateOnDocumentKeepsMatchWithinByteLimit(t *testing.T) {
 	}
 }
 
+// TestApplyRerankDisplayConfigHidesModelContext trims the model context of a
+// match to the display config. With no context lines, the match keeps none.
+// After-only output with one line keeps the first line after the match. The
+// input does not change.
 func TestApplyRerankDisplayConfigHidesModelContext(t *testing.T) {
 	result := rerankTestResult("context.go", 1)
 	result.file.LineMatches[0].Before = []byte("b1\nb2\nb3\nb4\n")
@@ -546,6 +572,9 @@ func TestApplyRerankDisplayConfigHidesModelContext(t *testing.T) {
 	}
 }
 
+// TestRankCorpusResultsForDisplayHonorsOverride orders two results. Their
+// rank overrides set the order before their BM25 scores do. With no override,
+// the higher score comes first.
 func TestRankCorpusResultsForDisplayHonorsOverride(t *testing.T) {
 	low := rerankTestResult("low.go", 1)
 	low.rankOverride = 1
@@ -626,7 +655,7 @@ func TestRunRerankFailingModelKeepsStrictOutputForEveryShape(t *testing.T) {
 }
 
 // TestRunRerankWithDirtyFilesAcrossCorpora searches two Git repositories, one
-// with a dirty and an untracked file: the model scores the strict files of
+// with a dirty and an untracked file. The model scores the strict files of
 // both, and the committed text of the dirty file never shows. The build fails
 // on purpose, so no vector exists.
 func TestRunRerankWithDirtyFilesAcrossCorpora(t *testing.T) {
@@ -643,9 +672,9 @@ func TestRunRerankWithDirtyFilesAcrossCorpora(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The strict files of both nodes show; the dirty same.go of repo one
-	// matches only one word, so it is no candidate, and its stale
-	// committed bytes never show.
+	// The strict files of both nodes show. The dirty same.go of repo one
+	// matches only one word, so it is no candidate, and its stale committed
+	// bytes never show.
 	for _, want := range []string{
 		filepath.Join(repoOne, "untracked.go"),
 		filepath.Join(repoTwo, "same.go"),
@@ -711,9 +740,9 @@ func TestRunRerankModelContextStaysOutOfDisplay(t *testing.T) {
 }
 
 // TestRunRerankFailureKeepsModelContextOutOfDisplay searches with no context
-// lines and a model that fails at the score call: the model reads context
-// lines on both sides of the match, and the strict output shows the match and
-// none of them. The build fails on purpose, so no vector exists.
+// lines and a model that fails at the score call. The model reads context
+// lines on both sides of the match. The strict output shows the match and
+// none of these lines. The build fails on purpose, so no vector exists.
 func TestRunRerankFailureKeepsModelContextOutOfDisplay(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -761,6 +790,8 @@ func TestRunRerankFailureKeepsModelContextOutOfDisplay(t *testing.T) {
 	}
 }
 
+// rerankTestResult returns a folder result for name with one match line,
+// "alpha beta" at line 1. score is the score of the file and of the line.
 func rerankTestResult(name string, score float64) corpusSearchResult {
 	return corpusSearchResult{
 		corpusID: "repo",
@@ -796,29 +827,33 @@ func TestPlanRerankQueryFilterTextOutlivesItsMask(t *testing.T) {
 }
 
 // TestPlanRerankQueryOrMaskKeepsOnlyFilters plans queries with a punctuation
-// atom or a nested type:file next to their filters: the model text and the
-// semantic mask are those of the same query with neither, and so is relaxed
-// retrieval, except that it keeps the punctuation of a filter.
+// atom or a nested type:file next to their filters. Neither one changes the
+// model text or the semantic mask. Relaxed retrieval drops them too, but it
+// keeps the punctuation inside a filter. The expected plans are worked out by
+// hand.
 func TestPlanRerankQueryOrMaskKeepsOnlyFilters(t *testing.T) {
+	const (
+		alphaBetaMask    = "[(or lang:Go lang:Python)]"
+		alphaBetaRelaxed = `(and (or content_substr:"alpha" content_substr:"beta") (or lang:Go lang:Python))`
+	)
 	for _, row := range []struct {
-		pattern, same           string
-		relaxedKeepsPunctuation bool
+		pattern, model, filters, relaxed string
 	}{
-		{pattern: `(alpha \d+ lang:go) or (lang:python beta)`, same: "(alpha lang:go) or (lang:python beta)"},
-		{pattern: "(type:file alpha lang:go) or (lang:python beta)", same: "(alpha lang:go) or (lang:python beta)"},
-		{pattern: "((type:file alpha) lang:go) or (lang:python beta)", same: "(alpha lang:go) or (lang:python beta)"},
-		{pattern: "lang:go (type:file alpha)", same: "type:file lang:go alpha"},
-		{pattern: `(\d+ lang:go) or lang:python`, same: "lang:go or lang:python", relaxedKeepsPunctuation: true},
+		{`(alpha \d+ lang:go) or (lang:python beta)`, "alpha beta", alphaBetaMask, alphaBetaRelaxed},
+		{"(type:file alpha lang:go) or (lang:python beta)", "alpha beta", alphaBetaMask, alphaBetaRelaxed},
+		{"((type:file alpha) lang:go) or (lang:python beta)", "alpha beta", alphaBetaMask, alphaBetaRelaxed},
+		{"lang:go (type:file alpha)", "alpha", "[lang:Go]", `(and content_substr:"alpha" lang:Go)`},
+		{`(\d+ lang:go) or lang:python`, "Go Python", "[(or lang:Go lang:Python)]", `(or (and regex:"[0-9]+" lang:Go) lang:Python)`},
 	} {
-		got, want := planFor(t, row.pattern), planFor(t, row.same)
-		if got.modelQuery != want.modelQuery {
-			t.Fatalf("%s: model text %q, want %q", row.pattern, got.modelQuery, want.modelQuery)
+		plan := planFor(t, row.pattern)
+		if plan.modelQuery != row.model {
+			t.Fatalf("%s: model text %q, want %q", row.pattern, plan.modelQuery, row.model)
 		}
-		if fmt.Sprint(got.filters) != fmt.Sprint(want.filters) {
-			t.Fatalf("%s: mask %s, want %s", row.pattern, got.filters, want.filters)
+		if got := fmt.Sprint(plan.filters); got != row.filters {
+			t.Fatalf("%s: mask %s, want %s", row.pattern, got, row.filters)
 		}
-		if equal := got.relaxedQ.String() == want.relaxedQ.String(); equal == row.relaxedKeepsPunctuation {
-			t.Fatalf("%s: relaxed %s, %s: %s", row.pattern, got.relaxedQ, row.same, want.relaxedQ)
+		if got := plan.relaxedQ.String(); got != row.relaxed {
+			t.Fatalf("%s: relaxed %s, want %s", row.pattern, got, row.relaxed)
 		}
 	}
 }

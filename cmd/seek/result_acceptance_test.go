@@ -7,10 +7,11 @@ import (
 )
 
 // TestMeanMaxSimPassesStrictBoundary proves that a lift equal to the
-// threshold fails and the next float32 above it passes, and that the
-// empty-document score comes off the score before the test.
+// threshold fails and the next float32 above it passes. It also proves that
+// the rule subtracts the empty-document score and then divides by the token
+// count.
 func TestMeanMaxSimPassesStrictBoundary(t *testing.T) {
-	threshold := pipelineTauFile
+	const threshold float32 = 0.25
 	if meanMaxSimPasses(threshold, 0, 1, threshold) {
 		t.Fatal("threshold equality passed")
 	}
@@ -20,19 +21,20 @@ func TestMeanMaxSimPassesStrictBoundary(t *testing.T) {
 	if !meanMaxSimPasses(math.Nextafter32(threshold, 1), 0, 1, threshold) {
 		t.Fatal("the float32 above the threshold did not pass")
 	}
-	// A score of 0.9 per token is only a lift of 0.1 per token above an
-	// empty-document score of 0.8 per token.
-	if meanMaxSimPasses(0.9*4, 0.8*4, 4, threshold) {
+	// Over 4 tokens, (3.6 - 3.2) / 4 = 0.1 is under the threshold, and
+	// (3.6 - 2.0) / 4 = 0.4 is above it. The score alone, 3.6 / 4 = 0.9, and
+	// the difference alone, 0.4, are above it.
+	if meanMaxSimPasses(3.6, 3.2, 4, threshold) {
 		t.Fatal("a score with a lift under the threshold passed")
 	}
-	if !meanMaxSimPasses(0.9*4, 0.5*4, 4, threshold) {
+	if !meanMaxSimPasses(3.6, 2.0, 4, threshold) {
 		t.Fatal("a score with a lift above the threshold did not pass")
 	}
 }
 
 // TestRerankAcceptanceCalibrationContract pins the inputs of the per-file
 // acceptance: tau_file, the retrieval delta, the rank fusion, and the model
-// compatibility that they were measured with. Recalibrate when one changes.
+// compatibility of their measurement. When one changes, measure them again.
 func TestRerankAcceptanceCalibrationContract(t *testing.T) {
 	const wantCompatibility = "lateon-code-edge-proxy-no-symbol-centroids-v5-76339ee2c2f5a452923bf85c0a72d6bb"
 	if pipelineTauFile != 0.25 {
@@ -81,10 +83,10 @@ var acceptanceRealFiles = [][2]string{
 // relative to the repository, so no temporary name enters the model input.
 //
 // A sentence of 51 tokens with no topic admits no file, and the model scores
-// no candidate: each of its tokens is about as similar to a file as to the
-// empty document, so no row has a fine lift in the radius. A threshold on the
-// score per token alone admitted each file for it (0.742 to 0.756), because
-// each token with no topic adds to the score of any text.
+// no candidate. Each of its tokens is about as similar to a file as to the
+// empty document. So no row has a fine lift in the radius. A threshold on the
+// score per token alone admits each file for it (0.742 to 0.756 per token).
+// The cause is that each token with no topic adds to the score of any text.
 //
 // No file holds the word "operations", so no file is a strict match for
 // "retry failed operations", and only the model adds the retry function. The

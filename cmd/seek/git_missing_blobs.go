@@ -13,20 +13,20 @@ import (
 	"strings"
 )
 
-// A partial clone can lack blobs, and Seek indexes their files by name only:
-// a search never fetches. A blob can arrive later (sparse-checkout add, a
-// fetch) with no change to HEAD or to the work tree, so each build records the
-// blobs that it read as missing, with the object-store fingerprint from before
-// the read. A search compares the fingerprint, and checks the blobs again only
-// when the store changed: a check of 31,250 missing blobs takes about 1 s on a
-// Kubernetes checkout, the fingerprint less than 10 ms.
+// A partial clone can lack blobs, and Seek indexes their files by name only: a
+// search never fetches. A blob can arrive later (sparse-checkout add, a fetch)
+// with no change to HEAD or to the work tree. So each build records the blobs
+// that it read as missing, with the object-store fingerprint from before the
+// read. A search compares the fingerprint, and checks the blobs again only
+// when the store changed. On a Kubernetes checkout, a check of 31,250 missing
+// blobs takes about 1 s, and the fingerprint less than 10 ms.
 const (
 	lexicalMissingBlobsFile  = ".git-missing-lexical-v1"
 	semanticMissingBlobsFile = ".git-missing-semantic-v1"
 	missingBlobsVersion      = "v1"
-	// unknownObjectStore never equals a fingerprint, so a record that has it
-	// is checked on each search: a damaged record, a store that Seek cannot
-	// read, and the record that a build writes before it publishes.
+	// unknownObjectStore never equals a fingerprint, so each search checks a
+	// record that has it. Such records are a damaged record, a store that Seek
+	// cannot read, and the record that a build writes before it publishes.
 	unknownObjectStore = "unknown"
 )
 
@@ -92,9 +92,9 @@ func writeMissingBlobRecord(cacheDir, name string, record missingBlobRecord) err
 // writePendingMissingBlobRecord writes, before a publish, the union of the
 // blobs of the live data and of the new build. A stop before the exact record
 // then leaves a record that names every name-only file of either, with a
-// store that forces a check. A damaged live record (no head) stays as it is:
-// it cannot name its blobs, but it makes the next search rebuild the data, a
-// mark that the union would lose.
+// store that forces a check. A damaged live record (no head) stays as it is.
+// It cannot name its blobs, but it makes the next search rebuild the data.
+// The union would lose that mark.
 func writePendingMissingBlobRecord(cacheDir, name, head string, blobs []missingBlob) error {
 	if old, ok := readMissingBlobRecord(cacheDir, name); ok {
 		if old.head == "" {
@@ -136,10 +136,10 @@ func gitObjectStoreFingerprint(ctx context.Context, repoDir string) (string, err
 	return strings.Join(fields, ","), nil
 }
 
-// objectDirectoryFingerprint hashes what an arriving object changes in an
-// object directory: its own mtime (a new loose fan-out directory), the mtime
-// of each fan-out directory (a new loose object), and the name, size and mtime
-// of each pack file.
+// objectDirectoryFingerprint hashes what a new object changes in an object
+// directory. That is its own mtime (a new loose fan-out directory), and the
+// mtime of each fan-out directory (a new loose object). It is also the name,
+// size, and mtime of each pack file.
 func objectDirectoryFingerprint(dir string) (string, error) {
 	hash := sha256.New()
 	info, err := os.Stat(dir)
@@ -166,10 +166,11 @@ func objectDirectoryFingerprint(dir string) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)[:12]), nil
 }
 
-// buildObjectStoreFingerprint returns the fingerprint that a build records:
-// one read before the recheck and every blob read, so a blob that arrives
-// after it changes the store that the next search sees. Only a
-// partial clone can lack a blob, and a node with a record keeps checking it.
+// buildObjectStoreFingerprint returns the fingerprint that a build records. It
+// reads the fingerprint once, before the recheck and before any blob read. So
+// a blob that arrives after it changes the store that the next search sees.
+// Only a partial clone can lack a blob, and a node with a record keeps its
+// check.
 func buildObjectStoreFingerprint(ctx context.Context, repoDir, cacheDir string) string {
 	if !repoIsPartialClone(ctx, repoDir) && len(nodeMissingBlobRecords(cacheDir, "", false)) == 0 {
 		return ""
@@ -218,7 +219,8 @@ func missingBlobCheckDue(ctx context.Context, repoDir, cacheDir, head string, se
 }
 
 // missingBlobArrival says which data of the node holds a name-only file whose
-// blob is now present, and the blobs that a lexical delta must keep recording.
+// blob is now present. It also holds the blobs that a lexical delta must keep
+// in its record.
 type missingBlobArrival struct {
 	lexical      bool
 	semantic     bool
@@ -275,7 +277,8 @@ func recheckMissingBlobs(
 			}
 			record.fingerprint = fingerprint
 			if err := writeMissingBlobRecord(cacheDir, name, record); err != nil {
-				// The next search checks again; nothing is wrong, only slower.
+				// The next search checks again; the result is correct, only
+				// slower.
 				slog.Debug("Failed to refresh a missing-blob record", "file", name, "error", err)
 			}
 		}
@@ -283,8 +286,8 @@ func recheckMissingBlobs(
 	return arrival, nil
 }
 
-// deltaMissingBlobs returns the record of a delta build: the base record less
-// the paths that the delta changed, plus the blobs that the delta read as
+// deltaMissingBlobs returns the record of a delta build. It is the base record
+// less the paths that the delta changed, plus the blobs that the delta read as
 // missing.
 func deltaMissingBlobs(carry []missingBlob, changedPaths []string, infos []gitBlobInfo) []missingBlob {
 	changed := make(map[string]struct{}, len(changedPaths))

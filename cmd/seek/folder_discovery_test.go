@@ -66,7 +66,7 @@ func TestFolderWalkerDepth3(t *testing.T) {
 }
 
 // TestFolderFingerprintStableUnderNestedCommit checks that a file edit and a
-// new file inside a nested repo do not change the parent's state hash: the
+// new file inside a nested repo do not change the parent's state hash. The
 // nested repo is its own node. The test makes no commit.
 func TestFolderFingerprintStableUnderNestedCommit(t *testing.T) {
 	root := canonTempDir(t)
@@ -91,6 +91,9 @@ func TestFolderFingerprintStableUnderNestedCommit(t *testing.T) {
 	}
 }
 
+// TestFolderFingerprintStableUnderNestedGitLockFile checks that a Git lock
+// file that comes and goes in a nested repo does not change the parent's
+// state hash.
 func TestFolderFingerprintStableUnderNestedGitLockFile(t *testing.T) {
 	root := canonTempDir(t)
 	nested := filepath.Join(root, "repo")
@@ -130,7 +133,7 @@ func TestFolderWalkerSkipsSymlinkedWorktree(t *testing.T) {
 }
 
 // TestBrokenSubmoduleGracefulSkip checks that a .git file that points to a
-// missing directory makes a failed node: the walk records no Git root and
+// missing directory makes a failed node. The walk records no Git root and
 // returns no error.
 func TestBrokenSubmoduleGracefulSkip(t *testing.T) {
 	root := canonTempDir(t)

@@ -12,10 +12,11 @@ import (
 	"time"
 )
 
-// TestTempSwap_RecoversFromIncompleteSwap simulates a crash mid-publish: a
-// leftover .swapping marker means the committed family may be torn. The next
-// build must run recoverIncompleteSwap (clean the family + force rebuild) and
-// return correct results.
+// TestTempSwap_RecoversFromIncompleteSwap leaves a .swapping marker of the
+// committed family, as a crash during a publish does. The marker makes the
+// next search build again, after lockBuild repairs the family
+// (recoverIncompleteSwap). The search then finds the content, the marker is
+// gone, and the committed Git state names HEAD.
 func TestTempSwap_RecoversFromIncompleteSwap(t *testing.T) {
 	requireTools(t)
 
@@ -31,9 +32,7 @@ func TestTempSwap_RecoversFromIncompleteSwap(t *testing.T) {
 		t.Fatal("initial build did not publish committed Git state")
 	}
 
-	// Simulate an interrupted swap: drop a .swapping marker for the committed
-	// family. recoverIncompleteSwap should clean committed shards + clear state
-	// on the next build, forcing a clean rebuild.
+	// A publish that stopped during its swap leaves this marker.
 	if err := os.WriteFile(filepath.Join(plan.cacheDir, swappingMarkerFile), []byte("committed"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -54,40 +53,53 @@ func TestTempSwap_RecoversFromIncompleteSwap(t *testing.T) {
 	}
 }
 
-// TestTempSwap_SweepsOrphanBuildDir verifies the gc orphan sweep removes a
-// leftover temp build dir whose mtime is older than the staleness bound, and
-// keeps a fresh one.
+// TestTempSwap_SweepsOrphanBuildDir runs the gc orphan sweep of one corpus
+// (sweepCorpusOrphans). It removes a build directory older than buildTmpMaxAge
+// and keeps a younger one. While a build holds the build lock, it keeps both.
 func TestTempSwap_SweepsOrphanBuildDir(t *testing.T) {
-	indexDir := t.TempDir()
-
+	cacheDir := t.TempDir()
+	entry := corpusDirEntry{name: "c", path: cacheDir}
+	indexDir := filepath.Join(cacheDir, "index")
+	now := time.Now()
 	stale := filepath.Join(indexDir, buildDirPrefix+"1-2-3")
 	fresh := filepath.Join(indexDir, buildDirPrefix+"9-9-9")
-	for _, d := range []string{stale, fresh} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
+	for path, age := range map[string]time.Duration{stale: buildTmpMaxAge + time.Minute, fresh: buildTmpMaxAge - time.Minute} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		at := now.Add(-age)
+		if err := os.Chtimes(path, at, at); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// Age the stale dir past the bound.
-	old := time.Now().Add(-2 * buildTmpMaxAge)
-	if err := os.Chtimes(stale, old, old); err != nil {
-		t.Fatal(err)
+	exists := func(path string) bool {
+		_, err := os.Stat(path)
+		return err == nil
 	}
 
-	sweepOrphanBuildDirs(indexDir, time.Now().Add(-buildTmpMaxAge))
-
-	if _, err := os.Stat(stale); !os.IsNotExist(err) {
-		t.Fatalf("stale build dir should be swept, stat err=%v", err)
+	build, ok, err := tryBuildLock(cacheDir)
+	if err != nil || !ok {
+		t.Fatalf("take the build lock: ok=%t err=%v", ok, err)
 	}
-	if _, err := os.Stat(fresh); err != nil {
-		t.Fatalf("fresh build dir must NOT be swept, stat err=%v", err)
+	sweepCorpusOrphans(entry, now)
+	releaseLock(build)
+	if !exists(stale) || !exists(fresh) {
+		t.Fatalf("the sweep removed a build directory while a build held the lock: stale=%t fresh=%t", exists(stale), exists(fresh))
+	}
+
+	sweepCorpusOrphans(entry, now)
+	if exists(stale) {
+		t.Fatal("the sweep kept a build directory older than buildTmpMaxAge")
+	}
+	if !exists(fresh) {
+		t.Fatal("the sweep removed a build directory younger than buildTmpMaxAge")
 	}
 }
 
-// TestTempSwap_CommittedDeltaKeepsPriorShards verifies the hard-link seed
-// path: a committed rebuild after a new commit adds a delta shard and does not
-// rebuild in full, so the build linked the prior generation into the temp dir
-// and Zoekt built the delta on it. A full rebuild of this repository makes one
-// shard, so the shard count does not grow.
+// TestTempSwap_CommittedDeltaKeepsPriorShards checks the hard-link seed of a
+// committed delta. After a new commit, the build links the prior shards into
+// its build directory, and Zoekt adds a delta shard to them. A full rebuild of
+// this repository makes one shard, so only a delta adds to the shard count.
 func TestTempSwap_CommittedDeltaKeepsPriorShards(t *testing.T) {
 	requireTools(t)
 
@@ -103,12 +115,12 @@ func TestTempSwap_CommittedDeltaKeepsPriorShards(t *testing.T) {
 		t.Fatal("expected committed shards after initial build")
 	}
 
-	// New commit adds a file → committed rebuild should delta-stack.
+	// A new commit adds a file, so the committed build adds a delta shard.
 	writeTrackedFile(t, dir, "b.go", "package main\n// DELTA_NEXT\n")
 	if files, err := runSeekInPlannedGitCorpus(ctx, "DELTA_NEXT", paths, plan); err != nil || len(files) == 0 {
 		t.Fatalf("delta rebuild: files=%v err=%v", files, err)
 	}
-	// Old content must still be found (delta stacked on the seeded base).
+	// The delta builds on the linked shards, so the old content stays.
 	if files, err := runSeekInPlannedGitCorpus(ctx, "DELTA_BASE", paths, plan); err != nil || len(files) == 0 {
 		t.Fatalf("base content lost after delta rebuild: files=%v err=%v", files, err)
 	}
@@ -133,12 +145,12 @@ func committedShardCount(t *testing.T, indexDir string) int {
 	return n
 }
 
-// TestTempSwap_RecoversFolderIncompleteSwap covers the recovery of a folder
-// node: a leftover .swapping marker of the "all" family makes the folder fast
-// path (its swapPending check) take the build lock and run
-// recoverIncompleteSwap, which reads the label with shardFamilyFromLabel,
-// cleans familyAll, and builds again. After the build the marker is gone and
-// a search finds the content.
+// TestTempSwap_RecoversFolderIncompleteSwap leaves a .swapping marker of the
+// "all" family in a folder node. The marker makes the folder skip its warm
+// fast path (swapPending) and take the build lock. lockBuild then runs
+// recoverIncompleteSwap, which reads the label (shardFamilyFromLabel), cleans
+// familyAll, and clears the state, so the folder builds again. After the
+// build, the marker is gone and a search finds the content.
 func TestTempSwap_RecoversFolderIncompleteSwap(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -160,7 +172,7 @@ func TestTempSwap_RecoversFolderIncompleteSwap(t *testing.T) {
 		t.Fatalf("initial folder build: st=%v err=%v", st, err)
 	}
 
-	// Simulate an interrupted wholesale (familyAll) swap.
+	// A publish of familyAll that stopped during its swap leaves this marker.
 	if err := os.WriteFile(filepath.Join(plan.cacheDir, swappingMarkerFile), []byte(familyAll.label()), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -341,10 +353,10 @@ func TestPublishStepFailureKeepsTheLiveFamily(t *testing.T) {
 
 // TestRecoverIncompleteSwapCleansTornFamily makes a torn family by hand, as a
 // crash during a publish leaves it, and runs the swap repair. The repair
-// removes the shards and sidecars of the family that .swapping names, the
-// family manifest and the state files, and keeps the delta base record. A
-// full rebuild cannot show this: the next publish removes every live member
-// of the family anyway.
+// removes the shards and sidecars of the family that .swapping names. It also
+// removes the family manifest and the state files, and keeps the delta base
+// record. A full rebuild cannot show this: the next publish removes every
+// live member of the family anyway.
 func TestRecoverIncompleteSwapCleansTornFamily(t *testing.T) {
 	for _, test := range []struct {
 		label           string
@@ -392,9 +404,9 @@ func TestRecoverIncompleteSwapCleansTornFamily(t *testing.T) {
 }
 
 // TestPublishMarksOnlyASwapThatMovedFiles publishes into an index directory
-// that cannot be listed: the scan fails before any move, so no .swapping
-// stays and the next build keeps the family. TestPublishMarksAFailedMoveBack
-// (macOS) covers a move back that fails.
+// that cannot be listed. The scan fails before any move, so no .swapping stays
+// and the next build keeps the family. TestPublishMarksAFailedMoveBack (macOS)
+// covers a move back that fails.
 func TestPublishMarksOnlyASwapThatMovedFiles(t *testing.T) {
 	const shard = "folder_x_v16.00000.zoekt"
 	store := corpusStore{cacheDir: t.TempDir(), indexDir: filepath.Join(t.TempDir(), "index")}

@@ -29,9 +29,9 @@ func TestEnsureFolderCorpusFresh_MultiShardEarlyBeaconSurvives(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "a_early.txt"), []byte(earlyBeacon+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Middle payload: about 12 MiB in 256 KiB files, three times the test
-	// budget and more than the 10 MiB shardMax, so the build makes two or more
-	// shards.
+	// The middle payload is 12 MiB in 256 KiB files. That is three times the
+	// test budget and more than the 10 MiB shardMax, so the build makes two or
+	// more shards.
 	const fileSize int64 = 256 * 1024
 	const totalPayload int64 = 12 * 1024 * 1024
 	written := int64(0)
@@ -57,15 +57,15 @@ func TestEnsureFolderCorpusFresh_MultiShardEarlyBeaconSurvives(t *testing.T) {
 	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 		t.Fatalf("ensureFolderCorpusFresh: %v", err)
 	}
-	// Sanity: the fixture must produce multiple shards. With a single
-	// shard, the test asserts nothing about survival across shards.
+	// The fixture must make two or more shards. With one shard, the test
+	// proves nothing about the shards that follow the first.
 	if n := repositoryShardCount(plan.indexDir, folderRepoName(plan)); n < 2 {
 		t.Fatalf("expected >= 2 shards, got %d", n)
 	}
 
-	// Both beacons must be findable: the early beacon proves that the later
-	// shards left the first shard searchable, and the late beacon proves that
-	// the final shard flushed.
+	// Both beacons must be found. The early beacon proves that the later shards
+	// left the first shard searchable, and the late beacon proves that the
+	// final shard flushed.
 	for _, b := range []struct{ name, marker string }{{"early", earlyBeacon}, {"late", lateBeacon}} {
 		results, err := searchPlannedCorpusForTest(ctx, plan, b.marker)
 		if err != nil {

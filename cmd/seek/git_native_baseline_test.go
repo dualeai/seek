@@ -16,6 +16,8 @@ import (
 	"github.com/sourcegraph/zoekt/query"
 )
 
+// zoektIndexedPaths returns the sorted paths of the documents in the shards of
+// indexDir.
 func zoektIndexedPaths(t testing.TB, indexDir string) []string {
 	t.Helper()
 	// An empty repository writes no shard, so it indexes no path.
@@ -53,11 +55,16 @@ func zoektIndexedPaths(t testing.TB, indexDir string) []string {
 	return paths
 }
 
+// zoektRepositoryMetadata returns the first committed repository record in
+// indexDir.
 func zoektRepositoryMetadata(t testing.TB, indexDir string) *zoekt.Repository {
 	t.Helper()
 	return zoektCommittedRepositoryMetadata(t, indexDir)[0]
 }
 
+// zoektCommittedRepositoryMetadata returns the live repository records of the
+// committed shards in indexDir, in shard name order. It fails the test when
+// there is none.
 func zoektCommittedRepositoryMetadata(t testing.TB, indexDir string) []*zoekt.Repository {
 	t.Helper()
 	shards, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
@@ -83,6 +90,8 @@ func zoektCommittedRepositoryMetadata(t testing.TB, indexDir string) []*zoekt.Re
 	return committed
 }
 
+// requireCompleteNativeIndex builds a native full index of the HEAD of repoDir
+// and checks that it holds exactly the paths in want.
 func requireCompleteNativeIndex(t *testing.T, repoDir string, want []string) {
 	t.Helper()
 	indexDir := t.TempDir()
@@ -129,8 +138,8 @@ func TestNativeGitFullIndexesFixtureInventory(t *testing.T) {
 }
 
 // moveObjectToLoosePrefixedPack stores one object in a valid Git pack whose
-// name does not start with "pack-", then removes its loose copy. Git reads all
-// *.idx packs. The former go-git-backed reader read only pack-* packs.
+// name does not start with "pack-", then removes its loose copy. Git reads
+// every *.idx pack, so a reader that reads only pack-* packs misses the object.
 func moveObjectToLoosePrefixedPack(t *testing.T, repoDir, oid string) {
 	t.Helper()
 	prefix := filepath.Join(repoDir, ".git", "objects", "pack", "loose-native-fixture")
@@ -235,6 +244,11 @@ func TestNativeGitIndexer_AlternatesIsComplete(t *testing.T) {
 	requireCompleteNativeIndex(t, clone, want)
 }
 
+// TestNativeGitIndexer_VisibleContract checks what a native full build
+// writes. Each committed file has a document: also a binary, an empty, an
+// oversize and a symlink file, and a file that .sourcegraph/ignore names. A
+// gitlink has none. The one repository record has the Seek name and source,
+// one HEAD branch, and none of the zoekt.* config values.
 func TestNativeGitIndexer_VisibleContract(t *testing.T) {
 	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	requireTools(t)

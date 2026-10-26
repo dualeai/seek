@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -21,6 +22,8 @@ import (
 	"unicode/utf8"
 )
 
+// openLateOnTestTokenizer opens the bundled tokenizer and returns it with the
+// IDs of its punctuation tokens. Cleanup closes it.
 func openLateOnTestTokenizer(tb testing.TB) (*lateOnTokenizer, map[int]struct{}) {
 	tb.Helper()
 	tokenizerJSON, err := decodeLateOnAsset(lateOnCompressedTokenizer)
@@ -124,15 +127,15 @@ func TestLateOnTokenizerMatchesPyLate(t *testing.T) {
 }
 
 // TestLateOnPrepareSemanticQueryUsesWindows prepares a short and a 300-term
-// query: the short one is one 128-token window, the long one keeps every token
-// in ceil(tokens/room) windows, with no truncation. The score of the long
-// query against the empty document, from the row after its last window, must
+// query. The short one is one 128-token window. The long one keeps every token
+// in ceil(tokens/room) windows, with no truncation. The long query takes its
+// empty-document score from the row after its last window. That score must
 // equal the score that the scorer gives an empty document.
 func TestLateOnPrepareSemanticQueryUsesWindows(t *testing.T) {
 	scorer := sharedModel(t)
 	tokenizer, _ := openLateOnTestTokenizer(t)
 	// A query starts with the class and the [Q] tokens and ends with the
-	// separator (TestLateOnTokenizerMatchesPyLate), so each window has room
+	// separator (TestLateOnTokenizerMatchesPyLate). So each window has room
 	// for 128 - 3 = 125 query tokens. The 300 words encode to 301 tokens (one
 	// per word and one for the final space): ceil(301/125) = 3 windows.
 	const head = 2
@@ -530,8 +533,9 @@ func TestLateOnRuntimeExtractHelper(t *testing.T) {
 }
 
 func TestLateOnInferenceMatchesReferenceScores(t *testing.T) {
-	// The automatic case gates CI: the process model uses whatever the
-	// run-time provider check selected on this host, which is what users get.
+	// A score difference of the selected case fails the test. The process
+	// model uses the provider that the run-time check selected on this host,
+	// as a user's search does.
 	t.Run("selected", func(t *testing.T) {
 		lateOnReferenceScoreCheck(t, sharedModel(t), sharedModelProvider, true)
 	})
@@ -542,10 +546,10 @@ func TestLateOnInferenceMatchesReferenceScores(t *testing.T) {
 	if lateOnAcceleratedProviderName == lateOnCPUProviderName {
 		return
 	}
-	// Pinning the accelerated provider bypasses the run-time check, so this
-	// case records its scores without gating. On a host where that provider
-	// is wrong, the automatic case above still passes because the check
-	// demotes it, and the deltas recorded here say how wrong it is.
+	// A pinned accelerated provider skips the run-time check, so this case
+	// logs its scores and does not fail. On a host where that provider is
+	// wrong, the check demotes it, so the automatic case above still passes.
+	// The scores logged here show how wrong the provider is.
 	t.Run(lateOnAcceleratedProviderName, func(t *testing.T) {
 		t.Setenv(lateOnProviderEnv, lateOnAcceleratedProviderName)
 		lateOnReferenceScoreCheck(t, newPinnedLateOnModel(t), semanticProviderName, false)
@@ -553,8 +557,8 @@ func TestLateOnInferenceMatchesReferenceScores(t *testing.T) {
 }
 
 // newPinnedLateOnModel returns a new model in a new cache root, for a test
-// that pins a provider: the process model keeps the provider of the process.
-// Cleanup closes it.
+// that pins a provider. The process model keeps the provider of the process.
+// Cleanup closes the new model.
 func newPinnedLateOnModel(t *testing.T) *lateOnModel {
 	t.Helper()
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
@@ -567,16 +571,16 @@ func newPinnedLateOnModel(t *testing.T) *lateOnModel {
 	return model
 }
 
-// lateOnReferenceScoreCheck holds the scores this project calibrated its
-// acceptance thresholds against. Every provider must reproduce them. With
-// gate false, a difference in a score or in the rank order is logged, not
-// failed. provider names the provider of scorer after its first call.
-// semanticProviderName gives the provider of the last model that built an
-// encoder, which is not the process model if another test built one later.
+// lateOnReferenceScoreCheck scores one description against three fixed
+// documents. Every provider must give the reference scores (want) within 0.01,
+// in the same order. With gate false, a difference in a score or in the order
+// is logged, not failed. provider names the provider of scorer after its first
+// call. semanticProviderName gives the provider of the last model that built
+// an encoder. That is not the process model if another test built one later.
 //
 // A provider that passes the run-time check in verifyLateOnAcceleratedProvider
-// but fails here means that check is too permissive. That is the signal to
-// tighten lateOnProbeAgreementLimit.
+// but fails here shows that the check accepts too much. Then make
+// lateOnProbeAgreementLimit or lateOnProbeMagnitudeLimit smaller.
 func lateOnReferenceScoreCheck(t *testing.T, scorer semanticModel, provider func() string, gate bool) {
 	documents := []rerankDocument{
 		{
@@ -711,10 +715,10 @@ func TestLateOnEncoderConcurrentOutputsAreIsolated(t *testing.T) {
 		}()
 	}
 	close(start)
-	// Each call holds its output until all calls have one. The test has no
-	// timer, because the time of a batch changes from host to host: an
-	// encoder that runs one call at a time blocks here until the -timeout of
-	// the test binary, which prints every goroutine.
+	// Each call holds its output until all calls have one. The time of a
+	// batch changes from host to host, so the test has no timer. An encoder
+	// that runs one call at a time blocks here until the -timeout of the test
+	// binary, which prints every goroutine.
 	for range units {
 		<-ready
 	}
@@ -778,7 +782,7 @@ func TestLateOnModelCanReopen(t *testing.T) {
 // TestCLIProcessLateOnStrictEvidenceContract runs a description in a
 // process, as a user does. Only strict.go holds each word of the query, so
 // --lexical-only prints only it. The real model adds evict.go and lru.go,
-// which hold some of the words and the same topic: their lifts above the
+// which hold some of the words and the same topic. Their lifts above the
 // empty-document score are 0.302 and 0.294 per token, at least 0.044 above
 // pipelineTauFile. The folder has a fixed model path (stableModelRoot), so
 // the scores do not change from run to run.
@@ -819,12 +823,12 @@ func TestCLIProcessLateOnStrictEvidenceContract(t *testing.T) {
 
 // TestCLIProcessLateOnAcceptanceBoundary runs a nonsense query and a
 // description in a process. The nonsense query shares no word piece with the
-// files, and its lift above the empty-document score is under 0 for each
-// file, so no candidate gets to the model, and it admits no file. No file
-// holds each word of the description, so --lexical-only finds nothing, and
-// only the model can add auth.go: its lift is 0.277 per token. colors.go has
-// 0.048 and does not print. The folder has a fixed model path
-// (stableModelRoot), so the scores do not change from run to run.
+// files. Its lift above the empty-document score is under 0 for each file. So
+// no candidate gets to the model, and it admits no file. No file holds each
+// word of the description, so --lexical-only finds nothing. Only the model
+// can add auth.go: its lift is 0.277 per token. colors.go has 0.048 and does
+// not print. The folder has a fixed model path (stableModelRoot), so the
+// scores do not change from run to run.
 func TestCLIProcessLateOnAcceptanceBoundary(t *testing.T) {
 	requireTools(t)
 	folder := stableModelRoot(t)
@@ -865,7 +869,7 @@ func TestCLIProcessLateOnAcceptanceBoundary(t *testing.T) {
 		t.Fatalf("verbose nonexistent query=%+v, want no match", verbose)
 	}
 	// The search reads the vector index, but no row is in the retrieval
-	// radius, so no candidate gets to the score stage, which logs "Accepted
+	// radius. So no candidate gets to the score stage, which logs "Accepted
 	// model candidates".
 	if !strings.Contains(verbose.stderr, `msg="Searched semantic index"`) ||
 		strings.Contains(verbose.stderr, `msg="Accepted model candidates"`) {
@@ -923,10 +927,10 @@ func TestLateOnMaxSimRejectsZeroDocumentVectors(t *testing.T) {
 }
 
 func TestPrepareSemanticQueryReturnsUsableTokens(t *testing.T) {
-	// PrepareSemanticQuery guards its own output, because a degenerate query
-	// row gives every candidate a finite score of zero that no later guard can
-	// tell apart from a genuine miss. Assert the invariant on real model
-	// output, so a provider that starts returning zero rows fails here.
+	// PrepareSemanticQuery checks its own output. A degenerate query row gives
+	// every candidate a finite score of zero, and no later check can tell it
+	// from a real miss. The test checks real model output, so a provider that
+	// starts to return zero rows fails here.
 	model := sharedModel(t)
 	prepared, err := model.PrepareSemanticQuery(t.Context(), "rank search results before the output limit")
 	if err != nil {
@@ -1012,15 +1016,15 @@ func TestLateOnProbeRowsCoverActiveTokens(t *testing.T) {
 	if len(ids) != semanticModelBatchRows*lateOnSequenceLength || len(attention) != len(ids) {
 		t.Fatalf("ids=%d attention=%d, want %d", len(ids), len(attention), semanticModelBatchRows*lateOnSequenceLength)
 	}
-	// Stability is the property the probe depends on: both providers must be
-	// given the same input, and a cached verdict must describe the same input a
-	// later process will use.
+	// The probe needs the same rows on each call. Both providers must get the
+	// same input, and a cached verdict must describe the input of a later
+	// process.
 	again, againAttention := lateOnProbeRows()
 	if !reflect.DeepEqual(ids, again) || !reflect.DeepEqual(attention, againAttention) {
 		t.Fatal("the probe row is not stable between calls")
 	}
-	// Every attended token must be one the model can embed, and nothing beyond
-	// them may be attended, or the two providers would be compared over
+	// Every attended token must be one that the model can embed, and no other
+	// token is attended. Otherwise the check compares the two providers on
 	// padding.
 	for row := range semanticModelBatchRows {
 		base := row * lateOnSequenceLength
@@ -1121,12 +1125,10 @@ func TestLateOnOutputsAgreeSeparatesFaultFromNoise(t *testing.T) {
 func TestSemanticProviderNameIsSettledAfterConstruction(t *testing.T) {
 	// The fallback logs print this value. A real construction must leave a
 	// settled provider, not an intent.
+	// An atomic.Value cannot hold nil again, so a value that was not set
+	// comes back as an empty string, which names no provider in use.
 	previous := lateOnSelectedProvider.Load()
-	t.Cleanup(func() {
-		if previous != nil {
-			lateOnSelectedProvider.Store(previous)
-		}
-	})
+	t.Cleanup(func() { lateOnSelectedProvider.Store(cmp.Or[any](previous, "")) })
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
 	model, err := newLateOnSemanticModel(t.Context())
 	if err != nil {
@@ -1150,9 +1152,9 @@ func TestSemanticProviderNameIsSettledAfterConstruction(t *testing.T) {
 }
 
 func TestDegenerateScoringErrorCarriesTheProviderSentinel(t *testing.T) {
-	// The search path must be able to tell a provider fault from any other
-	// scoring failure, or a wrong provider on an already-built index would drop
-	// every re-rank to BM25 and never record itself.
+	// The search must tell a provider fault from any other scoring failure.
+	// Otherwise a wrong provider on a built index drops every search to text
+	// ranking and never records itself (recordFault).
 	query := make([]float32, lateOnSequenceLength*semanticEmbeddingDimensions)
 	query[0] = 1
 	queryMask := make([]bool, lateOnSequenceLength)
@@ -1172,7 +1174,7 @@ func TestDegenerateScoringErrorCarriesTheProviderSentinel(t *testing.T) {
 }
 
 // TestScoresWithSemanticQueryBatchesAboveModelWidth scores 300 documents in
-// one call: the scorer runs ceil(300/128) encoder batches and returns one
+// one call. The scorer runs ceil(300/128) = 3 encoder batches. It returns one
 // score per document, equal to the scores of smaller calls.
 func TestScoresWithSemanticQueryBatchesAboveModelWidth(t *testing.T) {
 	scorer := sharedModel(t)
@@ -1219,7 +1221,7 @@ func newTestLateOnModel(t *testing.T) *lateOnModel {
 // heldBuildContext is the context of an encoder build that a test holds.
 // newLateOnRowEncoder and newLateOnCPUBuildEncoder read the context error
 // first, in the sync.Once of the model. The first Err call closes started and
-// waits until release closes, so the build stays in its Once for that time.
+// waits until release closes. So the build stays in its Once for that time.
 type heldBuildContext struct {
 	context.Context
 	once    sync.Once
@@ -1238,8 +1240,8 @@ func (c *heldBuildContext) Err() error {
 // closeDuringBuild starts a call of model that builds an encoder for the
 // index build, and holds the build at its start (heldBuildContext). It starts
 // Close while the build is held, then lets the build go on. The call passed
-// the closed check before Close, so it must get its encoder, and Close must
-// wait for the build and close what it made.
+// the closed check before Close, so it must get its encoder. Close must wait
+// for the build and close what it made.
 func closeDuringBuild(t *testing.T, model *lateOnModel) {
 	t.Helper()
 	ctx := &heldBuildContext{Context: t.Context(), started: make(chan struct{}), release: make(chan struct{})}
@@ -1272,12 +1274,15 @@ func closeDuringBuild(t *testing.T, model *lateOnModel) {
 	}
 }
 
-// TestLateOnModelCloseAtEachStage closes a model before its first call,
-// after it, while the first call builds the encoder, and while a later call
-// builds the second CPU session (closeDuringBuild). Close must close each
-// encoder that a build made, also a build that was in flight. A call after
-// Close gets the closed error, and -race sees no write of an encoder field
-// after its read.
+// TestLateOnModelCloseAtEachStage closes a model at four stages:
+//   - before its first call;
+//   - after its first call;
+//   - while the first call builds the encoder;
+//   - while a later call builds the second CPU session (closeDuringBuild).
+//
+// Close must close each encoder that a build made, also the encoder of a
+// build that runs now. A call after Close gets the closed error. -race sees
+// no write of an encoder field after its read.
 func TestLateOnModelCloseAtEachStage(t *testing.T) {
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
 	t.Run("close first", func(t *testing.T) {
@@ -1329,18 +1334,15 @@ func TestLateOnModelCloseAtEachStage(t *testing.T) {
 // later query makes no second session. A model whose first call is a query
 // gets the interactive count, and a scoring call uses that session. A later
 // index build gets a session of its own with the build's count. On 1 or 2
-// CPUs both counts are 1, so the test sets GOMAXPROCS to 8 for its run: the
-// build count is then 2 and the interactive count 5, on each host.
+// CPUs both counts are 1, so the test sets GOMAXPROCS to 8 for its run. Then
+// the build count is round(sqrt(8/2)) = 2 and the interactive count is
+// round(8*2/3) = 5, on each host.
 func TestLateOnSessionThreadsFollowTheFirstUse(t *testing.T) {
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
 	t.Setenv(lateOnProviderEnv, lateOnCPUProviderName)
-	const cpus = 8
-	previous := runtime.GOMAXPROCS(cpus)
+	previous := runtime.GOMAXPROCS(8)
 	t.Cleanup(func() { runtime.GOMAXPROCS(previous) })
-	build, interactive := lateOnCPUIntraOpThreads(cpus), lateOnCPUInteractiveThreads(cpus)
-	if build == interactive {
-		t.Fatalf("the two thread counts are both %d on %d CPUs", build, cpus)
-	}
+	const build, interactive = 2, 5
 	newModel := func(t *testing.T) *lateOnModel {
 		t.Helper()
 		model := newTestLateOnModel(t)

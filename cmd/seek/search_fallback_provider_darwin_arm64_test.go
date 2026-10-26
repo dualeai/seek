@@ -7,6 +7,11 @@ import (
 	"testing"
 )
 
+// TestRunSearchCommandEmbeddingFaultRecordsOnce pins the accelerated provider
+// and gives a model whose vector build fails with a provider fault
+// (errDegenerateSemanticVector). It searches a folder node and a Git node. The
+// search still prints the strict file and calls each model stage once. It
+// records one provider fault with no rejection.
 func TestRunSearchCommandEmbeddingFaultRecordsOnce(t *testing.T) {
 	for _, kind := range []string{"folder", "git"} {
 		t.Run(kind, func(t *testing.T) {

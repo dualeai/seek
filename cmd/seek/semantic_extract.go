@@ -54,8 +54,8 @@ type semanticUnit struct {
 	end          uint64
 	kind         semanticUnitKind
 	parserResult semanticParserResult
-	// pathCut is transient: the window header of the row ends inside its
-	// path line, so the key holds only a prefix of the model path tail.
+	// pathCut is transient. It marks a row whose window header ends inside
+	// its path line, so the key holds only a prefix of the model path tail.
 	pathCut bool
 	// language describes this extracted unit in model and result documents.
 	language string
@@ -79,13 +79,13 @@ type semanticAnchor struct {
 	symbol string
 }
 
-// extractSemanticUnitsWithID extracts content whose SHA-256 the caller has
-// (contentID). The caller has checked that content is eligible
-// (semanticContentIsEligible). The units cover each source byte once, in
-// parts of at most semanticUnitMaxBytes. Valid ctags starts create symbol
-// units, and the bytes before the first start create a gap unit. A parser
-// failure, invalid UTF-8, or a file without valid symbols creates fallback
-// units. Every unit takes the file's language (semanticFileLanguage).
+// extractSemanticUnitsWithID splits content into units. contentID is the
+// SHA-256 of content, from the caller. The caller has checked that content is
+// eligible (semanticContentIsEligible). The units cover each source byte
+// once, in parts of at most semanticUnitMaxBytes. Valid ctags starts create
+// symbol units, and the bytes before the first start create a gap unit. A
+// parser failure, invalid UTF-8, or a file without valid symbols creates
+// fallback units. Every unit takes the file's language (semanticFileLanguage).
 func extractSemanticUnitsWithID(
 	path string,
 	content []byte,
@@ -152,7 +152,7 @@ func extractSemanticUnitsWithID(
 }
 
 // semanticFileLanguage names the language of a file as Zoekt names it in the
-// shard (index.DetermineLanguageIfUnknown), so a vector hit, its model input
+// shard (index.DetermineLanguageIfUnknown). So a vector hit, its model input
 // and a strict hit of the same file all name one language. ctags names some
 // languages in its own way ("Sh" for "Shell").
 func semanticFileLanguage(path string, content []byte) string {
@@ -169,10 +169,10 @@ func semanticFileLanguage(path string, content []byte) string {
 // text that Zoekt keeps (readSemanticEvidence), so such a file gets no rows. An
 // empty file has no text to describe.
 //
-// A file of more than half the shard format gets no rows either: Zoekt stores
-// its content and at least one posting byte for each position, so its shard
+// A file of more than half the shard format gets no rows either. Zoekt stores
+// its content and at least one posting byte for each position. So its shard
 // passes the format (2.01 bytes of shard for each byte of the most repetitive
-// content), and the shard guard keeps it by name only (guardWrappedShards).
+// content). The shard guard then keeps it by name only (guardWrappedShards).
 // A smaller file can still pass the format (6.6 bytes for each byte of random
 // text); its rows then give no hit.
 func semanticContentIsEligible(content []byte) bool {
@@ -263,11 +263,12 @@ func makeSemanticUnitID(unit semanticUnit) semanticUnitID {
 	return id
 }
 
-// makeSemanticUnitIDBuffered hashes the stable v1 byte encoding. The encoding
-// contains the version prefix; length-prefixed path and content ID; little-
-// endian start and end; kind and parser-result bytes; and length-prefixed unit
-// language and symbol, in that order. buffer is caller-owned scratch storage.
-// The returned slice can be reused and is not part of the ID.
+// makeSemanticUnitIDBuffered hashes the stable v1 byte encoding of unit. The
+// encoding starts with the version prefix, the length-prefixed path and
+// content ID, and the little-endian start and end. Then come the kind and
+// parser-result bytes and the length-prefixed unit language and symbol.
+// buffer is caller-owned scratch storage. The returned slice can be reused and
+// is not part of the ID.
 func makeSemanticUnitIDBuffered(unit semanticUnit, buffer []byte) (semanticUnitID, []byte) {
 	const prefix = "seek-semantic-unit-v1\x00"
 	wantBytes := len(prefix) + 4*8 + len(unit.path) + len(unit.contentID) + 2*8 + 2 +

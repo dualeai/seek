@@ -12,21 +12,20 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-// testReadSemMu serializes every test that observes the SHARED
-// readSemaphore via availableWeight. Without it, parallel test
-// goroutines holding transient weight would skew the binary-search
-// reading and produce flaky false-positive "leak detected" failures.
+// testReadSemMu serializes every test that reads the shared readSemaphore
+// with availableWeight. Without it, other tests can hold weight for a short
+// time during the binary search. Then a test can report a leak that does not
+// exist.
 //
-// Tests that only use a LOCAL semaphore (constructed in-test) don't
-// need this lock.
+// A test that uses only its own semaphore does not need this lock.
 var testReadSemMu sync.Mutex
 
-// availableWeight probes available weight by binary-search with
-// TryAcquire/Release. While a waiter is queued, TryAcquire can fail even when
-// capacity remains, so active-pipeline callers must use this only as an
-// activity signal. After all workers stop, it gives an exact leak check.
-// Callers touching the shared readSemaphore MUST hold testReadSemMu for the
-// full before-action-after sequence.
+// availableWeight finds the free weight of sem by a binary search with
+// TryAcquire and Release. While a waiter is in the queue, TryAcquire can fail
+// with free weight left, so during a pipeline run the value only shows
+// activity. After all workers stop, it gives an exact leak check. A caller
+// that reads the shared readSemaphore must hold testReadSemMu from the first
+// read to the last.
 func availableWeight(sem *semaphore.Weighted) int64 {
 	lo, hi := int64(0), readBudgetBytes
 	for lo < hi {
@@ -41,10 +40,10 @@ func availableWeight(sem *semaphore.Weighted) int64 {
 	return lo
 }
 
-// TestReader_OversizeCandidate_NoSemaphoreTouch — a synthetic
-// candidate larger than the content limit must become one name-only
-// document without touching the semaphore. The test runs in a synctest
-// bubble: a reader that waits for read weight fails at once as a deadlock.
+// TestReader_OversizeCandidate_NoSemaphoreTouch checks that a candidate
+// larger than the content limit becomes one name-only document with no
+// acquire of read weight. The test runs in a synctest bubble: a reader that
+// waits for read weight fails at once as a deadlock.
 func TestReader_OversizeCandidate_NoSemaphoreTouch(t *testing.T) {
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
@@ -121,7 +120,7 @@ func TestReader_AboveBudgetCandidate_ClampsWeight(t *testing.T) {
 }
 
 // TestReader_BinaryPrefixSendsNameOnly checks that a large file that starts
-// with a NUL byte becomes one binary, name-only document: the reader keeps no
+// with a NUL byte becomes one binary, name-only document. The reader keeps no
 // content and returns its weight.
 func TestReader_BinaryPrefixSendsNameOnly(t *testing.T) {
 	testReadSemMu.Lock()

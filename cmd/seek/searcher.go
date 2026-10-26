@@ -28,14 +28,13 @@ import (
 // each match.
 const searchContextLines = 3
 
-// searchOpts are the zoekt search options used for every search. Defined
-// at package level to avoid per-search heap allocation.
+// searchOpts are the base Zoekt search options of every search. A package
+// variable saves one heap allocation per search.
 var searchOpts = zoekt.SearchOptions{
-	// MaxDocDisplayCount is intentionally left at 0 (unlimited). Display
-	// limiting is handled by seek's --limit/-n flag during formatting,
-	// which applies after the BM25 sort. A zoekt-level display cap
-	// would silently drop low-ranked files before seek or downstream
-	// pipes (| grep, | head) see them, causing false negatives.
+	// MaxDocDisplayCount stays 0 (no limit). The --limit/-n flag limits the
+	// display when the formatter runs, after the final sort. A Zoekt display
+	// limit would drop low-ranked files before Seek or a pipe (| grep,
+	// | head) sees them. The search would then miss them with no sign.
 	//
 	// Seek searches each shard with Zoekt's per-shard searcher, which reads
 	// only ShardMaxMatchCount. It stays at math.MaxInt so that every match in
@@ -51,7 +50,7 @@ type searchConfig struct {
 	// opts holds the Zoekt options. It is never nil.
 	opts *zoekt.SearchOptions
 	// bm25 marks a lexical search (the strict query, or the relaxed rank of
-	// a model query) whose hits the command rescores with one global average
+	// a model query). The command rescores its hits with one global average
 	// file length.
 	bm25              bool
 	afterOnly         bool
@@ -79,10 +78,12 @@ func defaultSearchConfig() searchConfig {
 	return searchConfig{opts: &searchOpts}
 }
 
-// explicitSearchConfig limits the context count to zoektShardFormatBytes: no
-// document holds more lines than a shard holds bytes, so the cap shows the
-// same lines. Zoekt adds the line number to this count, and a value near
-// math.MaxInt would overflow and drop every line after the match.
+// explicitSearchConfig returns the search config of a context flag
+// (--after-context or --context). It limits the context count to
+// zoektShardFormatBytes: no document holds more lines than a shard holds
+// bytes, so the limit shows the same lines. Zoekt adds the line number to this
+// count, and a value near math.MaxInt would overflow and drop every line after
+// the match.
 func explicitSearchConfig(contextLines int, afterOnly bool) searchConfig {
 	opts := searchOpts
 	opts.NumContextLines = min(contextLines, zoektShardFormatBytes)
@@ -150,13 +151,13 @@ func loadShardPaths(paths []string) ([]zoekt.Searcher, error) {
 	return searchers, nil
 }
 
-// errShardUnloadable marks index damage: a shard that exists but cannot be
-// opened (truncated, unreadable, a directory, or a dangling symlink), or an
+// errShardUnloadable marks index damage. That is a shard that exists but cannot
+// be opened (truncated, unreadable, a directory, or a dangling symlink), or an
 // index with no shard. openNode removes the family manifest that the read saw
 // (removeDamagedFamilyManifest) and opens the node once more.
 //
-// The repair covers both families: with no manifest, the committed family
-// rebuilds (gitBuildPlan.committed), and the uncommitted family takes no keep
+// The repair covers both families. With no manifest, the committed family
+// rebuilds (gitBuildPlan.committed). The uncommitted family then takes no keep
 // and no delta (uncommittedDeltaPossible), so it rebuilds in full.
 var errShardUnloadable = errors.New("index damage")
 
@@ -193,8 +194,8 @@ func parseQueryHalves(pattern string) (raw, strict query.Q, halves map[query.Q]s
 }
 
 // compileRegexpAtoms compiles each regexp atom of q as Zoekt does
-// (index/matchtree.go regexpPattern and MustCompile): a regexp that Go's
-// parser rejects after Zoekt's simplification, such as a{1,501}, is a query
+// (index/matchtree.go regexpPattern and MustCompile). Go's parser can reject
+// a regexp after Zoekt's simplification, such as a{1,501}. Then it is a query
 // error, not a panic in the search.
 // TODO(https://github.com/sourcegraph/zoekt/issues/1188): drop this check
 // once Zoekt returns the compile error.
@@ -229,9 +230,9 @@ func compileRegexpAtoms(q query.Q) error {
 
 // parsePlainDescriptionFallback keeps programming names such as C++ usable.
 // Zoekt parses bare terms as regular expressions, so a valid programming name
-// can otherwise fail the whole query. Only after Zoekt rejects the query, it
-// quotes each programming name (C++, X[], X(), with :: qualifiers) and parses
-// the rewritten query again, so filters keep their meaning. A name
+// can otherwise fail the whole query. It runs only after Zoekt rejects the
+// query. It quotes each programming name (C++, X[], X(), with :: qualifiers)
+// and parses the rewritten query again, so filters keep their meaning. A name
 // such as at() is also a valid expression, but next to C++ it means the
 // literal name. The quoted term parses to the literal name, which the model
 // reads.
@@ -302,8 +303,8 @@ func searchShards(
 ) ([]zoekt.FileMatch, error) {
 	q := userQ
 	if scope != nil {
-		// Zoekt gathers no match under a file-name type, so the scope filters
-		// the files and adds no file-name term to their BM25 score: a file in
+		// Zoekt gathers no match under a file-name type. So the scope filters
+		// the files and adds no file-name term to their BM25 score. A file in
 		// the scope scores as in an unscoped search. Unlike a double
 		// negation, it keeps Zoekt's shard and file skips.
 		q = query.NewAnd(q, &query.Type{Type: query.TypeFileName, Child: scope})
@@ -327,10 +328,10 @@ func closeShards(searchers []zoekt.Searcher) {
 	}
 }
 
-// bm25ShardParts prepares the rescore of a bm25 search: it records
-// each shard's counts for the command's average, asks Zoekt for its score
-// debug line, and returns the function that rebuilds each hit's parts. Other
-// searches get nil.
+// bm25ShardParts prepares the rescore of a bm25 search. It records each
+// shard's counts for the command's average and asks Zoekt for its score debug
+// line. It returns the function that rebuilds each hit's parts. Other searches
+// get nil.
 func bm25ShardParts(ctx context.Context, searchers []zoekt.Searcher, paths []string, q query.Q, config *searchConfig) (func(int, []zoekt.FileMatch), error) {
 	command, ok := ctx.Value(bm25CommandKey{}).(*bm25Command)
 	if !ok || !config.bm25 || !config.opts.UseBM25Scoring || len(paths) != len(searchers) {
@@ -376,9 +377,9 @@ func bm25ShardParts(ctx context.Context, searchers []zoekt.Searcher, paths []str
 	opts := *config.opts
 	opts.DebugScore = true
 	config.opts = &opts
-	// The clone keeps context lines for the best files by score. With
-	// one node these shards are all of the command's, so each hit gets its
-	// final score here (with one shard Zoekt's score is final). Otherwise the
+	// The clone keeps context lines for the best files by score. With one
+	// node, these shards are all the shards of the command. So each hit gets
+	// its final score here (with one shard, Zoekt's score is final). Else the
 	// command rescore can reorder the files after the clone, and every strict
 	// file keeps its context.
 	global, final := 0.0, false
@@ -403,8 +404,8 @@ func bm25ShardParts(ctx context.Context, searchers []zoekt.Searcher, paths []str
 		}
 	}
 	return func(index int, files []zoekt.FileMatch) {
-		// One hit's rebuild reads only that hit: the hits of one shard
-		// spread over the host's CPUs, so the shard with the most ambiguous
+		// One hit's rebuild reads only that hit. So the hits of one shard
+		// spread over the host's CPUs, and the shard with the most ambiguous
 		// lines does not hold the search.
 		workers := min(runtime.GOMAXPROCS(0), max(1, len(files)/bm25FilesPerWorker))
 		var group sync.WaitGroup
@@ -420,8 +421,8 @@ func bm25ShardParts(ctx context.Context, searchers []zoekt.Searcher, paths []str
 }
 
 // bm25FilesPerWorker is the share of a shard's hits below which one more
-// goroutine costs more than it saves. On the Kubernetes repository, whose
-// shards hold few hits each, 4 instead of 64 took the rebuild phase of
+// goroutine costs more than it saves. The Kubernetes repository has few hits
+// per shard. There, 4 instead of 64 took the rebuild phase of
 // `case:yes func Convert` from 5.97 to 2.85 ms (all 26 shards, median of 15
 // runs). The end-to-end search time did not change measurably.
 const bm25FilesPerWorker = 4
@@ -451,11 +452,11 @@ func searchLoadedShards(
 		roundScores(r.Files)
 		return r.Files, nil
 	}
-	// The shards fan out across GOMAXPROCS goroutines: shardMax drives the
-	// shard count into the hundreds for multi-GiB corpora, and parallel
-	// dispatch turns the query cost from the sum of the shards into their
-	// maximum. One shard needs no goroutine. Every shard search runs to its
-	// end, and the first failed shard in order gives the error.
+	// The shard searches run on GOMAXPROCS goroutines. shardMax gives a
+	// corpus of many GiB hundreds of shards, and parallel searches make the
+	// query cost the maximum of the shards, not their sum. One shard needs no
+	// goroutine. Every shard search runs to its end, and the first failed
+	// shard in order gives the error.
 	results := make([][]zoekt.FileMatch, len(searchers))
 	errs := make([]error, len(searchers))
 	if len(searchers) == 1 {
@@ -486,17 +487,22 @@ func searchLoadedShards(
 	return cloneFileMatches(files, config), nil
 }
 
-// zoektSearch runs one Zoekt shard search; zoektList lists one shard's
-// repositories; zoektOpen parses one shard file; zoektReadMetadata reads the
-// repository records of one shard file; zoektShardCall runs any other Zoekt
-// call that reads shard files (a delta Builder reads the records of the old
-// shards). Zoekt's index package panics where it could return an error, and
-// its own sharded searcher recovers the panic at the shard boundary
-// (search.searchOneShard). Seek calls the shards itself, so every Zoekt shard
-// call goes through these five functions. A memory fault in a damaged mapping
-// becomes a panic too (debug.SetPanicOnFault). They cover only the Zoekt call:
-// a panic in Seek's own code still stops the process, so a Seek bug is not
-// taken for index damage.
+// zoektSearch runs one Zoekt shard search. It is one of five functions that
+// recover the panics of Zoekt shard calls:
+//   - zoektSearch runs one shard search;
+//   - zoektList lists one shard's repositories;
+//   - zoektOpen parses one shard file;
+//   - zoektReadMetadata reads the repository records of one shard file;
+//   - zoektShardCall runs any other Zoekt call that reads shard files (a delta
+//     Builder reads the records of the old shards).
+//
+// Zoekt's index package panics where it could return an error. Its own sharded
+// searcher recovers the panic at the shard boundary (search.searchOneShard).
+// Seek calls the shards itself, so every Zoekt shard call goes through these
+// five functions. A memory fault in a damaged mapping becomes a panic too
+// (debug.SetPanicOnFault). They cover only the Zoekt call. A panic in Seek's
+// own code still stops the process, so a Seek bug is not taken for index
+// damage.
 func zoektSearch(ctx context.Context, searcher zoekt.Searcher, q query.Q, opts *zoekt.SearchOptions) (_ *zoekt.SearchResult, err error) {
 	defer recoverShardPanic(&err)
 	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
@@ -534,9 +540,9 @@ func zoektReadMetadata(path string) (_ []*zoekt.Repository, err error) {
 	return repos, shardCallError(err)
 }
 
-// shardCallError marks a Zoekt error that names a read past the end of the
-// shard file (index.mmapedIndexFile.Read, "out of bounds:") as index damage:
-// only shard offsets that do not match the file give it.
+// shardCallError marks as index damage a Zoekt error that names a read past
+// the end of the shard file (index.mmapedIndexFile.Read, "out of bounds:").
+// Only shard offsets that do not match the file give it.
 func shardCallError(err error) error {
 	if err != nil && strings.Contains(err.Error(), "out of bounds: ") {
 		return fmt.Errorf("%w: %w", errShardUnloadable, err)
@@ -554,16 +560,19 @@ func recoverShardPanic(err *error) {
 }
 
 // shardSearchPanic turns the panic of one Zoekt shard call into an error.
-// Index damage, which openNode repairs with one rebuild, is a panic that names
-// a corrupt shard (index.contentProvider.panicCorrupt) or a corrupt index
-// (index/eval.go: a damaged subRepos section), or a Go runtime error (an index
-// or slice bound, or a memory fault): shard bytes that do not match their
-// offsets give these. In a census of single-byte changes to one shard,
-// 37 gave the corrupt-shard panic and 43 a runtime error. Zoekt's other
-// panics are strings, such as the one for type:repo, type:filematch or a
-// negated case:, and fail only this node, with one warning.
-// TODO(https://github.com/sourcegraph/zoekt/issues/1189): Zoekt returns an
-// error for type:repo and type:filematch; then that error names the cause.
+// openNode repairs index damage with one rebuild. Index damage is one of these
+// panics, which shard bytes that do not match their offsets give:
+//   - a panic that names a corrupt shard (index.contentProvider.panicCorrupt);
+//   - a panic that names a corrupt index (index/eval.go: a damaged subRepos
+//     section);
+//   - a Go runtime error (an index or slice bound, or a memory fault).
+//
+// In a census of single-byte changes to one shard, 37 gave the corrupt-shard
+// panic and 43 a runtime error. Zoekt's other panics are strings, such as the
+// one for type:repo, type:filematch or a negated case:. They fail only this
+// node, with one warning.
+// TODO(https://github.com/sourcegraph/zoekt/issues/1189): when Zoekt returns
+// an error for type:repo and type:filematch, that error names the cause.
 func shardSearchPanic(recovered any) error {
 	err, ok := recovered.(error)
 	if !ok {
@@ -577,9 +586,9 @@ func shardSearchPanic(recovered any) error {
 	return fmt.Errorf("shard search panicked: %w", err)
 }
 
-// roundScores rounds each score once, after the parts read the exact value:
+// roundScores rounds each score once, after the parts read the exact value.
 // Zoekt sums a score over a Go map, so equal true scores differ in their last
-// bits from run to run, and rounded ties sort by name.
+// bits from run to run. Rounded ties sort by name.
 // TODO(https://github.com/sourcegraph/zoekt/issues/1187): drop the rounding
 // once Zoekt sums in a fixed order.
 func roundScores(files []zoekt.FileMatch) {

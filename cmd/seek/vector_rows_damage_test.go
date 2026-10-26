@@ -10,10 +10,10 @@ import (
 	"testing"
 )
 
-// damageVectorRows changes the content ID of every row of name in every
-// rows.bin below root, then records the new file as trusted, as damage that
-// the stat check does not see would leave it. It returns the number of rows
-// that it changed.
+// damageVectorRows changes the content ID of each row of name in each
+// semanticRowsFile below root, out of the build directories. It then records
+// the new file as trusted, as media damage that the stat check does not see
+// would leave it. It returns the number of rows that it changed.
 func damageVectorRows(t *testing.T, root, name string) int {
 	t.Helper()
 	changed := 0
@@ -63,8 +63,9 @@ func damageVectorRows(t *testing.T, root, name string) int {
 	return changed
 }
 
-// repairWarnings counts the warnings of logs from record from on: shard
-// repairs, vector repairs, and skipped nodes. It also returns the record count.
+// repairWarnings counts the warnings in logs from the record at index from:
+// shard repairs, vector repairs, and skipped nodes. It also returns the record
+// count.
 func repairWarnings(logs *testLogRecorder, from int) (shards, vectors, skips, records int) {
 	all := logs.Records()
 	for _, record := range all[from:] {
@@ -81,13 +82,13 @@ func repairWarnings(logs *testLogRecorder, from int) (shards, vectors, skips, re
 }
 
 // TestDamagedVectorRowsAreRepairedOnce damages the rows of one file in a
-// folder node and in a Git node, as media damage that the stat check does not
-// see would. The test model accepts every row, so semantic.go, which holds no
+// folder node and in a Git node. This is media damage that the stat check does
+// not see. The test model accepts every row. So semantic.go, which holds no
 // query word, prints exactly when the search binds its rows. The first search
 // repairs the shards, finds the same mismatch on fresh shards, and unbinds the
-// vectors: one warning of each, the text hit, and no semantic.go. The next two
-// searches print semantic.go with no warning, and the third makes no build
-// directory (newBuildDir), so it builds no folder index.
+// vectors. It gives one warning of each, the text hit, and no semantic.go. The
+// next two searches print semantic.go with no warning. In the folder node, the
+// third search makes no build directory (newBuildDir), so it builds no index.
 func TestDamagedVectorRowsAreRepairedOnce(t *testing.T) {
 	requireTools(t)
 	for _, kind := range []string{"folder", "git"} {
@@ -147,14 +148,14 @@ func TestDamagedVectorRowsAreRepairedOnce(t *testing.T) {
 
 // TestDamagedRowsAreRepairedWhileAnotherFileChanges damages the rows of one
 // folder file while another file changes during every build. Each search sees
-// the tree change and reads the node again; the retry judges each file
-// against the published folder manifest, so the changing file gives no vector
-// hit, and the unchanged file with damaged rows makes the vectors rebuild.
-// The next search finds the damaged file with no warning. The test model
-// accepts every row, so semantic.go and writer.log, which hold no query word,
-// print exactly when the search binds their rows: both print in the warm-up,
-// writer.log prints in no search while it changes, and semantic.go prints
-// again after the repair.
+// the tree change and reads the node again. The retry compares each file with
+// the published folder manifest (evidenceMismatch). So the changing file gives
+// no vector hit, and the unchanged file with damaged rows makes the vectors
+// rebuild. The next search finds the damaged file with no warning. The test
+// model accepts every row. So semantic.go and writer.log, which hold no query
+// word, print exactly when the search binds their rows. Both print in the
+// warm-up. writer.log prints in no search while it changes, and semantic.go
+// prints again after the repair.
 func TestDamagedRowsAreRepairedWhileAnotherFileChanges(t *testing.T) {
 	requireTools(t)
 	home := setTestUserCache(t)
@@ -205,10 +206,10 @@ func TestDamagedRowsAreRepairedWhileAnotherFileChanges(t *testing.T) {
 }
 
 // TestFileOfHalfTheShardFormatGetsNoVectorRows builds a folder under scaled
-// guard limits (a 10 MiB shard format). A 6 MiB file always passes the format
-// (at least 2 bytes of shard for each byte of content), so the shard guard
-// keeps it by name only and the vector build embeds none of it. A 2 MiB file
-// gets its rows.
+// guard limits (a 10 MiB shard format). A shard takes at least 2 bytes for
+// each byte of content, so the shard of a 6 MiB file always passes the format.
+// The shard guard then keeps the file by name only, and the vector build
+// embeds none of it. A 2 MiB file gets its rows.
 func TestFileOfHalfTheShardFormatGetsNoVectorRows(t *testing.T) {
 	requireTools(t)
 	swapGuardLimitsForTest(t)
@@ -235,8 +236,8 @@ func TestFileOfHalfTheShardFormatGetsNoVectorRows(t *testing.T) {
 }
 
 // TestDamagedRowsRepairWaitsForNoBuild checks that the repair of damaged rows
-// keeps every generation while a build holds the node's build lock (a build
-// can still link their graph files). Once the lock is free, the repair removes
+// keeps every generation while a build holds the node's build lock. That build
+// can still link their graph files. Once the lock is free, the repair removes
 // the generations and the bound descriptor (joinedGenerationFile).
 func TestDamagedRowsRepairWaitsForNoBuild(t *testing.T) {
 	cacheDir := t.TempDir()

@@ -175,7 +175,7 @@ static int seek_usearch_bitmap_filter(uint64_t key, void* raw_state) {
 // seek_usearch_search_many searches each query with up to count keys. A NULL
 // bits searches every vector; other bits filter keys with the generation row
 // bitmap, and row_base is the shard's first row. The cosine metric gives the
-// distance 1 - cosine, so each hit score is the cosine of the int8 codes of
+// distance 1 - cosine. So each hit score is the cosine of the int8 codes of
 // the query and the key.
 static void seek_usearch_search_many(
     seek_usearch_index_t index,
@@ -239,7 +239,7 @@ const (
 	//
 	// The graphs use USearch's cosine metric on int8 codes. The int8 cast
 	// truncates, so cast norms differ by up to 4 %. With the inner product, a
-	// key can then be nearer to another key than to itself, and no search
+	// key can then be nearer to another key than to itself. Then no search
 	// reaches 3.68 % of the keys of a Kubernetes checkout. The cosine divides
 	// by both norms: 0.004 % of the keys stay unreachable, and the graphs take
 	// the same time to build. USearch 2.26.4 or later is necessary: earlier
@@ -254,20 +254,20 @@ const (
 	semanticUSearchThreads = 1
 	// Each native shard call first requests this many approximate vector keys
 	// per query token. A token whose last key still reaches
-	// semanticUSearchDeepenSimilarity searches again with twice as many keys,
-	// until the shard has no more or the shard saturates: no count cuts the
-	// candidates.
+	// semanticUSearchDeepenSimilarity searches again with twice as many keys.
+	// It stops when the shard has no more keys or saturates, so no count cuts
+	// the candidates.
 	semanticUSearchVectorsPerQuery = 256
-	// A token whose last key still reaches semanticUSearchDeepenSimilarity
-	// when its next request would pass this many keys saturates the shard:
-	// the walk of the shard stops, and every allowed row of the shard becomes
-	// a candidate for the exact fine scores. The last token of each query
-	// window, a special token, is near the first coarse centroid of almost
-	// every row. Without this rule, that token walks each graph to all of its
-	// keys. On a Kubernetes checkout (20 queries), this rule made the vector
-	// search 20 % faster, and 24 % faster with lang:go. The candidates then
-	// held every row within the radius that an exact scan finds, also the
-	// rows whose keys the graph cannot reach.
+	// A token saturates the shard when its last key still reaches
+	// semanticUSearchDeepenSimilarity and its next request would pass this
+	// many keys. Then the walk of the shard stops, and every allowed row of
+	// the shard becomes a candidate for the exact fine scores. The last token
+	// of each query window, a special token, is near the first coarse
+	// centroid of almost every row. Without this rule, that token walks each
+	// graph to all of its keys. On a Kubernetes checkout (20 queries), this
+	// rule made the vector search 20 % faster, and 24 % faster with lang:go.
+	// The candidates then held every row within the radius that an exact scan
+	// finds, also the rows whose keys the graph cannot reach.
 	semanticUSearchSaturationKeys = 1_024
 	// Revision 3 cuts the shards at file boundaries and gives each shard keys
 	// that start at 0 (semantic_usearch_layout.go).
@@ -299,8 +299,9 @@ func ensureSemanticUSearchRuntime() error {
 }
 
 // semanticUSearchCompatibility names the graphs that this binary can read and
-// reuse: the loaded runtime version, the digest of the bundled library (two
-// builds of one version can differ), and the layout.
+// reuse. The name holds the loaded runtime version, the digest of the bundled
+// library, and the layout. Two builds of one version can differ, so the
+// digest is part of the name.
 func semanticUSearchCompatibility() (string, error) {
 	version, err := semanticUSearchRuntime()
 	if err != nil {
@@ -569,10 +570,10 @@ func buildSemanticUSearchStream(
 	done <- result
 }
 
-// prepareSemanticUSearchShard gives the graph of one planned shard: the file
-// of a published shard with the same ID, copied now or verified for a later
-// link, or a new build in dir. A source that fails its check costs only the
-// build.
+// prepareSemanticUSearchShard gives the graph of one planned shard. It takes
+// the file of a published shard with the same ID, copied now or verified for a
+// later link. Else it builds a new graph in dir. A source that fails its check
+// costs only the build.
 func prepareSemanticUSearchShard(
 	ctx context.Context,
 	dir string,
@@ -625,9 +626,9 @@ func prepareSemanticUSearchShard(
 	return shard, nil, nil
 }
 
-// placeSemanticUSearchShards links each verified file of reuses that is not
-// placed yet in dir, on workers goroutines, and records the check of each new
-// file in shards.
+// placeSemanticUSearchShards links into dir each verified file of reuses that
+// is not placed yet. It runs on workers goroutines and records the check of
+// each new file in shards.
 func placeSemanticUSearchShards(
 	dir string,
 	reuses map[int]semanticUSearchShardReuse,
@@ -746,8 +747,8 @@ func buildSemanticUSearchShard(
 
 // semanticUSearchQueryShard defines one shard search. limit is the number of
 // vector keys that the first request asks for each query token, not a
-// semantic row count; a token can search again with more. filtered is true
-// only when the shard must use the bitmap predicate.
+// semantic row count. A token can search again with more keys. filtered is
+// true only when the shard must use the bitmap predicate.
 type semanticUSearchQueryShard struct {
 	index    int
 	limit    int
@@ -778,6 +779,9 @@ type semanticUSearchCandidateSet struct {
 // exact scoring.
 const semanticFilteredExactShardDivisor = 4
 
+// semanticUSearchOptionalExactShard reports whether a partial shard of rows
+// rows, allowed of them selected, goes to exact scoring at the
+// semanticFilteredExactShardDivisor boundary.
 func semanticUSearchOptionalExactShard(allowed, rows uint64) bool {
 	// Add one row of tolerance so integer shard boundaries do not turn a 25%
 	// periodic selection into the other route.
@@ -795,11 +799,12 @@ func semanticUSearchOptionalExactShard(allowed, rows uint64) bool {
 //
 // When the native request count equals all allowed keys, native search would
 // have to return every allowed key to fill the request. Exact scoring avoids
-// that sparse graph case. No work budget sends exact shards to native search:
-// a native search that saturates its shard also gives every allowed row of
-// the shard to the exact scores, after a graph walk. On a Kubernetes checkout
-// with a _test.go filter (18 % of the rows), a budget of one full shard at
-// 128 query tokens saved no time and found the same rows.
+// that sparse graph case. No work budget sends exact shards to native search.
+// A native search that saturates its shard also gives every allowed row of
+// the shard to the exact scores, after a graph walk. A measurement used a
+// Kubernetes checkout with a _test.go filter (18 % of the rows). There, a
+// budget of one full shard at 128 query tokens saved no time and found the
+// same rows.
 func planSemanticUSearchShards(
 	ctx context.Context,
 	generation *semanticGeneration,
@@ -874,8 +879,8 @@ func planSemanticUSearchShards(
 // searchSemanticUSearchCandidatesWithMask executes the shard plan. A nil mask
 // sends every shard to unfiltered native search. A partial mask uses the route
 // table in planSemanticUSearchShards. The merger takes the row of every vector
-// key that a shard returns and every allowed row of a saturated shard, joins
-// the exact rows, and returns one sorted unique row set.
+// key that a shard returns, and every allowed row of a saturated shard. It
+// adds the exact rows and returns one sorted unique row set.
 func searchSemanticUSearchCandidatesWithMask(
 	ctx context.Context,
 	generation *semanticGeneration,
@@ -893,6 +898,9 @@ func searchSemanticUSearchCandidatesWithMask(
 	return executeSemanticUSearchPlan(ctx, generation, queryVectors, mask, plan)
 }
 
+// executeSemanticUSearchPlan runs the native jobs of plan on up to GOMAXPROCS
+// workers. It merges their rows with plan.exactRows into one sorted unique
+// row set.
 func executeSemanticUSearchPlan(
 	ctx context.Context,
 	generation *semanticGeneration,
@@ -962,7 +970,7 @@ func executeSemanticUSearchPlan(
 		close(results)
 	}()
 	// Only the row set reaches the exact scores, so each shard's keys go to a
-	// bitmap of the generation's rows: a merge in score order costs time
+	// bitmap of the generation's rows. A merge in score order costs time
 	// quadratic in the shard count.
 	rows := generation.manifest.Rows
 	seen := make([]uint64, (rows+63)/64)
@@ -1070,13 +1078,13 @@ func markSemanticRowRange(seen []uint64, rows, start, end uint64, mask *semantic
 // tokens through one synchronous C batch of up to limit keys each. The batch
 // loops over normal USearch calls and cannot stop in its middle. A token whose
 // last key still reaches semanticUSearchDeepenSimilarity searches again alone
-// with twice the keys, until the shard has no more; each token keeps only the
+// with twice the keys, until the shard has no more. Each token keeps only the
 // keys within that bound. When such a token's next request would pass
 // semanticUSearchSaturationKeys, the search stops and reports a saturated
-// shard with no hits: the caller then takes every allowed row of the shard.
+// shard with no hits. The caller then takes every allowed row of the shard.
 // A filtered batch requires a partial global-row bitmap. The shard's keys
-// start at 0; each returned semanticHit.row holds the generation vector key,
-// semanticUSearchVectorKey(shard.Start, 0) plus the shard key, and the caller
+// start at 0. Each returned semanticHit.row holds the generation vector key:
+// semanticUSearchVectorKey(shard.Start, 0) plus the shard key. The caller
 // later converts it to a semantic row. This boundary rejects keys outside the
 // shard, filtered-out rows, duplicate keys, and non-finite distances.
 func searchSemanticUSearchShardTokens(
@@ -1292,9 +1300,9 @@ func callSemanticUSearch(call func(*C.seek_usearch_error_t)) error {
 	return nil
 }
 
-// semanticUSearchMasked searches the rows that mask allows (nil: every row):
-// USearch or a direct exact scan finds the candidates, and the exact fine
-// scores keep the candidates that reach floor, best first.
+// semanticUSearchMasked searches the rows that mask allows (nil: every row).
+// USearch or a direct exact scan finds the candidates. The exact fine scores
+// keep the candidates that reach floor, best first.
 func semanticUSearchMasked(
 	ctx context.Context,
 	generation *semanticGeneration,
@@ -1341,10 +1349,10 @@ func semanticUSearchMasked(
 	return exactSemanticSortedRows(ctx, generation.vectors, candidates.query, candidates.rows, floor)
 }
 
-// semanticUSearchExactFallback uses a full exact scan for a small generation.
-// For a larger generation it gets approximate USearch candidates and then
-// exact-scores their mapped vectors. A native error other than cancellation
-// falls back to a full exact scan.
+// semanticUSearchExactFallback uses a full exact scan for a generation of at
+// most semanticUSearchVectorsPerQuery rows. For a larger generation it gets
+// approximate USearch candidates and then exact-scores their mapped vectors.
+// A native error other than cancellation falls back to a full exact scan.
 func semanticUSearchExactFallback(
 	ctx context.Context,
 	generation *semanticGeneration,

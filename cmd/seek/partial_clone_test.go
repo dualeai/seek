@@ -13,8 +13,8 @@ import (
 )
 
 // TestPartialCloneIndexesWithoutFetch searches a blobless sparse clone. A
-// search must not fetch: the blob outside the sparse cone stays missing, its
-// file is searchable by name, and one WARN gives the count.
+// search must not fetch. The blob outside the sparse cone stays missing, its
+// file is searchable by name, and one warning gives the count.
 func TestPartialCloneIndexesWithoutFetch(t *testing.T) {
 	requireTools(t)
 	clone := newPartialClone(t)
@@ -85,29 +85,36 @@ func TestPartialCloneNeedsNoLazyFetchGit(t *testing.T) {
 		t.Fatal(err)
 	}
 	for dir := range strings.Lines(string(data)) {
-		if pathWithin(canonicalCorpusPath(clone), canonicalCorpusPath(strings.TrimSpace(dir))) {
+		if pathWithin(resolvedPath(t, clone), resolvedPath(t, strings.TrimSpace(dir))) {
 			t.Fatalf("a Git command ran in the partial clone: %s", data)
 		}
 	}
 
-	// Found below a folder seed, the clone is a child node: one warning, and
-	// the search goes on without it.
+	// Found below a folder seed, the clone is a child node. It gets one
+	// warning, and the search goes on without it.
 	logs = captureTestLogs(t, slog.LevelWarn)
 	out, err := seek(t, "--lexical-only", "zqpartialmarker", filepath.Dir(clone))
 	if err != nil {
 		t.Fatalf("run: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "source") || strings.Contains(out, canonicalCorpusPath(clone)) {
+	// The headers start with the operand as typed, so they hold the clone
+	// path as typed, not its resolved path.
+	below := func(dir string) func(string) bool {
+		return func(header string) bool { return strings.HasPrefix(header, dir+string(filepath.Separator)) }
+	}
+	headers := headerPaths(out)
+	if !slices.ContainsFunc(headers, below(filepath.Join(filepath.Dir(clone), "source"))) ||
+		slices.ContainsFunc(headers, below(clone)) {
 		t.Fatalf("want the source repository searched and the partial clone not:\n%s", out)
 	}
-	if len(logs.Records()) == 0 {
-		t.Fatal("no warning for the partial clone child")
+	if records := logs.Records(); len(records) != 1 || !logsMention(records, "a partial clone needs Git 2.45 or later") {
+		t.Fatalf("warnings=%v, want one partial-clone version warning for the child", records)
 	}
 }
 
-// TestPartialCloneBlobArrivesLater fetches a missing blob after a search: the
+// TestPartialCloneBlobArrivesLater fetches a missing blob after a search. The
 // next search indexes its content in the lexical and the semantic data. A
-// search with an unchanged object store runs no object check, and a fetch that
+// search with an unchanged object store runs no object check. A fetch that
 // brings none of the missing blobs costs one check.
 func TestPartialCloneBlobArrivesLater(t *testing.T) {
 	requireTools(t)
@@ -195,7 +202,8 @@ func TestPartialCloneBlobArrivesLater(t *testing.T) {
 }
 
 // newPartialClone makes a blobless sparse clone with one blob outside the
-// sparse cone, plus the extra files outside the cone.
+// sparse cone, plus the extra files outside the cone. It also sets a new user
+// cache for the test.
 func newPartialClone(t *testing.T, extra ...string) string {
 	t.Helper()
 	f := newGraphFixture(t)
@@ -231,8 +239,9 @@ func assertOneMissingBlobWarning(t *testing.T, logs *testLogRecorder) {
 // TestPartialCloneBlobArrivesDuringDelta fetches a missing blob after the
 // recheck of a delta build and before its reads. A Git shim runs the fetch
 // when the recheck ends: the first `git cat-file --batch-command` of the
-// delta search. The record keeps the store from before the recheck, so the
-// next search sees the change and indexes the content.
+// delta search. The record keeps the store from before the recheck
+// (buildObjectStoreFingerprint). So the next search sees the change and
+// indexes the content.
 func TestPartialCloneBlobArrivesDuringDelta(t *testing.T) {
 	requireTools(t)
 	clone := newPartialClone(t)
@@ -290,8 +299,8 @@ func TestPartialCloneBlobArrivesDuringDelta(t *testing.T) {
 // TestPartialCloneSemanticPublishStops stops the semantic publish after a
 // blob arrived, as a kill there would. The publish replaces the generation of
 // HEAD, and each folder of that generation takes no change, so the publish
-// fails. The pending record still names the blob, so the next descriptive
-// search rebuilds the generation.
+// fails. The pending record (writePendingMissingBlobRecord) still names the
+// blob, so the next descriptive search rebuilds the generation.
 func TestPartialCloneSemanticPublishStops(t *testing.T) {
 	requireTools(t)
 	clone := newPartialClone(t)

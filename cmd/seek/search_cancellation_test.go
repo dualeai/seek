@@ -15,11 +15,12 @@ import (
 
 // cancellationTestModel is the test model with a build that fails
 // (errRerankUnavailable), so no vector exists and only strict hits can print.
-// Its query preparation or its scoring, as failureStage says, calls fail and
-// returns that error, so a test can cancel the command inside the model call.
-// A test with it proves the route after a model failure: the strict fallback
-// for an ordinary error, no output and the cancellation for a cancelled
-// command. It cannot prove that a cancellation stops a real model call in
+// With failureStage "prepare", its query preparation calls fail and returns
+// that error. Else the preparation succeeds, and its scoring does that. So a
+// test can cancel the command inside the model call.
+// A test with it proves the route after a model failure. An ordinary error
+// gives the strict fallback. A cancelled command gives no output and the
+// cancellation. It cannot prove that a cancellation stops a real model call in
 // time, or anything about vectors, meaning or rank.
 type cancellationTestModel struct {
 	hybridTestScorer
@@ -47,6 +48,10 @@ func (model *cancellationTestModel) ScoresWithSemanticQuery(
 	return nil, model.fail()
 }
 
+// TestRunSearchCommandLexicalModelCancellation fails the model in query
+// preparation or in scoring, with an ordinary error or with a cancellation of
+// the command. An ordinary error prints the strict lexical result. A
+// cancellation prints nothing and returns context.Canceled.
 func TestRunSearchCommandLexicalModelCancellation(t *testing.T) {
 	for _, stage := range []string{"prepare", "score"} {
 		for _, cancelled := range []bool{false, true} {
@@ -104,6 +109,8 @@ func TestRunSearchCommandLexicalModelCancellation(t *testing.T) {
 	}
 }
 
+// cancellationTestShard is a Zoekt shard whose Search runs search and that
+// counts its Close calls.
 type cancellationTestShard struct {
 	zoekt.Searcher
 	search     func(context.Context) (*zoekt.SearchResult, error)

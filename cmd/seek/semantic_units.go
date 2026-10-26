@@ -17,15 +17,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// The content-addressed unit store: the windows that a node's bound generation
-// replaced, keyed by their model input. A build copies a window from a live
-// generation or from the store, so content that any generation embedded is
-// never embedded again while the store holds it: a branch switch back and
-// forth embeds nothing new. The store holds only superseded windows (the live
-// generations hold the rest), so it adds little disk. It sits in the corpora
-// tree under the one cache budget, and its segments go first when the cache
-// is over budget: no live generation references them (reachability first),
-// oldest first.
+// The content-addressed unit store holds the windows that a node's bound
+// generation replaced, keyed by their model input. A build copies a window
+// from a live generation or from the store. So the model does not embed again
+// the content that the store holds: a branch switch back and forth embeds
+// nothing new. The store holds only replaced windows (the live generations
+// hold the rest), so it adds little disk. It sits in the corpora tree under
+// the one cache budget. No live generation references its segments, so they
+// go first, oldest first, when the cache is over budget.
 const (
 	semanticUnitsDir         = "units"
 	semanticUnitsMagic       = "SEEKUNIT"
@@ -35,8 +34,8 @@ const (
 )
 
 // semanticUnitsDirFor is the store of one row-key prefix
-// (semanticRowKeyPrefix): a new model, representation, codec, or run time
-// starts a new store.
+// (semanticRowKeyPrefix): a new model, representation, codec, or inference
+// runtime starts a new store.
 func semanticUnitsDirFor(cacheRoot string) string {
 	return filepath.Join(cacheRoot, corporaDir, semanticUnitsDir, hex.EncodeToString(semanticRowKeyPrefix()[:16]))
 }
@@ -118,17 +117,18 @@ func closeSemanticUnits(segments []*semanticUnitSegment) {
 	}
 }
 
-// archiveSupersededUnits writes into the store the windows of the generations
-// in indexDir other than keep that keep and the store do not hold, as one new
-// segment, before the bind removes those generations. The caller holds the
-// node's publish lock. A failure loses only reuse.
+// archiveSupersededUnits writes one new segment into the store before the
+// bind removes the generations of indexDir other than keep. The segment holds
+// the windows of those generations that keep and the store do not hold. The
+// caller holds the node's publish lock. A failure loses only reuse.
 //
-// The new segment also takes in the existing segments, smallest first, while
-// the next one holds at most twice the records taken so far, and those
-// segments go. One segment per bind would grow the store without end, and
-// every build maps and probes each segment (1,000 extra segments cost 180 ms
-// on a one-file change); with the merge the store holds about log2 of its
-// records in segments, and each record is written again about as often.
+// The new segment also takes in existing segments, smallest first, while the
+// next one holds at most twice the records taken so far. Those segments are
+// then removed. With one segment per bind, the segment count would grow with
+// no limit. Every build maps and probes each segment: 1,000 extra segments
+// cost 180 ms on a one-file change. With the merge, the store holds about
+// log2 of its record count in segments. Each record is written again about as
+// often.
 func archiveSupersededUnits(indexDir string, keep ...string) {
 	var others []string
 	for _, dir := range semanticGenerationDirsIn(indexDir, "") {

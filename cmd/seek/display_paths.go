@@ -9,10 +9,11 @@ import (
 	"github.com/sourcegraph/zoekt/query"
 )
 
-// Headers and file: filters read one string per file: the operand as typed,
-// cleaned, plus the path of the file below the operand's root, the ripgrep and
-// git grep rule. With no operand, or ".", it is the path below the cwd with no
-// "./". A file takes the form of the deepest operand that holds it.
+// Headers and file: filters read one string per file. It is the operand as
+// typed and cleaned, plus the path of the file below the operand's root: the
+// ripgrep and git grep rule. With no operand, or ".", it is the path below the
+// cwd with no "./". A file takes the form of the deepest operand that holds
+// it.
 
 // displayOperand is one path operand: its cleaned text ("" for ".") and its
 // canonical root.
@@ -65,9 +66,11 @@ func (operands displayOperands) header(abs string) string {
 }
 
 // headersArePaths reports whether every file of the node at root shows its
-// node-relative path, so a file: filter needs no rewrite: the operand at the
-// root (if any) is ".", no operand above the root is the deepest one that
-// holds it, and every operand below the root is typed as its path below it.
+// node-relative path, so a file: filter needs no rewrite. That is so when
+// three conditions hold:
+//   - The operand at the root, if any, is ".".
+//   - No operand above the root is the deepest one that holds it.
+//   - Every operand below the root is typed as its path below the root.
 func (operands displayOperands) headersArePaths(root string) bool {
 	holder, below := false, false
 	for _, operand := range operands {
@@ -91,8 +94,9 @@ func (operands displayOperands) headersArePaths(root string) bool {
 	return holder || below
 }
 
-// applyHeaders sets the display path of every result and of its copies, and
-// the text of each file-name line, so one result shows one path form.
+// applyHeaders sets the display path of every result and of its copies. It
+// also sets the text of each file-name line, so one result shows one path
+// form.
 func applyHeaders(results []corpusSearchResult, operands displayOperands) {
 	for index := range results {
 		result := &results[index]
@@ -104,8 +108,8 @@ func applyHeaders(results []corpusSearchResult, operands displayOperands) {
 				continue
 			}
 			// The header and the node path share the path below the
-			// operand: a highlight there moves to its place in the header,
-			// and a highlight in a part that the header drops is removed.
+			// operand. A highlight there moves to its place in the header.
+			// A highlight in a part that the header drops is removed.
 			var fragments []zoekt.LineFragmentMatch
 			if name := result.file.FileName; string(line.Line) == name {
 				shared := sharedPathSuffix(headerLine, name)
@@ -170,9 +174,9 @@ func hasFileNameAtom(halves map[query.Q]struct{}, queries ...query.Q) bool {
 }
 
 // nodeHeaderQuery makes the file: atoms of qp match the display path of each
-// file of the node, the string that the header prints: each atom becomes the
+// file of the node: the string that the header prints. Each atom becomes the
 // set of the node's files whose display path it matches, with Zoekt's case
-// rules. The strict, relaxed and mask queries all read the sets, so lexical
+// rules. The strict, relaxed and filter queries all read the sets, so lexical
 // and semantic retrieval keep one rule.
 func nodeHeaderQuery(ctx context.Context, read *nodeRead, qp queryPlan, operands displayOperands) (queryPlan, error) {
 	plan := read.plan
@@ -214,12 +218,7 @@ func nodeHeaderQuery(ctx context.Context, read *nodeRead, qp queryPlan, operands
 			return set
 		}
 		var filter semanticPathFilter
-		switch typed := atom.(type) {
-		case *query.Substring:
-			filter, compileErr = newSemanticSubstringFilter(typed)
-		case *query.Regexp:
-			filter, compileErr = newSemanticRegexpFilter(typed)
-		}
+		filter, compileErr = newSemanticPathFilter(atom)
 		if compileErr != nil {
 			return atom
 		}
@@ -230,9 +229,9 @@ func nodeHeaderQuery(ctx context.Context, read *nodeRead, qp queryPlan, operands
 			}
 		}
 		// The set filters by the header and gives no BM25 term. The clause
-		// atom-or-not-atom filters nothing, and Zoekt gathers the atom's
-		// matches on the index path from it, the term that the atom gives
-		// with path headers: one rule in every layout, which Zoekt computes.
+		// atom-or-not-atom filters nothing. From it, Zoekt gathers the atom's
+		// matches on the index path: the term that the atom gives with path
+		// headers. So every layout has one rule, which Zoekt computes.
 		scored := query.NewAnd(set, query.NewOr(atom, &query.Not{Child: atom}))
 		sets[atom] = scored
 		return scored
@@ -271,8 +270,9 @@ func rewriteFileNameAtoms(qp queryPlan, replace func(query.Q) query.Q) queryPlan
 	return out
 }
 
-// displayHeader is the header of a result, or its node-relative form for a
-// caller that set none.
+// displayHeader is the header of a result. For a result with no header, it is
+// the path joined to its display root with showRoot, else the display name,
+// else the node-relative path.
 func displayHeader(result corpusSearchResult, showRoot bool) string {
 	switch {
 	case result.header != "":

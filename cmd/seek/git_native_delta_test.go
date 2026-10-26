@@ -20,6 +20,9 @@ import (
 	"github.com/sourcegraph/zoekt/query"
 )
 
+// TestReadNativeGitDiffFixedChanges commits an add, a deletion, an edit, a
+// mode change, a type change and a rename. A rename reads as a deletion and
+// an add. Each diff entry has the modes and the path of its change.
 func TestReadNativeGitDiffFixedChanges(t *testing.T) {
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
@@ -84,6 +87,8 @@ func TestReadNativeGitDiffFixedChanges(t *testing.T) {
 	}
 }
 
+// nativeVisibleDocument is one document that a search of an index sees, with
+// the fields that a delta build and a full build must agree on.
 type nativeVisibleDocument struct {
 	name     string
 	content  string
@@ -91,6 +96,8 @@ type nativeVisibleDocument struct {
 	version  string
 }
 
+// nativeVisibleDocuments returns every document that a search of the shards
+// in indexDir sees, after the tombstones, in a fixed order.
 func nativeVisibleDocuments(t testing.TB, indexDir string) []nativeVisibleDocument {
 	t.Helper()
 	searchers, err := loadShards(indexDir)
@@ -133,6 +140,9 @@ func nativeVisibleDocuments(t testing.TB, indexDir string) []nativeVisibleDocume
 	return documents
 }
 
+// assertNativeRepositoryParity fails the test unless every committed shard of
+// deltaDir and fullDir has the repository metadata of the first full shard,
+// apart from the tombstones.
 func assertNativeRepositoryParity(t testing.TB, deltaDir, fullDir string) {
 	t.Helper()
 	fullRepositories := zoektCommittedRepositoryMetadata(t, fullDir)
@@ -298,6 +308,8 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 	}
 }
 
+// prepareNativeDeltaFixture commits base.go in a new repository and builds
+// its index. It returns the repository, its paths and its plan.
 func prepareNativeDeltaFixture(t *testing.T) (string, gitPaths, node) {
 	t.Helper()
 	repoDir := initEmptyGitRepo(t)
@@ -394,11 +406,11 @@ func TestNativeGitTombstonedBytesCompactTheFamily(t *testing.T) {
 }
 
 // TestNativeGitBinaryBlobsCountTheirMarker commits the removal of 8 of 10
-// text files beside a blob of about 10,000 bytes whose NUL byte comes after the
-// reader's probe: the reader sends its content, and Zoekt keeps it by name
-// only. The full build counts the blob as its marker, so 8 dead text files
-// against 2 live ones and the marker build the family in full
-// (deltaNeedsCompaction).
+// text files. Beside them is a blob of about 10,000 bytes whose NUL byte comes
+// after the probe of the reader. The reader sends its content, and Zoekt keeps
+// it by name only. The full build counts the blob as its marker. So 8 dead
+// text files against 2 live ones and the marker make the build replace the
+// family (deltaNeedsCompaction).
 func TestNativeGitBinaryBlobsCountTheirMarker(t *testing.T) {
 	requireTools(t)
 	// A small shardMax puts the floor of deltaNeedsCompaction below the
@@ -428,7 +440,7 @@ func TestNativeGitBinaryBlobsCountTheirMarker(t *testing.T) {
 }
 
 // TestNativeGitDeltaCountsANewBinaryBlobAsItsMarker commits a binary blob of
-// 8,000 bytes. The delta admits it at its size, and its read adds its 36-byte
+// 8,000 bytes. The delta admits it at its size. Its read adds its 36-byte
 // marker, not its 8,000 bytes, to the live bytes of the committed state.
 func TestNativeGitDeltaCountsANewBinaryBlobAsItsMarker(t *testing.T) {
 	requireTools(t)
@@ -456,7 +468,7 @@ func TestNativeGitDeltaCountsANewBinaryBlobAsItsMarker(t *testing.T) {
 
 // TestNativeGitBinaryOnlyCommitsStayDeltas commits 3 changes of only a binary
 // blob of 8,000 bytes beside 30 text files. The delta reads each old blob, so
-// each commit tombstones its 36-byte marker, not its 8,000 bytes: every commit
+// each commit tombstones its 36-byte marker, not its 8,000 bytes. Every commit
 // stays a delta, and the dead bytes grow by 36 each time.
 func TestNativeGitBinaryOnlyCommitsStayDeltas(t *testing.T) {
 	requireTools(t)
@@ -493,6 +505,9 @@ func TestNativeGitBinaryOnlyCommitsStayDeltas(t *testing.T) {
 	}
 }
 
+// TestPrepareNativeGitDeltaFallsBackBeforeSeeding makes the delta not
+// eligible before it links a seed shard. The two causes are a change larger
+// than the build window and a damaged family manifest.
 func TestPrepareNativeGitDeltaFallsBackBeforeSeeding(t *testing.T) {
 	t.Run("payload-window", func(t *testing.T) {
 		repoDir, paths, plan := prepareNativeDeltaFixture(t)
@@ -631,6 +646,8 @@ func TestPrepareNativeGitDeltaRejectsCommittedStateDamage(t *testing.T) {
 	}
 }
 
+// TestPrepareNativeGitDeltaAcceptsExplicitPriority sets zoekt.priority before
+// the first build. Seek reads no zoekt.* config, so the delta stays eligible.
 func TestPrepareNativeGitDeltaAcceptsExplicitPriority(t *testing.T) {
 	requireTools(t)
 	repoDir := initGitRepo(t, "base.go", "package base\n")
@@ -711,7 +728,7 @@ func TestNativeDeltaWithNullShardMetadataIsNoCrash(t *testing.T) {
 }
 
 // TestNativeDeltaSeedLinkErrorFallsBack gives the delta a seed shard that
-// does not link: a full build links no seed, so the error wraps both
+// does not link. A full build links no seed. So the error wraps
 // errNativeDeltaFallback, which asks for a full build, and the link error.
 func TestNativeDeltaSeedLinkErrorFallsBack(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "git-x_v16.00000.zoekt")
@@ -722,12 +739,11 @@ func TestNativeDeltaSeedLinkErrorFallsBack(t *testing.T) {
 }
 
 // TestNativeDeltaOnADamagedRecordBuildsInFull commits three times, so the
-// committed family has later shards with records, damages the record of
-// shard 1 with same-size bytes that keep the file time, and commits once
-// more. The native delta reads that record in its Finish, which panics on
-// "null" and returns a JSON error on other bytes: in both cases the stage
-// builds the family in full, with no warning, and the search finds the new
-// file.
+// committed family has later shards with records. It damages the record of
+// shard 1 with bytes of the same size and file time, and commits once more.
+// The native delta reads that record in its Finish. The read panics on "null"
+// and returns a JSON error on other bytes. In both cases the stage builds the
+// family in full with no warning, and the search finds the new file.
 func TestNativeDeltaOnADamagedRecordBuildsInFull(t *testing.T) {
 	requireTools(t)
 	for _, record := range []string{"null", "{garbage"} {

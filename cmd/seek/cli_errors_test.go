@@ -220,9 +220,9 @@ func TestReportStaleIndexWarning_CancellationDoesNotWarn(t *testing.T) {
 	}
 }
 
-// TestKeptFilesWarningNamesTheFile checks that dirty files kept by name get
-// one warning with their count, the first path, and the cause without the
-// path, not "using the existing index".
+// TestKeptFilesWarningNamesTheFile checks the warning for dirty files kept by
+// name. It is one warning with their count, the first path, and the cause
+// without the path. It does not say "using the existing index".
 func TestKeptFilesWarningNamesTheFile(t *testing.T) {
 	recorder := captureTestLogs(t, slog.LevelWarn)
 	reportStaleIndexWarning(gitCorpusError("/repo", "/index", &dirtyFilesKept{files: []string{"b.txt", "c.txt"}, cause: fmt.Errorf("read /repo/b.txt: %w", &fs.PathError{Op: "open", Path: "/repo/b.txt", Err: syscall.EIO})}))

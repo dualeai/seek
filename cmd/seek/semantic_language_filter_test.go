@@ -9,13 +9,16 @@ import (
 	"testing"
 )
 
-// languageFilterFixture writes files that only vectors find for a description
-// with no word in them: each holds the word zqlangmark, which Zoekt finds as
-// text, and no word of the description. A test model in accept mode makes
-// every row a candidate and accepts it, so the vector results are the rows
-// that the filters keep. The tree has a Git node (committed Go, Python and an
-// extensionless Python script, and untracked Go and Python files in its dirty
-// overlay) and a folder node (Go and Python). It returns the tree root.
+// languageFilterFixture writes files that only vectors find for a
+// description. Each holds the word zqlangmark, which Zoekt finds as text, and
+// no word of the description. A test model in accept mode makes every row a
+// candidate and accepts it. So the vector results are the rows that the
+// filters keep. The tree has two nodes:
+//   - a Git node: committed Go, Python and an extensionless Python script, and
+//     untracked Go and Python files in its dirty overlay;
+//   - a folder node: Go and Python.
+//
+// It returns the tree root.
 func languageFilterFixture(t *testing.T) string {
 	t.Helper()
 	f := newGraphFixture(t)
@@ -37,9 +40,10 @@ func languageFilterFixture(t *testing.T) string {
 // TestLanguageFilterKeepsTheVectorHitsOfThatLanguage runs descriptions whose
 // words no file holds, so every result comes from vector search, with
 // language filters. The oracle is the lexical-only search "zqlangmark
-// <filter>", which runs no model: every file holds zqlangmark, so its hits are
-// the files that the filter keeps. The vector results must be exactly those files,
-// in the Git node's committed rows, its dirty overlay, and the folder node.
+// <filter>", which runs no model. Every file holds zqlangmark, so its hits are
+// the files that the filter keeps. The vector results must be exactly those
+// files, in the Git node's committed rows, its dirty overlay, and the folder
+// node.
 // The filter also keeps the model from scoring a file of another language.
 // The cases are lang:go, lang:python, lang:Python, -lang:go, and lang:go with
 // file:loose. The first case runs again on the built vectors and must print
@@ -106,7 +110,7 @@ func TestLanguageFilterKeepsTheVectorHitsOfThatLanguage(t *testing.T) {
 
 // TestLanguageFilterWithNoFileOfThatLanguage gives a description a language
 // that no file has. The test model accepts every row, so only the filter can
-// keep the rows out: vector search returns nothing, the model scores nothing,
+// keep the rows out. Vector search returns nothing, the model scores nothing,
 // and the command reports no match.
 func TestLanguageFilterWithNoFileOfThatLanguage(t *testing.T) {
 	requireTools(t)
@@ -118,15 +122,15 @@ func TestLanguageFilterWithNoFileOfThatLanguage(t *testing.T) {
 	}
 }
 
-// TestLanguageFilterOnTheFilteredVectorRoutes searches a folder whose Python
-// rows are more than the direct exact route takes (semanticFilteredExactRows),
-// so lang:python goes through the filtered USearch route, and whose Go rows
-// are few, so lang:go takes the direct exact route. Neither route returns a
+// TestLanguageFilterOnTheFilteredVectorRoutes searches a folder with many
+// Python rows and few Go rows. The Python rows are more than the direct exact
+// route takes (semanticFilteredExactRows), so lang:python takes the filtered
+// USearch route. lang:go takes the direct exact route. Neither route returns a
 // file of another language. The test model makes every row a candidate and
-// accepts it. The direct route is exact, so it returns every Go file; the
+// accepts it. The direct route is exact, so it returns every Go file. The
 // USearch route is approximate, so it must return at least one Python file
 // but need not return all. Each file has its own content, so no result
-// collapses into another's "also:" line.
+// collapses into the "also:" line of another.
 func TestLanguageFilterOnTheFilteredVectorRoutes(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)

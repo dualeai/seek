@@ -16,17 +16,17 @@ const (
 )
 
 // semanticQueryEmbedding holds the token vectors of one query model call: one
-// or more 128-token query windows, row after row, so a long query keeps every
-// token (up to semanticModelBatchRows - 1 windows, because the last row of the
-// call holds the empty document). The token vectors drive both USearch and
+// or more 128-token query windows, row after row. So a long query keeps every
+// token, in up to semanticModelBatchRows - 1 windows, because the last row of
+// the call holds the empty document. The token vectors drive both USearch and
 // LateOn MaxSim.
 type semanticQueryEmbedding struct {
 	tokens    []float32
 	scoreMask []bool
 	// emptyScore is the raw MaxSim score of the query against a document with
 	// no text: the document prefix and the separator only. Every document row
-	// starts with this prefix and ends with this separator, so the value is
-	// approximately the part of a score that the query gets from any document,
+	// starts with this prefix and ends with this separator. So the value is
+	// about the part of a score that the query gets from any document,
 	// whatever its text.
 	emptyScore float32
 	modelQuery string
@@ -58,9 +58,11 @@ type semanticModel interface {
 
 type semanticModelFactory func(context.Context) (semanticModel, error)
 
-// semanticModelCallLimit keeps accelerator calls within the effective CPU
-// count even though those calls do not reserve CPU capacity in the shared
-// gate. The live memory and throughput controller can select a lower limit.
+// semanticModelCallLimit gives the number of model calls that can run at the
+// same time: cpuLimit divided by the CPUs of one call, rounded up. An
+// accelerated call (callCPUs 0) reserves no CPU in the shared gate, so the
+// limit keeps such calls within the effective CPU count. The live memory and
+// throughput controller can select a lower limit.
 func semanticModelCallLimit(cpuLimit, callCPUs int) int {
 	cpuLimit = max(1, cpuLimit)
 	callCPUs = max(1, callCPUs)
@@ -91,12 +93,12 @@ type semanticModelFuture struct {
 }
 
 // recordFault records the first provider fault of the command's model and
-// ignores later ones. The vector build, the scans, and the ranking of one bad
-// query fail on the same output, and each record counts toward a demotion of
-// the provider. An error that is not a provider fault records nothing, so a
-// later provider fault is still recorded. A search on an already-built index
-// is the common path, so without this record a wrong provider would drop
-// every search to text ranking and never record itself.
+// ignores later ones. One bad query fails the vector build, the scans, and the
+// ranking on the same output. Each record counts toward a demotion of the
+// provider, so one command records one fault. An error that is not a provider
+// fault records nothing, so a later provider fault is still recorded. A search
+// on a built index is the common path. Without this record there, a wrong
+// provider would drop every search to text ranking and never record itself.
 func (future *semanticModelFuture) recordFault(err error) {
 	if future == nil || !errors.Is(err, errDegenerateSemanticVector) {
 		return
@@ -224,15 +226,15 @@ type searchExecution struct {
 }
 
 // buildsVectors reports whether a node with the commit head builds and binds a
-// vector generation: the model stages run, the policy allows semantic search,
-// a model exists, and head is not "no-head". A folder node passes an empty
-// head.
+// vector generation. It does when the model stages run, the policy allows
+// semantic search, a model exists, and head is not "no-head". A folder node
+// passes an empty head.
 func (e searchExecution) buildsVectors(head string) bool {
 	return e.vectors && e.policy.semanticEnabled() && e.model != nil && head != "no-head"
 }
 
 // buildsOverlay reports whether a Git node with dirty files builds and binds
-// the overlay of their work-tree bytes: every file of the node is then in
+// the overlay of their work-tree bytes. Then every file of the node is in
 // vector retrieval, committed or not, with or without a commit.
 func (e searchExecution) buildsOverlay(dirty bool) bool {
 	return e.vectors && e.policy.semanticEnabled() && e.model != nil && dirty

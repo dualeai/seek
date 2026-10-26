@@ -15,10 +15,10 @@ import (
 )
 
 // TestSplicePassthroughSeparator checks when splicePassthroughSeparator
-// reads an unknown leading `-token` as a Zoekt query (it goes to pflag as a
-// positional argument after a new `--`) and when as a typo of a known flag
-// (a `--token`, for which pflag gives its "unknown flag" error). Each case
-// has a name, so the table also documents the rule.
+// reads an unknown leading `-token` as a Zoekt query. Such a token goes to
+// pflag as a positional argument after a new `--`. An unknown `--token` stays
+// a typo of a known flag, for which pflag gives its "unknown flag" error.
+// Each case has a name, so the table also documents the rule.
 func TestSplicePassthroughSeparator(t *testing.T) {
 	flags := newRootCmd(newLateOnSemanticModel).Flags()
 	cases := []struct {
@@ -169,8 +169,8 @@ func TestRootCmd_RejectsNegativeLimit(t *testing.T) {
 }
 
 // TestSearchRunConfigBindsTheModelFactory checks which model factory the run
-// config binds: the given factory with the default policy, and no factory with
-// the lexical-only policy, so that a --lexical-only search starts no model.
+// config binds. The default policy binds the given factory. The lexical-only
+// policy binds no factory, so a --lexical-only search starts no model.
 func TestSearchRunConfigBindsTheModelFactory(t *testing.T) {
 	if config := newSearchRunConfig(defaultSearchPolicy(), newLateOnSemanticModel); config.newModel == nil {
 		t.Fatalf("default run config has no model: %+v", config)
@@ -313,7 +313,7 @@ func TestSelectSearchConfig(t *testing.T) {
 
 // TestRootCmd_VersionOutputHasNoDoublePrefix runs `seek --version` and
 // reads stdout: the printed line starts with exactly one "seek " prefix. It
-// checks the printed output, not the layout of the Version field, so a
+// checks the printed output, not the layout of the Version field. So a
 // rename of the field or a change to SetVersionTemplate does not break it.
 func TestRootCmd_VersionOutputHasNoDoublePrefix(t *testing.T) {
 	root := newRootCmd(newLateOnSemanticModel)

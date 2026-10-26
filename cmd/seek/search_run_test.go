@@ -14,10 +14,9 @@ import (
 )
 
 // TestColdSearchEqualsWarmSearch searches two Git nodes and a folder node
-// whose files hold no query word, with a model that accepts every row, so
-// only vectors find the files. The first search waits for the vectors of
-// every node, so it prints what the second prints, and the second embeds
-// nothing.
+// whose files hold no query word. The model accepts every row, so only
+// vectors find the files. The first search waits for the vectors of every
+// node, so it prints what the second prints, and the second embeds nothing.
 func TestColdSearchEqualsWarmSearch(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -45,11 +44,11 @@ func TestColdSearchEqualsWarmSearch(t *testing.T) {
 
 // TestRunScopedSearchUsesWholeRepoGeneration searches a subfolder of a
 // repository after a whole-repository search, with a model that accepts every
-// row: only the in-scope file prints, and the scoped search embeds nothing
-// new. The scope bounds the rows that the vector search reads: a row out of
-// scope would have no shard copy in the scoped read, which the search reports
-// as index damage, with a warning. From the subfolder, a search with no path
-// prints the same bytes as a search of ".".
+// row. Only the file in the scope prints, and the scoped search embeds
+// nothing new. The scope bounds the rows that the vector search reads. A row
+// out of the scope would have no shard copy in the scoped read. The search
+// would report that as index damage, with a warning. From the subfolder, a
+// search with no path prints the same bytes as a search of ".".
 func TestRunScopedSearchUsesWholeRepoGeneration(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -86,7 +85,7 @@ func TestRunScopedSearchUsesWholeRepoGeneration(t *testing.T) {
 }
 
 // TestRunMixedFolderGitSearch searches a folder that holds a loose file and a
-// nested repository, with a model that accepts every row: the vectors of each
+// nested repository, with a model that accepts every row. The vectors of each
 // node find its file.
 func TestRunMixedFolderGitSearch(t *testing.T) {
 	requireTools(t)
@@ -102,8 +101,8 @@ func TestRunMixedFolderGitSearch(t *testing.T) {
 }
 
 // TestPassThroughAtomMasksSemantic gives a description a repo: atom that no
-// node matches, with a model that accepts every row: Zoekt's mask leaves no
-// row, so neither lexical nor semantic retrieval returns a file, and the
+// node matches, with a model that accepts every row. The Zoekt mask leaves no
+// row. So neither lexical nor semantic retrieval returns a file, and the
 // model scores nothing.
 func TestPassThroughAtomMasksSemantic(t *testing.T) {
 	requireTools(t)
@@ -118,7 +117,7 @@ func TestPassThroughAtomMasksSemantic(t *testing.T) {
 
 // TestJoinedSemanticMergeKeepsSamePathInTwoNodes finds the same relative path
 // with other content in two nodes through vectors, with a model that accepts
-// every row: both show (the identity of a file includes its node).
+// every row. Both files print: the identity of a file includes its node.
 func TestJoinedSemanticMergeKeepsSamePathInTwoNodes(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -133,8 +132,8 @@ func TestJoinedSemanticMergeKeepsSamePathInTwoNodes(t *testing.T) {
 }
 
 // TestDuplicateContentCollapses searches a repository and two linked
-// worktrees at one commit: the same content and match print once, under the
-// smallest path, with the other paths after it; a dirty copy prints as its
+// worktrees at one commit. The same content and match print once, under the
+// smallest path, with the other paths after it. A dirty copy prints as its
 // own result.
 func TestDuplicateContentCollapses(t *testing.T) {
 	requireTools(t)
@@ -162,7 +161,7 @@ func TestDuplicateContentCollapses(t *testing.T) {
 }
 
 // TestDuplicateDirtyStrictCopiesCollapse puts the same untracked file in two
-// Git nodes: the strict hits take their content ID from the overlay, so they
+// Git nodes. The strict hits take their content ID from the overlay, so they
 // print as one result, as semantic-only copies do.
 func TestDuplicateDirtyStrictCopiesCollapse(t *testing.T) {
 	requireTools(t)
@@ -180,9 +179,9 @@ func TestDuplicateDirtyStrictCopiesCollapse(t *testing.T) {
 }
 
 // TestDuplicateContentCollapsesSemanticOnly finds two copies of one file only
-// through vectors, with a model that accepts every row: they print as one
-// result. The path in the model input gives the two copies different vectors,
-// so the score, not the name, picks the copy that represents the other, and
+// through vectors, with a model that accepts every row. They print as one
+// result. The path in the model input gives the two copies different vectors.
+// So the score, not the name, picks the copy that represents the other, and
 // the test reads the two paths as a set.
 func TestDuplicateContentCollapsesSemanticOnly(t *testing.T) {
 	requireTools(t)
@@ -202,8 +201,8 @@ func TestDuplicateContentCollapsesSemanticOnly(t *testing.T) {
 }
 
 // TestMoreThan128AcceptedFilesAllPrint gives 300 files, with a model that
-// accepts every row: every file prints with no -n, and the model scores every
-// file (no candidate count).
+// accepts every row. Every file prints with no -n, and the model scores every
+// file: no count cuts the candidates.
 func TestMoreThan128AcceptedFilesAllPrint(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
@@ -223,8 +222,8 @@ func TestMoreThan128AcceptedFilesAllPrint(t *testing.T) {
 }
 
 // TestNameOnlyFilesNeverModelScored matches a binary file by name, with a
-// model that accepts every row: it enters as a strict match, prints after the
-// scored files, and the model neither embeds nor scores it.
+// model that accepts every row. The file enters as a strict match and prints
+// after the scored files. The model does not embed or score it.
 func TestNameOnlyFilesNeverModelScored(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
@@ -249,9 +248,9 @@ func TestNameOnlyFilesNeverModelScored(t *testing.T) {
 }
 
 // queryShapeFolder writes a folder with one strict target (cmd/parse.go), its
-// test file, and one file that holds no query word (target.go), and moves
-// into it: file filters match the header, and a header of "." holds no part
-// of the temporary path (whose test name holds "Test").
+// test file, and one file that holds no query word (target.go). Then it moves
+// into the folder. So file filters match the header, and a header of "."
+// holds no part of the temporary path, whose test name holds "Test".
 func queryShapeFolder(t *testing.T) string {
 	t.Helper()
 	folder := t.TempDir()
@@ -262,9 +261,9 @@ func queryShapeFolder(t *testing.T) string {
 	return "."
 }
 
-// searchShape runs one query on folder with the test model in mode and
-// returns its output, the queries that the model prepared and the semantic
-// searches that the command logged.
+// searchShape runs one query on folder with the test model in mode. It
+// returns the output, the number of queries that the model prepared, and the
+// number of semantic searches that the command logged.
 func searchShape(t *testing.T, mode payloadMode, query, folder string) (string, int32, int) {
 	t.Helper()
 	logs := captureTestLogs(t, slog.LevelDebug)
@@ -281,45 +280,32 @@ func searchShape(t *testing.T, mode payloadMode, query, folder string) (string, 
 	return output, scorer.prepareCalls.Load(), searches
 }
 
-// lexicalHeaders returns the sorted header paths of the --lexical-only search
-// of query on folder.
-func lexicalHeaders(t *testing.T, query, folder string) []string {
-	t.Helper()
-	output, err := seek(t, "--lexical-only", query, folder)
-	if err != nil {
-		t.Fatalf("--lexical-only %s: %v\n%s", query, err, output)
-	}
-	return headerPaths(output)
-}
-
-// TestEveryQueryShapeUsesVectors searches one word, an identifier, a phrase,
-// type:file, case:yes, a symbol filter and file filters alone, with a model
-// that accepts every row: each shape takes the vector route, so it prepares
-// one query and searches the vectors once. A shape with no filter prints every
-// file. A filter shape prints the files of its --lexical-only search, because
-// the filter bounds the vectors.
+// TestEveryQueryShapeUsesVectors searches with a model that accepts every
+// row. The query shapes are one word, an identifier, a phrase, type:file,
+// case:yes, a symbol filter, and file filters alone. Each shape takes the
+// vector route, so it prepares one query and searches the vectors once. A
+// shape with no filter prints every file. A filter shape prints only the
+// files that its filter keeps, because the filter bounds the vectors.
+// sym:ParseRequest keeps the two files whose symbols hold ParseRequest.
+// file:cmd -file:test keeps cmd/parse.go.
 func TestEveryQueryShapeUsesVectors(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
 	folder := queryShapeFolder(t)
 	every := []string{"cmd/parse.go", "cmd/parse_test.go", "target.go"}
-	for query, unfiltered := range map[string]bool{
-		"request":                 true,
-		"ParseRequest":            true,
-		`"request line"`:          true,
-		"type:file parse request": true,
-		"case:yes parse request":  true,
-		"sym:ParseRequest":        false,
-		"file:cmd -file:test":     false,
+	for query, want := range map[string][]string{
+		"request":                 every,
+		"ParseRequest":            every,
+		`"request line"`:          every,
+		"type:file parse request": every,
+		"case:yes parse request":  every,
+		"sym:ParseRequest":        {"cmd/parse.go", "cmd/parse_test.go"},
+		"file:cmd -file:test":     {"cmd/parse.go"},
 	} {
 		t.Run(query, func(t *testing.T) {
 			output, prepares, searches := searchShape(t, payloadAccept, query, folder)
 			if prepares != 1 || searches != 1 {
 				t.Fatalf("prepared queries=%d semantic searches=%d, want 1 and 1:\n%s", prepares, searches, output)
-			}
-			want := every
-			if !unfiltered {
-				want = lexicalHeaders(t, query, folder)
 			}
 			if got := headerPaths(output); !slices.Equal(got, want) {
 				t.Fatalf("printed %v, want %v:\n%s", got, want, output)
@@ -331,7 +317,9 @@ func TestEveryQueryShapeUsesVectors(t *testing.T) {
 // TestOrOfDescriptionsUsesVectors searches an or of two descriptions. With a
 // model that accepts every row, the model reads both descriptions in one
 // query and every file prints. With a model that rejects every row, only the
-// strict hit of the or prints, as in the --lexical-only search.
+// strict hits of the or print, as in the --lexical-only search. These are the
+// two files that hold "parse" and "request": cmd/parse_test.go holds them in
+// TestParseRequest.
 func TestOrOfDescriptionsUsesVectors(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -344,15 +332,15 @@ func TestOrOfDescriptionsUsesVectors(t *testing.T) {
 			prepares, searches, got, every, output)
 	}
 	output, _, _ = searchShape(t, payloadReject, query, folder)
-	if got, want := headerPaths(output), lexicalHeaders(t, query, folder); len(want) == 0 || !slices.Equal(got, want) {
+	if got, want := headerPaths(output), []string{"cmd/parse.go", "cmd/parse_test.go"}; !slices.Equal(got, want) {
 		t.Fatalf("with every row rejected the or printed %v, want the strict hits %v:\n%s", got, want, output)
 	}
 }
 
-// TestOrOfDescriptionsKeepsItsFilters searches ors whose every branch holds a
-// filter, with a model that accepts every row: the vectors add only files
-// that a branch's filter allows, so a file in another language or path never
-// prints, and every file that a filter allows does.
+// TestOrOfDescriptionsKeepsItsFilters searches ors in which each branch holds
+// a filter, with a model that accepts every row. The vectors add only the
+// files that the filter of a branch allows. So a file in another language or
+// path never prints, and every file that a filter allows does.
 func TestOrOfDescriptionsKeepsItsFilters(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -544,9 +532,9 @@ func TestRun_NoPathEqualsDot(t *testing.T) {
 }
 
 // TestPartitionIndependence searches the same 60 files as one folder node and
-// as three folder nodes, with a model that accepts every row: the strict rank
+// as three folder nodes, with a model that accepts every row. The strict rank
 // reads the global average, so the top-20 sets overlap by at least 0.95. The
-// short filler files of tree/a make the nodes' averages differ.
+// short filler files of tree/a make the averages of the nodes differ.
 func TestPartitionIndependence(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -599,9 +587,9 @@ func TestPartitionIndependence(t *testing.T) {
 }
 
 // TestRelaxedRankIndependentOfPartition searches four files that hold one of
-// the two words, as one node and as two, with a model that accepts every row:
-// the relaxed lexical rank reads the global average, so the order is the
-// same. The short filler files make the two nodes' averages differ.
+// the two words, as one node and as two, with a model that accepts every row.
+// The relaxed lexical rank reads the global average, so the order is the
+// same. The short filler files make the averages of the two nodes differ.
 func TestRelaxedRankIndependentOfPartition(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -634,9 +622,9 @@ func TestRelaxedRankIndependentOfPartition(t *testing.T) {
 }
 
 // TestRelaxedRankReadsTheCurrentCopy removes "alpha" from a committed file in
-// the work tree, with a model that accepts every row: the relaxed rank of the
-// file reads the current copy, so the dirty tree ranks as a commit with the
-// same bytes. Both searches print the two files in the same order.
+// the work tree, with a model that accepts every row. The relaxed rank of the
+// file reads the current copy. So the dirty tree ranks as a commit with the
+// same bytes, and both searches print the two files in the same order.
 func TestRelaxedRankReadsTheCurrentCopy(t *testing.T) {
 	requireTools(t)
 	order := func(dirty bool) []string {
@@ -671,11 +659,11 @@ func TestRelaxedRankReadsTheCurrentCopy(t *testing.T) {
 }
 
 // TestModelInputIndependentOfSearchRoot searches a Git node as the operand,
-// then as a child of a parent folder seed: every row keys a window that names
-// the repository-relative path, the second search embeds nothing, and the
+// then as a child of a parent folder seed. Every row keys a window that names
+// the repository-relative path, and the second search embeds nothing. The
 // model reads each scored file by its repository-relative path. The
-// generation of a Git node has the commit as its key, so the second search
-// cannot show a model input that follows the search root: the row keys do.
+// generation of a Git node has the commit as its key. So the second search
+// cannot show a model input that follows the search root; the row keys can.
 // The folder rows are in TestFolderModelInputIndependentOfSearchRoot.
 func TestModelInputIndependentOfSearchRoot(t *testing.T) {
 	requireTools(t)
@@ -692,7 +680,7 @@ func TestModelInputIndependentOfSearchRoot(t *testing.T) {
 	if scorer.embedCalls.Load() == 0 || !strings.Contains(first, "sub/b.go") {
 		t.Fatalf("the first search built no vectors (embeds=%d):\n%s", scorer.embedCalls.Load(), first)
 	}
-	requireRowsKeyModelPath(t, canonicalCorpusPath(repo), "")
+	requireRowsKeyModelPath(t, resolvedPath(t, repo), "")
 	second, scorer, err := stubSearch(t, payloadFar, "alpha beta", f.path("parent"))
 	if err != nil {
 		t.Fatal(err)
@@ -712,10 +700,11 @@ func TestModelInputIndependentOfSearchRoot(t *testing.T) {
 	}
 }
 
-// requireRowsKeyModelPath checks that every row of the one generation in the
-// cache keys a window of its file below root whose header names the path from
-// the model path base (semanticModelPath): the absolute path for the base of
-// a folder node, the node-relative path for base "".
+// requireRowsKeyModelPath checks every row of the one generation in the
+// cache. Each row must key a window of its file below root. The header of
+// that window names the path from the model path base (semanticModelPath).
+// That is the absolute path for the base of a folder node, and the
+// node-relative path for base "".
 func requireRowsKeyModelPath(t *testing.T, root, base string) {
 	t.Helper()
 	cache, err := seekUserCacheRoot()
@@ -759,9 +748,9 @@ func requireRowsKeyModelPath(t *testing.T, root, base string) {
 }
 
 // TestRenamedFolderGetsVectorsOfItsNewPath searches a folder, renames it, and
-// searches it again. The folder keeps its corpus (the corpus ID is the root's
-// file identity), and the model reads its files by absolute path: the second
-// search builds vectors whose windows name the new path.
+// searches it again. The folder keeps its corpus: the corpus ID is the file
+// identity of the root. The model reads its files by absolute path, so the
+// second search builds vectors whose windows name the new path.
 func TestRenamedFolderGetsVectorsOfItsNewPath(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -776,14 +765,14 @@ func TestRenamedFolderGetsVectorsOfItsNewPath(t *testing.T) {
 	if _, _, err := stubSearch(t, payloadFar, "alpha beta", f.path("new/notes")); err != nil {
 		t.Fatal(err)
 	}
-	newRoot := canonicalCorpusPath(f.path("new/notes"))
+	newRoot := resolvedPath(t, f.path("new/notes"))
 	requireRowsKeyModelPath(t, newRoot, filepath.ToSlash(newRoot))
 }
 
 // TestFileRootReusesOnlyFoldersThatHoldIt searches a subfolder and then a
-// file next to it: no folder inside the file's directory can hold the file,
-// so the file's build loads no generation. A file inside a searched folder
-// copies that folder's vectors.
+// file next to it. No folder inside the directory of the file can hold the
+// file, so the build of the file loads no generation. A file inside a
+// searched folder copies the vectors of that folder.
 func TestFileRootReusesOnlyFoldersThatHoldIt(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -817,11 +806,11 @@ func TestFileRootReusesOnlyFoldersThatHoldIt(t *testing.T) {
 }
 
 // TestFolderModelInputIndependentOfSearchRoot searches a folder and then a
-// subfolder of it, and in a new cache the subfolder first. A folder node is
-// rooted at its search root, so its node-relative paths change with the root;
-// the model reads a folder file by its absolute path instead. So the second
-// search copies the vectors of every file that the first one embedded, and
-// embeds only the files that the first one did not hold.
+// subfolder of it, and in a new cache the subfolder first. The root of a
+// folder node is its search root, so its node-relative paths change with the
+// root. The model reads a folder file by its absolute path instead. So the
+// second search copies the vectors of each file that the first one embedded.
+// It embeds only the files that the first one did not hold.
 func TestFolderModelInputIndependentOfSearchRoot(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -843,7 +832,7 @@ func TestFolderModelInputIndependentOfSearchRoot(t *testing.T) {
 		if got := embedded(t, f.path("parent")); len(got) != 3 {
 			t.Fatalf("the folder search embedded %v, want its 3 files", got)
 		}
-		parent := canonicalCorpusPath(f.path("parent"))
+		parent := resolvedPath(t, f.path("parent"))
 		requireRowsKeyModelPath(t, parent, filepath.ToSlash(parent))
 		if got := embedded(t, f.path("parent/notes")); len(got) != 0 {
 			t.Fatalf("the subfolder search embedded %v, want none", got)
@@ -861,11 +850,11 @@ func TestFolderModelInputIndependentOfSearchRoot(t *testing.T) {
 }
 
 // TestDisplayLimitsApplyAfterTheRank searches five strict files, each with a
-// context line after its match, with the far model: no row is near the query,
+// context line after its match, with the far model. No row is near the query,
 // and every score is 0. The model reads every strict file with its context at
 // each -n, and -n prints the first n files of the unlimited order. The equal
 // scores leave the lexical order, so the test cannot show that -n cuts after
-// the model rank; the real-model test checks that.
+// the model rank; TestE2EMarkerRealModelFindsTheRetryFunction checks that.
 func TestDisplayLimitsApplyAfterTheRank(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
@@ -909,7 +898,7 @@ func TestDisplayLimitsApplyAfterTheRank(t *testing.T) {
 
 // TestDeletedSemanticSourceKeepsOtherNodes deletes a folder file while its
 // unit is embedded (a change during a build), with a model that accepts every
-// row. The command still answers with the other node's file, and it prints
+// row. The command still answers with the file of the other node. It prints
 // the deleted file with the text that the index holds, as a strict hit does.
 // The next search reads the tree again and prints no deleted file. The delete
 // runs inside the embed call, so the test cannot prove the timing against the
@@ -949,8 +938,8 @@ func TestDeletedSemanticSourceKeepsOtherNodes(t *testing.T) {
 }
 
 // TestDuplicateInsideOneNodePrintsRelativeCopies collapses two copies in one
-// folder node, with a model that accepts every row: the `also:` line prints
-// the copy in the header's form, node-relative.
+// folder node, with a model that accepts every row. The `also:` line prints
+// the copy in the form of the header: node-relative.
 func TestDuplicateInsideOneNodePrintsRelativeCopies(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()

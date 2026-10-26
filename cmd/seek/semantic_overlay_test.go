@@ -13,9 +13,9 @@ import (
 // TestRunDirtySearchOverlay commits a.go, then edits it and adds an
 // untracked b.go. The test model accepts every row, so the printed set is the
 // set of files whose rows the search binds. Vector retrieval reads the work
-// tree: after the edit, a.go answers with its new text and not the committed
-// text, b.go answers as [uncommitted], and only the two dirty files embed.
-// The base rows of a dirty file are no candidate: a committed row would not
+// tree. After the edit, a.go answers with its new text and not the committed
+// text, and b.go answers as [uncommitted]. Only the two dirty files embed.
+// The base rows of a dirty file are no candidate. A committed row would not
 // match the work-tree copy, and the search would report index damage.
 func TestRunDirtySearchOverlay(t *testing.T) {
 	requireTools(t)
@@ -59,9 +59,9 @@ func TestRunDirtySearchOverlay(t *testing.T) {
 	}
 }
 
-// TestNoHeadRepoUsesVectors searches a repository with no commit: its
-// overlay holds every file, so with a test model that accepts every row, both
-// files answer as [uncommitted], target.go from its rows only.
+// TestNoHeadRepoUsesVectors searches a repository with no commit, so its
+// overlay holds every file. The test model accepts every row. Both files
+// answer as [uncommitted], and target.go comes from its rows only.
 func TestNoHeadRepoUsesVectors(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -117,11 +117,11 @@ func TestOverlayStoreBoundedUnderRepeatedSaves(t *testing.T) {
 	}
 }
 
-// TestOverlayDamageRepairs appends one byte to the overlay rows: the search
-// that finds the damage clears the descriptor, so a later search embeds the
-// untracked file again and it answers again. The test model accepts every
-// row, so u.go, which holds no query word, prints exactly when the search
-// binds its overlay rows.
+// TestOverlayDamageRepairs appends one byte to the overlay rows. The search
+// that finds the damage clears the descriptor. So a later search embeds the
+// untracked file again, and the file answers again. The test model accepts
+// every row. So u.go, which holds no query word, prints exactly when the
+// search binds its overlay rows.
 func TestOverlayDamageRepairs(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -159,7 +159,7 @@ func TestOverlayDamageRepairs(t *testing.T) {
 }
 
 // TestOverlayColdBuildReusesTheStagedBase adds one line to a long committed
-// file before the first search: the overlay reuses the windows that the base
+// file before the first search. The overlay reuses the windows that the base
 // of the same build embedded, so the file embeds about once, not twice.
 func TestOverlayColdBuildReusesTheStagedBase(t *testing.T) {
 	requireTools(t)
@@ -198,9 +198,9 @@ func TestOverlayColdBuildReusesTheStagedBase(t *testing.T) {
 	}
 }
 
-// TestOverlayHasNoUSearchGraph builds an overlay: it holds no USearch shard,
-// and its search still finds the untracked file, which holds no query word,
-// with a test model that accepts every row.
+// TestOverlayHasNoUSearchGraph builds an overlay, which holds no USearch
+// shard. With a test model that accepts every row, its search still finds the
+// untracked file, which holds no query word.
 func TestOverlayHasNoUSearchGraph(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)

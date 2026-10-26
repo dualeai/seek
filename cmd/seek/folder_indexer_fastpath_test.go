@@ -10,9 +10,9 @@ import (
 	"testing"
 )
 
-// TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable checks that a built
-// corpus with a stored state remains searchable on a warm call, and that the
-// warm call returns before it takes a build slot. A warm call that waits for
+// TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable checks that a warm
+// call on a built corpus with a stored state gives corpusSearchable. The warm
+// call must return before it takes a build slot. A warm call that waits for
 // a slot runs until the go test timeout, which prints each goroutine.
 func TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable(t *testing.T) {
 	requireTools(t)
@@ -27,10 +27,10 @@ func TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable(t *testing.T) {
 	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 		t.Fatalf("first call: %v", err)
 	}
-	// After the first call the state file must be populated; the
-	// warm-path gate depends on this.
+	// The warm return compares the state file with the walk, so the first
+	// call must write it.
 	if cached := readStateFile(plan.cacheDir); cached == "" {
-		t.Fatal("cold call did not write the state file; cache-gate test would be invalid")
+		t.Fatal("the cold call did not write the state file")
 	}
 	// With every build slot held, only the warm return before the slot can
 	// answer.
@@ -113,9 +113,9 @@ func TestFolderCorpusState_IdempotentSelectedAndStateHash(t *testing.T) {
 	}
 }
 
-// TestWalkDirectory_GitContentNotInStateHash checks that content in .git does
-// not change the parent folder state.
-func TestWalkDirectory_GitContentNotInStateHash(t *testing.T) {
+// TestFolderCorpusState_GitContentNotInStateHash checks that content in .git
+// does not change the parent folder state.
+func TestFolderCorpusState_GitContentNotInStateHash(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("payload"), 0o644); err != nil {
 		t.Fatal(err)
@@ -145,12 +145,8 @@ func TestWalkDirectory_GitContentNotInStateHash(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------
-// End-to-end smoke: cumulative cold + warm path.
-// ---------------------------------------------------------------------
-
 // TestEnsureFolderCorpusFresh_ColdThenWarm_SearchableBoth builds a folder of
-// 25 files cold, then calls again warm: both calls give corpusSearchable, and
+// 25 files cold, then calls again warm. Both calls give corpusSearchable, and
 // the warm call returns before it takes a build slot. A warm call that waits
 // for a slot runs until the go test timeout, which prints each goroutine.
 func TestEnsureFolderCorpusFresh_ColdThenWarm_SearchableBoth(t *testing.T) {
@@ -190,12 +186,12 @@ func TestEnsureFolderCorpusFresh_ColdThenWarm_SearchableBoth(t *testing.T) {
 }
 
 // TestWarmFolderVectorSearchTakesNoBuildSlot runs a warm folder search that
-// reads vectors while every build slot is held: the fast path finds the bound
-// generation of the folder's semantic source with no build lock, so the
+// reads vectors while every build slot is held. The fast path finds the bound
+// generation of the folder's semantic source with no build slot, so the
 // search ends. b.go holds no word of the query, so only the vector read can
 // print it. The warm search embeds no unit and prints what the cold search
-// printed, b.go included. A search that waits for a slot never ends: go test
-// -timeout then stops the process with a dump of each goroutine, which shows
+// printed, b.go included. A search that waits for a slot never ends. Then go
+// test -timeout stops the process with a dump of each goroutine, which shows
 // the wait in acquireBuildSlot. The process ends there, so no later test
 // shares os.Stdout with the waiting search.
 func TestWarmFolderVectorSearchTakesNoBuildSlot(t *testing.T) {

@@ -49,6 +49,10 @@ func TestNativeGitRecordParserAllocations(t *testing.T) {
 	}
 }
 
+// installFakeGit puts a shell script named git alone on PATH. FAKE_GIT_MODE
+// selects its reply. A mode with a malformed reply exits 0 after it, unless its
+// name ends in _hang. So only a reply check of Seek can fail the call. An
+// unknown mode exits 64.
 func installFakeGit(t *testing.T) {
 	t.Helper()
 	binDir := t.TempDir()
@@ -119,18 +123,22 @@ case "$FAKE_GIT_MODE" in
   batch_check_wrong_id)
     read_object_command
     printf '1123456789abcdef0123456789abcdef01234567 blob 3\n'
+    exit 0
     ;;
   batch_check_wrong_type)
     read_object_command
     printf '%s tree 3\n' "$object"
+    exit 0
     ;;
   batch_check_invalid_size)
     read_object_command
     printf '%s blob -1\n' "$object"
+    exit 0
     ;;
   batch_check_overflow)
     read_object_command
     printf '%s blob 999999999999999999999999999999999999\n' "$object"
+    exit 0
     ;;
   batch_check_limits)
     read_object_command
@@ -141,20 +149,15 @@ case "$FAKE_GIT_MODE" in
     printf '%s blob 104857601\n' "$second"
     exit 0
     ;;
-	batch_check_oversize)
-		read_object_command
-		IFS= read -r flush
-		test "$flush" = flush || exit 70
-		printf '%s blob 104857601\n' "$object"
-		exit 0
-		;;
   batch_check_missing)
     read_object_command
     printf '%s missing\n' "$object"
+    exit 0
     ;;
   batch_check_extra)
     read_object_command
     printf '%s blob 3\nEXTRA\n' "$object"
+    exit 0
     ;;
   batch_check_nonzero)
     read_object_command
@@ -167,6 +170,7 @@ case "$FAKE_GIT_MODE" in
     i=0
     while [ "$i" -lt 600 ]; do printf x; i=$((i + 1)); done
     printf '\n'
+    exit 0
     ;;
   batch_check_blocked_pipes)
     i=0
@@ -180,14 +184,17 @@ case "$FAKE_GIT_MODE" in
   batch_content_truncated)
     read_object_command
     printf '%s blob 3\nab' "$object"
+    exit 0
     ;;
   batch_content_bad_delimiter)
     read_object_command
     printf '%s blob 3\nabcX' "$object"
+    exit 0
     ;;
   batch_content_extra)
     read_object_command
     printf '%s blob 3\nabc\nEXTRA' "$object"
+    exit 0
     ;;
   batch_content_nonzero)
     read_object_command
@@ -198,6 +205,7 @@ case "$FAKE_GIT_MODE" in
   batch_content_wrong_size)
     read_object_command
     printf '%s blob 4\nabcd\n' "$object"
+    exit 0
     ;;
   batch_content_blocked_pipes)
     i=0
@@ -221,6 +229,7 @@ case "$FAKE_GIT_MODE" in
     ;;
   diff_malformed)
     printf ':bad\0path\0'
+    exit 0
     ;;
 esac
 exit 64
@@ -643,20 +652,21 @@ func startFakeNativeGitBatch(t *testing.T, ctx context.Context, mode string) *na
 
 // TestNativeGitBatchCheckReplyFailures gives the batch a malformed reply. A bad
 // info reply fails check; extra output or a failed exit fails close. Either
-// way the child ends.
+// way the call joins the child.
 func TestNativeGitBatchCheckReplyFailures(t *testing.T) {
 	for _, test := range []struct {
 		mode    string
 		atClose bool
+		want    string
 	}{
-		{mode: "batch_check_wrong_id"},
-		{mode: "batch_check_wrong_type"},
-		{mode: "batch_check_invalid_size"},
-		{mode: "batch_check_overflow"},
-		{mode: "batch_check_missing"},
-		{mode: "batch_check_extra", atClose: true},
-		{mode: "batch_check_nonzero", atClose: true},
-		{mode: "batch_check_long_header"},
+		{mode: "batch_check_wrong_id", want: "returned object 1123456789abcdef0123456789abcdef01234567"},
+		{mode: "batch_check_wrong_type", want: `returned type "tree"`},
+		{mode: "batch_check_invalid_size", want: `invalid Git blob size "-1"`},
+		{mode: "batch_check_overflow", want: "invalid Git blob size"},
+		{mode: "batch_check_missing", want: "missing locally"},
+		{mode: "batch_check_extra", atClose: true, want: "unexpected trailing Git output"},
+		{mode: "batch_check_nonzero", atClose: true, want: "exit status 9"},
+		{mode: "batch_check_long_header", want: "header exceeds 512 bytes"},
 	} {
 		t.Run(test.mode, func(t *testing.T) {
 			batch := startFakeNativeGitBatch(t, t.Context(), test.mode)
@@ -667,11 +677,13 @@ func TestNativeGitBatchCheckReplyFailures(t *testing.T) {
 				}
 				err = batch.close()
 			}
-			if err == nil {
-				t.Fatal("malformed cat-file reply succeeded")
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v, want %q", err, test.want)
 			}
-			if !batch.finished {
-				t.Fatal("the failed batch left its child running")
+			// Wait sets ProcessState: a nil value is a child that no call
+			// joined.
+			if batch.execCmd.ProcessState == nil {
+				t.Fatal("the failed batch did not join its child")
 			}
 			// A missing blob in a repository that is not a partial clone is
 			// damage: the error names the object and its path.
@@ -741,8 +753,8 @@ func TestNativeGitBatchCheckCancellationKillsChild(t *testing.T) {
 func TestReadNativeGitBlobsReadsExactContent(t *testing.T) {
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
-	// A binary blob larger than the probe comes first: the reader must drop the
-	// rest of it and still read the text blob after it exactly.
+	// A binary blob larger than the probe comes first. The reader must drop
+	// the rest of it and still read the text blob after it exactly.
 	binary := append([]byte{0}, bytes.Repeat([]byte("b"), 3*binaryProbeBytes)...)
 	text := []byte("abc\nwith content\n")
 	var infos []gitBlobInfo
@@ -798,17 +810,22 @@ func TestReadNativeGitBlobsDoesNotStartChildForOversize(t *testing.T) {
 	}
 }
 
+// TestReadNativeGitBlobReplyFailures reads a 3-byte blob from a malformed
+// contents reply. Each reply fails the read with the error of its check.
 func TestReadNativeGitBlobReplyFailures(t *testing.T) {
-	for _, mode := range []string{
-		"batch_content_truncated",
-		"batch_content_bad_delimiter",
-		"batch_content_extra",
-		"batch_content_nonzero",
-		"batch_content_wrong_size",
+	for _, test := range []struct {
+		mode string
+		want string
+	}{
+		{mode: "batch_content_truncated", want: "body: unexpected EOF"},
+		{mode: "batch_content_bad_delimiter", want: "delimiter: got byte 0x58"},
+		{mode: "batch_content_extra", want: "unexpected trailing Git output"},
+		{mode: "batch_content_nonzero", want: "exit status 11"},
+		{mode: "batch_content_wrong_size", want: "size changed from 3 to 4"},
 	} {
-		t.Run(mode, func(t *testing.T) {
+		t.Run(test.mode, func(t *testing.T) {
 			installFakeGit(t)
-			t.Setenv("FAKE_GIT_MODE", mode)
+			t.Setenv("FAKE_GIT_MODE", test.mode)
 			info := gitBlobInfo{entry: fakeTreeEntry(nativeTestOID), size: 3}
 			err := readNativeGitBlobs(t.Context(), t.TempDir(), []gitBlobInfo{info}, func(document fileContent) error {
 				if document.weight > 0 {
@@ -816,8 +833,8 @@ func TestReadNativeGitBlobReplyFailures(t *testing.T) {
 				}
 				return nil
 			})
-			if err == nil {
-				t.Fatal("malformed batch reply succeeded")
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v, want %q", err, test.want)
 			}
 		})
 	}
@@ -894,13 +911,19 @@ func TestParseNativeGitDiffHeader(t *testing.T) {
 }
 
 func TestReadNativeGitDiffChecksLateExitAndMalformedOutput(t *testing.T) {
-	for _, mode := range []string{"diff_valid_then_fail", "diff_malformed"} {
-		t.Run(mode, func(t *testing.T) {
+	for _, test := range []struct {
+		mode string
+		want string
+	}{
+		{mode: "diff_valid_then_fail", want: "exit status 12"},
+		{mode: "diff_malformed", want: "malformed Git raw diff header"},
+	} {
+		t.Run(test.mode, func(t *testing.T) {
 			installFakeGit(t)
-			t.Setenv("FAKE_GIT_MODE", mode)
+			t.Setenv("FAKE_GIT_MODE", test.mode)
 			_, err := readNativeGitDiff(t.Context(), t.TempDir(), gitObjectID(nativeTestOID), gitObjectID(strings.Repeat("a", 40)), 10)
-			if err == nil {
-				t.Fatal("invalid diff succeeded")
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v, want %q", err, test.want)
 			}
 		})
 	}

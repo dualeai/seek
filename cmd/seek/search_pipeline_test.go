@@ -3,11 +3,12 @@ package main
 import (
 	"fmt"
 	"math/rand/v2"
-	"reflect"
 	"slices"
 	"testing"
 )
 
+// testContentID returns a content ID whose first byte is seed and whose other
+// bytes are zero.
 func testContentID(seed byte) semanticContentID {
 	var id semanticContentID
 	id[0] = seed
@@ -15,9 +16,9 @@ func testContentID(seed byte) semanticContentID {
 }
 
 // TestMergeHitsIgnoresInputOrder merges the hits of four nodes 20 times, with
-// the nodes and the hits of each node shuffled: the output is the same each
-// time and keeps all 24 hits. Full ties have different content, since equal
-// content collapses.
+// the nodes and the hits of each node shuffled. Each merge gives the same
+// hand-worked order and keeps all 24 hits. Each hit has its own content, so
+// no hit collapses into another.
 func TestMergeHitsIgnoresInputOrder(t *testing.T) {
 	var nodes []nodeHits
 	for node := range 4 {
@@ -33,7 +34,17 @@ func TestMergeHitsIgnoresInputOrder(t *testing.T) {
 		}
 		nodes = append(nodes, hits)
 	}
-	want := mergeNodeHits(slices.Concat(nodes...))
+	// The tie key orders by score, then by display path. Score 2 (files 2 and
+	// 5) comes first, then 1 (files 1 and 4), then 0 (files 0 and 3). Each
+	// score is in node order. No node loses a hit.
+	var want []string
+	for _, files := range [][2]int{{2, 5}, {1, 4}, {0, 3}} {
+		for node := range 4 {
+			for _, file := range files {
+				want = append(want, fmt.Sprintf("/root/n%d/f%d.go", node, file))
+			}
+		}
+	}
 	random := rand.New(rand.NewPCG(3, 4))
 	for range 20 {
 		shuffled := slices.Clone(nodes)
@@ -43,17 +54,19 @@ func TestMergeHitsIgnoresInputOrder(t *testing.T) {
 			random.Shuffle(len(inner), func(i, j int) { inner[i], inner[j] = inner[j], inner[i] })
 			shuffled[index] = inner
 		}
-		if got := mergeNodeHits(slices.Concat(shuffled...)); !reflect.DeepEqual(got, want) {
-			t.Fatalf("merge depends on input order:\ngot  %+v\nwant %+v", got, want)
+		merged := mergeNodeHits(slices.Concat(shuffled...))
+		got := make([]string, len(merged))
+		for index, hit := range merged {
+			got[index] = hit.displayPath()
 		}
-	}
-	if len(want) != 24 {
-		t.Fatalf("merged %d hits, want all 24 (no per-node cut)", len(want))
+		if !slices.Equal(got, want) {
+			t.Fatalf("merged order:\ngot  %v\nwant %v", got, want)
+		}
 	}
 }
 
 // TestDuplicateCollapseRepresentative collapses copies with the same content
-// and match into the copy with the smallest path; a dirty copy (other
+// and match into the copy with the smallest path. A dirty copy (other
 // content) and two name-only files with no content ID stay separate.
 func TestDuplicateCollapseRepresentative(t *testing.T) {
 	same := testContentID(7)
@@ -83,21 +96,24 @@ func TestDuplicateCollapseRepresentative(t *testing.T) {
 }
 
 // TestAcceptanceIsPerFile scores the same relevant file inside a pool of 128
-// and of 4,096 candidates: the verdict for that file is the same, because
-// each model-added file is accepted on its own lift above the empty-document
-// score. A strict file is accepted with a score of 0.
+// and of 4,096 candidates. The verdict for that file is the same, because
+// each model-added file passes on its own lift above the empty-document
+// score. A strict file passes with a score of 0.
 func TestAcceptanceIsPerFile(t *testing.T) {
-	const tokens, emptyScore = 4, 3
+	// Over 4 tokens above an empty-document score of 3, a noise score of 3.6
+	// lifts (3.6 - 3) / 4 = 0.15, under tau_file 0.25. The relevant score of
+	// 4.04 lifts (4.04 - 3) / 4 = 0.26, above it.
+	const tokens, emptyScore, tauFile = 4, 3, 0.25
 	verdict := func(poolSize int) bool {
 		scored := make(nodeHits, poolSize)
 		scores := make([]float32, poolSize)
 		for index := range scored {
 			scored[index] = nodeHit{corpus: "c", path: fmt.Sprintf("noise%05d.go", index), semantic: true}
-			scores[index] = emptyScore + (pipelineTauFile-0.1)*tokens
+			scores[index] = 3.6
 		}
 		scored[poolSize/2] = nodeHit{corpus: "c", path: "relevant.go", semantic: true}
-		scores[poolSize/2] = emptyScore + (pipelineTauFile+0.01)*tokens
-		accepted, err := acceptFiles(scored, scores, emptyScore, tokens, pipelineTauFile, nil)
+		scores[poolSize/2] = 4.04
+		accepted, err := acceptFiles(scored, scores, emptyScore, tokens, tauFile, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -108,17 +124,17 @@ func TestAcceptanceIsPerFile(t *testing.T) {
 		t.Fatal("the relevant file's verdict depends on the pool size")
 	}
 	strict := nodeHits{{corpus: "c", path: "strict.go", strict: true}}
-	accepted, err := acceptFiles(strict, []float32{0}, emptyScore, tokens, pipelineTauFile, nil)
+	accepted, err := acceptFiles(strict, []float32{0}, emptyScore, tokens, tauFile, nil)
 	if err != nil || len(accepted.hits) != 1 {
 		t.Fatalf("a strict all-word file was not admitted: %+v %v", accepted, err)
 	}
 }
 
 // TestCandidateFilesKeepsNameOnlyOutOfTheModel puts strict, relaxed, semantic
-// and name-only hits through the candidate set: strict and semantic files are
-// scored with no limit on their count; a relaxed-only file is not (it cannot
-// pass tau_file); a name-only file enters only as a strict match and never
-// gets a model score.
+// and name-only hits through the candidate set. The model scores strict and
+// semantic files with no limit on their count. It does not score a
+// relaxed-only file, which cannot pass tau_file. A name-only file enters only
+// as a strict match and never gets a model score.
 func TestCandidateFilesKeepsNameOnlyOutOfTheModel(t *testing.T) {
 	hits := nodeHits{
 		{path: "strict.go", strict: true},

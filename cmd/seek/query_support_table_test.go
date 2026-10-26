@@ -4,16 +4,16 @@ package main
 type queryRole string
 
 const (
-	// roleDescription: the model reads the atom's text, and the lexical half
-	// keeps the Zoekt meaning.
+	// roleDescription: the model reads the text of the atom, and the lexical
+	// half keeps the Zoekt meaning.
 	roleDescription queryRole = "description"
-	// roleFilter: Zoekt applies the atom in lexical retrieval, and the
-	// per-node Zoekt mask applies it to semantic retrieval: the rows of the
-	// files that the filters keep on the node's own shards.
+	// roleFilter: Zoekt applies the atom in lexical retrieval. The Zoekt mask
+	// of each node applies it to semantic retrieval. Semantic retrieval reads
+	// the rows of the files that the filters keep on the shards of the node.
 	roleFilter queryRole = "filter"
-	// roleModifier: the atom is neither model text nor a filter: a parse
-	// directive, grouping, an output mode, or a search-wide condition (a
-	// condition such as --lexical-only can choose strict ranking).
+	// roleModifier: the atom is neither model text nor a filter. It is a parse
+	// directive, grouping, an output mode, or a search-wide condition. A
+	// condition such as --lexical-only can choose strict ranking.
 	roleModifier queryRole = "modifier"
 )
 

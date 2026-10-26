@@ -29,30 +29,35 @@ const (
 	folderManifestFileName = ".folder-manifest-v1"
 )
 
+// folderChecksumTable is the CRC-64 table of Zoekt's document checksum
+// (FileMatch.Checksum), so a delta can compare a file with its indexed copy.
 var folderChecksumTable = crc64.MakeTable(crc64.ISO)
 
+// folderCandidate is one regular file that a folder walk selected, with the
+// stat values that the state hash and the folder manifest compare.
 type folderCandidate struct {
 	name  string
 	path  string
 	mode  os.FileMode
 	size  int64
 	mtime int64
-	// ctime moves on every write and on every metadata change, so a rewrite
-	// that keeps the size and puts the old mtime back is still seen.
+	// ctime moves on every write and on every metadata change. So the walk
+	// sees a rewrite that keeps the size and puts the old mtime back.
 	ctime int64
 	dev   uint64
 	ino   uint64
 	// dataless marks a cloud-only file: it is indexed by name only, so the
-	// walk never downloads it.
+	// build never reads its bytes and never makes the system download them.
 	dataless bool
 }
 
-// heldBytes is the content bytes that the shard document of the file holds:
-// the NOT-INDEXED marker for a file kept by name only (marker, a cloud-only
-// file, or one too large for the index), else its size. marker is the marker
-// bytes that a read found (nameOnlyMarkerBytes), zero when the shard holds the
-// content, or unreadFileMarker. An unread file counts at the larger of that
-// value and the largest marker (maxNotIndexedMarkerBytes).
+// heldBytes is the content bytes that the shard document of the file holds. A
+// file kept by name only holds the NOT-INDEXED marker: a file with a marker, a
+// cloud-only file, or one too large for the index. Any other file holds its
+// size. marker is the marker bytes that a read found (nameOnlyMarkerBytes),
+// zero when the shard holds the content, or unreadFileMarker. An unread file
+// counts at the larger of that value and the largest marker
+// (maxNotIndexedMarkerBytes).
 func (c folderCandidate) heldBytes(marker int64) int64 {
 	switch {
 	case marker == unreadFileMarker:
@@ -97,11 +102,11 @@ func folderFamilyUsable(indexDir string) bool {
 }
 
 // ensureFolderCorpusFreshWithExecution makes the Zoekt family and, when
-// enabled, its semantic generation describe one captured folder state. Missing
-// branches build concurrently. It activates the joined descriptor last, under
-// the publish lock. A semantic failure leaves the Zoekt family searchable.
-// When a peer holds the build lock, it serves the current shards
-// (corpusStale).
+// enabled, its semantic generation describe one captured folder state. The
+// lexical and semantic builds that are due run at the same time. It activates
+// the joined descriptor last, under the publish lock. A semantic failure
+// leaves the Zoekt family searchable. When a peer holds the build lock, it
+// serves the current shards (corpusStale).
 func ensureFolderCorpusFreshWithExecution(
 	ctx context.Context,
 	plan node,
@@ -249,10 +254,10 @@ func ensureFolderCorpusFreshWithExecution(
 	}
 	// The published family is the one this scan describes. Every failure below
 	// happens before the publish at the end of this function, so a failure
-	// cannot have changed it. Keeping .state in that case keeps the delta base:
-	// .state alone decides whether the next build can be a delta, so deleting
-	// it turns every interrupted build into a full rebuild of a family that is
-	// still correct on disk (build.keepState).
+	// cannot have changed it. Then .state can stay when the family is usable
+	// (build.keepState), and with it the delta base. .state alone decides
+	// whether the next build can be a delta. Without it, each stopped build
+	// would rebuild in full a family that is still correct on disk.
 	//
 	// dropStateUnlessPublished clears the cached state only when no usable
 	// family survives. Every caller below sits before the publish.
@@ -343,10 +348,10 @@ func ensureFolderCorpusFreshWithExecution(
 		semanticBuildFailed(execution.model, "Semantic folder index build failed; keeping lexical search", semanticErr)
 	}
 
-	// The index holds the bytes each file had when the build read it, under
-	// the state of the walk. A file that changed after the walk is a change for
-	// the next search: its stat no longer matches, so the next delta reads it
-	// again.
+	// The index holds the bytes that each file had when the build read it,
+	// under the state of the walk. A file that changed after the walk is a
+	// change for the next search. Its stat then differs, so the next delta
+	// reads it again.
 
 	activateSemantic := func() {
 		removeJoinedGeneration(plan.cacheDir)
@@ -419,6 +424,8 @@ func ensureFolderCorpusFreshWithExecution(
 	return corpusSearchable, nil
 }
 
+// folderCorpusContextError is a folder corpus failure with the root, cache,
+// and index directories of the corpus.
 type folderCorpusContextError struct {
 	root     string
 	cacheDir string
@@ -449,14 +456,14 @@ func folderCorpusError(plan node, err error) error {
 	}
 }
 
-// indexFolderDocuments indexes selected into dir, the build directory: a
-// delta on the prior shards that dir holds when tryDelta holds and the family
-// has at most maxFolderDeltaShards shards, else a full build. A failed delta
-// also falls back to a full build. It returns the bytes that deltas tombstoned
-// since the last full build (zero after a full build) and, by index of
-// selected, the marker bytes that a file's shard document holds instead of its
-// content (nameOnlyMarkerBytes), for the folder manifest. A read error that
-// may pass fails the build with a folderReadError.
+// indexFolderDocuments indexes selected into dir, the build directory. It
+// makes a delta on the prior shards in dir when tryDelta holds and the family
+// has at most maxFolderDeltaShards shards. Else, or when the delta fails, it
+// makes a full build. It returns the bytes that deltas tombstoned since the
+// last full build (zero after a full build). For the folder manifest, it also
+// returns the marker bytes of each file by index of selected
+// (nameOnlyMarkerBytes). A read error that can pass fails the build with a
+// folderReadError.
 func indexFolderDocuments(
 	ctx context.Context,
 	plan node,
@@ -501,19 +508,19 @@ func indexFolderDocuments(
 }
 
 // indexFolderDocumentsDelta writes the changed files of the folder into a
-// delta on the prior shards in dir, with up to parallelism shard jobs at the
-// same time. A delta of removals only adds no document; Zoekt then writes only
-// the tombstones (indexDeltaDocumentsWithRepository). It returns the bytes
-// that deltas tombstoned since the last full build, the markers of
-// indexFolderDocuments, and errDeltaCompaction when the tombstoned bytes reach
-// both the live bytes and one shard (deltaNeedsCompaction). The rule runs
-// before the reads, with an upper bound of each unread file's shard bytes
-// (unreadFileMarker), and again after them, with the bytes that each read
-// file's shard document holds. It returns errDeltaPayloadExceedsWindow when
-// the changed content reaches the build's window, with or without a manifest
-// of the cached state. With no such manifest, the dead bytes are what the
-// shards list beyond the live files, so a missing, failed, or older manifest
-// does not reset them.
+// delta on the prior shards in dir. It runs up to parallelism shard jobs at
+// the same time. A delta of removals only adds no document; Zoekt then writes
+// only the tombstones (indexDeltaDocumentsWithRepository). It returns the
+// bytes that deltas tombstoned since the last full build, and the markers of
+// indexFolderDocuments. It returns errDeltaCompaction when the tombstoned
+// bytes reach both the live bytes and one shard (deltaNeedsCompaction). The
+// rule runs before the reads, with an upper bound of each unread file's shard
+// bytes (unreadFileMarker). It runs again after them, with the bytes that
+// each read file's shard document holds. It returns
+// errDeltaPayloadExceedsWindow when the changed content reaches the build's
+// window, with or without a manifest of the cached state. With no such
+// manifest, the dead bytes are what the shards list beyond the live files. So
+// a missing, failed, or older manifest does not reset them.
 func indexFolderDocumentsDelta(
 	ctx context.Context,
 	plan node,
@@ -546,7 +553,7 @@ func indexFolderDocumentsDelta(
 			return false, 0, nil, errDeltaCompaction
 		}
 	} else {
-		// With no manifest, the shards give the dead content: they list the
+		// With no manifest, the shards give the dead content. They list the
 		// content and name bytes of every document since the last full build,
 		// and the live files hold the rest.
 		oldChecksums, shardBytes, err := enumerateIndexedFolderChecksums(ctx, dir, repoName)
@@ -554,8 +561,8 @@ func indexFolderDocumentsDelta(
 			return false, 0, nil, err
 		}
 		// Before the reads, each file counts at an upper bound of its shard
-		// bytes (unreadFileMarker), so these dead bytes are a lower bound: the
-		// rule cannot fire too early.
+		// bytes (unreadFileMarker). So these dead bytes are a lower bound, and
+		// the rule cannot fire too early.
 		if deltaNeedsCompaction(shardBytes-folderLiveBytesWithNames(selected, markers), folderLiveBytes(selected, markers)) {
 			return false, 0, nil, errDeltaCompaction
 		}
@@ -574,10 +581,10 @@ func indexFolderDocumentsDelta(
 	if len(changedPaths) == 0 {
 		return len(selected) > 0, tombstoned, markers, nil
 	}
-	// Both paths stop at the build's window (changedFolderDocumentsFromManifest
-	// before it reads the file that brings the changed size to it,
-	// changedFolderDocuments when the changed content reaches it), so the one
-	// delta Builder holds less than a window of content until its Finish.
+	// Both paths stop at the build's window. changedFolderDocumentsFromManifest
+	// stops before it reads the file that brings the changed size to it.
+	// changedFolderDocuments stops when the changed content reaches it. So the
+	// one delta Builder holds less than a window of content until its Finish.
 	indexedAny, err := indexDeltaDocuments(dir, repoName, plan.root, changedDocs, parallelism, changedPaths)
 	return indexedAny, tombstoned, markers, err
 }
@@ -603,7 +610,7 @@ func folderLiveBytesWithNames(selected []folderCandidate, markers []int64) int64
 }
 
 // folderManifestMarkers copies the marker of each unchanged manifest entry to
-// markers, by index of selected: a changed file keeps its marker of
+// markers, by index of selected. A changed file keeps its marker of
 // unreadFileMarker until it is read. Both slices are sorted by name.
 func folderManifestMarkers(selected []folderCandidate, manifest folderManifest, markers []int64) {
 	selectedIndex, manifestIndex := 0, 0
@@ -669,8 +676,9 @@ func folderManifestTombstonedBytes(selected []folderCandidate, manifest folderMa
 }
 
 // enumerateIndexedFolderChecksums returns the content checksum of each live
-// document of repoName in indexDir, and the content and name bytes that its
-// shards hold, tombstoned documents included (index.RepoStats.ContentBytes).
+// document of repoName in indexDir. It also returns the content and name
+// bytes that its shards hold, with the tombstoned documents
+// (index.RepoStats.ContentBytes).
 func enumerateIndexedFolderChecksums(ctx context.Context, indexDir, repoName string) (map[string]uint64, int64, error) {
 	searchers, err := loadShards(indexDir)
 	if err != nil {
@@ -716,9 +724,9 @@ func enumerateIndexedFolderChecksums(ctx context.Context, indexDir, repoName str
 // changedFolderDocuments finds the changed files by content checksum, for a
 // cached state with no matching manifest. It reads every selected file and
 // sets its marker bytes in markers, by index (nameOnlyMarkerBytes). It keeps
-// only the changed documents, and returns errDeltaPayloadExceedsWindow when
+// only the changed documents. It returns errDeltaPayloadExceedsWindow when
 // the content that they hold reaches window, as the manifest path does
-// (changedFolderDocumentsFromManifest): the one delta Builder holds them all
+// (changedFolderDocumentsFromManifest). The one delta Builder holds them all
 // until its Finish.
 func changedFolderDocuments(selected []folderCandidate, oldChecksums map[string]uint64, markers []int64, window int64) ([]fileContent, []string, error) {
 	changedDocs := make([]fileContent, 0, 1)
@@ -775,6 +783,8 @@ func changedFolderDocuments(selected []folderCandidate, oldChecksums map[string]
 	return changedDocs, changedPaths, nil
 }
 
+// folderManifest records the stat values of each file of the last folder
+// build, so the next build reads only new and changed files.
 type folderManifest struct {
 	Version int    `json:"version"`
 	State   string `json:"state"`
@@ -784,6 +794,7 @@ type folderManifest struct {
 	Files     []folderManifestEntry `json:"files"`
 }
 
+// folderManifestEntry is the stat record of one file in a folderManifest.
 type folderManifestEntry struct {
 	Name     string      `json:"name"`
 	Mode     os.FileMode `json:"mode"`
@@ -793,15 +804,15 @@ type folderManifestEntry struct {
 	Dev      uint64      `json:"dev"`
 	Ino      uint64      `json:"ino"`
 	Dataless bool        `json:"dataless,omitempty"`
-	// Marker is the size of the NOT-INDEXED marker that the shard holds
-	// instead of the content, as the read found it (nameOnlyMarkerBytes):
-	// content with a NUL byte, of one or two bytes, or unreadable. Zero means
-	// the shard holds the content.
+	// Marker is the size of the NOT-INDEXED marker that the shard holds in
+	// place of the content, as the read found it (nameOnlyMarkerBytes). The
+	// read finds one for content with a NUL byte, of one or two bytes, or
+	// that it cannot read. Zero means that the shard holds the content.
 	Marker int64 `json:"marker,omitempty"`
 }
 
-// heldBytes is the content bytes that the shard document of the file holds:
-// the NOT-INDEXED marker for a file kept by name only, else its size.
+// heldBytes is the content bytes that the shard document of the file holds.
+// That is the NOT-INDEXED marker for a file kept by name only, else its size.
 func (file folderManifestEntry) heldBytes() int64 {
 	switch {
 	case file.Marker > 0:
@@ -814,6 +825,8 @@ func (file folderManifestEntry) heldBytes() int64 {
 	return file.Size
 }
 
+// readFolderManifest reads the folder manifest of cacheDir. It reports false
+// when the manifest is missing or damaged, or has another version or state.
 func readFolderManifest(cacheDir, expectedState string) (folderManifest, bool) {
 	var manifest folderManifest
 	if expectedState == "" {
@@ -969,6 +982,8 @@ func newFolderCandidate(name, path string, info os.FileInfo) folderCandidate {
 	return candidate
 }
 
+// fileInfoIdentity returns the device, inode, and mtime in nanoseconds of
+// info. With no Stat_t, it returns zeros and the ModTime.
 func fileInfoIdentity(info os.FileInfo) (uint64, uint64, int64) {
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
 		return uint64(st.Dev), uint64(st.Ino), statMtimeNano(*st)
@@ -976,6 +991,9 @@ func fileInfoIdentity(info os.FileInfo) (uint64, uint64, int64) {
 	return 0, 0, info.ModTime().UnixNano()
 }
 
+// newFolderStateHasher starts the state hash of a folder node with the format
+// versions, the index options, the root type, and the root identity. So a
+// change of any of them changes the state.
 func newFolderStateHasher(plan node) *xxhash.Digest {
 	h := xxhash.New()
 	_, _ = h.WriteString(stateVersion)
@@ -1029,13 +1047,13 @@ func appendFolderFingerprintBytes(h *xxhash.Digest, part []byte) {
 }
 
 // streamFolderFilesWithMarkers returns a channel that yields file contents for
-// each folder candidate. The output channel is unbuffered. In-flight
-// memory is bounded by two limits, whichever is tighter:
+// each folder candidate. The output channel has no buffer. Two limits bound
+// the memory in use, whichever is tighter:
 //   - the worker count (each worker holds at most one fileContent),
-//   - readSemaphore's readBudgetBytes weight budget (see caps.go).
+//   - the readBudgetBytes weight budget of readSemaphore (see caps.go).
 //
-// Each yielded fileContent carries readWeight of the candidate's pre-read size
-// as its readSemaphore weight; a name-only document carries zero. The consumer
+// Each yielded fileContent carries readWeight of the candidate's stat size as
+// its readSemaphore weight; a name-only document carries zero. The consumer
 // (indexDocuments) releases that weight after Builder.Add, or after Finish for
 // a document that fills a shard of its own. A caller must drain the channel or
 // cancel ctx.
@@ -1043,8 +1061,8 @@ func appendFolderFingerprintBytes(h *xxhash.Digest, part []byte) {
 // Synchronous folder-delta reads use readFolderDocument and have zero weight.
 // readSemaphore does not limit those reads.
 //
-// A read error that may pass (folderReadError) calls fail and stops the
-// stream: the build then publishes nothing, so the next search reads the file
+// A read error that can pass (folderReadError) calls fail and stops the
+// stream. The build then publishes nothing, so the next search reads the file
 // again.
 //
 // When markers is set, it also sets the marker bytes of each sent document by
@@ -1100,11 +1118,10 @@ func streamFolderFilesWithMarkers(
 // readOneFolderFileStreaming reads one candidate (readFolderDocument) and
 // sends its document. A file whose content the index reads (indexedBytes)
 // takes readSemaphore weight before the read. A document with content keeps
-// the weight, and a successful send transfers its release to the consumer. A
-// name-only document carries no weight: the reader releases it before the
-// send. A read error that may pass calls fail and sends nothing. It returns the
-// marker bytes of the document (nameOnlyMarkerBytes), or zero when it sends
-// none.
+// the weight, and after a send the consumer releases it. A name-only document
+// carries no weight: the reader releases it before the send. A read error
+// that can pass calls fail and sends nothing. It returns the marker bytes of
+// the document (nameOnlyMarkerBytes), or zero when it sends none.
 func readOneFolderFileStreaming(
 	ctx context.Context,
 	candidate folderCandidate,
@@ -1151,14 +1168,14 @@ func readWeightedFolderDocument(candidate folderCandidate, weight int64) (fileCo
 }
 
 // streamFolderFilesInOrder is streamFolderFilesWithMarkers that sends the
-// documents in the order of candidates, for the vector build: a graph shard is
-// reused only when its rows are the same (semanticUSearchShardID), and reads
+// documents in the order of candidates, for the vector build. A build reuses a
+// graph shard only when its rows are the same (semanticUSearchShardID). Reads
 // that end in another order would give other rows to every shard at each
 // build. The reads still run on parallelism workers. The dispatcher takes the
-// weight of each file in order, before its read starts, so the earliest
+// weight of each file in order, before its read starts. So the earliest
 // document that is not sent always holds its weight, and its read can always
-// finish: no read waits for the weight of a later document that waits to be
-// sent.
+// finish. No read waits for the weight of a later document that waits for its
+// send.
 func streamFolderFilesInOrder(
 	ctx context.Context,
 	candidates []folderCandidate,
@@ -1236,11 +1253,11 @@ func streamFolderFilesInOrder(
 }
 
 // readFolderDocument returns the document for one candidate, with no
-// readSemaphore weight: its content, or a name-only document when the file is
-// cloud-only, too large for the index, unreadable for a lasting reason
-// (folderReadIsLasting), or starts with binary content. A file removed after
-// the walk returns an fs.ErrNotExist error. A read error that may pass returns
-// a folderReadError.
+// readSemaphore weight. The document holds the content of the file. It is
+// name-only when the file is cloud-only, too large for the index, unreadable
+// for a lasting reason (folderReadIsLasting), or starts with binary content. A
+// file removed after the walk returns an fs.ErrNotExist error. A read error
+// that can pass returns a folderReadError.
 func readFolderDocument(candidate folderCandidate) (fileContent, error) {
 	if candidate.dataless {
 		return fileContent{name: candidate.name, skipReason: seekNoBytesReason}, nil
@@ -1266,13 +1283,16 @@ func readFolderDocument(candidate folderCandidate) (fileContent, error) {
 	return fileContent{name: candidate.name, content: content}, nil
 }
 
-// folderOpenFile opens a folder file for reading; tests replace it to inject
-// read errors.
+// folderOpenFile opens a folder file for reading. Tests replace it to fail one
+// chosen file with EIO or EMFILE. A test cannot make these faults on disk. EIO
+// comes from a failing disk, and a lower file limit fails every open of the
+// process. Tests also replace it to write a file between the text read and the
+// vector read of one build. No file-system event marks that time.
 var folderOpenFile = openWorkTreeFile
 
 var errFolderFileGrew = errors.New("file grew beyond its stat size")
 
-// folderReadError is a read error that may pass (EMFILE, EIO, ESTALE, a
+// folderReadError is a read error that can pass (EMFILE, EIO, ESTALE, a
 // network timeout): the build stops and publishes nothing.
 type folderReadError struct {
 	path string
@@ -1283,8 +1303,8 @@ func (e *folderReadError) Error() string { return fmt.Sprintf("read %s: %v", e.p
 func (e *folderReadError) Unwrap() error { return e.err }
 
 // folderReadIsLasting reports a read error that the next search would see
-// again: the file stays searchable by name. Permissions heal through a ctime
-// change, which the state hash sees. ELOOP comes from the Lstat of the dirty
+// again: the file stays searchable by name. A permission fix changes the
+// ctime, which the state hash sees. ELOOP comes from the Lstat of the dirty
 // reader when a directory of the path is a symlink loop.
 func folderReadIsLasting(err error) bool {
 	return errors.Is(err, fs.ErrPermission) || errors.Is(err, errFolderFileGrew) ||

@@ -24,16 +24,7 @@ func semanticPathFilterForTest(t testing.TB, source string) semanticPathFilter {
 // semanticPathFilterForAtom compiles one file: atom as nodeHeaderQuery does.
 func semanticPathFilterForAtom(t testing.TB, atom query.Q) semanticPathFilter {
 	t.Helper()
-	var filter semanticPathFilter
-	var err error
-	switch typed := atom.(type) {
-	case *query.Substring:
-		filter, err = newSemanticSubstringFilter(typed)
-	case *query.Regexp:
-		filter, err = newSemanticRegexpFilter(typed)
-	default:
-		t.Fatalf("atom %s is %T, want one file: atom", atom, atom)
-	}
+	filter, err := newSemanticPathFilter(atom)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -50,10 +50,9 @@ func splicePassthroughSeparator(args []string, flags *pflag.FlagSet) []string {
 		// Strip optional `=value` to match the registered name.
 		name, _, hasEq := strings.Cut(arg, "=")
 		if flag := lookupExactFlag(flags, name); flag != nil {
-			// Skip the value arg when the flag takes one and used
-			// the space-separated form (`-n 5` not `-n=5`),
-			// otherwise the next iteration would see `5` (or
-			// `-5`) as a candidate splice point.
+			// Skip the value argument of a flag that takes one in the
+			// space-separated form (`-n 5`, not `-n=5`). Else the next
+			// iteration would see `5` (or `-5`) as a splice point.
 			if flag.NoOptDefVal == "" && !hasEq && i+1 < len(args) {
 				i++
 			}
@@ -114,13 +113,13 @@ the meaning-based index and all model work.`,
 		Args: rootArgsValidator,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			slog.SetDefault(newCLILogger(os.Stderr, flags.verbose))
-			// Report a bad provider pin here, at the default log level. Left to
-			// the encoder, it would surface as one more reason to keep lexical
-			// search, which the fallback path hides behind --verbose.
+			// Report a bad provider pin here, at the default log level. The
+			// encoder would report it as one more reason to keep lexical
+			// search, and the fallback path shows that only with --verbose.
 			//
-			// Only for commands that can use the model: `gc`, `completion` and
-			// a --lexical-only search do not read the setting, so a typo in it
-			// must not stop them.
+			// Only commands that can use the model check it. `gc`, `completion`
+			// and a --lexical-only search do not read the setting, so a typo in
+			// it must not stop them.
 			if flags.lexicalOnly || !commandUsesSemanticModel(cmd) {
 				return nil
 			}
@@ -239,7 +238,7 @@ func rootArgsValidator(_ *cobra.Command, args []string) error {
 // suggestFlagError adds a did-you-mean hint, by Levenshtein distance, to the
 // error of an unknown flag. Cobra suggests only command names and pflag
 // suggests nothing, so this hook puts the hint in the error message that the
-// CLI presenter shows.
+// CLI prints.
 func suggestFlagError(cmd *cobra.Command, err error) error {
 	if err == nil {
 		return nil

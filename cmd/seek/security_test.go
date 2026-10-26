@@ -69,9 +69,9 @@ func TestSearchRunsNoRepoConfiguredCommands(t *testing.T) {
 	}
 }
 
-// TestParseRepoGitConfig lists each local and worktree filter driver once, in
-// order, also with a dotted, an equals-sign, or an empty name; a key from the
-// global config adds no driver.
+// TestParseRepoGitConfig checks that parseRepoGitConfig lists each local and
+// worktree filter driver once, in order, also with a dotted, an equals-sign,
+// or an empty name. A key from the global config adds no driver.
 func TestParseRepoGitConfig(t *testing.T) {
 	out := []byte("global\x00filter.lfs.clean\ngit-lfs clean\x00" +
 		"local\x00filter.pwn.clean\n/bin/x\x00" +

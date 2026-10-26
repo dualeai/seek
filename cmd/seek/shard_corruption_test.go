@@ -27,8 +27,8 @@ const (
 	// shardScanHeapCap ends a scan child whose heap passes it. Zoekt's delta
 	// readers append forever on a cut-off varint (index/bits.go
 	// fromSizedDeltas and unmarshalDocSections), which reached 12 GB in 1.7 s.
-	// A cap of 128 MiB finds the same offsets as 512 MiB, and the -race child
-	// then peaks near 390 MB of memory instead of 2 GB.
+	// A cap of 128 MiB finds the same offsets as 512 MiB. The -race child then
+	// peaks near 390 MB of memory instead of 2 GB.
 	// TODO(https://github.com/sourcegraph/zoekt/issues/1205): fail on a hang
 	// in place of the heap cap once Zoekt returns an error on a cut-off
 	// varint.
@@ -37,9 +37,9 @@ const (
 )
 
 // TestShardScanHelper is the child process of shardScan. It changes one byte
-// of the shard at a time and prints the outcome of each Zoekt call that Seek
-// makes on a shard: the open, the content search, the name listing and the
-// repository list. A heap above shardScanHeapCap ends the child with
+// of the shard at a time. It prints the outcome of each Zoekt call of Seek on
+// a shard: the open, the content search, the name listing and the repository
+// list. A heap above shardScanHeapCap ends the child with
 // shardScanHangExit after it prints the offset. The child ends with os.Exit,
 // so it writes only into the directory of the shard copy, which its parent
 // owns and removes.
@@ -86,9 +86,10 @@ func TestShardScanHelper(t *testing.T) {
 }
 
 // shardScanOutcome runs each of Seek's Zoekt shard calls on path and gives
-// the class of each, as "open=<class>" or as "listing=<class> list=<class>
-// search=<class>": the name listing (the current-copy listing and the BM25
-// counts), the repository list (the BM25 counts), and the content search.
+// the class of each. The result is "open=<class>" when the open fails, else
+// "listing=<class> list=<class> search=<class>". The current-copy listing and
+// the BM25 counts read the name listing, the BM25 counts read the repository
+// list, and search is the content search.
 func shardScanOutcome(path string, content query.Q) string {
 	searcher, err := openShard(path)
 	if err != nil {
@@ -104,6 +105,8 @@ func shardScanOutcome(path string, content query.Q) string {
 	return "listing=" + shardScanClass(listingErr) + " list=" + shardScanClass(listErr) + " search=" + shardScanClass(searchErr)
 }
 
+// shardScanClass names the class of err: ok, skip for an error that is not
+// index damage, or the kind of damage from the error text.
 func shardScanClass(err error) string {
 	if err == nil {
 		return "ok"
@@ -185,19 +188,23 @@ func shardScan(t *testing.T, shard, content string, stop func(offset int, outcom
 	return hangs
 }
 
-// TestCorruptShardIsRepairedNeverCrashes changes one byte of a shard at a time.
-// A child process runs Seek's Zoekt shard calls on each change, so a panic
-// that escaped zoektOpen, zoektSearch or zoektList would crash it and fail the
-// test. Then a CLI child process searches the first change of each case: for
-// a folder shard, a Zoekt corrupt-shard panic, a corrupt-index panic, a Go
-// runtime error and a read past the end of the file; for an uncommitted
-// shard, a failed name listing (the current-copy listing reads it); for a
-// committed shard with a new time, a failed listing or repository list (the
-// BM25 counts read them). The search must not crash. The folder and
-// uncommitted cases must warn once for the repair. The committed case need
-// not repair: when it does not warn once, the test writes the original bytes
-// back. The next search must find every file with no warning. The shard bytes
-// differ from build to build, so the test scans for the offsets.
+// TestCorruptShardIsRepairedNeverCrashes changes one byte of a shard at a
+// time. A child process runs Seek's Zoekt shard calls on each change. A panic
+// that escaped zoektOpen, zoektSearch or zoektList would crash the child and
+// fail the test. Then a CLI child process searches the first change of each
+// case:
+//   - folder shard: a Zoekt corrupt-shard panic, a corrupt-index panic, a Go
+//     runtime error, and a read past the end of the file;
+//   - uncommitted shard: a failed name listing, which the current-copy
+//     listing reads;
+//   - committed shard with a new time: a failed listing or repository list,
+//     which the BM25 counts read.
+//
+// The search must not crash. The folder and uncommitted cases must warn once
+// for the repair. The committed case need not repair: when it does not warn
+// once, the test writes the original bytes back. The next search must find
+// every file with no warning. The shard bytes differ from build to build, so
+// the test scans for the offsets.
 func TestCorruptShardIsRepairedNeverCrashes(t *testing.T) {
 	requireTools(t)
 	const marker = "zqcorruptmark"

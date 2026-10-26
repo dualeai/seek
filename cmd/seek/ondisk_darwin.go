@@ -19,9 +19,9 @@ import (
 // onDiskPath returns path with the letter case that the file system stores.
 // A directory takes it from one open and one F_GETPATH, with no directory
 // listing. Any failure returns path unchanged. A file takes the case of its
-// directory and its stored name from getattrlist, with no open (an open can
-// download a cloud-only file) and, on APFS and HFS+, no listing (a listing of
-// a large directory is slow).
+// directory and its stored name from getattrlist. The file gets no open,
+// because an open can download a cloud-only file. On APFS and HFS+, it also
+// gets no listing, because a listing of a large directory is slow.
 func onDiskPath(path string) string {
 	var st unix.Stat_t
 	if err := unix.Stat(path, &st); err == nil && st.Mode&unix.S_IFMT != unix.S_IFDIR {
@@ -54,7 +54,7 @@ func onDiskPath(path string) string {
 }
 
 // storedName returns the name that the file system stores for the last
-// component of path: getattrlist(2) with ATTR_CMN_NAME reads it from the
+// component of path. getattrlist(2) with ATTR_CMN_NAME reads it from the
 // metadata, with no open and no directory listing.
 func storedName(path string) (string, bool) {
 	target := C.CString(path)

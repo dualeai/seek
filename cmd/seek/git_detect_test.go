@@ -80,8 +80,8 @@ func TestDetectGitBoundary_DirMissingRefs(t *testing.T) {
 }
 
 func TestDetectGitBoundary_HEADIsDir(t *testing.T) {
-	// A directory named HEAD (not a regular file) must NOT satisfy the
-	// triad. Guards against attacker-crafted trees with HEAD/ as a dir.
+	// A directory named HEAD is not a regular file, so it does not satisfy
+	// the triad. A hostile tree can hold such a directory.
 	root := t.TempDir()
 	gitDir := filepath.Join(root, ".git")
 	if err := os.MkdirAll(filepath.Join(gitDir, "HEAD"), 0o755); err != nil {
@@ -300,9 +300,9 @@ func TestDetectGitBoundary_SymlinkedGitAsksGit(t *testing.T) {
 }
 
 func TestDetectGitBoundary_SeparateGitDirOutsideTreeAsksGit(t *testing.T) {
-	// A .git file that names a Git directory outside the worktree, with no
-	// core.worktree that names the worktree and no linked-worktree
-	// back-reference, proves nothing on its own: Git decides.
+	// A .git file that names a Git directory outside the worktree proves
+	// nothing on its own: Git decides. Here no core.worktree and no
+	// linked-worktree back-reference names the worktree.
 	root := t.TempDir()
 	realGitDir := filepath.Join(root, "real-git")
 	writeGitTriadAt(t, realGitDir)
@@ -319,9 +319,9 @@ func TestDetectGitBoundary_SeparateGitDirOutsideTreeAsksGit(t *testing.T) {
 }
 
 func TestDetectGitBoundary_LargeGitFileNoOOM(t *testing.T) {
-	// Pathological `.git` file: 64 MiB of junk. The detector must not read
-	// the whole file into memory (DoS guard); it reads maxGitFileBytes. Only
-	// the first KiB holds data; the rest is a sparse hole with no disk space.
+	// The `.git` file holds 64 MiB of junk. The detector must not read the
+	// whole file into memory: it reads at most maxGitFileBytes. Only the first
+	// KiB holds data; the rest is a sparse hole that uses no disk space.
 	root := t.TempDir()
 	worktree := filepath.Join(root, "wt")
 	if err := os.MkdirAll(worktree, 0o755); err != nil {
@@ -351,8 +351,9 @@ func TestDetectGitBoundary_LargeGitFileNoOOM(t *testing.T) {
 
 func TestDetectGitBoundary_LongGitdirLineConfirmed(t *testing.T) {
 	// A valid gitdir line longer than 1 KiB (PATH_MAX on darwin) names a real
-	// submodule Git directory. maxGitFileBytes is a hostile-input bound, not a
-	// path limit, so the line is read whole and the boundary is confirmed.
+	// submodule Git directory. maxGitFileBytes bounds hostile input; it is not
+	// a path limit. So the detector reads the whole line and confirms the
+	// boundary.
 	root := t.TempDir()
 	worktree := filepath.Join(root, "wt")
 	writeSubmoduleGitDir(t, filepath.Join(root, "super", ".git", "modules", "real-git"), worktree)
@@ -410,9 +411,9 @@ func TestDetectGitBoundary_NULBytePointer(t *testing.T) {
 	if err := os.MkdirAll(worktree, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// `/tmp/foo\x00/etc/passwd` is a syscall-API truncation attack vector.
-	// Even though our path lands at the resolvable prefix, NUL in a path
-	// is malformed and must be refused.
+	// A NUL byte cuts a path at the system call, as in
+	// `/tmp/foo\x00/etc/passwd`. The prefix here names a real Git directory,
+	// but a path with a NUL byte is not valid, so the detector refuses it.
 	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: "+realGitDir+"\x00/etc/passwd\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -423,8 +424,8 @@ func TestDetectGitBoundary_NULBytePointer(t *testing.T) {
 }
 
 func TestDetectGitBoundary_SymlinkedHEADRefused(t *testing.T) {
-	// HEAD as a symlink to an attacker-readable file (e.g. /etc/passwd
-	// shape): hasGitTriad must refuse via Lstat.
+	// HEAD is a symlink to a file elsewhere, as a hostile tree can make.
+	// hasGitTriad reads HEAD with Lstat, so it refuses the symlink.
 	root := t.TempDir()
 	gitDir := filepath.Join(root, ".git")
 	if err := os.MkdirAll(filepath.Join(gitDir, "objects"), 0o755); err != nil {
@@ -447,7 +448,7 @@ func TestDetectGitBoundary_SymlinkedHEADRefused(t *testing.T) {
 }
 
 func TestDetectBareRepoAt_True(t *testing.T) {
-	// Bare repo layout: HEAD + objects/ + refs/ at top-level, no `.git`.
+	// A bare repository has HEAD, objects/ and refs/ at its top and no `.git`.
 	// detectBareRepoAt confirms it; detectGitBoundary reads only a `.git`
 	// entry.
 	root := t.TempDir()
@@ -486,8 +487,8 @@ func TestDetectBareRepoAt_FalseOnPlainDir(t *testing.T) {
 }
 
 func TestDetectGitBoundary_CommonDirRead(t *testing.T) {
-	// Worktree with explicit commondir file: detector reads it and reports
-	// the resolved common dir.
+	// The admin directory of the worktree has a commondir file: the detector
+	// reads it and reports the resolved common directory.
 	root := t.TempDir()
 	parentGit := filepath.Join(root, "parent.git")
 	writeGitTriadAt(t, parentGit)
@@ -591,6 +592,10 @@ func TestDetectGitBoundary_LinkedWorktreeWrongBackrefRejected(t *testing.T) {
 	}
 }
 
+// writeLinkedWorktreeAdmin writes the admin directory of a linked worktree
+// named feature in commonDir/worktrees. The directory holds HEAD, refs, a
+// commondir file that names commonDir, and a gitdir back-reference to
+// worktree/.git. It returns the admin directory.
 func writeLinkedWorktreeAdmin(t testing.TB, commonDir, worktree string) string {
 	t.Helper()
 	const name = "feature"

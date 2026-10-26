@@ -146,8 +146,9 @@ func TestFailureClasses(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if strings.Contains(tc.name, "unreadable objects") {
-				// Git says "not a git repository"; the file-system rule still
-				// rejects it, so its config is never shown.
+				// Git says "not a git repository", but the file-system rule
+				// still finds a Git directory. So no search prints its files,
+				// such as config.
 				objects := filepath.Join(bare, "objects")
 				if err := os.Chmod(objects, 0); err != nil {
 					t.Fatal(err)
@@ -178,8 +179,8 @@ func TestFailureClasses(t *testing.T) {
 		})
 	}
 
-	// Node rows: a node that fails is skipped with one warning;
-	// the other nodes answer; the exit is 0 on matches and 1 on none, never 2.
+	// Node rows: Seek skips a node that fails, with one warning, and the other
+	// nodes answer. The exit code is 0 with matches and 1 with none, never 2.
 	const nodeMarker = "zqnodefailuremarker"
 	for _, tc := range []struct {
 		name  string
@@ -189,7 +190,7 @@ func TestFailureClasses(t *testing.T) {
 		cause string
 	}{
 		{
-			// The start operand exists but cannot be read.
+			// The start operand exists, and Seek cannot read it.
 			name: "cwd mode 000",
 			setup: func(t *testing.T, f *graphFixture) ([]string, string) {
 				locked := f.path("locked")
@@ -206,13 +207,17 @@ func TestFailureClasses(t *testing.T) {
 			},
 		},
 		{
-			// An absolute operand that cannot be read fails without a Git
-			// process; the warning names the canonical path.
+			// An absolute operand that Seek cannot read fails with no Git
+			// process. The warning names the path with its symlinks resolved.
 			name: "operand mode 000",
 			setup: func(t *testing.T, f *graphFixture) ([]string, string) {
 				locked := f.path("locked")
 				f.graphFile("locked/a.txt", nodeMarker)
 				f.graphFile("plain/b.txt", nodeMarker)
+				resolved, err := filepath.EvalSymlinks(locked)
+				if err != nil {
+					t.Fatal(err)
+				}
 				if err := os.Chmod(locked, 0); err != nil {
 					t.Fatal(err)
 				}
@@ -220,13 +225,13 @@ func TestFailureClasses(t *testing.T) {
 				if _, err := os.ReadDir(locked); err == nil {
 					t.Fatal("the test user lists a mode-000 directory, so the node cannot fail")
 				}
-				return []string{locked, f.path("plain")}, canonicalCorpusPath(locked)
+				return []string{locked, f.path("plain")}, resolved
 			},
 			found: []string{"plain/b.txt"},
 			cause: "cannot read path",
 		},
 		{
-			// A folder operand that cannot be listed fails its node.
+			// A folder operand that Seek cannot list fails its node.
 			name: "folder operand mode 0311",
 			setup: func(t *testing.T, f *graphFixture) ([]string, string) {
 				noRead := f.path("noread")
@@ -244,7 +249,7 @@ func TestFailureClasses(t *testing.T) {
 			found: []string{"plain/b.txt"},
 		},
 		{
-			// A file operand that cannot be read fails its node.
+			// A file operand that Seek cannot read fails its node.
 			name: "file operand mode 000",
 			setup: func(t *testing.T, f *graphFixture) ([]string, string) {
 				locked := f.path("d/locked.txt")
@@ -414,7 +419,7 @@ func TestFailureClasses(t *testing.T) {
 
 	// Boundary rows: a `.git` entry below a folder root. Git cannot use it: one
 	// warning, and the folder never indexes that directory. A stray `.git`
-	// entry is no boundary: its siblings are found, the entry itself is not.
+	// entry is no boundary: the search finds its siblings, but not the entry.
 	const marker = "zqfailureboundarymarker"
 	for _, tc := range []struct {
 		name   string
@@ -504,9 +509,9 @@ func TestFailureClasses(t *testing.T) {
 }
 
 // TestOperandBelowAStrayGitEntryStaysInItsRepository searches a subfolder
-// whose `.git` entry names no repository (a file with no `gitdir:` line, or a
-// directory with HEAD only): the operand belongs to the parent repository, so
-// its Git-ignored file stays hidden and its tracked file is found.
+// whose `.git` entry names no repository: a file with no `gitdir:` line, or a
+// directory with HEAD only. The operand belongs to the parent repository. So
+// the search finds its tracked file and hides its Git-ignored file.
 func TestOperandBelowAStrayGitEntryStaysInItsRepository(t *testing.T) {
 	requireTools(t)
 	const marker = "zqstraysubmarker"
@@ -540,8 +545,8 @@ func TestOperandBelowAStrayGitEntryStaysInItsRepository(t *testing.T) {
 }
 
 // TestOperandsOfOneRepositoryReadItsDriversOnce resolves three operands of a
-// repository whose `.git` file points to a separate Git directory (an
-// ambiguous boundary): Seek reads the repository's driver list once.
+// repository whose `.git` file points to a separate Git directory, an
+// ambiguous boundary. Seek reads the filter drivers of the repository once.
 func TestOperandsOfOneRepositoryReadItsDriversOnce(t *testing.T) {
 	requireGit(t)
 	f := newGraphFixture(t)

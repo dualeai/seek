@@ -6,12 +6,12 @@ import (
 	"testing"
 )
 
-// TestFamilyScanContiguous pins the guard that decides whether a family may be
-// seeded. Zoekt derives the next shard number from the contiguous run it finds,
-// so a gapped seed can make a delta replace a later shard. Basename order does
-// not group each prefix's shards, so the comparison must use parsed prefixes
-// and shard numbers. Each case scans a directory of empty files with those
-// names, as the delta build does.
+// TestFamilyScanContiguous checks the guard that decides whether a family can
+// seed a delta build. Zoekt derives the next shard number from the contiguous
+// run that it finds. So a seed with a gap can make a delta replace a later
+// shard. Basename order does not group the shards of each prefix, so the
+// comparison must use the parsed prefixes and shard numbers. Each case scans
+// a directory of empty files with those names, as the delta build does.
 func TestFamilyScanContiguous(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -25,10 +25,10 @@ func TestFamilyScanContiguous(t *testing.T) {
 		{"missing zero", familyAll, []string{"r_v16.00001.zoekt", "r_v16.00002.zoekt"}, false},
 		{"gap in the middle", familyAll, []string{"r_v16.00000.zoekt", "r_v16.00002.zoekt"}, false},
 		{
-			// The case that the doc comment of contiguous names: a second
-			// family whose whole name sorts between the first family's shard 0
-			// and shard 1. Sorting by basename alone would interleave the two
-			// runs and mis-decide.
+			// The case that the doc comment of contiguous names. The whole
+			// name of a second family sorts between shard 0 and shard 1 of the
+			// first family. A sort by basename alone would mix the two runs
+			// and give the wrong answer.
 			name: "two prefixes interleaved by basename",
 			fam:  familyAll,
 			names: []string{
@@ -48,8 +48,8 @@ func TestFamilyScanContiguous(t *testing.T) {
 			want: false,
 		},
 		{
-			// familyCommitted must ignore the uncommitted family entirely: its
-			// own numbering says nothing about the committed run.
+			// familyCommitted ignores the uncommitted family: its numbering
+			// tells nothing about the committed run.
 			name: "committed view skips a gapped uncommitted family",
 			fam:  familyCommitted,
 			names: []string{
@@ -87,8 +87,8 @@ func TestFamilyScanContiguous(t *testing.T) {
 		})
 	}
 
-	// An explicit shard list arrives in the caller's order; the comparator
-	// must order it, not the input.
+	// An explicit shard list comes in the order of the caller: the check
+	// sorts it and does not trust the input order.
 	if !pathsAreContiguous([]string{"r_v16.00002.zoekt", "r_v16.00000.zoekt", "r_v16.00001.zoekt"}) {
 		t.Error("an unsorted run of three is not contiguous")
 	}
@@ -98,8 +98,8 @@ func TestFamilyScanContiguous(t *testing.T) {
 }
 
 // TestMatchesManifestFamilyScoping checks that a change to the uncommitted
-// family does not mark the committed family as damaged, and that a changed or
-// a missing committed shard does.
+// family does not mark the committed family as damaged. A changed or a
+// missing committed shard does.
 func TestMatchesManifestFamilyScoping(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, content string) {
@@ -142,9 +142,14 @@ func TestMatchesManifestFamilyScoping(t *testing.T) {
 		t.Error("committed half reported damaged by an uncommitted-only change")
 	}
 
-	// Damage the committed shard: both answers must now be false.
+	// Put the uncommitted shard back, then damage the committed shard: both
+	// answers must now be false.
+	write(uncommitted, "uncommitted")
 	write(committed, "committed-shard-changed")
 	sc = scan()
+	if sc.matchesManifest(dir) {
+		t.Error("whole family matched after the committed shard changed")
+	}
 	if sc.matchesManifestFamily(dir, familyCommitted) {
 		t.Error("committed half matched after the committed shard changed")
 	}

@@ -14,9 +14,9 @@ import (
 )
 
 const (
-	// The order of accepted files fuses the lexical and the model rank with
-	// weighted reciprocal-rank fusion: the lexical rank weighs twice the model
-	// rank.
+	// rerankRRFConstant (k) and rerankLexicalWeight set the weighted
+	// reciprocal-rank fusion that orders the accepted files (acceptFiles): the
+	// lexical rank weighs twice the model rank.
 	rerankRRFConstant        = 60.0
 	rerankLexicalWeight      = 2.0
 	rerankPathComponentLimit = 4
@@ -37,6 +37,9 @@ type rerankQueryPlan struct {
 	filters []query.Q
 }
 
+// rerankDocument is the text that the model scores for one file: its path,
+// language and symbol, and one part of its text. That part is the best
+// lexical match with its context, or the window that the vectors found.
 type rerankDocument struct {
 	Path     string
 	Language string
@@ -62,13 +65,16 @@ type searchRunConfig struct {
 // word, an identifier and a phrase too. Description atoms feed the model;
 // filters stay with Zoekt; modifiers change no route (querySupport in
 // query_support_table_test.go). An or that holds descriptions gives the model
-// every description atom in it, in query order, and relaxed retrieval any one
-// of them; the strict query keeps the or, and its filters bound the vectors.
-// A query of filters only gives the model the text of its positive patterns
-// (rerankFilterText): sym:Foo reads Foo. It returns false for a query with no
-// text for the model: one that matches nothing, one of a result type other
-// than files (type:repo), and one whose filters have no positive pattern
-// (negations, punctuation, repo: or branch: only).
+// every description atom in it, in query order. Relaxed retrieval takes any
+// one of them. The strict query keeps the or, and its filters bound the
+// vectors. A query of filters only gives the model the text of its positive
+// patterns (rerankFilterText): sym:Foo reads Foo.
+//
+// It returns false for a query with no text for the model:
+//   - a query that matches nothing;
+//   - a query of a result type other than files (type:repo);
+//   - a query whose filters have no positive pattern (negations, punctuation,
+//     repo: or branch: only).
 func planRerankQuery(raw query.Q) (rerankQueryPlan, bool) {
 	// type:file is an output mode at every depth: Zoekt matches a type:file
 	// node as its child, so the plan reads the child.
@@ -163,8 +169,8 @@ func rerankDescriptionAtoms(node query.Q, atoms []query.Q) []query.Q {
 }
 
 // rerankMask returns the part of node that bounds the vectors, or nil when it
-// bounds nothing: node with each description atom and each punctuation atom
-// outside a negation read as true (rerankDescriptionsAsTrue).
+// bounds nothing. The mask is node with each description atom and each
+// punctuation atom outside a negation read as true (rerankDescriptionsAsTrue).
 func rerankMask(node query.Q) query.Q {
 	mask := query.Simplify(rerankDescriptionsAsTrue(node))
 	if always, ok := mask.(*query.Const); ok && always.Value {
@@ -199,9 +205,9 @@ func rerankDescriptionsAsTrue(node query.Q) query.Q {
 }
 
 // rerankFilterText appends the model text of the positive patterns of a
-// filter: the pattern of a file, content or symbol atom, and the name of a
-// language. A negation, a repository or branch atom, a result type and the
-// API-only nodes add none.
+// filter. These are the pattern of a file, content or symbol atom, and the
+// name of a language. A negation, a repository or branch atom, a result type
+// and the API-only nodes add none.
 func rerankFilterText(node query.Q, text []string) []string {
 	switch typed := node.(type) {
 	case *query.Substring:
@@ -229,9 +235,9 @@ func rerankFilterText(node query.Q, text []string) []string {
 }
 
 // rerankDescriptionAtom returns a description atom as the content-only node
-// of relaxed retrieval, and the text that the model reads: any word, phrase,
-// or regular expression with a literal letter or digit that is not a file or
-// content filter.
+// of relaxed retrieval, and the text that the model reads. A description atom
+// is a word, phrase, or regular expression with a literal letter or digit. It
+// is not a file or content filter.
 func rerankDescriptionAtom(node query.Q) (query.Q, string, bool) {
 	switch typed := node.(type) {
 	case *query.Substring:
@@ -295,11 +301,12 @@ func hasWordCharacter(text string) bool {
 }
 
 // regexpModelText renders a parsed regular expression close to how it was
-// typed, for the model to read: Go's printer adds flag groups such as
-// (?-s:...) that no user wrote. Zoekt removes capture groups, so the
-// renderer puts back the parentheses that the tree needs: an empty group in a
-// sequence (Foo() or a::b()), an alternation in a sequence, and a repeat of
-// more than one character.
+// typed, for the model to read. Go's printer adds flag groups such as
+// (?-s:...) that no user wrote. Zoekt removes capture groups, so the renderer
+// puts back the parentheses that the tree needs:
+//   - an empty group in a sequence (Foo() or a::b());
+//   - an alternation in a sequence;
+//   - a repeat of more than one character.
 func regexpModelText(re *syntax.Regexp) string {
 	switch re.Op {
 	case syntax.OpLiteral:
@@ -357,10 +364,10 @@ func regexpModelRepeated(sub *syntax.Regexp) string {
 }
 
 // rerankFilter reports a node that Zoekt applies as a filter of the
-// description atoms: a file, content, language, or symbol atom, a negation, a
-// repository or branch atom (which Seek passes to Zoekt unchanged), or an and
-// or an or of filters. An and or an or that holds a description is not a
-// filter.
+// description atoms. A filter is a file, content, language, or symbol atom, or
+// a negation. It is also a repository or branch atom (which Seek passes to
+// Zoekt unchanged), or an and or an or of filters. An and or an or that holds
+// a description is not a filter.
 func rerankFilter(node query.Q) bool {
 	switch typed := node.(type) {
 	case *query.Substring, *query.Regexp:
@@ -388,7 +395,8 @@ func rerankFilter(node query.Q) bool {
 }
 
 // rerankModelSearchConfig collects at least the standard symmetric context for
-// model input. The original config must be applied again before display.
+// model input. runSearchCommand applies the original config again before
+// display (applyRerankDisplayConfig).
 func rerankModelSearchConfig(config searchConfig) searchConfig {
 	out := config
 	opts := *config.opts
@@ -397,8 +405,9 @@ func rerankModelSearchConfig(config searchConfig) searchConfig {
 	}
 	out.opts = &opts
 	out.afterOnly = false
-	// The display limits apply after the rank: a node's Zoekt top -n is not the
-	// final top -n, so the model reads every strict file with its context.
+	// The display limits (--limit, --max-matches) apply after the rank. The
+	// top files of a node are not the final top files, so the model reads
+	// every strict file with its context.
 	out.contextFileLimit = 0
 	out.contextMatchLimit = 0
 	return out

@@ -7,13 +7,13 @@ package main
 // the host CPU, so they are several times faster than scalar Go code. The dot
 // products of the fine MaxSim use binary16 vectors. The dot products of the
 // final model MaxSim use float32 vectors. Seek does not use NumKong's own
-// MaxSim kernel: its int8 screen selects the best centroid of a token
+// MaxSim kernel. Its int8 screen selects the best centroid of a token
 // approximately, and on close centroids it selects a worse one. That score is
 // too low, and a row near the radius can be lost.
 //
-// Seek loads the NumKong release library at run time, as it loads USearch:
-// the maintainer asset workflow packages the library of each target, and
-// Seek installs it in the cache and opens it with dlopen. The release library
+// Seek loads the NumKong release library at run time, as it loads USearch.
+// The maintainer asset workflow packages the library of each target. Seek
+// installs it in the cache and opens it with dlopen. The release library
 // contains the kernels of many CPU families and reads the CPU features itself.
 // Seek asks it for the kernels of one family at a time
 // (nk_find_kernel_punned), and it uses only these families:
@@ -33,8 +33,8 @@ package main
 //
 // NumKong selects the skylake kernels when the CPU has AVX-512F, and the
 // haswell kernels when it has AVX2, FMA, and F16C. These kernels also use
-// AVX-512BW, AVX-512VL, AVX-512DQ, BMI1, and BMI2, and NumKong does not ask
-// the operating system whether it saves the YMM and ZMM registers. On some
+// AVX-512BW, AVX-512VL, AVX-512DQ, BMI1, and BMI2. NumKong does not ask the
+// operating system whether it saves the YMM and ZMM registers. On some
 // CPUs and virtual machines, these kernels can then stop the process with an
 // illegal instruction. So Seek also requires each feature of a family from
 // golang.org/x/sys/cpu, which includes the operating system check.
@@ -185,8 +185,9 @@ static void seek_nk_f16_query_pack(int backend, uint16_t const* query, size_t to
 // products holds count * 20 * tokens floats. gathered holds count * 20 * 48
 // binary16 values; it can be NULL when rows is NULL. The function returns -1
 // when every row is valid. Otherwise it returns the index i of the first row
-// with a centroid whose squared norm is not finite or is more than tolerance
-// from 1, and it writes the index of that centroid to bad_centroid.
+// with a bad centroid, and it writes the index of that centroid to
+// bad_centroid. A bad centroid has a squared norm that is not finite or is
+// more than tolerance from 1.
 static int64_t seek_nk_fine_maxsim_f16(int backend, uint16_t const* vectors, uint64_t const* rows,
                                        uint64_t first, size_t count, void const* packed_query, size_t tokens,
                                        float tolerance, float* products, uint16_t* gathered, float* scores,
@@ -247,8 +248,8 @@ static void seek_nk_f32_query_pack(int backend, float const* query, size_t token
     seek_nk_backends[backend].f32_pack(query, tokens, seek_nk_dimensions, seek_nk_dimensions * sizeof(float), packed);
 }
 
-// seek_nk_dots_f32 writes the dot product of vector i of vectors and query
-// token j to products[i * tokens + j], for count vectors of 48 floats.
+// seek_nk_dots_f32 reads count vectors of 48 floats. It writes the dot product
+// of vector i and query token j to products[i * tokens + j].
 static void seek_nk_dots_f32(int backend, float const* vectors, size_t count, void const* packed_query,
                              size_t tokens, double* products) {
     seek_nk_backends[backend].f32_packed(vectors, packed_query, products, count, tokens, seek_nk_dimensions,
@@ -305,8 +306,8 @@ func semanticNumKongHostFeatures() semanticNumKongFeatures {
 	}
 }
 
-// semanticNumKongAllowedCapabilities gives the kernel families whose every
-// compile target the features include. golang.org/x/sys/cpu reports AVX2 and
+// semanticNumKongAllowedCapabilities gives the kernel families whose compile
+// targets are all in features. golang.org/x/sys/cpu reports AVX2 and
 // AVX-512 only when the operating system saves their registers. Every arm64
 // CPU that Seek supports has NEON.
 func semanticNumKongAllowedCapabilities(features semanticNumKongFeatures) uint64 {
@@ -371,6 +372,8 @@ func semanticNumKongBackendName(backend int) string {
 	return C.GoString(C.seek_nk_backend_name(C.int(backend)))
 }
 
+// semanticNumKongAssetKey names the cache directory of the bundled library by
+// a hash of its compressed bytes, so a new library gets a new directory.
 func semanticNumKongAssetKey() string {
 	digest := sha256.Sum256(semanticNumKongCompressedRuntime)
 	return hex.EncodeToString(digest[:16])
@@ -444,8 +447,9 @@ func packSemanticF32Query(backend int, query []float32) semanticNumKongPack {
 	return pack
 }
 
-// semanticFineScratch holds the buffers of one worker: the dot products of
-// one block of rows, the rows of a block with gaps, and the block scores. A
+// semanticFineScratch holds the buffers of one worker. They hold the dot
+// products of one block of rows, the rows of a block with gaps, and the block
+// scores. A
 // pool keeps the buffers, so a search does not clear new memory for each
 // worker.
 type semanticFineScratch struct {

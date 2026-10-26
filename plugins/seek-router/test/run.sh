@@ -54,7 +54,7 @@ else
 	record_failure "router contract" "plugin-owned contract tests failed"
 fi
 
-# Use one observed file-list family to inspect the host response boundary.
+# Check the response that the host gets, with one file-list command.
 payload=$(bash_payload "rg -l 'seek-router' . | head -n 2")
 out=$(printf '%s' "$payload" | sh "$ROUTER" 2>/dev/null)
 code=$?

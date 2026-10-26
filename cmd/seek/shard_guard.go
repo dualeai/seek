@@ -31,13 +31,13 @@ func firstBuilderShard(opts index.Options) int {
 }
 
 // isolatesShard reports whether a document fills a shard of its own when it is
-// added to an empty Builder: Zoekt adds len(Name)+len(Content) to the pending
+// added to an empty Builder. Zoekt adds len(Name)+len(Content) to the pending
 // size and flushes when that size passes ShardMax (index.Builder.Add). Zoekt
-// counts only the name of a document that it skips at Add (a skip reason or a
-// DocChecker reason such as a NUL byte), so such a document does not flush and
-// is not isolated. Zoekt's SizeMax skip cannot apply: readers never send
-// content above documentContentLimit, which is SizeMax, and seek sets no
-// LargeFiles.
+// counts only the name of a document that it skips at Add. The skip comes from
+// a skip reason or a DocChecker reason such as a NUL byte. So such a document
+// does not flush and is not isolated. Zoekt's SizeMax skip cannot apply:
+// readers never send content above documentContentLimit, which is SizeMax, and
+// seek sets no LargeFiles.
 func isolatesShard(doc index.Document, opts index.Options) bool {
 	if doc.SkipReason != index.SkipReasonNone || len(doc.Name)+len(doc.Content) <= opts.ShardMax {
 		return false
@@ -57,7 +57,7 @@ func isolatesShard(doc index.Document, opts index.Options) bool {
 // delta Builder. A wrapped document keeps only its name
 // (index.SkipReasonTooLarge), so Zoekt stores its NOT-INDEXED marker and the
 // exact-file warning can report it. A shard without an isolated document holds
-// at most about twice ShardMax of content, so it cannot wrap, and the function
+// at most about twice ShardMax of content, so it cannot wrap. So the function
 // does nothing when isolated is empty.
 func guardWrappedShards(opts index.Options, firstShard int, isolated, later []index.Document) error {
 	if len(isolated) == 0 {

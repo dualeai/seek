@@ -22,14 +22,15 @@ import (
 
 var errGitIndexStateChanged = errors.New("git index state changed")
 
-// Set via ldflags (-X main.version=...) by the build and release commands.
+// version is the release version. The build and release commands set it with
+// ldflags (-X main.version=...).
 var version = ""
 
 func versionString() string {
 	if version != "" {
 		return "seek " + version
 	}
-	// Fallback to VCS info embedded by go build.
+	// Fall back to the VCS data that go build embeds.
 	if info, ok := debug.ReadBuildInfo(); ok {
 		v := info.Main.Version
 		for _, s := range info.Settings {
@@ -44,10 +45,12 @@ func versionString() string {
 	return "seek (unknown)"
 }
 
-// TODO: github.com/rs/xid v1.6.0, which zoekt/index imports, runs ioreg at
-// package init on macOS, so every seek process waits about 20 ms (one ioreg
-// run) before main.
-// Upstream issue https://github.com/rs/xid/issues/120; the fix
+// main runs the root command and the automatic GC (shouldRunOpportunisticGC),
+// then exits with the exit code of the command.
+//
+// TODO(https://github.com/rs/xid/issues/120): github.com/rs/xid v1.6.0, which
+// zoekt/index imports, runs ioreg at package init on macOS. So every seek
+// process waits about 20 ms (one ioreg run) before main. The fix
 // (https://github.com/rs/xid/pull/121) is on master but in no release yet.
 // Upgrade rs/xid when a release after v1.6.0 has it.
 func main() {
@@ -62,9 +65,9 @@ func main() {
 
 	// Scan the effective arguments for -v and --verbose before Cobra parses
 	// them, so a flag error also follows the verbose contract.
-	// PersistentPreRunE runs only after pflag parses the flags, so without this
-	// scan `seek -v --unknown foo` would print only the plain `seek: <err>`
-	// line, without the structured slog ERROR record that the user asked for.
+	// PersistentPreRunE runs only after pflag parses the flags. Without this
+	// scan, `seek -v --unknown foo` would print only the plain `seek: <err>`
+	// line, with no structured slog ERROR record.
 	root := newRootCmd(newLateOnSemanticModel)
 	args := splicePassthroughSeparator(os.Args[1:], root.Flags())
 	verbose := hasVerboseArg(args)
@@ -87,6 +90,9 @@ func main() {
 	}
 }
 
+// shouldRunOpportunisticGC reports whether the command runs the automatic GC
+// after it ends. A help or version flag turns it off. A first argument that
+// names the help, completion, or GC command turns it off too.
 func shouldRunOpportunisticGC(args []string) bool {
 	for _, arg := range args {
 		if arg == "--" {
@@ -121,6 +127,8 @@ func shouldRunOpportunisticGC(args []string) bool {
 	return true
 }
 
+// optionalBoolFlag parses arg as the bool flag name, alone or as name=value.
+// It returns the flag value and whether arg is that flag with a valid value.
 func optionalBoolFlag(arg, name string) (bool, bool) {
 	if arg == name {
 		return true, true
@@ -133,10 +141,9 @@ func optionalBoolFlag(arg, name string) (bool, bool) {
 	return parsed, err == nil
 }
 
-// hasVerboseArg scans effective arguments for -v / --verbose without
-// consulting Cobra. Used by main() to decide error formatting BEFORE the Cobra
-// flag parser has run — a `seek -v --unknown` typo still needs the
-// verbose contract honoured.
+// hasVerboseArg reports whether the arguments before "--" set -v or
+// --verbose; the last one wins. main reads it before Cobra parses the flags,
+// so the error of `seek -v --unknown` also gets the verbose record.
 func hasVerboseArg(args []string) bool {
 	verbose := false
 	for _, a := range args {
@@ -162,11 +169,12 @@ func cloneStringSlice(values []string) []string {
 	return out
 }
 
-// runSearchCommand runs one search: it plans the query, expands the path
-// operands into the node graph, prepares and searches every node, ranks with
-// the model a query that gives the model text, and writes the results. When
-// it writes no result it returns errNoMatch, or the user's interrupt after an
-// interrupt ended a lock wait (noMatchOrInterrupted).
+// runSearchCommand runs one search. It plans the query, expands the path
+// operands into the node graph, and prepares and searches every node. For a
+// query that gives the model text, the model ranks the results. Then it writes
+// the results.
+// When it writes no result, it returns errNoMatch, or the user's interrupt
+// after an interrupt ended a lock wait (noMatchOrInterrupted).
 func runSearchCommand(
 	ctx context.Context,
 	pattern string,
@@ -306,12 +314,15 @@ func runSearchCommand(
 	return nil
 }
 
-// useColor decides whether to emit ANSI color on the given stream. Color is ON
-// by default and disabled only by constraints, in precedence order: NO_COLOR
-// (present and non-empty) forces off; CLICOLOR_FORCE (present, any value)
-// forces on even through a pipe (e.g. `… | less -R`, CI); otherwise color is
-// used only when the stream is a real terminal and TERM is set and not "dumb".
-// Piped output (agents, CI, `| cat`) is therefore plain with zero config.
+// useColor reports whether to write ANSI color to f. The first rule that
+// applies decides:
+//
+//   - NO_COLOR is set and not empty: no color.
+//   - CLICOLOR_FORCE is set, to any value: color, also through a pipe
+//     (`… | less -R`, CI).
+//   - Else: color only when TERM is set and is not "dumb", and f is a terminal.
+//
+// So piped output (agents, CI, `| cat`) is plain with no setting.
 func useColor(f *os.File) bool {
 	if v, ok := os.LookupEnv("NO_COLOR"); ok && v != "" {
 		return false
@@ -444,8 +455,8 @@ func (g *gitNode) refreshState(
 		plan.committedSnapshotReady(state, sc)
 	clearCommitted := state.HeadSHA == "no-head" && sc.hasMember(familyCommitted)
 	// A leftover .swapping marker means that a publish was interrupted, or did
-	// not move the live family back, and the shards may be torn: force the
-	// build path so recoverIncompleteSwap runs even when the state looks
+	// not move the live family back, and the shards can be torn. Force the
+	// build path, so recoverIncompleteSwap runs even when the state looks
 	// current.
 	swapPending := readCacheFile(plan.cacheDir, swappingMarkerFile) != ""
 	needBuild := currentState != cachedState || !hasShards || swapPending || clearCommitted || !joinedReady ||
@@ -501,8 +512,8 @@ func (g *gitNode) refreshState(
 }
 
 // watchInterrupts cancels the command on SIGTERM and on SIGINT, with one
-// exception: the first SIGINT while a node waits for a lock ends the waits
-// only (lockWaits), so the nodes that are ready print. A later SIGINT cancels
+// exception. The first SIGINT while a node waits for a lock ends only the
+// waits (lockWaits), so the nodes that are ready print. A later SIGINT cancels
 // the command. It returns when signals closes.
 func watchInterrupts(signals <-chan os.Signal, cancel context.CancelFunc, waits *lockWaits) {
 	waitsEnded := false
@@ -522,8 +533,9 @@ func normalizeCommittedTreeish(headSHA string) string {
 	return headSHA
 }
 
-// validateCommittedHead reports whether HEAD still equals the captured commit
-// OID or no-head sentinel. It does not change published cache state.
+// validateCommittedHead returns errGitIndexStateChanged when HEAD no longer
+// names the captured commit, or the no-head state. It does not change the
+// published cache state.
 func validateCommittedHead(ctx context.Context, paths gitPaths, expectedHead string) error {
 	currentHead, err := gitHeadTreeish(ctx, paths.RepoDir)
 	if err != nil {

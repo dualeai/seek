@@ -24,10 +24,11 @@ import (
 )
 
 // The cache budget is the one limit on the disk that Seek's indexes use. It
-// covers the whole corpora tree. After a search, each corpus that it
-// published records its size in a ledger file. A search checks before any
-// build that its new generations fit, and after the search it evicts the least
-// recently used corpora that it did not use until the cache fits again.
+// covers the whole corpora tree, with the unit store. After a search, each
+// corpus that it published records its size in a ledger file. Before any
+// build, a search checks that its new generations fit. After the search, it
+// evicts the unit-store segments and then the least recently used corpora that
+// it did not use, until the cache fits again.
 const (
 	envCacheBudget = "SEEK_CACHE_BUDGET"
 	// corpusSizeFile is the ledger entry of one corpus: its bytes on disk.
@@ -38,16 +39,17 @@ const (
 	// need more: 7.5 on a folder of 10,000 small text files.
 	zoektIndexRatio = 2.76
 	// semanticBytesPerContentByte estimates the semantic generation from the
-	// content, measured on the same checkout with 128-token windows: 4.0 GB for
-	// 278 MB, about 3.4 KB per row and one row per 233 bytes of content.
+	// content. A measurement on the same checkout with 128-token windows gave
+	// 4.0 GB for 278 MB. That is about 3.4 KB per row and one row per 233
+	// bytes of content.
 	semanticBytesPerContentByte = 14.4
 )
 
 // cacheBudgetError stops a search whose new generations do not fit the cache
 // budget, before any build. growth is the part that the search adds to the
-// corpora it uses; freeBound reports a budget that the 5 % free-space floor
-// sets; textFits reports that the same search with no vectors passes this
-// check (--lexical-only).
+// corpora it uses. freeBound reports a budget that the 5 % free-space floor
+// sets. textFits reports that the same search with no vectors (--lexical-only)
+// passes this check.
 type cacheBudgetError struct {
 	planned   int64
 	growth    int64
@@ -61,8 +63,9 @@ func (e *cacheBudgetError) Error() string {
 		humanBytes(e.planned), humanBytes(e.growth), humanBytes(e.budget))
 }
 
-// budgetSuggestion rounds a planned size up to whole GiB, with room for the
-// next searches, for the hint of the budget error.
+// budgetSuggestion gives the budget that the hint of the budget error names.
+// It is twice the planned size, rounded up to whole GiB, so the next searches
+// fit too.
 func budgetSuggestion(planned int64) string {
 	const gib = int64(1) << 30
 	return strconv.FormatInt(max(1, 2*planned/gib+1), 10) + "G"
@@ -88,11 +91,12 @@ func cacheVolume(dir string) (capacity, free int64, err error) {
 	return int64(st.Blocks) * blockSize, int64(st.Bavail) * blockSize, nil
 }
 
-// cacheBudget returns the byte budget of the corpora tree: the smaller of 10 %
-// of the cache volume and the bytes that keep 5 % of the volume free with the
-// current corpora counted as reusable. SEEK_CACHE_BUDGET overrides it.
-// freeBound reports a budget that the 5 % free-space floor sets. corpora is
-// called only when the volume formula needs the corpora total.
+// cacheBudget returns the byte budget of the corpora tree. It is the smaller
+// of 10 % of the cache volume and the bytes that keep 5 % of the volume free.
+// The second value counts the current corpora as free space that the cache can
+// use again. SEEK_CACHE_BUDGET overrides it. freeBound reports a budget that
+// the 5 % free-space floor sets. cacheBudget calls corpora only when the volume
+// formula needs the corpora total.
 func cacheBudget(cacheRoot string, corpora func() int64) (budget int64, freeBound bool, err error) {
 	if value := os.Getenv(envCacheBudget); value != "" {
 		budget, err := parseByteSize(value)
@@ -197,7 +201,7 @@ func checkCacheBudget(ctx context.Context, plans []node, vectors bool) error {
 	if err != nil {
 		return err
 	}
-	// The budget does not shrink when the corpora total grows, so a size
+	// The budget does not shrink when the corpora total grows. So a size
 	// within the budget of an empty cache fits with no listing of the corpora.
 	if budget, _, err := cacheBudget(cacheRoot, func() int64 { return 0 }); err != nil || planned <= budget {
 		return err
@@ -297,13 +301,13 @@ func plannedCacheBytes(ctx context.Context, plans []node, vectors, probe bool) (
 
 // plannedNodeBytes estimates one node with its kind (nodeKind.estimate). A
 // node with no kind (a failed Git node's cache record) counts its published
-// size and no rebuild. rebuild reports a node that the search builds: no
-// published state, a state other than the capture, or vectors that the search
-// wants and the node has no generation for (the same rule as the build).
-// probe reads file heads so that binary files count 0; without it every file
-// counts by its size. A vector build copies the rows of a node's live
-// generation, so with one it adds only the changed content; with none it adds
-// all of it.
+// size and no rebuild. rebuild reports a node that the search builds, with the
+// rule of the build. That is a node with no published state, a state other
+// than the capture, or no generation for the vectors that the search wants.
+// probe reads file heads so that binary files count 0; without
+// it every file counts by its size. A vector build copies the rows of a node's
+// live generation. So with a live generation it adds only the changed content,
+// and with none it adds all of it.
 func plannedNodeBytes(ctx context.Context, plan node, vectors, probe bool) (bytes int64, rebuild bool, err error) {
 	if plan.behavior == nil {
 		return publishedCorpusBytes(plan.cacheDir), false, nil
@@ -348,9 +352,9 @@ func (*folderNode) estimate(ctx context.Context, plan node, vectors, probe bool)
 	return bytes, true, err
 }
 
-// estimate gives the Git node's next generation from the captured status:
-// the commit's content when nothing is known, else the commit range and the
-// dirty files.
+// estimate gives the Git node's next generation from the captured status.
+// That is the commit's content when nothing is known, else the commit range
+// and the dirty files.
 func (g *gitNode) estimate(ctx context.Context, plan node, vectors, probe bool) (bytes int64, rebuild bool, err error) {
 	published := readStateFile(plan.cacheDir)
 	state, ok := plan.gitState.current()
@@ -501,8 +505,8 @@ func changedFolderCandidates(cacheDir, published string, selected []folderCandid
 
 // folderContentBytes sums the content that the index holds for candidates.
 // With probe it reads the head of every file, as the index does, so a binary
-// file (indexed by name only) counts 0; without it every file whose content
-// the index reads (indexedBytes) counts by its stat size.
+// file (indexed by name only) counts 0. Without probe, every file whose
+// content the index reads (indexedBytes) counts by its stat size.
 func folderContentBytes(ctx context.Context, candidates []folderCandidate, probe bool) (int64, error) {
 	if !probe {
 		var total int64
@@ -628,10 +632,10 @@ type gitSizedBlob struct {
 }
 
 // committedBlobBytes sums the blobs that fit a document. With probe, or with
-// an unknown size, it streams the blobs through one git cat-file --batch: a
-// blob with a NUL byte in its first binaryProbeBytes is indexed by name only
-// and counts 0, the same test as the index; Git attributes do not change it.
-// Without probe a known size counts as it is.
+// an unknown size, it streams the blobs through one git cat-file --batch. A
+// streamed blob with a NUL byte in its first binaryProbeBytes is indexed by
+// name only and counts 0. This is the test of the index, and Git attributes do
+// not change it. Without probe, a known size counts as it is.
 func committedBlobBytes(ctx context.Context, paths gitPaths, blobs []gitSizedBlob, probe bool) (int64, error) {
 	var total int64
 	var stream []gitSizedBlob
@@ -705,11 +709,13 @@ func committedBlobBytes(ctx context.Context, paths gitPaths, blobs []gitSizedBlo
 	return total, readErr
 }
 
-// enforceCacheBudget runs after a search. It records the ledger size of the
-// corpora that the search used, then evicts the least recently used corpora
-// that it did not use until the cache fits the budget. It has no time limit:
-// the budget is the only disk limit. It does nothing when the search published
-// nothing, or when the cache is on a network or FUSE file system (as gc).
+// enforceCacheBudget runs after a search. It records the ledger size of each
+// corpus that the search used and whose ledger is stale. Then it evicts the
+// oldest unit-store segments and the least recently used corpora that the
+// search did not use, until the cache fits (planCorpusEviction). It has no
+// time limit: the budget is the only disk limit. It does nothing when the
+// search published nothing, or when the cache is on a network or FUSE file
+// system (as gc).
 func enforceCacheBudget(plans []node) {
 	cacheRoot, err := seekUserCacheRoot()
 	if err != nil || isOnNFS(cacheRoot) {
@@ -760,8 +766,8 @@ func evictPlannedUnits(cacheRoot string, evict map[corpusID]bool) {
 }
 
 // ledgerStale reports a corpus that published lexical shards or bound
-// vectors after its ledger entry was written (or that has none), so a warm
-// search measures nothing.
+// vectors after its ledger entry was written, or that has no entry. When it
+// reports false, a warm search measures nothing.
 func ledgerStale(dir string) bool {
 	ledger, ledgerErr := os.Stat(filepath.Join(dir, corpusSizeFile))
 	published := false
@@ -788,19 +794,19 @@ func ledgerStale(dir string) bool {
 var processStarted = time.Now().Truncate(2 * time.Second)
 
 // usedByARunningCommand reports a corpus whose last use falls between the
-// start of this command and now, with the same 2-second step: a .used time
+// start of this command and now, with the same 2-second step. A .used time
 // further in the future proves nothing.
 func usedByARunningCommand(usedAt time.Time) bool {
 	return !usedAt.Before(processStarted) && !usedAt.After(time.Now().Add(2*time.Second))
 }
 
-// planCorpusEviction returns the corpora and the unit-store segments to evict:
-// all of them with all, or else, until the total size fits the budget, the
-// oldest unit-store segments first, then the least recently used corpora that
-// keep is not holding and that no command used since this one started. Corpus
-// directories of other layout versions reach the LRU end first unless an
-// older binary still uses them. record writes measured sizes into the ledger;
-// a dry run passes false.
+// planCorpusEviction returns the corpora and the unit-store segments to
+// evict. With all, it returns all of them. Else it takes the oldest unit-store
+// segments first, then the least recently used corpora, until the total size
+// fits the budget. In that mode, it skips a corpus that keep holds or that a
+// command used since this one started. Corpus directories of other layout
+// versions reach the LRU end first unless an older binary still uses them.
+// record writes measured sizes into the ledger; a dry run passes false.
 func planCorpusEviction(
 	cacheRoot string,
 	entries []corpusDirEntry,
@@ -872,7 +878,7 @@ func evictPlanned(entry corpusDirEntry, trashDir string) gcRowResult {
 }
 
 // checkCacheRoot makes the corpora directory and checks that Seek can write
-// it. Every node keeps its index there, so a cache root that cannot be used is
+// it. Every node keeps its index there. So a cache root that cannot be used is
 // an environment error with exit 2, not one warning per node.
 func checkCacheRoot() error {
 	cacheRoot, err := seekUserCacheRoot()

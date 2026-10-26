@@ -98,10 +98,10 @@ func planIDOf(t *testing.T, operand string) corpusID {
 }
 
 // TestOperandCaseInRepoThatGitClassifies types an operand in another letter
-// case inside a repository whose `.git` is a file that names a separate Git
-// directory, so only Git can classify the path. The operand stays a Git
-// scope: the Git-ignored file is not shown. On a case-sensitive file system,
-// the operand names no file.
+// case inside a repository whose `.git` is a file. The file names a separate
+// Git directory, so only Git can classify the path. The operand stays a Git
+// scope: the search does not show the Git-ignored file. On a case-sensitive
+// file system, the operand names no file.
 func TestOperandCaseInRepoThatGitClassifies(t *testing.T) {
 	requireTools(t)
 	const marker = "zqoperandcasemarker"
@@ -129,9 +129,9 @@ func TestOperandCaseInRepoThatGitClassifies(t *testing.T) {
 }
 
 // TestNodeIdentitySurvivesRename renames a searched Git repository and a
-// searched folder. The identity is the file identity, not the path, so the
-// node keeps its corpus and its state: the search after the rename reuses the
-// index.
+// searched folder. The identity is the file identity, not the path. So the
+// node keeps its corpus and its state, and the search after the rename reuses
+// the index.
 func TestNodeIdentitySurvivesRename(t *testing.T) {
 	requireTools(t)
 	const marker = "zqrenamemarker"

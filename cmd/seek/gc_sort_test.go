@@ -13,11 +13,11 @@ import (
 	"time"
 )
 
-// seedCorpusWithSize seeds a corpus like seedCorpus, then writes a fake
-// shard file of exactly indexBytes under index/ so the corpus has a
-// deterministic corpusDirSize. The file is not a valid zoekt shard —
-// readCorpusDisplayInfo swallows the metadata error and renders [empty],
-// which is fine for order assertions.
+// seedCorpusWithSize seeds a corpus like seedCorpus, then writes a fake shard
+// file of exactly indexBytes under index/, so the corpus has a known
+// corpusDirSize. The file is not a valid Zoekt shard: readCorpusDisplayInfo
+// gives no source, and the ROOT column shows [empty]. The order checks do not
+// read that column.
 func seedCorpusWithSize(tb testing.TB, cacheRoot, hash string, usedAt time.Time, indexBytes int) string {
 	tb.Helper()
 	dir := seedCorpus(tb, cacheRoot, hash, usedAt)
@@ -28,9 +28,9 @@ func seedCorpusWithSize(tb testing.TB, cacheRoot, hash string, usedAt time.Time,
 	return dir
 }
 
-// requireRowOrder asserts the table rows for the given corpora appear in
-// exactly the given order. Matches by truncated hash, substring-based like
-// requireRow so column-width tweaks don't break it.
+// requireRowOrder checks that the table rows of the given corpora come in
+// exactly the given order. As requireRow does, it finds a row by the
+// truncated hash in the line, so a change of column width does not break it.
 func requireRowOrder(tb testing.TB, out string, hashes ...string) {
 	tb.Helper()
 	shorts := make([]string, len(hashes))
@@ -77,8 +77,8 @@ func TestGC_ParseGCSortKey(t *testing.T) {
 				t.Errorf("parseGCSortKey(%q): expected error, got %v", tc.in, got)
 			case !strings.Contains(err.Error(), "must be one of"):
 				t.Errorf("parseGCSortKey(%q): error %q missing valid-values hint", tc.in, err)
-			// The accepted values must actually appear — guards against a
-			// stale/empty gcSortValues slice leaving a hint with no values.
+			// The hint must name the accepted values, so an empty
+			// gcSortValues fails here.
 			case !strings.Contains(err.Error(), "name|age|size"):
 				t.Errorf("parseGCSortKey(%q): error %q missing the value list", tc.in, err)
 			}
@@ -92,9 +92,9 @@ func TestGC_ParseGCSortKey(t *testing.T) {
 	}
 }
 
-// TestGC_SortGCRows_Direction pins largest-first / oldest-first with the
-// tiebreak: the two equal-key rows (aaa,bbb) keep incoming order, ccc sorts
-// by its key.
+// TestGC_SortGCRows_Direction checks largest first and oldest first, with the
+// tiebreak. The two rows with equal keys (aaa, bbb) keep their input order,
+// and ccc sorts by its key.
 func TestGC_SortGCRows_Direction(t *testing.T) {
 	same := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	cases := []struct {
@@ -126,14 +126,12 @@ func TestGC_SortGCRows_Direction(t *testing.T) {
 	}
 }
 
-// TestGC_SortGCRows_StableTiebreak proves the tiebreak is delivered by a
-// STABLE sort, not by luck. A small or all-equal fixture cannot: Go's sort
-// uses insertion sort (incidentally stable) for n<=12, and pdqsort leaves an
-// all-equal run untouched. The revealing pattern is many rows with only TWO
-// distinct key values interleaved — quicksort's partitioning reorders the
-// equal keys within each group, so sort.Slice fails here while SliceStable
-// preserves the ascending-hash order within each group. (Verified: swapping
-// SliceStable for Slice makes this test fail.)
+// TestGC_SortGCRows_StableTiebreak checks that a stable sort gives the
+// tiebreak. A small or all-equal fixture cannot show it. Go's sort uses an
+// insertion sort, which is stable, for 12 rows or fewer. pdqsort does not
+// move an all-equal run. This fixture has 40 rows with two key values in
+// turn. The partitions of pdqsort reorder the equal keys of each group, so
+// sort.Slice in place of sort.SliceStable fails this test.
 func TestGC_SortGCRows_StableTiebreak(t *testing.T) {
 	const n = 40
 	old := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -201,9 +199,9 @@ func rowNames(rows []gcRow) []corpusID {
 	return out
 }
 
-// TestGCCmd_DryRun_NoCorpora — an empty cache under --dry-run prints the
-// banner + "no corpora" and returns before the table, with NO summary line
-// (reportGCPlan returns right after the banner when the cache has no corpus).
+// TestGCCmd_DryRun_NoCorpora checks that --dry-run on an empty cache prints
+// the banner with "no corpora" and no summary line. reportGCPlan returns
+// after the banner when the cache has no corpus.
 func TestGCCmd_DryRun_NoCorpora(t *testing.T) {
 	cacheRootForTest(t)
 	out := runGCCapture(t, "--dry-run")
@@ -215,11 +213,11 @@ func TestGCCmd_DryRun_NoCorpora(t *testing.T) {
 	}
 }
 
-// TestGCCmd_SortedCtxCancel_EvictsNothing — the sorted branch measures every
-// corpus before evicting any. A ctx canceled before the run must therefore
-// evict nothing (the "cancel during measurement evicts nothing" contract
-// documented in runGC). Every other ctx-cancel test uses the default name
-// order, which takes the interleaved branch instead.
+// TestGCCmd_SortedCtxCancel_EvictsNothing checks the sorted branch of runGC,
+// which measures every corpus before it evicts one. A context canceled before
+// the run evicts nothing, as runGC states for a cancel during the
+// measurement. The other cancellation tests use the default name order, which
+// takes the interleaved branch.
 func TestGCCmd_SortedCtxCancel_EvictsNothing(t *testing.T) {
 	root := cacheRootForTest(t)
 	// Over the budget, so an uncanceled run evicts both corpora.
@@ -244,11 +242,11 @@ func TestGCCmd_SortedCtxCancel_EvictsNothing(t *testing.T) {
 	}
 }
 
-// TestGC_EmitGCRow_TrashedCountsAsEvicted pins the record predicate for the
-// actionTrashed outcome (rename succeeded, RemoveAll failed — drainTrash
-// finishes later). No eviction fixture engineers a failed RemoveAll, so this
-// is the only coverage that a trashed corpus still counts toward the freed
-// total. A predicate regression to `== actionEvicted` only would undercount.
+// TestGC_EmitGCRow_TrashedCountsAsEvicted checks that emitGCRow counts the
+// actionTrashed outcome (the rename worked, RemoveAll failed, and drainTrash
+// finishes later) in the freed total. No eviction fixture makes RemoveAll
+// fail, so only this test covers it. A check for actionEvicted alone would
+// count too few.
 func TestGC_EmitGCRow_TrashedCountsAsEvicted(t *testing.T) {
 	for _, action := range []gcAction{actionEvicted, actionTrashed} {
 		stats := &gcTableStats{}
@@ -267,9 +265,9 @@ func TestGC_EmitGCRow_TrashedCountsAsEvicted(t *testing.T) {
 	}
 }
 
-// TestGC_PlanCorpusEviction pins the eviction plan: least recently used
-// first, corpora that the search holds are skipped, and eviction stops at the
-// budget; --all evicts everything. The dry-run prediction follows the plan.
+// TestGC_PlanCorpusEviction checks the eviction plan: least recently used
+// first, no corpus that the search holds, and a stop at the budget; --all
+// evicts everything. The dry-run prediction follows the plan.
 func TestGC_PlanCorpusEviction(t *testing.T) {
 	root := cacheRootForTest(t)
 	t.Setenv(envCacheBudget, strconv.Itoa(2*seededCorpusBytes))
@@ -307,13 +305,12 @@ func TestGC_PlanCorpusEviction(t *testing.T) {
 	}
 }
 
-// rowProbeWriter records whether a marker file still existed when the row
-// for a given corpus was written. Streaming (interleaved) processing renders
-// row 1 before later corpora are touched, so a sweep-marker planted in the
-// last corpus must still exist; a materialize-everything shape sweeps every
-// corpus before rendering anything, so the marker is already gone.
+// rowProbeWriter records whether a marker file still exists when the row of a
+// given corpus is written. The interleaved pass prints row 1 before it sweeps
+// the later corpora, so a marker in the last corpus is still there. A pass
+// that sweeps every corpus before it prints a row has already removed it.
 type rowProbeWriter struct {
-	rowToken                []byte // truncated hash of the corpus expected in row 1
+	rowToken                []byte // short hash of the corpus in row 1
 	markerPath              string
 	sawRow                  bool
 	markerPresentAtFirstRow bool
@@ -330,11 +327,11 @@ func (w *rowProbeWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// TestGC_StreamingDefault_RendersBeforeLaterCorporaProcessed — with the
-// default name order the live table must stream: row i renders before
-// corpora i+1..n are processed (incremental output, and a Ctrl-C keeps the
-// already-evicted prefix). Ordering-based via a synchronous writer probe — no
-// timing, fully deterministic.
+// TestGC_StreamingDefault_RendersBeforeLaterCorporaProcessed checks that the
+// live table of the default name order streams. Row i prints before runGC
+// processes corpora i+1..n. So the output grows row by row, and a Ctrl-C
+// keeps the corpora already evicted. A writer probe checks the order, with no
+// timing.
 func TestGC_StreamingDefault_RendersBeforeLaterCorporaProcessed(t *testing.T) {
 	root := cacheRootForTest(t)
 	stale := time.Now().Add(-30 * 24 * time.Hour)
@@ -342,8 +339,8 @@ func TestGC_StreamingDefault_RendersBeforeLaterCorporaProcessed(t *testing.T) {
 	seedCorpus(t, root, first, stale)
 	lastDir := seedCorpus(t, root, last, stale)
 
-	// Orphan tmp manifest in the LAST corpus (hash order): deleted by
-	// sweepCorpusOrphans when that corpus is processed.
+	// An orphan tmp manifest in the last corpus (hash order):
+	// sweepCorpusOrphans deletes it when runGC processes that corpus.
 	marker := filepath.Join(lastDir, folderManifestFileName+".tmp")
 	if err := os.WriteFile(marker, nil, 0o644); err != nil {
 		t.Fatalf("write marker: %v", err)
@@ -391,8 +388,8 @@ func TestGCCmd_DryRun_SortByAge_OldestFirst(t *testing.T) {
 	requireRowOrder(t, out, oldest, middle, newest)
 }
 
-// TestGCCmd_DryRun_DefaultOrderIsHash — without --sort the table must keep
-// the hash order even when sizes would order differently.
+// TestGCCmd_DryRun_DefaultOrderIsHash checks that with no --sort the table
+// keeps the hash order, also when the sizes give another order.
 func TestGCCmd_DryRun_DefaultOrderIsHash(t *testing.T) {
 	root := cacheRootForTest(t)
 	now := time.Now()
@@ -406,9 +403,8 @@ func TestGCCmd_DryRun_DefaultOrderIsHash(t *testing.T) {
 	requireRowOrder(t, out, h1, h2, h3)
 }
 
-// TestGCCmd_SortInvalid_Errors — an invalid --sort must error loudly even
-// when the run would otherwise be silently throttled (parse happens before
-// the throttle gate).
+// TestGCCmd_SortInvalid_Errors checks that an invalid --sort fails, also when
+// the throttle would skip the run: the parse comes before the throttle gate.
 func TestGCCmd_SortInvalid_Errors(t *testing.T) {
 	root := cacheRootForTest(t)
 	touchStamp(root) // fresh .last-gc: without --force the run would no-op
@@ -422,8 +418,8 @@ func TestGCCmd_SortInvalid_Errors(t *testing.T) {
 	}
 }
 
-// TestGCCmd_Force_SortBySize_LiveOrderAndEviction — the live table follows
-// --sort and corpora over the budget are actually removed from disk.
+// TestGCCmd_Force_SortBySize_LiveOrderAndEviction checks that the live table
+// follows --sort and that runGC removes the corpora over the budget from disk.
 func TestGCCmd_Force_SortBySize_LiveOrderAndEviction(t *testing.T) {
 	root := cacheRootForTest(t)
 	// Over the budget, so GC evicts every corpus that no search holds.
@@ -459,10 +455,9 @@ func TestGCCmd_All_DryRun_SortByAge(t *testing.T) {
 	requireRow(t, out, newer, "evicted")
 }
 
-// gcTableRows extracts the corpus rows (between the header and the summary)
-// from captured gc table output. The header sentinel is the production
-// gcTableHeader constant itself, so a column rename can't silently make this
-// return zero rows.
+// gcTableRows returns the corpus rows, between the header and the summary, of
+// gc table output. It finds the header by the production gcTableHeader, so a
+// column rename cannot make it return no rows with no error.
 func gcTableRows(out string) []string {
 	var rows []string
 	inTable := false
@@ -479,10 +474,10 @@ func gcTableRows(out string) []string {
 	return rows
 }
 
-// assertDryRunLiveParity runs `--dry-run` then `--force` with the same sort
-// and asserts the rendered rows match byte-for-byte — the reportGCPlan
-// byte-alignment promise. dry-run must run first: it predicts but never
-// mutates, so live then sees the identical starting state.
+// assertDryRunLiveParity runs --dry-run, then --force with the same sort, and
+// checks that the rows match byte for byte, as reportGCPlan states. The dry
+// run goes first: it predicts and changes nothing, so the live run starts
+// from the same state.
 func assertDryRunLiveParity(t *testing.T, wantRows int, sortArg string) {
 	t.Helper()
 	dry := runGCCapture(t, "--dry-run", sortArg)
@@ -499,10 +494,10 @@ func assertDryRunLiveParity(t *testing.T, wantRows int, sortArg string) {
 	}
 }
 
-// TestGCCmd_SortBySize_DryRunLiveParity_Kept — fixtures within the budget:
-// the live run keeps everything and mutates nothing, so every "kept" row must
-// match the dry-run prediction byte-for-byte. Ages are days in the past so
-// the AGE cell cannot flip between the two runs.
+// TestGCCmd_SortBySize_DryRunLiveParity_Kept uses corpora within the budget.
+// The live run keeps them all and changes nothing, so each "kept" row must
+// match the dry-run row byte for byte. The ages are days in the past, so the
+// AGE cell cannot change between the two runs.
 func TestGCCmd_SortBySize_DryRunLiveParity_Kept(t *testing.T) {
 	root := cacheRootForTest(t)
 	usedAt := time.Now().Add(-48 * time.Hour)
@@ -511,11 +506,10 @@ func TestGCCmd_SortBySize_DryRunLiveParity_Kept(t *testing.T) {
 	assertDryRunLiveParity(t, 2, "--sort=size")
 }
 
-// TestGCCmd_SortBySize_DryRunLiveParity_Evicted — fixtures over the budget:
-// dry-run predicts "evicted" rows, live actually evicts them. The rendered
-// rows (size captured pre-eviction) must still match byte-for-byte, pinning
-// the evicted-row half of the byte-alignment promise that the kept variant
-// cannot reach.
+// TestGCCmd_SortBySize_DryRunLiveParity_Evicted uses corpora over the
+// budget: the dry run predicts "evicted" rows, and the live run evicts them.
+// The rows, with the size measured before the eviction, must still match
+// byte for byte. The kept variant cannot check the evicted rows.
 func TestGCCmd_SortBySize_DryRunLiveParity_Evicted(t *testing.T) {
 	root := cacheRootForTest(t)
 	// Over the budget, so the plan evicts both corpora.

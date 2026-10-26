@@ -51,6 +51,9 @@ func TestDynamicCPUGateUsesNewCapacity(t *testing.T) {
 	})
 }
 
+// TestSearchResourcesDoNotChargeAcceleratorWait holds the one CPU of the
+// gate, then asks for a cost of 0, as a model call on an accelerator does. The
+// acquire returns at once and takes no CPU.
 func TestSearchResourcesDoNotChargeAcceleratorWait(t *testing.T) {
 	gate := newDynamicCPUGate(func() int { return 1 })
 	resources := searchResources{cpu: gate}
@@ -67,6 +70,9 @@ func TestSearchResourcesDoNotChargeAcceleratorWait(t *testing.T) {
 	accelerated.release()
 }
 
+// TestDynamicCPUGateFillsPartialCapacity takes 3 of 4 CPUs, then asks for 3
+// more. The gate admits the last call at its full cost, so the free CPU does
+// not stay idle.
 func TestDynamicCPUGateFillsPartialCapacity(t *testing.T) {
 	gate := newDynamicCPUGate(func() int { return 4 })
 	first, err := gate.acquire(t.Context(), 3)

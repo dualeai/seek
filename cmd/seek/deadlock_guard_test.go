@@ -17,7 +17,7 @@ import (
 // On exit (via the returned cleanup func): restores GOMAXPROCS, then reports
 // with goleak each goroutine that started after the entry and still runs. It
 // reports with t.Error, not Fatal, so the test continues to drain. goleak
-// tries again for a short time before it reports: a goroutine that the code
+// tries again for a short time before it reports. A goroutine that the code
 // does not join can still be on its way out, and no signal tells when it
 // ends.
 //

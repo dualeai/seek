@@ -6,8 +6,17 @@ import (
 	"unsafe"
 )
 
+// semanticSNORM16MaximumDecodeError is the largest difference between a
+// decoded SNORM16 component and code/32767, over every code. The round-trip
+// test measures it again and requires this exact value.
 const semanticSNORM16MaximumDecodeError = 2.980141289299354e-8
 
+// semanticSourceSquaredNormBounds returns the smallest and the largest exact
+// squared norm of a vector that validateNormalizedSemanticVector accepts. The
+// check rounds each square to float32 (u32) and sums the 48 squares in
+// float64 (gamma47). It accepts a sum within
+// semanticNormalizedSquaredNormTolerance of 1. A square can also underflow to
+// 0 (underflow).
 func semanticSourceSquaredNormBounds() (float64, float64) {
 	u32 := math.Ldexp(1, -24)
 	u64 := math.Ldexp(1, -53)

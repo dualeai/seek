@@ -29,15 +29,16 @@ import (
 // Retrieval rule: a semantic hit is a row whose summed fine MaxSim F reaches
 // S0 + (tau_file - delta) * T (semanticRetrievalFloor). S0 is the
 // empty-document score of the query (semanticQueryEmbedding.emptyScore), and T
-// is its token count. Take a file whose model lift (S - S0) / T passes
-// tau_file. Its rows are within the radius while the fine vectors
+// is its token count. Take a row whose window has a model lift (S - S0) / T
+// that passes tau_file. That row is within the radius while the fine vectors
 // under-estimate the model score S by at most delta per token.
 //
-// delta comes from the earlier rule. It is the p99.9 of (model MeanMaxSim -
-// fine MeanMaxSim) over 18,856 window rows of a Kubernetes checkout. Each row
-// had a model MeanMaxSim of at least 0.55. The gap had a p50 of 0.008, a p99
-// of 0.069 and a maximum of 0.149. A per-token coarse radius kept every
-// Kubernetes file (delta p99 0.445), so it is not the rule.
+// The measurement of delta used the earlier acceptance rule, 0.6 on the score
+// per token. delta is the p99.9 of (model MeanMaxSim - fine MeanMaxSim) over
+// 18,856 window rows of a Kubernetes checkout. Each row had a model MeanMaxSim
+// of at least 0.55. The gap had a p50 of 0.008, a p99 of 0.069 and a maximum
+// of 0.149. A per-token coarse radius kept every Kubernetes file (delta p99
+// 0.445), so it is not the rule.
 //
 // The measurement of pipelineTauFile gives a larger p99.9, 0.1413. It used
 // the 3,906 rows of both corpora with a model lift of at least 0.15. But at
@@ -113,20 +114,20 @@ func semanticRetrievalFloor(emptyScore float32, tokens int) float32 {
 
 // semanticUSearchDeepenSimilarity is the coarse similarity down to which
 // USearch keeps returning keys for a token: an approximation parameter, not a
-// count. A measurement on a Kubernetes checkout used 20 queries and the radius
-// of an earlier rule (a fine MeanMaxSim of 0.4842 per token). At 0.6, USearch
-// kept a median 0.998 (min 0.985) of the files that an exact fine scan finds
-// within the radius. It also kept the exact top 20 in every query. 0.7
+// count. In a shard that does not saturate, only keys at or above it are
+// candidates. A measurement on a Kubernetes checkout used 20 queries and the
+// radius of an earlier rule (a fine MeanMaxSim of 0.4842 per token). At 0.6,
+// USearch kept a median 0.998 (min 0.985) of the files that an exact fine scan
+// finds within the radius. It also kept the exact top 20 in every query. 0.7
 // reached the recall target (top-20 overlap of at least 0.95) only at its
 // limit, and 0.8 kept half. That measurement read a 127^2 scale, 4.5 % below
 // the cosine (an effective cosine of about 0.627). The bound applies to
 // USearch's cosine of the int8 codes. For keys at a cosine of 0.5 or more, it
 // differs from the f32 cosine by a mean under 0.001 and by at most 0.012. So
 // the bound keeps a few more rows than measured. On the same checkout in
-// October 2026, descriptions of 1 to 51 words with no filter gave all
-// 1,347,164 rows to the fine scan. 373 of the 379 shards saturated, and the 6
-// smallest (4 to 598 rows) gave all their rows. So the bound changed no
-// result for them.
+// October 2026, descriptions of 1 to 51 words with no filter gave all 1,347,164
+// rows to the fine scan. 373 of the 379 shards saturated, and the 6 smallest (4
+// to 598 rows) gave all their rows. So the bound changed no result for them.
 var semanticUSearchDeepenSimilarity float32 = 0.6
 
 // nodeHit is one file of one node: the unit of merge, duplicate collapse,
@@ -156,7 +157,7 @@ type nodeHit struct {
 	lexicalParts string
 	// also holds the other collapsed copies, in tie order.
 	also []corpusCopy
-	// display is what the output prints for the file, and document what the
+	// display is what the output prints for the file. document is what the
 	// model reads: the window that the vectors found, or the best lexical
 	// match with its context.
 	display  corpusSearchResult
@@ -196,11 +197,11 @@ func compareNodeHits(left, right nodeHit) int {
 	return 0
 }
 
-// mergeNodeHits sorts a copy of the hits of every node once with the tie key,
-// and collapses copies with the same content and match on the sorted list:
-// the representative is the copy with the smallest tie key, and the other
-// paths follow in order. The same (corpus, path) twice keeps its first, best
-// hit. No step cuts a node's hits.
+// mergeNodeHits sorts a copy of the hits of every node once with the tie key.
+// It then collapses copies with the same content and match on the sorted
+// list. The representative is the copy with the smallest tie key, and the
+// other paths follow in order. The same (corpus, path) twice keeps its first,
+// best hit. No step cuts a node's hits.
 func mergeNodeHits(hits nodeHits) nodeHits {
 	merged := slices.Clone(hits)
 	sortNodeHits(merged)
@@ -238,14 +239,15 @@ func sortNodeHits(hits nodeHits) {
 	slices.SortStableFunc(hits, compareNodeHits)
 }
 
-// candidateFiles is the set that the model scores: the strict all-word files,
-// which are admitted and need a model rank, and every file with a semantic hit
-// within the retrieval radius, with no count. A relaxed lexical match alone is
-// a rank signal, not a candidate: it has no row within the radius, so it
-// cannot pass tau_file (relaxed matching returns 2,819 to 31,238 files of a
-// Kubernetes checkout for a description). A name-only file (a binary file, a
-// macOS dataless file, a missing blob) has no model text: it enters only as a
-// strict all-word match and is never model-scored.
+// candidateFiles gives the set that the model scores. The set holds the strict
+// all-word files, which are admitted and need a model rank. It also holds
+// every file with a semantic hit within the retrieval radius, with no count. A
+// relaxed lexical match alone is a rank signal, not a candidate. It has no row
+// within the radius, so it cannot pass tau_file. Relaxed matching returns
+// 2,819 to 31,238 files of a Kubernetes checkout for a description. A
+// name-only file (a binary file, a macOS dataless file, a missing blob) has no
+// model text. It enters only as a strict all-word match, and the model never
+// scores it.
 func candidateFiles(hits nodeHits) (scored nodeHits, nameOnly nodeHits) {
 	for _, hit := range hits {
 		switch {
@@ -259,13 +261,13 @@ func candidateFiles(hits nodeHits) (scored nodeHits, nameOnly nodeHits) {
 	return scored, nameOnly
 }
 
-// acceptFiles admits every strict all-word file and each model-added file
-// whose lift (s(f) - emptyScore)/T passes tauFile on its own, with no
-// candidate count: the verdict for a file does not depend on the other
-// candidates. The order is weighted reciprocal-rank fusion of the lexical
-// rank (strict files first, then relaxed) and the model rank (2:1, k = 60).
-// scores holds one raw model score per scored candidate; nameOnly files come
-// after them in tie order.
+// acceptFiles admits every strict all-word file. It also admits each
+// model-added file whose lift (s(f) - emptyScore)/T passes tauFile on its own,
+// with no candidate count. So the verdict for a file does not depend on the
+// other candidates. The order is weighted reciprocal-rank fusion of the
+// lexical rank (strict files first, then relaxed) and the model rank (2:1,
+// k = 60). scores holds one raw model score per scored candidate. The nameOnly
+// files come after them in tie order.
 func acceptFiles(
 	scored nodeHits,
 	scores []float32,
@@ -339,8 +341,8 @@ func ranks(n int, compare func(left, right int) int) []int {
 }
 
 // compareLexicalRank orders strict all-word files first, then relaxed lexical
-// files, each by their lexical score and the tie key; semantic-only files
-// come last (acceptFiles gives them one shared rank).
+// files, each by their lexical score and the tie key. Semantic-only files
+// come last, and acceptFiles gives them one shared rank.
 func compareLexicalRank(left, right nodeHit) int {
 	rank := func(hit nodeHit) int {
 		switch {
@@ -365,9 +367,9 @@ type openedNode struct {
 	state      repoState
 	indexState corpusIndexState
 	dirty      dirtyFileSet
-	// version gives the state that the index must hold at read time and the
-	// semantic source of that state: the commit of a Git node, the walk
-	// state of a folder node. nil reads text only.
+	// version gives the state that the index must hold at read time. It also
+	// gives the semantic source of that state: the commit of a Git node, the
+	// walk state of a folder node. nil reads text only.
 	version func() (state, source string, ok bool)
 	// attempt counts the reads of this node in one openNode: 0, or 1 after a
 	// repair or a tree change.
@@ -382,17 +384,18 @@ type openedNode struct {
 // reader: so the read only records it.
 type nodeRepair struct {
 	// vectors is set when a read finds vector data that no shard repair
-	// fixes: rows that still do not match their shard copy after the shard
-	// repair, or a graph shard that fails its hash.
+	// fixes. That data is rows that still do not match their shard copy
+	// after the shard repair, or a graph shard that fails its hash.
 	vectors atomic.Bool
 }
 
-// openNode makes one node's index current, then runs read on it: the build or
-// delta under the node locks, swap recovery, and the stale-index rule
-// (servesStale: a failed update with published shards warns and serves them).
-// A read that finds a shard it cannot load removes the family manifest that
-// it saw (removeDamagedFamilyManifest) and opens the node once more
-// (errShardUnloadable); a second failure returns. A read that sees the tree
+// openNode makes one node's index current, then runs read on it. The
+// preparation runs the build or delta under the node locks, swap recovery,
+// and the stale-index rule. That rule (servesStale) serves the published
+// shards of a failed update with a warning. A read can find a shard that it
+// cannot load (errShardUnloadable). Then openNode removes the family manifest
+// that the read saw (removeDamagedFamilyManifest) and opens the node once
+// more. A second failure returns. A read that sees the tree
 // change opens the node once more from a new capture. When a read records
 // vector damage (nodeRepair), openNode removes the node's vector generations
 // after the read (removeDamagedVectors). Every prepare path of a search goes
@@ -446,20 +449,20 @@ func openNode(
 
 // removeDamagedVectors removes the node's vector generations, so the next
 // preparation builds them again. The shard repair rebuilds only the Zoekt
-// family, and the open check of a generation trusts rows that its build
-// recorded, so damaged rows would else give the same mismatch on every search.
-// The open check does not read the graph shards either, so the next bind would
-// serve a damaged graph shard again, and each search would hash it and fall
-// back to the exact vectors. The windows of the removed generations go to the
-// unit store first: the rebuild copies every window whose file and content
-// still match, and embeds only the damaged rows again, because their content
-// no longer matches. The graphs are built again from the rows. The
+// family. The open check of a generation trusts rows that its build recorded.
+// So without this removal, damaged rows give the same mismatch on every
+// search. The open check does not read the graph shards either. So the next
+// bind would serve a damaged graph shard again, and each search would hash it
+// and fall back to the exact vectors. The windows of the removed generations
+// go to the unit store first. The rebuild copies every window whose file and
+// content still match. It embeds only the damaged rows again, because their
+// content does not match. The graphs are built again from the rows. The
 // removal takes the publish lock, as removeDamagedFamilyManifest does. It
-// also takes the node's build lock with no wait: a peer build can still link
+// also takes the node's build lock with no wait. A peer build can still link
 // graph files of these generations, so the removal skips while one runs. That
-// build's rows are good, because the damaged rows no longer match their
-// content and are not copied, and it hashes a graph shard whose check fails
-// before it links it.
+// build's rows are good, because it does not copy the damaged rows: their
+// content does not match. It also hashes a graph shard whose recorded check
+// fails, and links it only when the hash matches.
 func removeDamagedVectors(ctx context.Context, plan node) {
 	build, ok, err := tryBuildLock(plan.cacheDir)
 	if err != nil || !ok {
@@ -481,9 +484,9 @@ func removeDamagedVectors(ctx context.Context, plan node) {
 
 // removeDamagedFamilyManifest removes the family manifest that a damaged read
 // saw, so the next preparation rebuilds the family. A peer can publish a new
-// family, with a new manifest, after the read released its lock: so the
-// removal takes the publish lock, which waits for every reader of the node,
-// and removes the manifest only when it is still the file that the read saw.
+// family, with a new manifest, after the read released its lock. So the
+// removal takes the publish lock, which waits for every reader of the node.
+// It removes the manifest only when it is still the file that the read saw.
 // On cancellation or eviction it removes nothing.
 func removeDamagedFamilyManifest(ctx context.Context, plan node, err error) {
 	damage, ok := errors.AsType[*shardDamage](err)
@@ -507,10 +510,6 @@ func removeDamagedFamilyManifest(ctx context.Context, plan node, err error) {
 // nodePreparations counts prepareNode calls; tests read it to see one
 // preparation per node per command.
 var nodePreparations atomic.Int64
-
-// nodeShardLoads counts the shard loads of node reads; tests read it to see
-// one load per node read.
-var nodeShardLoads atomic.Int64
 
 // prepareNode makes the index of one node current through its kind
 // (nodeKind.prepare) and counts the preparation.
@@ -590,9 +589,10 @@ func asNodeFailure(ctx context.Context, err error) error {
 var errInvariant = errors.New("internal error")
 
 // environmentFailure reports an error that every node would meet, so it ends
-// the command with exit 2 and is no node failure: a missing ctags, no free file
-// descriptor (EMFILE, ENFILE: no property of a node), and a Seek defect.
-// The cache root is checked once before the expansion (checkCacheRoot).
+// the command with exit 2 and is no node failure. Such errors are a missing
+// ctags, no free file descriptor (EMFILE, ENFILE: no property of a node), and
+// a Seek defect. The cache root is checked once before the expansion
+// (checkCacheRoot).
 func environmentFailure(err error) bool {
 	if _, ctags := errors.AsType[*ctagsUnavailableError](err); ctags {
 		return true
@@ -620,10 +620,10 @@ func interruptedChild(err error) bool {
 }
 
 // buildWindowBytes is the read budget that running node builds take: two
-// maximum-weight documents stay free. Each build takes the two
-// windows of its command (the lexical and the semantic consumer), so the
-// builds of every command in the process keep the deadlock proof. The
-// preparation of a ready node and every search take none.
+// maximum-weight documents stay free. Each build takes the two windows of its
+// command (the lexical and the semantic consumer). So the builds of every
+// command in the process keep the deadlock proof. The preparation of a ready
+// node and every search take none.
 var (
 	buildWindowBytes = max(readBudgetBytes-2*maxReadWeightBytes, 1)
 	buildWindows     = semaphore.NewWeighted(buildWindowBytes)
@@ -645,11 +645,11 @@ func acquireBuildSlot(ctx context.Context) (func(), error) {
 }
 
 // searchNodes runs every node of the graph at the same time: search opens one
-// node and reads it. A node that fails to open is skipped with one warning,
-// and the others still answer (exit 0 on matches, 1 on none, never 2 for a
-// node failure). Any other error stops the search. A
-// cancellation returns ctx.Err() once, with no warning per node. The node
-// outputs are concatenated in plan order; the next stage orders them.
+// node and reads it. A node that fails to open is skipped with one warning.
+// The others still answer: exit 0 on matches, 1 on none, never 2 for a node
+// failure. Any other error stops the search. A cancellation returns ctx.Err()
+// once, with no warning per node. The node outputs are concatenated in plan
+// order; the next stage orders them.
 func searchNodes[T any](
 	ctx context.Context,
 	plans []node,
@@ -719,7 +719,7 @@ func warnSkippedNode(ctx context.Context, root string, err error) {
 	slog.Warn("Skipped a search node; its results are missing", "root", root, "cause", cause)
 }
 
-// skippedNodes holds the roots that one command already warned about: the
+// skippedNodes holds the roots that one command already warned about. The
 // operand resolver, the walks, and the node search can meet one failed node,
 // and it gets one warning. A root is keyed by its file identity, so two
 // spellings of one directory are one root.
@@ -750,9 +750,9 @@ func (nodes *skippedNodes) first(root string) bool {
 	return true
 }
 
-// queryPlan is the first stage of the pipeline: the strict query that
-// every node runs, and for a query that gives the model text the plan of the
-// model stages.
+// queryPlan is the first stage of the pipeline: the strict query that every
+// node runs. For a query that gives the model text, it also holds the plan of
+// the model stages.
 type queryPlan struct {
 	raw    query.Q
 	strict query.Q
@@ -823,11 +823,12 @@ func strictNode(ctx context.Context, plan node, qp queryPlan, config searchConfi
 	return results, dirty, nil
 }
 
-// retrieveNode opens one node and reads it for a model query: strict
-// lexical retrieval, semantic retrieval within the radius over the rows that
-// the query's filters and the node's scope allow, and the relaxed lexical rank
-// of each semantic hit, under one read lock on one generation. It gives one
-// hit per file with its display result and its model document.
+// retrieveNode opens one node and reads it for a model query, under one read
+// lock on one generation. The read runs strict lexical retrieval and the
+// relaxed lexical rank of each semantic hit. It also runs semantic retrieval
+// within the radius, over the rows that the query's filters and the node's
+// scope allow. It gives one hit per file with its display result and its
+// model document.
 func retrieveNode(ctx context.Context, plan node, qp queryPlan, config searchConfig, execution searchExecution) ([]nodeHit, dirtyFileSet, error) {
 	var hits nodeHits
 	var dirty dirtyFileSet
@@ -853,10 +854,10 @@ func retrieveNode(ctx context.Context, plan node, qp queryPlan, config searchCon
 }
 
 // readNodeEvidence reads one opened node for a model query. Under the node's
-// read lock it runs the strict search, the name-only count, semantic retrieval
-// on the bound generation and the overlay, the relaxed lexical rank of each
-// semantic file, and the text of each semantic file from the shards
-// (readSemanticEvidence).
+// read lock it runs the strict search, the name-only count, and semantic
+// retrieval on the bound generation and the overlay. It then reads the
+// relaxed lexical rank of each semantic file, and the text of each semantic
+// file from the shards (readSemanticEvidence).
 func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config searchConfig, execution searchExecution, nameOnlyFiles *int64) (nodeHits, error) {
 	plan := node.plan
 	read, ctx, err := openNodeRead(ctx, plan, node.dirty)
@@ -867,8 +868,8 @@ func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config
 
 	// One capture per node per command: under the lock the index
 	// must hold the captured state, and the bound generation that state.
-	// The base generation holds the commit; the overlay of a dirty Git node
-	// holds the work-tree bytes of its dirty files.
+	// The base generation of a Git node holds the commit; the overlay of a
+	// dirty Git node holds the work-tree bytes of its dirty files.
 	var generation, overlay *semanticGeneration
 	var state, source string
 	var ok bool
@@ -885,7 +886,7 @@ func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config
 			return nil, treeChanged(plan)
 		}
 		// The tree changed again after the retry's capture, as a file
-		// written on each save does: the node serves its text with no
+		// written on each save does. The node serves its text with no
 		// vectors, as a stale index does.
 		slog.Debug("vectors unavailable", "root", plan.displayRoot, "cause", "the tree changed again")
 		ok = false
@@ -934,7 +935,7 @@ func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config
 	if overlay != nil {
 		defer func() { _ = overlay.Close() }()
 	}
-	// Under the lock: the file sets read the generation that the search reads.
+	// Under the lock: the file sets read the shards that the search reads.
 	qp, err = nodeHeaderQuery(ctx, read, qp, execution.operands)
 	if err != nil {
 		return nil, err
@@ -1051,9 +1052,9 @@ func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config
 	return nodeEvidenceHits(plan, node.dirty, generation, overlay, strict, evidence, relaxedScores), nil
 }
 
-// scanNode runs semantic retrieval on one node through USearch: its filtered
-// search over the rows that the mask allows finds the candidates, and the
-// exact fine scores rank them with no final count.
+// scanNode runs semantic retrieval on one node through USearch. Its filtered
+// search over the rows that the mask allows finds the candidates. The exact
+// fine scores rank them with no final count.
 func scanNode(ctx context.Context, node openedNode, qp queryPlan, generation *semanticGeneration, execution searchExecution, selection func() (map[string]struct{}, error)) ([]semanticHit, error) {
 	return scanWithinRadius(ctx, qp, execution, selection, func(prepared *semanticQueryEmbedding, selected map[string]struct{}, floor float32) ([]semanticHit, error) {
 		var mask *semanticFilterMask
@@ -1068,9 +1069,9 @@ func scanNode(ctx context.Context, node openedNode, qp queryPlan, generation *se
 	})
 }
 
-// scanOverlay scores every overlay row that the query's filters and the
-// node's scope allow with the exact fine vectors, on the scale of the base
-// rows.
+// scanOverlay scores with the exact fine vectors every overlay row that the
+// query's filters and the node's scope allow. The scores use the scale of the
+// base rows.
 func scanOverlay(ctx context.Context, qp queryPlan, overlay *semanticGeneration, execution searchExecution, selection func() (map[string]struct{}, error)) ([]semanticHit, error) {
 	return scanWithinRadius(ctx, qp, execution, selection, func(prepared *semanticQueryEmbedding, selected map[string]struct{}, floor float32) ([]semanticHit, error) {
 		if selected == nil {
@@ -1127,7 +1128,7 @@ func scanWithinRadius(
 
 // nodeRowSelection gives the files that Zoekt selects on the node's own shards
 // for the query's filters and the node's scope; nil keeps every file. The read
-// searches only the current copy of each file, as for the text results: a
+// searches only the current copy of each file, as for the text results. So a
 // committed copy that matches a filter does not select the work-tree copy.
 func nodeRowSelection(ctx context.Context, read *nodeRead, qp queryPlan) (map[string]struct{}, error) {
 	if len(qp.model.filters) == 0 && read.plan.scope == nil {
@@ -1147,10 +1148,10 @@ func nodeRowSelection(ctx context.Context, read *nodeRead, qp queryPlan) (map[st
 	return selected, nil
 }
 
-// nodeRowFilter gives the files whose rows semantic retrieval reads: the
-// selected files (nodeRowSelection; nil selects every file), less the dirty
-// files (their rows hold the commit; the overlay adds the dirty bytes). nil
-// keeps every row.
+// nodeRowFilter gives the files whose rows semantic retrieval reads. These are
+// the selected files (nodeRowSelection; nil selects every file), less the
+// dirty files. The rows of a dirty file hold the commit, and the overlay adds
+// the dirty bytes. nil keeps every row.
 func nodeRowFilter(selected map[string]struct{}, dirty dirtyFileSet) func(string) bool {
 	if selected == nil && len(dirty) == 0 {
 		return nil
@@ -1218,7 +1219,7 @@ func generationContentIDs(generation *semanticGeneration, wanted map[string]stru
 
 // nodeEvidenceHits builds the node's hits: each strict file, and each file of
 // a semantic hit. A file with both keeps its lexical display and scores the
-// window that the vectors found. A file's content ID comes from its rows: a
+// window that the vectors found. A file's content ID comes from its rows. A
 // clean file reads the base rows, a dirty file the overlay rows, and a
 // name-only file has none.
 func nodeEvidenceHits(

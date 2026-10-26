@@ -11,8 +11,8 @@ import (
 )
 
 // markDataless makes fileIsDataless report cloud.txt as cloud-only and its
-// mode 000. noOpen is true when the test user cannot open a mode-000 file:
-// then any open of cloud.txt fails, so a passing check proves no open. A user
+// mode 000. noOpen is true when the test user cannot open a mode-000 file.
+// Then any open of cloud.txt fails, so a passing check proves no open. A user
 // who ignores file modes, as root does, opens it.
 func markDataless(t *testing.T, dir string) (path string, noOpen bool) {
 	t.Helper()
@@ -36,8 +36,8 @@ func markDataless(t *testing.T, dir string) (path string, noOpen bool) {
 }
 
 // TestDirtyContentBytesSkipsDatalessFiles checks that a cloud-only file adds
-// no bytes and gets no open, with and without the binary probe. For a user who
-// ignores file modes, the test checks the bytes only.
+// no bytes, with and without the binary probe. The bytes do not show an open:
+// the probe counts a file that it cannot open as binary, so 0 bytes too.
 func TestDirtyContentBytesSkipsDatalessFiles(t *testing.T) {
 	dir := t.TempDir()
 	markDataless(t, dir)
@@ -61,10 +61,11 @@ func TestStatOperandDoesNotOpenDatalessFiles(t *testing.T) {
 	}
 }
 
-// TestOnDiskPathOfFileReadsTheDirectory checks that onDiskPath gives a
-// cloud-only file and its directory their stored letter case, with no open of
-// the file. On a case-sensitive file system, the mistyped path names no file,
-// and onDiskPath gives it back unchanged.
+// TestOnDiskPathOfFileReadsTheDirectory checks that onDiskPath gives a file
+// and its directory their stored letter case with no open of the file. The
+// file has mode 000, so an open by the test user fails, and onDiskPath would
+// give the typed path back. On a case-sensitive file system, the mistyped
+// path names no file, and onDiskPath gives it back unchanged.
 func TestOnDiskPathOfFileReadsTheDirectory(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "Dir")
 	markDataless(t, dir)

@@ -12,9 +12,9 @@ import (
 	"github.com/sourcegraph/zoekt"
 )
 
-// requireNoGitCorpusOutput puts files in testGitCorpusPlan, runs the
-// streamed formatter with limit, and requires no output and no written result:
-// runSearchCommand then returns errNoMatch (exit status 1).
+// requireNoGitCorpusOutput puts files in testGitCorpusPlan and runs the
+// streamed formatter with limit. It requires no output and no written result,
+// for which runSearchCommand returns errNoMatch (exit status 1).
 func requireNoGitCorpusOutput(t *testing.T, files []zoekt.FileMatch, limit int) {
 	t.Helper()
 	var output bytes.Buffer
@@ -35,7 +35,9 @@ func TestGitCorpusFormatting_Empty(t *testing.T) {
 	requireNoGitCorpusOutput(t, nil, 0)
 }
 
-func TestWriteCorpusResultsWithContextMatchesStringFormatter(t *testing.T) {
+// TestWriteCorpusResultsWithContextLimitNotice streams two files with limit 1:
+// the kept file, a blank line, then the notice for the other file.
+func TestWriteCorpusResultsWithContextLimitNotice(t *testing.T) {
 	results := []corpusSearchResult{
 		{
 			corpusID: "one",
@@ -64,8 +66,8 @@ func TestWriteCorpusResultsWithContextMatchesStringFormatter(t *testing.T) {
 			},
 		},
 	}
-	// Written by hand from the output format: the header and the match line of
-	// the file that limit 1 keeps, a blank line, then the notice for the other.
+	// Written by hand from the output format. Limit 1 keeps the first file: its
+	// header and match line, a blank line, then the notice for the other file.
 	const want = "## first.go (Go)\n1 first match\n\n… 1 more file (showing 1 of 2)\n"
 	var output bytes.Buffer
 	wrote, err := writeCorpusResultsWithContext(
@@ -73,13 +75,6 @@ func TestWriteCorpusResultsWithContextMatchesStringFormatter(t *testing.T) {
 	)
 	if err != nil || !wrote || output.String() != want {
 		t.Fatalf("streamed output=%q wrote=%t error=%v, want %q", output.String(), wrote, err, want)
-	}
-	// The other formatter tests use the string formatter: it must give the
-	// same bytes as the streamed one.
-	if got := formatCorpusResultsWithContext(
-		results, 1, 0, hideCorpusContext, plainPalette,
-	); got != want {
-		t.Fatalf("string output=%q, want %q", got, want)
 	}
 }
 
@@ -549,7 +544,7 @@ func TestGitCorpusFormatting_ContextLines_ThreeContextLines(t *testing.T) {
 }
 
 func TestGitCorpusFormatting_ContextLines_MatchOnLine1(t *testing.T) {
-	// Match on line 1 — no room for before-context.
+	// A match on line 1 has no room for before-context.
 	files := []zoekt.FileMatch{
 		{
 			FileName:   "main.go",
@@ -579,8 +574,8 @@ func TestGitCorpusFormatting_ContextLines_MatchOnLine1(t *testing.T) {
 
 func TestGitCorpusFormatting_ContextLines_MatchOnLine1_ExcessBefore(t *testing.T) {
 	// Match on line 1 with Before bytes that would produce negative line
-	// numbers. The guard should clamp firstBeforeLine to 1 and slice off
-	// excess.
+	// numbers. The formatter sets firstBeforeLine to 1 and drops the extra
+	// lines.
 	files := []zoekt.FileMatch{
 		{
 			FileName:   "main.go",
@@ -599,7 +594,7 @@ func TestGitCorpusFormatting_ContextLines_MatchOnLine1_ExcessBefore(t *testing.T
 	}
 
 	result := formatGitCorpusResultsForTest(files, 0, 0)
-	// Before lines should be silently dropped — no negative line numbers
+	// The extra Before lines do not print, and no line number is 0 or less.
 	if strings.Contains(result, "phantom") {
 		t.Errorf("expected excess Before lines to be dropped, got:\n%s", result)
 	}
@@ -612,7 +607,7 @@ func TestGitCorpusFormatting_ContextLines_MatchOnLine1_ExcessBefore(t *testing.T
 }
 
 func TestGitCorpusFormatting_ContextLines_MatchOnLine2_PartialBefore(t *testing.T) {
-	// Match on line 2 with 3 lines of Before — only 1 line fits (line 1).
+	// A match on line 2 with 3 lines of Before: only 1 line fits (line 1).
 	files := []zoekt.FileMatch{
 		{
 			FileName:   "main.go",
@@ -641,8 +636,7 @@ func TestGitCorpusFormatting_ContextLines_MatchOnLine2_PartialBefore(t *testing.
 }
 
 func TestGitCorpusFormatting_ContextLines_ThreeConsecutiveMatches(t *testing.T) {
-	// Three matches close together — context should flow without duplication
-	// or gaps.
+	// Three matches close together: each line prints once, with no gap.
 	files := []zoekt.FileMatch{
 		{
 			FileName:   "app.go",
@@ -777,7 +771,7 @@ func TestGitCorpusFormatting_ContextLines_EmptyLinesInContext(t *testing.T) {
 }
 
 func TestGitCorpusFormatting_ContextLines_EmptyByteSlice(t *testing.T) {
-	// Before/After as empty []byte{} (not nil) — should behave like nil.
+	// Before and After as empty []byte{} (not nil) must behave like nil.
 	files := []zoekt.FileMatch{
 		{
 			FileName:   "app.go",
@@ -914,7 +908,7 @@ func TestGitCorpusFormatting_SpecialCharsInLine(t *testing.T) {
 }
 
 func TestGitCorpusFormatting_LineNumber_MaxUint32(t *testing.T) {
-	// Large line number — verify no overflow in context line arithmetic
+	// A large line number: the context line arithmetic must not overflow.
 	files := []zoekt.FileMatch{
 		{
 			FileName:   "big.go",
@@ -953,8 +947,8 @@ func TestGitCorpusFormatting_LineNumbers_NoPaddingNoIndent(t *testing.T) {
 		},
 	}
 	result := formatGitCorpusResultsForTest(files, 0, 0)
-	// Dense gutter: line numbers are flush-left with a single space, never
-	// indented or right-aligned to a shared cross-file width.
+	// A line number starts the line and one space follows it. No padding
+	// aligns the numbers to a shared width.
 	if !strings.Contains(result, "\n5 near top") || !strings.Contains(result, "\n100 far down") {
 		t.Errorf("expected flush-left line numbers, got:\n%s", result)
 	}

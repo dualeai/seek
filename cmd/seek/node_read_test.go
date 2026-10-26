@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -14,9 +15,9 @@ import (
 	"github.com/sourcegraph/zoekt/query"
 )
 
-// TestNodeReadSharesOneLoad gives a read one load of two shards: two searches
-// use the same searchers with no close, close closes each shard once, and a
-// search after close is a defect, not index damage.
+// TestNodeReadSharesOneLoad gives a read one load of two shards. Two searches
+// use the same searchers and close none. Two calls of close close each shard
+// once. A search after close is a defect, not index damage.
 func TestNodeReadSharesOneLoad(t *testing.T) {
 	cacheDir := t.TempDir()
 	plan := node{corpusStore: corpusStore{cacheDir: cacheDir, indexDir: filepath.Join(cacheDir, "index")}}
@@ -53,11 +54,11 @@ func TestNodeReadSharesOneLoad(t *testing.T) {
 }
 
 // TestNodeReadLoadsShardsOnce counts the shard loads of one warm search of a
-// dirty Git node: the strict route (no model) and the model route each load
-// the node's shards once, for every query of the read. A read with no search
-// loads none. The test model accepts every row, so c.go, which holds no query
-// word, is a scan hit with no strict match: the model route runs the relaxed
-// query and scores c.go.
+// dirty Git node, by the debug line of each load. The strict route (no model)
+// and the model route each load the node's shards once for all the queries of
+// the read. A read with no search loads none. The test model accepts every
+// row. So c.go, which holds no query word, is a vector hit with no strict
+// match. The model route runs the relaxed query and scores c.go.
 func TestNodeReadLoadsShardsOnce(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -69,26 +70,38 @@ func TestNodeReadLoadsShardsOnce(t *testing.T) {
 	if _, _, err := stubSearch(t, payloadAccept, "zqonce alpha file:go", repo); err != nil {
 		t.Fatal(err)
 	}
+	// shardLoads counts the loads that the logs saw: nodeRead.shards writes
+	// one debug line for each load.
+	shardLoads := func(logs *testLogRecorder) int {
+		loads := 0
+		for _, record := range logs.Records() {
+			if record.Message == "Loaded the node's shards" {
+				loads++
+			}
+		}
+		return loads
+	}
 	t.Run("strict", func(t *testing.T) {
-		// The file: atom makes the strict route run its header listing too.
-		before := nodeShardLoads.Load()
+		// The file: atom makes the strict route also run its file listing
+		// (nodeHeaderQuery).
+		logs := captureTestLogs(t, slog.LevelDebug)
 		out, err := seek(t, "--lexical-only", "zqonce file:go", repo)
 		if err != nil || !strings.Contains(out, "b.go") {
 			t.Fatalf("err=%v output:\n%s", err, out)
 		}
-		if got := nodeShardLoads.Load() - before; got != 1 {
+		if got := shardLoads(logs); got != 1 {
 			t.Fatalf("shard loads=%d, want 1", got)
 		}
 	})
 	t.Run("description", func(t *testing.T) {
 		// The strict query, the name-only count, both scans with the file
 		// selection, and the relaxed query.
-		before := nodeShardLoads.Load()
+		logs := captureTestLogs(t, slog.LevelDebug)
 		out, scorer, err := stubSearch(t, payloadAccept, "zqonce alpha file:go", repo)
 		if err != nil || !strings.Contains(out, "b.go") {
 			t.Fatalf("err=%v output:\n%s", err, out)
 		}
-		if got := nodeShardLoads.Load() - before; got != 1 {
+		if got := shardLoads(logs); got != 1 {
 			t.Fatalf("shard loads=%d, want 1", got)
 		}
 		scorer.mu.Lock()
@@ -102,20 +115,21 @@ func TestNodeReadLoadsShardsOnce(t *testing.T) {
 	if err != nil || len(plans) != 1 {
 		t.Fatalf("plans=%d err=%v", len(plans), err)
 	}
-	before := nodeShardLoads.Load()
+	logs := captureTestLogs(t, slog.LevelDebug)
 	read, _, err := openNodeRead(t.Context(), plans[0], nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	read.close()
-	if got := nodeShardLoads.Load() - before; got != 0 {
+	if got := shardLoads(logs); got != 0 {
 		t.Fatalf("a read with no search loaded the shards %d times", got)
 	}
 }
 
-// TestRemoveDamagedFamilyManifestKeepsANewPublish removes the family manifest
-// that a damaged read saw, and keeps any other: a manifest that a peer
-// published after the read, a read that saw none, and an evicted node.
+// TestRemoveDamagedFamilyManifestKeepsANewPublish checks that the repair
+// removes the family manifest that a damaged read saw. It keeps the manifest
+// in each other case: a peer published it after the read, the read saw none,
+// or the node was evicted.
 func TestRemoveDamagedFamilyManifestKeepsANewPublish(t *testing.T) {
 	newNode := func(t *testing.T) node {
 		t.Helper()

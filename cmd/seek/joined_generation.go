@@ -20,9 +20,9 @@ const (
 )
 
 // joinedGenerationDescriptor binds a Zoekt state to its base semantic
-// generation (the commit of a Git node, the folderSemanticSource of a folder)
-// and, for a dirty Git node, to the overlay of its dirty files. A Git node
-// with no commit has an overlay and no base.
+// generation: the commit of a Git node, the folderSemanticSource of a folder.
+// For a dirty Git node, it also binds the overlay of its dirty files. A Git
+// node with no commit has an overlay and no base.
 type joinedGenerationDescriptor struct {
 	Format      uint32 `json:"format"`
 	State       string `json:"state"`
@@ -31,7 +31,7 @@ type joinedGenerationDescriptor struct {
 	OverlayKey  string `json:"overlay_key,omitempty"`
 }
 
-// semanticOverlaySource names the overlay generation of a Git node state: the
+// semanticOverlaySource names the overlay generation of a Git node state. The
 // state hash covers the dirty paths and their stats, so a saved file gives a
 // new overlay.
 func semanticOverlaySource(state string) string {
@@ -177,9 +177,11 @@ func joinedFamilyDigest(indexDir string) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-// publishSemanticGeneration keeps a valid generation of source unless
-// replace is set: a generation that holds a name-only file whose blob arrived
-// is valid but stale.
+// publishSemanticGeneration moves the build in stagingDir to the generation
+// of source and checks it. A valid generation of source stays, and the build
+// is discarded, unless replace is set. A generation that holds a name-only
+// file whose blob arrived is valid but stale. The build after that arrival
+// sets replace.
 func publishSemanticGeneration(indexDir, stagingDir, source string, replace bool) error {
 	finalDir := semanticGenerationDir(indexDir, source)
 	if err := validateSemanticGeneration(indexDir, source); err == nil && !replace {
@@ -202,9 +204,9 @@ func semanticGenerationPresent(indexDir, source string) bool {
 	return validateSemanticGeneration(indexDir, source) == nil
 }
 
-// validateSemanticGeneration opens a generation the way a search does: the
-// build hashed each artifact while it wrote it, and the checks recorded then
-// let the open trust the files that the build wrote.
+// validateSemanticGeneration opens a generation the way a search does. The
+// build hashed each artifact while it wrote it. The checks recorded then let
+// the open trust the files that the build wrote.
 func validateSemanticGeneration(indexDir, source string) error {
 	generation, err := openSemanticGenerationForSearch(semanticGenerationDir(indexDir, source), source)
 	if err != nil {
@@ -234,10 +236,10 @@ func (store corpusStore) openJoinedSemanticGeneration(
 	return generation, nil
 }
 
-// bindSemanticGenerations binds the base generation and the overlay (either
-// may be empty) and removes every other generation of the node: a superseded
-// overlay is unreachable once a new one binds. The caller must hold the
-// publish lock.
+// bindSemanticGenerations binds the base generation and the overlay; either
+// may be empty. It removes every other generation of the node, because no
+// search reads a superseded overlay after a new one binds. The caller must
+// hold the publish lock.
 func (store corpusStore) bindSemanticGenerations(
 	state string,
 	source string,
@@ -256,7 +258,8 @@ func (store corpusStore) bindSemanticGenerations(
 		}
 	}
 	// The windows that only the replaced generations hold go to the unit
-	// store first, so a later build copies them and does not embed them again.
+	// store first. So a later build copies them and does not embed them
+	// again.
 	archiveSupersededUnits(store.indexDir, live...)
 	removeSemanticGenerationsExcept(store.indexDir, keep)
 	// The removal changed the ctime of each graph file that the new

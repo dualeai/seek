@@ -24,9 +24,10 @@ import (
 //
 //   - Folder -> Folder: the walk descends into each subdirectory. A folder
 //     belongs to the node whose walk reaches it.
-//   - Folder -> Git: a subdirectory whose `.git` directory holds HEAD,
-//     objects, and refs, or whose `.git` file points to a Git directory that
-//     belongs to it (detectGitBoundary). Git decides any other `.git` entry.
+//   - Folder -> Git: a subdirectory whose `.git` entry belongs to it
+//     (detectGitBoundary). That is a `.git` directory that holds HEAD,
+//     objects, and refs, or a `.git` file that points to a Git directory of
+//     that subdirectory. Git decides any other `.git` entry.
 //   - Git -> Git: an untracked nested repository (Git lists it as one
 //     "? dir/" entry) and a checked-out gitlink (index mode 160000).
 //   - A folder inside a Git node belongs to that node.
@@ -36,12 +37,12 @@ import (
 //   - Bare repository: no edge, no content, and no Git process.
 //   - Mount point: crossed.
 //
-// A `.git` entry that Git cannot use (unreadable, dubious owner, corrupt, or a
-// broken `gitdir:` line), or one that names the Git directory of another work
-// tree (foreignGitDir), makes its directory a failed node: one warning, and no
-// other node indexes its files. A stray `.git` entry that names no
-// repository (strayGitEntry) is not a boundary. No walk indexes a `.git`
-// entry.
+// A directory whose `.git` entry Git cannot use (unreadable, dubious owner,
+// corrupt, or a broken `gitdir:` line) is a failed node. A `.git` entry that
+// names the Git directory of another work tree (foreignGitDir) also makes a
+// failed node. A failed node gives one warning, and no other node indexes its
+// files. A stray `.git` entry that names no repository (strayGitEntry) is not
+// a boundary. No walk indexes a `.git` entry.
 
 // graphExpansion holds the nodes that the expansion found. Every task runs on
 // one errgroup; slots bounds the tasks that run Git or walk at the same time.
@@ -194,7 +195,7 @@ func gitNodeError(ctx context.Context, paths gitPaths, err error) error {
 }
 
 // addGitChild adds the repository that Git listed at dir below parentRoot.
-// A child is a real directory strictly below its parent: a symlink is no edge,
+// A child is a real directory strictly below its parent. A symlink is no edge,
 // and a gitlink replaced by a file is content of the parent.
 func (x *graphExpansion) addGitChild(parentRoot, dir string) {
 	x.run(func() error {
@@ -253,8 +254,8 @@ func (x *graphExpansion) addFolderNode(root externalRoot) {
 	})
 }
 
-// plans builds one node per root. A folder seed that another folder
-// seed's walk reaches is part of that node, so it is dropped.
+// plans builds one node per root. A folder seed that the walk of another
+// folder seed reaches is part of that node, so plans drops it.
 func (x *graphExpansion) plans() ([]node, error) {
 	plans := make([]node, 0, len(x.git)+len(x.folders))
 	for _, root := range x.git {
@@ -289,8 +290,8 @@ func (x *graphExpansion) plans() ([]node, error) {
 }
 
 // folderNodeCovered reports whether the walk of another folder node reaches
-// the root of plan: the root is below that node and below none of the
-// directories that its walk did not enter.
+// the root of plan. The root must be below that node, and below no directory
+// that its walk did not enter.
 func folderNodeCovered(plan node, folders map[corpusID]*node) bool {
 	for _, other := range folders {
 		if other.id == plan.id || other.folder == nil || !pathWithin(other.root, plan.root) {
@@ -400,7 +401,7 @@ func classifyGitDir(ctx context.Context, dir string) (gitPaths, bool, error) {
 		return gitPaths{}, false, err
 	}
 	if !sameFile(paths.RepoDir, dir) {
-		return gitPaths{}, false, fmt.Errorf("git does not use %s", filepath.Join(dir, ".git"))
+		return gitPaths{}, false, fmt.Errorf("git does not use %s", filepath.Join(dir, gitEntryName))
 	}
 	// Git prints the on-disk letter case; the node keeps the walked spelling,
 	// so it stays below its parent by path.
@@ -408,10 +409,11 @@ func classifyGitDir(ctx context.Context, dir string) (gitPaths, bool, error) {
 	return paths, true, nil
 }
 
-// strayGitEntry reports a `.git` entry that names no repository: a file
-// without a `gitdir:` line, or a readable directory that Git's
-// is_git_directory rejects (no HEAD; or, with no commondir file, no objects or
-// refs directory). Git ignores such a directory and goes on to the parent.
+// strayGitEntry reports a `.git` entry that names no repository. That is a
+// file without a `gitdir:` line, or a readable directory that Git's
+// is_git_directory rejects. Git rejects a directory with no HEAD, or with no
+// commondir file and no objects or no refs directory. Git ignores such a
+// directory and goes on to the parent.
 // Git's own message cannot tell these apart from an unreadable repository, so
 // only a missing entry counts, never an unreadable one.
 func strayGitEntry(dir string) bool {
@@ -439,12 +441,17 @@ func strayGitEntry(dir string) bool {
 }
 
 // foreignGitDir reports a `.git` entry whose Git directory belongs to another
-// work tree: the `.git` directory of another work tree, the admin directory of
-// a linked worktree whose back-reference names another `.git` file, or a `.git`
-// directory whose commondir names another repository. Git would accept it and
-// make dir a second work tree of that repository, which shows that
-// repository's files here and rewrites its index. Symlinks in the target are
-// resolved first. A separate Git directory names no owner, so Git decides.
+// work tree. That Git directory is one of these:
+//
+//   - the `.git` directory of another work tree;
+//   - the admin directory of a linked worktree whose back-reference names
+//     another `.git` file;
+//   - a `.git` directory whose commondir names another repository.
+//
+// Git would accept it and make dir a second work tree of that repository,
+// which shows that repository's files here and rewrites its index. It
+// resolves the symlinks in the target first. A separate Git directory names no
+// owner, so Git decides.
 func foreignGitDir(dir string) (string, bool) {
 	gitPath := filepath.Join(dir, gitEntryName)
 	info, err := os.Lstat(gitPath)
@@ -535,8 +542,8 @@ type folderBoundaries struct {
 }
 
 // claim reports whether dir, a directory below the walk root, is not content
-// of the walked node: a Git node, a failed node, or a bare repository. It
-// records each such directory. entries is the listing of dir.
+// of the walked node. Such a directory is a Git node, a failed node, or a bare
+// repository. It records each such directory. entries is the listing of dir.
 func (b *folderBoundaries) claim(ctx context.Context, dir string, entries []os.DirEntry) bool {
 	gitEntry, bare := gitListingMarks(dir, entries)
 	// A HEAD file that names no ref and no commit makes a plain folder, as for
@@ -565,8 +572,9 @@ func (b *folderBoundaries) claim(ctx context.Context, dir string, entries []os.D
 	return true
 }
 
-// gitListingMarks reads the Git marks of the listing of dir: a `.git` entry,
-// or the HEAD file and objects and refs directories of a bare repository.
+// gitListingMarks reads the Git marks in the listing of dir. The marks are a
+// `.git` entry, and the HEAD file and objects and refs directories of a bare
+// repository.
 func gitListingMarks(dir string, entries []os.DirEntry) (gitEntry, bare bool) {
 	var head, objects, refs bool
 	for _, entry := range entries {
@@ -584,9 +592,9 @@ func gitListingMarks(dir string, entries []os.DirEntry) (gitEntry, bare bool) {
 	return gitEntry, !gitEntry && head && objects && refs
 }
 
-// validGitHead reports a HEAD file that Git accepts (validate_headref): a
-// symbolic ref below refs/, or a line that starts with an object ID in hex of
-// either case. Text after the ID does not matter.
+// validGitHead reports a HEAD file that Git accepts (validate_headref). Git
+// accepts a symbolic ref below refs/, or a line that starts with an object ID
+// in hex of either case. Text after the ID does not matter.
 func validGitHead(path string) bool {
 	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
 		// An old-style symbolic HEAD.

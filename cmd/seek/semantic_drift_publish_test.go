@@ -7,9 +7,9 @@ import (
 )
 
 // TestDrift_BuildPublishesItsCaptureAndTheNextSearchSeesTheChange changes the
-// working tree while a build runs: the build publishes the captured state and
-// binds its committed vectors, with no second status; the next search
-// captures the change and indexes it.
+// work tree while a build runs. The build publishes the state that it
+// captured and binds its committed vectors, with no second git status. The
+// next search captures the change and indexes it.
 func TestDrift_BuildPublishesItsCaptureAndTheNextSearchSeesTheChange(t *testing.T) {
 	requireTools(t)
 

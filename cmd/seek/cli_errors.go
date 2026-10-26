@@ -166,7 +166,7 @@ func ctagsUserMessage(err *ctagsUnavailableError) (problem, hint string) {
 // reportStaleIndexWarning owns warnings for update failures when a prior index
 // remains usable. A cancellation writes only a debug line. Dirty files kept by
 // name after a read error get one warning with their count, the first path,
-// and the cause. Ctags discovery errors get an actionable normal message.
+// and the cause. A ctags discovery error gets a warning with a hint.
 // Debug output keeps the full typed error and its corpus context.
 func reportStaleIndexWarning(err error) {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

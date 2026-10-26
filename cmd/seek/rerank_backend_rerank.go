@@ -93,8 +93,8 @@ var lateOnTokenizerJSON = sync.OnceValues(func() ([]byte, error) {
 
 // lateOnTokenizers is the process-wide LateOn tokenizer pool: the model and
 // the index build's window split share it. A tokenizer takes tens of
-// milliseconds to build, so a released one serves the next caller, and a
-// caller that finds none free builds one instead of waiting.
+// milliseconds to build, so a released one serves the next caller. A caller
+// that finds none free builds one and does not wait.
 var lateOnTokenizers lateOnTokenizerPool
 
 // lateOnTokenizerPool holds the free tokenizers, and the punctuation IDs of
@@ -468,8 +468,8 @@ func (s *lateOnModel) ScoresWithSemanticQuery(
 	if err != nil {
 		return nil, err
 	}
-	// One encoder call holds one static 128-row batch: the scorer runs
-	// ceil(N/128) calls, at the same time up to the model call limit, so any
+	// One encoder call holds one static batch of 128 rows. The scorer runs
+	// ceil(N/128) calls, up to the model call limit at the same time. So any
 	// number of candidates gets a score.
 	scores := make([]float32, len(documents))
 	group, groupCtx := errgroup.WithContext(ctx)
@@ -562,7 +562,7 @@ var errLateOnModelClosed = errors.New("the semantic model is closed")
 
 func (s *lateOnModel) Close() error {
 	s.closed.Store(true)
-	// Each Once waits for a construction in flight. With none, it stops a
+	// Each Once waits for a construction that runs now. With none, it stops a
 	// later call from building one. So Close reads the encoder fields after
 	// their write. Close writes neither encoder pointer, because a call that
 	// passed the closed check can still read both.
@@ -581,8 +581,8 @@ func (s *lateOnModel) Close() error {
 func newLateOnTokenizer(
 	content []byte,
 ) (*lateOnTokenizer, map[int]struct{}, error) {
-	// Serialized rerank input is at most 16 KiB. This larger tokenizer bound
-	// keeps match-centered truncation under Seek's control.
+	// Serialized rerank input is at most 16 KiB. The tokenizer bound is
+	// larger, so Seek's truncation around the match decides what stays.
 	native, err := tokenizers.FromBytesWithTruncation(
 		content,
 		uint32(maxRerankDocumentBytes*4),
@@ -761,11 +761,12 @@ func packLateOnRows(
 	return inputIDs, attention, masks
 }
 
-// lateOnMaxSimPrepared gives the MaxSim score of each document: for each kept
-// query token, the largest dot product with a kept document token, summed in
-// query token order as a float32. NumKong's exact batched float32 dot products
-// give the dot products of a block of documents and every kept query token in
-// one call. They sum each dot product in float64.
+// lateOnMaxSimPrepared gives the MaxSim score of each document. For each kept
+// query token, it takes the largest dot product with a kept document token. It
+// sums these values in query token order as a float32. NumKong's exact
+// batched float32 dot products give, in one call, the dot products of a block
+// of documents and every kept query token. They sum each dot product in
+// float64.
 func lateOnMaxSimPrepared(
 	query []float32,
 	queryMask []bool,
@@ -844,9 +845,9 @@ func lateOnMaxSimPrepared(
 
 // lateOnRowHasUsableToken reports whether a row (a document or a query
 // window) keeps one masked token with a finite, non-zero vector. A provider
-// fault can return a zero vector. That vector contributes a dot product of
-// zero, which keeps the score finite and hides the fault, so the "no
-// scoreable token" guard of lateOnMaxSimPrepared never sees it.
+// fault can return a zero vector. That vector gives a dot product of zero,
+// which keeps the score finite and hides the fault. So the "no scoreable
+// token" guard of lateOnMaxSimPrepared never sees it.
 func lateOnRowHasUsableToken(documents []float32, document int, mask []bool) bool {
 	for documentToken, keepDocument := range mask {
 		if !keepDocument {
@@ -858,10 +859,10 @@ func lateOnRowHasUsableToken(documents []float32, document int, mask []bool) boo
 		for dimension := range semanticEmbeddingDimensions {
 			value := float64(documents[offset+dimension])
 			if math.IsNaN(value) || math.IsInf(value, 0) {
-				// Keep looking. A later token can still carry the row. In the
+				// Keep looking: a later token can still carry the row. In the
 				// scoring loop of lateOnMaxSimPrepared, a NaN or -Inf dot
-				// product never wins the maximum, and a +Inf one makes the
-				// score not finite, which fails the call.
+				// product never wins the maximum. A +Inf one makes the score
+				// not finite, which fails the call.
 				finite = false
 				break
 			}
@@ -926,10 +927,10 @@ func sanitizeLateOnDocumentInput(
 
 // truncateLateOnDocumentTokens packs one annotated document into limit tokens.
 // The byte offsets refer to the prefixed serialized text. It keeps the model
-// prefix and separator, uses at most one quarter of the content slots for
-// metadata, and centers the remaining evidence on the match. When no token
+// prefix and separator. It uses at most one quarter of the content slots for
+// metadata, and centers the rest of the evidence on the match. When no token
 // overlaps the match, it keeps the start of the body. An invalid annotated
-// layout uses head truncation.
+// layout keeps the head.
 func truncateLateOnDocumentTokens(
 	ids []int,
 	spans []lateOnTokenSpan,
@@ -1008,10 +1009,10 @@ func truncateLateOnDocumentTokens(
 // holds next to the empty document.
 var errLateOnQueryTooLong = errors.New("the query is too long for the model")
 
-// lateOnQueryWindows splits a query into 128-token windows: each window holds
+// lateOnQueryWindows splits a query into 128-token windows. Each window holds
 // CLS, the query prefix, a part of the query tokens, and SEP, so a long query
 // keeps every token. A query that fits gives one window. The windows and the
-// empty document go in one model call (PrepareSemanticQuery), so a query of
+// empty document go in one model call (PrepareSemanticQuery). So a query of
 // more than semanticModelBatchRows - 1 windows fails with
 // errLateOnQueryTooLong.
 func lateOnQueryWindows(tokenizer *lateOnTokenizer, modelQuery string) ([][]int, error) {
@@ -1070,6 +1071,10 @@ func decodeLateOnAsset(compressed []byte) ([]byte, error) {
 	return decoded, nil
 }
 
+// ensureLateOnRuntime installs the ONNX Runtime library of bundle in
+// reranker/<version>/<sha256> of the cache, unless a file with its digest is
+// there. It returns the path, and whether this call wrote the file. It marks
+// the directory as used for GC (touchRuntimeUse).
 func ensureLateOnRuntime(bundle lateOnRuntimeBundle) (string, bool, error) {
 	cacheRoot, err := seekUserCacheRoot()
 	if err != nil {
