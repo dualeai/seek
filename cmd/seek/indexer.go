@@ -264,6 +264,11 @@ func indexBuildOptions(indexDir string, parallelism int) index.Options {
 	// TrigramMax, so the count never decides whether content is searchable. The
 	// cost is index size and build memory for large files with many distinct
 	// non-ASCII trigrams.
+	//
+	// TODO(https://github.com/sourcegraph/zoekt/issues/1204): Zoekt skips a
+	// file whose ctags parse takes more than 1 minute, also with
+	// CTagsMustSucceed, so that file has no symbols. Set a longer timeout once
+	// Zoekt lets callers set it.
 	return index.Options{
 		IndexDir:         indexDir,
 		SizeMax:          int(documentContentLimit),

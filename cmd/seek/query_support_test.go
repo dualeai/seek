@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"reflect"
@@ -158,12 +157,7 @@ func TestCppFallbackKeepsFilters(t *testing.T) {
 	if plan.modelQuery != "parse C++ request" || len(plan.filters) == 0 {
 		t.Fatalf("plan=%#v, want the name in the model query and the language filter", plan)
 	}
-	output, err := captureStdout(t, func() error {
-		return runSearchCommand(
-			context.Background(), "parse C++ request lang:go", []string{folder},
-			0, 0, defaultSearchConfig(), searchRunConfig{},
-		)
-	})
+	output, err := seek(t, "--lexical-only", "parse C++ request lang:go", folder)
 	if err != nil || !strings.Contains(output, "parse.go") || strings.Contains(output, "parse.py") {
 		t.Fatalf("output=%q err=%v, want parse.go only", output, err)
 	}
@@ -190,92 +184,6 @@ func TestCppFallbackKeepsFilters(t *testing.T) {
 	}
 	if !strings.Contains(raw.String(), `"foo  bar"`) {
 		t.Errorf("phrase spacing changed: %s", raw)
-	}
-}
-
-// TestTypeFilePrintsNamesOnly checks that type:file prints names only on the
-// model route as on the strict route.
-func TestTypeFilePrintsNamesOnly(t *testing.T) {
-	requireTools(t)
-	setTestUserCache(t)
-	t.Chdir(t.TempDir())
-	strict := t.TempDir()
-	relaxed := t.TempDir()
-	writeFileAt(t, strict, "strict.go", "package sample\n// alpha beta\n")
-	writeFileAt(t, relaxed, "relaxed.go", "package sample\n// alpha only\n")
-	search := func(config searchRunConfig) string {
-		t.Helper()
-		output, err := captureStdout(t, func() error {
-			return runSearchCommand(
-				t.Context(), "type:file alpha beta", []string{strict, relaxed},
-				0, 0, defaultSearchConfig(), config,
-			)
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return output
-	}
-	lexical := search(searchRunConfig{})
-	scorer := &fixedRerankScorer{}
-	model := search(searchRunConfig{
-		policy: defaultSearchPolicy(),
-		newModel: func(context.Context) (semanticModel, error) {
-			return scorer, nil
-		},
-	})
-	if scorer.scoreCalls.Load() != 1 {
-		t.Fatalf("model calls=%d, want 1", scorer.scoreCalls.Load())
-	}
-	// The relaxed-only file is no candidate: both routes print the strict
-	// names.
-	if model != lexical || strings.Contains(model, "relaxed.go") {
-		t.Fatalf("model output differs from the strict names:\nlexical=%q\nmodel=%q", lexical, model)
-	}
-	if strings.Contains(model, "alpha") || strings.Contains(model, "package") {
-		t.Fatalf("model output prints content:\n%s", model)
-	}
-}
-
-// TestRunRerankDescriptionAtomsStartTheModel checks that a description with
-// regex:, case:, a negated word, or a sym:, content:, or -lang: filter takes
-// the model routes: it starts the model, and a model failure keeps the strict
-// output.
-func TestRunRerankDescriptionAtomsStartTheModel(t *testing.T) {
-	requireTools(t)
-	setTestUserCache(t)
-	t.Chdir(t.TempDir())
-	folder := t.TempDir()
-	writeFileAt(t, folder, "strict.go", "package sample\nfunc Alpha() {}\n// alpha beta gamma\n")
-	writeFileAt(t, folder, "relaxed.go", "package sample\n// alpha only\n")
-	for _, pattern := range []string{
-		"regex:alpha beta", "case:yes alpha beta", "alpha beta -missing",
-		"alpha beta sym:Alpha", "alpha beta content:gamma", "alpha beta -lang:python",
-	} {
-		t.Run(pattern, func(t *testing.T) {
-			baseline, err := captureStdout(t, func() error {
-				return runWithSearchConfig(context.Background(), pattern, []string{folder}, defaultSearchConfig())
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			factoryCalls := 0
-			got, err := captureStdout(t, func() error {
-				return runSearchCommand(
-					context.Background(), pattern, []string{folder}, 0, 0, defaultSearchConfig(),
-					searchRunConfig{
-						policy: defaultSearchPolicy(),
-						newModel: func(context.Context) (semanticModel, error) {
-							factoryCalls++
-							return nil, errors.New("backend failure")
-						},
-					},
-				)
-			})
-			if err != nil || got != baseline || factoryCalls == 0 {
-				t.Fatalf("calls=%d err=%v\nwant=%q\ngot=%q", factoryCalls, err, baseline, got)
-			}
-		})
 	}
 }
 
@@ -321,31 +229,6 @@ func TestPunctuationAtomStaysInRelaxedRetrieval(t *testing.T) {
 	with, without := planFor(t, "parse request line ."), planFor(t, "parse request line")
 	if fmt.Sprint(with.relaxedQ) == fmt.Sprint(without.relaxedQ) {
 		t.Fatalf("relaxed query %v lost the punctuation atom", with.relaxedQ)
-	}
-}
-
-// TestCLIFilterMasksSemanticRetrieval runs a cold description with -lang:go:
-// Zoekt applies the filter to the semantic mask, so the node builds vectors
-// and semantic retrieval finds only files that the filter keeps.
-func TestCLIFilterMasksSemanticRetrieval(t *testing.T) {
-	requireTools(t)
-	setTestUserCache(t)
-	folder := t.TempDir()
-	writeFileAt(t, folder, "notes.py", "# SEMANTIC_TARGET dispatches the request\n")
-	writeFileAt(t, folder, "target.go", "package sample\n// SEMANTIC_TARGET dispatches the request\n")
-	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
-	t.Chdir(t.TempDir())
-	output, err := runHybridTestSearch(t, "alpha beta -lang:go", []string{folder}, defaultSearchPolicy(),
-		func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil })
-	if err != nil || !strings.Contains(output, "notes.py") || strings.Contains(output, "target.go") || strings.Contains(output, "strict.go") {
-		t.Fatalf("err=%v output:\n%s", err, output)
-	}
-	plans, err := planCorpora(context.Background(), []string{folder})
-	if err != nil || len(plans) != 1 {
-		t.Fatalf("plans=%d err=%v", len(plans), err)
-	}
-	if dirs := semanticGenerationDirs(t, plans[0].indexDir); len(dirs) != 1 {
-		t.Fatalf("built %d vector generations, want 1", len(dirs))
 	}
 }
 

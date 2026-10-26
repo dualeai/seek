@@ -84,20 +84,20 @@ func TestDuplicateCollapseRepresentative(t *testing.T) {
 
 // TestAcceptanceIsPerFile scores the same relevant file inside a pool of 128
 // and of 4,096 candidates: the verdict for that file is the same, because
-// each model-added file is accepted on its own score. A strict file is
-// accepted with a score of 0.
+// each model-added file is accepted on its own lift above the empty-document
+// score. A strict file is accepted with a score of 0.
 func TestAcceptanceIsPerFile(t *testing.T) {
-	const tauFile = 0.6
+	const tokens, emptyScore = 4, 3
 	verdict := func(poolSize int) bool {
 		scored := make(nodeHits, poolSize)
 		scores := make([]float32, poolSize)
 		for index := range scored {
 			scored[index] = nodeHit{corpus: "c", path: fmt.Sprintf("noise%05d.go", index), semantic: true}
-			scores[index] = 0.3 * 4
+			scores[index] = emptyScore + (pipelineTauFile-0.1)*tokens
 		}
 		scored[poolSize/2] = nodeHit{corpus: "c", path: "relevant.go", semantic: true}
-		scores[poolSize/2] = 0.61 * 4
-		accepted, err := acceptFiles(scored, scores, 4, tauFile, nil)
+		scores[poolSize/2] = emptyScore + (pipelineTauFile+0.01)*tokens
+		accepted, err := acceptFiles(scored, scores, emptyScore, tokens, pipelineTauFile, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -108,7 +108,7 @@ func TestAcceptanceIsPerFile(t *testing.T) {
 		t.Fatal("the relevant file's verdict depends on the pool size")
 	}
 	strict := nodeHits{{corpus: "c", path: "strict.go", strict: true}}
-	accepted, err := acceptFiles(strict, []float32{0}, 4, tauFile, nil)
+	accepted, err := acceptFiles(strict, []float32{0}, emptyScore, tokens, pipelineTauFile, nil)
 	if err != nil || len(accepted.hits) != 1 {
 		t.Fatalf("a strict all-word file was not admitted: %+v %v", accepted, err)
 	}

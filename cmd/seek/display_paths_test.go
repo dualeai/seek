@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,19 +11,16 @@ import (
 )
 
 // searchHeaders runs query on operands from the cwd and returns the output
-// and its file headers.
+// and the path of each result header, in print order.
 func searchHeaders(t *testing.T, query string, operands ...string) (string, []string) {
 	t.Helper()
-	out, err := captureStdout(t, func() error { return run(context.Background(), query, operands) })
+	out, err := seek(t, slices.Concat([]string{"--lexical-only", query}, operands)...)
 	if err != nil && err != errNoMatch {
 		t.Fatalf("run %q %v: %v", query, operands, err)
 	}
 	var headers []string
-	for line := range strings.Lines(out) {
-		if header, ok := strings.CutPrefix(strings.TrimSpace(line), "## "); ok {
-			name, _, _ := strings.Cut(header, " (")
-			headers = append(headers, name)
-		}
+	for _, result := range printedResults(out) {
+		headers = append(headers, result.path)
 	}
 	return out, headers
 }
@@ -73,25 +69,27 @@ func TestRunSubfolderHeaderIsCwdRelative(t *testing.T) {
 }
 
 // TestSemanticFileFilterIsSearchRootRelative runs a description with a
-// search-root file: filter: semantic retrieval reads the same path rule, so
-// only gitA files answer, the semantic-only target among them.
+// search-root file: filter. The test model accepts every row, so the printed
+// set is the set of rows that the filter keeps: semantic retrieval reads the
+// same path rule, so exactly the files of gitA answer.
 func TestSemanticFileFilterIsSearchRootRelative(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
 	for _, name := range []string{"gitA", "gitB"} {
 		repo := f.GitRepo("multi/"+name, "README.md", "readme\n")
-		writeFixtureFile(t, filepath.Join(repo, "net/retry.go"), "package net\n// SEMANTIC_TARGET backs off between tries\n")
+		writeFixtureFile(t, filepath.Join(repo, "net/retry.go"), "package net\n// backs off between tries\n")
 		gitRunIn(t, repo, "add", ".")
 		gitRunIn(t, repo, "commit", "-q", "-m", "retry")
 	}
 	setTestUserCache(t)
 	t.Chdir(f.path("multi"))
-	output, scorer, err := describe(t, "retry with exponential backoff file:gitA/", ".")
+	output, scorer, err := stubSearch(t, payloadAccept, "retry with exponential backoff file:gitA/", ".")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if scorer.embedCalls.Load() == 0 || !strings.Contains(output, "## gitA/net/retry.go") || strings.Contains(output, "gitB") {
-		t.Fatalf("want the semantic target of gitA only (embeds=%d):\n%s", scorer.embedCalls.Load(), output)
+	if got := headerPaths(output); scorer.embedCalls.Load() == 0 ||
+		!slices.Equal(got, []string{"gitA/README.md", "gitA/net/retry.go"}) {
+		t.Fatalf("headers=%v (embeds=%d), want the files of gitA only:\n%s", got, scorer.embedCalls.Load(), output)
 	}
 }
 

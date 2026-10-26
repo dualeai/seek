@@ -737,7 +737,7 @@ func TestNativeDeltaOnADamagedRecordBuildsInFull(t *testing.T) {
 			t.Chdir(repo)
 			search := func(query string) string {
 				t.Helper()
-				output, err := runHybridTestSearch(t, query, nil, lexicalOnlySearchPolicy(), nil)
+				output, err := seek(t, "--lexical-only", query)
 				if err != nil {
 					t.Fatalf("%s: %v\n%s", query, err, output)
 				}

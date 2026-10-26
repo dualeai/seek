@@ -157,7 +157,7 @@ func TestCancelDuringKeptDeltaKeepsChanges(t *testing.T) {
 		return realLstat(path)
 	}
 	old := runtime.GOMAXPROCS(1)
-	_, _ = captureStdout(t, func() error { return run(ctx, "zqcancel", []string{repo}) })
+	_, _ = captureStdout(t, func() error { return seekRoot(ctx, t, nil, "--lexical-only", "zqcancel", repo) })
 	runtime.GOMAXPROCS(old)
 	dirtyLstat = realLstat
 	hook.set(false)

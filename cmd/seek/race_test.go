@@ -343,9 +343,11 @@ func TestFix_ConcurrentSearchDuringCommittedSwap(t *testing.T) {
 
 // TestDescriptionReadDuringRepublish_Stress runs description reads in 8
 // readers while commits republish the committed family, one publish per
-// commit. Every read must find the strict hit, a committed file. A read that
-// binds vectors binds the base and the overlay of one state, so it finds both
-// scan hits; most reads meet a peer's build and read text only, with neither.
+// commit. Every read must find the strict hit, a committed file. The test
+// model makes every row a scan hit, so target.go and dirty.go, which hold no
+// query word, are the scan hits of the base and the overlay. A read that binds
+// vectors binds the base and the overlay of one state, so it finds both scan
+// hits; most reads meet a peer's build and read text only, with neither.
 // A read that sees the state move (errGitIndexStateChanged) is counted, not
 // failed. The swaps stay open for 20 ms, so a read that does not wait for the
 // publish lock meets the torn family. The test fails when no swap ran or no
@@ -354,12 +356,10 @@ func TestFix_ConcurrentSearchDuringCommittedSwap(t *testing.T) {
 func TestDescriptionReadDuringRepublish_Stress(t *testing.T) {
 	requireTools(t)
 	dir := initGitRepo(t, "stable.go", "package main\n// zqstress anchor committed\n")
-	writeTrackedFile(t, dir, "target.go", "package main\n// SEMANTIC_TARGET committed\n")
-	writeFileAt(t, dir, "dirty.go", "package main\n// SEMANTIC_TARGET dirty\n")
+	writeTrackedFile(t, dir, "target.go", "package main\n// committed\n")
+	writeFileAt(t, dir, "dirty.go", "package main\n// dirty\n")
 	paths, plan := planGitTestCorpus(t, dir)
-	execution := testSemanticSearchExecution(t, func(context.Context) (semanticModel, error) {
-		return &hybridTestScorer{}, nil
-	})
+	execution := testSemanticSearchExecution(t, modelFactory(&hybridTestScorer{mode: payloadAccept}))
 	qp, err := planQuery("zqstress anchor file:go", defaultSearchPolicy())
 	if err != nil || qp.model == nil || len(qp.model.filters) == 0 {
 		t.Fatalf("the query must plan a filtered model route: err=%v", err)
@@ -536,7 +536,7 @@ func TestEvictionDuringBuildPerKind(t *testing.T) {
 			}
 			search := func() (string, error) {
 				t.Helper()
-				return captureStdout(t, func() error { return run(t.Context(), "zqevict", []string{root}) })
+				return seek(t, "--lexical-only", "zqevict", root)
 			}
 			if _, err := search(); err != nil {
 				t.Fatal(err)

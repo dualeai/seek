@@ -80,7 +80,7 @@ func TestCacheBudgetStopsBeforeBuild(t *testing.T) {
 	setTestUserCache(t)
 	t.Setenv(envCacheBudget, "1K")
 
-	err := run(context.Background(), "zqbudgetmarker", []string{f.path("folder")})
+	err := seekRoot(context.Background(), t, nil, "--lexical-only", "zqbudgetmarker", f.path("folder"))
 	if _, ok := errors.AsType[*cacheBudgetError](err); !ok {
 		t.Fatalf("err=%v, want a cache budget error", err)
 	}
@@ -205,9 +205,6 @@ func budgetGitKind(t *testing.T, dir, kind string) {
 	}
 }
 
-// budgetModel gives the descriptive searches of these tests a test scorer.
-func budgetModel(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil }
-
 // TestCacheBudgetCountsVectorBuild warms a node with a lexical search, then
 // sets the budget just above its size: the first descriptive search would
 // add vectors (for a dirty Git node the commit's generation and the overlay,
@@ -222,7 +219,7 @@ func TestCacheBudgetCountsVectorBuild(t *testing.T) {
 			budgetFolder(t, root)
 			budgetGitKind(t, root, kind)
 			t.Chdir(t.TempDir())
-			if _, err := runHybridTestSearch(t, "alpha beta", []string{root}, lexicalOnlySearchPolicy(), nil); err != nil {
+			if _, err := seek(t, "--lexical-only", "alpha beta", root); err != nil {
 				t.Fatal(err)
 			}
 			plans, err := planCorpora(context.Background(), []string{root})
@@ -230,7 +227,7 @@ func TestCacheBudgetCountsVectorBuild(t *testing.T) {
 				t.Fatalf("plans=%d err=%v", len(plans), err)
 			}
 			t.Setenv(envCacheBudget, strconv.FormatInt(corpusDirSize(plans[0].cacheDir)+1<<10, 10))
-			_, err = runHybridTestSearch(t, "alpha beta", []string{root}, defaultSearchPolicy(), budgetModel)
+			_, _, err = stubSearch(t, payloadFar, "alpha beta", root)
 			budgetErr, ok := errors.AsType[*cacheBudgetError](err)
 			if !ok {
 				t.Fatalf("err=%v, want a cache budget error", err)
@@ -255,12 +252,12 @@ func TestCacheLedgerMatchesDirAfterVectorBind(t *testing.T) {
 	folder := t.TempDir()
 	budgetFolder(t, folder)
 	t.Chdir(t.TempDir())
-	if _, err := runHybridTestSearch(t, "alpha beta", []string{folder}, lexicalOnlySearchPolicy(), nil); err != nil {
+	if _, err := seek(t, "--lexical-only", "alpha beta", folder); err != nil {
 		t.Fatal(err)
 	}
 	// The vector bind and the ledger can fall in one mtime tick.
 	time.Sleep(20 * time.Millisecond)
-	if _, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(), budgetModel); err != nil {
+	if _, _, err := stubSearch(t, payloadFar, "alpha beta", folder); err != nil {
 		t.Fatal(err)
 	}
 	plans, err := planCorpora(context.Background(), []string{folder})
@@ -323,7 +320,7 @@ func TestCacheBudgetCountsCommittedChangeAfterHeadMove(t *testing.T) {
 	}
 	t.Setenv(envCacheBudget, strconv.FormatInt(corpusDirSize(plans[0].cacheDir)+64<<10, 10))
 	gitRunIn(t, repo, "checkout", "-q", "big")
-	err = run(context.Background(), "zqheadmovemarker", []string{repo})
+	err = seekRoot(context.Background(), t, nil, "--lexical-only", "zqheadmovemarker", repo)
 	if _, ok := errors.AsType[*cacheBudgetError](err); !ok {
 		t.Fatalf("err=%v, want a cache budget error", err)
 	}
@@ -431,13 +428,12 @@ func TestCacheBudgetStopNamesTextSearchWhenItFits(t *testing.T) {
 	}
 	t.Chdir(t.TempDir())
 	t.Setenv(envCacheBudget, "60K")
-	_, err := runHybridTestSearch(t, "Foo1", []string{folder}, defaultSearchPolicy(),
-		func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil })
+	_, _, err := stubSearch(t, payloadFar, "Foo1", folder)
 	if budgetErr, ok := errors.AsType[*cacheBudgetError](err); !ok || !budgetErr.textFits ||
 		!strings.Contains(formatCLIError(err), "--lexical-only") {
 		t.Fatalf("err=%v, want a budget stop whose hint names --lexical-only", err)
 	}
-	if _, err := runHybridTestSearch(t, "Foo1", []string{folder}, lexicalOnlySearchPolicy(), nil); err != nil {
+	if _, err := seek(t, "--lexical-only", "Foo1", folder); err != nil {
 		t.Fatalf("the text search the hint names failed: %v", err)
 	}
 }
@@ -457,12 +453,11 @@ func TestCacheBudgetHintFollowsTheTextSearch(t *testing.T) {
 	}
 	t.Chdir(t.TempDir())
 	describe := func() error {
-		_, err := runHybridTestSearch(t, "Foo1", []string{folder}, defaultSearchPolicy(),
-			func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil })
+		_, _, err := stubSearch(t, payloadFar, "Foo1", folder)
 		return err
 	}
 	lexical := func() error {
-		_, err := runHybridTestSearch(t, "Foo1", []string{folder}, lexicalOnlySearchPolicy(), nil)
+		_, err := seek(t, "--lexical-only", "Foo1", folder)
 		return err
 	}
 	t.Setenv(envCacheBudget, "4K")
@@ -544,7 +539,7 @@ func TestFolderReaderTransientErrorDoesNotPublish(t *testing.T) {
 		}
 		return realOpen(path)
 	}
-	err := run(context.Background(), "zqtransientmarker", []string{f.path("folder")})
+	err := seekRoot(context.Background(), t, nil, "--lexical-only", "zqtransientmarker", f.path("folder"))
 	folderOpenFile = realOpen
 	// EMFILE is no property of the node: the command ends.
 	if !errors.Is(err, syscall.EMFILE) {
@@ -574,9 +569,7 @@ func gitInitCommitAll(t *testing.T, dir string) {
 // budgetSearchFiles runs a search and counts the files that it prints.
 func budgetSearchFiles(t *testing.T, marker string, operands ...string) int {
 	t.Helper()
-	out, err := captureStdout(t, func() error {
-		return run(context.Background(), marker, operands)
-	})
+	out, err := seek(t, slices.Concat([]string{"--lexical-only", marker}, operands)...)
 	if err != nil {
 		t.Fatalf("run %q: %v\n%s", operands, err, out)
 	}
@@ -593,11 +586,11 @@ func TestCacheBudgetCleanAgainAfterDirtyBuildFits(t *testing.T) {
 	budgetFolder(t, root)
 	gitInitCommitAll(t, root)
 	t.Chdir(t.TempDir())
-	if _, err := runHybridTestSearch(t, "alpha beta", []string{root}, defaultSearchPolicy(), budgetModel); err != nil {
+	if _, _, err := stubSearch(t, payloadFar, "alpha beta", root); err != nil {
 		t.Fatal(err)
 	}
 	writeFileAt(t, root, "strict.go", "package sample\n// alpha beta dirty\n")
-	if _, err := runHybridTestSearch(t, "alpha beta", []string{root}, defaultSearchPolicy(), budgetModel); err != nil {
+	if _, _, err := stubSearch(t, payloadFar, "alpha beta", root); err != nil {
 		t.Fatal(err)
 	}
 	gitRunIn(t, root, "checkout", "--", "strict.go")
@@ -606,7 +599,7 @@ func TestCacheBudgetCleanAgainAfterDirtyBuildFits(t *testing.T) {
 		t.Fatalf("plans=%d err=%v", len(plans), err)
 	}
 	t.Setenv(envCacheBudget, strconv.FormatInt(corpusDirSize(plans[0].cacheDir)+1<<10, 10))
-	if _, err := runHybridTestSearch(t, "alpha beta", []string{root}, defaultSearchPolicy(), budgetModel); err != nil {
+	if _, _, err := stubSearch(t, payloadFar, "alpha beta", root); err != nil {
 		t.Fatalf("the clean search stopped: %v", err)
 	}
 }
@@ -635,7 +628,7 @@ func TestCacheBudgetCountsDirtyAndFolderDelta(t *testing.T) {
 			}
 			t.Setenv(envCacheBudget, strconv.FormatInt(corpusDirSize(plans[0].cacheDir)+64<<10, 10))
 			writeFileAt(t, root, "big.txt", text)
-			err = run(context.Background(), "zqdeltamarker", []string{root})
+			err = seekRoot(context.Background(), t, nil, "--lexical-only", "zqdeltamarker", root)
 			if _, ok := errors.AsType[*cacheBudgetError](err); !ok {
 				t.Fatalf("err=%v, want a cache budget error", err)
 			}
@@ -687,7 +680,7 @@ func TestFolderReaderTransientErrorOnWarmFolder(t *testing.T) {
 	folder := t.TempDir()
 	budgetFolder(t, folder)
 	t.Chdir(t.TempDir())
-	if _, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(), budgetModel); err != nil {
+	if _, _, err := stubSearch(t, payloadFar, "alpha beta", folder); err != nil {
 		t.Fatal(err)
 	}
 	plans, err := planCorpora(context.Background(), []string{folder})
@@ -704,7 +697,7 @@ func TestFolderReaderTransientErrorOnWarmFolder(t *testing.T) {
 		return realOpen(path)
 	}
 	// A warm folder whose update fails serves its old index with a warning.
-	_, _ = runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(), budgetModel)
+	_, _, _ = stubSearch(t, payloadFar, "alpha beta", folder)
 	folderOpenFile = realOpen
 	if state := readStateFile(plans[0].cacheDir); state != before {
 		t.Fatalf("the failed build published state %q", state)
@@ -712,7 +705,7 @@ func TestFolderReaderTransientErrorOnWarmFolder(t *testing.T) {
 	if descriptor, err := readJoinedGeneration(plans[0].cacheDir); err == nil && descriptor.State != before {
 		t.Fatalf("the failed build bound vectors for state %q", descriptor.State)
 	}
-	out, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(), budgetModel)
+	out, _, err := stubSearch(t, payloadFar, "alpha beta", folder)
 	if err != nil || !strings.Contains(out, "zqwarmtransient") {
 		t.Fatalf("the next search: err=%v\n%s", err, out)
 	}
@@ -737,7 +730,7 @@ func TestDirtyReaderTransientErrorDoesNotPublish(t *testing.T) {
 		}
 		return realOpen(path)
 	}
-	err := run(context.Background(), "zqdirtytransient", []string{repo})
+	err := seekRoot(context.Background(), t, nil, "--lexical-only", "zqdirtytransient", repo)
 	dirtyOpenFile = realOpen
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("err=%v, want the committed family served", err)
@@ -786,7 +779,10 @@ func TestDirtyFileReadAgainAfterChmod(t *testing.T) {
 
 // TestDirtyDirectoryReplacedByFile replaces a tracked directory with a file of
 // the same name: Lstat of the deleted file gives ENOTDIR, which is a path
-// that is gone, not a read error, so both routes keep every dirty file.
+// that is gone, not a read error, so both routes keep every dirty file. The
+// description runs with a model that accepts every row, so it prints each
+// file that has vectors: the new file docs, the edited keep.txt and the clean
+// clean.txt.
 func TestDirtyDirectoryReplacedByFile(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -808,9 +804,9 @@ func TestDirtyDirectoryReplacedByFile(t *testing.T) {
 	if !slices.Equal(headers, []string{"clean.txt", "docs", "keep.txt"}) {
 		t.Fatalf("strict headers=%v", headers)
 	}
-	output, _, err := describe(t, "zqnotdir now file", ".")
-	if err != nil || !strings.Contains(output, "## docs") {
-		t.Fatalf("description: err=%v\n%s", err, output)
+	output, _, err := stubSearch(t, payloadAccept, "zqnotdir now file", ".")
+	if got := headerPaths(output); err != nil || !slices.Equal(got, []string{"clean.txt", "docs", "keep.txt"}) {
+		t.Fatalf("description: err=%v, headers %v, want clean.txt, docs and keep.txt:\n%s", err, got, output)
 	}
 	for _, record := range recorder.Records() {
 		t.Errorf("warning: %s", record.Message)
@@ -820,7 +816,11 @@ func TestDirtyDirectoryReplacedByFile(t *testing.T) {
 // TestDirtyReadErrorKeepsTheLiveFamily makes the read of one changed dirty
 // file fail with EIO: the build applies every other change and keeps that
 // file by name, so both routes show the other dirty files with the warning,
-// the notice counts the file, and the next search reads the change.
+// the notice counts the file, and the next search reads the change. The
+// description runs with a model that accepts every row, so a vector row of
+// the old b.txt would print. The vector build stops at the read error: no
+// vectors bind the state, the description prints exactly the other files, and
+// the next description embeds the change of b.txt.
 func TestDirtyReadErrorKeepsTheLiveFamily(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -857,13 +857,27 @@ func TestDirtyReadErrorKeepsTheLiveFamily(t *testing.T) {
 		dirtyOpenFile = realOpen
 		t.Fatalf("strict search during the failure %v, want the other files and b.txt by name:\n%s", got, out)
 	}
-	output, _, err := describe(t, "zqlive alpha beta", ".")
+	output, _, err := stubSearch(t, payloadAccept, "zqlive alpha beta", ".")
 	dirtyOpenFile = realOpen
-	if err != nil || !strings.Contains(output, "## a.txt") || !strings.Contains(output, "## u.txt") {
-		t.Fatalf("description during the failure: err=%v\n%s", err, output)
+	if got := headerPaths(output); err != nil || !slices.Equal(got, []string{"a.txt", "c.txt", "u.txt"}) ||
+		strings.Contains(output, "zqlive first") || !strings.Contains(output, nameOnlyNoticeLine(1)) {
+		t.Fatalf("description during the failure printed %v, want a.txt, c.txt and u.txt with the notice: err=%v\n%s", got, err, output)
+	}
+	plans, err := planCorpora(t.Context(), []string{repo})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%d err=%v", len(plans), err)
+	}
+	if _, err := os.Lstat(filepath.Join(plans[0].cacheDir, joinedGenerationFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the failed vector build bound vectors (err=%v)", err)
 	}
 	if output, _ := searchHeaders(t, "zqlive changed", "."); !strings.Contains(output, "## b.txt") {
 		t.Fatalf("the next search misses the change:\n%s", output)
+	}
+	_, scorer, err := stubSearch(t, payloadAccept, "zqlive alpha beta", ".")
+	scorer.mu.Lock()
+	defer scorer.mu.Unlock()
+	if err != nil || !slices.Contains(scorer.embeddedPaths, "b.txt") {
+		t.Fatalf("the next description embedded %v, want the change of b.txt (err=%v)", scorer.embeddedPaths, err)
 	}
 }
 
@@ -1081,7 +1095,7 @@ func TestCacheBudgetEstimatesAnOrphanBranch(t *testing.T) {
 	root := t.TempDir()
 	budgetFolder(t, root)
 	gitInitCommitAll(t, root)
-	if _, err := runHybridTestSearch(t, "alpha beta", []string{root}, lexicalOnlySearchPolicy(), nil); err != nil {
+	if _, err := seek(t, "--lexical-only", "alpha beta", root); err != nil {
 		t.Fatal(err)
 	}
 	gitRunIn(t, root, "checkout", "-q", "--orphan", "fresh")
@@ -1107,7 +1121,7 @@ func TestCacheBudgetCountsOnlyVectorsForACurrentTextIndex(t *testing.T) {
 	budgetFolder(t, root)
 	gitInitCommitAll(t, root)
 	writeFileAt(t, root, "strict.go", "package sample\n// alpha beta dirty\n")
-	if _, err := runHybridTestSearch(t, "alpha beta", []string{root}, lexicalOnlySearchPolicy(), nil); err != nil {
+	if _, err := seek(t, "--lexical-only", "alpha beta", root); err != nil {
 		t.Fatal(err)
 	}
 	plans, err := planCorpora(t.Context(), []string{root})
@@ -1141,7 +1155,7 @@ func TestCacheBudgetCountsVectorsBehindTheTextIndex(t *testing.T) {
 			root := t.TempDir()
 			budgetFolder(t, root)
 			budgetGitKind(t, root, kind)
-			if _, err := runHybridTestSearch(t, "alpha beta", []string{root}, defaultSearchPolicy(), budgetModel); err != nil {
+			if _, _, err := stubSearch(t, payloadFar, "alpha beta", root); err != nil {
 				t.Fatal(err)
 			}
 			added := "package sample\n// alpha " + strings.Repeat("vectorless words ", 9000) + "\n"
@@ -1150,7 +1164,7 @@ func TestCacheBudgetCountsVectorsBehindTheTextIndex(t *testing.T) {
 				gitRunIn(t, root, "add", "added.go")
 				gitRunIn(t, root, "commit", "-q", "-m", "add")
 			}
-			if _, err := runHybridTestSearch(t, "alpha beta", []string{root}, lexicalOnlySearchPolicy(), nil); err != nil {
+			if _, err := seek(t, "--lexical-only", "alpha beta", root); err != nil {
 				t.Fatal(err)
 			}
 			plans, err := planCorpora(t.Context(), []string{root})
@@ -1187,7 +1201,7 @@ func TestCacheBudgetCountsTheChangedFilesOfABoundFolder(t *testing.T) {
 	setTestUserCache(t)
 	root := t.TempDir()
 	budgetFolder(t, root)
-	if _, err := runHybridTestSearch(t, "alpha beta", []string{root}, defaultSearchPolicy(), budgetModel); err != nil {
+	if _, _, err := stubSearch(t, payloadFar, "alpha beta", root); err != nil {
 		t.Fatal(err)
 	}
 	const edit = "package sample\n// alpha beta edited\n"
@@ -1219,7 +1233,7 @@ func TestCacheBudgetCountsACommitAfterTheVectors(t *testing.T) {
 	root := t.TempDir()
 	budgetFolder(t, root)
 	gitInitCommitAll(t, root)
-	if _, err := runHybridTestSearch(t, "alpha beta", []string{root}, defaultSearchPolicy(), budgetModel); err != nil {
+	if _, _, err := stubSearch(t, payloadFar, "alpha beta", root); err != nil {
 		t.Fatal(err)
 	}
 	added := "package sample\n// alpha " + strings.Repeat("committed words ", 900) + "\n"

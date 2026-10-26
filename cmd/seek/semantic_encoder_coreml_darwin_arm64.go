@@ -419,10 +419,8 @@ func cachedLateOnProviderVerdict(model []byte) string {
 // version and build enter the cache key only, through lateOnHostOSBuild, so a
 // system update makes this measure again rather than deciding the answer.
 //
-// Agreement does not always write "trusted". A fault already on the record is
-// carried forward with its original timestamp, because a provider that passes
-// this batch and fails on real work must still be able to reach a demotion, and
-// restamping would restart the expiry window on every probe.
+// Agreement does not always write "trusted": lateOnProbeVerdict gives the
+// record to store.
 func verifyLateOnAcceleratedProvider(
 	ctx context.Context,
 	pool *lateOnStaticRowEncoder,
@@ -492,26 +490,7 @@ func verifyLateOnAcceleratedProvider(
 	if closeErr != nil {
 		return true, "", fmt.Errorf("release the reference session: %w", closeErr)
 	}
-	verdict := lateOnVerdictRejected
-	reason := difference
-	if agree {
-		verdict = lateOnVerdictTrusted
-		reason = "matches the CPU provider"
-		if prior.faults > 0 {
-			// Keep the count. Clearing it here is what would stop a provider
-			// that passes this batch and fails real work from ever being
-			// demoted. Keep the original timestamp. Restamping it here would
-			// restart the window on every passing probe, so the count would
-			// never expire and this host would probe on every search for ever.
-			verdict = fmt.Sprintf(
-				"%s %d %d",
-				lateOnVerdictRecheck,
-				prior.faults,
-				prior.at,
-			)
-			reason = "matches the CPU provider after an earlier fault"
-		}
-	}
+	verdict, reason := lateOnProbeVerdict(agree, difference, prior)
 	writeLateOnProviderVerdict(verdictPath, verdict)
 	// Release the probe's own garbage now. The index build samples free memory
 	// to size its inference concurrency, and it samples after this returns, so
@@ -520,6 +499,33 @@ func verifyLateOnAcceleratedProvider(
 	// already cost a session build and two inferences.
 	runtime.GC()
 	return agree, reason, nil
+}
+
+// lateOnProbeVerdict gives the record that the provider probe stores, and the
+// reason to log, from the probe result and the record on disk before the
+// write. It reads and writes nothing, so a test can check the rule on every
+// host that builds this file, whatever the probe result on that host.
+//
+// Disagreement rejects the provider, and the difference is the reason.
+// Agreement with no fault on the record trusts it. Agreement after a fault
+// keeps the count: clearing it would stop a provider that passes the probe
+// batch and fails on real work from ever being demoted. It also keeps the
+// original timestamp: restamping would restart the window on every passing
+// probe, so the count would never expire and this host would probe on every
+// search.
+func lateOnProbeVerdict(
+	agree bool,
+	difference string,
+	prior lateOnProviderRecord,
+) (verdict, reason string) {
+	if !agree {
+		return lateOnVerdictRejected, difference
+	}
+	if prior.faults > 0 {
+		return fmt.Sprintf("%s %d %d", lateOnVerdictRecheck, prior.faults, prior.at),
+			"matches the CPU provider after an earlier fault"
+	}
+	return lateOnVerdictTrusted, "matches the CPU provider"
 }
 
 // writeLateOnProviderVerdict stores the verdict beside the compiled model. A

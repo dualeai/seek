@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -164,7 +165,7 @@ func TestFailureClasses(t *testing.T) {
 				}
 			}
 			setTestUserCache(t)
-			err := run(context.Background(), "a", []string{tc.operand})
+			err := seekRoot(context.Background(), t, nil, "--lexical-only", "a", tc.operand)
 			if err == nil {
 				t.Fatal("search succeeded, want an error")
 			}
@@ -338,9 +339,7 @@ func TestFailureClasses(t *testing.T) {
 			operands, failed := tc.setup(t, f)
 			setTestUserCache(t)
 			logs := captureTestLogs(t, slog.LevelWarn)
-			out, err := captureStdout(t, func() error {
-				return run(context.Background(), nodeMarker, operands)
-			})
+			out, err := seek(t, slices.Concat([]string{"--lexical-only", nodeMarker}, operands)...)
 			wantCode := 1
 			if len(tc.found) > 0 {
 				wantCode = 0
@@ -401,7 +400,7 @@ func TestFailureClasses(t *testing.T) {
 			setTestUserCache(t)
 			tc.setup(t, f)
 			logs := captureTestLogs(t, slog.LevelWarn)
-			err := run(context.Background(), nodeMarker, []string{f.path("one"), repo})
+			err := seekRoot(context.Background(), t, nil, "--lexical-only", nodeMarker, f.path("one"), repo)
 			if exitCodeForError(err) != 2 || !strings.Contains(formatCLIError(err), tc.want) {
 				t.Fatalf("err=%v, want exit 2 with %q", err, tc.want)
 			}
@@ -530,9 +529,7 @@ func TestOperandBelowAStrayGitEntryStaysInItsRepository(t *testing.T) {
 			tc.stray(t, filepath.Join(repo, "sub"))
 			setTestUserCache(t)
 			logs := captureTestLogs(t, slog.LevelWarn)
-			out, err := captureStdout(t, func() error {
-				return run(context.Background(), marker, []string{filepath.Join(repo, "sub")})
-			})
+			out, err := seek(t, "--lexical-only", marker, filepath.Join(repo, "sub"))
 			if err != nil || !strings.Contains(out, "tracked.txt") || strings.Contains(out, "secret.env") || len(logs.Records()) != 0 {
 				t.Fatalf("err=%v warnings=%v, want the tracked file and no ignored file:\n%s", err, logs.Records(), out)
 			}

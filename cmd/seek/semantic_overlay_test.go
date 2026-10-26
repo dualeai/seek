@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -9,30 +10,41 @@ import (
 	"testing"
 )
 
-// TestRunDirtySearchOverlay edits a committed file to drop its meaning and
-// adds an untracked file with it: vector retrieval reads the work tree, so
-// the untracked file answers as [uncommitted], the edited file does not, and
-// only the two dirty files embed.
+// TestRunDirtySearchOverlay commits a.go, then edits it and adds an
+// untracked b.go. The test model accepts every row, so the printed set is the
+// set of files whose rows the search binds. Vector retrieval reads the work
+// tree: after the edit, a.go answers with its new text and not the committed
+// text, b.go answers as [uncommitted], and only the two dirty files embed.
+// The base rows of a dirty file are no candidate: a committed row would not
+// match the work-tree copy, and the search would report index damage.
 func TestRunDirtySearchOverlay(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
-	repo := f.GitRepo("repo", "a.go", "package a\n// SEMANTIC_TARGET handles the request\n")
+	repo := f.GitRepo("repo", "a.go", "package a\n// handles the request\n")
 	writeFixtureFile(t, filepath.Join(repo, "keep.go"), "package a\n// alpha beta keep\n")
 	gitRunIn(t, repo, "add", ".")
 	gitRunIn(t, repo, "commit", "-q", "-m", "keep")
 	setTestUserCache(t)
 	t.Chdir(repo)
-	if output, _, err := describe(t, "alpha beta", "."); err != nil || !strings.Contains(output, "## a.go") {
-		t.Fatalf("committed search: err=%v\n%s", err, output)
+	output, _, err := stubSearch(t, payloadAccept, "alpha beta", ".")
+	if got := headerPaths(output); err != nil || !slices.Equal(got, []string{"a.go", "keep.go"}) {
+		t.Fatalf("committed search: err=%v headers=%v, want [a.go keep.go]:\n%s", err, got, output)
 	}
 	writeFixtureFile(t, filepath.Join(repo, "a.go"), "package a\n// nothing to see\n")
-	writeFixtureFile(t, filepath.Join(repo, "b.go"), "package b\n// SEMANTIC_TARGET dispatches the call\n")
-	output, scorer, err := describe(t, "alpha beta", ".")
+	writeFixtureFile(t, filepath.Join(repo, "b.go"), "package b\n// dispatches the call\n")
+	logs := captureTestLogs(t, slog.LevelWarn)
+	output, scorer, err := stubSearch(t, payloadAccept, "alpha beta", ".")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output, "## b.go (Go) [uncommitted]") || strings.Contains(output, "## a.go") {
-		t.Fatalf("want the untracked semantic target and not the edited file:\n%s", output)
+	if shards, vectors, skips, _ := repairWarnings(logs, 0); shards+vectors+skips != 0 {
+		t.Fatalf("the dirty search reported damage: shard repairs=%d vector repairs=%d skips=%d, want none",
+			shards, vectors, skips)
+	}
+	if got := headerPaths(output); !slices.Equal(got, []string{"a.go", "b.go", "keep.go"}) ||
+		!strings.Contains(output, "## b.go (Go) [uncommitted]") || strings.Contains(output, "handles the request") {
+		t.Fatalf("headers=%v, want [a.go b.go keep.go] with b.go [uncommitted] and no committed text of a.go:\n%s",
+			got, output)
 	}
 	scorer.mu.Lock()
 	embedded := slices.Clone(scorer.embeddedPaths)
@@ -42,28 +54,32 @@ func TestRunDirtySearchOverlay(t *testing.T) {
 		t.Fatalf("embedded %v, want only the dirty files a.go and b.go", embedded)
 	}
 	// The same dirty tree again embeds nothing.
-	if _, scorer, err = describe(t, "alpha beta", "."); err != nil || scorer.embedCalls.Load() != 0 {
+	if _, scorer, err = stubSearch(t, payloadAccept, "alpha beta", "."); err != nil || scorer.embedCalls.Load() != 0 {
 		t.Fatalf("an unchanged dirty tree embedded %d batches (err=%v)", scorer.embedCalls.Load(), err)
 	}
 }
 
 // TestNoHeadRepoUsesVectors searches a repository with no commit: its
-// overlay holds every file, so a semantic-only file answers.
+// overlay holds every file, so with a test model that accepts every row, both
+// files answer as [uncommitted], target.go from its rows only.
 func TestNoHeadRepoUsesVectors(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
 	repo := f.path("fresh")
 	gitRunIn(t, f.root, "init", "-q", repo)
-	writeFixtureFile(t, filepath.Join(repo, "target.go"), "package fresh\n// SEMANTIC_TARGET routes the request\n")
+	writeFixtureFile(t, filepath.Join(repo, "target.go"), "package fresh\n// routes the request\n")
 	writeFixtureFile(t, filepath.Join(repo, "other.go"), "package fresh\n// alpha beta other\n")
 	setTestUserCache(t)
 	t.Chdir(repo)
-	output, scorer, err := describe(t, "alpha beta", ".")
+	output, scorer, err := stubSearch(t, payloadAccept, "alpha beta", ".")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if scorer.embedCalls.Load() == 0 || !strings.Contains(output, "## target.go (Go) [uncommitted]") {
-		t.Fatalf("want the semantic-only file of a repository with no commit (embeds=%d):\n%s", scorer.embedCalls.Load(), output)
+	if got := headerPaths(output); scorer.embedCalls.Load() == 0 || !slices.Equal(got, []string{"other.go", "target.go"}) ||
+		!strings.Contains(output, "## other.go (Go) [uncommitted]") ||
+		!strings.Contains(output, "## target.go (Go) [uncommitted]") {
+		t.Fatalf("headers=%v (embeds=%d), want other.go and target.go, both [uncommitted]:\n%s",
+			got, scorer.embedCalls.Load(), output)
 	}
 }
 
@@ -78,7 +94,7 @@ func TestOverlayStoreBoundedUnderRepeatedSaves(t *testing.T) {
 	t.Chdir(repo)
 	for save := range 3 {
 		writeFixtureFile(t, filepath.Join(repo, "a.go"), "package a\n// alpha beta save "+strings.Repeat("x", save+1)+"\n")
-		if _, _, err := describe(t, "alpha beta", "."); err != nil {
+		if _, _, err := stubSearch(t, payloadFar, "alpha beta", "."); err != nil {
 			t.Fatalf("save %d: %v", save, err)
 		}
 	}
@@ -102,16 +118,18 @@ func TestOverlayStoreBoundedUnderRepeatedSaves(t *testing.T) {
 }
 
 // TestOverlayDamageRepairs appends one byte to the overlay rows: the search
-// that finds the damage clears the descriptor, so a later search rebuilds the
-// overlay and the untracked file answers again.
+// that finds the damage clears the descriptor, so a later search embeds the
+// untracked file again and it answers again. The test model accepts every
+// row, so u.go, which holds no query word, prints exactly when the search
+// binds its overlay rows.
 func TestOverlayDamageRepairs(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
 	repo := f.GitRepo("repo", "a.go", "package a\n// alpha beta committed\n")
-	writeFixtureFile(t, filepath.Join(repo, "u.go"), "package u\n// SEMANTIC_TARGET routes the request\n")
+	writeFixtureFile(t, filepath.Join(repo, "u.go"), "package u\n// routes the request\n")
 	setTestUserCache(t)
 	t.Chdir(repo)
-	if output, _, err := describe(t, "alpha beta", "."); err != nil || !strings.Contains(output, "## u.go (Go) [uncommitted]") {
+	if output, _, err := stubSearch(t, payloadAccept, "alpha beta", "."); err != nil || !strings.Contains(output, "## u.go (Go) [uncommitted]") {
 		t.Fatalf("first search: err=%v\n%s", err, output)
 	}
 	plans, err := planCorpora(t.Context(), []string{"."})
@@ -130,9 +148,13 @@ func TestOverlayDamageRepairs(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = rows.Close()
-	_, _, _ = describe(t, "alpha beta", ".")
-	if output, _, err := describe(t, "alpha beta", "."); err != nil || !strings.Contains(output, "## u.go (Go) [uncommitted]") {
-		t.Fatalf("the overlay was not repaired: err=%v\n%s", err, output)
+	_, _, _ = stubSearch(t, payloadAccept, "alpha beta", ".")
+	output, scorer, err := stubSearch(t, payloadAccept, "alpha beta", ".")
+	scorer.mu.Lock()
+	embedded := slices.Contains(scorer.embeddedPaths, "u.go")
+	scorer.mu.Unlock()
+	if err != nil || !embedded || !strings.Contains(output, "## u.go (Go) [uncommitted]") {
+		t.Fatalf("the overlay was not repaired: err=%v embedded u.go=%t\n%s", err, embedded, output)
 	}
 }
 
@@ -155,7 +177,7 @@ func TestOverlayColdBuildReusesTheStagedBase(t *testing.T) {
 		}
 		setTestUserCache(t)
 		t.Chdir(repo)
-		_, scorer, err := describe(t, "alpha beta", ".")
+		_, scorer, err := stubSearch(t, payloadFar, "alpha beta", ".")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -177,15 +199,16 @@ func TestOverlayColdBuildReusesTheStagedBase(t *testing.T) {
 }
 
 // TestOverlayHasNoUSearchGraph builds an overlay: it holds no USearch shard,
-// and its search still finds the untracked file.
+// and its search still finds the untracked file, which holds no query word,
+// with a test model that accepts every row.
 func TestOverlayHasNoUSearchGraph(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
 	repo := f.GitRepo("repo", "a.go", "package a\n// alpha beta committed\n")
-	writeFixtureFile(t, filepath.Join(repo, "u.go"), "package u\n// SEMANTIC_TARGET routes the request\n")
+	writeFixtureFile(t, filepath.Join(repo, "u.go"), "package u\n// routes the request\n")
 	setTestUserCache(t)
 	t.Chdir(repo)
-	if output, _, err := describe(t, "alpha beta", "."); err != nil || !strings.Contains(output, "## u.go (Go) [uncommitted]") {
+	if output, _, err := stubSearch(t, payloadAccept, "alpha beta", "."); err != nil || !strings.Contains(output, "## u.go (Go) [uncommitted]") {
 		t.Fatalf("err=%v\n%s", err, output)
 	}
 	plans, err := planCorpora(t.Context(), []string{"."})

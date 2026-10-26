@@ -24,9 +24,7 @@ func TestDrift_BuildPublishesItsCaptureAndTheNextSearchSeesTheChange(t *testing.
 			return semanticVector{1: 1}
 		},
 	}
-	execution := testSemanticSearchExecution(t, func(context.Context) (semanticModel, error) {
-		return scorer, nil
-	})
+	execution := testSemanticSearchExecution(t, modelFactory(scorer))
 	state := mustGitRepoStateIn(t, ctx, repo)
 	if _, err := (&gitNode{paths: paths}).refreshState(ctx, plan, state, execution); err != nil {
 		t.Fatal(err)

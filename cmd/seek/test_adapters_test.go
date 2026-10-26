@@ -18,32 +18,6 @@ import (
 // results in.
 var testGitCorpusPlan = node{id: "test-git", kind: corpusKindGit}
 
-// run is a test adapter for runSearchCommand. It searches pathOperands with
-// no file or match limit, the default search config, and the zero run config:
-// lexical only, with no model.
-func run(ctx context.Context, pattern string, pathOperands []string) error {
-	return runSearchCommand(
-		ctx,
-		pattern,
-		pathOperands,
-		0,
-		0,
-		defaultSearchConfig(),
-		searchRunConfig{},
-	)
-}
-
-// runWithSearchConfig is a test adapter for runSearchCommand. It is the same
-// as run, but it uses config.
-func runWithSearchConfig(
-	ctx context.Context,
-	pattern string,
-	pathOperands []string,
-	config searchConfig,
-) error {
-	return runSearchCommand(ctx, pattern, pathOperands, 0, 0, config, searchRunConfig{})
-}
-
 // runGCCommand is a test adapter for the gc command (newGCCmd). It runs the
 // command with args, writes its output to os.Stdout, and discards its error
 // output: the caller reads the returned error.

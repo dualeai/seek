@@ -391,39 +391,64 @@ func (s *lateOnModel) PrepareSemanticQuery(
 		return nil, err
 	}
 	windows, encodeErr := lateOnQueryWindows(tokenizer, modelQuery)
+	// The empty document goes through the scorer's own tokenizer path, so its
+	// row is the row that ScoresWithSemanticQuery encodes for it.
+	var emptyIDs, emptyAttention []int64
+	var emptyMasks [][]bool
+	if encodeErr == nil {
+		emptyIDs, emptyAttention, emptyMasks, encodeErr = tokenizeLateOnDocuments(
+			tokenizer,
+			s.punctuation,
+			[]rerankDocument{{}},
+		)
+	}
 	lateOnTokenizers.release(tokenizer)
 	if encodeErr != nil {
 		return nil, encodeErr
 	}
 	inputIDs, attention, masks := packLateOnRows(windows, nil, true)
+	// The static batch always runs semanticModelBatchRows rows, so the empty
+	// document in the row after the last window costs no model call.
+	inputIDs = append(inputIDs, emptyIDs...)
+	attention = append(attention, emptyAttention...)
+	scoreMask := make([]bool, 0, len(masks)*lateOnSequenceLength)
+	for _, mask := range masks {
+		scoreMask = append(scoreMask, mask...)
+	}
 	encoder, err := s.semanticRowEncoder(ctx, true)
 	if err != nil {
 		return nil, err
 	}
-	var embeddings []float32
-	err = encoder.Run(ctx, inputIDs, attention, len(windows), func(output []float32) error {
-		embeddings = append([]float32(nil), output...)
+	var tokens []float32
+	var emptyScore float32
+	err = encoder.Run(ctx, inputIDs, attention, len(windows)+1, func(output []float32) error {
+		queryValues := len(windows) * lateOnSequenceLength * semanticEmbeddingDimensions
+		tokens = append([]float32(nil), output[:queryValues]...)
+		for window, mask := range masks {
+			// The same provider fault that zeroes a document row can zero a
+			// query row. A zero query gives every candidate a finite score of
+			// 0, which no later guard can tell apart from a genuine miss.
+			if !lateOnRowHasUsableToken(tokens, window, mask) {
+				return fmt.Errorf(
+					"%w: LateOn query has no usable token vector",
+					errDegenerateSemanticVector,
+				)
+			}
+		}
+		scores, scoreErr := lateOnMaxSimPrepared(tokens, scoreMask, output[queryValues:], emptyMasks)
+		if scoreErr != nil {
+			return fmt.Errorf("score the empty LateOn document: %w", scoreErr)
+		}
+		emptyScore = scores[0]
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	scoreMask := make([]bool, 0, len(masks)*lateOnSequenceLength)
-	for window, mask := range masks {
-		// The same provider fault that zeroes a document row can zero a query
-		// row. A zero query gives every candidate a finite score of 0, which no
-		// later guard can tell apart from a genuine miss.
-		if !lateOnRowHasUsableToken(embeddings, window, mask) {
-			return nil, fmt.Errorf(
-				"%w: LateOn query has no usable token vector",
-				errDegenerateSemanticVector,
-			)
-		}
-		scoreMask = append(scoreMask, mask...)
-	}
 	return &semanticQueryEmbedding{
-		tokens:     embeddings,
+		tokens:     tokens,
 		scoreMask:  scoreMask,
+		emptyScore: emptyScore,
 		modelQuery: modelQuery,
 	}, nil
 }
@@ -979,11 +1004,16 @@ func truncateLateOnDocumentTokens(
 	return out
 }
 
+// errLateOnQueryTooLong reports a query with more windows than one model call
+// holds next to the empty document.
+var errLateOnQueryTooLong = errors.New("the query is too long for the model")
+
 // lateOnQueryWindows splits a query into 128-token windows: each window holds
 // CLS, the query prefix, a part of the query tokens, and SEP, so a long query
-// keeps every token. A query that fits gives one window. The windows go in
-// one model call, so a query of more than semanticModelBatchRows windows
-// fails.
+// keeps every token. A query that fits gives one window. The windows and the
+// empty document go in one model call (PrepareSemanticQuery), so a query of
+// more than semanticModelBatchRows - 1 windows fails with
+// errLateOnQueryTooLong.
 func lateOnQueryWindows(tokenizer *lateOnTokenizer, modelQuery string) ([][]int, error) {
 	encoded, _, err := tokenizer.encode(lateOnQueryPrefix+modelQuery, true, false)
 	if err != nil {
@@ -998,6 +1028,10 @@ func lateOnQueryWindows(tokenizer *lateOnTokenizer, modelQuery string) ([][]int,
 	}
 	body := encoded[head : len(encoded)-1]
 	room := lateOnSequenceLength - head - 1
+	if count := (len(body) + room - 1) / room; count > semanticModelBatchRows-1 {
+		return nil, fmt.Errorf("%w: %d windows, the limit is %d",
+			errLateOnQueryTooLong, count, semanticModelBatchRows-1)
+	}
 	var windows [][]int
 	for start := 0; start < len(body); start += room {
 		window := make([]int, 0, lateOnSequenceLength)

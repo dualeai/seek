@@ -49,7 +49,7 @@ func TestNodeIdentityIgnoresTypedPath(t *testing.T) {
 			{".", filepath.Join(upper, "sub")},
 		} {
 			t.Chdir(repo)
-			if err := run(context.Background(), "sub", operands); err != nil {
+			if err := seekRoot(context.Background(), t, nil, slices.Concat([]string{"--lexical-only", "sub"}, operands)...); err != nil {
 				t.Fatalf("mixed-case operands %q of one repository: %v", operands, err)
 			}
 		}
@@ -73,9 +73,7 @@ func assertNodeIdentityOnce(t *testing.T, marker string, operands ...string) {
 			t.Fatalf("operands %q got corpus IDs %q and %q, want one ID", operands, id, got)
 		}
 	}
-	out, err := captureStdout(t, func() error {
-		return run(context.Background(), marker, operands)
-	})
+	out, err := seek(t, slices.Concat([]string{"--lexical-only", marker}, operands)...)
 	if err != nil {
 		t.Fatalf("run: %v\n%s", err, out)
 	}

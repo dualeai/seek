@@ -357,21 +357,21 @@ func TestWindowHeaderMatchesScorerDocument(t *testing.T) {
 // TestScorerDocumentsNameTheModelPathBase searches a folder with a strict hit
 // and a vector-only hit, and a Git repository: every document that the final
 // scorer reads names the base that the rows' windows name, the folder's
-// absolute path, and none for the Git node.
+// absolute path, and none for the Git node. The test model accepts every row,
+// so semantic.go, which holds no query word, reaches the scorer from its rows.
 func TestScorerDocumentsNameTheModelPathBase(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
 	folder := t.TempDir()
 	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
-	writeFileAt(t, folder, "semantic.go", "package sample\n// SEMANTIC_TARGET dispatches a request\n")
+	writeFileAt(t, folder, "semantic.go", "package sample\n// dispatches a request\n")
 	repo := initGitRepo(t, "strict.go", "package sample\n// alpha beta\n")
 	for operand, want := range map[string]string{
 		folder: filepath.ToSlash(canonicalCorpusPath(folder)),
 		repo:   "",
 	} {
-		scorer := &hybridTestScorer{}
-		if _, err := runHybridTestSearch(t, "alpha beta", []string{operand}, defaultSearchPolicy(),
-			func(context.Context) (semanticModel, error) { return scorer, nil }); err != nil {
+		_, scorer, err := stubSearch(t, payloadAccept, "alpha beta", operand)
+		if err != nil {
 			t.Fatal(err)
 		}
 		scorer.mu.Lock()

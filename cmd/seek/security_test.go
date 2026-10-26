@@ -35,9 +35,7 @@ func TestSearchRunsNoRepoConfiguredCommands(t *testing.T) {
 	trace := filepath.Join(t.TempDir(), "trace")
 	t.Setenv("GIT_TRACE", trace)
 
-	out, err := captureStdout(t, func() error {
-		return run(context.Background(), marker, []string{f.root})
-	})
+	out, err := seek(t, "--lexical-only", marker, f.root)
 	if err != nil {
 		t.Fatalf("run: %v\n%s", err, out)
 	}
@@ -125,7 +123,7 @@ func TestFilterDriverReadFailureFailsClosed(t *testing.T) {
 	setTestUserCache(t)
 
 	logs := captureTestLogs(t, slog.LevelWarn)
-	err = run(context.Background(), marker, []string{repo})
+	err = seekRoot(context.Background(), t, nil, "--lexical-only", marker, repo)
 	if !errors.Is(err, errNoMatch) || !logsMention(logs.Records(), "forced-config-failure") {
 		t.Fatalf("err=%v warnings=%v, want the driver-list read failure", err, logs.Records())
 	}
@@ -218,9 +216,7 @@ func TestLinkedWorktreeRunsNoRepoConfiguredCommands(t *testing.T) {
 	gitRunIn(t, repo, "worktree", "add", "-q", worktree)
 	f.makeStatDirty(worktree, string(vectorCleanFilter)+".txt")
 	setTestUserCache(t)
-	out, err := captureStdout(t, func() error {
-		return run(context.Background(), marker, []string{worktree})
-	})
+	out, err := seek(t, "--lexical-only", marker, worktree)
 	if err != nil {
 		t.Fatalf("run: %v\n%s", err, out)
 	}
@@ -245,9 +241,7 @@ func TestWorktreeConfigDriverStaysOff(t *testing.T) {
 	gitRunIn(t, repo, "config", "--worktree", "filter.wtpwn.clean", f.markerScript("worktreeConfig"))
 	f.makeStatDirty(repo, file)
 	setTestUserCache(t)
-	out, err := captureStdout(t, func() error {
-		return run(context.Background(), marker, []string{repo})
-	})
+	out, err := seek(t, "--lexical-only", marker, repo)
 	if err != nil {
 		t.Fatalf("run: %v\n%s", err, out)
 	}

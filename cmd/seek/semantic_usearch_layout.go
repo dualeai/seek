@@ -43,10 +43,6 @@ const (
 	semanticUSearchCutAnchorDivisor = 32
 )
 
-// semanticUSearchShardRowsTestHook, when it is not 0, is the shard size of
-// every build. Tests set it to get the same shards on every host.
-var semanticUSearchShardRowsTestHook uint64
-
 // semanticUSearchShardRowsFor gives the shard size of a generation of rows
 // rows on cpus CPUs: the largest power of two from 256 to 4,096 that is at
 // most rows / cpus. So a small generation builds its graphs on all CPUs: one
@@ -121,9 +117,7 @@ type semanticUSearchShardPlanner struct {
 }
 
 func newSemanticUSearchShardPlanner(cpus int) *semanticUSearchShardPlanner {
-	return &semanticUSearchShardPlanner{
-		cpus: max(1, cpus), size: semanticUSearchShardRowsTestHook, hash: sha256.New(),
-	}
+	return &semanticUSearchShardPlanner{cpus: max(1, cpus), hash: sha256.New()}
 }
 
 // addFile reads the rows of one file, which must follow the rows of the

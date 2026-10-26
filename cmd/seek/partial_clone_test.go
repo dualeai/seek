@@ -22,9 +22,7 @@ func TestPartialCloneIndexesWithoutFetch(t *testing.T) {
 	t.Setenv("GIT_TRACE", trace)
 	logs := captureTestLogs(t, slog.LevelWarn)
 
-	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "file:missing", []string{clone})
-	})
+	out, err := seek(t, "--lexical-only", "file:missing", clone)
 	if err != nil {
 		t.Fatalf("run: %v\n%s", err, out)
 	}
@@ -49,10 +47,8 @@ func TestPartialCloneWarnsOncePerCommand(t *testing.T) {
 	requireTools(t)
 	clone := newPartialClone(t)
 	logs := captureTestLogs(t, slog.LevelWarn)
-	scorer := &hybridTestScorer{}
-	if _, err := runHybridTestSearch(t, "zqpartialmarker kept", []string{clone}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
-		return scorer, nil
-	}); err != nil {
+	_, scorer, err := stubSearch(t, payloadFar, "zqpartialmarker kept", clone)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if scorer.embedCalls.Load() == 0 {
@@ -80,7 +76,7 @@ func TestPartialCloneNeedsNoLazyFetchGit(t *testing.T) {
 	t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	logs := captureTestLogs(t, slog.LevelWarn)
-	err = run(context.Background(), "zqpartialmarker", []string{clone})
+	err = seekRoot(context.Background(), t, nil, "--lexical-only", "zqpartialmarker", clone)
 	if !errors.Is(err, errNoMatch) || !logsMention(logs.Records(), "a partial clone needs Git 2.45 or later") {
 		t.Fatalf("err=%v warnings=%v, want the partial-clone version warning", err, logs.Records())
 	}
@@ -97,9 +93,7 @@ func TestPartialCloneNeedsNoLazyFetchGit(t *testing.T) {
 	// Found below a folder seed, the clone is a child node: one warning, and
 	// the search goes on without it.
 	logs = captureTestLogs(t, slog.LevelWarn)
-	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "zqpartialmarker", []string{filepath.Dir(clone)})
-	})
+	out, err := seek(t, "--lexical-only", "zqpartialmarker", filepath.Dir(clone))
 	if err != nil {
 		t.Fatalf("run: %v\n%s", err, out)
 	}
@@ -120,12 +114,10 @@ func TestPartialCloneBlobArrivesLater(t *testing.T) {
 	clone := newPartialClone(t, "far/still.txt")
 	source := filepath.Join(filepath.Dir(clone), "source")
 	scorer := &hybridTestScorer{}
-	newModel := func(context.Context) (semanticModel, error) { return scorer, nil }
+	newModel := modelFactory(scorer)
 	lexical := func(t *testing.T) string {
 		t.Helper()
-		out, err := captureStdout(t, func() error {
-			return run(context.Background(), "zqpartialmarker", []string{clone})
-		})
+		out, err := seek(t, "--lexical-only", "zqpartialmarker", clone)
 		if err != nil {
 			t.Fatalf("run: %v\n%s", err, out)
 		}
@@ -144,7 +136,7 @@ func TestPartialCloneBlobArrivesLater(t *testing.T) {
 		return strings.Count(string(data), "built-in: git cat-file")
 	}
 	describe := func() {
-		if _, err := runHybridTestSearch(t, "zqpartialmarker missing", []string{clone}, defaultSearchPolicy(), newModel); err != nil && !errors.Is(err, errNoMatch) {
+		if _, err := seekWith(t, newModel, "zqpartialmarker missing", clone); err != nil && !errors.Is(err, errNoMatch) {
 			t.Fatal(err)
 		}
 	}
@@ -246,9 +238,7 @@ func TestPartialCloneBlobArrivesDuringDelta(t *testing.T) {
 	source := filepath.Join(filepath.Dir(clone), "source")
 	lexical := func() string {
 		t.Helper()
-		out, err := captureStdout(t, func() error {
-			return run(context.Background(), "zqpartialmarker", []string{clone})
-		})
+		out, err := seek(t, "--lexical-only", "zqpartialmarker", clone)
 		if err != nil {
 			t.Fatalf("run: %v\n%s", err, out)
 		}
@@ -277,10 +267,10 @@ func TestPartialCloneSemanticPublishStops(t *testing.T) {
 	requireTools(t)
 	clone := newPartialClone(t)
 	scorer := &hybridTestScorer{}
-	newModel := func(context.Context) (semanticModel, error) { return scorer, nil }
+	newModel := modelFactory(scorer)
 	describe := func() {
 		t.Helper()
-		if _, err := runHybridTestSearch(t, "zqpartialmarker missing", []string{clone}, defaultSearchPolicy(), newModel); err != nil && !errors.Is(err, errNoMatch) {
+		if _, err := seekWith(t, newModel, "zqpartialmarker missing", clone); err != nil && !errors.Is(err, errNoMatch) {
 			t.Fatal(err)
 		}
 	}

@@ -263,9 +263,7 @@ func TestWarmSearchReadsNoCommittedState(t *testing.T) {
 	setTestUserCache(t)
 	t.Chdir(dir)
 	search := func() (string, error) {
-		return captureStdout(t, func() error {
-			return run(context.Background(), "warm_state_marker", nil)
-		})
+		return seek(t, "--lexical-only", "warm_state_marker")
 	}
 	if out, err := search(); err != nil {
 		t.Fatalf("cold search: %v\n%s", err, out)

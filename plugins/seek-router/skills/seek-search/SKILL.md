@@ -52,6 +52,9 @@ matches. Filters and paths apply to both. The results are approximate: a
 result can contain none of the query words, and no result (exit code 1) does
 not prove that the code is absent.
 
+Write a description of three to six words: a shorter one adds few files by
+meaning, and a longer one can add none.
+
 The first search of a large repository builds its indexes and can take tens of
 seconds. `--lexical-only` skips the model.
 

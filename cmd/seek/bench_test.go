@@ -2623,13 +2623,13 @@ func BenchmarkDetectGitBoundary_LinkedWorktreeBackref(b *testing.B) {
 }
 
 // BenchmarkManyShardGit_WarmSearch times warm searches of one Git node with
-// at least 8 shards through runSearchCommand, the entry point of a command,
-// with the benchmark model (benchmarkNodeModel). Each case query gives the
-// model text, so each case runs the model stages, also the cases named
-// Strict. Each search loads every shard of the node, so the time of a case
-// grows with the number of shard loads per node read. The body calls only
-// runSearchCommand, so a change inside the node read does not change the
-// benchmark.
+// at least 8 shards through runSearchCommand, the entry point of a command.
+// It times Seek's stages with a model that runs no inference
+// (benchmarkNodeModel). Each case query gives the model text, so each case
+// runs the model stages, also the cases named Strict. Each search loads every
+// shard of the node, so the time of a case grows with the number of shard
+// loads per node read. The body calls only runSearchCommand, so a change
+// inside the node read does not change the benchmark.
 func BenchmarkManyShardGit_WarmSearch(b *testing.B) {
 	requireTools(b)
 	setTestUserCache(b)
@@ -2637,11 +2637,12 @@ func BenchmarkManyShardGit_WarmSearch(b *testing.B) {
 	repo := initEmptyGitRepoNoRemote(b)
 	writeBenchmarkNodeFiles(b, repo, "pkg", 1024)
 	writeFileAt(b, repo, "pkg/f0517_marker.go", "package pkg\n\n// zqselectivebenchmarker\n")
-	// The benchmark model finds these files by vector only: they hold no
-	// query word, so a case that finds them also runs the relaxed query. The
-	// names match the file:pkg/f00 filter of the last case.
+	// The benchmark model puts these files near the query, by their names:
+	// they hold no query word, so a case that finds them also runs the
+	// relaxed query. The names match the file:pkg/f00 filter of the last
+	// case.
 	for i := range 64 {
-		writeFileAt(b, repo, fmt.Sprintf("pkg/f00s%02d.go", i), fmt.Sprintf("package pkg\n\n// SEMANTIC_TARGET vector-only file %d\n", i))
+		writeFileAt(b, repo, fmt.Sprintf("pkg/f00s%02d.go", i), fmt.Sprintf("package pkg\n\n// vector-only file %d\n", i))
 	}
 	gitRunIn(b, repo, "add", ".")
 	gitRunIn(b, repo, "commit", "-q", "-m", "fixture")
@@ -2687,8 +2688,9 @@ func BenchmarkManyShardGit_WarmSearch(b *testing.B) {
 
 // BenchmarkMultiNode_WarmSearch times warm searches with no path operand in a
 // folder that holds two Git repositories: three nodes (the folder and the two
-// repositories), which searchNodes reads at the same time. Both case queries
-// give the model text, so both cases run the model stages.
+// repositories), which searchNodes reads at the same time. It times Seek's
+// stages with a model that runs no inference (benchmarkNodeModel). Both case
+// queries give the model text, so both cases run the model stages.
 func BenchmarkMultiNode_WarmSearch(b *testing.B) {
 	requireTools(b)
 	setTestUserCache(b)
@@ -2742,12 +2744,14 @@ func mustRunBenchmarkSearch(b *testing.B, query string, operands []string) {
 
 // benchmarkNodeModel is the test model with one vector per file, so USearch's
 // graph has distinct points (equal vectors give a degenerate graph that finds
-// nothing). A file with SEMANTIC_TARGET lies near the query; the others lie
-// far from it.
+// nothing). It times Seek's stages with a model that runs no inference.
+// BenchmarkCLIProcess times a warm description search with the bundled model.
+// The files whose path starts with pkg/f00s lie near the query, and the
+// others lie far from it. The model accepts every document that it scores.
 func benchmarkNodeModel(context.Context) (semanticModel, error) {
-	return &hybridTestScorer{vectorForUnit: func(unit semanticUnit) semanticVector {
+	return &hybridTestScorer{mode: payloadAccept, vectorForUnit: func(unit semanticUnit) semanticVector {
 		var vector semanticVector
-		if strings.Contains(string(unit.text), "SEMANTIC_TARGET") {
+		if strings.HasPrefix(unit.path, "pkg/f00s") {
 			vector[0] = 1
 		} else {
 			vector[1] = 1

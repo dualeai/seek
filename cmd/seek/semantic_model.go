@@ -17,11 +17,18 @@ const (
 
 // semanticQueryEmbedding holds the token vectors of one query model call: one
 // or more 128-token query windows, row after row, so a long query keeps every
-// token (up to semanticModelBatchRows windows). The token vectors drive both
-// USearch and LateOn MaxSim.
+// token (up to semanticModelBatchRows - 1 windows, because the last row of the
+// call holds the empty document). The token vectors drive both USearch and
+// LateOn MaxSim.
 type semanticQueryEmbedding struct {
-	tokens     []float32
-	scoreMask  []bool
+	tokens    []float32
+	scoreMask []bool
+	// emptyScore is the raw MaxSim score of the query against a document with
+	// no text: the document prefix and the separator only. Every document row
+	// starts with this prefix and ends with this separator, so the value is
+	// approximately the part of a score that the query gets from any document,
+	// whatever its text.
+	emptyScore float32
 	modelQuery string
 }
 

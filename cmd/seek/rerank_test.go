@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -15,61 +14,6 @@ import (
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/query"
 )
-
-type fixedRerankScorer struct {
-	scores            []float32
-	err               error
-	closed            *bool
-	documents         *[]rerankDocument
-	activeQueryTokens int
-	scoreCalls        atomic.Int32
-}
-
-func (*fixedRerankScorer) EmbedSemanticUnits(
-	context.Context,
-	[]semanticUnit,
-) ([]semanticUnitEmbedding, error) {
-	return nil, errRerankUnavailable
-}
-
-func (s *fixedRerankScorer) PrepareSemanticQuery(
-	_ context.Context,
-	query string,
-) (*semanticQueryEmbedding, error) {
-	mask := make([]bool, lateOnSequenceLength)
-	for index := range max(1, s.activeQueryTokens) {
-		mask[index] = true
-	}
-	return &semanticQueryEmbedding{
-		tokens:     make([]float32, lateOnSequenceLength*semanticEmbeddingDimensions),
-		modelQuery: query,
-		scoreMask:  mask,
-	}, nil
-}
-
-func (s *fixedRerankScorer) ScoresWithSemanticQuery(
-	_ context.Context,
-	_ *semanticQueryEmbedding,
-	documents []rerankDocument,
-) ([]float32, error) {
-	s.scoreCalls.Add(1)
-	if s.documents != nil {
-		*s.documents = append([]rerankDocument(nil), documents...)
-	}
-	if s.scores == nil {
-		return make([]float32, len(documents)), s.err
-	}
-	return append([]float32(nil), s.scores...), s.err
-}
-
-func (*fixedRerankScorer) SemanticCallCPUs(context.Context) int { return 1 }
-
-func (s *fixedRerankScorer) Close() error {
-	if s.closed != nil {
-		*s.closed = true
-	}
-	return nil
-}
 
 func TestPlanRerankQuery(t *testing.T) {
 	raw, _, err := parseSearchQueryForms("Handle shell completion")
@@ -320,8 +264,8 @@ func TestPlanRerankQueryEveryShapeUsesTheModel(t *testing.T) {
 // TestPlanRerankQueryKeepsZoektFiltersOutOfModelText plans descriptions with
 // filters other than a positive lang: or file: (a negated language, sym:,
 // content:, repo:, and an or group): the model reads only the description,
-// and the plan keeps each filter for the per-node Zoekt mask,
-// which applies it to semantic retrieval (TestCLIFilterMasksSemanticRetrieval,
+// and the plan keeps each filter for the per-node Zoekt mask, which applies
+// it to semantic retrieval (TestLanguageFilterKeepsTheVectorHitsOfThatLanguage,
 // TestPassThroughAtomMasksSemantic).
 func TestPlanRerankQueryKeepsZoektFiltersOutOfModelText(t *testing.T) {
 	for _, pattern := range []string{
@@ -389,9 +333,9 @@ func TestRerankModelSearchConfigClearsDisplayLimitsAndAddsInternalContext(t *tes
 }
 
 // TestRunRerankAcceptanceWithoutStrictResults searches two folders where no
-// file holds both words and no vector exists: a relaxed match alone is a rank
-// signal, not a candidate, so the search has no match and the model
-// scores nothing.
+// file holds both words: a relaxed match alone is a rank signal, not a
+// candidate, so the search has no match and the model scores nothing. The
+// build fails on purpose, so no vector exists.
 func TestRunRerankAcceptanceWithoutStrictResults(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -400,11 +344,8 @@ func TestRunRerankAcceptanceWithoutStrictResults(t *testing.T) {
 	beta := t.TempDir()
 	writeFileAt(t, alpha, "alpha.go", "package sample\n// alpha only\n")
 	writeFileAt(t, beta, "beta.go", "package sample\n// beta only\n")
-	scorer := &fixedRerankScorer{scores: []float32{1, 0}}
-	output, err := captureStdout(t, func() error {
-		return runSearchCommand(t.Context(), "alpha beta", []string{alpha, beta}, 0, 0, defaultSearchConfig(),
-			searchRunConfig{policy: defaultSearchPolicy(), newModel: func(context.Context) (semanticModel, error) { return scorer, nil }})
-	})
+	scorer := &hybridTestScorer{embedErr: errRerankUnavailable}
+	output, err := seekWith(t, modelFactory(scorer), "alpha beta", alpha, beta)
 	if !errors.Is(err, errNoMatch) || output != "" || scorer.scoreCalls.Load() != 0 {
 		t.Fatalf("output=%q err=%v model calls=%d, want no match and no model call", output, err, scorer.scoreCalls.Load())
 	}
@@ -412,7 +353,8 @@ func TestRunRerankAcceptanceWithoutStrictResults(t *testing.T) {
 
 // TestRunRerankStrictEvidenceContract searches a strict all-word file and a
 // relaxed-only file: the strict file is admitted and model-scored, the
-// relaxed-only file is no candidate.
+// relaxed-only file is no candidate. The build fails on purpose, so no vector
+// exists.
 func TestRunRerankStrictEvidenceContract(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -421,17 +363,13 @@ func TestRunRerankStrictEvidenceContract(t *testing.T) {
 	relaxed := t.TempDir()
 	writeFileAt(t, strict, "strict.go", "package sample\n// alpha beta\n")
 	writeFileAt(t, relaxed, "relaxed.go", "package sample\n// alpha only\n")
-	var documents []rerankDocument
-	scorer := &fixedRerankScorer{documents: &documents}
-	output, err := captureStdout(t, func() error {
-		return runSearchCommand(t.Context(), "alpha beta", []string{strict, relaxed}, 0, 0, defaultSearchConfig(),
-			searchRunConfig{policy: defaultSearchPolicy(), newModel: func(context.Context) (semanticModel, error) { return scorer, nil }})
-	})
+	scorer := &hybridTestScorer{embedErr: errRerankUnavailable}
+	output, err := seekWith(t, modelFactory(scorer), "alpha beta", strict, relaxed)
 	if err != nil || !strings.Contains(output, "strict.go") || strings.Contains(output, "relaxed.go") {
 		t.Fatalf("output=%q err=%v, want strict.go only", output, err)
 	}
-	if scorer.scoreCalls.Load() != 1 || len(documents) != 1 {
-		t.Fatalf("model calls=%d documents=%d, want one call with the strict file", scorer.scoreCalls.Load(), len(documents))
+	if scorer.scoreCalls.Load() != 1 || len(scorer.documents) != 1 {
+		t.Fatalf("model calls=%d documents=%d, want one call with the strict file", scorer.scoreCalls.Load(), len(scorer.documents))
 	}
 }
 
@@ -626,162 +564,28 @@ func TestRankCorpusResultsForDisplayHonorsOverride(t *testing.T) {
 	}
 }
 
-func TestRunRerankFallbackContracts(t *testing.T) {
-	requireTools(t)
-	setTestUserCache(t)
-	t.Chdir(t.TempDir())
-	folder := t.TempDir()
-	writeFileAt(t, folder, "strict.go", "package strict\n// alpha beta\n")
-	writeFileAt(t, folder, "relaxed.go", "package relaxed\n// alpha\n")
-
-	runQuery := func(pattern string, rerankConfig searchRunConfig) (string, error) {
-		return captureStdout(t, func() error {
-			return runSearchCommand(
-				context.Background(),
-				pattern,
-				[]string{folder},
-				0,
-				0,
-				defaultSearchConfig(),
-				rerankConfig,
-			)
-		})
-	}
-
-	// The header is the operand plus the path below it.
-	expected := "## " + filepath.Join(folder, "strict.go") + " (Go)\n1 package strict\n2 // alpha beta\n"
-	baseline, err := captureStdout(t, func() error {
-		return runWithSearchConfig(
-			context.Background(),
-			"alpha beta",
-			[]string{folder},
-			defaultSearchConfig(),
-		)
-	})
-	if err != nil {
-		t.Fatalf("baseline: %v", err)
-	}
-	if baseline != expected {
-		t.Fatalf("baseline output changed:\nwant=%q\ngot=%q", expected, baseline)
-	}
-
-	factoryCalls := 0
-	disabled, err := runQuery("alpha beta", searchRunConfig{
-		newModel: func(context.Context) (semanticModel, error) {
-			factoryCalls++
-			return nil, errors.New("must not start")
-		},
-	})
-	if err != nil || disabled != baseline || factoryCalls != 0 {
-		t.Fatalf("disabled path: error=%v calls=%d\nwant=%q\ngot=%q", err, factoryCalls, baseline, disabled)
-	}
-
-	protectedBaseline, err := runQuery(`"alpha beta"`, searchRunConfig{})
-	if err != nil {
-		t.Fatalf("protected baseline: %v", err)
-	}
-	if protectedBaseline != expected {
-		t.Fatalf("protected output changed:\nwant=%q\ngot=%q", expected, protectedBaseline)
-	}
-	protected, err := runQuery(`"alpha beta"`, searchRunConfig{
-		policy: defaultSearchPolicy(),
-		newModel: func(context.Context) (semanticModel, error) {
-			factoryCalls++
-			return nil, errors.New("must not start")
-		},
-	})
-	// An exact phrase uses the model too: a model that cannot start leaves
-	// the strict output.
-	wantIndexCalls := 1
-	if err != nil || protected != protectedBaseline || factoryCalls != wantIndexCalls {
-		t.Fatalf("protected path: error=%v calls=%d\nwant=%q\ngot=%q", err, factoryCalls, protectedBaseline, protected)
-	}
-
-	factoryCalls = 0
-	backendFailure, err := runQuery("alpha beta", searchRunConfig{
-		policy: defaultSearchPolicy(),
-		newModel: func(context.Context) (semanticModel, error) {
-			factoryCalls++
-			return nil, errors.New("backend failure")
-		},
-	})
-	if err != nil || backendFailure != baseline || factoryCalls != 1 {
-		t.Fatalf("backend fallback: error=%v calls=%d\nwant=%q\ngot=%q", err, factoryCalls, baseline, backendFailure)
-	}
-}
-
-func TestRunRerankClosesPreparedScorerWhenPoolIsTooSmall(t *testing.T) {
-	requireTools(t)
-	setTestUserCache(t)
-	t.Chdir(t.TempDir())
-	folder := t.TempDir()
-	writeFileAt(t, folder, "only.go", "package sample\n// alpha beta\n")
-
-	factoryCalls := 0
-	closed := false
-	output, err := captureStdout(t, func() error {
-		return runSearchCommand(
-			context.Background(),
-			"alpha beta",
-			[]string{folder},
-			0,
-			0,
-			defaultSearchConfig(),
-			searchRunConfig{
-				policy: defaultSearchPolicy(),
-				newModel: func(context.Context) (semanticModel, error) {
-					factoryCalls++
-					return &fixedRerankScorer{closed: &closed}, nil
-				},
-			},
-		)
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if factoryCalls != 1 || !closed {
-		t.Fatalf("prepared scorer: calls=%d closed=%t", factoryCalls, closed)
-	}
-	if !strings.Contains(output, "only.go") {
-		t.Fatalf("strict result was not kept:\n%s", output)
-	}
-}
-
 func TestRunRerankDoesNotStartScorerWhenCorpusPlanningFails(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
 	t.Chdir(t.TempDir())
 	missing := filepath.Join(t.TempDir(), "missing")
 
-	factoryCalls := 0
-	closed := false
-	err := runSearchCommand(
-		context.Background(),
-		"alpha beta",
-		[]string{missing},
-		0,
-		0,
-		defaultSearchConfig(),
-		searchRunConfig{
-			policy: defaultSearchPolicy(),
-			newModel: func(context.Context) (semanticModel, error) {
-				factoryCalls++
-				return &fixedRerankScorer{closed: &closed}, nil
-			},
-		},
-	)
+	model := observeModel(&hybridTestScorer{})
+	_, err := seekWith(t, model.factory(), "alpha beta", missing)
 	if err == nil {
 		t.Fatal("missing corpus must fail")
 	}
-	if factoryCalls != 0 || closed {
-		t.Fatalf("scorer started before planning: calls=%d closed=%t error=%v", factoryCalls, closed, err)
+	if model.starts.Load() != 0 || model.closes.Load() != 0 {
+		t.Fatalf("scorer started before planning: calls=%d closes=%d error=%v", model.starts.Load(), model.closes.Load(), err)
 	}
 }
 
 // TestRunRerankFailingModelKeepsStrictOutputForEveryShape searches one word,
-// a phrase, filters, an or and a negation with a model that cannot start:
-// each shape asks for the model once and prints the strict output byte for
-// byte. A query of negations only gives the model no text, so it never asks.
+// a description, a phrase, regex:, case:, filters, an or and negations with a
+// model that cannot start. The factory error is a test value. Each shape
+// takes the model route: it asks for the model once and prints the strict
+// output byte for byte. A query of negations only gives the model no text, so
+// it never asks.
 func TestRunRerankFailingModelKeepsStrictOutputForEveryShape(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -790,55 +594,41 @@ func TestRunRerankFailingModelKeepsStrictOutputForEveryShape(t *testing.T) {
 	writeFileAt(t, folder, "strict.go", "package sample\nfunc Alpha() {}\n// alpha beta gamma\n")
 	writeFileAt(t, folder, "relaxed.go", "package sample\n// alpha only\n")
 
-	for pattern, wantIndexCalls := range map[string]int{
-		"alpha":              1,
-		`"alpha beta"`:       1,
-		"file:strict alpha":  1,
-		"content:alpha beta": 1,
-		"alpha or beta":      1,
-		"alpha -missing":     1,
-		"-file:missing":      0,
+	for pattern, wantFactoryCalls := range map[string]int32{
+		"alpha":                    1,
+		"alpha beta":               1,
+		`"alpha beta"`:             1,
+		"regex:alpha beta":         1,
+		"case:yes alpha beta":      1,
+		"file:strict alpha":        1,
+		"content:alpha beta":       1,
+		"alpha beta content:gamma": 1,
+		"alpha beta sym:Alpha":     1,
+		"alpha beta -lang:python":  1,
+		"alpha or beta":            1,
+		"alpha -missing":           1,
+		"alpha beta -missing":      1,
+		"-file:missing":            0,
 	} {
 		t.Run(pattern, func(t *testing.T) {
-			baseline, baselineErr := captureStdout(t, func() error {
-				return runWithSearchConfig(
-					context.Background(), pattern, []string{folder}, defaultSearchConfig(),
-				)
-			})
-			factoryCalls := 0
-			got, gotErr := captureStdout(t, func() error {
-				return runSearchCommand(
-					context.Background(),
-					pattern,
-					[]string{folder},
-					0,
-					0,
-					defaultSearchConfig(),
-					searchRunConfig{
-						policy: defaultSearchPolicy(),
-						newModel: func(context.Context) (semanticModel, error) {
-							factoryCalls++
-							return nil, errors.New("must not start")
-						},
-					},
-				)
-			})
-			if baseline != got || factoryCalls != wantIndexCalls ||
-				(baselineErr == nil) != (gotErr == nil) ||
-				(baselineErr != nil && baselineErr.Error() != gotErr.Error()) {
-				t.Fatalf(
-					"a failing model changed the output: calls=%d baseline=%q/%v got=%q/%v",
-					factoryCalls,
-					baseline,
-					baselineErr,
-					got,
-					gotErr,
-				)
+			baseline, err := seek(t, "--lexical-only", pattern, folder)
+			if err != nil || baseline == "" {
+				t.Fatalf("lexical baseline=%q err=%v, want a strict match", baseline, err)
+			}
+			var factoryCalls atomic.Int32
+			got, err := seekWith(t, failingModelFactory(&factoryCalls), pattern, folder)
+			if err != nil || got != baseline || factoryCalls.Load() != wantFactoryCalls {
+				t.Fatalf("a failing model changed the output: calls=%d err=%v\nwant=%q\ngot=%q",
+					factoryCalls.Load(), err, baseline, got)
 			}
 		})
 	}
 }
 
+// TestRunRerankWithDirtyFilesAcrossCorpora searches two Git repositories, one
+// with a dirty and an untracked file: the model scores the strict files of
+// both, and the committed text of the dirty file never shows. The build fails
+// on purpose, so no vector exists.
 func TestRunRerankWithDirtyFilesAcrossCorpora(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -848,23 +638,8 @@ func TestRunRerankWithDirtyFilesAcrossCorpora(t *testing.T) {
 	writeFileAt(t, repoOne, "untracked.go", "package sample\n// alpha beta untracked\n")
 	repoTwo := initGitRepo(t, "same.go", "package sample\n// alpha beta second repository\n")
 
-	var documents []rerankDocument
-	output, err := captureStdout(t, func() error {
-		return runSearchCommand(
-			context.Background(),
-			"alpha beta",
-			[]string{repoOne, repoTwo},
-			0,
-			0,
-			defaultSearchConfig(),
-			searchRunConfig{
-				policy: defaultSearchPolicy(),
-				newModel: func(context.Context) (semanticModel, error) {
-					return &fixedRerankScorer{documents: &documents}, nil
-				},
-			},
-		)
-	})
+	scorer := &hybridTestScorer{embedErr: errRerankUnavailable}
+	output, err := seekWith(t, modelFactory(scorer), "alpha beta", repoOne, repoTwo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -883,8 +658,8 @@ func TestRunRerankWithDirtyFilesAcrossCorpora(t *testing.T) {
 	if strings.Contains(output, "alpha beta committed") || strings.Contains(output, filepath.Join(repoOne, "same.go")) {
 		t.Fatalf("output shows the stale or relaxed-only same.go of repo one:\n%s", output)
 	}
-	paths := make([]string, 0, len(documents))
-	for _, document := range documents {
+	paths := make([]string, 0, len(scorer.documents))
+	for _, document := range scorer.documents {
 		paths = append(paths, document.Path)
 	}
 	slices.Sort(paths)
@@ -893,6 +668,9 @@ func TestRunRerankWithDirtyFilesAcrossCorpora(t *testing.T) {
 	}
 }
 
+// TestRunRerankModelContextStaysOutOfDisplay searches with no context lines:
+// the model reads context lines on both sides of the match, and the output
+// shows none of them. The build fails on purpose, so no vector exists.
 func TestRunRerankModelContextStaysOutOfDisplay(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -911,23 +689,8 @@ func TestRunRerankModelContextStaysOutOfDisplay(t *testing.T) {
 	}, "\n"))
 	writeFileAt(t, folder, "relaxed.go", "package sample\n// alpha only\n")
 
-	var documents []rerankDocument
-	output, err := captureStdout(t, func() error {
-		return runSearchCommand(
-			context.Background(),
-			"alpha beta",
-			[]string{folder},
-			0,
-			0,
-			explicitSearchConfig(0, false),
-			searchRunConfig{
-				policy: defaultSearchPolicy(),
-				newModel: func(context.Context) (semanticModel, error) {
-					return &fixedRerankScorer{documents: &documents}, nil
-				},
-			},
-		)
-	})
+	scorer := &hybridTestScorer{embedErr: errRerankUnavailable}
+	output, err := seekWith(t, modelFactory(scorer), "-C", "0", "alpha beta", folder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -935,7 +698,7 @@ func TestRunRerankModelContextStaysOutOfDisplay(t *testing.T) {
 		t.Fatalf("internal model context reached output:\n%s", output)
 	}
 	modelSawContext := false
-	for _, document := range documents {
+	for _, document := range scorer.documents {
 		if document.Path == "target.go" &&
 			strings.Contains(document.Text, "hidden before three") &&
 			strings.Contains(document.Text, "hidden after three") {
@@ -943,10 +706,14 @@ func TestRunRerankModelContextStaysOutOfDisplay(t *testing.T) {
 		}
 	}
 	if !modelSawContext {
-		t.Fatalf("model did not receive fixed context: %+v", documents)
+		t.Fatalf("model did not receive fixed context: %+v", scorer.documents)
 	}
 }
 
+// TestRunRerankFailureKeepsModelContextOutOfDisplay searches with no context
+// lines and a model that fails at the score call: the model reads context
+// lines on both sides of the match, and the strict output shows the match and
+// none of them. The build fails on purpose, so no vector exists.
 func TestRunRerankFailureKeepsModelContextOutOfDisplay(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -965,26 +732,11 @@ func TestRunRerankFailureKeepsModelContextOutOfDisplay(t *testing.T) {
 	}, "\n"))
 	writeFileAt(t, folder, "relaxed.go", "package sample\n// alpha only\n")
 
-	var documents []rerankDocument
-	output, err := captureStdout(t, func() error {
-		return runSearchCommand(
-			context.Background(),
-			"alpha beta",
-			[]string{folder},
-			0,
-			0,
-			explicitSearchConfig(0, false),
-			searchRunConfig{
-				policy: defaultSearchPolicy(),
-				newModel: func(context.Context) (semanticModel, error) {
-					return &fixedRerankScorer{
-						err:       errors.New("score failure"),
-						documents: &documents,
-					}, nil
-				},
-			},
-		)
+	model := observeModel(&hybridTestScorer{
+		embedErr: errRerankUnavailable,
+		scoreErr: errors.New("score failure"),
 	})
+	output, err := seekWith(t, model.factory(), "-C", "0", "alpha beta", folder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -994,16 +746,18 @@ func TestRunRerankFailureKeepsModelContextOutOfDisplay(t *testing.T) {
 	if !strings.Contains(output, "alpha beta target") {
 		t.Fatalf("fallback lost the strict match:\n%s", output)
 	}
+	model.mu.Lock()
+	defer model.mu.Unlock()
 	modelSawContext := false
-	for _, document := range documents {
-		if document.Path == "target.go" &&
-			strings.Contains(document.Text, "hidden before three") &&
-			strings.Contains(document.Text, "hidden after three") {
+	for _, scored := range model.scored {
+		if scored.document.Path == "target.go" &&
+			strings.Contains(scored.document.Text, "hidden before three") &&
+			strings.Contains(scored.document.Text, "hidden after three") {
 			modelSawContext = true
 		}
 	}
 	if !modelSawContext {
-		t.Fatalf("failed scorer did not receive fixed context: %+v", documents)
+		t.Fatalf("failed scorer did not receive fixed context: %+v", model.scored)
 	}
 }
 

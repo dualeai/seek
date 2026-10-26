@@ -91,9 +91,7 @@ func TestRun_EmptyGitRepoReturnsNoMatch(t *testing.T) {
 	setTestUserCache(t)
 	t.Chdir(dir)
 
-	_, err := captureStdout(t, func() error {
-		return run(context.Background(), "absent_empty_repo_marker", nil)
-	})
+	_, err := seek(t, "--lexical-only", "absent_empty_repo_marker")
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("expected no match for empty git repo, got %v", err)
 	}
@@ -865,11 +863,11 @@ func TestIntegration_VeryLargeUncommittedFile(t *testing.T) {
 		t.Fatal("expected match for small file when large file is present")
 	}
 	// The large file is found by its name and not by its content.
-	named, err := runHybridTestSearch(t, "file:huge.dat", []string{dir}, lexicalOnlySearchPolicy(), nil)
+	named, err := seek(t, "--lexical-only", "file:huge.dat", dir)
 	if err != nil || !strings.Contains(named, "huge.dat") {
 		t.Fatalf("the large file is not found by name: err=%v\n%s", err, named)
 	}
-	content, err := runHybridTestSearch(t, strings.Repeat("x", 32), []string{dir}, lexicalOnlySearchPolicy(), nil)
+	content, err := seek(t, "--lexical-only", strings.Repeat("x", 32), dir)
 	if err != nil && !errors.Is(err, errNoMatch) || strings.Contains(content, "huge.dat") {
 		t.Fatalf("the content of the large file is indexed: err=%v\n%s", err, content)
 	}
@@ -877,7 +875,7 @@ func TestIntegration_VeryLargeUncommittedFile(t *testing.T) {
 
 // TestPlannedGitCorpus_ConcurrentSearches exercises concurrent planned-corpus
 // searches against the same cache/index. It intentionally stays below the CLI
-// boundary because run/captureStdout/cwd changes are process-global.
+// boundary because captureStdout and cwd changes are process-global.
 func TestPlannedGitCorpus_ConcurrentSearches(t *testing.T) {
 	requireTools(t)
 

@@ -15,8 +15,9 @@ import (
 // for the next build, which is a delta on the published family. A change
 // during a build is not an error.
 //
-// The drift is driven through the semantic scorer, which the builder calls
-// while the build runs. That needs no production test hook.
+// The builds are text builds. The drift comes from the folder read hook
+// (folderOpenFile): the build opens each file after its walk, and the hook
+// writes the new file when the build opens second.go.
 func TestFolderDrift_NextBuildIndexesTheDrift(t *testing.T) {
 	requireTools(t)
 
@@ -25,13 +26,7 @@ func TestFolderDrift_NextBuildIndexesTheDrift(t *testing.T) {
 	plan := planFolderTestCorpus(t, folder)
 	ctx := context.Background()
 
-	newExecution := func(scorer *hybridTestScorer) searchExecution {
-		return testSemanticSearchExecution(t, func(context.Context) (semanticModel, error) {
-			return scorer, nil
-		})
-	}
-
-	if _, err := ensureFolderCorpusFreshWithExecution(ctx, plan, newExecution(&hybridTestScorer{})); err != nil {
+	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 		t.Fatalf("first folder build: %v", err)
 	}
 	published := readStateFile(plan.cacheDir)
@@ -44,19 +39,22 @@ func TestFolderDrift_NextBuildIndexesTheDrift(t *testing.T) {
 
 	// Add a file while the build runs.
 	var once sync.Once
-	drifting := &hybridTestScorer{
-		vectorForUnit: func(unit semanticUnit) semanticVector {
+	realOpen := folderOpenFile
+	t.Cleanup(func() { folderOpenFile = realOpen })
+	folderOpenFile = func(path string) (*os.File, error) {
+		if filepath.Base(path) == "second.go" {
 			once.Do(func() {
 				writeFileAt(t, folder, "late.go", "package sample\n// arrived during the build\n")
 			})
-			return semanticVector{}
-		},
+		}
+		return realOpen(path)
 	}
 	writeFileAt(t, folder, "second.go", "package sample\n// forces a rebuild\n")
 
-	if _, err := ensureFolderCorpusFreshWithExecution(ctx, plan, newExecution(drifting)); err != nil {
+	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 		t.Fatalf("the drifted build failed: %v", err)
 	}
+	folderOpenFile = realOpen
 	if got := readStateFile(plan.cacheDir); got == "" || got == published {
 		t.Fatalf("the drifted build published no new state: %q", got)
 	}
@@ -65,7 +63,7 @@ func TestFolderDrift_NextBuildIndexesTheDrift(t *testing.T) {
 	// shards with hard links, so the base shard stays the same file. A full
 	// rebuild writes a new one.
 	baseBefore := firstShardInfo(t, plan.indexDir)
-	if _, err := ensureFolderCorpusFreshWithExecution(ctx, plan, newExecution(&hybridTestScorer{})); err != nil {
+	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 		t.Fatalf("next build: %v", err)
 	}
 	baseAfter := firstShardInfo(t, plan.indexDir)
@@ -77,7 +75,7 @@ func TestFolderDrift_NextBuildIndexesTheDrift(t *testing.T) {
 	}
 	// The corpus answers for the file that arrived during the build. The
 	// search reads the node under its read lock, as a search does.
-	if _, err := ensureFolderCorpusFreshWithExecution(ctx, plan, newExecution(&hybridTestScorer{})); err != nil {
+	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 		t.Fatalf("warm build: %v", err)
 	}
 	files, err := searchPlannedCorpusParsed(ctx, plan, nil, &query.Substring{Pattern: "arrived during the build"}, defaultSearchConfig())

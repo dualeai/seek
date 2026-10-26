@@ -14,26 +14,49 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 )
 
-// The tests of this file drive runSearchCommand with descriptions whose words
+// The tests of this file run the root command with descriptions whose words
 // (zqalpha zqbeta) no file holds, so every result comes from vector search.
 // They read the semantic route of each node from the "Searched semantic
 // index" debug record.
+//
+// The route tests (mask kinds, saturated shard, dirty exclusion, shard plan)
+// use hybridTestScorer in its accept mode: every row is near the query, and
+// the model accepts every candidate. So each route must print exactly the
+// files that the filters and the scope keep. Every fixture file holds zqrow,
+// so the lexical-only search "zqrow <filters>" gives these files: the oracle.
+// The route tests prove which rows each route reads. They prove nothing about
+// meaning, the acceptance threshold, the radius or rank. With every row near
+// the query, each shard that a USearch route of these tests searches allows
+// more than 1,024 near coarse vectors, so the shard saturates: all of its
+// allowed rows go to the exact fine scores. The radius test shows the radius
+// cut.
+//
+// The build sizes the USearch shards from the row count and GOMAXPROCS, as
+// for a user. A test whose routes need a shard plan sets the CPU count that
+// gives it (setTestUSearchShardCPUs). A generation of fewer than 512 rows
+// gets shards of 256 rows on every host.
+//
+// The geometry tests (radius, long query, model order) use e2eRouteModel,
+// whose cosines and scores the fixture text chooses.
 
-// e2eRouteMarker puts a row near the query: the model maps a row whose text
-// holds it to a vector near the first query axis.
-const e2eRouteMarker = "SEMANTIC_TARGET"
+// e2eRouteNear puts a row of e2eRouteModel near query axis 0.
+const e2eRouteNear = "E2E_NEAR"
 
-// e2eRouteWindowWords is the number of query words that one 128-token query
-// window holds in this file's model. A longer query has a second window.
-const e2eRouteWindowWords = 125
+// e2eRouteEmptyScore is the empty-document score of each scoring token of a
+// query of e2eRouteModel. A row near the query has a cosine of at least 0.85,
+// so it stays within the radius above this score; an orthogonal row does not.
+const e2eRouteEmptyScore = 0.5
 
-// e2eRouteModel is the test model of this file. Each row gets its own unit
-// vectors from its path, start, and text, so no two rows share a vector. A
-// row whose text holds SEMANTIC_TARGET is near query axis 0, with a cosine
+// e2eRouteModel is the chosen-geometry model of the radius, long-query and
+// model-order tests. The text of a row chooses its cosines, and the text of a
+// document chooses its score. So the tests prove the arithmetic of the radius
+// cut, the query windows and the fusion rule; they prove nothing about
+// meaning, about where real vectors put a file, or about tau. Each row gets
+// its own unit vectors from its path, start, and text, so no two rows share a
+// vector. A row whose text holds E2E_NEAR is near query axis 0, with a cosine
 // from 0.85 to 0.95. Any other row is orthogonal to both query axes. Text
 // markers change a near row:
 //   - E2E_FINE_dddd sets the cosine of the fine vectors to dddd/10000; the
@@ -41,14 +64,22 @@ const e2eRouteWindowWords = 125
 //   - E2E_AXIS1 puts the coarse vectors near query axis 1, the first fine
 //     vector near axis 0, and the other fine vectors near axis 1;
 //   - E2E_MODEL_ddd sets the model score of the document to ddd; a document
-//     with SEMANTIC_TARGET and no such marker scores 100, any other 0.
+//     with E2E_NEAR and no such marker scores 100, any other 0.
 //
-// A query of more than e2eRouteWindowWords words has two 128-token windows,
-// as the real model makes for a long query. The scoring token of window 0 is
-// on axis 0, and the scoring token of window 1 is on axis 1.
+// The query has one scoring token for each 128-token window that the bundled
+// tokenizer gives it (lateOnQueryWindows), as with the real model. The token
+// of window 0 is on axis 0, and the tokens of the other windows are on axis 1.
+// The query has an empty-document score of e2eRouteEmptyScore per scoring
+// token, so the retrieval floor and the acceptance lift both subtract it.
 type e2eRouteModel struct {
-	mu        sync.Mutex
-	documents []rerankDocument
+	tokenizer *lateOnTokenizer
+}
+
+// newE2ERouteModel returns an e2eRouteModel with the bundled tokenizer.
+func newE2ERouteModel(t *testing.T) *e2eRouteModel {
+	t.Helper()
+	tokenizer, _ := openLateOnTestTokenizer(t)
+	return &e2eRouteModel{tokenizer: tokenizer}
 }
 
 func (*e2eRouteModel) EmbedSemanticUnits(_ context.Context, units []semanticUnit) ([]semanticUnitEmbedding, error) {
@@ -63,37 +94,36 @@ func (*e2eRouteModel) EmbedSemanticUnits(_ context.Context, units []semanticUnit
 	return embeddings, nil
 }
 
-func (*e2eRouteModel) PrepareSemanticQuery(_ context.Context, query string) (*semanticQueryEmbedding, error) {
-	windows := 1
-	if len(strings.Fields(query)) > e2eRouteWindowWords {
-		windows = 2
+func (model *e2eRouteModel) PrepareSemanticQuery(_ context.Context, query string) (*semanticQueryEmbedding, error) {
+	queryWindows, err := lateOnQueryWindows(model.tokenizer, query)
+	if err != nil {
+		return nil, err
 	}
+	windows := len(queryWindows)
 	prepared := &semanticQueryEmbedding{
 		tokens:     make([]float32, windows*lateOnSequenceLength*semanticEmbeddingDimensions),
 		scoreMask:  make([]bool, windows*lateOnSequenceLength),
+		emptyScore: e2eRouteEmptyScore * float32(windows),
 		modelQuery: query,
 	}
 	for window := range windows {
 		token := window * lateOnSequenceLength
-		prepared.tokens[token*semanticEmbeddingDimensions+window] = 1
+		prepared.tokens[token*semanticEmbeddingDimensions+min(window, 1)] = 1
 		prepared.scoreMask[token] = true
 	}
 	return prepared, nil
 }
 
-func (model *e2eRouteModel) ScoresWithSemanticQuery(
+func (*e2eRouteModel) ScoresWithSemanticQuery(
 	_ context.Context,
 	_ *semanticQueryEmbedding,
 	documents []rerankDocument,
 ) ([]float32, error) {
-	model.mu.Lock()
-	model.documents = append(model.documents, documents...)
-	model.mu.Unlock()
 	scores := make([]float32, len(documents))
 	for index, document := range documents {
 		if value, ok := e2eRouteNumber(document.Text, "E2E_MODEL_"); ok {
 			scores[index] = float32(value)
-		} else if strings.Contains(document.Text, e2eRouteMarker) {
+		} else if strings.Contains(document.Text, e2eRouteNear) {
 			scores[index] = 100
 		}
 	}
@@ -129,7 +159,7 @@ func e2eRouteEmbedding(unit semanticUnit) (semanticUnitEmbedding, error) {
 	seed := hash.Sum64()
 	text := string(unit.text)
 	axis, coarseCosine, fineCosine := -1, 0.0, 0.0
-	if strings.Contains(text, e2eRouteMarker) {
+	if strings.Contains(text, e2eRouteNear) {
 		axis = 0
 		coarseCosine = 0.85 + 0.1*float64(seed%1000)/1000
 		fineCosine = coarseCosine
@@ -189,30 +219,23 @@ func e2eRouteVector(seed uint64, stream, axis int, cosine float64) (semanticVect
 // holds the sorted semantic backends of its debug records. saturated counts
 // the USearch shards that gave all of their allowed rows. fallback tells
 // that a USearch call failed over to exact vectors. scored holds the
-// node-relative paths that the model scored.
+// documents that the model scored, with node-relative paths.
 type e2eRouteRun struct {
 	output    string
 	err       error
 	backends  []string
 	saturated int64
 	fallback  bool
-	scored    []string
+	scored    []rerankDocument
 }
 
-// e2eRouteSearch runs query on operands with a new e2eRouteModel and reads
-// the route from the debug log.
-func e2eRouteSearch(t *testing.T, query string, operands ...string) e2eRouteRun {
-	t.Helper()
-	return e2eRouteSearchWith(t, defaultSearchPolicy(), query, operands...)
-}
-
-// e2eRouteSearchWith runs e2eRouteSearch with policy.
-func e2eRouteSearchWith(t *testing.T, policy searchPolicy, query string, operands ...string) e2eRouteRun {
+// e2eRouteSearch runs query on operands through the root command with model
+// and reads the route from the debug log.
+func e2eRouteSearch(t *testing.T, model semanticModel, query string, operands ...string) e2eRouteRun {
 	t.Helper()
 	logs := captureTestLogs(t, slog.LevelDebug)
-	model := &e2eRouteModel{}
-	output, err := runHybridTestSearch(t, query, operands, policy,
-		func(context.Context) (semanticModel, error) { return model, nil })
+	observed := observeModel(model)
+	output, err := seekWith(t, observed.factory(), append([]string{query}, operands...)...)
 	run := e2eRouteRun{output: output, err: err}
 	for _, record := range logs.Records() {
 		switch record.Message {
@@ -228,38 +251,26 @@ func e2eRouteSearchWith(t *testing.T, policy searchPolicy, query string, operand
 		}
 	}
 	slices.Sort(run.backends)
-	model.mu.Lock()
-	for _, document := range model.documents {
-		run.scored = append(run.scored, document.Path)
+	observed.mu.Lock()
+	for _, score := range observed.scored {
+		run.scored = append(run.scored, score.document)
 	}
-	model.mu.Unlock()
+	observed.mu.Unlock()
 	return run
 }
 
-// e2eRouteOracle runs the one-word text search zqnear with filters on
-// operands. Zoekt's own rule then gives the near files that the filters and
-// the scope keep. The oracle search must read no vector and score nothing.
+// e2eRouteOracle runs the lexical-only search "zqrow <filters>" on operands.
+// Every fixture file of the route tests holds zqrow, so Zoekt's own rule gives
+// the files that the filters and the scope keep. The lexical-only search gets
+// no model, so it reads no vector.
 func e2eRouteOracle(t *testing.T, filters string, operands ...string) []string {
 	t.Helper()
-	run := e2eRouteSearchWith(t, lexicalOnlySearchPolicy(), strings.TrimSpace("zqnear "+filters), operands...)
-	if run.err != nil && !errors.Is(run.err, errNoMatch) {
-		t.Fatalf("text oracle %q: %v", filters, run.err)
+	args := append([]string{"--lexical-only", strings.TrimSpace("zqrow " + filters)}, operands...)
+	output, err := seek(t, args...)
+	if err != nil && !errors.Is(err, errNoMatch) {
+		t.Fatalf("text oracle %q: %v", filters, err)
 	}
-	if len(run.backends) != 0 || len(run.scored) != 0 {
-		t.Fatalf("text oracle %q read vectors %v or scored %v", filters, run.backends, run.scored)
-	}
-	return headerPaths(run.output)
-}
-
-// e2eRouteOrder returns the file path of each result header in print order.
-func e2eRouteOrder(output string) []string {
-	var paths []string
-	for line := range strings.Lines(output) {
-		if rest, ok := strings.CutPrefix(line, "## "); ok {
-			paths = append(paths, strings.Fields(rest)[0])
-		}
-	}
-	return paths
+	return headerPaths(output)
 }
 
 // e2eRouteJoin joins root and each slash path rel, and sorts the result.
@@ -272,37 +283,20 @@ func e2eRouteJoin(root string, rels ...string) []string {
 	return paths
 }
 
-// e2eRouteCount counts the paths that contain fragment.
-func e2eRouteCount(paths []string, fragment string) int {
-	count := 0
-	for _, path := range paths {
-		if strings.Contains(path, fragment) {
-			count++
-		}
-	}
-	return count
-}
-
-// e2eRouteCase is one description search. backends lists the sorted
-// semantic backends, one for each node that reads base rows. exact routes
-// must return every file of the oracle; an approximate route must return
-// some of them and no other file. deepIn names a path fragment. The output
-// must show more files with that fragment than one USearch call returns:
-// semanticUSearchVectorsPerQuery keys for each token and shard.
+// e2eRouteCase is one description search of a route test. backends lists the
+// sorted semantic backends, one for each node that reads base rows.
 type e2eRouteCase struct {
 	name     string
 	filters  string
 	operands []string
 	backends []string
-	exact    bool
-	deepIn   string
 }
 
 // e2eRouteVerify checks one vector search against want. It checks the route,
-// that no USearch call failed over to exact vectors, and the result set. The
-// model must score only files that the output shows. It returns the result
-// paths.
-func e2eRouteVerify(t *testing.T, run e2eRouteRun, want []string, backends []string, exact bool) []string {
+// that no USearch call failed over to exact vectors, and that the result set
+// equals want. The model must score only files that the output shows. It
+// returns the result paths.
+func e2eRouteVerify(t *testing.T, run e2eRouteRun, want, backends []string) []string {
 	t.Helper()
 	if len(want) == 0 {
 		if !errors.Is(run.err, errNoMatch) || run.output != "" {
@@ -318,106 +312,118 @@ func e2eRouteVerify(t *testing.T, run e2eRouteRun, want []string, backends []str
 		t.Fatalf("semantic backends %v, want %v", run.backends, backends)
 	}
 	got := headerPaths(run.output)
-	t.Logf("backends %v: %d files, %d expected (exact route: %t)", run.backends, len(got), len(want), exact)
-	if exact {
-		if !slices.Equal(got, want) {
-			t.Fatalf("exact route found %d files, want the %d files of the oracle\ngot:  %v\nwant: %v",
-				len(got), len(want), got, want)
-		}
-	} else {
-		if len(want) > 0 && len(got) == 0 {
-			t.Fatalf("approximate route found no file; the oracle has %d", len(want))
-		}
-		for _, path := range got {
-			if _, found := slices.BinarySearch(want, path); !found {
-				t.Fatalf("approximate route found %s, which the oracle drops", path)
-			}
-		}
+	t.Logf("backends %v, saturated shards %d: %d files", run.backends, run.saturated, len(got))
+	if !slices.Equal(got, want) {
+		t.Fatalf("backends %v found %d files, want %d\ngot:  %v\nwant: %v",
+			run.backends, len(got), len(want), got, want)
 	}
 	for _, scored := range run.scored {
-		suffix := string(filepath.Separator) + filepath.FromSlash(scored)
+		suffix := string(filepath.Separator) + filepath.FromSlash(scored.Path)
 		if !slices.ContainsFunc(got, func(path string) bool { return strings.HasSuffix(path, suffix) }) {
-			t.Fatalf("the model scored %s, which the output does not show", scored)
+			t.Fatalf("the model scored %s, which the output does not show", scored.Path)
 		}
 	}
 	return got
 }
 
-// e2eRouteCheck runs the text oracle and the description of test, and
-// checks the description against the oracle.
+// e2eRouteCheck runs the text oracle and the description of test with a model
+// that accepts every row, and checks that the description prints the files of
+// the oracle. The oracle of a route that reads rows must hold a file, so that
+// two empty results cannot pass.
 func e2eRouteCheck(t *testing.T, test e2eRouteCase) e2eRouteRun {
 	t.Helper()
 	oracle := e2eRouteOracle(t, test.filters, test.operands...)
-	run := e2eRouteSearch(t, strings.TrimSpace("zqalpha zqbeta "+test.filters), test.operands...)
-	got := e2eRouteVerify(t, run, oracle, test.backends, test.exact)
-	if test.deepIn != "" {
-		if count := e2eRouteCount(got, test.deepIn); count <= semanticUSearchVectorsPerQuery {
-			t.Fatalf("found %d files in %q, want more than the %d keys of one USearch call (oracle %d files)",
-				count, test.deepIn, semanticUSearchVectorsPerQuery, e2eRouteCount(oracle, test.deepIn))
-		}
+	if len(oracle) == 0 && len(test.backends) > 0 {
+		t.Fatalf("the text oracle %q finds no file on a route that reads rows", test.filters)
 	}
+	run := e2eRouteSearch(t, &hybridTestScorer{mode: payloadAccept}, strings.TrimSpace("zqalpha zqbeta "+test.filters), test.operands...)
+	e2eRouteVerify(t, run, oracle, test.backends)
 	return run
 }
 
-// e2eRouteColdWarm runs query again: the warm search must print what the
-// cold search printed.
-func e2eRouteColdWarm(t *testing.T, cold e2eRouteRun, query string, operands ...string) {
+// e2eRouteColdWarm runs query again with model: the warm search must print
+// what the cold search printed.
+func e2eRouteColdWarm(t *testing.T, model semanticModel, cold e2eRouteRun, query string, operands ...string) {
 	t.Helper()
-	warm := e2eRouteSearch(t, query, operands...)
+	warm := e2eRouteSearch(t, model, query, operands...)
 	if warm.err != nil || warm.output != cold.output {
 		t.Fatalf("warm search differs (err=%v):\ncold:\n%s\nwarm:\n%s", warm.err, cold.output, warm.output)
 	}
 }
 
-// e2eRouteBulk returns a Go file of funcs functions with no marker: funcs+1
-// rows far from the query.
+// e2eRouteBulk returns a Go file of funcs functions: funcs+2 rows (its first
+// line, its package clause, and one row for each function). Its first line
+// holds zqrow, and its first line and each function comment hold the version
+// mark zqv1.
 func e2eRouteBulk(pkg string, file, funcs int) string {
 	var builder strings.Builder
-	fmt.Fprintf(&builder, "package %s\n\n", pkg)
+	fmt.Fprintf(&builder, "// zqrow %s %d zqv1\npackage %s\n\n", pkg, file, pkg)
 	for function := range funcs {
-		fmt.Fprintf(&builder, "// %s %d %d plain filler\nfunc F%d_%d() int { return %d }\n\n",
+		fmt.Fprintf(&builder, "// %s %d %d filler zqv1\nfunc F%d_%d() int { return %d }\n\n",
 			pkg, file, function, file, function, function)
 	}
 	return builder.String()
 }
 
 // e2eRouteRepo builds and commits the Git node of the route tests at
-// tree/repo. Each small file is one row; zqnear marks the near files for
-// the text oracle:
+// tree/repo. Each small file is one row. Every file holds zqrow for the text
+// oracle and the version mark zqv1. The rows come in path order:
 //
-//	few/f00.go-f19.go    20 near Go rows
-//	few/far.go            1 far Go row
-//	dense/d000-d299.py  300 near Python rows
-//	tools/t0.rb-t7.rb     8 near Ruby rows
-//	filler/g0.go-g3.go 1204 far Go rows
-//	README.md             1 far row
+//	README.md             1 row
+//	dense/d000-d299.py  300 Python rows
+//	few/extra.go          1 Go row
+//	few/f00.go-f19.go    20 Go rows
+//	filler/g0.go-g3.go 1808 Go rows (452 in each file)
+//	tools/t0.rb-t7.rb     8 Ruby rows
 //
-// The 1,534 rows fill one USearch shard. A partial selection of up to 256
-// rows takes the direct exact route. Up to 384 rows (a quarter of the shard,
-// plus one), it takes the shard-exact route. Above, it takes the filtered
-// USearch route.
+// It sets GOMAXPROCS (setTestUSearchShardCPUs) so that the 2,138 rows get
+// shards of 2,048 rows. The cut gives two shards: shard 0 holds README.md,
+// dense/, few/, and filler/g0-g2 (1,678 rows), and shard 1 holds filler/g3.go
+// and tools/ (460 rows). e2eRouteRepoShards checks the row count of each shard
+// and the folders of its rows: with the rows in path order, the 452 filler
+// rows of shard 1 are the rows of filler/g3.go. A partial selection of up to
+// 256 rows takes the direct exact route. When each shard that it reads allows
+// at most a quarter of its rows (plus one), or at most 64 rows, it takes the
+// shard-exact route. Otherwise it takes the filtered USearch route.
 func e2eRouteRepo(t *testing.T, f *graphFixture) string {
 	t.Helper()
-	repo := f.GitRepo("tree/repo", "README.md", "readme\n")
+	setTestUSearchShardCPUs(t, 2_138, 2_048)
+	repo := f.GitRepo("tree/repo", "README.md", "zqrow readme zqv1\n")
 	for index := range 20 {
 		writeFixtureFile(t, filepath.Join(repo, fmt.Sprintf("few/f%02d.go", index)),
-			fmt.Sprintf("package few\n// zqnear SEMANTIC_TARGET few %02d\n", index))
+			fmt.Sprintf("package few\n// zqrow few %02d zqv1\n", index))
 	}
-	writeFixtureFile(t, filepath.Join(repo, "few/far.go"), "package few\n// plain few far\n")
+	writeFixtureFile(t, filepath.Join(repo, "few/extra.go"), "package few\n// zqrow few extra zqv1\n")
 	for index := range 300 {
 		writeFixtureFile(t, filepath.Join(repo, fmt.Sprintf("dense/d%03d.py", index)),
-			fmt.Sprintf("# zqnear SEMANTIC_TARGET dense %03d\n", index))
+			fmt.Sprintf("# zqrow dense %03d zqv1\n", index))
 	}
 	for index := range 8 {
 		writeFixtureFile(t, filepath.Join(repo, fmt.Sprintf("tools/t%d.rb", index)),
-			fmt.Sprintf("# zqnear SEMANTIC_TARGET tool %d\n", index))
+			fmt.Sprintf("# zqrow tool %d zqv1\n", index))
 	}
 	for index := range 4 {
-		writeFixtureFile(t, filepath.Join(repo, fmt.Sprintf("filler/g%d.go", index)), e2eRouteBulk("filler", index, 300))
+		writeFixtureFile(t, filepath.Join(repo, fmt.Sprintf("filler/g%d.go", index)), e2eRouteBulk("filler", index, 450))
 	}
 	gitRunIn(t, repo, "add", ".")
 	gitRunIn(t, repo, "commit", "-q", "-m", "routes")
 	return repo
+}
+
+// e2eRouteRepoShards checks the shards of the e2eRouteRepo build, the one
+// semantic generation of the test's cache, and returns their count: 1,678 and
+// 460 rows, README.md, dense/ and few/ in shard 0, filler/ in both, and tools/
+// in shard 1.
+func e2eRouteRepoShards(t *testing.T) int {
+	t.Helper()
+	rows, shards := e2eRouteShards(t)
+	if !slices.Equal(rows, []uint64{1_678, 460}) || !slices.Equal(shards["."], []int{0}) ||
+		!slices.Equal(shards["dense"], []int{0}) || !slices.Equal(shards["few"], []int{0}) ||
+		!slices.Equal(shards["filler"], []int{0, 1}) || !slices.Equal(shards["tools"], []int{1}) {
+		t.Fatalf("the route repository has shards of %v rows and shard map %v, want 1,678 and 460 rows, "+
+			"README.md, dense/ and few/ in shard 0, filler/ in both, and tools/ in shard 1", rows, shards)
+	}
+	return len(rows)
 }
 
 // TestE2ERouteMaskKindsTakeEveryRoute runs each kind of mask on the committed
@@ -425,51 +431,50 @@ func e2eRouteRepo(t *testing.T, f *graphFixture) string {
 // combination. Each kind takes the direct exact route, the shard-exact route,
 // and the filtered USearch route. It also runs the unfiltered routes of the
 // Git node and a folder node. Then it runs a filter that keeps every row, one
-// that keeps no row, and two nodes together. A one-word text search with the
-// same filters is the oracle. Exact routes must return every oracle file. The
-// USearch routes must return oracle files only. Where the oracle has more
-// files than one USearch call returns, they must return more too. The model
-// scores only files that show.
+// that keeps no row, and two nodes together. The model accepts every row, so
+// each route must print exactly the files of the oracle, the lexical-only
+// search with the same filters. The model scores only files that show, and
+// the two-node result is the union of the one-node results.
 func TestE2ERouteMaskKindsTakeEveryRoute(t *testing.T) {
-	fixTestUSearchShardRows(t, semanticUSearchMaxShardRows)
 	requireTools(t)
 	f := newGraphFixture(t)
 	repo := e2eRouteRepo(t, f)
 	loose := f.path("tree/loose")
 	for index := range 6 {
 		writeFixtureFile(t, filepath.Join(loose, fmt.Sprintf("l%d.go", index)),
-			fmt.Sprintf("package loose\n// zqnear SEMANTIC_TARGET loose %d\n", index))
+			fmt.Sprintf("package loose\n// zqrow loose %d\n", index))
 	}
-	writeFixtureFile(t, filepath.Join(loose, "plain.go"), "package loose\n// plain loose far\n")
+	writeFixtureFile(t, filepath.Join(loose, "extra.go"), "package loose\n// zqrow loose extra\n")
 	setTestUserCache(t)
 	t.Chdir(t.TempDir())
 	in := func(rels ...string) []string { return e2eRouteJoin(repo, rels...) }
 	cases := []e2eRouteCase{
-		{"file/filtered-exact", "file:few/", []string{repo}, []string{"filtered-exact"}, true, ""},
-		{"file/filtered-shard-exact", "file:dense/", []string{repo}, []string{"filtered-shard-exact"}, true, ""},
-		{"negated-file/filtered-usearch", "-file:few/", []string{repo}, []string{"filtered-usearch"}, false, "/"},
-		{"lang/filtered-exact", "lang:ruby", []string{repo}, []string{"filtered-exact"}, true, ""},
-		{"lang/filtered-shard-exact", "lang:python", []string{repo}, []string{"filtered-shard-exact"}, true, ""},
-		{"lang/filtered-usearch", "lang:go", []string{repo}, []string{"filtered-usearch"}, false, ""},
-		{"scope/filtered-exact", "", in("few"), []string{"filtered-exact"}, true, ""},
-		{"scope/filtered-shard-exact", "", in("dense"), []string{"filtered-shard-exact"}, true, ""},
-		{"scope/filtered-usearch", "", in("dense", "filler", "tools"), []string{"filtered-usearch"}, false, "/"},
-		{"combination/filtered-exact", "lang:go -file:f0", in("few"), []string{"filtered-exact"}, true, ""},
-		{"combination/filtered-shard-exact", "lang:python -file:d29", in("dense", "tools"), []string{"filtered-shard-exact"}, true, ""},
-		{"combination/filtered-usearch", "lang:go -file:f0", in("few", "filler"), []string{"filtered-usearch"}, false, ""},
-		{"no-mask/usearch", "", []string{repo}, []string{"usearch"}, false, "/"},
-		{"filter-keeps-every-row/usearch", "-file:nomatchzq", []string{repo}, []string{"usearch"}, false, "/"},
-		{"filter-keeps-no-row", "file:nomatchzq", []string{repo}, nil, true, ""},
-		{"folder/no-mask/exact", "", []string{loose}, []string{"exact"}, true, ""},
-		{"folder/filter-keeps-every-row/exact", "lang:go", []string{loose}, []string{"exact"}, true, ""},
-		{"folder/file/filtered-exact", "file:l[0-2]", []string{loose}, []string{"filtered-exact"}, true, ""},
+		{"file/filtered-exact", "file:few/", []string{repo}, []string{"filtered-exact"}},
+		{"file/filtered-shard-exact", "file:dense/", []string{repo}, []string{"filtered-shard-exact"}},
+		{"negated-file/filtered-usearch", "-file:few/", []string{repo}, []string{"filtered-usearch"}},
+		{"lang/filtered-exact", "lang:ruby", []string{repo}, []string{"filtered-exact"}},
+		{"lang/filtered-shard-exact", "lang:python", []string{repo}, []string{"filtered-shard-exact"}},
+		{"lang/filtered-usearch", "lang:go", []string{repo}, []string{"filtered-usearch"}},
+		{"scope/filtered-exact", "", in("few"), []string{"filtered-exact"}},
+		{"scope/filtered-shard-exact", "", in("dense"), []string{"filtered-shard-exact"}},
+		{"scope/filtered-usearch", "", in("dense", "filler", "tools"), []string{"filtered-usearch"}},
+		{"combination/filtered-exact", "lang:go -file:f0", in("few"), []string{"filtered-exact"}},
+		{"combination/filtered-shard-exact", "lang:python -file:d29", in("dense", "tools"), []string{"filtered-shard-exact"}},
+		{"combination/filtered-usearch", "lang:go -file:f0", in("few", "filler"), []string{"filtered-usearch"}},
+		{"no-mask/usearch", "", []string{repo}, []string{"usearch"}},
+		{"filter-keeps-every-row/usearch", "-file:nomatchzq", []string{repo}, []string{"usearch"}},
+		{"filter-keeps-no-row", "file:nomatchzq", []string{repo}, nil},
+		{"folder/no-mask/exact", "", []string{loose}, []string{"exact"}},
+		{"folder/filter-keeps-every-row/exact", "lang:go", []string{loose}, []string{"exact"}},
+		{"folder/file/filtered-exact", "file:l[0-2]", []string{loose}, []string{"filtered-exact"}},
 	}
 	for index, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
 			run := e2eRouteCheck(t, test)
 			if index == 0 {
 				// The first description built the vectors.
-				e2eRouteColdWarm(t, run, "zqalpha zqbeta "+test.filters, test.operands...)
+				e2eRouteColdWarm(t, &hybridTestScorer{mode: payloadAccept}, run, "zqalpha zqbeta "+test.filters, test.operands...)
+				e2eRouteRepoShards(t)
 			}
 		})
 	}
@@ -478,14 +483,11 @@ func TestE2ERouteMaskKindsTakeEveryRoute(t *testing.T) {
 	// union of the one-node results.
 	t.Run("two-nodes", func(t *testing.T) {
 		const filters = "-file:few/"
-		test := e2eRouteCase{
-			"two-nodes", filters, []string{repo, loose},
-			[]string{"exact", "filtered-usearch"}, false, "/",
-		}
+		test := e2eRouteCase{"two-nodes", filters, []string{repo, loose}, []string{"exact", "filtered-usearch"}}
 		run := e2eRouteCheck(t, test)
 		var union []string
 		for _, operand := range test.operands {
-			single := e2eRouteSearch(t, "zqalpha zqbeta "+filters, operand)
+			single := e2eRouteSearch(t, &hybridTestScorer{mode: payloadAccept}, "zqalpha zqbeta "+filters, operand)
 			if single.err != nil {
 				t.Fatalf("one node %s: %v", operand, single.err)
 			}
@@ -500,25 +502,26 @@ func TestE2ERouteMaskKindsTakeEveryRoute(t *testing.T) {
 }
 
 // TestE2ERouteSaturatedShardGivesEveryAllowedRow searches the route
-// repository. Its one USearch shard holds 1,312 keys near the query, and 1,232
-// of them stay when -file:few/ drops the few/ files. The query token still
-// reaches the bound after 1,024 keys, so the shard saturates and every
-// allowed row goes to the exact fine scores. The output must then hold every
-// file of the oracle and no other file, with and without the filter.
+// repository with a model that puts every row near the query. Its two USearch
+// shards hold 6,712 and 1,840 near keys, and 6,628 keys of shard 0 stay when
+// -file:few/ drops the few/ files. The query tokens still reach the deepen
+// bound after 1,024 keys, so each shard saturates and every allowed row goes
+// to the exact fine scores. The output must then hold every file of the
+// oracle and no other file, with and without the filter.
 func TestE2ERouteSaturatedShardGivesEveryAllowedRow(t *testing.T) {
-	fixTestUSearchShardRows(t, semanticUSearchMaxShardRows)
 	requireTools(t)
 	f := newGraphFixture(t)
 	repo := e2eRouteRepo(t, f)
 	setTestUserCache(t)
 	t.Chdir(t.TempDir())
 	for _, test := range []e2eRouteCase{
-		{"no-mask/usearch", "", []string{repo}, []string{"usearch"}, true, "/"},
-		{"negated-file/filtered-usearch", "-file:few/", []string{repo}, []string{"filtered-usearch"}, true, "/"},
+		{"no-mask/usearch", "", []string{repo}, []string{"usearch"}},
+		{"negated-file/filtered-usearch", "-file:few/", []string{repo}, []string{"filtered-usearch"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if run := e2eRouteCheck(t, test); run.saturated != 1 {
-				t.Fatalf("saturated shards=%d, want the one shard", run.saturated)
+			run := e2eRouteCheck(t, test)
+			if count := e2eRouteRepoShards(t); run.saturated != int64(count) {
+				t.Fatalf("saturated shards=%d, want all %d shards", run.saturated, count)
 			}
 		})
 	}
@@ -527,91 +530,100 @@ func TestE2ERouteSaturatedShardGivesEveryAllowedRow(t *testing.T) {
 // TestE2ERouteDirtyExclusionTakesEveryRoute makes a Git node dirty in three
 // steps. In each step the dirty-file exclusion of the base rows alone takes
 // another route: the filtered USearch route, the shard-exact route, and the
-// direct exact route. The dirty files are: a near file edited to far text, a
-// deleted near file, a near file with new near text, and a far file edited
-// to near text. Two untracked near files are dirty too. The one-word text
-// search on the work tree is the oracle. The committed rows of an edited or
-// deleted file never show, and the model never scores them. The overlay is
-// exact, so each dirty near file always shows.
+// direct exact route. The committed rows hold the version mark zqv1, and the
+// edited and untracked files zqv2. The dirty files are three edited files, a
+// deleted file, and two untracked files; then the filler files are edited and
+// 80 dense files are deleted. The model accepts every row. At each step the
+// output must equal the lexical-only search on the work tree. The model never
+// scores a deleted file or the zqv1 text of an edited file, and no edited file
+// shows a zqv1 line.
 func TestE2ERouteDirtyExclusionTakesEveryRoute(t *testing.T) {
-	fixTestUSearchShardRows(t, semanticUSearchMaxShardRows)
 	requireTools(t)
 	f := newGraphFixture(t)
 	repo := e2eRouteRepo(t, f)
 	setTestUserCache(t)
 	t.Chdir(t.TempDir())
-	if run := e2eRouteSearch(t, "zqalpha zqbeta", repo); run.err != nil || !slices.Equal(run.backends, []string{"usearch"}) {
+	if run := e2eRouteSearch(t, &hybridTestScorer{mode: payloadAccept}, "zqalpha zqbeta", repo); run.err != nil || !slices.Equal(run.backends, []string{"usearch"}) {
 		t.Fatalf("clean search: err=%v backends=%v", run.err, run.backends)
 	}
+	e2eRouteRepoShards(t)
 
-	writeFixtureFile(t, filepath.Join(repo, "few/f00.go"), "package few\n// plain edited far\n")
+	writeFixtureFile(t, filepath.Join(repo, "few/f00.go"), "package few\n// zqrow few 00 zqv2\n")
 	if err := os.Remove(filepath.Join(repo, "few/f01.go")); err != nil {
 		t.Fatal(err)
 	}
-	writeFixtureFile(t, filepath.Join(repo, "few/f02.go"), "package few\n// zqnear SEMANTIC_TARGET few 02 edited\n")
-	writeFixtureFile(t, filepath.Join(repo, "few/far.go"), "package few\n// zqnear SEMANTIC_TARGET few far edited\n")
-	writeFixtureFile(t, filepath.Join(repo, "few/u00.go"), "package few\n// zqnear SEMANTIC_TARGET few untracked\n")
-	writeFixtureFile(t, filepath.Join(repo, "tools/t8.rb"), "# zqnear SEMANTIC_TARGET tool untracked\n")
-	gone := []string{"few/f00.go", "few/f01.go"}
-	overlay := e2eRouteJoin(repo, "few/f02.go", "few/far.go", "few/u00.go", "tools/t8.rb")
+	writeFixtureFile(t, filepath.Join(repo, "few/f02.go"), "package few\n// zqrow few 02 zqv2\n")
+	writeFixtureFile(t, filepath.Join(repo, "few/extra.go"), "package few\n// zqrow few extra zqv2\n")
+	writeFixtureFile(t, filepath.Join(repo, "few/u00.go"), "package few\n// zqrow few untracked zqv2\n")
+	writeFixtureFile(t, filepath.Join(repo, "tools/t8.rb"), "# zqrow tool untracked zqv2\n")
+	edited := []string{"few/f00.go", "few/f02.go", "few/extra.go"}
+	gone := []string{"few/f01.go"}
 	check := func(t *testing.T, test e2eRouteCase) e2eRouteRun {
 		t.Helper()
 		run := e2eRouteCheck(t, test)
-		got := headerPaths(run.output)
-		for _, rel := range gone {
-			if slices.Contains(got, filepath.Join(repo, rel)) || slices.Contains(run.scored, rel) {
-				t.Fatalf("the committed rows of %s leaked: scored %v\n%s", rel, run.scored, run.output)
+		for _, document := range run.scored {
+			if slices.Contains(gone, document.Path) ||
+				slices.Contains(edited, document.Path) && strings.Contains(document.Text, "zqv1") {
+				t.Fatalf("the model scored the committed rows of %s:\n%s", document.Path, document.Text)
 			}
 		}
-		oracle := e2eRouteOracle(t, test.filters, test.operands...)
-		for _, path := range overlay {
-			if slices.Contains(oracle, path) && !slices.Contains(got, path) {
-				t.Fatalf("the exact overlay lost %s:\n%s", path, run.output)
+		editedPaths := e2eRouteJoin(repo, edited...)
+		for _, result := range printedResults(run.output) {
+			if !slices.Contains(editedPaths, result.path) {
+				continue
+			}
+			for _, line := range result.body {
+				if strings.Contains(line, "zqv1") {
+					t.Fatalf("%s shows its committed line %q:\n%s", result.path, line, run.output)
+				}
 			}
 		}
 		return run
 	}
 
-	// Four committed files are dirty: 1,530 base rows stay.
+	// Four committed files are dirty: 2,134 base rows stay.
 	for index, test := range []e2eRouteCase{
-		{"few-dirty/filtered-usearch", "", []string{repo}, []string{"filtered-usearch"}, false, "/"},
-		{"few-dirty-and-file/filtered-exact", "file:few/", []string{repo}, []string{"filtered-exact"}, true, ""},
-		{"few-dirty-scope-and-lang/filtered-exact", "lang:ruby", e2eRouteJoin(repo, "tools"), []string{"filtered-exact"}, true, ""},
+		{"few-dirty/filtered-usearch", "", []string{repo}, []string{"filtered-usearch"}},
+		{"few-dirty-and-file/filtered-exact", "file:few/", []string{repo}, []string{"filtered-exact"}},
+		{"few-dirty-scope-and-lang/filtered-exact", "lang:ruby", e2eRouteJoin(repo, "tools"), []string{"filtered-exact"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			run := check(t, test)
 			if index == 0 {
 				// The first dirty search built the overlay.
-				e2eRouteColdWarm(t, run, "zqalpha zqbeta", repo)
+				e2eRouteColdWarm(t, &hybridTestScorer{mode: payloadAccept}, run, "zqalpha zqbeta", repo)
 			}
 		})
 	}
 
 	// The four filler files are dirty too: 326 base rows stay.
 	for index := range 4 {
-		writeFixtureFile(t, filepath.Join(repo, fmt.Sprintf("filler/g%d.go", index)),
-			e2eRouteBulk("filler", index, 300)+"// plain edited filler\n")
+		rel := fmt.Sprintf("filler/g%d.go", index)
+		writeFixtureFile(t, filepath.Join(repo, rel), strings.ReplaceAll(e2eRouteBulk("filler", index, 300), "zqv1", "zqv2"))
+		edited = append(edited, rel)
 	}
 	t.Run("filler-dirty/filtered-shard-exact", func(t *testing.T) {
-		check(t, e2eRouteCase{"", "", []string{repo}, []string{"filtered-shard-exact"}, true, ""})
+		check(t, e2eRouteCase{"", "", []string{repo}, []string{"filtered-shard-exact"}})
 	})
 
 	// 80 dense files are deleted too: 246 base rows stay.
 	for index := range 80 {
-		if err := os.Remove(filepath.Join(repo, fmt.Sprintf("dense/d%03d.py", index))); err != nil {
+		rel := fmt.Sprintf("dense/d%03d.py", index)
+		if err := os.Remove(filepath.Join(repo, rel)); err != nil {
 			t.Fatal(err)
 		}
+		gone = append(gone, rel)
 	}
-	gone = append(gone, "dense/d000.py", "dense/d079.py")
 	t.Run("dense-deleted/filtered-exact", func(t *testing.T) {
-		check(t, e2eRouteCase{"", "", []string{repo}, []string{"filtered-exact"}, true, ""})
+		check(t, e2eRouteCase{"", "", []string{repo}, []string{"filtered-exact"}})
 	})
 }
 
 // e2eRouteShards reads the one semantic generation in the test's cache. It
-// returns its USearch shard count and, for each directory of its rows, the
-// shards that hold those rows. It checks the fixture, not a result.
-func e2eRouteShards(t *testing.T) (int, map[string][]int) {
+// returns the row count of each of its USearch shards and, for each directory
+// of its rows, the shards that hold those rows. It checks the fixture, not a
+// result.
+func e2eRouteShards(t *testing.T) ([]uint64, map[string][]int) {
 	t.Helper()
 	root, err := seekUserCacheRoot()
 	if err != nil {
@@ -640,32 +652,35 @@ func e2eRouteShards(t *testing.T) (int, map[string][]int) {
 			shards[dir] = append(shards[dir], shard)
 		}
 	}
-	return len(manifest.USearchFiles), shards
+	rows := make([]uint64, len(manifest.USearchFiles))
+	for index, file := range manifest.USearchFiles {
+		rows[index] = file.Rows
+	}
+	return rows, shards
 }
 
-// TestE2ERouteFilterInSomeUSearchShards builds a Git node of 4,952 rows in
-// two USearch shards of at most semanticUSearchMaxShardRows rows. The near
-// files of a/anear lie in shard 0, and those of b/near in shard 1. Each
+// TestE2ERouteFilterInSomeUSearchShards builds a Git node of 4,963 rows on
+// one CPU, which gives shards of semanticUSearchMaxShardRows rows: two shards.
+// The files of a/anear lie in shard 0, and those of b/near in shard 1. Each
 // filter allows rows in some shards only. So the shard plan skips a shard,
 // searches a whole shard with no bitmap, scores a shard directly, or uses the
-// bitmap. A one-word text search with the same filter is the oracle. Shard 1
-// holds more near files than one USearch call returns, so its results show
-// the deepening.
+// bitmap. The model accepts every row, so each route must print exactly the
+// files of the lexical-only search with the same filter.
 func TestE2ERouteFilterInSomeUSearchShards(t *testing.T) {
-	fixTestUSearchShardRows(t, semanticUSearchMaxShardRows)
 	requireTools(t)
+	setTestUSearchShardCPUs(t, 4_963, semanticUSearchMaxShardRows)
 	f := newGraphFixture(t)
-	repo := f.GitRepo("tree/repo", "README.md", "readme\n")
+	repo := f.GitRepo("tree/repo", "README.md", "zqrow readme\n")
 	for index := range 240 {
 		writeFixtureFile(t, filepath.Join(repo, fmt.Sprintf("a/anear/n%03d.go", index)),
-			fmt.Sprintf("package anear\n// zqnear SEMANTIC_TARGET a near %03d\n", index))
+			fmt.Sprintf("package anear\n// zqrow a near %03d\n", index))
 	}
 	for index := range 10 {
 		writeFixtureFile(t, filepath.Join(repo, fmt.Sprintf("a/bulk%02d.go", index)), e2eRouteBulk("a", index, 400))
 	}
 	for index := range 300 {
 		writeFixtureFile(t, filepath.Join(repo, fmt.Sprintf("b/near/m%03d.go", index)),
-			fmt.Sprintf("package near\n// zqnear SEMANTIC_TARGET b near %03d\n", index))
+			fmt.Sprintf("package near\n// zqrow b near %03d\n", index))
 	}
 	writeFixtureFile(t, filepath.Join(repo, "b/zfar/z0.go"), e2eRouteBulk("zfar", 0, 400))
 	gitRunIn(t, repo, "add", ".")
@@ -673,30 +688,30 @@ func TestE2ERouteFilterInSomeUSearchShards(t *testing.T) {
 	setTestUserCache(t)
 	t.Chdir(t.TempDir())
 
-	// Rows: README 1, a/anear 240, a/bulk 4,010 (401 for each file), b/near
-	// 300, b/zfar 401. The cut falls after a/bulk08.go, the first file after
-	// which shard 0 holds 3,840 rows (15/16 of 4,096); a file of 401 rows is
-	// always an anchor. So shard 0 holds rows 0-3,849; shard 1 holds
-	// a/bulk09.go, b/near, and b/zfar: 1,102 rows.
-	cold := e2eRouteCheck(t, e2eRouteCase{"", "", []string{repo}, []string{"usearch"}, false, "/b/near/"})
-	e2eRouteColdWarm(t, cold, "zqalpha zqbeta", repo)
-	count, shards := e2eRouteShards(t)
-	if count != 2 || !slices.Equal(shards["a/anear"], []int{0}) || !slices.Equal(shards["b/near"], []int{1}) {
-		t.Fatalf("fixture has %d shards and shard map %v, want a/anear in shard 0 and b/near in shard 1", count, shards)
+	// Rows: README 1, a/anear 240, a/bulk 4,020 (402 for each file), b/near
+	// 300, b/zfar 402. The cut falls after a/bulk08.go, the first file after
+	// which shard 0 holds 3,840 rows (15/16 of 4,096); a file of 402 rows is
+	// always an anchor. So shard 0 holds rows 0-3,858; shard 1 holds
+	// a/bulk09.go, b/near, and b/zfar: 1,104 rows.
+	cold := e2eRouteCheck(t, e2eRouteCase{"", "", []string{repo}, []string{"usearch"}})
+	e2eRouteColdWarm(t, &hybridTestScorer{mode: payloadAccept}, cold, "zqalpha zqbeta", repo)
+	rows, shards := e2eRouteShards(t)
+	if len(rows) != 2 || !slices.Equal(shards["a/anear"], []int{0}) || !slices.Equal(shards["b/near"], []int{1}) {
+		t.Fatalf("fixture has %d shards and shard map %v, want a/anear in shard 0 and b/near in shard 1", len(rows), shards)
 	}
 	for _, test := range []e2eRouteCase{
-		// Shard 0 has no allowed row; 300 of shard 1's 1,102 rows take the
+		// Shard 0 has no allowed row; 300 of shard 1's 1,104 rows take the
 		// bitmap search.
-		{"second-shard-only/filtered-usearch", "file:b/near/", []string{repo}, []string{"filtered-usearch"}, false, "/b/near/"},
+		{"second-shard-only/filtered-usearch", "file:b/near/", []string{repo}, []string{"filtered-usearch"}},
 		// 120 rows of shard 0 and 150 rows of shard 1: each at most a
 		// quarter of its shard, so both score directly.
-		{"both-shards-direct/filtered-shard-exact", `file:near/ file:[02468]\.go$`, []string{repo}, []string{"filtered-shard-exact"}, true, ""},
+		{"both-shards-direct/filtered-shard-exact", `file:near/ file:[02468]\.go$`, []string{repo}, []string{"filtered-shard-exact"}},
 		// Shard 0 scores its 240 rows directly; shard 1 takes the bitmap
 		// search.
-		{"direct-and-bitmap/filtered-usearch", "file:near/", []string{repo}, []string{"filtered-usearch"}, false, "/b/near/"},
+		{"direct-and-bitmap/filtered-usearch", "file:near/", []string{repo}, []string{"filtered-usearch"}},
 		// Shard 0 is whole, so its search has no bitmap; shard 1 takes the
-		// bitmap search for the 401 rows of a/bulk09.go.
-		{"whole-first-shard/filtered-usearch", "-file:b/", []string{repo}, []string{"filtered-usearch"}, false, ""},
+		// bitmap search for the 402 rows of a/bulk09.go.
+		{"whole-first-shard/filtered-usearch", "-file:b/", []string{repo}, []string{"filtered-usearch"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			e2eRouteCheck(t, test)
@@ -705,34 +720,47 @@ func TestE2ERouteFilterInSomeUSearchShards(t *testing.T) {
 }
 
 // TestE2ERouteRadiusBoundsEveryRoute gives a folder node and a Git node files
-// just inside the retrieval radius (fine MeanMaxSim 0.4860) and just outside
-// it (0.4825). All have near coarse vectors, so USearch returns each of them,
-// and only the radius tells them apart. The Git node has an inside and an
-// outside file in its committed rows and in its untracked overlay. The model
-// would accept every one of them. On every route the inside files show, and
-// the outside files never reach the model. The expected files come from the
-// fixture.
+// just inside the retrieval radius (a fine lift 0.0018 above it) and just
+// outside it (0.0018 under it). The lift is the fine cosine minus the
+// empty-document score of the one query token, so a scan that leaves out that
+// score takes the outside files too. All have near coarse vectors, so USearch
+// returns each of them; only the radius tells them apart. The Git node has an
+// inside and an outside file in its committed rows and in its untracked
+// overlay. The model would accept every one of them. On every route the
+// inside files show, and the outside files never reach the model. The cosines
+// are chosen. The test proves the radius cut on each route; it proves neither
+// where real vectors put a file nor that tau or delta are right.
 func TestE2ERouteRadiusBoundsEveryRoute(t *testing.T) {
-	fixTestUSearchShardRows(t, semanticUSearchMaxShardRows)
 	requireTools(t)
+	const margin = 0.0018
+	// floor is the fine cosine at the radius for a query of one token.
+	floor := e2eRouteEmptyScore + float64(semanticRetrievalRadius)
+	// The index stores the fine vectors as binary16. Its step at the floor
+	// must be under the margin, so that the cast keeps each file on its side.
+	code := semanticF16FromFloat32(float32(floor))
+	if step := semanticF16ToFloat32(code+1) - semanticF16ToFloat32(code); float64(step) >= margin {
+		t.Fatalf("the binary16 step %v at the fine cosine %.4f is not under the margin %v", step, floor, margin)
+	}
+	marker := func(lift float64) string {
+		return fmt.Sprintf("%s E2E_FINE_%04d", e2eRouteNear, int(math.Round((floor+lift)*10000)))
+	}
+	inside, outside := marker(margin), marker(-margin)
 	f := newGraphFixture(t)
 	fold := f.path("tree/fold")
-	writeFixtureFile(t, filepath.Join(fold, "radius/in.go"), "package radius\n// SEMANTIC_TARGET E2E_FINE_4860 inside\n")
-	writeFixtureFile(t, filepath.Join(fold, "radius/out.go"), "package radius\n// SEMANTIC_TARGET E2E_FINE_4825 outside\n")
+	writeFixtureFile(t, filepath.Join(fold, "radius/in.go"), "package radius\n// "+inside+" inside\n")
+	writeFixtureFile(t, filepath.Join(fold, "radius/out.go"), "package radius\n// "+outside+" outside\n")
 	writeFixtureFile(t, filepath.Join(fold, "filler/big.go"), e2eRouteBulk("filler", 0, 300))
 	repo := f.GitRepo("tree/repo", "README.md", "readme\n")
-	writeFixtureFile(t, filepath.Join(repo, "radius/cin.go"), "package radius\n// SEMANTIC_TARGET E2E_FINE_4860 committed inside\n")
-	writeFixtureFile(t, filepath.Join(repo, "radius/cout.go"), "package radius\n// SEMANTIC_TARGET E2E_FINE_4825 committed outside\n")
+	writeFixtureFile(t, filepath.Join(repo, "radius/cin.go"), "package radius\n// "+inside+" committed inside\n")
+	writeFixtureFile(t, filepath.Join(repo, "radius/cout.go"), "package radius\n// "+outside+" committed outside\n")
 	writeFixtureFile(t, filepath.Join(repo, "filler/big.go"), e2eRouteBulk("filler", 1, 300))
 	gitRunIn(t, repo, "add", ".")
 	gitRunIn(t, repo, "commit", "-q", "-m", "radius")
-	writeFixtureFile(t, filepath.Join(repo, "radius/uin.go"), "package radius\n// SEMANTIC_TARGET E2E_FINE_4860 untracked inside\n")
-	writeFixtureFile(t, filepath.Join(repo, "radius/uout.go"), "package radius\n// SEMANTIC_TARGET E2E_FINE_4825 untracked outside\n")
+	writeFixtureFile(t, filepath.Join(repo, "radius/uin.go"), "package radius\n// "+inside+" untracked inside\n")
+	writeFixtureFile(t, filepath.Join(repo, "radius/uout.go"), "package radius\n// "+outside+" untracked outside\n")
 	setTestUserCache(t)
 	t.Chdir(t.TempDir())
-	if semanticRetrievalRadius <= 0.4825 || semanticRetrievalRadius >= 0.4860 {
-		t.Fatalf("the fixture cosines do not bound the radius %v", semanticRetrievalRadius)
-	}
+	model := newE2ERouteModel(t)
 	inFold := e2eRouteJoin(fold, "radius/in.go")
 	inRepo := e2eRouteJoin(repo, "radius/cin.go", "radius/uin.go")
 	both := append(slices.Clone(inFold), inRepo...)
@@ -754,51 +782,77 @@ func TestE2ERouteRadiusBoundsEveryRoute(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			query := strings.TrimSpace("zqalpha zqbeta " + test.filters)
-			run := e2eRouteSearch(t, query, test.operands...)
-			e2eRouteVerify(t, run, test.want, test.backends, true)
+			run := e2eRouteSearch(t, model, query, test.operands...)
+			e2eRouteVerify(t, run, test.want, test.backends)
 			for _, scored := range run.scored {
-				if strings.Contains(scored, "out.go") {
-					t.Fatalf("the model scored %s, which is outside the radius", scored)
+				if strings.Contains(scored.Path, "out.go") {
+					t.Fatalf("the model scored %s, which is outside the radius", scored.Path)
 				}
 			}
 			if index == 0 {
-				e2eRouteColdWarm(t, run, query, test.operands...)
+				e2eRouteColdWarm(t, model, run, query, test.operands...)
 			}
 		})
 	}
 }
 
 // TestE2ERouteLongQueryWindowsOnEveryRoute runs a 130-word description. The
-// model gives it two query windows, whose scoring tokens lie on two axes. The
-// w/b files have their coarse vectors on the second window's axis and a fine
-// vector on each axis. So only the second window's token finds them in
-// USearch, and their MeanMaxSim over both tokens is in the radius. The w/s
-// files lie on the first axis only: their MeanMaxSim over two tokens is about
-// half, outside the radius. On every route the long query returns w/b files
-// only. The USearch routes need the deepening for the second token. A
-// two-word description on the exact route returns both kinds. The expected
-// files come from the fixture.
+// bundled tokenizer splits it into W query windows (5), and e2eRouteModel gives
+// each window one scoring token: window 0 on the first axis, the other windows
+// on the second. The w/b files have their coarse vectors on the second axis
+// and a fine vector on each axis, so only the tokens of windows 1 and up find
+// them in USearch. The w/s files lie on the first axis only. Each row has the
+// fine cosine c, chosen so that c/W < floor < c, with floor the
+// empty-document score plus the radius per token. Over the W tokens a w/b row
+// has a fine MeanMaxSim of about c, in the radius, and a w/s row about c/W,
+// outside it. On every route the long query returns every w/b file and no
+// other file. A two-word description has one window, and on the exact route
+// it returns both kinds. The cosines are chosen; only the window count comes
+// from the tokenizer.
 func TestE2ERouteLongQueryWindowsOnEveryRoute(t *testing.T) {
-	fixTestUSearchShardRows(t, semanticUSearchMaxShardRows)
 	requireTools(t)
-	folder := t.TempDir()
-	for index := range 300 {
-		writeFileAt(t, folder, fmt.Sprintf("w/b%03d.go", index),
-			fmt.Sprintf("package w\n// SEMANTIC_TARGET E2E_AXIS1 both windows %03d\n", index))
-	}
-	for index := range 20 {
-		writeFileAt(t, folder, fmt.Sprintf("w/s%02d.go", index),
-			fmt.Sprintf("package w\n// SEMANTIC_TARGET first window only %02d\n", index))
-	}
-	writeFileAt(t, folder, "x/plain.go", "package x\n// plain far\n")
-	setTestUserCache(t)
-	t.Chdir(t.TempDir())
-	words := make([]string, e2eRouteWindowWords+5)
+	model := newE2ERouteModel(t)
+	words := make([]string, 130)
 	for index := range words {
 		words[index] = fmt.Sprintf("zqw%03d", index)
 	}
 	long := strings.Join(words, " ")
-	var both, first []string
+	plan, err := planQuery(long, defaultSearchPolicy())
+	if err != nil || plan.model == nil {
+		t.Fatalf("plan the long query: model %v, err %v", plan.model, err)
+	}
+	queryWindows, err := lateOnQueryWindows(model.tokenizer, plan.model.modelQuery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	windows := len(queryWindows)
+	t.Logf("the long query has %d windows", windows)
+	if windows < 2 {
+		t.Fatalf("the long query has %d windows, want 2 or more", windows)
+	}
+	floor := e2eRouteEmptyScore + float64(semanticRetrievalRadius)
+	high := min(1, float64(windows)*floor)
+	if high-floor < 0.01 {
+		t.Fatalf("no fine cosine c gives c/%d < %.4f < c with a margin", windows, floor)
+	}
+	fine := fmt.Sprintf("E2E_FINE_%04d", int(math.Round((floor+high)/2*10000)))
+
+	folder := t.TempDir()
+	for index := range 300 {
+		writeFileAt(t, folder, fmt.Sprintf("w/b%03d.go", index),
+			fmt.Sprintf("package w\n// %s %s E2E_AXIS1 both windows %03d\n", e2eRouteNear, fine, index))
+	}
+	for index := range 20 {
+		writeFileAt(t, folder, fmt.Sprintf("w/s%02d.go", index),
+			fmt.Sprintf("package w\n// %s %s first window only %02d\n", e2eRouteNear, fine, index))
+	}
+	writeFileAt(t, folder, "x/plain.go", "package x\n// plain far\n")
+	setTestUserCache(t)
+	t.Chdir(t.TempDir())
+	var every, both, first []string
+	for index := range 300 {
+		every = append(every, fmt.Sprintf("w/b%03d.go", index))
+	}
 	for index := range 100 {
 		both = append(both, fmt.Sprintf("w/b%03d.go", index))
 	}
@@ -809,35 +863,20 @@ func TestE2ERouteLongQueryWindowsOnEveryRoute(t *testing.T) {
 		name     string
 		query    string
 		backends []string
-		exact    bool
 		want     []string
 	}{
-		{"long/usearch", long, []string{"usearch"}, false, nil},
-		{"long/filtered-usearch", long + " file:w/", []string{"filtered-usearch"}, false, nil},
-		{"long/filtered-exact", long + ` file:w/[bs]0`, []string{"filtered-exact"}, true, e2eRouteJoin(folder, both...)},
-		{"short/filtered-exact", `zqalpha zqbeta file:w/[bs]0`, []string{"filtered-exact"}, true,
+		{"long/usearch", long, []string{"usearch"}, e2eRouteJoin(folder, every...)},
+		{"long/filtered-usearch", long + " file:w/", []string{"filtered-usearch"}, e2eRouteJoin(folder, every...)},
+		{"long/filtered-exact", long + ` file:w/[bs]0`, []string{"filtered-exact"}, e2eRouteJoin(folder, both...)},
+		{"short/filtered-exact", `zqalpha zqbeta file:w/[bs]0`, []string{"filtered-exact"},
 			e2eRouteJoin(folder, append(slices.Clone(both), first...)...)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			run := e2eRouteSearch(t, test.query, folder)
-			want := test.want
-			if !test.exact {
-				// Every w/b file is a candidate; the approximate route must
-				// return some of them, and more than one USearch call
-				// returns.
-				want = nil
-				for index := range 300 {
-					want = append(want, filepath.Join(folder, fmt.Sprintf("w/b%03d.go", index)))
-				}
-				slices.Sort(want)
-			}
-			got := e2eRouteVerify(t, run, want, test.backends, test.exact)
-			if !test.exact && len(got) <= semanticUSearchVectorsPerQuery {
-				t.Fatalf("found %d files, want more than the %d keys of one USearch call", len(got), semanticUSearchVectorsPerQuery)
-			}
+			run := e2eRouteSearch(t, model, test.query, folder)
+			e2eRouteVerify(t, run, test.want, test.backends)
 			if index == 0 {
 				// The first description built the vectors.
-				e2eRouteColdWarm(t, run, test.query, folder)
+				e2eRouteColdWarm(t, model, run, test.query, folder)
 			}
 		})
 	}
@@ -850,10 +889,11 @@ func TestE2ERouteLongQueryWindowsOnEveryRoute(t *testing.T) {
 // no lexical match has no lexical evidence. So the output must follow the
 // model scores when the vector scores order the files the other way. It must
 // also follow them when all vector scores are equal. The expected order comes
-// from the fixture.
+// from the fixture. The scores are chosen. The test proves the fusion rule
+// for vector-only hits; it proves nothing about the real model's ranking.
 func TestE2ERouteModelScoresOrderVectorHits(t *testing.T) {
-	fixTestUSearchShardRows(t, semanticUSearchMaxShardRows)
 	requireTools(t)
+	model := newE2ERouteModel(t)
 	folder := t.TempDir()
 	for index, file := range []struct{ name, fine, model string }{
 		{"rank/r1.go", "9500", "070"},
@@ -866,7 +906,7 @@ func TestE2ERouteModelScoresOrderVectorHits(t *testing.T) {
 		{"tie/d.go", "9000", "100"},
 	} {
 		writeFileAt(t, folder, file.name, fmt.Sprintf(
-			"package p\n// SEMANTIC_TARGET E2E_FINE_%s E2E_MODEL_%s file %d\n", file.fine, file.model, index))
+			"package p\n// %s E2E_FINE_%s E2E_MODEL_%s file %d\n", e2eRouteNear, file.fine, file.model, index))
 	}
 	setTestUserCache(t)
 	t.Chdir(t.TempDir())
@@ -878,11 +918,11 @@ func TestE2ERouteModelScoresOrderVectorHits(t *testing.T) {
 		{"vector-scores-equal", "file:tie/", []string{"tie/d.go", "tie/c.go", "tie/b.go", "tie/a.go"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			run := e2eRouteSearch(t, "zqalpha zqbeta "+test.filter, folder)
-			e2eRouteVerify(t, run, e2eRouteJoin(folder, test.want...), []string{"filtered-exact"}, true)
+			run := e2eRouteSearch(t, model, "zqalpha zqbeta "+test.filter, folder)
+			e2eRouteVerify(t, run, e2eRouteJoin(folder, test.want...), []string{"filtered-exact"})
 			var got []string
-			for _, path := range e2eRouteOrder(run.output) {
-				rel, err := filepath.Rel(folder, path)
+			for _, result := range printedResults(run.output) {
+				rel, err := filepath.Rel(folder, result.path)
 				if err != nil {
 					t.Fatal(err)
 				}

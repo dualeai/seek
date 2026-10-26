@@ -598,7 +598,7 @@ func TestOpenSemanticGenerationRejectsDamage(t *testing.T) {
 				t.Fatal(err)
 			}
 			if err := os.Symlink(backup, path); err != nil {
-				t.Skipf("symlink unavailable: %v", err)
+				t.Fatal(err)
 			}
 		}},
 	}
@@ -878,9 +878,21 @@ var semanticExactBenchmarkHits []semanticHit
 // BenchmarkExactSemanticRange isolates stored-vector validation and MaxSim
 // scoring at the retrieval radius. It keeps vectors resident in heap memory,
 // so it does not measure route planning, worker merge, mmap page faults, or
-// query preparation.
+// query preparation. The floor of each query size is the floor per scoring
+// token of a 3-word description, such as "request authentication flow": 6
+// scoring tokens with an empty-document score of 0.35 per token with the real
+// model (semanticRetrievalFloor).
 func BenchmarkExactSemanticRange(b *testing.B) {
 	const rowCount = 328
+	description := &semanticQueryEmbedding{
+		tokens:     make([]float32, lateOnSequenceLength*semanticEmbeddingDimensions),
+		scoreMask:  make([]bool, lateOnSequenceLength),
+		emptyScore: 0.35 * 6,
+	}
+	for token := range 6 {
+		description.scoreMask[token] = true
+	}
+	floorPerToken := semanticRetrievalFloor(description.emptyScore, 6) / 6
 	vectors := make([]semanticFineF16Vectors, rowCount)
 	for row := range vectors {
 		for centroid := range vectors[row] {
@@ -902,7 +914,7 @@ func BenchmarkExactSemanticRange(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			floor := semanticRetrievalRadius * float32(tokenCount)
+			floor := floorPerToken * float32(tokenCount)
 			ctx := context.Background()
 			b.ReportAllocs()
 			b.ResetTimer()

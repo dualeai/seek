@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -239,7 +240,7 @@ func TestRunSizesTheWindowFromTheGraph(t *testing.T) {
 		waited = errors.Is(err, context.DeadlineExceeded)
 	}
 	t.Cleanup(func() { folderBuildTestHook = nil })
-	if _, err := captureStdout(t, func() error { return run(t.Context(), "zqwindowmarker", []string{f.path("one")}) }); err != nil {
+	if _, err := seek(t, "--lexical-only", "zqwindowmarker", f.path("one")); err != nil {
 		t.Fatal(err)
 	}
 	if !ran {
@@ -311,14 +312,14 @@ func TestSearchesTakeNoBuildSlot(t *testing.T) {
 	coldRepo := f.graphRepo("coldrepo", "c.txt", marker)
 	setTestUserCache(t)
 	for _, warm := range []string{f.path("warm"), warmRepo} {
-		if _, err := captureStdout(t, func() error { return run(t.Context(), marker, []string{warm}) }); err != nil {
+		if _, err := seek(t, "--lexical-only", marker, warm); err != nil {
 			t.Fatal(err)
 		}
 	}
 	release := holdEveryBuildSlot(t)
 	for _, warm := range []string{f.path("warm"), warmRepo} {
 		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-		out, err := captureStdout(t, func() error { return run(ctx, marker, []string{warm}) })
+		out, err := captureStdout(t, func() error { return seekRoot(ctx, t, nil, "--lexical-only", marker, warm) })
 		cancel()
 		if err != nil || !strings.Contains(out, "a.txt") && !strings.Contains(out, "w.txt") {
 			t.Fatalf("the warm search of %s did not finish while the slots were taken: err=%v\n%s", warm, err, out)
@@ -328,7 +329,7 @@ func TestSearchesTakeNoBuildSlot(t *testing.T) {
 	for _, cold := range []string{f.path("cold"), coldRepo} {
 		done := make(chan error, 1)
 		go func() {
-			_, err := captureStdout(t, func() error { return run(t.Context(), marker, []string{cold}) })
+			_, err := seek(t, "--lexical-only", marker, cold)
 			done <- err
 		}()
 		select {
@@ -474,8 +475,10 @@ func TestSearchNodesRealIndexingBeyondTheWindow(t *testing.T) {
 	}
 }
 
-// TestPipelinePreparesEachNodeOnce runs a description over two nodes: the
-// command prepares each node once (2 preparations).
+// TestPipelinePreparesEachNodeOnce runs a description over two nodes, with a
+// model that accepts every row: the command prepares each node once (2
+// preparations), and one model session serves the command, with one prepared
+// query.
 func TestPipelinePreparesEachNodeOnce(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -484,35 +487,16 @@ func TestPipelinePreparesEachNodeOnce(t *testing.T) {
 	f.graphFile("two/c.txt", "alpha beta\n")
 	f.graphFile("two/d.txt", "beta only\n")
 	setTestUserCache(t)
+	model := observeModel(&hybridTestScorer{mode: payloadAccept})
 	before := nodePreparations.Load()
-	if _, err := runHybridTestSearch(t, "alpha beta", []string{f.path("one"), f.path("two")}, defaultSearchPolicy(),
-		func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil }); err != nil {
+	if _, err := seekWith(t, model.factory(), "alpha beta", f.path("one"), f.path("two")); err != nil {
 		t.Fatal(err)
 	}
 	if got := nodePreparations.Load() - before; got != 2 {
 		t.Fatalf("preparations=%d, want one per node (2)", got)
 	}
-}
-
-// TestPipelineOneModelSessionPerCommand runs a description over two nodes:
-// one model session serves the command.
-func TestPipelineOneModelSessionPerCommand(t *testing.T) {
-	requireTools(t)
-	f := newGraphFixture(t)
-	f.graphFile("one/a.txt", "alpha beta\n")
-	f.graphFile("two/c.txt", "alpha beta\n")
-	setTestUserCache(t)
-	var sessions atomic.Int32
-	scorer := &hybridTestScorer{}
-	if _, err := runHybridTestSearch(t, "alpha beta", []string{f.path("one"), f.path("two")}, defaultSearchPolicy(),
-		func(context.Context) (semanticModel, error) {
-			sessions.Add(1)
-			return scorer, nil
-		}); err != nil {
-		t.Fatal(err)
-	}
-	if sessions.Load() != 1 || scorer.prepareCalls.Load() != 1 {
-		t.Fatalf("sessions=%d query encodings=%d, want 1 and 1", sessions.Load(), scorer.prepareCalls.Load())
+	if model.starts.Load() != 1 || model.prepares.Load() != 1 {
+		t.Fatalf("sessions=%d prepared queries=%d, want 1 and 1", model.starts.Load(), model.prepares.Load())
 	}
 }
 
@@ -558,7 +542,7 @@ func TestCancelDuringGraphSearch(t *testing.T) {
 		}
 	}()
 	begin := time.Now()
-	err = run(ctx, "zqcancelmarker", []string{f.path("folder")})
+	err = seekRoot(ctx, t, nil, "--lexical-only", "zqcancelmarker", f.path("folder"))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err=%v, want the cancellation", err)
 	}
@@ -587,11 +571,10 @@ func TestCancelDuringGraphSearch(t *testing.T) {
 // nested repository with a bad HEAD, one with a corrupt index, and one whose
 // build cannot read its content, with a one-word and a two-word query: the
 // readable content returns, each failure warns once, and the exit is 0.
+// Root, or any user who can read a mode-000 folder, reads the locked folder.
+// The test then removes it and expects the 3 other warnings.
 func TestPartialFailureContract(t *testing.T) {
 	requireTools(t)
-	if os.Geteuid() == 0 {
-		t.Skip("root reads a mode-000 directory")
-	}
 	const words = "zqpartial contract"
 	for _, query := range []string{"zqpartial", words} {
 		t.Run(query, func(t *testing.T) {
@@ -608,6 +591,17 @@ func TestPartialFailureContract(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+			// Root opens the locked folder: remove it, so no part of the
+			// search reads hidden.txt or warns about the folder.
+			unreadable := true
+			hidden := []string{"hidden.txt", "head.txt", "index.txt", "build.txt"}
+			if dir, err := os.Open(locked); err == nil {
+				_ = dir.Close()
+				if err := os.RemoveAll(locked); err != nil {
+					t.Fatal(err)
+				}
+				unreadable, hidden = false, hidden[1:]
+			}
 			// The build of badbuild cannot read its content.
 			realGit, err := exec.LookPath("git")
 			if err != nil {
@@ -624,20 +618,19 @@ func TestPartialFailureContract(t *testing.T) {
 			t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 			setTestUserCache(t)
 			logs := captureTestLogs(t, slog.LevelWarn)
-			out, err := runHybridTestSearch(t, query, []string{f.path("tree")}, defaultSearchPolicy(),
-				func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil })
+			out, _, err := stubSearch(t, payloadFar, query, f.path("tree"))
 			if exitCodeForError(err) != 0 || !strings.Contains(out, "readable.txt") {
 				t.Fatalf("err=%v output:\n%s", err, out)
 			}
-			for _, hidden := range []string{"hidden.txt", "head.txt", "index.txt", "build.txt"} {
-				if strings.Contains(out, hidden) {
-					t.Fatalf("a failed part showed %s:\n%s", hidden, out)
+			for _, name := range hidden {
+				if strings.Contains(out, name) {
+					t.Fatalf("a failed part showed %s:\n%s", name, out)
 				}
 			}
 			records := logs.Records()
-			if len(records) != 4 || !logsMention(records, "could not be read") ||
+			if len(records) != len(hidden) || logsMention(records, "could not be read") != unreadable ||
 				!logsMention(records, badHead) || !logsMention(records, badIndex) || !logsMention(records, badBuild) {
-				t.Fatalf("warnings=%v, want one for each failed part", records)
+				t.Fatalf("warnings=%v, want one for each of the %d failed parts", records, len(hidden))
 			}
 		})
 	}
@@ -679,7 +672,7 @@ func TestOneFailedNodeWarnsOnce(t *testing.T) {
 			operands := tc.setup(f)
 			setTestUserCache(t)
 			logs := captureTestLogs(t, slog.LevelWarn)
-			out, err := captureStdout(t, func() error { return run(context.Background(), marker, operands) })
+			out, err := seek(t, slices.Concat([]string{"--lexical-only", marker}, operands)...)
 			if err != nil || !strings.Contains(out, "ok.txt") || strings.Contains(out, "secret.env") || strings.Contains(out, "inside.txt") {
 				t.Fatalf("err=%v output:\n%s", err, out)
 			}
@@ -704,8 +697,8 @@ func TestPersistentShardDamageFailsOnce(t *testing.T) {
 	f.graphFile("plain/b.txt", words)
 	setTestUserCache(t)
 	operands := []string{repo, f.path("plain")}
-	newModel := func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil }
-	if _, err := runHybridTestSearch(t, words, operands, defaultSearchPolicy(), newModel); err != nil {
+	newModel := modelFactory(&hybridTestScorer{})
+	if _, err := seekWith(t, newModel, slices.Concat([]string{words}, operands)...); err != nil {
 		t.Fatal(err)
 	}
 	paths, err := resolveGitPaths(context.Background(), repo)
@@ -756,7 +749,7 @@ func TestPersistentShardDamageFailsOnce(t *testing.T) {
 	defer releaseLock(holder)
 	logs := captureTestLogs(t, slog.LevelWarn)
 	before := nodePreparations.Load()
-	out, err := runHybridTestSearch(t, words, operands, defaultSearchPolicy(), newModel)
+	out, err := seekWith(t, newModel, slices.Concat([]string{words}, operands)...)
 	if err != nil || !strings.Contains(out, "b.txt") {
 		t.Fatalf("err=%v output:\n%s", err, out)
 	}
@@ -788,7 +781,7 @@ func TestCommittedShardDamageRepairsOnce(t *testing.T) {
 	f := newGraphFixture(t)
 	repo := f.graphRepo("repo", "a.txt", "zqrepair committed")
 	setTestUserCache(t)
-	if _, err := captureStdout(t, func() error { return run(t.Context(), "zqrepair", []string{repo}) }); err != nil {
+	if _, err := seek(t, "--lexical-only", "zqrepair", repo); err != nil {
 		t.Fatal(err)
 	}
 	plans, err := planCorpora(t.Context(), []string{repo})
@@ -818,7 +811,7 @@ func TestCommittedShardDamageRepairsOnce(t *testing.T) {
 	}
 	logs := captureTestLogs(t, slog.LevelWarn)
 	before := nodePreparations.Load()
-	out, err := captureStdout(t, func() error { return run(t.Context(), "zqrepair", []string{repo}) })
+	out, err := seek(t, "--lexical-only", "zqrepair", repo)
 	if err != nil || !strings.Contains(out, "a.txt") {
 		t.Fatalf("the repair must find the file: err=%v output:\n%s", err, out)
 	}
@@ -839,9 +832,11 @@ func TestCommittedShardDamageRepairsOnce(t *testing.T) {
 
 // TestDescriptionSearchWhileAPeerBuilds holds the build lock of a Git node
 // and a folder node, as a peer builder would, and searches after an edit of
-// each. Each node serves its last complete index (corpusStale), so the
-// description reads its text index only: one preparation per node, no failed
-// node, and the old files found.
+// each, with a model that accepts every row. Each node serves its last
+// complete index (corpusStale), so the description reads its text index only:
+// one preparation per node, no warning, the old files found, and no vector
+// hit. The first search, with no peer, prints a.txt, which holds no
+// query word, through vectors; the second does not.
 func TestDescriptionSearchWhileAPeerBuilds(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -850,10 +845,10 @@ func TestDescriptionSearchWhileAPeerBuilds(t *testing.T) {
 	f.graphFile("plain/c.txt", "zqpeer alpha beta")
 	setTestUserCache(t)
 	operands := []string{repo, f.path("plain")}
-	newModel := func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil }
-	out, err := runHybridTestSearch(t, "zqpeer alpha", operands, defaultSearchPolicy(), newModel)
-	if err != nil || !strings.Contains(out, "b.txt") || !strings.Contains(out, "c.txt") {
-		t.Fatalf("the first search must build both nodes: err=%v output:\n%s", err, out)
+	newModel := modelFactory(&hybridTestScorer{mode: payloadAccept})
+	out, err := seekWith(t, newModel, slices.Concat([]string{"zqpeer alpha"}, operands)...)
+	if err != nil || !strings.Contains(out, "b.txt") || !strings.Contains(out, "c.txt") || !strings.Contains(out, "a.txt") {
+		t.Fatalf("the first search must build both nodes and find a.txt through vectors: err=%v output:\n%s", err, out)
 	}
 	plans, err := planCorpora(t.Context(), operands)
 	if err != nil || len(plans) != 2 {
@@ -875,17 +870,18 @@ func TestDescriptionSearchWhileAPeerBuilds(t *testing.T) {
 	f.graphFile("plain/c.txt", "zqpeer alpha beta edited")
 	logs := captureTestLogs(t, slog.LevelWarn)
 	before := nodePreparations.Load()
-	out, err = runHybridTestSearch(t, "zqpeer alpha", operands, defaultSearchPolicy(), newModel)
+	out, err = seekWith(t, newModel, slices.Concat([]string{"zqpeer alpha"}, operands)...)
 	if err != nil || !strings.Contains(out, "c.txt") || !strings.Contains(out, "b.txt") || strings.Contains(out, "edited") {
 		t.Fatalf("want both nodes' old text indexes: err=%v output:\n%s", err, out)
+	}
+	if strings.Contains(out, "a.txt") {
+		t.Fatalf("the search read vectors while a peer builds:\n%s", out)
 	}
 	if got := nodePreparations.Load() - before; got != 2 {
 		t.Fatalf("preparations=%d, want 1 per node", got)
 	}
-	for _, record := range logs.Records() {
-		if strings.Contains(record.Message, "Skipped a search node") {
-			t.Fatalf("a node failed: %v", logs.Records())
-		}
+	if records := logs.Records(); len(records) != 0 {
+		t.Fatalf("a peer build is no failure, but the search warned: %v", records)
 	}
 }
 
@@ -913,8 +909,7 @@ func TestDescriptionReadRetriesAfterADirtyFileChanges(t *testing.T) {
 	}
 	t.Cleanup(func() { semanticPublishTestHook = nil })
 	before := nodePreparations.Load()
-	out, err := runHybridTestSearch(t, "zqretry fresh", []string{repo}, defaultSearchPolicy(),
-		func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil })
+	out, _, err := stubSearch(t, payloadFar, "zqretry fresh", repo)
 	if err != nil || editErr != nil || hookCalls.Load() == 0 {
 		t.Fatalf("err=%v edit=%v hook calls=%d", err, editErr, hookCalls.Load())
 	}
@@ -973,7 +968,7 @@ func TestBuildsUseTheCommandWindow(t *testing.T) {
 	}
 	search := func(operand string) {
 		t.Helper()
-		if _, err := captureStdout(t, func() error { return run(t.Context(), marker, []string{operand}) }); err != nil {
+		if _, err := seek(t, "--lexical-only", marker, operand); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1032,8 +1027,8 @@ func TestPeerBuildPrintsNoStaleTextOfAnEditedFile(t *testing.T) {
 	f := newGraphFixture(t)
 	repo := f.GitRepo("repo", "a.txt", "zqstaleedit alpha beta\n")
 	setTestUserCache(t)
-	newModel := func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil }
-	if _, err := runHybridTestSearch(t, "zqstaleedit alpha", []string{repo}, defaultSearchPolicy(), newModel); err != nil {
+	newModel := modelFactory(&hybridTestScorer{})
+	if _, err := seekWith(t, newModel, "zqstaleedit alpha", repo); err != nil {
 		t.Fatal(err)
 	}
 	plans, err := planCorpora(t.Context(), []string{repo})
@@ -1050,14 +1045,15 @@ func TestPeerBuildPrintsNoStaleTextOfAnEditedFile(t *testing.T) {
 	}
 	writeFixtureFile(t, filepath.Join(repo, "a.txt"), "edited while a peer builds\n")
 	for _, test := range []struct {
-		name, query string
-		newModel    semanticModelFactory
+		name     string
+		args     []string
+		newModel semanticModelFactory
 	}{
-		{"strict", "zqstaleedit", nil},
-		{"description", "zqstaleedit alpha", newModel},
+		{"strict", []string{"--lexical-only", "zqstaleedit", repo}, nil},
+		{"description", []string{"zqstaleedit alpha", repo}, newModel},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			out, err := runHybridTestSearch(t, test.query, []string{repo}, defaultSearchPolicy(), test.newModel)
+			out, err := seekWith(t, test.newModel, test.args...)
 			if strings.Contains(out, "zqstaleedit") || err != nil && !errors.Is(err, errNoMatch) {
 				t.Fatalf("want no old text of the edited file: err=%v output:\n%s", err, out)
 			}
@@ -1077,9 +1073,9 @@ func TestPeerBuildUncommittedCopyWinsForARevertedFile(t *testing.T) {
 	const committed = "zqrevertwin committedtext alpha beta\n"
 	repo := f.GitRepo("repo", "a.txt", committed)
 	setTestUserCache(t)
-	newModel := func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil }
+	newModel := modelFactory(&hybridTestScorer{})
 	writeFixtureFile(t, filepath.Join(repo, "a.txt"), "zqrevertwin editedtext alpha beta\n")
-	if _, err := runHybridTestSearch(t, "zqrevertwin alpha", []string{repo}, defaultSearchPolicy(), newModel); err != nil {
+	if _, err := seekWith(t, newModel, "zqrevertwin alpha", repo); err != nil {
 		t.Fatal(err)
 	}
 	plans, err := planCorpora(t.Context(), []string{repo})
@@ -1099,23 +1095,19 @@ func TestPeerBuildUncommittedCopyWinsForARevertedFile(t *testing.T) {
 		t.Fatalf("the revert left the work tree dirty: %q err=%v", out, err)
 	}
 	for _, test := range []struct {
-		name, query string
-		newModel    semanticModelFactory
+		name     string
+		args     []string
+		newModel semanticModelFactory
 	}{
-		{"strict", "zqrevertwin", nil},
-		{"description", "zqrevertwin alpha", newModel},
+		{"strict", []string{"--lexical-only", "zqrevertwin", repo}, nil},
+		{"description", []string{"zqrevertwin alpha", repo}, newModel},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			out, err := runHybridTestSearch(t, test.query, []string{repo}, defaultSearchPolicy(), test.newModel)
+			out, err := seekWith(t, test.newModel, test.args...)
 			if err != nil {
 				t.Fatalf("search: %v output:\n%s", err, out)
 			}
-			var headers []string
-			for line := range strings.Lines(out) {
-				if strings.HasPrefix(line, "## ") {
-					headers = append(headers, strings.TrimSpace(line))
-				}
-			}
+			headers := headerOrder(out)
 			if len(headers) != 1 || !strings.HasSuffix(headers[0], "a.txt (Text) [uncommitted]") {
 				t.Fatalf("headers=%q, want a.txt once, as the uncommitted copy; output:\n%s", headers, out)
 			}

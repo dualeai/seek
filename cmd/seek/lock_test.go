@@ -253,7 +253,7 @@ func TestTwoColdSearchesSameNode(t *testing.T) {
 		writeFileAt(t, folder, fmt.Sprintf("f%02d.txt", index), fmt.Sprintf("zqtwocold %d\n", index))
 	}
 	setTestUserCache(t)
-	// run writes to os.Stdout, which one swap covers for both searches.
+	// seekRoot writes to os.Stdout, which one swap covers for both searches.
 	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -267,7 +267,7 @@ func TestTwoColdSearchesSameNode(t *testing.T) {
 	var group errgroup.Group
 	for range 2 {
 		group.Go(func() error {
-			return run(context.Background(), "zqtwocold", []string{folder})
+			return seekRoot(context.Background(), t, nil, "--lexical-only", "zqtwocold", folder)
 		})
 	}
 	if err := group.Wait(); err != nil {
@@ -376,7 +376,7 @@ func TestReaderDoesNotWaitForAFullRebuild(t *testing.T) {
 	}
 	cacheDir := t.TempDir()
 	t.Setenv("SEEK_CACHE_DIR", cacheDir)
-	if _, err := captureStdout(t, func() error { return run(context.Background(), "zqreader", []string{repo}) }); err != nil {
+	if _, err := seek(t, "--lexical-only", "zqreader", repo); err != nil {
 		t.Fatal(err)
 	}
 	plans, err := planCorpora(context.Background(), []string{repo})
@@ -397,7 +397,7 @@ func TestReaderDoesNotWaitForAFullRebuild(t *testing.T) {
 	}
 	built := make(chan error, 1)
 	go func() {
-		_, err := captureStdout(t, func() error { return run(context.Background(), "zqreader", []string{repo}) })
+		_, err := seek(t, "--lexical-only", "zqreader", repo)
 		built <- err
 	}()
 	time.Sleep(500 * time.Millisecond)

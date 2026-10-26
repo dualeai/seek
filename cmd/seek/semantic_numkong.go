@@ -28,6 +28,8 @@ package main
 // mode change clears these registers, but the caller keeps its own values in
 // them, so the caller's floating-point values change. Seek does not use the
 // AMX kernels: they need a permission from the Linux kernel for each process.
+// TODO(https://github.com/ashvardanian/NumKong/issues/416): allow the SME
+// family once a NumKong release saves these registers.
 //
 // NumKong selects the skylake kernels when the CPU has AVX-512F, and the
 // haswell kernels when it has AVX2, FMA, and F16C. These kernels also use
@@ -36,6 +38,8 @@ package main
 // CPUs and virtual machines, these kernels can then stop the process with an
 // illegal instruction. So Seek also requires each feature of a family from
 // golang.org/x/sys/cpu, which includes the operating system check.
+// TODO(https://github.com/ashvardanian/NumKong/issues/415): drop this check
+// once NumKong checks every feature and the operating system state itself.
 
 /*
 #include <dlfcn.h>

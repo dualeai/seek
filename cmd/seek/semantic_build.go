@@ -402,6 +402,9 @@ func buildSemanticGeneration(
 	workerCount := resources.cpuLimit()
 	parsers := make([]ctags.Parser, workerCount)
 	for index := range parsers {
+		// TODO(https://github.com/sourcegraph/go-ctags/issues/27): go-ctags
+		// drops a tag whose reply line has 4,096 bytes or more, with no
+		// error, so such a symbol gets no unit of its own.
 		parser, err := ctags.New(ctags.Options{Bin: os.Getenv("CTAGS_COMMAND")})
 		if err != nil {
 			for _, opened := range parsers[:index] {

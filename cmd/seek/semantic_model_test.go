@@ -38,6 +38,11 @@ func TestSemanticCPUParallelismProvidesCapacityForEffectiveCPU(t *testing.T) {
 	}
 }
 
+// countingSemanticScorer is a model that counts its query, score and close
+// calls. Its build gives no vectors, its query holds only the score mask of
+// the test, and every score is 0. A test with it proves how often the model
+// future starts the model, prepares the query, scores and closes. It cannot
+// prove anything about vectors, scores or what a search prints.
 type countingSemanticScorer struct {
 	prepareCalls atomic.Int32
 	scoreCalls   atomic.Int32
@@ -151,6 +156,11 @@ func TestSemanticModelFutureReusesOneQueryForRetrievalAndRerank(t *testing.T) {
 	}
 }
 
+// waitingQueryScorer is countingSemanticScorer with a query preparation that
+// waits for release and then returns err. A test with it proves that the
+// model future waits for a started query before it closes the model, and
+// keeps the query result for later callers. It cannot prove that a real model
+// call stops when its context ends.
 type waitingQueryScorer struct {
 	countingSemanticScorer
 	release <-chan struct{}
@@ -189,9 +199,7 @@ func TestSemanticModelFutureCloseWaitsForStartedQuery(t *testing.T) {
 					}
 				}()
 				scorer := &waitingQueryScorer{release: release, err: test.err}
-				future := newSemanticModelFuture(func(context.Context) (semanticModel, error) {
-					return scorer, nil
-				})
+				future := newSemanticModelFuture(modelFactory(scorer))
 				// Close right after startQuery: it must already see the query
 				// as started and wait for it.
 				future.startQuery(ctx, "find request handler")

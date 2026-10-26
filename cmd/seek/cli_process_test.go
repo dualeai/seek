@@ -318,9 +318,12 @@ func TestCLIProcess_LexicalOnlySkipsSemanticCacheAndModel(t *testing.T) {
 // This sits at process level beside the --lexical-only test because it makes
 // the same kind of claim: a command either leaves semantic data in the cache or
 // it does not. The in-process tests cover why; this covers what a user sees.
+// The symbol lookup expects the model to add no file, so the folder has a
+// fixed model path (stableModelRoot) and the score does not change from run
+// to run.
 func TestCLIProcess_QueryShapeDecidesSemanticCache(t *testing.T) {
 	requireTools(t)
-	folder := t.TempDir()
+	folder := stableModelRoot(t)
 	writeFileAt(t, folder, "app.go", "package sample\n// alpha beta gamma describes the sample\n")
 
 	// wantCode guards this table against a vacuous pass: a case that expects no

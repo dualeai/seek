@@ -1,10 +1,10 @@
 package main
 
 import (
-	"context"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -34,9 +34,7 @@ const highTrigramNeedle = "high_trigram_needle_marker"
 func searchFrom(t *testing.T, dir, term string, operands []string) (string, error) {
 	t.Helper()
 	t.Chdir(dir)
-	return captureStdout(t, func() error {
-		return run(context.Background(), term, operands)
-	})
+	return seek(t, slices.Concat([]string{"--lexical-only", term}, operands)...)
 }
 
 // hasHeaderLine reports whether out has the file header line header, with

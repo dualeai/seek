@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	ort "github.com/yalue/onnxruntime_go"
+	"golang.org/x/sys/unix"
 )
 
 func TestLateOnCoreMLCacheDirectoryTracksModel(t *testing.T) {
@@ -275,8 +277,7 @@ func TestSearchFallbacksRecordAProviderFault(t *testing.T) {
 			path := pinAcceleratedProviderForTest(t)
 			search := func(scorer *hybridTestScorer) {
 				t.Helper()
-				output, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(),
-					func(context.Context) (semanticModel, error) { return scorer, nil })
+				output, err := seekWith(t, modelFactory(scorer), "alpha beta", folder)
 				if err != nil || !strings.Contains(output, "strict.go") {
 					t.Fatalf("output=%q err=%v, want the strict file", output, err)
 				}
@@ -345,14 +346,12 @@ func buildFolderWithFailingModel(t *testing.T, embedErr error) {
 	folder := t.TempDir()
 	writeFileAt(t, folder, "app.go", "package sample\n// semantic folder text\n")
 	plan := planFolderTestCorpus(t, folder)
-	execution := testSemanticSearchExecution(t, func(context.Context) (semanticModel, error) {
-		return semanticBuildTestEmbedder{embed: func(
-			context.Context,
-			[]semanticUnit,
-		) ([]semanticUnitEmbedding, error) {
-			return nil, embedErr
-		}}, nil
-	})
+	execution := testSemanticSearchExecution(t, modelFactory(semanticBuildTestEmbedder{embed: func(
+		context.Context,
+		[]semanticUnit,
+	) ([]semanticUnitEmbedding, error) {
+		return nil, embedErr
+	}}))
 	if _, err := ensureFolderCorpusFreshWithExecution(t.Context(), plan, execution); err != nil {
 		t.Fatalf("the build must keep lexical search, not fail: %v", err)
 	}
@@ -399,13 +398,60 @@ func TestReadLateOnProviderRecordRejectsMalformedRecords(t *testing.T) {
 	}
 }
 
-func TestProviderFaultCountSurvivesAPassingProbe(t *testing.T) {
+func TestLateOnProbeVerdict(t *testing.T) {
 	// A provider that agrees on the fixed probe batch but fails on real work
 	// must still earn a demotion. If a passing probe cleared the count, the two
 	// records would alternate for ever and nothing would change.
+	const at = 1_700_000_000
+	fault := lateOnProviderRecord{faults: 1, at: at}
+	for _, test := range []struct {
+		name    string
+		agree   bool
+		prior   lateOnProviderRecord
+		verdict string
+	}{
+		{
+			name:    "a passing probe keeps the fault and its time",
+			agree:   true,
+			prior:   fault,
+			verdict: fmt.Sprintf("%s 1 %d", lateOnVerdictRecheck, at),
+		},
+		{name: "a passing probe with no fault trusts", agree: true, verdict: lateOnVerdictTrusted},
+		{name: "a failing probe rejects", verdict: lateOnVerdictRejected},
+		{name: "a failing probe after a fault rejects", prior: fault, verdict: lateOnVerdictRejected},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			verdict, reason := lateOnProbeVerdict(test.agree, "token 3 differs", test.prior)
+			if verdict != test.verdict {
+				t.Fatalf("verdict = %q, want %q", verdict, test.verdict)
+			}
+			if !test.agree && reason != "token 3 differs" {
+				t.Fatalf("reason = %q, want the difference", reason)
+			}
+		})
+	}
+}
+
+// TestProviderProbeStoresTheRuleVerdict runs the real provider probe with one
+// fault on the record. The probe agrees on a host where Core ML gives correct
+// output, and disagrees on a host where it does not (macOS 15 ARM64, ONNX
+// Runtime issue 32569). When the probe finishes, selection keeps Core ML if and
+// only if the probe agreed. So the test gets the probe result from the
+// selected provider and requires the record that lateOnProbeVerdict must give
+// for it: the kept fault on the first kind of host, a rejection on the second.
+// On macOS 26 and later, the test also requires Core ML.
+func TestProviderProbeStoresTheRuleVerdict(t *testing.T) {
+	// The probe runs only with the automatic choice, so no pin may come from
+	// the environment.
+	t.Setenv(lateOnProviderEnv, "")
 	rawModel, _, path := newModelWithVerdictPath(t)
-	stamped := fmt.Sprintf("%s 1 %d\n", lateOnVerdictRecheck, time.Now().Unix())
-	if err := os.WriteFile(path, []byte(stamped), 0o600); err != nil {
+	prior := lateOnProviderRecord{faults: 1, at: time.Now().Unix()}
+	written := fmt.Sprintf("%s %d %d\n", lateOnVerdictRecheck, prior.faults, prior.at)
+	if err := os.WriteFile(path, []byte(written), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
 		t.Fatal(err)
 	}
 	lateOn, ok := rawModel.(*lateOnModel)
@@ -415,16 +461,54 @@ func TestProviderFaultCountSurvivesAPassingProbe(t *testing.T) {
 	if _, err := lateOn.semanticRowEncoder(t.Context(), false); err != nil {
 		t.Fatal(err)
 	}
-	if got := semanticProviderName(); got != lateOnAcceleratedProviderName {
-		t.Skipf("this host selected %q, so no probe ran", got)
+	provider := semanticProviderName()
+	// The probe writes its record through a rename, so a probe that finished
+	// leaves a new file. With no new file, the provider tells nothing about
+	// the probe: the Core ML session failed, or the probe stopped early.
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(before, after) {
+		t.Fatalf("no probe record was written; the selected provider is %q", provider)
 	}
 	stored, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if readLateOnProviderRecord(path).faults != 1 {
-		t.Fatalf("a passing probe cleared the fault count: %q", string(stored))
+	got := strings.TrimSpace(string(stored))
+	// The records are fixed values, not a call to lateOnProbeVerdict, so a
+	// fault in that rule also fails this test.
+	want := lateOnVerdictRejected
+	if provider == lateOnAcceleratedProviderName {
+		// Agreement after a fault keeps the count and its time.
+		want = strings.TrimSpace(written)
 	}
+	t.Logf("the probe selected %q and stored %q", provider, got)
+	if got != want {
+		t.Fatalf("stored record = %q, want %q", got, want)
+	}
+	// ONNX Runtime issue 32569 is a macOS 15 fault. On macOS 26 and later,
+	// Core ML gives correct output. A probe that rejects it there is a defect:
+	// every search would then use the CPU provider.
+	if major := macOSMajorVersion(t); major >= 26 && provider != lateOnAcceleratedProviderName {
+		t.Fatalf("the probe rejected Core ML on macOS %d and stored %q", major, got)
+	}
+}
+
+// macOSMajorVersion returns the major macOS version of the host, from the
+// same sysctl that the Core ML cache key reads.
+func macOSMajorVersion(t *testing.T) int {
+	t.Helper()
+	product, err := unix.Sysctl("kern.osproductversion")
+	if err != nil {
+		t.Fatal(err)
+	}
+	major, err := strconv.Atoi(strings.SplitN(product, ".", 2)[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return major
 }
 
 func TestRejectDoesNotDowngradeASettledRejection(t *testing.T) {
@@ -506,8 +590,7 @@ func TestOverlayScanFaultIsRecorded(t *testing.T) {
 	path := pinAcceleratedProviderForTest(t)
 	search := func(scorer *hybridTestScorer) {
 		t.Helper()
-		output, err := runHybridTestSearch(t, "alpha beta", []string{repo}, defaultSearchPolicy(),
-			func(context.Context) (semanticModel, error) { return scorer, nil })
+		output, err := seekWith(t, modelFactory(scorer), "alpha beta", repo)
 		if err != nil || !strings.Contains(output, "strict.go") {
 			t.Fatalf("output=%q err=%v, want the strict file", output, err)
 		}
@@ -530,8 +613,7 @@ func TestOneCommandRecordsOneProviderFault(t *testing.T) {
 	path := pinAcceleratedProviderForTest(t)
 	degenerate := fmt.Errorf("both: %w", errDegenerateSemanticVector)
 	scorer := &hybridTestScorer{embedErr: degenerate, scoreErr: degenerate}
-	output, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(),
-		func(context.Context) (semanticModel, error) { return scorer, nil })
+	output, err := seekWith(t, modelFactory(scorer), "alpha beta", folder)
 	if err != nil || !strings.Contains(output, "strict.go") {
 		t.Fatalf("output=%q err=%v, want the strict file", output, err)
 	}

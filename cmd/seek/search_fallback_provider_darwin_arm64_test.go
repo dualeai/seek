@@ -3,7 +3,6 @@
 package main
 
 import (
-	"context"
 	"strings"
 	"testing"
 )
@@ -30,9 +29,7 @@ func TestRunSearchCommandEmbeddingFaultRecordsOnce(t *testing.T) {
 			// Start with no index. Query preparation and final scoring still
 			// work when the vector build fails, so the strict file returns; a
 			// relaxed match alone is no candidate.
-			output, err := runHybridTestSearch(t, "alpha beta", []string{root}, defaultSearchPolicy(), func(context.Context) (semanticModel, error) {
-				return scorer, nil
-			})
+			output, err := seekWith(t, modelFactory(scorer), "alpha beta", root)
 			if err != nil || !strings.Contains(output, "strict.go") || strings.Contains(output, "relaxed.go") {
 				t.Fatalf("embedding fault fallback: output=%q error=%v", output, err)
 			}

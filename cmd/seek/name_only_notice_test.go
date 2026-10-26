@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,7 +16,7 @@ import (
 // name-only notice line, or "" when it prints none.
 func nameOnlyNotice(t *testing.T, query string, operands ...string) (string, string) {
 	t.Helper()
-	out, err := captureStdout(t, func() error { return run(context.Background(), query, operands) })
+	out, err := seek(t, slices.Concat([]string{"--lexical-only", query}, operands)...)
 	if err != nil {
 		t.Fatalf("run %q: %v\n%s", query, err, out)
 	}
@@ -120,7 +119,7 @@ func TestNameOnlyNoticeReadsTheCurrentCopy(t *testing.T) {
 func TestPartialCloneMissingBlobCounted(t *testing.T) {
 	requireTools(t)
 	clone := newPartialClone(t)
-	out, err := captureStdout(t, func() error { return run(context.Background(), "zqpartialmarker", []string{clone}) })
+	out, err := seek(t, "--lexical-only", "zqpartialmarker", clone)
 	if err != nil || !strings.Contains(out, "\n1 name-only file could also match") {
 		t.Fatalf("the missing blob is not counted: err=%v\n%s", err, out)
 	}

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -10,117 +9,66 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 )
 
-// The tests of this file drive the real search command with the test model
-// on query atoms and filters (the querySupport rows). Each description holds
-// words that no fixture file holds (zqalpha, zqbeta), so every result of a
-// description comes from vector search. The oracle of a filter is the
-// one-word text search "zqmark <filter>" (Zoekt's own rule), and a file set
-// worked out by hand from the fixture.
+// The tests of this file drive the root command with the test model on query
+// atoms and filters (the querySupport rows). Each description holds words
+// that no fixture file holds (zqalpha, zqbeta), so every result of a
+// description comes from vector search. The test model accepts every row
+// (payloadAccept), so a description prints every live file that its filters
+// keep. The tests prove the filters, the routes and the text that the model
+// reads; they prove nothing about meaning, tau, the retrieval radius or rank.
+// The oracle of a filter is the one-word text search "zqmark <filter>" with
+// --lexical-only (Zoekt's own rule), and a file set worked out by hand from
+// the fixture.
 
-// e2eFilterScorer is the test model of this file. It records the text of each
-// query that the model prepares and each document that the model scores. With
-// windows above 1, it prepares each query as that number of 128-token query
-// windows, and each window has one scoring token on the target direction.
-type e2eFilterScorer struct {
-	*hybridTestScorer
-	windows int
-
-	record  sync.Mutex
-	queries []string
-	scored  []rerankDocument
+// e2eFilterRun is the outcome of one search command, with the record of its
+// test model in accept mode. A test with it proves which files the filters
+// keep and which query text the model reads. It cannot prove meaning, tau,
+// the retrieval radius or rank.
+type e2eFilterRun struct {
+	output string
+	err    error
+	// model records the calls of the test model, and its starts count the
+	// calls of the factory.
+	model *observedModel
 }
 
-func (scorer *e2eFilterScorer) PrepareSemanticQuery(ctx context.Context, query string) (*semanticQueryEmbedding, error) {
-	scorer.record.Lock()
-	scorer.queries = append(scorer.queries, query)
-	scorer.record.Unlock()
-	if scorer.windows <= 1 {
-		return scorer.hybridTestScorer.PrepareSemanticQuery(ctx, query)
-	}
-	scorer.prepareCalls.Add(1)
-	prepared := &semanticQueryEmbedding{
-		tokens:     make([]float32, scorer.windows*lateOnSequenceLength*semanticEmbeddingDimensions),
-		scoreMask:  make([]bool, scorer.windows*lateOnSequenceLength),
-		modelQuery: query,
-	}
-	for window := range scorer.windows {
-		token := window*lateOnSequenceLength + 1
-		prepared.tokens[token*semanticEmbeddingDimensions] = 1
-		prepared.scoreMask[token] = true
-	}
-	return prepared, nil
-}
-
-func (scorer *e2eFilterScorer) ScoresWithSemanticQuery(
-	ctx context.Context,
-	prepared *semanticQueryEmbedding,
-	documents []rerankDocument,
-) ([]float32, error) {
-	scorer.record.Lock()
-	scorer.scored = append(scorer.scored, documents...)
-	scorer.record.Unlock()
-	return scorer.hybridTestScorer.ScoresWithSemanticQuery(ctx, prepared, documents)
+// e2eFilterSearch runs query on operands through the root command, with the
+// test model in accept mode. It does not use stubSearch, because these tests
+// read the records of observedModel: the query texts, the scored documents and
+// the factory starts. The "--" keeps a query that starts with "-" as the query.
+func e2eFilterSearch(t *testing.T, query string, operands ...string) e2eFilterRun {
+	t.Helper()
+	model := observeModel(&hybridTestScorer{mode: payloadAccept})
+	output, err := seekWith(t, model.factory(), slices.Concat([]string{"--", query}, operands)...)
+	return e2eFilterRun{output: output, err: err, model: model}
 }
 
 // modelQueries returns the text of each query that the model prepared.
-func (scorer *e2eFilterScorer) modelQueries() []string {
-	scorer.record.Lock()
-	defer scorer.record.Unlock()
-	return slices.Clone(scorer.queries)
+func (run e2eFilterRun) modelQueries() []string {
+	run.model.mu.Lock()
+	defer run.model.mu.Unlock()
+	return slices.Clone(run.model.queries)
 }
 
-// scoredNames returns the base name of each document that the model scored,
-// from every model call of the search.
-func (scorer *e2eFilterScorer) scoredNames() []string {
-	scorer.record.Lock()
-	defer scorer.record.Unlock()
-	names := make([]string, 0, len(scorer.scored))
-	for _, document := range scorer.scored {
-		names = append(names, filepath.Base(document.Path))
-	}
-	// The hybrid scorer keeps the documents of its last call: they must be
-	// in the record too.
-	scorer.mu.Lock()
-	defer scorer.mu.Unlock()
-	for _, document := range scorer.documents {
-		if !slices.Contains(names, filepath.Base(document.Path)) {
-			names = append(names, "missing-from-record:"+document.Path)
-		}
+// scoredNames returns the base name of each distinct path that the search
+// sent to the model, over all score calls (scoredPaths).
+func (run e2eFilterRun) scoredNames() []string {
+	paths, _ := run.model.scoredPaths()
+	names := make([]string, len(paths))
+	for index, path := range paths {
+		names[index] = filepath.Base(path)
 	}
 	return names
 }
 
-// e2eFilterRun is the outcome of one search command.
-type e2eFilterRun struct {
-	output string
-	err    error
-	scorer *e2eFilterScorer
-	// factory counts the calls of the model factory.
-	factory int32
-}
-
-// e2eFilterSearch runs query on operands through the real search command,
-// with the default policy and the test model.
-func e2eFilterSearch(t *testing.T, windows int, query string, operands ...string) e2eFilterRun {
+// e2eFilterText runs query on operands through the root command with
+// --lexical-only. The "--" keeps a query that starts with "-" as an argument.
+func e2eFilterText(t *testing.T, query string, operands ...string) (string, error) {
 	t.Helper()
-	return e2eFilterSearchWith(t, defaultSearchPolicy(), windows, query, operands...)
-}
-
-// e2eFilterSearchWith runs e2eFilterSearch with policy.
-func e2eFilterSearchWith(t *testing.T, policy searchPolicy, windows int, query string, operands ...string) e2eFilterRun {
-	t.Helper()
-	scorer := &e2eFilterScorer{hybridTestScorer: &hybridTestScorer{}, windows: windows}
-	var factory atomic.Int32
-	output, err := runHybridTestSearch(t, query, operands, policy, func(context.Context) (semanticModel, error) {
-		factory.Add(1)
-		return scorer, nil
-	})
-	return e2eFilterRun{output: output, err: err, scorer: scorer, factory: factory.Load()}
+	return seek(t, slices.Concat([]string{"--lexical-only", "--", query}, operands)...)
 }
 
 // e2eFilterNames returns the sorted base name of each result header.
@@ -143,17 +91,16 @@ type e2eFilterRow struct {
 
 // e2eFilterExpect checks one filter from the current folder on ".". The text
 // search "zqmark <filter>" must keep the hand set. The description
-// "zqalpha zqbeta <filter>" must keep the same files through vector search,
+// "zqalpha zqbeta <filter>" must print the same files through vector search,
 // and the model must score no other file. It returns the description output.
 func e2eFilterExpect(t *testing.T, row e2eFilterRow) e2eFilterRun {
 	t.Helper()
 	want := slices.Sorted(slices.Values(row.want))
-	text := e2eFilterSearchWith(t, lexicalOnlySearchPolicy(), 1, "zqmark "+row.filter, ".")
-	if got := e2eFilterNames(text.output); !slices.Equal(got, want) ||
-		(len(want) == 0) != errors.Is(text.err, errNoMatch) {
-		t.Fatalf("text oracle %q kept %v (err=%v), want %v:\n%s", row.filter, got, text.err, want, text.output)
+	text, textErr := e2eFilterText(t, "zqmark "+row.filter, ".")
+	if got := e2eFilterNames(text); !slices.Equal(got, want) || (len(want) == 0) != errors.Is(textErr, errNoMatch) {
+		t.Fatalf("text oracle %q kept %v (err=%v), want %v:\n%s", row.filter, got, textErr, want, text)
 	}
-	vector := e2eFilterSearch(t, 1, "zqalpha zqbeta "+row.filter, ".")
+	vector := e2eFilterSearch(t, "zqalpha zqbeta "+row.filter, ".")
 	switch {
 	case len(want) == 0:
 		if !errors.Is(vector.err, errNoMatch) || vector.output != "" {
@@ -163,13 +110,13 @@ func e2eFilterExpect(t *testing.T, row e2eFilterRow) e2eFilterRun {
 		t.Errorf("description with %q: %v\n%s", row.filter, vector.err, vector.output)
 	default:
 		if got := e2eFilterNames(vector.output); !slices.Equal(got, want) {
-			t.Errorf("vector search with %q kept %v, want the text oracle %v:\n%s", row.filter, got, want, vector.output)
+			t.Errorf("vector search with %q printed %v, want the text oracle %v:\n%s", row.filter, got, want, vector.output)
 		}
-		if vector.scorer.prepareCalls.Load() == 0 {
+		if vector.model.prepares.Load() == 0 {
 			t.Errorf("description with %q prepared no model query: it took the strict route", row.filter)
 		}
 	}
-	for _, name := range vector.scorer.scoredNames() {
+	for _, name := range vector.scoredNames() {
 		if !slices.Contains(want, name) {
 			t.Errorf("the model scored %s, which %q drops", name, row.filter)
 		}
@@ -188,13 +135,13 @@ func e2eFilterCheckTable(t *testing.T, rows []e2eFilterRow) {
 			if index != 0 {
 				return
 			}
-			if cold.scorer.embedCalls.Load() == 0 {
+			if cold.model.embeds.Load() == 0 {
 				t.Fatalf("the first description embedded nothing: it was not cold")
 			}
-			warm := e2eFilterSearch(t, 1, "zqalpha zqbeta "+row.filter, ".")
-			if warm.err != nil || warm.output != cold.output || warm.scorer.embedCalls.Load() != 0 {
+			warm := e2eFilterSearch(t, "zqalpha zqbeta "+row.filter, ".")
+			if warm.err != nil || warm.output != cold.output || warm.model.embeds.Load() != 0 {
 				t.Fatalf("warm search differs (err=%v embeds=%d):\ncold:\n%s\nwarm:\n%s",
-					warm.err, warm.scorer.embedCalls.Load(), cold.output, warm.output)
+					warm.err, warm.model.embeds.Load(), cold.output, warm.output)
 			}
 		})
 	}
@@ -212,24 +159,24 @@ func e2eFilterCheckTable(t *testing.T, rows []e2eFilterRow) {
 //   - other, a Git node with zoekt.name=zqnamed, which Seek does not read:
 //     other.go is committed in the repository with the opaque name.
 //
-// Each live file holds SEMANTIC_TARGET and zqmark. It returns the cache home.
+// Each live file holds zqmark. It returns the cache home.
 func e2eFilterContentTree(t *testing.T) string {
 	t.Helper()
 	f := newGraphFixture(t)
-	repo := f.GitRepo("tree/repo", "clean.go", "package repo\n// zqmark SEMANTIC_TARGET zqkeep ZqCase\nfunc ZqHeld() {}\n")
-	writeFixtureFile(t, filepath.Join(repo, "mod.go"), "package repo\n// zqmark SEMANTIC_TARGET zqkeep\nfunc ZqHeld() {}\n")
+	repo := f.GitRepo("tree/repo", "clean.go", "package repo\n// zqmark zqkeep ZqCase\nfunc ZqHeld() {}\n")
+	writeFixtureFile(t, filepath.Join(repo, "mod.go"), "package repo\n// zqmark zqkeep\nfunc ZqHeld() {}\n")
 	writeFixtureFile(t, filepath.Join(repo, "gone.go"),
-		"package repo\n// zqmark SEMANTIC_TARGET zqkeep zqdrop ZqCase zqcase ZQCASE\nfunc ZqHeld() {}\n\nfunc ZqFreed() {}\n")
+		"package repo\n// zqmark zqkeep zqdrop ZqCase zqcase ZQCASE\nfunc ZqHeld() {}\n\nfunc ZqFreed() {}\n")
 	gitRunIn(t, repo, "add", ".")
 	gitRunIn(t, repo, "commit", "-q", "-m", "content")
 	gitRunIn(t, repo, "config", "zoekt.archived", "1")
-	writeFixtureFile(t, filepath.Join(repo, "mod.go"), "package repo\n// zqmark SEMANTIC_TARGET zqdrop zqcase\nfunc ZqFreed() {}\n")
+	writeFixtureFile(t, filepath.Join(repo, "mod.go"), "package repo\n// zqmark zqdrop zqcase\nfunc ZqFreed() {}\n")
 	if err := os.Remove(filepath.Join(repo, "gone.go")); err != nil {
 		t.Fatal(err)
 	}
-	writeFixtureFile(t, filepath.Join(repo, "new.go"), "package repo\n// zqmark SEMANTIC_TARGET zqdrop ZQCASE\nfunc ZqFreed() {}\n")
-	writeFixtureFile(t, f.path("tree/loose/loose.go"), "package loose\n// zqmark SEMANTIC_TARGET zqkeep zqcase\nfunc ZqHeld() {}\n")
-	other := f.GitRepo("tree/other", "other.go", "package other\n// zqmark SEMANTIC_TARGET zqdrop ZqCase\nfunc ZqFreed() {}\n")
+	writeFixtureFile(t, filepath.Join(repo, "new.go"), "package repo\n// zqmark zqdrop ZQCASE\nfunc ZqFreed() {}\n")
+	writeFixtureFile(t, f.path("tree/loose/loose.go"), "package loose\n// zqmark zqkeep zqcase\nfunc ZqHeld() {}\n")
+	other := f.GitRepo("tree/other", "other.go", "package other\n// zqmark zqdrop ZqCase\nfunc ZqFreed() {}\n")
 	gitRunIn(t, other, "config", "zoekt.name", "zqnamed")
 	home := setTestUserCache(t)
 	t.Chdir(f.path("tree"))
@@ -260,7 +207,7 @@ func e2eFilterOtherRepo(t *testing.T) string {
 //     name or content.
 //   - other, a Git node: zqup/other.go is committed.
 //
-// Each live file holds SEMANTIC_TARGET and zqmark. It returns the cache home.
+// Each live file holds zqmark. It returns the cache home.
 func e2eFilterPathTree(t *testing.T) string {
 	t.Helper()
 	f := newGraphFixture(t)
@@ -270,20 +217,20 @@ func e2eFilterPathTree(t *testing.T) string {
 			t.Fatal(err)
 		}
 	}
-	repo := f.GitRepo("tree/repo", "ZqUp/clean.go", "package repo\n// zqmark SEMANTIC_TARGET\n")
-	writeFixtureFile(t, filepath.Join(repo, "zqlow/mod_test.go"), "package zqlow\n// zqmark SEMANTIC_TARGET committed\n")
-	writeFixtureFile(t, filepath.Join(repo, "zqlow/gone.go"), "package zqlow\n// zqmark SEMANTIC_TARGET deleted\n")
+	repo := f.GitRepo("tree/repo", "ZqUp/clean.go", "package repo\n// zqmark\n")
+	writeFixtureFile(t, filepath.Join(repo, "zqlow/mod_test.go"), "package zqlow\n// zqmark committed\n")
+	writeFixtureFile(t, filepath.Join(repo, "zqlow/gone.go"), "package zqlow\n// zqmark deleted\n")
 	gitRunIn(t, repo, "add", ".")
 	gitRunIn(t, repo, "commit", "-q", "-m", "paths")
-	writeFixtureFile(t, filepath.Join(repo, "zqlow/mod_test.go"), "package zqlow\n// zqmark SEMANTIC_TARGET modified\n")
+	writeFixtureFile(t, filepath.Join(repo, "zqlow/mod_test.go"), "package zqlow\n// zqmark modified\n")
 	if err := os.Remove(filepath.Join(repo, "zqlow/gone.go")); err != nil {
 		t.Fatal(err)
 	}
-	writeFixtureFile(t, filepath.Join(repo, "ZqUp/new.py"), "# zqmark SEMANTIC_TARGET untracked\n")
-	writeFixtureFile(t, f.path("tree/loose/zqlow/loose.go"), "package zqlow\n// zqmark SEMANTIC_TARGET folder\n")
-	writeFixtureFile(t, f.path("tree/loose/ZqUp/loose_test.py"), "# zqmark SEMANTIC_TARGET folder\n")
-	writeFixtureFile(t, f.path("tree/loose/zqbare"), "zqmark SEMANTIC_TARGET folder\n")
-	f.GitRepo("tree/other", "zqup/other.go", "package zqup\n// zqmark SEMANTIC_TARGET other\n")
+	writeFixtureFile(t, filepath.Join(repo, "ZqUp/new.py"), "# zqmark untracked\n")
+	writeFixtureFile(t, f.path("tree/loose/zqlow/loose.go"), "package zqlow\n// zqmark folder\n")
+	writeFixtureFile(t, f.path("tree/loose/ZqUp/loose_test.py"), "# zqmark folder\n")
+	writeFixtureFile(t, f.path("tree/loose/zqbare"), "zqmark folder\n")
+	f.GitRepo("tree/other", "zqup/other.go", "package zqup\n// zqmark other\n")
 	home := setTestUserCache(t)
 	t.Chdir(f.path("tree"))
 	return home
@@ -398,7 +345,8 @@ func TestE2EFilterPathFilters(t *testing.T) {
 // a backslash escape, smart case, programming names, an unknown prefix, a
 // plain OR, a token with no letter or digit, and parentheses. Each query takes
 // the vector route on every node kind. The model reads the hand-written text,
-// and the results are the files that the filters keep.
+// and with a model that accepts every row, the results are the files that the
+// filters keep.
 func TestE2EFilterDescriptionAtomsReachTheModel(t *testing.T) {
 	requireTools(t)
 	e2eFilterPathTree(t)
@@ -430,28 +378,28 @@ func TestE2EFilterDescriptionAtomsReachTheModel(t *testing.T) {
 	}
 	for index, test := range cases {
 		t.Run(test.query, func(t *testing.T) {
-			run := e2eFilterSearch(t, 1, test.query, ".")
+			run := e2eFilterSearch(t, test.query, ".")
 			if run.err != nil {
 				t.Fatalf("%v\n%s", run.err, run.output)
 			}
-			if index == 0 && run.scorer.embedCalls.Load() == 0 {
+			if index == 0 && run.model.embeds.Load() == 0 {
 				t.Fatal("the first description embedded nothing: it was not cold")
 			}
-			if got := run.scorer.modelQueries(); !slices.Equal(got, []string{test.model}) {
+			if got := run.modelQueries(); !slices.Equal(got, []string{test.model}) {
 				t.Errorf("the model read %q, want %q", got, test.model)
 			}
 			want := slices.Sorted(slices.Values(test.want))
 			if got := e2eFilterNames(run.output); !slices.Equal(got, want) {
-				t.Errorf("vector search kept %v, want %v:\n%s", got, want, run.output)
+				t.Errorf("vector search printed %v, want %v:\n%s", got, want, run.output)
 			}
-			for _, name := range run.scorer.scoredNames() {
+			for _, name := range run.scoredNames() {
 				if !slices.Contains(want, name) {
 					t.Errorf("the model scored %s, which the query drops", name)
 				}
 			}
 			if index == 0 {
-				warm := e2eFilterSearch(t, 1, test.query, ".")
-				if warm.err != nil || warm.output != run.output || warm.scorer.embedCalls.Load() != 0 {
+				warm := e2eFilterSearch(t, test.query, ".")
+				if warm.err != nil || warm.output != run.output || warm.model.embeds.Load() != 0 {
 					t.Fatalf("warm search differs (err=%v):\ncold:\n%s\nwarm:\n%s", warm.err, run.output, warm.output)
 				}
 			}
@@ -464,28 +412,22 @@ func TestE2EFilterDescriptionAtomsReachTheModel(t *testing.T) {
 // writes no vectors, and prints what --lexical-only prints. Every other form
 // (one description atom, with and without filters, a lone quoted phrase, an or
 // between descriptions, an or that binds the whole query, and filters alone)
-// prepares one model query and keeps every file of the strict search.
+// prepares one model query. With a model that accepts every row, it prints
+// every live file that its filters keep, and so every file of the strict
+// search.
 func TestE2EFilterEveryFormUsesVectors(t *testing.T) {
 	requireTools(t)
 	home := e2eFilterPathTree(t)
-	lexical := func(t *testing.T, query string) (string, error) {
-		t.Helper()
-		// The root command runs the query with --lexical-only, as the CLI
-		// does. The "--" keeps a query that starts with "-" as an argument.
-		root := newQuietRootCmd()
-		root.SetArgs([]string{"--lexical-only", "--", query, "."})
-		return captureStdout(t, func() error { return root.ExecuteContext(t.Context()) })
-	}
 	t.Run("-file:zqup -lang:go", func(t *testing.T) {
-		run := e2eFilterSearch(t, 1, "-file:zqup -lang:go", ".")
-		if run.factory != 0 || run.scorer.prepareCalls.Load() != 0 || run.scorer.embedCalls.Load() != 0 {
+		run := e2eFilterSearch(t, "-file:zqup -lang:go", ".")
+		if run.model.starts.Load() != 0 || run.model.prepares.Load() != 0 || run.model.embeds.Load() != 0 {
 			t.Fatalf("the model started: factory=%d prepares=%d embeds=%d",
-				run.factory, run.scorer.prepareCalls.Load(), run.scorer.embedCalls.Load())
+				run.model.starts.Load(), run.model.prepares.Load(), run.model.embeds.Load())
 		}
 		if got := e2eFilterNames(run.output); !slices.Equal(got, []string{"zqbare"}) {
 			t.Fatalf("strict search kept %v (err=%v), want zqbare:\n%s", got, run.err, run.output)
 		}
-		text, textErr := lexical(t, "-file:zqup -lang:go")
+		text, textErr := e2eFilterText(t, "-file:zqup -lang:go", ".")
 		if text != run.output || errors.Is(textErr, errNoMatch) != errors.Is(run.err, errNoMatch) {
 			t.Fatalf("--lexical-only prints another answer (err=%v):\n%s\nwant:\n%s", textErr, text, run.output)
 		}
@@ -497,8 +439,9 @@ func TestE2EFilterEveryFormUsesVectors(t *testing.T) {
 		query string
 		// want holds the files that the strict search keeps; nil keeps none.
 		want []string
-		// filters is the filter part of the query; every printed file must
-		// pass it. Empty: the query has no filter.
+		// filters is the filter part of the query; the search prints every
+		// live file that it keeps. Empty: the query has no filter, and the
+		// search prints every live file.
 		filters string
 	}{
 		{"zqalpha", nil, ""},
@@ -514,11 +457,11 @@ func TestE2EFilterEveryFormUsesVectors(t *testing.T) {
 		{"file:ZqUp", []string{"clean.go", "new.py", "loose_test.py"}, "file:ZqUp"},
 	} {
 		t.Run(test.query, func(t *testing.T) {
-			run := e2eFilterSearch(t, 1, test.query, ".")
-			if run.scorer.prepareCalls.Load() != 1 {
-				t.Fatalf("model queries=%d, want 1", run.scorer.prepareCalls.Load())
+			run := e2eFilterSearch(t, test.query, ".")
+			if run.model.prepares.Load() != 1 {
+				t.Fatalf("model queries=%d, want 1", run.model.prepares.Load())
 			}
-			text, textErr := lexical(t, test.query)
+			text, textErr := e2eFilterText(t, test.query, ".")
 			want := slices.Sorted(slices.Values(test.want))
 			if strict := e2eFilterNames(text); !slices.Equal(strict, want) || (len(want) == 0) != errors.Is(textErr, errNoMatch) {
 				t.Fatalf("strict search kept %v (err=%v), want %v:\n%s", strict, textErr, want, text)
@@ -529,14 +472,14 @@ func TestE2EFilterEveryFormUsesVectors(t *testing.T) {
 					t.Fatalf("the model route dropped the strict file %s:\n%s", name, run.output)
 				}
 			}
+			allowed := slices.Sorted(slices.Values(e2eFilterPathLive))
 			if test.filters != "" {
-				allowedText, _ := lexical(t, test.filters)
-				allowed := e2eFilterNames(allowedText)
-				for _, name := range got {
-					if !slices.Contains(allowed, name) {
-						t.Fatalf("the model route printed %s, which %q drops:\n%s", name, test.filters, run.output)
-					}
-				}
+				allowedText, _ := e2eFilterText(t, test.filters, ".")
+				allowed = e2eFilterNames(allowedText)
+			}
+			if !slices.Equal(got, allowed) {
+				t.Fatalf("the model route printed %v, want every live file that %q keeps %v:\n%s",
+					got, test.filters, allowed, run.output)
 			}
 		})
 	}
@@ -563,10 +506,11 @@ func e2eFilterSemanticDirs(t *testing.T, root string) []string {
 }
 
 // TestE2EFilterLongQueryKeepsEveryTerm runs a description of 130 words with a
-// -file: filter. The model reads every word in order. The test model
-// prepares the query as three query windows; a file passes the radius only
-// when retrieval reads every window. The results are the files that the
-// filter keeps, on every node kind.
+// -file: filter. The model reads the 130 words once, in order, with no filter
+// text, and with a model that accepts every row, the results are the files
+// that the filter keeps, on every node kind. The test proves that a long
+// description reaches the model whole and that its filters stay out; it
+// proves nothing about how a long real query ranks files.
 func TestE2EFilterLongQueryKeepsEveryTerm(t *testing.T) {
 	requireTools(t)
 	e2eFilterPathTree(t)
@@ -575,18 +519,18 @@ func TestE2EFilterLongQueryKeepsEveryTerm(t *testing.T) {
 		words[index] = fmt.Sprintf("zqw%03d", index)
 	}
 	description := strings.Join(words, " ")
-	run := e2eFilterSearch(t, 3, description+" -file:_test", ".")
+	run := e2eFilterSearch(t, description+" -file:_test", ".")
 	if run.err != nil {
 		t.Fatalf("%v\n%s", run.err, run.output)
 	}
-	if got := run.scorer.modelQueries(); len(got) != 1 || got[0] != description {
+	if got := run.modelQueries(); len(got) != 1 || got[0] != description {
 		t.Fatalf("the model read %q, want the 130 words", got)
 	}
 	want := []string{"clean.go", "loose.go", "new.py", "other.go", "zqbare"}
 	if got := e2eFilterNames(run.output); !slices.Equal(got, want) {
-		t.Fatalf("vector search kept %v, want %v:\n%s", got, want, run.output)
+		t.Fatalf("vector search printed %v, want %v:\n%s", got, want, run.output)
 	}
-	for _, name := range run.scorer.scoredNames() {
+	for _, name := range run.scoredNames() {
 		if !slices.Contains(want, name) {
 			t.Fatalf("the model scored %s, which -file:_test drops", name)
 		}
@@ -594,8 +538,9 @@ func TestE2EFilterLongQueryKeepsEveryTerm(t *testing.T) {
 }
 
 // TestE2EFilterTypeFilePrintsNamesOnly runs descriptions with type:file and
-// its spellings, alone and with filters. Vector search finds each file, and
-// the search prints only the name line of each file, as the text oracle does.
+// its spellings, alone and with filters. Vector search, with a model that
+// accepts every row, finds each file that the filters keep, and the search
+// prints only the name line of each file, as the text oracle does.
 // A negated -type:file fails the search of each node: Seek warns once for
 // each node and finds nothing.
 func TestE2EFilterTypeFilePrintsNamesOnly(t *testing.T) {
@@ -610,26 +555,25 @@ func TestE2EFilterTypeFilePrintsNamesOnly(t *testing.T) {
 	} {
 		t.Run(row.filter, func(t *testing.T) {
 			run := e2eFilterExpect(t, row)
-			header := ""
-			for line := range strings.Lines(run.output) {
-				line = strings.TrimSuffix(line, "\n")
-				switch {
-				case line == "":
-				case strings.HasPrefix(line, "## "):
-					header = strings.Fields(strings.TrimPrefix(line, "## "))[0]
-				case line != "0 "+header:
-					t.Fatalf("line %q is no name line of %s:\n%s", line, header, run.output)
+			if before, _, _ := strings.Cut(run.output, "## "); strings.TrimSpace(before) != "" {
+				t.Fatalf("%q prints before the first result:\n%s", before, run.output)
+			}
+			for _, result := range printedResults(run.output) {
+				for _, line := range result.body {
+					if line != "" && line != "0 "+result.path {
+						t.Fatalf("line %q is no name line of %s:\n%s", line, result.path, run.output)
+					}
 				}
 			}
 		})
 	}
 	t.Run("-type:file", func(t *testing.T) {
 		logs := captureTestLogs(t, slog.LevelWarn)
-		run := e2eFilterSearch(t, 1, "zqalpha zqbeta -type:file", ".")
+		run := e2eFilterSearch(t, "zqalpha zqbeta -type:file", ".")
 		if !errors.Is(run.err, errNoMatch) || run.output != "" {
 			t.Fatalf("err=%v, want no match:\n%s", run.err, run.output)
 		}
-		if names := run.scorer.scoredNames(); len(names) != 0 {
+		if names := run.scoredNames(); len(names) != 0 {
 			t.Fatalf("the model scored %v", names)
 		}
 		roots := map[string]bool{}
@@ -654,7 +598,7 @@ func TestE2EFilterTypeFilePrintsNamesOnly(t *testing.T) {
 func TestE2EFilterUpstreamPanicForms(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
-	writeFileAt(t, folder, "a.go", "package sample\n// zqmark SEMANTIC_TARGET\n")
+	writeFileAt(t, folder, "a.go", "package sample\n// zqmark\n")
 	for _, test := range []struct {
 		query  string
 		strict bool

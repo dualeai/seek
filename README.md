@@ -126,6 +126,9 @@ that only the model adds must pass a score threshold. No result means exit code
 1, which does not prove that the code is absent. If the model fails, Seek
 returns the text matches (`-v` gives the reason).
 
+Write a description of three to six words: a shorter one adds few files by
+meaning, and a longer one can add none.
+
 The first search builds the meaning-based index; later searches embed only
 changed files. Set `SEEK_PROVIDER=cpu` to run the model on the CPU,
 for example to report a problem; the default picks the best provider of the

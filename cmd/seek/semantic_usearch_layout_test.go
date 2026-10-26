@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -50,13 +51,23 @@ func streamTestUSearchShards(
 	return <-done
 }
 
-// fixTestUSearchShardRows makes every build of the test cut shards of at most
-// rows rows, whatever the CPU count of the host.
-func fixTestUSearchShardRows(tb testing.TB, rows uint64) {
+// setTestUSearchShardCPUs sets GOMAXPROCS for the test, and restores it
+// after, so that the build of a generation of rows rows cuts shards of size
+// rows. The build sizes its shards from the row count and GOMAXPROCS
+// (semanticUSearchShardRowsFor), as for a user. The helper keeps the host
+// count when it gives size. Otherwise it sets rows/size CPUs: each CPU then
+// gets from size to 2*size-1 rows, which give size.
+func setTestUSearchShardCPUs(tb testing.TB, rows, size uint64) {
 	tb.Helper()
-	saved := semanticUSearchShardRowsTestHook
-	semanticUSearchShardRowsTestHook = rows
-	tb.Cleanup(func() { semanticUSearchShardRowsTestHook = saved })
+	cpus := runtime.GOMAXPROCS(0)
+	if semanticUSearchShardRowsFor(rows, cpus) != size {
+		cpus = max(1, int(rows/size))
+	}
+	if got := semanticUSearchShardRowsFor(rows, cpus); got != size {
+		tb.Fatalf("%d rows on %d CPUs get shards of %d rows, want %d", rows, cpus, got, size)
+	}
+	saved := runtime.GOMAXPROCS(cpus)
+	tb.Cleanup(func() { runtime.GOMAXPROCS(saved) })
 }
 
 // fixedTestUSearchPlans cuts rows rows into shards of size rows, with no file
@@ -129,12 +140,12 @@ func testShardRows(files []testShardFile) ([]semanticUnit, []semanticUnitEmbeddi
 	return units, embeddings
 }
 
-// planTestShards runs the planner over the rows of files with a fixed shard
-// size, one file at a time.
+// planTestShards runs the planner over units, one file at a time, on the CPU
+// count that gives shards of size rows: on len(units)/size CPUs, each CPU
+// gets from size to 2*size-1 rows. It fails if the planner cuts another size.
 func planTestShards(t *testing.T, units []semanticUnit, size uint64) []semanticUSearchShardPlan {
 	t.Helper()
-	fixTestUSearchShardRows(t, size)
-	planner := newSemanticUSearchShardPlanner(1)
+	planner := newSemanticUSearchShardPlanner(max(1, len(units)/int(size)))
 	var plans []semanticUSearchShardPlan
 	for first := 0; first < len(units); {
 		end := first + 1
@@ -148,7 +159,11 @@ func planTestShards(t *testing.T, units []semanticUnit, size uint64) []semanticU
 		plans = append(plans, got...)
 		first = end
 	}
-	return append(plans, planner.finish()...)
+	plans = append(plans, planner.finish()...)
+	if planner.shardRows() != size {
+		t.Fatalf("%d rows: shards of %d rows, want %d", len(units), planner.shardRows(), size)
+	}
+	return plans
 }
 
 func TestSemanticUSearchShardRowsForSizesFromTheHost(t *testing.T) {
@@ -502,7 +517,7 @@ func TestBuildSemanticUSearchStreamRebuildsForOtherVectors(t *testing.T) {
 func TestGraphShardsSurviveAOneFileCommit(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
-	fixTestUSearchShardRows(t, semanticUSearchMinShardRows)
+	setTestUSearchShardCPUs(t, 1_201, semanticUSearchMinShardRows)
 	repo := initGitRepo(t, "seed.go", "package sample\n// alpha beta seed\n")
 	for index := range 1_200 {
 		writeFileAt(t, repo, fmt.Sprintf("pkg/d%02d/f%04d.go", index/50, index),
@@ -582,7 +597,7 @@ func TestGraphShardsSurviveAOneFileCommit(t *testing.T) {
 func TestFolderOneFileChangeReusesGraphShards(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
-	fixTestUSearchShardRows(t, semanticUSearchMinShardRows)
+	setTestUSearchShardCPUs(t, 1_200, semanticUSearchMinShardRows)
 	folder := t.TempDir()
 	for index := range 1_200 {
 		writeFileAt(t, folder, fmt.Sprintf("pkg/d%02d/f%04d.go", index/50, index),
@@ -611,8 +626,19 @@ func TestFolderOneFileChangeReusesGraphShards(t *testing.T) {
 		}
 		inodes[semanticRowsCheckOf(info).Inode] = true
 	}
-	time.Sleep(20 * time.Millisecond)
+	// Set the mtime of the changed file 1 s after its old one, as an edit
+	// made later would: its stat then differs from the indexed one on any
+	// clock resolution, with no wait.
+	changed := filepath.Join(folder, "pkg", "d12", "f0600.go")
+	old, err := os.Stat(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
 	writeFileAt(t, folder, "pkg/d12/f0600.go", "package sample\n// alpha beta changed file\n\nfunc Changed() int {\n\treturn 1\n}\n")
+	mtime := old.ModTime().Add(time.Second)
+	if err := os.Chtimes(changed, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
 	built := semanticUSearchShardsBuilt.Load()
 	reuseSearch(t, "alpha beta", folder)
 	second, _ := filepath.Glob(glob)
@@ -647,7 +673,7 @@ func TestFolderOneFileChangeReusesGraphShards(t *testing.T) {
 func TestWorktreeGraphSourceIsCopiedNotLinked(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
-	fixTestUSearchShardRows(t, semanticUSearchMinShardRows)
+	setTestUSearchShardCPUs(t, 601, semanticUSearchMinShardRows)
 	repo := initGitRepo(t, "seed.go", "package sample\n// alpha beta seed\n")
 	for index := range 600 {
 		writeFileAt(t, repo, fmt.Sprintf("pkg/d%02d/f%04d.go", index/50, index),
@@ -721,19 +747,21 @@ func TestRefusedGraphLinkCopiesTheFile(t *testing.T) {
 
 // TestDamagedGraphShardIsRebuiltOnce damages one graph shard of a folder node
 // and of a Git node in place, as a disk fault that also changes the file time
-// would. The next search hashes the shard, keeps its text hits, and removes
-// the vector generations: one warning. The search after it builds the graphs
-// again, and a warm search then hashes no shard and builds none.
+// would. The next search hashes the shard, keeps its text hits (every file
+// holds the query words), and removes the vector generations: one warning.
+// The search after it builds the graphs again, and a warm search then hashes
+// no shard and builds none.
 func TestDamagedGraphShardIsRebuiltOnce(t *testing.T) {
 	requireTools(t)
 	for _, kind := range []string{"folder", "git"} {
 		t.Run(kind, func(t *testing.T) {
 			setTestUserCache(t)
-			fixTestUSearchShardRows(t, semanticUSearchMinShardRows)
 			var root string
 			if kind == "folder" {
+				setTestUSearchShardCPUs(t, 600, semanticUSearchMinShardRows)
 				root = t.TempDir()
 			} else {
+				setTestUSearchShardCPUs(t, 601, semanticUSearchMinShardRows)
 				root = initGitRepo(t, "seed.go", "package sample\n// alpha beta seed\n")
 			}
 			for index := range 600 {
@@ -778,11 +806,14 @@ func TestDamagedGraphShardIsRebuiltOnce(t *testing.T) {
 
 			from := len(logs.Records())
 			hashed := semanticShardsHashed.Load()
-			reuseSearch(t, "alpha beta", root)
+			_, output := reuseSearchWith(t, &hybridTestScorer{}, "alpha beta", root)
 			shards, vectors, skips, next := repairWarnings(logs, from)
 			if semanticShardsHashed.Load() == hashed || shards != 0 || vectors != 1 || skips != 0 {
 				t.Fatalf("search with the damaged shard: hashed %d shards, warnings %d/%d/%d; want a hash and one vector repair",
 					semanticShardsHashed.Load()-hashed, shards, vectors, skips)
+			}
+			if header := "## " + filepath.Join(root, "pkg", "d00", "f0000.go"); !strings.Contains(output, header) {
+				t.Fatalf("the search with the damaged shard printed no %q, want its text hits", header)
 			}
 			built := semanticUSearchShardsBuilt.Load()
 			reuseSearch(t, "alpha beta", root)

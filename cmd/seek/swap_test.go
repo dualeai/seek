@@ -261,7 +261,7 @@ func TestPublishStepFailureKeepsTheLiveFamily(t *testing.T) {
 			}
 			search := func() string {
 				t.Helper()
-				out, err := captureStdout(t, func() error { return run(t.Context(), "zqtorn", []string{root}) })
+				out, err := seek(t, "--lexical-only", "zqtorn", root)
 				if err != nil {
 					t.Fatalf("search: %v", err)
 				}
@@ -313,7 +313,7 @@ func TestPublishStepFailureKeepsTheLiveFamily(t *testing.T) {
 			if label := readCacheFile(plan.cacheDir, swappingMarkerFile); label != "" {
 				t.Fatalf(".swapping=%q after a rolled-back swap, want none", label)
 			}
-			if edited, err := captureStdout(t, func() error { return run(t.Context(), "zqtornedit", []string{root}) }); err != nil || !strings.Contains(edited, "f3.txt") {
+			if edited, err := seek(t, "--lexical-only", "zqtornedit", root); err != nil || !strings.Contains(edited, "f3.txt") {
 				t.Fatalf("the next search must publish the edit: err=%v\n%s", err, edited)
 			}
 		})

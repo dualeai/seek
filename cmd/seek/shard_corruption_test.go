@@ -29,7 +29,9 @@ const (
 	// fromSizedDeltas and unmarshalDocSections), which reached 12 GB in 1.7 s.
 	// A cap of 128 MiB finds the same offsets as 512 MiB, and the -race child
 	// then peaks near 390 MB of memory instead of 2 GB.
-	// TODO: link the upstream Zoekt issue once it is filed.
+	// TODO(https://github.com/sourcegraph/zoekt/issues/1205): fail on a hang
+	// in place of the heap cap once Zoekt returns an error on a cut-off
+	// varint.
 	shardScanHeapCap  = 128 << 20
 	shardScanHangExit = 3
 )

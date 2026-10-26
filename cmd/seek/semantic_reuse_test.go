@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -14,18 +15,30 @@ import (
 	"time"
 )
 
-// reuseSearch runs one descriptive search with a fresh test scorer and
-// returns the paths that the model embedded.
+// reuseSearch runs one descriptive search with a fresh test model in the far
+// mode and returns the path of each unit that the model embedded.
 func reuseSearch(t *testing.T, query string, root string) []string {
 	t.Helper()
-	scorer := &hybridTestScorer{}
-	if _, err := runHybridTestSearch(t, query, []string{root}, defaultSearchPolicy(),
-		func(context.Context) (semanticModel, error) { return scorer, nil }); err != nil {
+	units, _ := reuseSearchWith(t, &hybridTestScorer{}, query, root)
+	paths := make([]string, len(units))
+	for index, unit := range units {
+		paths[index] = unit.path
+	}
+	return paths
+}
+
+// reuseSearchWith runs one descriptive search with model and returns a copy
+// of each unit that the model embedded, in call order, and the output.
+func reuseSearchWith(t *testing.T, model semanticModel, query string, root string) ([]semanticUnit, string) {
+	t.Helper()
+	observed := observeModel(model)
+	output, err := seekWith(t, observed.factory(), query, root)
+	if err != nil {
 		t.Fatal(err)
 	}
-	scorer.mu.Lock()
-	defer scorer.mu.Unlock()
-	return slices.Clone(scorer.embeddedPaths)
+	observed.mu.Lock()
+	defer observed.mu.Unlock()
+	return slices.Clone(observed.units), output
 }
 
 // TestCacheKeyIncludesModelInput checks that the key follows the model input:
@@ -77,7 +90,7 @@ func TestEmbeddingCacheReusesUnchangedFilesAcrossCommits(t *testing.T) {
 }
 
 // TestOneLineEditReembedsOneUnit edits one line inside the middle function of
-// a file: the next build embeds that unit only.
+// a file: the next build embeds that unit only, Beta with its new line.
 func TestOneLineEditReembedsOneUnit(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -90,8 +103,13 @@ func TestOneLineEditReembedsOneUnit(t *testing.T) {
 	}
 	writeFileAt(t, repo, "three.go", strings.Replace(content, "return 2", "return 22", 1))
 	gitRunIn(t, repo, "commit", "-q", "-am", "edit Beta")
-	if second := reuseSearch(t, "alpha beta", repo); len(second) != 1 {
-		t.Fatalf("the second build embedded %d rows (%v), want the edited unit only", len(second), second)
+	second, _ := reuseSearchWith(t, &hybridTestScorer{}, "alpha beta", repo)
+	if len(second) != 1 || !bytes.HasPrefix(second[0].text, []byte("func Beta() int {\n\treturn 22 ")) {
+		var got []string
+		for _, unit := range second {
+			got = append(got, fmt.Sprintf("%s %q", unit.path, unit.text))
+		}
+		t.Fatalf("the second build embedded %v, want the edited unit Beta only", got)
 	}
 }
 
@@ -115,9 +133,10 @@ func TestLinkedWorktreesEmbedNothingNew(t *testing.T) {
 	}
 }
 
-// TestRunFolderChangeEmbedsOnlyChangedFile edits one file of a 50-file folder
-// so that it describes the query: the search finds it through vectors, and
-// the build embeds rows of that file only.
+// TestRunFolderChangeEmbedsOnlyChangedFile edits one file of a 50-file
+// folder: the next build embeds rows of that file only. The model accepts
+// every row, so the search prints the file through its vectors, and the
+// result holds the new text, not the old text.
 func TestRunFolderChangeEmbedsOnlyChangedFile(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -127,18 +146,23 @@ func TestRunFolderChangeEmbedsOnlyChangedFile(t *testing.T) {
 		writeFileAt(t, folder, fmt.Sprintf("f%02d.go", i), fmt.Sprintf("package sample\n// alpha file %d\n", i))
 	}
 	t.Chdir(t.TempDir())
-	if first := reuseSearch(t, "alpha beta", folder); len(first) < 50 {
+	if first, _ := reuseSearchWith(t, &hybridTestScorer{mode: payloadAccept}, "alpha beta", folder); len(first) < 50 {
 		t.Fatalf("the first build embedded %d rows", len(first))
 	}
-	writeFileAt(t, folder, "f07.go", "package sample\n// SEMANTIC_TARGET dispatches a request to its handler\n")
-	scorer := &hybridTestScorer{}
-	output, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(),
-		func(context.Context) (semanticModel, error) { return scorer, nil })
-	if err != nil || !strings.Contains(output, "## "+filepath.Join(folder, "f07.go")) {
-		t.Fatalf("output=%q err=%v, want f07.go through vectors", output, err)
+	const edit = "dispatches a request to its handler"
+	writeFileAt(t, folder, "f07.go", "package sample\n// "+edit+"\n")
+	units, output := reuseSearchWith(t, &hybridTestScorer{mode: payloadAccept}, "alpha beta", folder)
+	_, block, found := strings.Cut(output, "## "+filepath.Join(folder, "f07.go"))
+	block, _, _ = strings.Cut(block, "\n## ")
+	if !found || !strings.Contains(block, edit) || strings.Contains(output, "alpha file 7\n") {
+		t.Fatalf("output=%q, want the f07.go result with its new text only", output)
 	}
-	if got := scorer.embeddedPaths; len(got) == 0 || slices.ContainsFunc(got, func(path string) bool { return path != "f07.go" }) {
-		t.Fatalf("the change embedded %v, want f07.go only", got)
+	var paths []string
+	for _, unit := range units {
+		paths = append(paths, unit.path)
+	}
+	if len(paths) == 0 || slices.ContainsFunc(paths, func(path string) bool { return path != "f07.go" }) {
+		t.Fatalf("the change embedded %v, want f07.go only", paths)
 	}
 }
 
@@ -176,18 +200,14 @@ func TestRowsIntegrityCheckedOnceAtBind(t *testing.T) {
 // TestFileReuseRowsMatchFreshRows builds a generation for one file, then asks
 // the reuse index for the same content under another root with the same
 // path tail. A second build, with no reuse index, stores that file under the
-// new path. The copied rows equal the rows of that fresh build, so file reuse
-// changes no stored byte.
+// new path. The copied rows equal the rows of that fresh build, and each
+// copied row reads the vectors that the fresh build stores for it, so file
+// reuse changes no stored byte. The test model gives each window a vector of
+// its own model input, so a row that reads the vectors of another row shows.
 func TestFileReuseRowsMatchFreshRows(t *testing.T) {
 	requireTools(t)
 	content := longSemanticFunction(6_000)
-	embedder := semanticBuildTestEmbedder{embed: func(_ context.Context, units []semanticUnit) ([]semanticUnitEmbedding, error) {
-		embeddings := make([]semanticUnitEmbedding, len(units))
-		for index := range embeddings {
-			embeddings[index] = testSemanticUnitEmbedding(semanticVector{0: 1})
-		}
-		return embeddings, nil
-	}}
+	embedder := &hybridTestScorer{mode: payloadAccept}
 	// build stores content at path in a generation of indexDir, with no
 	// reuse index.
 	build := func(indexDir, path string) string {
@@ -228,6 +248,12 @@ func TestFileReuseRowsMatchFreshRows(t *testing.T) {
 		want.reuse, want.row, want.text, want.modelInput = nil, 0, nil, nil
 		if fmt.Sprintf("%+v", got) != fmt.Sprintf("%+v", want) {
 			t.Fatalf("row %d:\ncopied %+v\nfresh  %+v", index, got, want)
+		}
+		if copied[index].reuse == nil {
+			t.Fatalf("row %d names no vectors to copy", index)
+		}
+		if fine, coarse := copied[index].reuse.vectors(); *fine != fresh.vectors[index] || *coarse != fresh.coarse[index] {
+			t.Fatalf("row %d copies other vectors than the fresh build stores for it", index)
 		}
 	}
 }
@@ -349,22 +375,27 @@ func TestRowsCheckRefreshedAfterAFullCheck(t *testing.T) {
 }
 
 // TestColdFolderReadsNoOtherCorpus searches a Git repository and a folder,
-// then a new folder, all three with the same file: a folder has no lineage,
-// so its build reads no generation of another corpus, copies no row from
-// one, and embeds the file.
+// then a new folder, all three with the same file at the same path tail, so
+// its rows have the same keys in each. A Git lineage shares nothing with a
+// folder, and a folder whose root neither holds nor sits in another root
+// shares no lineage, so each build reads no generation of another corpus,
+// copies no row from one, and embeds the file.
 func TestColdFolderReadsNoOtherCorpus(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
-	const content = "package sample\n// alpha beta one\n"
-	repo := initGitRepo(t, "a.go", content)
+	const name, content = "p/q/r/a.go", "package sample\n// alpha beta one\n"
+	repo := initGitRepo(t, "seed.go", "package sample\n// alpha beta seed\n")
+	writeFileAt(t, repo, name, content)
+	gitRunIn(t, repo, "add", ".")
+	gitRunIn(t, repo, "commit", "-q", "-m", "tail")
 	first := t.TempDir()
-	writeFileAt(t, first, "a.go", content)
+	writeFileAt(t, first, name, content)
 	cold := t.TempDir()
-	writeFileAt(t, cold, "a.go", content)
+	writeFileAt(t, cold, name, content)
 	t.Chdir(t.TempDir())
 	for _, root := range []string{repo, first, cold} {
-		if embedded := reuseSearch(t, "alpha beta", root); !slices.Contains(embedded, "a.go") {
-			t.Fatalf("%s embedded %v, want a.go: its build copied rows of another corpus", root, embedded)
+		if embedded := reuseSearch(t, "alpha beta", root); !slices.Contains(embedded, name) {
+			t.Fatalf("%s embedded %v, want %s: its build copied rows of another corpus", root, embedded, name)
 		}
 	}
 }

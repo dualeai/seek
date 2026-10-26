@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -202,46 +203,37 @@ func TestEnsureFolderCorpusFresh_ColdThenWarm_SearchableBoth(t *testing.T) {
 // TestWarmFolderVectorSearchTakesNoBuildSlot runs a warm folder search that
 // reads vectors while every build slot is held: the fast path finds the bound
 // generation of the folder's semantic source with no build lock, so the
-// search ends.
+// search ends. b.go holds no word of the query, so only the vector read can
+// print it. The warm search embeds no unit and prints what the cold search
+// printed, b.go included. A search that waits for a slot never ends: go test
+// -timeout then stops the process with a dump of each goroutine, which shows
+// the wait in acquireBuildSlot. The process ends there, so no later test
+// shares os.Stdout with the waiting search.
 func TestWarmFolderVectorSearchTakesNoBuildSlot(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
 	folder := t.TempDir()
 	writeFileAt(t, folder, "a.go", "package a\n// alpha beta handler\n")
-	model := func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil }
-	if _, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(), model); err != nil {
+	writeFileAt(t, folder, "b.go", "package a\n// dispatches a request to its handler\n")
+	scorer := &hybridTestScorer{mode: payloadAccept}
+	model := modelFactory(scorer)
+	cold, err := seekWith(t, model, "alpha beta", folder)
+	if err != nil {
 		t.Fatal(err)
 	}
+	embeds := scorer.embedCalls.Load()
+	if embeds == 0 || !slices.Contains(headerPaths(cold), filepath.Join(folder, "b.go")) {
+		t.Fatalf("the cold search embedded %d calls and printed %v, want b.go from the vectors:\n%s",
+			embeds, headerPaths(cold), cold)
+	}
 	release := holdEveryBuildSlot(t)
-	done := make(chan error, 1)
-	finished := make(chan struct{})
-	go func() {
-		defer close(finished)
-		_, err := runHybridTestSearch(t, "alpha beta", []string{folder}, defaultSearchPolicy(), model)
-		done <- err
-	}()
-	// A search that outlives a failed test still holds os.Stdout: wait for it,
-	// after t.Context ends it, so the next test does not race on os.Stdout.
-	t.Cleanup(func() {
-		select {
-		case <-finished:
-		case <-time.After(30 * time.Second):
-		}
-	})
-	select {
-	case err := <-done:
-		release()
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(10 * time.Second):
-		release()
-		// When the test returns, t.Context ends a search that still waits.
-		select {
-		case err := <-done:
-			t.Fatalf("the warm vector search waited for a build slot (after release: %v)", err)
-		case <-time.After(30 * time.Second):
-			t.Fatal("the warm vector search did not end, also after the release")
-		}
+	warm, err := seekWith(t, model, "alpha beta", folder)
+	release()
+	if err != nil {
+		t.Fatalf("the warm vector search failed while every build slot was held: %v", err)
+	}
+	if warm != cold || scorer.embedCalls.Load() != embeds {
+		t.Fatalf("the warm search embedded %d calls, want 0, and must print b.go from the vectors as the cold search did; cold:\n%s\nwarm:\n%s",
+			scorer.embedCalls.Load()-embeds, cold, warm)
 	}
 }

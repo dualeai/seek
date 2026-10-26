@@ -41,9 +41,7 @@ func TestFolderBusyWriterColdSearchSucceeds(t *testing.T) {
 	if !edited {
 		t.Fatal("the build hook did not run")
 	}
-	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "edited", []string{f.path("folder")})
-	})
+	out, err := seek(t, "--lexical-only", "edited", f.path("folder"))
 	if err != nil || !strings.Contains(out, "a.txt") {
 		t.Fatalf("next search missed the edit: err=%v\n%s", err, out)
 	}
@@ -145,14 +143,12 @@ func TestFolderDatalessNameOnly(t *testing.T) {
 	if got := slices.Sorted(maps.Keys(graphSearch(t, marker, f.path("folder")))); !slices.Equal(got, []string{"folder/local.txt"}) {
 		t.Fatalf("content search found %q, want only folder/local.txt", got)
 	}
-	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "file:cloud", []string{f.path("folder")})
-	})
+	out, err := seek(t, "--lexical-only", "file:cloud", f.path("folder"))
 	if err != nil || !strings.Contains(out, "cloud.txt") {
 		t.Fatalf("cloud-only file is not searchable by name: err=%v\n%s", err, out)
 	}
 	// The name-only notice counts the cloud-only file.
-	out, err = captureStdout(t, func() error { return run(context.Background(), marker, []string{f.path("folder")}) })
+	out, err = seek(t, "--lexical-only", marker, f.path("folder"))
 	if err != nil || !strings.Contains(out, "\n\n1 name-only file could also match") {
 		t.Fatalf("the notice does not count the cloud-only file: err=%v\n%s", err, out)
 	}
@@ -187,9 +183,7 @@ func TestFolderSameSizeRewriteDetected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := captureStdout(t, func() error {
-		return run(context.Background(), "zqoldcontent1", []string{f.path("folder")})
-	}); err != nil {
+	if out, err := seek(t, "--lexical-only", "zqoldcontent1", f.path("folder")); err != nil {
 		t.Fatalf("first search: %v\n%s", err, out)
 	}
 	if err := os.WriteFile(path, []byte("zqnewcontent1\n"), 0o644); err != nil {
@@ -198,9 +192,7 @@ func TestFolderSameSizeRewriteDetected(t *testing.T) {
 	if err := os.Chtimes(path, before.ModTime(), before.ModTime()); err != nil {
 		t.Fatal(err)
 	}
-	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "zqnewcontent1", []string{f.path("folder")})
-	})
+	out, err := seek(t, "--lexical-only", "zqnewcontent1", f.path("folder"))
 	if err != nil || !strings.Contains(out, "f.txt") {
 		t.Fatalf("same-size rewrite missed: err=%v\n%s", err, out)
 	}
@@ -322,9 +314,7 @@ func TestFolderUnreadableFileSearchableByName(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
 	setTestUserCache(t)
-	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "file:locked", []string{f.path("folder")})
-	})
+	out, err := seek(t, "--lexical-only", "file:locked", f.path("folder"))
 	if err != nil || !strings.Contains(out, "locked.txt") {
 		t.Fatalf("unreadable file is not searchable by name: err=%v\n%s", err, out)
 	}
@@ -385,9 +375,7 @@ func TestFolderUnreadableFileInWarmFolderByName(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(locked, 0o644) })
-	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "file:zqlockedname", []string{f.path("folder")})
-	})
+	out, err := seek(t, "--lexical-only", "file:zqlockedname", f.path("folder"))
 	if err != nil || !strings.Contains(out, "zqlockedname.txt") {
 		t.Fatalf("output=%q err=%v, want the unreadable file by name", out, err)
 	}
@@ -512,7 +500,7 @@ func TestFolderFileReplacedByFIFOAfterWalkDoesNotBlock(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		out, err := captureStdout(t, func() error { return run(t.Context(), query, []string{f.path("folder")}) })
+		out, err := seek(t, "--lexical-only", query, f.path("folder"))
 		done <- result{out, err}
 	}()
 	select {
@@ -588,7 +576,7 @@ func TestFolderFileReplacedAfterWalkReadsAsRemoved(t *testing.T) {
 				return saved(path)
 			}
 			t.Cleanup(func() { folderOpenFile = saved })
-			out, err := captureStdout(t, func() error { return run(t.Context(), query, []string{folder}) })
+			out, err := seek(t, "--lexical-only", query, folder)
 			if err != nil || !replaced || !strings.Contains(out, "b.txt") || strings.Contains(out, test.target) {
 				t.Fatalf("replaced=%t err=%v output:\n%s", replaced, err, out)
 			}

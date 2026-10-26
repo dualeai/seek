@@ -667,6 +667,14 @@ func TestSemanticFilteredRouteBoundaryAndNativeFailure(t *testing.T) {
 	}
 }
 
+// TestRunDefaultJoinedSearchUsesUSearchAboveExactThreshold searches a folder
+// with more rows than the exact route takes, so the search takes the USearch
+// route, and checks that the native graph returns the row nearest to an exact
+// query and that the file of that row prints. Vectors and scores are chosen:
+// each row gets a fixed vector, the query is the vector of the target row, and
+// the test model accepts every candidate. The test proves the route switch
+// above 256 rows and that the native graph finds the row nearest to an exact
+// query; it proves nothing about real vectors, tau or rank.
 func TestRunDefaultJoinedSearchUsesUSearchAboveExactThreshold(t *testing.T) {
 	requireTools(t)
 	logs := captureTestLogs(t, slog.LevelDebug)
@@ -680,7 +688,7 @@ func TestRunDefaultJoinedSearchUsesUSearchAboveExactThreshold(t *testing.T) {
 		t,
 		folder,
 		"00-target.go",
-		"package sample\n// SEMANTIC_TARGET dispatches the selected request\n",
+		"package sample\n// dispatches the selected request\n",
 	)
 	for index := range semanticUSearchVectorsPerQuery + 4 {
 		path := fmt.Sprintf("a-%03d.go", index)
@@ -695,28 +703,14 @@ func TestRunDefaultJoinedSearchUsesUSearchAboveExactThreshold(t *testing.T) {
 	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
 	plan := planFolderTestCorpus(t, folder)
 	scorer := &hybridTestScorer{
+		mode: payloadAccept,
 		vectorForUnit: func(unit semanticUnit) semanticVector {
 			return vectorsByPath[unit.path]
 		},
 		queryVector: &targetVector,
 	}
 
-	output, err := captureStdout(t, func() error {
-		return runSearchCommand(
-			t.Context(),
-			"alpha beta",
-			[]string{folder},
-			0,
-			0,
-			defaultSearchConfig(),
-			searchRunConfig{
-				policy: defaultSearchPolicy(),
-				newModel: func(context.Context) (semanticModel, error) {
-					return scorer, nil
-				},
-			},
-		)
-	})
+	output, err := seekWith(t, modelFactory(scorer), "alpha beta", folder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -764,7 +758,7 @@ func TestRunDefaultJoinedSearchUsesUSearchAboveExactThreshold(t *testing.T) {
 		t.Fatalf("native USearch omitted target row %d from %d candidates", targetRow, len(rows))
 	}
 	if !strings.Contains(output, "## "+filepath.Join(folder, "00-target.go")) ||
-		!strings.Contains(output, "SEMANTIC_TARGET") {
+		!strings.Contains(output, "dispatches the selected request") {
 		t.Fatalf("joined search omitted the native candidate:\n%s", output)
 	}
 	for _, record := range logs.Records() {

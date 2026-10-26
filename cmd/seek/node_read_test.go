@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -54,41 +55,49 @@ func TestNodeReadSharesOneLoad(t *testing.T) {
 // TestNodeReadLoadsShardsOnce counts the shard loads of one warm search of a
 // dirty Git node: the strict route (no model) and the model route each load
 // the node's shards once, for every query of the read. A read with no search
-// loads none.
+// loads none. The test model accepts every row, so c.go, which holds no query
+// word, is a scan hit with no strict match: the model route runs the relaxed
+// query and scores c.go.
 func TestNodeReadLoadsShardsOnce(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
 	repo := f.GitRepo("repo", "a.go", "package main\n// zqonce alpha committed\n")
-	// c.go is a base scan hit and no strict match, so the relaxed query runs.
-	writeTrackedFile(t, repo, "c.go", "package main\n// SEMANTIC_TARGET\n")
+	writeTrackedFile(t, repo, "c.go", "package main\n// no word of the query\n")
 	// b.go is dirty: the overlay.
 	writeFixtureFile(t, filepath.Join(repo, "b.go"), "package main\n// zqonce alpha dirty\n")
 	setTestUserCache(t)
-	newModel := func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil }
-	if _, err := runHybridTestSearch(t, "zqonce alpha file:go", []string{repo}, defaultSearchPolicy(), newModel); err != nil {
+	if _, _, err := stubSearch(t, payloadAccept, "zqonce alpha file:go", repo); err != nil {
 		t.Fatal(err)
 	}
-	for _, test := range []struct {
-		name, query string
-		newModel    semanticModelFactory
-	}{
+	t.Run("strict", func(t *testing.T) {
 		// The file: atom makes the strict route run its header listing too.
-		{"strict", "zqonce file:go", nil},
+		before := nodeShardLoads.Load()
+		out, err := seek(t, "--lexical-only", "zqonce file:go", repo)
+		if err != nil || !strings.Contains(out, "b.go") {
+			t.Fatalf("err=%v output:\n%s", err, out)
+		}
+		if got := nodeShardLoads.Load() - before; got != 1 {
+			t.Fatalf("shard loads=%d, want 1", got)
+		}
+	})
+	t.Run("description", func(t *testing.T) {
 		// The strict query, the name-only count, both scans with the file
 		// selection, and the relaxed query.
-		{"description", "zqonce alpha file:go", newModel},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			before := nodeShardLoads.Load()
-			out, err := runHybridTestSearch(t, test.query, []string{repo}, defaultSearchPolicy(), test.newModel)
-			if err != nil || !strings.Contains(out, "b.go") {
-				t.Fatalf("err=%v output:\n%s", err, out)
-			}
-			if got := nodeShardLoads.Load() - before; got != 1 {
-				t.Fatalf("shard loads=%d, want 1", got)
-			}
-		})
-	}
+		before := nodeShardLoads.Load()
+		out, scorer, err := stubSearch(t, payloadAccept, "zqonce alpha file:go", repo)
+		if err != nil || !strings.Contains(out, "b.go") {
+			t.Fatalf("err=%v output:\n%s", err, out)
+		}
+		if got := nodeShardLoads.Load() - before; got != 1 {
+			t.Fatalf("shard loads=%d, want 1", got)
+		}
+		scorer.mu.Lock()
+		scored := slices.ContainsFunc(scorer.documents, func(document rerankDocument) bool { return document.Path == "c.go" })
+		scorer.mu.Unlock()
+		if !scored {
+			t.Fatalf("the model did not score c.go, so the relaxed query did not run:\n%s", out)
+		}
+	})
 	plans, err := planCorpora(t.Context(), []string{repo})
 	if err != nil || len(plans) != 1 {
 		t.Fatalf("plans=%d err=%v", len(plans), err)

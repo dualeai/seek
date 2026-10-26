@@ -13,23 +13,29 @@ import (
 	"github.com/sourcegraph/zoekt/query"
 )
 
+// cancellationTestModel is the test model with a build that fails
+// (errRerankUnavailable), so no vector exists and only strict hits can print.
+// Its query preparation or its scoring, as failureStage says, calls fail and
+// returns that error, so a test can cancel the command inside the model call.
+// A test with it proves the route after a model failure: the strict fallback
+// for an ordinary error, no output and the cancellation for a cancelled
+// command. It cannot prove that a cancellation stops a real model call in
+// time, or anything about vectors, meaning or rank.
 type cancellationTestModel struct {
-	fixedRerankScorer
+	hybridTestScorer
 	failureStage string
 	fail         func() error
-	prepareCalls atomic.Int32
-	closeCalls   atomic.Int32
 }
 
 func (model *cancellationTestModel) PrepareSemanticQuery(
 	ctx context.Context,
 	text string,
 ) (*semanticQueryEmbedding, error) {
-	model.prepareCalls.Add(1)
 	if model.failureStage == "prepare" {
+		model.prepareCalls.Add(1)
 		return nil, model.fail()
 	}
-	return model.fixedRerankScorer.PrepareSemanticQuery(ctx, text)
+	return model.hybridTestScorer.PrepareSemanticQuery(ctx, text)
 }
 
 func (model *cancellationTestModel) ScoresWithSemanticQuery(
@@ -39,11 +45,6 @@ func (model *cancellationTestModel) ScoresWithSemanticQuery(
 ) ([]float32, error) {
 	model.scoreCalls.Add(1)
 	return nil, model.fail()
-}
-
-func (model *cancellationTestModel) Close() error {
-	model.closeCalls.Add(1)
-	return nil
 }
 
 func TestRunSearchCommandLexicalModelCancellation(t *testing.T) {
@@ -60,13 +61,7 @@ func TestRunSearchCommandLexicalModelCancellation(t *testing.T) {
 				strict, relaxed := t.TempDir(), t.TempDir()
 				writeFileAt(t, strict, "strict.go", "package sample\n// alpha beta\n")
 				writeFileAt(t, relaxed, "relaxed.go", "package sample\n// alpha only\n")
-				paths := []string{strict, relaxed}
-				run := func(ctx context.Context, config searchRunConfig) (string, error) {
-					return captureStdout(t, func() error {
-						return runSearchCommand(ctx, "alpha beta", paths, 0, 0, defaultSearchConfig(), config)
-					})
-				}
-				baseline, err := run(t.Context(), searchRunConfig{})
+				baseline, err := seek(t, "--lexical-only", "alpha beta", strict, relaxed)
 				if err != nil || !strings.Contains(baseline, "strict.go") || strings.Contains(baseline, "relaxed.go") {
 					t.Fatalf("strict baseline: output=%q error=%v", baseline, err)
 				}
@@ -74,7 +69,8 @@ func TestRunSearchCommandLexicalModelCancellation(t *testing.T) {
 				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
 				model := &cancellationTestModel{
-					failureStage: stage,
+					hybridTestScorer: hybridTestScorer{embedErr: errRerankUnavailable},
+					failureStage:     stage,
 					fail: func() error {
 						if cancelled {
 							cancel()
@@ -82,11 +78,8 @@ func TestRunSearchCommandLexicalModelCancellation(t *testing.T) {
 						return errors.New("fake model failure")
 					},
 				}
-				output, err := run(ctx, searchRunConfig{
-					policy: defaultSearchPolicy(),
-					newModel: func(context.Context) (semanticModel, error) {
-						return model, nil
-					},
+				output, err := captureStdout(t, func() error {
+					return seekRoot(ctx, t, modelFactory(model), "alpha beta", strict, relaxed)
 				})
 				// The output shows the route: a cancelled command prints
 				// nothing and returns the cancellation; an ordinary model

@@ -26,28 +26,87 @@ import (
 // no model stage gets corpusSearchResult values from each node (strictNode)
 // and has no ranked list.
 
-// Retrieval rule: a semantic hit is a row whose fine MeanMaxSim is at least
-// tau_file - delta. A file whose model MeanMaxSim passes tau_file then has its
-// rows within the radius while the fine vectors under-estimate the model score
-// by at most delta. delta is the p99.9 of (model MeanMaxSim - fine
+// Retrieval rule: a semantic hit is a row whose summed fine MaxSim F reaches
+// S0 + (tau_file - delta) * T (semanticRetrievalFloor), with S0 the
+// empty-document score of the query (semanticQueryEmbedding.emptyScore) and T
+// its token count. A file whose model lift (S - S0) / T passes tau_file then
+// has its rows within the radius while the fine vectors under-estimate the
+// model score S by at most delta per token.
+//
+// delta comes from the earlier rule: the p99.9 of (model MeanMaxSim - fine
 // MeanMaxSim) over 18,856 window rows of a Kubernetes checkout with a model
 // MeanMaxSim of at least 0.55 (p50 0.008, p99 0.069, max 0.149). A per-token
 // coarse radius kept every Kubernetes file (delta p99 0.445), so it is not the
 // rule.
+//
+// The measurement of pipelineTauFile gives a larger p99.9, 0.1413, over the
+// rows of both corpora with a model lift of at least 0.15 (3,906 rows). But at
+// tau_file 0.25, each delta from 0.10 to 0.15 kept a row of each admitted file
+// in the radius, and 0.1158 gives a short description 15.4 (Seek) and 9.4
+// (Kubernetes) candidate files against 26.8 and 27.7 at 0.1413. Fewer
+// candidates make a shorter search, so delta stays 0.1158.
 const semanticRetrievalDelta float32 = 0.1158
 
-// pipelineTauFile is the per-file acceptance threshold, a MeanMaxSim. A
-// calibration of 2026-09-14 set it for an earlier rule that admitted a query
-// by its best file (65/72 useful and 0/71 wrong-project descriptions on six
-// repository families).
-const pipelineTauFile float32 = 0.6
+// pipelineTauFile is the per-file acceptance threshold: the lift of the model
+// score above the empty-document score, per query token (meanMaxSimPasses).
+// A measurement of 2026-10-22 set it with the model of
+// TestRerankAcceptanceCalibrationContract on Core ML (the CPU provider
+// differs by at most 0.0005). The corpora were the 97 production files of
+// Seek (5,142 rows) and every 48th production Go file of Kubernetes at
+// 912ec3583d77 (298 files, 17,355 rows), with rows built with ctags symbols,
+// as the index builds them. The queries were 58 descriptions: 14 behaviors of
+// Seek in 3 lengths, 12 descriptions with no answer, 3 nonsense queries, and
+// a sentence of 51 tokens with no topic.
+//
+// The descriptions from other projects (e-mail, HTML pages, images), the
+// nonsense, and the sentence with no topic must admit no file. Their largest
+// lift is 0.2002 (Kubernetes), so 0.25 admits none of them. At 0.25, the
+// descriptions of the 14 Seek behaviors find their files for 8 of 14 short
+// forms, 1 of 14 questions and 0 of 14 long forms, with 16 false files. The
+// earlier rule, 0.6 on the score per token, found 8, 8 and 14 with 1,418
+// false files: it admitted almost every file for a long query, because each
+// token with no topic adds to the score of any text. The lift per token falls
+// as the query grows, so a long description finds few files.
+//
+// A description of one or two words adds few files by meaning. T counts the
+// 3 special tokens of each window (CLS, the query marker, SEP). Their lift
+// is about 0 or less: a median of -0.10 per token for one word. So the 1 to
+// 4 content tokens of such a description must lift the sum by 1.0 to 1.75
+// or more alone. A probe of 2026-10-23 used the same model and corpora. It
+// found the files of 6 of 21 one-word and 9 of 17 two-word labelled
+// descriptions of the Seek behaviors. On a corpus of 222 Seek files, 15
+// one-word descriptions added 12 files by meaning (111 with the earlier
+// rule). A lift per content token (T without the special tokens, tau_file
+// 0.40) finds the files of 13 of the 21 and 13 of the 17 descriptions.
+// With it, the 15 one-word descriptions add 150 files. But a description
+// of 1 to 4 content tokens then scores more candidates, so it
+// is slower. On the whole Kubernetes checkout, "request authentication
+// flow" in staging/ takes 1.5 s against 1.0 s, and "logging" 2.8 s against
+// 1.1 s. Fewer candidates make a shorter search, so T counts every scoring
+// token.
+//
+// On the whole Kubernetes checkout (31,250 files), warm, the earlier rule
+// gave a question of 51 words 24,138 candidates and 9.1 s; the lift gives 81
+// candidates and 1.7 s. A short description with a filter gets 1 to 4 % more
+// candidates, with no change of time that the measurement can show.
+const pipelineTauFile float32 = 0.25
 
-// semanticRetrievalRadius is the fine MeanMaxSim that a semantic hit reaches.
+// semanticRetrievalRadius is the fine lift per query token above the
+// empty-document score that a semantic hit reaches (semanticRetrievalFloor).
 const semanticRetrievalRadius = pipelineTauFile - semanticRetrievalDelta
+
+// semanticRetrievalFloor gives the summed fine MaxSim that a row reaches to be
+// a semantic hit: the empty-document score of the query plus the radius times
+// its scoring token count (semanticQueryTokenCount). The caller counts the
+// tokens once and also uses the count to turn sums into means.
+func semanticRetrievalFloor(emptyScore float32, tokens int) float32 {
+	return emptyScore + semanticRetrievalRadius*float32(tokens)
+}
 
 // semanticUSearchDeepenSimilarity is the coarse similarity down to which
 // USearch keeps returning keys for a token: an approximation parameter, not a
-// count. On a Kubernetes checkout (20 queries) 0.6 kept a median 0.998 (min
+// count. On a Kubernetes checkout (20 queries), with the radius of an earlier
+// rule (a fine MeanMaxSim of 0.4842 per token), 0.6 kept a median 0.998 (min
 // 0.985) of the files that an exact fine scan finds within the radius, and
 // the exact top 20 in every query; 0.7 reached the recall target (top-20
 // overlap of at least 0.95) only at its limit, 0.8 kept half. That
@@ -55,7 +114,10 @@ const semanticRetrievalRadius = pipelineTauFile - semanticRetrievalDelta
 // of about 0.627). The bound applies to USearch's cosine of the int8 codes.
 // For keys at a cosine of 0.5 or more, it differs from the f32 cosine by a
 // mean under 0.001 and by at most 0.012. So the bound keeps a few more rows
-// than measured.
+// than measured. On the same checkout in October 2026, descriptions of 1 to
+// 51 words with no filter gave all 1,347,164 rows to the fine scan. 373 of
+// the 379 shards saturated, and the 6 smallest (4 to 598 rows) gave all
+// their rows. So the bound changed no result for them.
 var semanticUSearchDeepenSimilarity float32 = 0.6
 
 // nodeHit is one file of one node: the unit of merge, duplicate collapse,
@@ -189,8 +251,8 @@ func candidateFiles(hits nodeHits) (scored nodeHits, nameOnly nodeHits) {
 }
 
 // acceptFiles admits every strict all-word file and each model-added file
-// whose normalized score s(f)/T passes tauFile on its own, with no candidate
-// count: the verdict for a file does not depend on the other
+// whose lift (s(f) - emptyScore)/T passes tauFile on its own, with no
+// candidate count: the verdict for a file does not depend on the other
 // candidates. The order is weighted reciprocal-rank fusion of the lexical
 // rank (strict files first, then relaxed) and the model rank (2:1, k = 60).
 // scores holds one raw model score per scored candidate; nameOnly files come
@@ -198,6 +260,7 @@ func candidateFiles(hits nodeHits) (scored nodeHits, nameOnly nodeHits) {
 func acceptFiles(
 	scored nodeHits,
 	scores []float32,
+	emptyScore float32,
 	activeTokens int,
 	tauFile float32,
 	nameOnly nodeHits,
@@ -238,7 +301,7 @@ func acceptFiles(
 		if math.IsNaN(float64(scores[index])) || math.IsInf(float64(scores[index]), 0) {
 			return ranked{}, fmt.Errorf("invalid model score")
 		}
-		if !hit.strict && !meanMaxSimPasses(scores[index], activeTokens, tauFile) {
+		if !hit.strict && !meanMaxSimPasses(scores[index], emptyScore, activeTokens, tauFile) {
 			continue
 		}
 		fused := hit
@@ -1015,12 +1078,11 @@ func scanOverlay(ctx context.Context, qp queryPlan, overlay *semanticGeneration,
 }
 
 // scanWithinRadius runs one scan with the command's query and the node's row
-// selection. The scan keeps the rows whose summed fine MaxSim reaches the
-// radius times the query's token count. Each kept row then takes its fine
-// MeanMaxSim as its score. The scorer applies this floor before it sorts, so
-// it sorts only the kept rows. On Kubernetes, about 2 % of 1.3 million rows
-// reach the radius, and a sort of every scored row costs 6 to 9 % of a
-// description search.
+// selection. The scan keeps the rows whose summed fine MaxSim reaches
+// semanticRetrievalFloor. Each kept row then takes its fine MeanMaxSim as its
+// score. The scorer applies this floor before it sorts, so it sorts only the
+// kept rows. On Kubernetes (1.3 million rows), a sort of every scored row
+// costs 6 to 9 % of a description search.
 func scanWithinRadius(
 	ctx context.Context,
 	qp queryPlan,
@@ -1039,11 +1101,12 @@ func scanWithinRadius(
 	if err != nil {
 		return nil, err
 	}
+	floor := semanticRetrievalFloor(prepared.emptyScore, tokens)
 	selected, err := selection()
 	if err != nil {
 		return nil, err
 	}
-	hits, err := scan(prepared, selected, semanticRetrievalRadius*float32(tokens))
+	hits, err := scan(prepared, selected, floor)
 	if err != nil {
 		return nil, err
 	}
@@ -1267,10 +1330,11 @@ func rankModelQuery(ctx context.Context, hits nodeHits, qp queryPlan, execution 
 	}
 	if err == nil {
 		var accepted ranked
-		accepted, err = acceptFiles(scored, scores, activeTokens, pipelineTauFile, nameOnly)
+		accepted, err = acceptFiles(scored, scores, prepared.emptyScore, activeTokens, pipelineTauFile, nameOnly)
 		if err == nil {
 			slog.Debug("Accepted model candidates", "candidates", len(scored),
-				"accepted", len(accepted.hits)-len(nameOnly), "tau_file", pipelineTauFile)
+				"accepted", len(accepted.hits)-len(nameOnly), "tau_file", pipelineTauFile,
+				"empty_score", prepared.emptyScore)
 			return accepted, nil
 		}
 	}

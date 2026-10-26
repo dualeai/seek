@@ -503,7 +503,7 @@ func TestNullShardMetadataIsNoCrash(t *testing.T) {
 	setTestUserCache(t)
 	repo := initGitRepo(t, "a.go", "package a\n// zqnullmeta\n")
 	t.Chdir(repo)
-	if _, err := runHybridTestSearch(t, "zqnullmeta", nil, lexicalOnlySearchPolicy(), nil); err != nil {
+	if _, err := seek(t, "--lexical-only", "zqnullmeta"); err != nil {
 		t.Fatal(err)
 	}
 	cache, err := seekUserCacheRoot()
@@ -522,7 +522,7 @@ func TestNullShardMetadataIsNoCrash(t *testing.T) {
 		}
 		readCorpusDisplayInfo(filepath.Dir(filepath.Dir(shard)))
 	}
-	_, _ = runHybridTestSearch(t, "zqnullmeta", nil, lexicalOnlySearchPolicy(), nil)
+	_, _ = seek(t, "--lexical-only", "zqnullmeta")
 }
 
 // TestDeltaBuilderWithNullShardMetadataIsNoCrash seeds an index, writes

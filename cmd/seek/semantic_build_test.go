@@ -11,9 +11,16 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
+// semanticBuildTestEmbedder is a build model whose embed call runs the
+// function of the test; its query and score calls fail. The test controls
+// when each batch starts, waits and ends, and what it returns. So a test with
+// it proves how the build schedules, admits, cancels and releases batches, and
+// which units it sends. It cannot prove the time or memory of a real model
+// call, or anything about the vectors or the search.
 type semanticBuildTestEmbedder struct {
 	embed func(context.Context, []semanticUnit) ([]semanticUnitEmbedding, error)
 }
@@ -203,259 +210,302 @@ func TestCollectSemanticBatchesCancelsAfterVectorCreationFailure(t *testing.T) {
 	}
 }
 
+// TestEncodeSemanticBatchesAdmitsReadyWorkAfterOneCallCompletes runs 4 model
+// calls with a live limit of 2. The second call is slow: it ends only after
+// the fourth call starts. The third call waits until the second starts. So
+// the scheduler must start the fourth call when the third ends, beside the
+// slow call. The test runs in a synctest bubble, so a scheduler that waits
+// for the slow call fails at once with a deadlock.
 func TestEncodeSemanticBatchesAdmitsReadyWorkAfterOneCallCompletes(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	batches := make(chan semanticBuildBatch, 4)
-	for sequence := range 4 {
-		batches <- semanticBuildBatch{
-			units: []semanticUnit{{row: uint64(sequence)}},
-		}
-	}
-	close(batches)
-
-	slowStarted := make(chan struct{})
-	slowRelease := make(chan struct{})
-	fourthStarted := make(chan struct{})
-	var fourthOnce sync.Once
-	var active atomic.Int32
-	var peak atomic.Int32
-	embedder := semanticBuildTestEmbedder{embed: func(
-		_ context.Context,
-		units []semanticUnit,
-	) ([]semanticUnitEmbedding, error) {
-		current := active.Add(1)
-		defer active.Add(-1)
-		for observed := peak.Load(); current > observed; observed = peak.Load() {
-			if peak.CompareAndSwap(observed, current) {
-				break
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		batches := make(chan semanticBuildBatch, 4)
+		for sequence := range 4 {
+			batches <- semanticBuildBatch{
+				units: []semanticUnit{{row: uint64(sequence)}},
 			}
 		}
-		switch units[0].row {
-		case 1:
-			close(slowStarted)
-			<-slowRelease
-		case 2:
-			<-slowStarted
-		case 3:
-			fourthOnce.Do(func() { close(fourthStarted) })
-		}
-		return make([]semanticUnitEmbedding, len(units)), nil
-	}}
-	clock := time.Unix(1, 0)
-	resources := searchResources{
-		now: func() time.Time {
-			clock = clock.Add(time.Second)
-			return clock
-		},
-		effectiveCPUs:   func() int { return 2 },
-		availableMemory: func() int64 { return 1 << 30 },
-		callCPUs:        1,
-	}
-	encoded := make(chan semanticEncodedBatch, 4)
-	done := make(chan struct{})
-	go func() {
-		encodeSemanticBatches(ctx, embedder, batches, encoded, cancel, resources)
-		close(done)
-	}()
+		close(batches)
 
-	select {
-	case <-fourthStarted:
-	case <-time.After(5 * time.Second):
-		close(slowRelease)
-		t.Fatal("ready work waited for the slow model call")
-	}
-	close(slowRelease)
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("semantic workers did not stop")
-	}
-	for range encoded {
-	}
-	if got := peak.Load(); got != 2 {
-		t.Fatalf("peak model calls=%d, want the live two-call limit", got)
-	}
-}
-
-func TestEncodeSemanticBatchesTracksLiveCPULimit(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	const batchCount = 48
-	batches := make(chan semanticBuildBatch, batchCount)
-	for sequence := range batchCount {
-		batches <- semanticBuildBatch{
-			units: []semanticUnit{{row: uint64(sequence)}},
-		}
-	}
-	close(batches)
-
-	var effectiveCPUs atomic.Int32
-	effectiveCPUs.Store(4)
-	var phase atomic.Int32
-	var active atomic.Int32
-	var initialPeak atomic.Int32
-	var constrainedPeak atomic.Int32
-	var recoveredPeak atomic.Int32
-	var constrainedStarts atomic.Int32
-	var shrinkOnce sync.Once
-	var recoverOnce sync.Once
-	updatePeak := func(target *atomic.Int32, value int32) {
-		for observed := target.Load(); value > observed; observed = target.Load() {
-			if target.CompareAndSwap(observed, value) {
-				return
+		slowStarted := make(chan struct{})
+		slowRelease := make(chan struct{})
+		fourthStarted := make(chan struct{})
+		var fourthOnce sync.Once
+		var active atomic.Int32
+		var peak atomic.Int32
+		embedder := semanticBuildTestEmbedder{embed: func(
+			_ context.Context,
+			units []semanticUnit,
+		) ([]semanticUnitEmbedding, error) {
+			current := active.Add(1)
+			defer active.Add(-1)
+			for observed := peak.Load(); current > observed; observed = peak.Load() {
+				if peak.CompareAndSwap(observed, current) {
+					break
+				}
 			}
-		}
-	}
-	embedder := semanticBuildTestEmbedder{embed: func(
-		_ context.Context,
-		units []semanticUnit,
-	) ([]semanticUnitEmbedding, error) {
-		currentPhase := phase.Load()
-		current := active.Add(1)
-		defer active.Add(-1)
-		switch currentPhase {
-		case 0:
-			updatePeak(&initialPeak, current)
-			if current >= 4 {
-				shrinkOnce.Do(func() {
-					effectiveCPUs.Store(1)
-					phase.Store(1)
-				})
+			switch units[0].row {
+			case 1:
+				close(slowStarted)
+				<-slowRelease
+			case 2:
+				<-slowStarted
+			case 3:
+				fourthOnce.Do(func() { close(fourthStarted) })
 			}
-		case 1:
-			updatePeak(&constrainedPeak, current)
-			if constrainedStarts.Add(1) == 3 {
-				recoverOnce.Do(func() {
-					effectiveCPUs.Store(4)
-					phase.Store(2)
-				})
-			}
-		default:
-			updatePeak(&recoveredPeak, current)
-		}
-		time.Sleep(3 * time.Millisecond)
-		return make([]semanticUnitEmbedding, len(units)), nil
-	}}
-	var clock atomic.Int64
-	encoded := make(chan semanticEncodedBatch, batchCount)
-	done := make(chan struct{})
-	go func() {
-		encodeSemanticBatches(ctx, embedder, batches, encoded, cancel, searchResources{
+			return make([]semanticUnitEmbedding, len(units)), nil
+		}}
+		clock := time.Unix(1, 0)
+		resources := searchResources{
 			now: func() time.Time {
-				return time.Unix(clock.Add(1), 0)
+				clock = clock.Add(time.Second)
+				return clock
 			},
-			effectiveCPUs: func() int { return int(effectiveCPUs.Load()) },
-			availableMemory: func() int64 {
-				return 1 << 30
-			},
-			callCPUs: 1,
-		})
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("semantic scheduler did not finish")
-	}
-	for range encoded {
-	}
-	if phase.Load() != 2 {
-		t.Fatalf("scheduler phase=%d, want CPU recovery", phase.Load())
-	}
-	if initialPeak.Load() < 4 {
-		t.Fatalf("initial peak=%d, want four model calls", initialPeak.Load())
-	}
-	if constrainedPeak.Load() != 1 {
-		t.Fatalf("constrained peak=%d, want one model call", constrainedPeak.Load())
-	}
-	if recoveredPeak.Load() < 2 {
-		t.Fatalf("recovered peak=%d, want renewed parallel calls", recoveredPeak.Load())
-	}
-}
-
-func TestEncodeSemanticBatchesTracksLiveMemoryHeadroom(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	const batchCount = 30
-	batches := make(chan semanticBuildBatch, batchCount)
-	for sequence := range batchCount {
-		batches <- semanticBuildBatch{
-			units: []semanticUnit{{row: uint64(sequence)}},
-		}
-	}
-	close(batches)
-
-	var available atomic.Int64
-	available.Store(100)
-	var active atomic.Int32
-	var initialPeak atomic.Int32
-	var constrainedPeak atomic.Int32
-	var recoveredPeak atomic.Int32
-	var lowOnce sync.Once
-	updatePeak := func(target *atomic.Int32, value int32) {
-		for observed := target.Load(); value > observed; observed = target.Load() {
-			if target.CompareAndSwap(observed, value) {
-				return
-			}
-		}
-	}
-	embedder := semanticBuildTestEmbedder{embed: func(
-		_ context.Context,
-		units []semanticUnit,
-	) ([]semanticUnitEmbedding, error) {
-		row := units[0].row
-		current := active.Add(1)
-		defer active.Add(-1)
-		switch {
-		case row < 6:
-			updatePeak(&initialPeak, current)
-			if current >= 2 {
-				lowOnce.Do(func() { available.Store(30) })
-			}
-		case row <= 8:
-			updatePeak(&constrainedPeak, current)
-			if row == 8 {
-				available.Store(1_000)
-			}
-		default:
-			updatePeak(&recoveredPeak, current)
-		}
-		time.Sleep(3 * time.Millisecond)
-		return make([]semanticUnitEmbedding, len(units)), nil
-	}}
-	var clock atomic.Int64
-	encoded := make(chan semanticEncodedBatch, batchCount)
-	done := make(chan struct{})
-	go func() {
-		encodeSemanticBatches(ctx, embedder, batches, encoded, cancel, searchResources{
-			now: func() time.Time {
-				return time.Unix(clock.Add(1), 0)
-			},
-			effectiveCPUs:   func() int { return 4 },
-			availableMemory: available.Load,
+			effectiveCPUs:   func() int { return 2 },
+			availableMemory: func() int64 { return 1 << 30 },
 			callCPUs:        1,
-		})
-		close(done)
-	}()
+		}
+		encoded := make(chan semanticEncodedBatch, 4)
+		done := make(chan struct{})
+		go func() {
+			encodeSemanticBatches(ctx, embedder, batches, encoded, cancel, resources)
+			close(done)
+		}()
 
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("semantic scheduler did not finish")
+		// Wait until each goroutine of the bubble blocks: the slow call then
+		// waits for its release, and a correct scheduler has started the
+		// fourth call beside it.
+		synctest.Wait()
+		select {
+		case <-fourthStarted:
+		default:
+			t.Error("the scheduler did not start the fourth call beside the slow call")
+		}
+		close(slowRelease)
+		<-done
+		for range encoded {
+		}
+		if got := peak.Load(); got != 2 {
+			t.Fatalf("peak model calls=%d, want the live two-call limit", got)
+		}
+	})
+}
+
+// stepSemanticModelCalls runs in a synctest bubble, with a stub model whose
+// calls wait on step. It waits until each goroutine of the bubble blocks: the
+// scheduler has then started each call that its live limit admits, and waits
+// for one to end. It then ends one call, and does this again until the
+// scheduler returns. So the calls in flight at each step are the scheduler's
+// limit, with no timer and whatever the load of the host. If the scheduler
+// waits with no call in flight, the send blocks too, and synctest stops the
+// test as a deadlock.
+func stepSemanticModelCalls(step chan<- struct{}, done <-chan struct{}) {
+	for {
+		synctest.Wait()
+		select {
+		case <-done:
+			return
+		default:
+		}
+		step <- struct{}{}
 	}
-	for range encoded {
-	}
-	if initialPeak.Load() < 2 {
-		t.Fatalf("initial peak=%d, want a memory probe", initialPeak.Load())
-	}
-	if constrainedPeak.Load() != 1 {
-		t.Fatalf("low-memory peak=%d, want one model call", constrainedPeak.Load())
-	}
-	if recoveredPeak.Load() < 2 {
-		t.Fatalf("recovered peak=%d, want renewed parallel calls", recoveredPeak.Load())
-	}
+}
+
+// TestEncodeSemanticBatchesTracksLiveCPULimit gives the scheduler 4 CPUs, then
+// 1 when 4 model calls are in flight, then 4 again after 3 calls on 1 CPU. The
+// scheduler must reach 4 calls, start each call on 1 CPU alone, and grow
+// again after the recovery. Each model call waits for its step, so the calls
+// that the scheduler admits overlap on any host.
+func TestEncodeSemanticBatchesTracksLiveCPULimit(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		const batchCount = 48
+		batches := make(chan semanticBuildBatch, batchCount)
+		for sequence := range batchCount {
+			batches <- semanticBuildBatch{
+				units: []semanticUnit{{row: uint64(sequence)}},
+			}
+		}
+		close(batches)
+
+		var effectiveCPUs atomic.Int32
+		effectiveCPUs.Store(4)
+		var phase atomic.Int32
+		var active atomic.Int32
+		var initialPeak atomic.Int32
+		var constrainedPeak atomic.Int32
+		var recoveredPeak atomic.Int32
+		var constrainedStarts atomic.Int32
+		var shrinkOnce sync.Once
+		var recoverOnce sync.Once
+		updatePeak := func(target *atomic.Int32, value int32) {
+			for observed := target.Load(); value > observed; observed = target.Load() {
+				if target.CompareAndSwap(observed, value) {
+					return
+				}
+			}
+		}
+		step := make(chan struct{})
+		embedder := semanticBuildTestEmbedder{embed: func(
+			callCtx context.Context,
+			units []semanticUnit,
+		) ([]semanticUnitEmbedding, error) {
+			currentPhase := phase.Load()
+			current := active.Add(1)
+			defer active.Add(-1)
+			switch currentPhase {
+			case 0:
+				updatePeak(&initialPeak, current)
+				if current >= 4 {
+					shrinkOnce.Do(func() {
+						effectiveCPUs.Store(1)
+						phase.Store(1)
+					})
+				}
+			case 1:
+				updatePeak(&constrainedPeak, current)
+				if constrainedStarts.Add(1) == 3 {
+					recoverOnce.Do(func() {
+						effectiveCPUs.Store(4)
+						phase.Store(2)
+					})
+				}
+			default:
+				updatePeak(&recoveredPeak, current)
+			}
+			select {
+			case <-step:
+			case <-callCtx.Done():
+			}
+			return make([]semanticUnitEmbedding, len(units)), nil
+		}}
+		var clock atomic.Int64
+		encoded := make(chan semanticEncodedBatch, batchCount)
+		done := make(chan struct{})
+		go func() {
+			encodeSemanticBatches(ctx, embedder, batches, encoded, cancel, searchResources{
+				now: func() time.Time {
+					return time.Unix(clock.Add(1), 0)
+				},
+				effectiveCPUs: func() int { return int(effectiveCPUs.Load()) },
+				availableMemory: func() int64 {
+					return 1 << 30
+				},
+				callCPUs: 1,
+			})
+			close(done)
+		}()
+
+		stepSemanticModelCalls(step, done)
+		for range encoded {
+		}
+		// A peak under 4 calls also keeps the phase at 0. Check the peak
+		// first, so that the failure gives the peak.
+		if initialPeak.Load() < 4 {
+			t.Fatalf("initial peak=%d, want four model calls", initialPeak.Load())
+		}
+		if phase.Load() != 2 {
+			t.Fatalf("scheduler phase=%d, want CPU recovery", phase.Load())
+		}
+		if constrainedPeak.Load() != 1 {
+			t.Fatalf("constrained peak=%d, want one model call", constrainedPeak.Load())
+		}
+		if recoveredPeak.Load() < 2 {
+			t.Fatalf("recovered peak=%d, want renewed parallel calls", recoveredPeak.Load())
+		}
+	})
+}
+
+// TestEncodeSemanticBatchesTracksLiveMemoryHeadroom drops the free memory
+// when the scheduler probes 2 model calls, and raises it on row 8. The
+// scheduler must probe 2 calls, run rows 6 to 8 one at a time, and grow again
+// after the rise. Each model call waits for its step, so the calls that the
+// scheduler admits overlap on any host.
+func TestEncodeSemanticBatchesTracksLiveMemoryHeadroom(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		const batchCount = 30
+		batches := make(chan semanticBuildBatch, batchCount)
+		for sequence := range batchCount {
+			batches <- semanticBuildBatch{
+				units: []semanticUnit{{row: uint64(sequence)}},
+			}
+		}
+		close(batches)
+
+		var available atomic.Int64
+		available.Store(100)
+		var active atomic.Int32
+		var initialPeak atomic.Int32
+		var constrainedPeak atomic.Int32
+		var recoveredPeak atomic.Int32
+		var lowOnce sync.Once
+		updatePeak := func(target *atomic.Int32, value int32) {
+			for observed := target.Load(); value > observed; observed = target.Load() {
+				if target.CompareAndSwap(observed, value) {
+					return
+				}
+			}
+		}
+		step := make(chan struct{})
+		embedder := semanticBuildTestEmbedder{embed: func(
+			callCtx context.Context,
+			units []semanticUnit,
+		) ([]semanticUnitEmbedding, error) {
+			row := units[0].row
+			current := active.Add(1)
+			defer active.Add(-1)
+			switch {
+			case row < 6:
+				updatePeak(&initialPeak, current)
+				if current >= 2 {
+					lowOnce.Do(func() { available.Store(30) })
+				}
+			case row <= 8:
+				updatePeak(&constrainedPeak, current)
+				if row == 8 {
+					available.Store(1_000)
+				}
+			default:
+				updatePeak(&recoveredPeak, current)
+			}
+			select {
+			case <-step:
+			case <-callCtx.Done():
+			}
+			return make([]semanticUnitEmbedding, len(units)), nil
+		}}
+		var clock atomic.Int64
+		encoded := make(chan semanticEncodedBatch, batchCount)
+		done := make(chan struct{})
+		go func() {
+			encodeSemanticBatches(ctx, embedder, batches, encoded, cancel, searchResources{
+				now: func() time.Time {
+					return time.Unix(clock.Add(1), 0)
+				},
+				effectiveCPUs:   func() int { return 4 },
+				availableMemory: available.Load,
+				callCPUs:        1,
+			})
+			close(done)
+		}()
+
+		stepSemanticModelCalls(step, done)
+		for range encoded {
+		}
+		if initialPeak.Load() < 2 {
+			t.Fatalf("initial peak=%d, want a memory probe", initialPeak.Load())
+		}
+		if constrainedPeak.Load() != 1 {
+			t.Fatalf("low-memory peak=%d, want one model call", constrainedPeak.Load())
+		}
+		if recoveredPeak.Load() < 2 {
+			t.Fatalf("recovered peak=%d, want renewed parallel calls", recoveredPeak.Load())
+		}
+	})
 }
 
 func TestEncodeSemanticBatchesCancellationReleasesAllWeights(t *testing.T) {

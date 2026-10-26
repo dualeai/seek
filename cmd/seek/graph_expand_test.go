@@ -21,9 +21,7 @@ import (
 // found twice fails the test.
 func graphSearch(t *testing.T, marker string, operands ...string) map[string]string {
 	t.Helper()
-	out, err := captureStdout(t, func() error {
-		return run(context.Background(), marker, operands)
-	})
+	out, err := seek(t, slices.Concat([]string{"--lexical-only", marker}, operands)...)
 	if err != nil {
 		t.Fatalf("run %q: %v\n%s", operands, err, out)
 	}
@@ -219,9 +217,7 @@ func TestGraphAmbiguousBoundaryAsksGit(t *testing.T) {
 		f.graphFile("work/sep/ign.txt", marker)
 		setTestUserCache(t)
 
-		out, err := captureStdout(t, func() error {
-			return run(context.Background(), marker, []string{f.path("work")})
-		})
+		out, err := seek(t, "--lexical-only", marker, f.path("work"))
 		if err != nil {
 			t.Fatalf("run: %v\n%s", err, out)
 		}
@@ -438,9 +434,7 @@ func TestGraphAmbiguousBoundaryAsksGit(t *testing.T) {
 		gitRunIn(t, worktree, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "-q")
 		setTestUserCache(t)
 
-		out, err := captureStdout(t, func() error {
-			return run(context.Background(), marker, []string{f.path("work")})
-		})
+		out, err := seek(t, "--lexical-only", marker, f.path("work"))
 		if err != nil {
 			t.Fatalf("run: %v\n%s", err, out)
 		}
@@ -510,15 +504,14 @@ func TestGraphGitProcessCountCold(t *testing.T) {
 			t.Chdir(t.TempDir())
 			query := marker
 			search := func() error {
-				_, err := captureStdout(t, func() error { return run(context.Background(), query, []string{f.path("folder")}) })
+				_, err := seek(t, "--lexical-only", query, f.path("folder"))
 				return err
 			}
 			if vectors {
 				// The vector run searches one Git node.
 				query = marker + " " + marker
 				search = func() error {
-					_, err := runHybridTestSearch(t, query, []string{f.path("folder/a")}, defaultSearchPolicy(),
-						func(context.Context) (semanticModel, error) { return &hybridTestScorer{}, nil })
+					_, _, err := stubSearch(t, payloadFar, query, f.path("folder/a"))
 					return err
 				}
 			}

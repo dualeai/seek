@@ -1,10 +1,11 @@
 package main
 
 import (
-	"context"
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -67,17 +68,7 @@ func TestMatchTotalIndependentOfOperandSplit(t *testing.T) {
 // per file, so the captured output stays small.
 func searchMatchCapFixture(t *testing.T, limit int, operands ...string) string {
 	t.Helper()
-	out, err := captureStdout(t, func() error {
-		return runSearchCommand(
-			context.Background(),
-			matchCapMarker,
-			operands,
-			limit,
-			1,
-			defaultSearchConfig(),
-			searchRunConfig{},
-		)
-	})
+	out, err := seek(t, slices.Concat([]string{"--lexical-only", "-n", strconv.Itoa(limit), "-m", "1", matchCapMarker}, operands)...)
 	if err != nil {
 		t.Fatalf("run %v: %v", operands, err)
 	}
@@ -102,9 +93,7 @@ func TestHugeContextKeepsLinesAfterTheMatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	setTestUserCache(t)
-	out, err := captureStdout(t, func() error {
-		return runWithSearchConfig(context.Background(), "zqhugecontext", []string{root}, explicitSearchConfig(math.MaxInt, false))
-	})
+	out, err := seek(t, "--lexical-only", "-C", strconv.Itoa(math.MaxInt), "zqhugecontext", root)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}

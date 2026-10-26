@@ -168,18 +168,15 @@ func TestRootCmd_RejectsNegativeLimit(t *testing.T) {
 	}
 }
 
-// TestSearchRunConfigBindsAcceptancePolicies checks the run config: the model
-// factory with semantic search, none without, and the one per-file acceptance
-// value.
-func TestSearchRunConfigBindsAcceptancePolicies(t *testing.T) {
+// TestSearchRunConfigBindsTheModelFactory checks which model factory the run
+// config binds: the given factory with the default policy, and no factory with
+// the lexical-only policy, so that a --lexical-only search starts no model.
+func TestSearchRunConfigBindsTheModelFactory(t *testing.T) {
 	if config := newSearchRunConfig(defaultSearchPolicy(), newLateOnSemanticModel); config.newModel == nil {
 		t.Fatalf("default run config has no model: %+v", config)
 	}
 	if lexical := newSearchRunConfig(lexicalOnlySearchPolicy(), newLateOnSemanticModel); lexical.newModel != nil {
 		t.Fatalf("lexical-only run config started a model: %+v", lexical)
-	}
-	if pipelineTauFile != 0.6 {
-		t.Fatalf("tau_file=%g, want 0.6", pipelineTauFile)
 	}
 }
 

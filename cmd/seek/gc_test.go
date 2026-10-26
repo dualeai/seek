@@ -1371,7 +1371,7 @@ func TestGC_Integration_PrepareAndSearchTouchesUsed(t *testing.T) {
 	}
 }
 
-// TestGC_Integration_RunFlowEvictsStale runs a real search through run(),
+// TestGC_Integration_RunFlowEvictsStale runs a real search through the root command,
 // then triggers GC through the same env-driven entry point used by main().
 // Verifies: (1) the real search path touches .used so its corpus survives,
 // (2) an alongside-seeded stale corpus is evicted by the env-configured GC.
@@ -1413,10 +1413,10 @@ func TestGC_Integration_RunFlowEvictsStale(t *testing.T) {
 		t.Fatalf("planGitCorpus: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(plan.cacheDir, usedFile)); err != nil {
-		t.Fatalf("real corpus .used missing after run(): %v", err)
+		t.Fatalf("real corpus .used missing after the search: %v", err)
 	}
 
-	// run() does not fire opportunistic GC inline — main() does. Test the
+	// The root command does not fire opportunistic GC inline — main() does. Test the
 	// env-driven entry point that main wraps.
 	runOpportunisticGC(context.Background())
 

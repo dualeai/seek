@@ -91,9 +91,7 @@ func TestBM25ContextFollowsTheFinalScore(t *testing.T) {
 	setTestUserCache(t)
 	check := func(name string, operands ...string) {
 		t.Helper()
-		out, err := captureStdout(t, func() error {
-			return runSearchCommand(context.Background(), "case:yes foo", operands, 1, 3, defaultSearchConfig(), searchRunConfig{})
-		})
+		out, err := seek(t, slices.Concat([]string{"--lexical-only", "-n", "1", "-m", "3", "case:yes foo"}, operands)...)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -131,9 +129,7 @@ func TestScopeAddsNoScoreTerm(t *testing.T) {
 	setTestUserCache(t)
 	order := func(operand string) []string {
 		t.Helper()
-		out, err := captureStdout(t, func() error {
-			return runSearchCommand(context.Background(), "case:yes foo", []string{operand}, 10, 3, defaultSearchConfig(), searchRunConfig{})
-		})
+		out, err := seek(t, "--lexical-only", "-n", "10", "-m", "3", "case:yes foo", operand)
 		if err != nil {
 			t.Fatalf("%s: %v", operand, err)
 		}

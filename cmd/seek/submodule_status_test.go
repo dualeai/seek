@@ -28,9 +28,7 @@ func TestRun_GitlinkReplacedByFileIsSearched(t *testing.T) {
 	setTestUserCache(t)
 	logs := captureTestLogs(t, slog.LevelWarn)
 
-	out, err := captureStdout(t, func() error {
-		return run(context.Background(), "zqtypechangemarker", []string{parent})
-	})
+	out, err := seek(t, "--lexical-only", "zqtypechangemarker", parent)
 	if err != nil {
 		t.Fatalf("run: %v\n%s", err, out)
 	}
@@ -72,7 +70,7 @@ func TestGitlinkSymlinkIsNoEdge(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 			defer cancel()
 			out, err := captureStdout(t, func() error {
-				return run(ctx, marker, []string{parent})
+				return seekRoot(ctx, t, nil, "--lexical-only", marker, parent)
 			})
 			if err != nil {
 				t.Fatalf("run: %v\n%s", err, out)
