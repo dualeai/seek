@@ -59,7 +59,7 @@ type cacheBudgetError struct {
 }
 
 func (e *cacheBudgetError) Error() string {
-	return fmt.Sprintf("the search needs about %s of index cache (%s new), more than the cache budget of %s",
+	return fmt.Sprintf("this search needs about %s of index cache (%s new), more than the cache budget of %s",
 		humanBytes(e.planned), humanBytes(e.growth), humanBytes(e.budget))
 }
 
@@ -159,10 +159,8 @@ func parseByteSize(value string) (int64, error) {
 // ledger; a dry run passes false so that it writes nothing.
 func corpusSize(dir string, record bool) int64 {
 	if !ledgerStale(dir) {
-		if data, err := os.ReadFile(filepath.Join(dir, corpusSizeFile)); err == nil {
-			if n, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); err == nil && n >= 0 {
-				return n
-			}
+		if n, err := strconv.ParseInt(readCacheFile(dir, corpusSizeFile), 10, 64); err == nil && n >= 0 {
+			return n
 		}
 	}
 	if !record {
@@ -277,6 +275,10 @@ func corpusSizes(entries []corpusDirEntry, record bool) map[corpusID]int64 {
 // vector build copies the rows of a node's live generation. So with a live
 // generation it adds only the changed content, and with none it adds all of
 // it.
+//
+// Each estimate reads the node's capture with no freshness check. The graph
+// expansion gives every node of plans its capture (graphExpansion.plans), and
+// checkCacheBudget runs before any route, so no route marked a capture stale.
 func plannedCacheBytes(ctx context.Context, plans []node, vectors, probe bool) (int64, bool, error) {
 	var planned atomic.Int64
 	var rebuilds atomic.Bool
@@ -310,10 +312,7 @@ func plannedCacheBytes(ctx context.Context, plans []node, vectors, probe bool) (
 // content when nothing is published, else the changed files.
 func (*folderNode) estimate(ctx context.Context, plan node, vectors, probe bool) (bytes int64, rebuild bool, err error) {
 	published := readStateFile(plan.cacheDir)
-	state, selected, ok := plan.folder.current()
-	if !ok {
-		return publishedCorpusBytes(plan.cacheDir), false, nil
-	}
+	state, selected := plan.folder.stateHash, plan.folder.selected
 	// decideFolderBuild uses the same rule. The manifest is read only when
 	// the search wants vectors.
 	present := vectors && semanticManifestPresent(plan.indexDir, plan.folderSemanticSource(state))
@@ -348,10 +347,7 @@ func (*folderNode) estimate(ctx context.Context, plan node, vectors, probe bool)
 // and the dirty files.
 func (g *gitNode) estimate(ctx context.Context, plan node, vectors, probe bool) (bytes int64, rebuild bool, err error) {
 	published := readStateFile(plan.cacheDir)
-	state, ok := plan.gitState.current()
-	if !ok {
-		return publishedCorpusBytes(plan.cacheDir), false, nil
-	}
+	state := plan.gitState.state
 	current := gitCorpusStateHash(g.paths, state)
 	// The build's rules (decideGitBuild, vectorGenerationNeeded): a commit
 	// builds its base generation, and dirty files build the overlay of their
@@ -359,7 +355,7 @@ func (g *gitNode) estimate(ctx context.Context, plan node, vectors, probe bool) 
 	// manifest reads, the check of the warm path (joinedGenerationsMatch).
 	// Stale is false: the estimate runs before the missing-blob recheck,
 	// which writes its records under the build lock.
-	wantBase := vectors && state.HeadSHA != "no-head"
+	wantBase := vectors && state.HeadSHA != gitNoHead
 	wantOverlay := vectors && len(state.Files) > 0
 	baseMissing := vectorGenerationNeeded(wantBase,
 		wantBase && semanticManifestPresent(plan.indexDir, state.HeadSHA), false)
@@ -475,19 +471,20 @@ func generationBytes(content int64, vectors bool) int64 {
 
 // changedFolderCandidates returns the files whose stat differs from the
 // published manifest: the delta of the new generation. With no readable
-// manifest every file counts.
+// manifest every file counts. Both lists are sorted by name, as in
+// folderManifestDiff, so one merge pass finds the entry of each file.
 func changedFolderCandidates(cacheDir, published string, selected []folderCandidate) []folderCandidate {
 	manifest, ok := readFolderManifest(cacheDir, published)
 	if !ok {
 		return selected
 	}
-	previous := make(map[string]folderManifestEntry, len(manifest.Files))
-	for _, file := range manifest.Files {
-		previous[file.Name] = file
-	}
+	files := manifest.Files
 	changed := make([]folderCandidate, 0, 16)
 	for _, candidate := range selected {
-		if old, ok := previous[candidate.name]; !ok || !folderManifestFileMatchesCandidate(old, candidate) {
+		for len(files) > 0 && files[0].Name < candidate.name {
+			files = files[1:]
+		}
+		if len(files) == 0 || files[0].Name != candidate.name || !folderManifestFileMatchesCandidate(files[0], candidate) {
 			changed = append(changed, candidate)
 		}
 	}
@@ -563,7 +560,7 @@ func dirtyContentBytes(repoDir string, files []string, probe bool) int64 {
 // committedContentBytes sums the committed blobs that fit a document, from one
 // git ls-tree. With probe a binary blob counts 0 (committedBlobBytes).
 func committedContentBytes(ctx context.Context, paths gitPaths, head string, probe bool) (int64, error) {
-	if normalizeCommittedTreeish(head) == "no-head" {
+	if normalizeCommittedTreeish(head) == gitNoHead {
 		return 0, nil
 	}
 	cmd := newGitCommand(ctx, paths.RepoDir, "ls-tree", "-r", "-l", "-z", "--full-tree", head)
@@ -594,7 +591,7 @@ func committedDeltaBytes(ctx context.Context, paths gitPaths, from, to string, p
 	// content. The from side is always a commit: the build records a
 	// committed state only for a commit, and only a commit has a base
 	// generation.
-	if normalizeCommittedTreeish(to) == "no-head" {
+	if normalizeCommittedTreeish(to) == gitNoHead {
 		return 0, nil
 	}
 	cmd := newGitCommand(ctx, paths.RepoDir, "diff-tree", "-r", "-z", "--no-renames", "--no-commit-id", from, to)

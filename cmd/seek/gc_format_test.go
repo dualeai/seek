@@ -49,6 +49,17 @@ func TestGC_GCRowResultString(t *testing.T) {
 		{gcRowResult{action: actionTrashed, err: errors.New("boom")}, "trashed: boom"},
 		{gcRowResult{action: actionFailed, err: errors.New("nope")}, "failed: nope"},
 		{gcRowResult{action: actionTrashed}, "trashed: unknown"}, // no error
+		// The cell keeps the first 60 bytes of a longer error.
+		{
+			gcRowResult{action: actionFailed, err: errors.New(strings.Repeat("x", 70))},
+			"failed: " + strings.Repeat("x", 60) + "...",
+		},
+		// The 60-byte cut falls inside "é" (bytes 59 and 60): the cell
+		// ends before the rune, so it stays valid UTF-8.
+		{
+			gcRowResult{action: actionFailed, err: errors.New(strings.Repeat("a", 59) + "é" + "zzz")},
+			"failed: " + strings.Repeat("a", 59) + "...",
+		},
 	}
 	for _, c := range cases {
 		if got := c.res.String(); got != c.want {

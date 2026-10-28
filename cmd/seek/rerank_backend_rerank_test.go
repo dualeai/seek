@@ -518,7 +518,7 @@ func TestLateOnRuntimeCacheAcrossProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantPath := filepath.Join(cache, rerankerDir, bundle.version, bundle.sha256, bundle.fileName)
+	wantPath := filepath.Join(cache, rerankerDir, bundle.Version, bundle.SHA256, bundle.FileName)
 	extracted, err := os.Stat(wantPath)
 	if err != nil {
 		t.Fatalf("concurrent extraction left no runtime: %v", err)

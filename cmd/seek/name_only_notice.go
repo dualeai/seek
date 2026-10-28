@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sync/atomic"
 
+	"github.com/sourcegraph/zoekt/index"
 	"github.com/sourcegraph/zoekt/query"
 )
 
@@ -19,12 +20,12 @@ import (
 // node counts them. The notice does not count Zoekt's own too-small files (1
 // or 2 bytes).
 
-// countedSkipReasons are the marker explanations that the notice counts, as
-// Zoekt writes them (index/document.go; TestCountedSkipReasonsMatchZoekt).
+// countedSkipReasons are the marker explanations that the notice counts
+// (zoektSkipExplanation; TestCountedSkipReasonsMatchZoekt).
 var countedSkipReasons = []string{
-	"exceeds the maximum size limit",
-	"contains binary content",
-	"contains too many trigrams", // seekNoBytesReason
+	zoektSkipExplanation(index.SkipReasonTooLarge),
+	zoektSkipExplanation(index.SkipReasonBinary),
+	zoektSkipExplanation(seekNoBytesReason),
 }
 
 type nameOnlyCountKey struct{}
@@ -106,10 +107,9 @@ func countNameOnlyFiles(
 		// A file-name query matches name-only files by name.
 		return 0
 	}
-	marker := &query.Substring{Pattern: zoektNotIndexedMarker, Content: true, CaseSensitive: true}
 	opts := searchOpts
 	opts.NumContextLines = 0
-	files, err := read.search(ctx, query.NewAnd(filter, marker, &query.Not{Child: q}), searchConfig{opts: &opts})
+	files, err := read.search(ctx, query.NewAnd(filter, notIndexedMarkerQuery(), &query.Not{Child: q}), searchConfig{opts: &opts})
 	if err != nil {
 		slog.Debug("Name-only count failed", "root", read.plan.displayRoot, "error", err)
 		return 0

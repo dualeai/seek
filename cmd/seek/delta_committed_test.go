@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,6 +19,30 @@ func reindexGit(t testing.TB, ctx context.Context, paths gitPaths, plan node) {
 	hash := gitCorpusStateHash(paths, state)
 	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, hash); err != nil {
 		t.Fatalf("runIndexingWithCache: %v", err)
+	}
+}
+
+// linkCommittedShards links the shard source to the shard numbers from first
+// to last and writes the family manifest. So a test gets a large committed
+// family with no build for each shard.
+func linkCommittedShards(t *testing.T, indexDir string, source familyMember, first, last int) {
+	t.Helper()
+	for i := first; i <= last; i++ {
+		name := fmt.Sprintf("%s.%05d%s", source.prefix, i, shardSuffix)
+		if err := os.Link(filepath.Join(indexDir, source.name), filepath.Join(indexDir, name)); err != nil {
+			t.Fatalf("link shard %d: %v", i, err)
+		}
+	}
+	scan, err := scanFamily(indexDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(scan.members))
+	for _, member := range scan.members {
+		names = append(names, member.name)
+	}
+	if err := writeFamilyManifest(indexDir, names); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -231,6 +254,10 @@ func TestDeltaCommitted_RebaseLeavesNoDuplicateHits(t *testing.T) {
 	}
 }
 
+// TestDeltaCommitted_ShardThresholdTriggersFullRebuild takes a committed
+// family to the delta shard limit and checks the build that comes next. The
+// limit reads only the shard count, so links to the first delta shard fill
+// the family. A commit and a build for each shard would give the same count.
 func TestDeltaCommitted_ShardThresholdTriggersFullRebuild(t *testing.T) {
 	requireTools(t)
 
@@ -239,11 +266,9 @@ func TestDeltaCommitted_ShardThresholdTriggersFullRebuild(t *testing.T) {
 	paths, plan := planGitTestCorpus(t, dir)
 	reindexGit(t, ctx, paths, plan)
 
-	// Make maxCommittedDeltaShards + 2 commits, with a build after each, and
-	// record the committed shard count after each build.
-	cycles := maxCommittedDeltaShards + 2
-	shardSeries := make([]int, 0, cycles)
-	for i := range cycles {
+	// commit commits cycle i, builds, and gives the committed shard count.
+	commit := func(i int) int {
+		t.Helper()
 		name := fmt.Sprintf("c%d.go", i)
 		body := fmt.Sprintf("package main\n// threshold_cycle_%d\n", i)
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
@@ -252,29 +277,43 @@ func TestDeltaCommitted_ShardThresholdTriggersFullRebuild(t *testing.T) {
 		gitRunIn(t, dir, "add", ".")
 		gitRunIn(t, dir, "commit", "-m", fmt.Sprintf("cycle %d", i))
 		reindexGit(t, ctx, paths, plan)
-		shardSeries = append(shardSeries, committedShardCount(t, plan.indexDir))
+		return committedShardCount(t, plan.indexDir)
 	}
 
-	// The full build of the seed gives one shard, and each delta adds one.
+	// The full build of the seed gives one shard, and the delta adds one.
+	if got := commit(0); got != 2 {
+		t.Fatalf("committed shards after the first delta=%d, want 2", got)
+	}
+	scan, err := scanFamily(plan.indexDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var delta familyMember
+	for _, member := range scan.members {
+		if member.shard && !member.uncommitted && member.numbered && member.num == 1 {
+			delta = member
+		}
+	}
+	if delta.name == "" {
+		t.Fatalf("family %+v has no delta shard one", scan.members)
+	}
+	linkCommittedShards(t, plan.indexDir, delta, 2, maxCommittedDeltaShards)
+
 	// The check permits a delta while the family holds at most
 	// maxCommittedDeltaShards delta shards, so that delta takes the family
 	// above the threshold. The next build is a full build of one shard.
-	want := make([]int, 0, cycles)
-	for i := range maxCommittedDeltaShards + 1 {
-		want = append(want, i+2)
+	if got := commit(1); got != maxCommittedDeltaShards+2 {
+		t.Fatalf("committed shards after the delta at the threshold=%d, want %d", got, maxCommittedDeltaShards+2)
 	}
-	want = append(want, 1)
-	if !slices.Equal(shardSeries, want) {
-		t.Fatalf("committed shard counts=%v, want %v", shardSeries, want)
+	if got := commit(2); got != 1 {
+		t.Fatalf("committed shards after the delta above the threshold=%d, want the full build of 1", got)
 	}
 
-	// The full build holds the content of the earlier deltas: the first, a
-	// middle, and the last cycle are found.
-	for _, i := range []int{0, cycles / 2, cycles - 1} {
+	// The full build holds the content of every commit once.
+	for i := range 3 {
 		pat := fmt.Sprintf("threshold_cycle_%d", i)
-		results, _ := searchPlannedCorpusForTest(ctx, plan, pat)
-		if len(results) == 0 {
-			t.Fatalf("cycle %d must remain findable post-rebuild", i)
+		if results, err := searchPlannedCorpusForTest(ctx, plan, pat); err != nil || len(results) != 1 {
+			t.Fatalf("cycle %d after the full build: results=%d err=%v, want 1", i, len(results), err)
 		}
 	}
 }

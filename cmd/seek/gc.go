@@ -21,6 +21,9 @@ const (
 	corporaDir  = "corpora"
 	rerankerDir = "reranker"
 	gcTrashDir  = ".trash"
+	// corpusIndexDir is the folder of a corpus that holds its shards and
+	// semantic generations (node.indexDir).
+	corpusIndexDir = "index"
 
 	// usedFile is the marker of one corpus. Its mtime records the last
 	// access, because most file systems mount with noatime or relatime, which
@@ -87,16 +90,15 @@ func (r gcRowResult) String() string {
 		return "gone"
 	case actionTrashed:
 		return "trashed: " + shortErr(r.err)
-	case actionFailed:
+	default: // actionFailed
 		return "failed: " + shortErr(r.err)
 	}
-	return "?"
 }
 
 // shortErr renders an error for the ACTION cell. It keeps the first line and
-// at most 60 bytes, so a "trashed: <reason>" or "failed: <reason>" row stays
-// on one terminal line. A nil error gives "unknown", so the table never
-// fails.
+// at most 60 bytes, cut on a rune boundary (utf8Prefix), so a
+// "trashed: <reason>" or "failed: <reason>" row stays on one terminal line. A
+// nil error gives "unknown", so the table never fails.
 func shortErr(err error) string {
 	if err == nil {
 		return "unknown"
@@ -107,7 +109,7 @@ func shortErr(err error) string {
 	}
 	const max = 60
 	if len(s) > max {
-		s = s[:max] + "..."
+		s = utf8Prefix(s, max) + "..."
 	}
 	return s
 }
@@ -380,7 +382,7 @@ func retiredRuntimes(cacheRoot string, before time.Time) []string {
 		return due
 	}
 	rerankerRoot := filepath.Join(cacheRoot, rerankerDir)
-	current := filepath.Join(rerankerRoot, bundle.version, bundle.sha256)
+	current := lateOnRuntimeDir(cacheRoot, bundle)
 	entries, _ := os.ReadDir(rerankerRoot)
 	for _, entry := range entries {
 		// Take only the reranker/<version> directories, and each runtime in
@@ -430,15 +432,21 @@ func touchRuntimeUse(dir string) {
 	_ = os.Chtimes(dir, now, now)
 }
 
-// touchStamp updates the .last-gc modification time. If the file does not yet
-// exist, it creates the file with an atomic rename.
+// touchStamp updates the .last-gc modification time (touchCacheFile).
 func touchStamp(cacheRoot string) {
-	stampPath := filepath.Join(cacheRoot, gcStampFile)
+	_ = touchCacheFile(cacheRoot, gcStampFile)
+}
+
+// touchCacheFile sets the modification time of the marker cacheDir/name to
+// now. When that fails (the file is missing), it makes the marker with a
+// temporary file and a rename (writeCacheFile). Two touches can share the
+// temporary file, so one rename can fail; the other touch makes the marker.
+func touchCacheFile(cacheDir, name string) error {
 	now := time.Now()
-	if err := os.Chtimes(stampPath, now, now); err == nil {
-		return
+	if err := os.Chtimes(filepath.Join(cacheDir, name), now, now); err == nil {
+		return nil
 	}
-	_ = writeCacheFile(cacheRoot, gcStampFile, "")
+	return writeCacheFile(cacheDir, name, "")
 }
 
 // warnNFSOnce logs a warning the first time GC finds the cache on a network
@@ -544,11 +552,18 @@ func sweepAgedProviderArtifacts(ctx context.Context, writer io.Writer, cacheRoot
 	discardAgedDirs(ctx, writer, "compiled model files", agedProviderArtifacts(ctx, cacheRoot, before), unused, nil)
 }
 
+// providerArtifactRoot is the cache folder of the compiled accelerator models:
+// reranker/coreml/<format>/<key>. It is here because the collector compiles on
+// every target, and the provider code only where an accelerator exists.
+func providerArtifactRoot(cacheRoot string) string {
+	return filepath.Join(cacheRoot, rerankerDir, "coreml")
+}
+
 // agedProviderArtifacts lists the compiled models a collection would remove,
 // so the live sweep and `--dry-run` agree on what is due. An entry a previous
 // sweep left marked is always due, whatever its age.
 func agedProviderArtifacts(ctx context.Context, cacheRoot string, before time.Time) []string {
-	root := filepath.Join(cacheRoot, rerankerDir, "coreml")
+	root := providerArtifactRoot(cacheRoot)
 	formats, err := os.ReadDir(root)
 	if err != nil {
 		return nil
@@ -700,9 +715,9 @@ func sweepOrphanManifestTmps(cacheDir string, before time.Time) {
 // writeSharedCacheFile.
 func isOrphanManifestTmpName(name string) bool {
 	switch name {
-	case folderManifestFileName + ".tmp",
-		uncommittedManifestFileName + ".tmp",
-		familyManifestFile + ".tmp":
+	case folderManifestFileName + cacheTmpSuffix,
+		uncommittedManifestFileName + cacheTmpSuffix,
+		familyManifestFile + cacheTmpSuffix:
 		return true
 	}
 	for _, record := range []string{bm25StatsFile, corpusSizeFile} {
@@ -781,10 +796,10 @@ func sweepCorpusOrphans(e corpusDirEntry, now time.Time) {
 	sweepOrphanManifestTmps(e.path, now.Add(-1*time.Hour))
 	// The publish puts .family-v1 beside the shards, not in cacheDir, so the
 	// sweep also reads the index directory for its .tmp file.
-	sweepOrphanManifestTmps(filepath.Join(e.path, "index"), now.Add(-1*time.Hour))
+	sweepOrphanManifestTmps(filepath.Join(e.path, corpusIndexDir), now.Add(-1*time.Hour))
 	if bf, ok, _ := tryBuildLock(e.path); ok {
 		releaseLock(bf)
-		sweepOrphanBuildDirs(filepath.Join(e.path, "index"), now.Add(-buildTmpMaxAge))
+		sweepOrphanBuildDirs(filepath.Join(e.path, corpusIndexDir), now.Add(-buildTmpMaxAge))
 	}
 }
 
@@ -898,7 +913,7 @@ type corpusDisplayInfo struct {
 // It returns an empty value when no readable shard exists. The table then
 // shows "[empty]" in the ROOT column (formatRoot).
 func readCorpusDisplayInfo(corpusDir string) corpusDisplayInfo {
-	indexDir := filepath.Join(corpusDir, "index")
+	indexDir := filepath.Join(corpusDir, corpusIndexDir)
 	shards, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
 	if err != nil || len(shards) == 0 {
 		return corpusDisplayInfo{}
@@ -933,34 +948,25 @@ func drainTrash(trashDir string) {
 	}
 }
 
-// nfsCheckOnce and nfsCached hold whether the cache root is on a network
-// filesystem. touchUsed checks it once per process.
-var (
-	nfsCheckOnce sync.Once
-	nfsCached    bool
-)
+// cacheRootOnNFS reports whether the cache root is on a network file system.
+// touchUsed checks it once per process; tests replace it.
+var cacheRootOnNFS = sync.OnceValue(checkCacheRootOnNFS)
+
+// checkCacheRootOnNFS reports whether the cache root is on a network file
+// system. A root that it cannot find counts as local.
+func checkCacheRootOnNFS() bool {
+	root, err := seekUserCacheRoot()
+	return err == nil && isOnNFS(root)
+}
 
 // touchUsed updates <cacheDir>/.used. It logs errors at Debug level and skips
 // caches on network filesystems. Scoped and unscoped searches of one
 // repository read one index, so both keep it recent for LRU eviction.
 func touchUsed(cacheDir string) {
-	nfsCheckOnce.Do(func() {
-		if root, err := seekUserCacheRoot(); err == nil {
-			nfsCached = isOnNFS(root)
-		}
-	})
-	if nfsCached {
+	if cacheRootOnNFS() {
 		return
 	}
-	p := filepath.Join(cacheDir, usedFile)
-	now := time.Now()
-	if err := os.Chtimes(p, now, now); err == nil {
-		return
-	}
-	// The file is missing (or Chtimes failed): make it with a temporary file
-	// and a rename. Two touches can share the temporary file, so one rename
-	// can fail; the other touch makes the marker.
-	if err := writeCacheFile(cacheDir, usedFile, ""); err != nil {
+	if err := touchCacheFile(cacheDir, usedFile); err != nil {
 		slog.Debug("touch used failed", "cache_dir", cacheDir, "error", err)
 	}
 }

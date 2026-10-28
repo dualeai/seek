@@ -750,8 +750,8 @@ func TestPlanCorpora_ExternalGitRootAndNestedOperandsCollapseToSingleGitPlan(t *
 
 	// The repository root, a nested directory, and a nested file of one
 	// repository all go to one Git corpus. The root operand widens the scope
-	// to the whole worktree (rootIncluded), so one unscoped Git plan holds
-	// all three, with no corpus for the file.
+	// to the whole worktree (gitScopeQuery gives no filter), so one unscoped
+	// Git plan holds all three, with no corpus for the file.
 	plans, err := planCorpora(context.Background(), []string{nestedFile, externalRepo, nested})
 	if err != nil {
 		t.Fatalf("planCorpora: %v", err)
@@ -805,6 +805,10 @@ func TestPathWithinMatchesRelWithin(t *testing.T) {
 		{"/a", "/", false},
 		{"/a/b", "/a", false},
 		{"/a", "/b/a", false},
+		// The Git scope compares slash paths below the work-tree root.
+		{"a", "a", true},
+		{"a", "a/b", true},
+		{"a", "ab", false},
 	} {
 		if got := pathWithin(tc.root, tc.path); got != tc.want {
 			t.Errorf("pathWithin(%q, %q)=%t, want %t", tc.root, tc.path, got, tc.want)

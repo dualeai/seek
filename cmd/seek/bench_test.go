@@ -520,7 +520,7 @@ func BenchmarkGitPathScoped_WarmSearch(b *testing.B) {
 
 	ctx := b.Context()
 	paths, _ := planGitTestCorpus(b, dir)
-	scopedPlan, err := planGitCorpus(paths, []string{filepath.Join(dir, "a")})
+	scopedPlan, err := planGitCorpus(paths, []gitScopeOperand{{path: filepath.Join(dir, "a"), dir: true}})
 	if err != nil {
 		b.Fatalf("plan scoped corpus: %v", err)
 	}
@@ -574,7 +574,7 @@ func BenchmarkGitPathScoped_ColdIndexWithTrackedSibling(b *testing.B) {
 	dir, scope := writeScopedGitBenchmarkRepo(b)
 	ctx := b.Context()
 	paths, _ := planGitTestCorpus(b, dir)
-	scopedPlan, err := planGitCorpus(paths, []string{scope})
+	scopedPlan, err := planGitCorpus(paths, []gitScopeOperand{{path: scope, dir: true}})
 	if err != nil {
 		b.Fatalf("plan scoped corpus: %v", err)
 	}
@@ -607,7 +607,7 @@ func BenchmarkGitPathScoped_DirtyReindexWithTrackedSibling(b *testing.B) {
 	dir, scope := writeScopedGitBenchmarkRepo(b)
 	ctx := b.Context()
 	paths, _ := planGitTestCorpus(b, dir)
-	scopedPlan, err := planGitCorpus(paths, []string{scope})
+	scopedPlan, err := planGitCorpus(paths, []gitScopeOperand{{path: scope, dir: true}})
 	if err != nil {
 		b.Fatalf("plan scoped corpus: %v", err)
 	}
@@ -651,7 +651,7 @@ func BenchmarkGitPathScoped_OutOfScopeCommitReusesCommittedLayer(b *testing.B) {
 	dir, scope := writeScopedGitBenchmarkRepo(b)
 	ctx := b.Context()
 	paths, _ := planGitTestCorpus(b, dir)
-	scopedPlan, err := planGitCorpus(paths, []string{scope})
+	scopedPlan, err := planGitCorpus(paths, []gitScopeOperand{{path: scope, dir: true}})
 	if err != nil {
 		b.Fatalf("plan scoped corpus: %v", err)
 	}
@@ -1088,7 +1088,7 @@ func BenchmarkWriteCorpusResults_TwoCorpora(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		output := bufio.NewWriter(io.Discard)
-		wrote, err := writeCorpusResultsWithContext(
+		err := writeCorpusResultsWithContext(
 			output,
 			results,
 			0,
@@ -1099,8 +1099,8 @@ func BenchmarkWriteCorpusResults_TwoCorpora(b *testing.B) {
 		if err == nil {
 			err = output.Flush()
 		}
-		if err != nil || !wrote {
-			b.Fatalf("write results: wrote=%t error=%v", wrote, err)
+		if err != nil {
+			b.Fatalf("write results: %v", err)
 		}
 	}
 }
@@ -2560,7 +2560,7 @@ func writeBenchmarkNodeFiles(b *testing.B, dir, sub string, count int) {
 func mustRunBenchmarkSearch(b *testing.B, query string, operands []string) {
 	b.Helper()
 	runConfig := searchRunConfig{policy: semanticSearch, newModel: benchmarkNodeModel}
-	if err := runSearchCommand(b.Context(), query, operands, 0, 0, defaultSearchConfig(), runConfig); err != nil {
+	if err := runSearchCommand(b.Context(), query, operands, defaultSearchConfig(), runConfig); err != nil {
 		b.Fatalf("search %q: %v", query, err)
 	}
 }

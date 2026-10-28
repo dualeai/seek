@@ -118,8 +118,7 @@ func (h zoektWarningHandler) WithGroup(name string) slog.Handler {
 // line for the errors that have one.
 func formatCLIError(err error) string {
 	if budgetErr, ok := errors.AsType[*cacheBudgetError](err); ok {
-		message := fmt.Sprintf("seek: this search needs about %s of index cache (%s new), more than the cache budget of %s\n",
-			humanBytes(budgetErr.planned), humanBytes(budgetErr.growth), humanBytes(budgetErr.budget))
+		message := "seek: " + budgetErr.Error() + "\n"
 		// A text search builds no meaning-based index: name it when it fits.
 		textOnly := ""
 		if budgetErr.textFits {

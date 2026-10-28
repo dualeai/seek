@@ -275,8 +275,8 @@ func familyShardFiles(dir string, fam shardFamily) ([]string, error) {
 // search can use. The family needs at least one shard, and exactly the set
 // that the last publish recorded. Presence alone accepts one survivor of a
 // torn family, so it always checks both.
-func (s familyScan) familyComplete(indexDir string) bool {
-	return s.hasShard(familyAll) && s.matchesManifest(indexDir)
+func (s familyScan) familyComplete() bool {
+	return s.hasShard(familyAll) && s.matchesManifest()
 }
 
 // familyManifestFile records the name and size of each published shard and
@@ -305,8 +305,7 @@ func writeFamilyManifest(indexDir string, names []string) error {
 // removeFamilyManifest removes the family manifest of indexDir and its
 // temporary file. It keeps the shards.
 func removeFamilyManifest(indexDir string) {
-	_ = os.Remove(filepath.Join(indexDir, familyManifestFile))
-	_ = os.Remove(filepath.Join(indexDir, familyManifestFile+".tmp"))
+	removeCacheFile(indexDir, familyManifestFile)
 }
 
 // matchesManifest reports whether the scanned directory still holds exactly the
@@ -322,19 +321,20 @@ func removeFamilyManifest(indexDir string) {
 // deleted content searchable again.
 //
 // Both lists are sorted by name, so a positional comparison checks equality.
-func (s familyScan) matchesManifest(indexDir string) bool {
-	return s.matchesManifestFamily(indexDir, familyAll)
+func (s familyScan) matchesManifest() bool {
+	return s.matchesManifestFamily(familyAll)
 }
 
-// matchesManifestFamily restricts the comparison to one family.
+// matchesManifestFamily restricts the comparison to one family. It reads the
+// manifest of the scanned directory.
 //
 // The committed and uncommitted families use different rebuild paths. A
 // mismatch in one family must not mark the other family as damaged.
 //
 // On the manifest side, the recorded name decides membership. scanFamily
 // applies the same rule on the directory side, so the two walks stay in step.
-func (s familyScan) matchesManifestFamily(indexDir string, fam shardFamily) bool {
-	raw := readCacheFile(indexDir, familyManifestFile)
+func (s familyScan) matchesManifestFamily(fam shardFamily) bool {
+	raw := readCacheFile(s.dir, familyManifestFile)
 	if raw == "" {
 		return false
 	}
@@ -418,14 +418,15 @@ func discardBuildDir(buildDir string) {
 	_ = os.RemoveAll(buildDir)
 }
 
-// publishGeneration replaces a shard family, then writes its manifest and its
-// state, while it holds the exclusive publish lock. Normal locked readers
-// cannot interleave with these writes. This multi-file swap is not one
-// filesystem transaction. A failed step moves the live family back. .swapping
-// records an interrupted swap, or a failed move back, for repair on the next
-// build. If GC removed the corpus during the build, it returns
-// errCorpusEvicted, and the caller discards the build.
-func (store corpusStore) publishGeneration(ctx context.Context, buildDir string, fam shardFamily, writeState func() error) error {
+// publishGeneration replaces every shard (familyAll), then writes the family
+// manifest and the state, while it holds the exclusive publish lock. Only the
+// folder build uses it. Normal locked readers cannot interleave with these
+// writes. This multi-file swap is not one filesystem transaction. A failed
+// step moves the live family back. .swapping records an interrupted swap, or a
+// failed move back, for repair on the next build. If GC removed the corpus
+// during the build, it returns errCorpusEvicted, and the caller discards the
+// build.
+func (store corpusStore) publishGeneration(ctx context.Context, buildDir string, writeState func() error) error {
 	pub, err := acquirePublishLock(ctx, store.cacheDir)
 	if err != nil {
 		return err // includes errCorpusEvicted
@@ -440,7 +441,7 @@ func (store corpusStore) publishGeneration(ctx context.Context, buildDir string,
 		}
 		return fmt.Errorf("stat index dir before swap: %w", err)
 	}
-	published, err := store.publishShardFamilyLocked(buildDir, fam)
+	published, err := store.publishShardFamilyLocked(buildDir, familyAll)
 	if err != nil {
 		return err
 	}
@@ -487,16 +488,18 @@ func (store corpusStore) publishShardFamilyLocked(buildDir string, fam shardFami
 // restored reports whether that worked. So the live family stays whole even
 // when one of its files can be neither moved nor removed (an immutable file).
 // A delete of the live files first would then leave a family that lost
-// content.
+// content. An incoming file that is the live file of its name stays in place
+// (keptLiveFiles).
 func swapFiles(indexDir, buildDir string, live, incoming []string) (published []string, restored bool, err error) {
 	aside, err := os.MkdirTemp(buildDir, liveAsidePrefix)
 	if err != nil {
 		return nil, true, fmt.Errorf("create the directory for the live shards: %w", err)
 	}
-	var moved []string
+	kept := keptLiveFiles(live, incoming)
+	var moved, renamed []string
 	rollBack := func(err error) ([]string, bool, error) {
 		restored := true
-		for _, base := range published {
+		for _, base := range renamed {
 			if removeErr := os.Remove(filepath.Join(indexDir, base)); removeErr != nil {
 				restored = false
 			}
@@ -509,6 +512,9 @@ func swapFiles(indexDir, buildDir string, live, incoming []string) (published []
 		return nil, restored, err
 	}
 	for _, f := range live {
+		if _, ok := kept[filepath.Base(f)]; ok {
+			continue
+		}
 		if err := os.Rename(f, filepath.Join(aside, filepath.Base(f))); err != nil {
 			if os.IsNotExist(err) {
 				continue
@@ -520,6 +526,10 @@ func swapFiles(indexDir, buildDir string, live, incoming []string) (published []
 	published = make([]string, 0, len(incoming))
 	for _, f := range incoming {
 		base := filepath.Base(f)
+		published = append(published, base)
+		if _, ok := kept[base]; ok {
+			continue
+		}
 		dst := filepath.Join(indexDir, base)
 		// A directory at this path is not in live, so the move did not clear
 		// it. Remove any non-regular replacement before Rename.
@@ -531,9 +541,37 @@ func swapFiles(indexDir, buildDir string, live, incoming []string) (published []
 		if err := os.Rename(f, dst); err != nil {
 			return rollBack(fmt.Errorf("publish shard %s: %w", base, err))
 		}
-		published = append(published, base)
+		renamed = append(renamed, base)
 	}
 	return published, true, nil
+}
+
+// keptLiveFiles returns the names of the incoming files that are the live file
+// of the same name: one inode with two links. A delta links the live shards
+// into its build directory (seedFamilyFiles), and Zoekt rewrites only their
+// .meta sidecars. A move aside and the rename in of such a file would put the
+// same inode back at the same path: two renames that change nothing.
+func keptLiveFiles(live, incoming []string) map[string]struct{} {
+	liveByName := make(map[string]string, len(live))
+	for _, f := range live {
+		liveByName[filepath.Base(f)] = f
+	}
+	kept := make(map[string]struct{})
+	for _, f := range incoming {
+		base := filepath.Base(f)
+		liveFile, ok := liveByName[base]
+		if !ok {
+			continue
+		}
+		liveInfo, err := os.Lstat(liveFile)
+		if err != nil {
+			continue
+		}
+		if info, err := os.Lstat(f); err == nil && os.SameFile(liveInfo, info) {
+			kept[base] = struct{}{}
+		}
+	}
+	return kept
 }
 
 // liveAsidePrefix starts the name of the directory, in a build directory, that
@@ -560,9 +598,4 @@ func (store corpusStore) recoverIncompleteSwap() {
 	removeFamilyManifest(store.indexDir)
 	deleteStateFiles(store.cacheDir)
 	removeCacheFile(store.cacheDir, swappingMarkerFile)
-}
-
-// removeCacheFile deletes a metadata file from cacheDir (best-effort).
-func removeCacheFile(cacheDir, name string) {
-	_ = os.Remove(filepath.Join(cacheDir, name))
 }

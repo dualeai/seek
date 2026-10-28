@@ -79,7 +79,7 @@ func TestPublishKeepsAFamilyWithAnImmutableShard(t *testing.T) {
 	family := func() []string {
 		t.Helper()
 		scan, err := scanFamily(plan.indexDir)
-		if err != nil || !scan.matchesManifest(plan.indexDir) {
+		if err != nil || !scan.matchesManifest() {
 			t.Fatalf("the family is not whole: %v", err)
 		}
 		names := make([]string, 0, len(scan.members))
@@ -181,7 +181,7 @@ func TestUncommittedPublishKeepsAFamilyWithAnImmutableShard(t *testing.T) {
 	if after := repositoryShardFiles(plan.indexDir, repoUncommitted); !slices.Equal(after, shards) {
 		t.Fatalf("uncommitted shards %v after the failed publish, want %v", after, shards)
 	}
-	if scan, err := scanFamily(plan.indexDir); err != nil || !scan.matchesManifest(plan.indexDir) {
+	if scan, err := scanFamily(plan.indexDir); err != nil || !scan.matchesManifest() {
 		t.Fatalf("the family is not whole after the failed publish: %v", err)
 	}
 	if found("zqu1") != 1 || found("zqu2old") != 1 {
@@ -384,10 +384,10 @@ func TestEarlyRecordKeepsADamagedUncommittedFamilyUnnamed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if scan.matchesManifest(plan.indexDir) {
+	if scan.matchesManifest() {
 		t.Fatal("the record after the committed publish names a damaged uncommitted family")
 	}
-	if !scan.matchesManifestFamily(plan.indexDir, familyCommitted) {
+	if !scan.matchesManifestFamily(familyCommitted) {
 		t.Fatal("the record does not name the published committed family")
 	}
 }

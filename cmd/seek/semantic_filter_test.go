@@ -18,17 +18,7 @@ func semanticPathFilterForTest(t testing.TB, source string) semanticPathFilter {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return semanticPathFilterForAtom(t, node)
-}
-
-// semanticPathFilterForAtom compiles one file: atom as nodeHeaderQuery does.
-func semanticPathFilterForAtom(t testing.TB, atom query.Q) semanticPathFilter {
-	t.Helper()
-	filter, err := newSemanticPathFilter(atom)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return filter
+	return newSemanticPathFilter(node)
 }
 
 // selectedFilesKeep gives the row predicate that scanNode gives
@@ -91,7 +81,7 @@ func TestBuildSemanticFilterMask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mask.mode != semanticFilterPartial || mask.allowed != 4 || mask.rows != 5 {
+	if !mask.partial() || mask.allowed != 4 || mask.rows != 5 {
 		t.Fatalf("mask=%+v", mask)
 	}
 	if !reflect.DeepEqual(mask.shardAllowed, []uint64{2, 2}) {
@@ -110,11 +100,11 @@ func TestBuildSemanticFilterMask(t *testing.T) {
 	all, err := buildSemanticFilterMask(
 		t.Context(), generation, selectedFilesKeep("keep/a.go", "drop/a.go", "keep/b.go"),
 	)
-	if err != nil || all.mode != semanticFilterAll || len(all.bits) != 0 || len(all.shardAllowed) != 0 {
+	if err != nil || all.allowed != all.rows || len(all.bits) != 0 || len(all.shardAllowed) != 0 {
 		t.Fatalf("all mask=%+v error=%v", all, err)
 	}
 	none, err := buildSemanticFilterMask(t.Context(), generation, selectedFilesKeep())
-	if err != nil || none.mode != semanticFilterNone || len(none.bits) != 0 || len(none.shardAllowed) != 0 {
+	if err != nil || none.allowed != 0 || len(none.bits) != 0 || len(none.shardAllowed) != 0 {
 		t.Fatalf("none mask=%+v error=%v", none, err)
 	}
 }
@@ -155,7 +145,7 @@ func TestSemanticFilterMaskCrossesByteAndShardBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mask.mode != semanticFilterPartial || !reflect.DeepEqual(mask.bits, []byte{0, 1}) ||
+	if !mask.partial() || !reflect.DeepEqual(mask.bits, []byte{0, 1}) ||
 		!reflect.DeepEqual(mask.shardAllowed, []uint64{0, 1}) {
 		t.Fatalf("boundary mask=%+v", mask)
 	}
@@ -222,7 +212,7 @@ func TestSemanticFilterMatchesRealZoektShard(t *testing.T) {
 			for _, file := range files {
 				zoektMatches[file.FileName] = true
 			}
-			filter := semanticPathFilterForAtom(t, node)
+			filter := newSemanticPathFilter(node)
 			for _, document := range documents {
 				if got := filter.matches(document.name); got != zoektMatches[document.name] {
 					t.Errorf("%s on %q=%t, Zoekt=%t", source, document.name, got, zoektMatches[document.name])

@@ -146,10 +146,8 @@ the meaning-based index and all model work.`,
 				cmd.Context(),
 				args[0],
 				args[1:],
-				flags.limit,
-				flags.maxMatches,
 				flags.search,
-				newSearchRunConfig(policy, newModel),
+				searchRunConfig{policy: policy, newModel: newModel},
 			)
 		},
 		SilenceErrors: true,
@@ -183,40 +181,31 @@ the meaning-based index and all model work.`,
 	return cmd
 }
 
-// newSearchRunConfig returns the run config of policy. Only the semanticSearch
-// policy gets the model factory newModel.
-func newSearchRunConfig(policy searchPolicy, newModel semanticModelFactory) searchRunConfig {
-	config := searchRunConfig{policy: policy}
-	if policy == semanticSearch {
-		config.newModel = newModel
-	}
-	return config
-}
-
 // selectSearchConfig sets flags.search from --after-context or --context, or
-// to the default. It rejects both flags together and a negative line count;
-// the count has no upper bound.
+// to the default, and sets its display limits from --limit and --max-matches.
+// It rejects both context flags together and a negative line count; the count
+// has no upper bound.
 func selectSearchConfig(cmd *cobra.Command, flags *cliFlags) error {
 	afterChanged := cmd.Flags().Changed("after-context")
 	contextChanged := cmd.Flags().Changed("context")
-	if afterChanged && contextChanged {
+	switch {
+	case afterChanged && contextChanged:
 		return fmt.Errorf("--after-context and --context cannot be used together")
-	}
-	if afterChanged {
+	case afterChanged:
 		if flags.afterContext < 0 {
 			return fmt.Errorf("--after-context must be 0 or more, got %d", flags.afterContext)
 		}
 		flags.search = explicitSearchConfig(flags.afterContext, true)
-		return nil
-	}
-	if contextChanged {
+	case contextChanged:
 		if flags.context < 0 {
 			return fmt.Errorf("--context must be 0 or more, got %d", flags.context)
 		}
 		flags.search = explicitSearchConfig(flags.context, false)
-		return nil
+	default:
+		flags.search = defaultSearchConfig()
 	}
-	flags.search = defaultSearchConfig()
+	flags.search.displayFileLimit = flags.limit
+	flags.search.displayMatchLimit = flags.maxMatches
 	return nil
 }
 
@@ -269,12 +258,6 @@ func closestFlag(want string, candidates []string) string {
 }
 
 func levenshtein(a, b string) int {
-	if len(a) == 0 {
-		return len(b)
-	}
-	if len(b) == 0 {
-		return len(a)
-	}
 	prev := make([]int, len(b)+1)
 	for j := range prev {
 		prev[j] = j

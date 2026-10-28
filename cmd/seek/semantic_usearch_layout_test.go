@@ -269,50 +269,84 @@ func TestSemanticUSearchShardPlannerWaitsForTheHostSize(t *testing.T) {
 
 // TestSemanticUSearchShardPlannerKeepsShardsAfterAnEdit edits one file at a
 // time, in 40 places: its rows grow, shrink, or keep their count, with new
-// keys. The shards before the file stay, and at most three shards change: the
-// cut finds the old cuts again at the next anchor. A cut every 1,024 rows
-// would change every shard after the file.
+// keys. In both trees below, the shards before the file stay, and the cut
+// finds the old cuts again at an anchor after the file. A cut every 1,024
+// rows would change every shard after the file.
+//
+//   - Files of 1 to 60 rows, and a few large ones: each edit changes 1 to 3
+//     shards.
+//   - Files of 2 rows each: every file end can take a cut, so a cut at 15/16
+//     of the size with no anchor moves each later cut with the edit. Anchors
+//     are sparse here, so an edit can move a cut that is just at 15/16 to the
+//     next anchor, and the cuts of a few shards after it. The 40 edits change
+//     at most 3 shards for each edit on average.
 func TestSemanticUSearchShardPlannerKeepsShardsAfterAnEdit(t *testing.T) {
 	const size = 1_024
-	files := testShardFiles(4_000, 3)
-	units := testShardUnits(files)
-	before := planTestShards(t, units, size)
-	random := rand.New(rand.NewPCG(4, 5))
-	total := 0
-	for edit := range 40 {
-		edited := slices.Clone(files)
-		target := random.IntN(len(edited))
-		edited[target].version++
-		edited[target].rows = max(1, edited[target].rows+[]int{0, 1, -1, 3, -3, 20}[edit%6])
-		after := planTestShards(t, testShardUnits(edited), size)
-		old := map[[sha256.Size]byte]bool{}
-		for _, plan := range before {
-			old[plan.digest] = true
-		}
-		changed := 0
-		for _, plan := range after {
-			if !old[plan.digest] {
-				changed++
-			}
-		}
-		firstRow := uint64(0)
-		for _, file := range files[:target] {
-			firstRow += uint64(file.rows)
-		}
-		for index, plan := range before {
-			if plan.start+plan.rows > firstRow {
-				break
-			}
-			if after[index] != plan {
-				t.Fatalf("edit %d of file %d changed shard %d before the file", edit, target, index)
-			}
-		}
-		if changed == 0 || changed > 3 {
-			t.Fatalf("edit %d of file %d (%d rows) changed %d of %d shards", edit, target, files[target].rows, changed, len(after))
-		}
-		total += changed
+	small := make([]testShardFile, 10_000)
+	for index := range small {
+		small[index] = testShardFile{path: fmt.Sprintf("pkg/d%03d/f%05d.go", index/40, index), rows: 2}
 	}
-	t.Logf("40 edits changed %d shards of %d", total, len(before))
+	for _, tree := range []struct {
+		name  string
+		files []testShardFile
+		// each: every edit changes at most 3 shards, not only the average.
+		each bool
+	}{
+		{name: "mixed sizes", files: testShardFiles(1_000, 3), each: true},
+		{name: "2 rows each", files: small},
+	} {
+		t.Run(tree.name, func(t *testing.T) {
+			files := tree.files
+			units := testShardUnits(files)
+			before := planTestShards(t, units, size)
+			old := map[[sha256.Size]byte]bool{}
+			for _, plan := range before {
+				old[plan.digest] = true
+			}
+			random := rand.New(rand.NewPCG(4, 5))
+			total := 0
+			for edit := range 40 {
+				target := random.IntN(len(files))
+				firstRow := 0
+				for _, file := range files[:target] {
+					firstRow += file.rows
+				}
+				file := files[target]
+				file.version++
+				file.rows = max(1, file.rows+[]int{0, 1, -1, 3, -3, 20}[edit%6])
+				// The rows of a file depend only on the file, so only the
+				// edited file gets new rows. The rows after it get new
+				// numbers.
+				edited := slices.Concat(units[:firstRow], testShardUnits([]testShardFile{file}), units[firstRow+files[target].rows:])
+				for row := firstRow; row < len(edited); row++ {
+					edited[row].row = uint64(row)
+				}
+				after := planTestShards(t, edited, size)
+				changed := 0
+				for _, plan := range after {
+					if !old[plan.digest] {
+						changed++
+					}
+				}
+				for index, plan := range before {
+					if plan.start+plan.rows > uint64(firstRow) {
+						break
+					}
+					if after[index] != plan {
+						t.Fatalf("edit %d of file %d changed shard %d before the file", edit, target, index)
+					}
+				}
+				if changed == 0 || tree.each && changed > 3 {
+					t.Fatalf("edit %d of file %d (%d rows) changed %d of %d shards", edit, target, files[target].rows, changed, len(after))
+				}
+				total += changed
+			}
+			if total > 3*40 {
+				t.Fatalf("40 edits changed %d shards of %d, more than 3 for each edit on average", total, len(before))
+			}
+			t.Logf("40 edits changed %d shards of %d", total, len(before))
+		})
+	}
 }
 
 // TestBuildSemanticUSearchStreamReusesUnchangedShards builds the graphs of a

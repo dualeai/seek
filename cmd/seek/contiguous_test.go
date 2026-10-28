@@ -125,20 +125,20 @@ func TestMatchesManifestFamilyScoping(t *testing.T) {
 	}
 
 	sc := scan()
-	if !sc.matchesManifest(dir) {
+	if !sc.matchesManifest() {
 		t.Fatal("intact family did not match")
 	}
-	if !sc.matchesManifestFamily(dir, familyCommitted) {
+	if !sc.matchesManifestFamily(familyCommitted) {
 		t.Fatal("intact committed half did not match")
 	}
 
 	// Rewrite only the uncommitted shard, as a dirty edit does.
 	write(uncommitted, "uncommitted-but-longer")
 	sc = scan()
-	if sc.matchesManifest(dir) {
+	if sc.matchesManifest() {
 		t.Error("whole family still matched after the uncommitted shard changed")
 	}
-	if !sc.matchesManifestFamily(dir, familyCommitted) {
+	if !sc.matchesManifestFamily(familyCommitted) {
 		t.Error("committed half reported damaged by an uncommitted-only change")
 	}
 
@@ -147,10 +147,10 @@ func TestMatchesManifestFamilyScoping(t *testing.T) {
 	write(uncommitted, "uncommitted")
 	write(committed, "committed-shard-changed")
 	sc = scan()
-	if sc.matchesManifest(dir) {
+	if sc.matchesManifest() {
 		t.Error("whole family matched after the committed shard changed")
 	}
-	if sc.matchesManifestFamily(dir, familyCommitted) {
+	if sc.matchesManifestFamily(familyCommitted) {
 		t.Error("committed half matched after the committed shard changed")
 	}
 
@@ -159,7 +159,7 @@ func TestMatchesManifestFamilyScoping(t *testing.T) {
 		t.Fatal(err)
 	}
 	sc = scan()
-	if sc.matchesManifestFamily(dir, familyCommitted) {
+	if sc.matchesManifestFamily(familyCommitted) {
 		t.Error("committed half matched after its only shard was removed")
 	}
 }

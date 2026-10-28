@@ -9,6 +9,7 @@ import (
 	"runtime"
 
 	"github.com/sourcegraph/zoekt"
+	"github.com/sourcegraph/zoekt/index"
 	"github.com/sourcegraph/zoekt/query"
 	"golang.org/x/sync/errgroup"
 )
@@ -18,6 +19,37 @@ import (
 // (notIndexedMarker in zoekt/index/shard_builder.go). Zoekt does not export
 // it, so TestZoektNotIndexedMarker pins the value.
 const zoektNotIndexedMarker = "NOT-INDEXED: "
+
+// zoektSkipExplanation is the text that Zoekt stores after
+// zoektNotIndexedMarker for a document that it keeps by name only for reason
+// (zoekt/index/document.go, SkipReason.explanation). Zoekt does not export it,
+// so TestCountedSkipReasonsMatchZoekt and TestNameOnlyMarkerBytes pin the
+// values.
+func zoektSkipExplanation(reason index.SkipReason) string {
+	switch reason {
+	case index.SkipReasonTooLarge:
+		return "exceeds the maximum size limit"
+	case index.SkipReasonTooSmall:
+		return "contains too few trigrams"
+	case index.SkipReasonBinary:
+		return "contains binary content"
+	case index.SkipReasonTooManyTrigrams:
+		return "contains too many trigrams"
+	}
+	return "unknown skip reason"
+}
+
+// notIndexedMarkerQuery matches the stored marker of each document that Zoekt
+// keeps by name only.
+func notIndexedMarkerQuery() query.Q {
+	return &query.Substring{Pattern: zoektNotIndexedMarker, Content: true, CaseSensitive: true}
+}
+
+// nameOnlyContent reports whether content is a complete NOT-INDEXED marker:
+// the content that Zoekt stores for a file that it keeps by name only.
+func nameOnlyContent(content []byte) bool {
+	return bytes.HasPrefix(content, []byte(zoektNotIndexedMarker)) && bytes.IndexByte(content, '\n') < 0
+}
 
 // warnUnindexedFileOperands warns for each file named as an exact path operand
 // that has no content match and no searchable content. The index stores the
@@ -38,7 +70,7 @@ func warnUnindexedFileOperands(
 	opened *openedNodes,
 	operands []string,
 	results []corpusSearchResult,
-	dirtyByCorpus dirtyFilesByCorpus,
+	dirtyByCorpus map[corpusID]dirtyFileSet,
 ) {
 	files := regularFileOperands(operands)
 	if len(files) == 0 {
@@ -122,17 +154,15 @@ type markerCheck struct {
 // is searchable. When the search fails, it returns nil and no file gets a
 // warning.
 func (check markerCheck) reasons(ctx context.Context) []string {
-	markerQuery := &query.Substring{Pattern: zoektNotIndexedMarker, Content: true, CaseSensitive: true}
-	matches, err := searchPlannedCorpusParsed(ctx, check.plan, check.dirty, markerQuery, defaultSearchConfig())
+	matches, err := searchPlannedCorpusParsed(ctx, check.plan, check.dirty, notIndexedMarkerQuery(), defaultSearchConfig())
 	if err != nil {
 		slog.Debug("Skipped the not-indexed check", "root", check.plan.root, "error", err)
 		return nil
 	}
-	found := wrapCorpusResults(check.plan, matches)
 	reasons := make([]string, len(check.names))
 	for i, name := range check.names {
-		reasons[i] = unindexedReason(found, name, check.paths[i])
-		if reasons[i] == zoektNotIndexedMarker+"contains too many trigrams" {
+		reasons[i] = unindexedReason(matches, name, check.paths[i])
+		if reasons[i] == zoektNotIndexedMarker+zoektSkipExplanation(seekNoBytesReason) {
 			// Seek's no-bytes reason (seekNoBytesReason), in its own words.
 			reasons[i] = zoektNotIndexedMarker + "its content is not on disk or cannot be read"
 		}
@@ -234,12 +264,11 @@ func corpusFileName(plan node, path string) (string, bool) {
 
 // unindexedReason returns Zoekt's stored reason when the current copy of the
 // document for name holds only the not-indexed marker, and "" otherwise. The
-// results hold only current copies. A real file can hold the marker text.
-// Then its stored line has a newline or the same bytes as the file on disk,
-// and it does not count.
-func unindexedReason(results []corpusSearchResult, name string, path string) string {
-	for _, result := range results {
-		file := result.file
+// files hold only current copies. A real file can hold the marker text. Then
+// its stored line has a newline or the same bytes as the file on disk, and it
+// does not count.
+func unindexedReason(files []zoekt.FileMatch, name string, path string) string {
+	for _, file := range files {
 		if file.FileName != name {
 			continue
 		}
@@ -272,9 +301,7 @@ func onlyMarkerLine(file zoekt.FileMatch) ([]byte, bool) {
 }
 
 // markerLine reports whether a line match can be a complete marker document:
-// line 1, the marker prefix, and no newline.
+// line 1 that holds a complete marker (nameOnlyContent).
 func markerLine(match zoekt.LineMatch) bool {
-	return match.LineNumber == 1 &&
-		bytes.HasPrefix(match.Line, []byte(zoektNotIndexedMarker)) &&
-		bytes.IndexByte(match.Line, '\n') < 0
+	return match.LineNumber == 1 && nameOnlyContent(match.Line)
 }

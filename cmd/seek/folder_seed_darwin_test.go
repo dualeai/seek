@@ -60,7 +60,7 @@ func TestFolderSeedThatWentAwayBuildsInFull(t *testing.T) {
 	if err := writeFamilyManifest(plan.indexDir, family()); err != nil {
 		t.Fatal(err)
 	}
-	if scan, err := scanFamily(plan.indexDir); err != nil || !scan.matchesManifest(plan.indexDir) {
+	if scan, err := scanFamily(plan.indexDir); err != nil || !scan.matchesManifest() {
 		t.Fatalf("the family with the dangling member is not intact: %v", err)
 	}
 	logs := captureTestLogs(t, slog.LevelDebug)

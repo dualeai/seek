@@ -13,12 +13,11 @@ import (
 )
 
 // requireNoGitCorpusOutput puts files in testGitCorpusPlan and runs the
-// streamed formatter with limit. It requires no output and no written result,
-// for which runSearchCommand returns errNoMatch (exit status 1).
+// streamed formatter with limit. It requires no output and no error.
 func requireNoGitCorpusOutput(t *testing.T, files []zoekt.FileMatch, limit int) {
 	t.Helper()
 	var output bytes.Buffer
-	wrote, err := writeCorpusResultsWithContext(
+	err := writeCorpusResultsWithContext(
 		&output,
 		wrapCorpusResults(testGitCorpusPlan, files),
 		limit,
@@ -26,8 +25,8 @@ func requireNoGitCorpusOutput(t *testing.T, files []zoekt.FileMatch, limit int) 
 		hideCorpusContext,
 		plainPalette,
 	)
-	if err != nil || wrote || output.Len() != 0 {
-		t.Fatalf("wrote=%t error=%v output=%q, want no result", wrote, err, output.String())
+	if err != nil || output.Len() != 0 {
+		t.Fatalf("error=%v output=%q, want no result", err, output.String())
 	}
 }
 
@@ -70,11 +69,11 @@ func TestWriteCorpusResultsWithContextLimitNotice(t *testing.T) {
 	// header and match line, a blank line, then the notice for the other file.
 	const want = "## first.go (Go)\n1 first match\n\n… 1 more file (showing 1 of 2)\n"
 	var output bytes.Buffer
-	wrote, err := writeCorpusResultsWithContext(
+	err := writeCorpusResultsWithContext(
 		&output, withHeaders(results), 1, 0, hideCorpusContext, plainPalette,
 	)
-	if err != nil || !wrote || output.String() != want {
-		t.Fatalf("streamed output=%q wrote=%t error=%v, want %q", output.String(), wrote, err, want)
+	if err != nil || output.String() != want {
+		t.Fatalf("streamed output=%q error=%v, want %q", output.String(), err, want)
 	}
 }
 
@@ -95,7 +94,7 @@ func TestWriteCorpusResultsWithContextReturnsWriteError(t *testing.T) {
 			Language: "Go",
 		},
 	}}
-	wrote, err := writeCorpusResultsWithContext(
+	err := writeCorpusResultsWithContext(
 		failingCorpusWriter{err: wantErr},
 		results,
 		0,
@@ -103,8 +102,8 @@ func TestWriteCorpusResultsWithContextReturnsWriteError(t *testing.T) {
 		hideCorpusContext,
 		plainPalette,
 	)
-	if !wrote || !errors.Is(err, wantErr) {
-		t.Fatalf("wrote=%t error=%v, want true and %v", wrote, err, wantErr)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error=%v, want %v", err, wantErr)
 	}
 }
 
@@ -431,6 +430,46 @@ func TestGitCorpusFormatting_ContextLines_OverlappingContext(t *testing.T) {
 		"10 first match",
 		"11 line eleven",
 		"12 second match",
+	}, "\n") + "\n"
+	if result != expected {
+		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)
+	}
+}
+
+// TestGitCorpusFormatting_ContextLines_AfterStopsAtNextBefore cuts the after
+// context in its middle: the line that the next match's before context holds
+// comes from that before context. The texts differ only to show which context
+// wrote each line.
+func TestGitCorpusFormatting_ContextLines_AfterStopsAtNextBefore(t *testing.T) {
+	files := []zoekt.FileMatch{
+		{
+			FileName:   "app.go",
+			Repository: "repo",
+			Language:   "Go",
+			Score:      10,
+			LineMatches: []zoekt.LineMatch{
+				{
+					Line:       []byte("first match\n"),
+					LineNumber: 10,
+					After:      []byte("after eleven\nafter twelve\nafter thirteen\n"),
+				},
+				{
+					Line:       []byte("second match\n"),
+					LineNumber: 14,
+					Before:     []byte("before thirteen\n"),
+				},
+			},
+		},
+	}
+
+	result := formatGitCorpusResultsForTest(files, 0, 0)
+	expected := strings.Join([]string{
+		"## app.go (Go)",
+		"10 first match",
+		"11 after eleven",
+		"12 after twelve",
+		"13 before thirteen",
+		"14 second match",
 	}, "\n") + "\n"
 	if result != expected {
 		t.Errorf("expected:\n%s\ngot:\n%s", expected, result)

@@ -269,9 +269,9 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			delta, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, target, scan)
-			if err != nil || !eligible {
-				t.Fatalf("prepare delta: eligible=%t error=%v", eligible, err)
+			delta, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, target, scan)
+			if err != nil || delta == nil {
+				t.Fatalf("prepare delta: eligible=%t error=%v", delta != nil, err)
 			}
 			if delta.nextState.head != target {
 				t.Fatalf("delta head=%s, want %s", delta.nextState.head, target)
@@ -523,9 +523,9 @@ func TestPrepareNativeGitDeltaFallsBackBeforeSeeding(t *testing.T) {
 		oldWindow := indexWindowBytes
 		indexWindowBytes = 1
 		defer func() { indexWindowBytes = oldWindow }()
-		_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan)
-		if err != nil || eligible {
-			t.Fatalf("payload cap: eligible=%t error=%v", eligible, err)
+		delta, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan)
+		if err != nil || delta != nil {
+			t.Fatalf("payload cap: eligible=%t error=%v", delta != nil, err)
 		}
 	})
 
@@ -543,9 +543,9 @@ func TestPrepareNativeGitDeltaFallsBackBeforeSeeding(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(plan.indexDir, familyManifestFile), []byte("invalid\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan)
-		if err != nil || eligible {
-			t.Fatalf("invalid manifest: eligible=%t error=%v", eligible, err)
+		delta, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan)
+		if err != nil || delta != nil {
+			t.Fatalf("invalid manifest: eligible=%t error=%v", delta != nil, err)
 		}
 	})
 
@@ -567,9 +567,9 @@ func TestPrepareNativeGitDeltaIgnoresZoektConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan)
-	if err != nil || !eligible {
-		t.Fatalf("zoekt config change: eligible=%t error=%v", eligible, err)
+	delta, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan)
+	if err != nil || delta == nil {
+		t.Fatalf("zoekt config change: eligible=%t error=%v", delta != nil, err)
 	}
 }
 
@@ -638,9 +638,9 @@ func TestPrepareNativeGitDeltaRejectsCommittedStateDamage(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, target, scan)
-			if err != nil || eligible {
-				t.Fatalf("damaged state: eligible=%t error=%v", eligible, err)
+			delta, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, target, scan)
+			if err != nil || delta != nil {
+				t.Fatalf("damaged state: eligible=%t error=%v", delta != nil, err)
 			}
 		})
 	}
@@ -663,9 +663,9 @@ func TestPrepareNativeGitDeltaAcceptsExplicitPriority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan)
-	if err != nil || !eligible {
-		t.Fatalf("priority delta: eligible=%t error=%v", eligible, err)
+	delta, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan)
+	if err != nil || delta == nil {
+		t.Fatalf("priority delta: eligible=%t error=%v", delta != nil, err)
 	}
 }
 
@@ -692,9 +692,9 @@ func TestPrepareNativeGitDeltaMissingBaseSelectsFull(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan)
-	if err != nil || eligible {
-		t.Fatalf("missing base: eligible=%t error=%v", eligible, err)
+	delta, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan)
+	if err != nil || delta != nil {
+		t.Fatalf("missing base: eligible=%t error=%v", delta != nil, err)
 	}
 }
 
@@ -722,7 +722,7 @@ func TestNativeDeltaWithNullShardMetadataIsNoCrash(t *testing.T) {
 			t.Fatalf("the delta check panicked: %v", recovered)
 		}
 	}()
-	if _, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan); eligible {
+	if delta, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan); delta != nil {
 		t.Fatalf("a delta on a base with a null record was eligible (err=%v)", err)
 	}
 }

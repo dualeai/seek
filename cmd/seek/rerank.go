@@ -64,6 +64,8 @@ const (
 )
 
 // searchRunConfig is the search policy and the model factory of one command.
+// The factory runs only for a query that the semanticSearch policy plans with
+// model stages (planQuery).
 type searchRunConfig struct {
 	policy   searchPolicy
 	newModel semanticModelFactory
@@ -418,19 +420,20 @@ func rerankModelSearchConfig(config searchConfig) searchConfig {
 	// The display limits (--limit, --max-matches) apply after the rank. The
 	// top files of a node are not the final top files, so the model reads
 	// every strict file with its context.
-	out.contextFileLimit = 0
-	out.contextMatchLimit = 0
+	out.displayFileLimit = 0
+	out.displayMatchLimit = 0
 	return out
 }
 
 // newRerankDocument selects the highest-scoring match, with its line number as
 // the tie-breaker. It includes at most three context lines on each side. The
 // matchAt and matchEnd fields identify the matched bytes in the selected text.
-func newRerankDocument(result corpusSearchResult) rerankDocument {
+// modelBase is the model path base of the result's node (modelPathBase).
+func newRerankDocument(result corpusSearchResult, modelBase string) rerankDocument {
 	document := rerankDocument{
 		Path:      result.file.FileName,
 		Language:  result.file.Language,
-		modelBase: result.modelBase,
+		modelBase: modelBase,
 	}
 	if len(result.file.LineMatches) == 0 {
 		return document
@@ -524,7 +527,7 @@ func serializeLateOnDocumentWithMatch(
 	}
 	header := strings.ToValidUTF8(metadata.String(), "\uFFFD")
 	if len(header) > maxRerankDocumentBytes/4 {
-		header = rerankUTF8Prefix(header, maxRerankDocumentBytes/4)
+		header = utf8Prefix(header, maxRerankDocumentBytes/4)
 	}
 	text, matchAt, matchEnd := document.Text, document.matchAt, document.matchEnd
 	bodyStart, bodyEnd := rerankTextWindowBounds(
@@ -572,7 +575,7 @@ func rerankTextWindowBounds(text string, matchAt, matchEnd, limit int) (int, int
 		return 0, backupToRuneBoundary([]byte(text), limit)
 	}
 	if matchEnd-matchAt >= limit {
-		return matchAt, matchAt + len(rerankUTF8Prefix(text[matchAt:matchEnd], limit))
+		return matchAt, matchAt + len(utf8Prefix(text[matchAt:matchEnd], limit))
 	}
 
 	remaining := limit - (matchEnd - matchAt)
@@ -586,14 +589,6 @@ func rerankTextWindowBounds(text string, matchAt, matchEnd, limit int) (int, int
 	}
 	end := backupToRuneBoundary([]byte(text), matchEnd+after)
 	return start, end
-}
-
-func rerankUTF8Prefix(text string, limit int) string {
-	if len(text) <= limit {
-		return text
-	}
-	end := backupToRuneBoundary([]byte(text), limit)
-	return text[:end]
 }
 
 // applyRerankDisplayConfig copies line matches and removes model-only context
@@ -613,7 +608,7 @@ func applyRerankDisplayConfig(
 		file.LineMatches = make([]zoekt.LineMatch, len(result.file.LineMatches))
 		contextMatches := displayedContextLines(
 			result.file.LineMatches,
-			config.contextMatchLimit,
+			config.displayMatchLimit,
 		)
 		for j, source := range result.file.LineMatches {
 			match := source

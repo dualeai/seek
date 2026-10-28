@@ -36,7 +36,7 @@ func TestDecideGitBuild(t *testing.T) {
 		{name: "overlay present", edit: func(in *gitBuildInputs) {
 			in.dirty, in.overlay, in.overlayPresent, in.cachedState = true, true, true, "s0"
 		}, want: gitBuildPlan{dropJoined: true, baseBound: true, overlayBound: true}},
-		{name: "no head with committed shards", edit: func(in *gitBuildInputs) { in.head, in.publishedHead = "no-head", "" },
+		{name: "no head with committed shards", edit: func(in *gitBuildInputs) { in.head, in.publishedHead = gitNoHead, "" },
 			want: gitBuildPlan{clearCommitted: true, dropJoined: true, baseBound: true, overlayBound: true}},
 		{name: "vectors missing", edit: func(in *gitBuildInputs) { in.vectors, in.joinedReady = true, false },
 			want: gitBuildPlan{semantic: true, overlayBound: true}},
@@ -49,7 +49,7 @@ func TestDecideGitBuild(t *testing.T) {
 		{name: "dirty with no vector policy", edit: func(in *gitBuildInputs) { in.dirty, in.semanticOn, in.cachedState = true, false, "s0" },
 			want: gitBuildPlan{baseBound: true, overlayBound: true}},
 		{name: "no-head overlay only", edit: func(in *gitBuildInputs) {
-			in.head, in.publishedHead, in.committedMember, in.committedReady = "no-head", "", false, true
+			in.head, in.publishedHead, in.committedMember, in.committedReady = gitNoHead, "", false, true
 			in.dirty, in.overlay, in.joinedReady = true, true, false
 		}, want: gitBuildPlan{overlay: true, dropJoined: true, baseBound: true}},
 	} {

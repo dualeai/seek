@@ -164,17 +164,51 @@ func readCacheFile(cacheDir, name string) string {
 	return strings.TrimSpace(string(data))
 }
 
-// writeCacheFile atomically writes value to cacheDir/name via tmp+rename.
-// Two writers of one name share the tmp file, so a record with content is
-// written only under the corpus's build or publish lock. The empty markers
-// .used and .last-gc also use it with no corpus lock. A lost race fails one
-// rename, and the marker records only its time.
+// cacheTmpSuffix ends the name of the temporary file of writeCacheFileFrom.
+// removeCacheFile removes that file with its record, and the gc orphan sweep
+// removes an old one (isOrphanManifestTmpName).
+const cacheTmpSuffix = ".tmp"
+
+// writeCacheFile atomically writes value to cacheDir/name
+// (writeCacheFileFrom).
 func writeCacheFile(cacheDir, name, value string) error {
-	tmpPath := filepath.Join(cacheDir, name+".tmp")
-	if err := os.WriteFile(tmpPath, []byte(value), 0o644); err != nil {
+	return writeCacheFileFrom(cacheDir, name, func(w io.Writer) error {
+		_, err := io.WriteString(w, value)
+		return err
+	})
+}
+
+// writeCacheFileFrom writes cacheDir/name through the temporary file
+// name+cacheTmpSuffix and a rename, so a reader sees the old file or the
+// complete new one. write fills the temporary file, and a failed step removes
+// it. Two writers of one name share the temporary file, so a record with
+// content is written only under the corpus's build or publish lock. The empty
+// markers .used and .last-gc also use it with no corpus lock. A lost race
+// fails one rename, and the marker records only its time.
+func writeCacheFileFrom(cacheDir, name string, write func(io.Writer) error) error {
+	tmpPath := filepath.Join(cacheDir, name+cacheTmpSuffix)
+	file, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, filepath.Join(cacheDir, name))
+	err = write(file)
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(tmpPath, filepath.Join(cacheDir, name))
+	}
+	if err != nil {
+		_ = os.Remove(tmpPath)
+	}
+	return err
+}
+
+// removeCacheFile removes cacheDir/name and the temporary file of its
+// writeCacheFileFrom (best effort).
+func removeCacheFile(cacheDir, name string) {
+	_ = os.Remove(filepath.Join(cacheDir, name))
+	_ = os.Remove(filepath.Join(cacheDir, name+cacheTmpSuffix))
 }
 
 // sharedTmpInfix marks the temp files of writeSharedCacheFile; the gc
@@ -183,16 +217,18 @@ const sharedTmpInfix = ".tmp-"
 
 // writeSharedCacheFile writes value to cacheDir/name through a temp file of
 // its own and a rename. Writers with no exclusive lock use it (.bm25-v2,
-// .size): each concurrent writer renames a complete file. The file has the
-// mode of os.CreateTemp (0600): only the cache owner reads it.
+// .size, the provider verdict): each concurrent writer renames a complete
+// file. The file has mode 0600 under any umask: only the cache owner reads it,
+// and the owner can replace it. os.CreateTemp alone applies the umask.
 func writeSharedCacheFile(cacheDir, name, value string) error {
 	tmp, err := os.CreateTemp(cacheDir, name+sharedTmpInfix+"*")
 	if err != nil {
 		return err
 	}
 	_, writeErr := tmp.WriteString(value)
+	chmodErr := tmp.Chmod(0o600)
 	closeErr := tmp.Close()
-	err = errors.Join(writeErr, closeErr)
+	err = errors.Join(writeErr, chmodErr, closeErr)
 	if err == nil {
 		err = os.Rename(tmp.Name(), filepath.Join(cacheDir, name))
 	}
@@ -221,8 +257,7 @@ func writeEmptyStateFile(cacheDir, state string) error {
 }
 
 func deleteEmptyStateFiles(cacheDir string) {
-	_ = os.Remove(filepath.Join(cacheDir, emptyFile))
-	_ = os.Remove(filepath.Join(cacheDir, emptyFile+".tmp"))
+	removeCacheFile(cacheDir, emptyFile)
 }
 
 // deleteStateFiles removes the cached working-tree state and its tmp files, so
@@ -233,10 +268,8 @@ func deleteEmptyStateFiles(cacheDir string) {
 // its publish. Without the file, the next commit rebuilds in full. It clears
 // .head, which is only a fallback.
 func deleteStateFiles(cacheDir string) {
-	_ = os.Remove(filepath.Join(cacheDir, stateFile))
-	_ = os.Remove(filepath.Join(cacheDir, stateFile+".tmp"))
-	_ = os.Remove(filepath.Join(cacheDir, headFile))
-	_ = os.Remove(filepath.Join(cacheDir, headFile+".tmp"))
+	removeCacheFile(cacheDir, stateFile)
+	removeCacheFile(cacheDir, headFile)
 	deleteEmptyStateFiles(cacheDir)
 	// A stale .git-committed-v1 cannot give a wrong answer.
 	// prepareNativeGitDelta compares it with the commit that the shard
@@ -280,11 +313,10 @@ func indexBuildOptions(indexDir string, parallelism int) index.Options {
 	}
 }
 
-// ctagsOnce caches executable discovery for one process.
-var (
-	ctagsOnce sync.Once
-	ctagsErr  error
-)
+// envCtagsCommand names the Universal Ctags command. Zoekt's builder reads
+// it too (index.Builder), so checkCtags sets it to the "ctags" fallback that it
+// finds.
+const envCtagsCommand = "CTAGS_COMMAND"
 
 // ctagsUnavailableError identifies a failure to locate an executable Ctags
 // command. An explicit command records its CTAGS_COMMAND value. The wrapped
@@ -305,12 +337,9 @@ func (e *ctagsUnavailableError) Unwrap() error {
 	return e.cause
 }
 
-// checkCtagsCached returns the cached result of checkCtags, running the
-// check at most once per process.
-func checkCtagsCached() error {
-	ctagsOnce.Do(func() { ctagsErr = checkCtags() })
-	return ctagsErr
-}
+// checkCtagsCached returns the result of checkCtags, which runs at most once
+// per process. Tests replace it to run the check again.
+var checkCtagsCached = sync.OnceValue(checkCtags)
 
 // checkCtags locates an executable command before Zoekt creates a builder. It
 // verifies the generic "ctags" fallback by version because that name can refer
@@ -324,7 +353,7 @@ func checkCtagsCached() error {
 //     installs universal-ctags as "ctags")
 func checkCtags() error {
 	// 1. An explicit environment variable: trust the user.
-	if cmd := os.Getenv("CTAGS_COMMAND"); cmd != "" {
+	if cmd := os.Getenv(envCtagsCommand); cmd != "" {
 		if _, err := exec.LookPath(cmd); err != nil {
 			return &ctagsUnavailableError{command: cmd, cause: err}
 		}
@@ -345,10 +374,10 @@ func checkCtags() error {
 		}
 		out, versionErr := exec.Command(ctags, "--version").Output()
 		if versionErr == nil && strings.Contains(string(out), "Universal Ctags") {
-			_ = os.Setenv("CTAGS_COMMAND", ctags)
+			_ = os.Setenv(envCtagsCommand, ctags)
 			return nil
 		}
-		if errors.Is(versionErr, syscall.EMFILE) || errors.Is(versionErr, syscall.ENFILE) {
+		if outOfFileDescriptors(versionErr) {
 			// No free descriptor says nothing about ctags.
 			return fmt.Errorf("check %q --version: %w", ctags, versionErr)
 		}
@@ -435,10 +464,10 @@ func (g *gitNode) buildLocked(
 		preState:     preState,
 		cachedState:  cachedState,
 		dirty:        hasDirty,
-		familyIntact: sc.matchesManifest(indexDir),
+		familyIntact: sc.matchesManifest(),
 		// The committed family is checked separately: a dirty edit can
 		// change only the uncommitted family.
-		committedIntact: sc.matchesManifestFamily(indexDir, familyCommitted),
+		committedIntact: sc.matchesManifestFamily(familyCommitted),
 		committedMember: sc.hasMember(familyCommitted),
 		committedReady:  store.committedSnapshotReady(state, sc),
 		// Prepare vectors only when a route can read them. The model itself
@@ -477,7 +506,7 @@ func (g *gitNode) buildLocked(
 
 	// publishedCommittedHead asks the shards rather than the sidecar;
 	// committedShardHead documents why.
-	if in.head != "no-head" {
+	if in.head != gitNoHead {
 		in.publishedHead = publishedCommittedHead(cacheDir, sc)
 	}
 	if in.vectors {
@@ -859,7 +888,7 @@ func buildCommittedGitStage(
 	// A delta reads only the changed paths, so a blob that arrived for an
 	// unchanged path needs the full build.
 	if !arrival.lexical {
-		delta, eligible, err := prepareNativeGitDelta(
+		delta, err := prepareNativeGitDelta(
 			ctx,
 			repoDir,
 			store,
@@ -869,7 +898,7 @@ func buildCommittedGitStage(
 		if err != nil {
 			return committedGitState{}, nil, err
 		}
-		if eligible {
+		if delta != nil {
 			err := indexNativeGitDelta(
 				ctx,
 				repoDir,
@@ -931,7 +960,7 @@ func publishedCommittedHead(cacheDir string, scan familyScan) string {
 // When a committed shard is present, the answer comes from the commit that
 // shard records, not from the .head sidecar. See committedShardHead.
 func (store corpusStore) committedSnapshotReady(state repoState, scan familyScan) bool {
-	if state.HeadSHA == "no-head" {
+	if state.HeadSHA == gitNoHead {
 		return !scan.hasMember(familyCommitted)
 	}
 	if scan.hasShard(familyCommitted) {
@@ -943,7 +972,7 @@ func (store corpusStore) committedSnapshotReady(state repoState, scan familyScan
 		// "stale" here would rebuild on every read of an unreadable shard.
 		return true
 	}
-	return readHeadFile(store.cacheDir) == state.HeadSHA && scan.matchesManifestFamily(store.indexDir, familyCommitted)
+	return readHeadFile(store.cacheDir) == state.HeadSHA && scan.matchesManifestFamily(familyCommitted)
 }
 
 // validateCommittedBuildHead distinguishes a real HEAD change from a failed
@@ -1206,7 +1235,7 @@ type dirtyFailure struct {
 // passing applies the failure rule to err, a read error of the dirty file
 // name. It stops the build, or sends the file by name only and notes err.
 func (failure *dirtyFailure) passing(ctx context.Context, out chan<- fileContent, name string, err error) {
-	if !failure.keep || errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) {
+	if !failure.keep || outOfFileDescriptors(err) {
 		failure.stop(err)
 		return
 	}
@@ -1269,11 +1298,9 @@ func markKept(entries []uncommittedManifestEntry, names []string) []uncommittedM
 }
 
 // onlyKept reports changed paths that are all kept files of the manifest:
-// such a delta reads only them, whatever the family's shard count.
+// such a delta reads only them, whatever the family's shard count. Both
+// callers give at least one changed path: a delta with none reads no file.
 func onlyKept(changed []string, manifest uncommittedManifest) bool {
-	if len(changed) == 0 {
-		return false
-	}
 	kept := map[string]struct{}{}
 	for _, entry := range manifest.Files {
 		if entry.Size == keptEntrySize {
@@ -1507,7 +1534,7 @@ func uncommittedDeltaPossible(ctx context.Context, repoDir string, store corpusS
 	var payload int64
 	window := indexWindow(ctx)
 	for _, candidate := range toRead {
-		if payload += candidate.size; payload >= window {
+		if payload += candidate.Size; payload >= window {
 			slog.Debug("Uncommitted delta payload exceeds window threshold; full rebuild", "payload", payload, "window", window)
 			return nil
 		}
@@ -1547,7 +1574,7 @@ func prepareUncommitted(
 		return nil, stage, nil, nil
 	case ctx.Err() != nil:
 		return nil, nil, nil, ctx.Err()
-	case errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE):
+	case outOfFileDescriptors(err):
 		return nil, nil, err, nil
 	}
 	return nil, nil, nil, err
@@ -1699,7 +1726,7 @@ func readUncommittedCandidates(ctx context.Context, repoDir string, candidates [
 	}
 	files := make([]string, len(candidates))
 	for i, c := range candidates {
-		files[i] = c.name
+		files[i] = c.Name
 	}
 	innerCtx, cancelInner := context.WithCancelCause(ctx)
 	defer cancelInner(nil)
@@ -1883,14 +1910,16 @@ func indexDocumentsWithRepository(
 	}
 
 	for doc := range fileCh {
+		// An add error comes first: its cancelProducer can also end ctx, as
+		// in the Git full build, and that cancel must not replace it.
+		if addErr != nil {
+			readSemaphore.Release(doc.weight)
+			continue
+		}
 		if err := ctx.Err(); err != nil {
 			abandon(doc.weight)
 			_ = finishWindow()
 			return indexedAny, err
-		}
-		if addErr != nil {
-			readSemaphore.Release(doc.weight)
-			continue
 		}
 
 		document := index.Document{
@@ -1969,15 +1998,11 @@ func indexDocumentsWithRepository(
 }
 
 // writePendingUncommittedManifest writes the manifest of a published family
-// that kept some files by name (noted). The manifest has no state, a kept mark
-// on those files, and deadBytes. So the next search's delta reads the kept
-// files again.
+// that kept some files by name (noted, the *dirtyFilesKept of
+// dirtyFailure.noted). The manifest has no state, a kept mark on those files,
+// and deadBytes. So the next search's delta reads the kept files again.
 func writePendingUncommittedManifest(cacheDir string, entries []uncommittedManifestEntry, noted error, deadBytes int64) {
-	kept, ok := errors.AsType[*dirtyFilesKept](noted)
-	if !ok {
-		deleteUncommittedManifest(cacheDir)
-		return
-	}
+	kept := noted.(*dirtyFilesKept)
 	if err := writeUncommittedManifest(cacheDir, "", markKept(entries, kept.files), deadBytes); err != nil {
 		deleteUncommittedManifest(cacheDir)
 	}

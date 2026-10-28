@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -132,14 +131,11 @@ var fileIsDataless = func(_ string, st *unix.Stat_t) bool {
 // its own digest. The state hash combines the digests in the order of their
 // relative paths, so worker timing never changes it. found is set only
 // for the graph expansion's walk, which records the boundaries; every later
-// walk skips the recorded directories.
+// walk skips the recorded directories. The root is a file or a directory
+// (planFolderCorpus).
 func walkFolderNode(ctx context.Context, plan node, collect bool, found *folderBoundaries) (folderWalk, error) {
-	switch plan.rootType {
-	case rootTypeFile:
+	if plan.rootType == rootTypeFile {
 		return walkFolderFileRoot(plan, collect)
-	case rootTypeDirectory:
-	default:
-		return folderWalk{}, fmt.Errorf("unsupported folder root type: %s", plan.rootType)
 	}
 	w := &folderWalker{
 		ctx:      ctx,
@@ -166,14 +162,13 @@ func walkFolderNode(ctx context.Context, plan node, collect bool, found *folderB
 
 // walkFolderFileRoot captures a single-file node.
 func walkFolderFileRoot(plan node, collect bool) (folderWalk, error) {
-	info, err := os.Lstat(plan.root)
+	candidate, regular, err := lstatFolderCandidate(filepath.Base(plan.root), plan.root)
 	if err != nil {
 		return folderWalk{}, fmt.Errorf("read file root: %w", err)
 	}
-	if !info.Mode().IsRegular() {
+	if !regular {
 		return folderWalk{}, fmt.Errorf("unsupported file root: %s", plan.root)
 	}
-	candidate := newFolderCandidate(filepath.Base(plan.root), plan.root, info)
 	h := newFolderStateHasher(plan)
 	appendFolderCandidateHash(h, candidate)
 	walk := folderWalk{stateHash: finishFolderStateHash(h), selectedCount: 1}
@@ -308,7 +303,7 @@ func (w *folderWalker) visit(job folderDirJob) error {
 		if job.rel == "" {
 			return fmt.Errorf("read folder root: %w", err)
 		}
-		if errors.Is(err, unix.EMFILE) || errors.Is(err, unix.ENFILE) {
+		if outOfFileDescriptors(err) {
 			// Out of file descriptors is no property of the folder: a walk
 			// that went on would publish a partial state.
 			return fmt.Errorf("read folder %s: %w", job.path, err)
@@ -428,12 +423,34 @@ func openSortedDirectory(dir string) (*os.File, []os.DirEntry, error) {
 
 // fstatatRegularFile stats name in the open directory dirFD, with no symlink
 // follow and no open of the file. It returns a candidate with the stat fields
-// set, and reports false for any other file type.
+// set (folderCandidateOf), and reports false for any other file type.
 func fstatatRegularFile(dirFD int, name string) (folderCandidate, bool) {
 	var st unix.Stat_t
 	if err := unix.Fstatat(dirFD, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return folderCandidate{}, false
 	}
+	return folderCandidateOf(name, &st)
+}
+
+// lstatFolderCandidate stats path with no symlink follow (lstatWorkTreeFile)
+// and returns its candidate named name (folderCandidateOf). ok is false for a
+// file that is not regular.
+func lstatFolderCandidate(name, path string) (candidate folderCandidate, ok bool, err error) {
+	var st unix.Stat_t
+	if err := lstatWorkTreeFile(path, &st); err != nil {
+		return folderCandidate{}, false, err
+	}
+	candidate, ok = folderCandidateOf(filepath.Base(path), &st)
+	candidate.name, candidate.path = name, path
+	return candidate, ok, nil
+}
+
+// folderCandidateOf returns the stat fields of the regular file that st
+// describes, with no name and no path, and reports false for any other file
+// type. entry is the directory entry name that fileIsDataless reads. The walk
+// and each later check of one file make the candidate here, so two candidates
+// of one file differ only when the file changed.
+func folderCandidateOf(entry string, st *unix.Stat_t) (folderCandidate, bool) {
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
 		return folderCandidate{}, false
 	}
@@ -444,7 +461,7 @@ func fstatatRegularFile(dirFD int, name string) (folderCandidate, bool) {
 		ctime:    st.Ctim.Nano(),
 		dev:      uint64(st.Dev),
 		ino:      st.Ino,
-		dataless: fileIsDataless(name, &st),
+		dataless: fileIsDataless(entry, st),
 	}, true
 }
 

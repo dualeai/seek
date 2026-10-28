@@ -123,27 +123,28 @@ func extractSemanticUnitsWithID(
 	})
 	// The first anchor of each offset, by symbol, starts the unit.
 	anchors = slices.CompactFunc(anchors, func(a, b semanticAnchor) bool { return a.offset == b.offset })
+	span := semanticUnit{path: path, contentID: contentID, parserResult: parserResult, language: language}
 	if len(anchors) == 0 {
 		if parserResult == semanticParserCTags {
-			parserResult = semanticParserNoSymbols
+			span.parserResult = semanticParserNoSymbols
 		}
-		return appendSemanticSpan(nil, path, content, contentID, 0, len(content),
-			semanticUnitFallback, parserResult, language, "", &idBuffer)
+		span.kind = semanticUnitFallback
+		return appendSemanticSpan(nil, span, content, 0, len(content), &idBuffer)
 	}
 
 	units := make([]semanticUnit, 0, len(anchors)+1)
 	if anchors[0].offset > 0 {
-		units = appendSemanticSpan(units, path, content, contentID, 0,
-			anchors[0].offset, semanticUnitGap, parserResult, language, "", &idBuffer)
+		span.kind = semanticUnitGap
+		units = appendSemanticSpan(units, span, content, 0, anchors[0].offset, &idBuffer)
 	}
+	span.kind = semanticUnitSymbol
 	for i, current := range anchors {
 		end := len(content)
 		if i+1 < len(anchors) {
 			end = anchors[i+1].offset
 		}
-		units = appendSemanticSpan(units, path, content, contentID,
-			current.offset, end, semanticUnitSymbol, parserResult,
-			language, current.symbol, &idBuffer)
+		span.symbol = current.symbol
+		units = appendSemanticSpan(units, span, content, current.offset, end, &idBuffer)
 	}
 	return units
 }
@@ -210,20 +211,18 @@ func semanticLineStarts(content []byte) []int {
 	return starts
 }
 
-// appendSemanticSpan splits one source span and assigns a stable ID to each
-// part. idBuffer must point to caller-owned scratch storage. The caller reuses
-// that storage for all spans from one source file.
+// appendSemanticSpan splits the span start:end of content and assigns a
+// stable ID to each part. Each part is a copy of span, which holds the fields
+// of the whole span (path, content ID, kind, parser result, language and
+// symbol), with its own offsets and text. idBuffer must point to caller-owned
+// scratch storage. The caller reuses that storage for all spans from one
+// source file.
 func appendSemanticSpan(
 	units []semanticUnit,
-	path string,
+	span semanticUnit,
 	content []byte,
-	contentID semanticContentID,
 	start int,
 	end int,
-	kind semanticUnitKind,
-	parserResult semanticParserResult,
-	language string,
-	symbol string,
 	idBuffer *[]byte,
 ) []semanticUnit {
 	for start < end {
@@ -233,20 +232,12 @@ func appendSemanticSpan(
 				partEnd = start + newline + 1
 			}
 		}
-		unit := semanticUnit{
-			path:         path,
-			contentID:    contentID,
-			start:        uint64(start),
-			end:          uint64(partEnd),
-			kind:         kind,
-			parserResult: parserResult,
-			language:     language,
-			symbol:       symbol,
-			// The caller owns content until it finishes encoding this unit.
-			// Keeping a view avoids a second full-file allocation during index
-			// builds.
-			text: content[start:partEnd],
-		}
+		unit := span
+		unit.start, unit.end = uint64(start), uint64(partEnd)
+		// The caller owns content until it finishes encoding this unit.
+		// Keeping a view avoids a second full-file allocation during index
+		// builds.
+		unit.text = content[start:partEnd]
 		unit.id, *idBuffer = makeSemanticUnitIDBuffered(unit, *idBuffer)
 		units = append(units, unit)
 		start = partEnd

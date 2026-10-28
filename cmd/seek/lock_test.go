@@ -200,9 +200,10 @@ func TestAcquireReadLock_WaitsForPublishUntilCancel(t *testing.T) {
 }
 
 // lockWaitProof is how long a lock test holds a lock that another wait needs,
-// in the fake time of a synctest bubble. So a lock wait with a deadline fails
-// the test.
-const lockWaitProof = time.Hour
+// in the fake time of a synctest bubble. So a lock wait with a deadline of 10
+// minutes or less fails the test. A longer hold costs real time: the wait
+// tries the real lock every 2 to 10 ms of fake time, and an hour took 10 s.
+const lockWaitProof = 10 * time.Minute
 
 // TestAcquireBuildLock_WaitsForAnotherBuildUntilCancel holds the build lock
 // of a node with no shard, as another build does. It holds the lock through a
@@ -430,7 +431,7 @@ func TestPollLockRetriesOnlyAHeldLock(t *testing.T) {
 				return held
 			}
 			return nil
-		}, time.Millisecond, time.Millisecond)
+		}, time.Millisecond)
 		if err != nil || calls != 2 {
 			t.Fatalf("%v: err=%v calls=%d, want a retry then success", held, err, calls)
 		}
@@ -440,7 +441,7 @@ func TestPollLockRetriesOnlyAHeldLock(t *testing.T) {
 		err := pollLock(t.Context(), "/cache/.lock", "", func() error {
 			calls++
 			return lasting
-		}, time.Millisecond, time.Millisecond)
+		}, time.Millisecond)
 		if !errors.Is(err, lasting) || calls != 1 || !strings.Contains(err.Error(), "/cache/.lock") {
 			t.Fatalf("%v: err=%v calls=%d, want one call and the lock path", lasting, err, calls)
 		}

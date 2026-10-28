@@ -172,11 +172,16 @@ func TestPlanCorpora_TrackedAndIgnoredFileSameRepoSplit(t *testing.T) {
 
 // TestRealCaseWithin checks that realCaseWithin keeps a path typed with the
 // on-disk case as it is. On a case-insensitive file system, it must change a
-// path typed with another case to the on-disk names, so the byte-exact Git
-// scope matches. On a case-sensitive file system, that path names no file, so
-// it stays as typed.
+// path typed with another case to the on-disk names, which the steps that
+// compare names byte for byte need. On a case-sensitive file system, that
+// path names no file, so it stays as typed. Below a directory that the test
+// user cannot read, onDiskPath cannot open that directory, and realCaseWithin
+// still gives the stored names.
 func TestRealCaseWithin(t *testing.T) {
-	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(filepath.Join(root, "Sub"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -194,6 +199,17 @@ func TestRealCaseWithin(t *testing.T) {
 	}
 	if got := realCaseWithin(root, wrong, dirListings{}); got != want {
 		t.Errorf("case correction: got %q want %q", got, want)
+	}
+
+	writeFixtureFile(t, filepath.Join(root, "Locked", "Real.txt"), "x")
+	chmodUnreadableOrFatal(t, filepath.Join(root, "Locked"), 0o311)
+	typed := filepath.Join(root, "locked", "REAL.txt")
+	want = filepath.Join(root, "Locked", "Real.txt")
+	if _, err := os.Stat(typed); err != nil {
+		want = typed
+	}
+	if got := realCaseWithin(root, onDiskPath(typed), dirListings{}); got != want {
+		t.Errorf("below an unreadable directory: got %q want %q", got, want)
 	}
 }
 

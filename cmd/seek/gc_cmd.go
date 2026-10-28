@@ -87,7 +87,7 @@ func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 }
 
 // gcTableHeader is the column row of `seek gc --dry-run` and of a live
-// `seek gc`. Its widths match the format string in renderGCRow.
+// `seek gc`. Its widths match the format string in emitGCRow.
 const gcTableHeader = "  CORPUS      ROOT                                                  AGE     SIZE    ACTION"
 
 // gcTableStats holds the counters of the table summary line. The dry-run and
@@ -133,7 +133,7 @@ func parseGCSortKey(s string) (gcSortKey, error) {
 }
 
 // gcRow is one table row: the corpus entry, and the size and display info
-// that renderGCRow needs. A sorted view (--sort=age|size) builds all rows
+// that emitGCRow needs. A sorted view (--sort=age|size) builds all rows
 // first, so it can sort them before it renders them. The default name order
 // builds one short-lived row per entry.
 type gcRow struct {
@@ -181,20 +181,6 @@ func sortGCRows(rows []gcRow, key gcSortKey) {
 	}
 }
 
-// renderGCRow prints one corpus row in the column layout of gcTableHeader.
-// The caller gives the display info, so a live caller can read it before the
-// eviction.
-func renderGCRow(w io.Writer, e corpusDirEntry, info corpusDisplayInfo, size int64, now time.Time, action string) {
-	age := now.Sub(e.usedAt)
-	_, _ = fmt.Fprintf(w, "  %-10s  %-*s  %-6s  %-6s  %s\n",
-		truncateHash(e.name),
-		gcRootWidth, formatRoot(info),
-		humanDuration(age),
-		humanBytes(size),
-		action,
-	)
-}
-
 // printGCTableBanner prints the banner shared by the dry-run and live tables,
 // then either the "no corpora" note (empty cache) or the column header.
 func printGCTableBanner(w io.Writer, cacheRoot string, n int) {
@@ -216,10 +202,18 @@ func predictGCAction(e corpusDirEntry, evict map[corpusID]bool) gcRowResult {
 	return gcRowResult{action: actionEvicted}
 }
 
-// emitGCRow renders one row and adds it to stats. Both paths give it a
-// gcRowResult, so the rule of what counts as evicted is in one place.
+// emitGCRow prints one corpus row in the column layout of gcTableHeader and
+// adds it to stats. The row holds the display info, so a live caller reads it
+// before the eviction (measureGCRow). Both paths give it a gcRowResult, so the
+// rule of what counts as evicted is in one place.
 func emitGCRow(w io.Writer, stats *gcTableStats, r gcRow, now time.Time, res gcRowResult) {
-	renderGCRow(w, r.entry, r.info, r.size, now, res.String())
+	_, _ = fmt.Fprintf(w, "  %-10s  %-*s  %-6s  %-6s  %s\n",
+		truncateHash(r.entry.name),
+		gcRootWidth, formatRoot(r.info),
+		humanDuration(now.Sub(r.entry.usedAt)),
+		humanBytes(r.size),
+		res.String(),
+	)
 	stats.totalBytes += r.size
 	stats.rendered++
 	if res.action == actionEvicted || res.action == actionTrashed {
@@ -236,7 +230,7 @@ func emitGCRow(w io.Writer, stats *gcTableStats, r gcRow, now time.Time, res gcR
 //
 // The rows use the words of the live path (`seek gc --force`), `kept` and
 // `evicted`, for what would happen. The live path (runGC) uses the same
-// renderGCRow and columns, so the dry-run and live output line up.
+// emitGCRow and columns, so the dry-run and live output line up.
 //
 // Most of the time of a row is corpusDirSize (a filepath.WalkDir walk of the
 // corpus) and readCorpusDisplayInfo (one read of Zoekt shard metadata). The

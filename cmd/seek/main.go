@@ -103,10 +103,8 @@ func shouldRunOpportunisticGC(args []string) bool {
 			}
 		}
 	}
+	// The loop above returned at any "--", so no argument here is "--".
 	for _, arg := range args {
-		if arg == "--" {
-			return true
-		}
 		knownBool := false
 		for _, name := range []string{"-h", "--help", "--version", "-v", "--verbose"} {
 			if _, ok := optionalBoolFlag(arg, name); ok {
@@ -159,15 +157,6 @@ func hasVerboseArg(args []string) bool {
 	return verbose
 }
 
-func cloneStringSlice(values []string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	out := make([]string, len(values))
-	copy(out, values)
-	return out
-}
-
 // runSearchCommand runs one search. It plans the query, expands the path
 // operands into the node graph, and prepares and searches every node. For a
 // query that gives the model text, the model ranks the results. Then it writes
@@ -178,13 +167,9 @@ func runSearchCommand(
 	ctx context.Context,
 	pattern string,
 	pathOperands []string,
-	limit int,
-	maxMatches int,
 	config searchConfig,
 	runConfig searchRunConfig,
 ) error {
-	config.contextMatchLimit = maxMatches
-	config.contextFileLimit = limit
 	plan, err := planQuery(pattern, runConfig.policy)
 	if err != nil {
 		return err
@@ -216,21 +201,18 @@ func runSearchCommand(
 		opened:    &openedNodes{},
 		operands:  newDisplayOperands(pathOperands),
 	}
-	if plan.model != nil && runConfig.newModel != nil {
+	if plan.model != nil {
 		// The model stages run: every node builds its vectors before its read,
 		// and the model session starts beside the index preparation.
 		execution.model = newSemanticModelFuture(runConfig.newModel)
-		execution.vectors = true
 		execution.model.start(ctx)
 		execution.model.startQuery(ctx, plan.model.modelQuery)
 		defer func() { _ = execution.model.Close() }()
-	} else {
-		plan.model = nil
 	}
 
 	// The graph is final: stop before any build when the search does not fit
 	// the cache budget, and evict unused corpora after it.
-	if err := checkCacheBudget(ctx, plans, execution.vectors); err != nil {
+	if err := checkCacheBudget(ctx, plans, execution.model != nil); err != nil {
 		return err
 	}
 	defer enforceCacheBudget(plans)
@@ -241,7 +223,7 @@ func runSearchCommand(
 	}
 	ctx, bm25 := withBM25Command(ctx, len(plans))
 	var allResults []corpusSearchResult
-	var dirtyByCorpus dirtyFilesByCorpus
+	var dirtyByCorpus map[corpusID]dirtyFileSet
 	if plan.model == nil {
 		allResults, dirtyByCorpus, err = searchNodes(ctx, plans, func(nodeCtx context.Context, node node) ([]corpusSearchResult, dirtyFileSet, error) {
 			return strictNode(nodeCtx, node, plan, config, execution)
@@ -251,7 +233,7 @@ func runSearchCommand(
 		}
 		rescoreStrictResults(allResults, bm25)
 	} else {
-		var hits nodeHits
+		var hits []nodeHit
 		hits, dirtyByCorpus, err = searchNodes(ctx, plans, func(nodeCtx context.Context, node node) ([]nodeHit, dirtyFileSet, error) {
 			return retrieveNode(nodeCtx, node, plan, config, execution)
 		})
@@ -286,17 +268,17 @@ func runSearchCommand(
 		pal = ansiPalette
 	}
 	output := bufio.NewWriter(os.Stdout)
-	wrote, err := writeCorpusResultsWithContext(
+	err = writeCorpusResultsWithContext(
 		output,
 		allResults,
-		limit,
-		maxMatches,
+		config.displayFileLimit,
+		config.displayMatchLimit,
 		displayMode,
 		pal,
 	)
 	// One notice per search counts the files indexed by name only, after the
 	// results. A search with no result keeps its silent exit 1.
-	if err == nil && wrote && nameOnly != nil {
+	if err == nil && nameOnly != nil {
 		if files := nameOnly.Load(); files > 0 {
 			_, err = output.WriteString(nameOnlyNoticeLine(files))
 		}
@@ -306,9 +288,6 @@ func runSearchCommand(
 	}
 	if err != nil {
 		return fmt.Errorf("write search results: %w", err)
-	}
-	if !wrote {
-		return noMatchOrInterrupted(ctx)
 	}
 	return nil
 }
@@ -357,7 +336,6 @@ func wrapCorpusResults(plan node, files []zoekt.FileMatch) []corpusSearchResult 
 			kind:        plan.kind,
 			displayRoot: plan.displayRoot,
 			file:        file,
-			modelBase:   plan.modelPathBase(),
 		}
 	}
 	return results
@@ -370,25 +348,6 @@ func gitNodeState(ctx context.Context, plan node, paths gitPaths) (repoState, er
 		return state, nil
 	}
 	return gitRepoStateIn(ctx, paths.RepoDir)
-}
-
-// refresh makes the one combined whole-repo index current. A scoped search
-// reads the same index; its scope applies at search time.
-func (g *gitNode) refresh(
-	ctx context.Context,
-	plan node,
-	execution searchExecution,
-) (repoState, corpusIndexState, error) {
-	paths := g.paths
-	state, err := gitNodeState(ctx, plan, paths)
-	if err != nil {
-		return repoState{}, corpusSearchable, gitCorpusError(paths.RepoDir, plan.indexDir, err)
-	}
-	indexState, err := g.refreshState(ctx, plan, state, execution)
-	if err != nil {
-		return repoState{}, corpusSearchable, err
-	}
-	return state, indexState, nil
 }
 
 // refreshState refreshes, for the captured state, the whole-repository index
@@ -432,9 +391,9 @@ func (g *gitNode) refreshState(
 	)
 	// Use one directory scan so all integrity checks describe the same state.
 	sc, scErr := scanFamilyOptional(plan.indexDir)
-	hasShards := scErr == nil && sc.familyComplete(plan.indexDir) &&
+	hasShards := scErr == nil && sc.familyComplete() &&
 		plan.committedSnapshotReady(state, sc)
-	clearCommitted := state.HeadSHA == "no-head" && sc.hasMember(familyCommitted)
+	clearCommitted := state.HeadSHA == gitNoHead && sc.hasMember(familyCommitted)
 	// A leftover .swapping marker means that a publish was interrupted, or did
 	// not move the live family back, and the shards can be torn. Force the
 	// build path, so recoverIncompleteSwap runs even when the state looks
@@ -508,8 +467,8 @@ func watchInterrupts(signals <-chan os.Signal, cancel context.CancelFunc, waits 
 }
 
 func normalizeCommittedTreeish(headSHA string) string {
-	if headSHA == "" || headSHA == "no-head" {
-		return "no-head"
+	if headSHA == "" || headSHA == gitNoHead {
+		return gitNoHead
 	}
 	return headSHA
 }

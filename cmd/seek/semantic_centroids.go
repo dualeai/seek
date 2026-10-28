@@ -77,7 +77,7 @@ func (workspace *semanticCentroidWorkspace) makeUnitEmbedding(
 	tokens := workspace.tokens[:tokenCount]
 	workspace.selectCentroids(tokens, result.fine[:])
 	copy(result.coarse[:], result.fine[:semanticCoarseCentroidsPerUnit])
-	if err := workspace.refineCentroids(tokens, result.coarse[:], semanticCoarseRefinementPasses); err != nil {
+	if err := workspace.refineCentroids(tokens, result.coarse[:]); err != nil {
 		return semanticUnitEmbedding{}, err
 	}
 	return result, nil
@@ -151,8 +151,8 @@ func (workspace *semanticCentroidWorkspace) selectCentroids(
 	}
 }
 
-// refineCentroids runs a number of passes (refinements) on centroids. In each
-// pass, every token after the first joins the most similar of the other
+// refineCentroids runs semanticCoarseRefinementPasses passes on centroids. In
+// each pass, every token after the first joins the most similar of the other
 // centroids. Then each centroid with members becomes the normalized mean of
 // its members. A centroid with no members keeps its value. Centroid zero stays
 // on the first scoreable token. tokens holds at least one token, and centroids
@@ -160,10 +160,9 @@ func (workspace *semanticCentroidWorkspace) selectCentroids(
 func (workspace *semanticCentroidWorkspace) refineCentroids(
 	tokens []semanticVector,
 	centroids []semanticVector,
-	refinements int,
 ) error {
 	count := len(centroids)
-	for range refinements {
+	for range semanticCoarseRefinementPasses {
 		sums := workspace.sums[:count]
 		members := workspace.members[:count]
 		for centroid := range count {

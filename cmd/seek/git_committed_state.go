@@ -78,5 +78,4 @@ func writeCommittedGitState(cacheDir string, state committedGitState) error {
 
 func deleteCommittedGitState(cacheDir string) {
 	removeCacheFile(cacheDir, committedGitStateFile)
-	removeCacheFile(cacheDir, committedGitStateFile+".tmp")
 }

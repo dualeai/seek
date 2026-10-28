@@ -51,10 +51,14 @@ type searchConfig struct {
 	// bm25 marks a lexical search (the strict query, or the relaxed rank of
 	// a model query). The command rescores its hits with one global average
 	// file length.
-	bm25              bool
-	afterOnly         bool
-	contextMatchLimit int
-	contextFileLimit  int
+	bm25      bool
+	afterOnly bool
+	// displayMatchLimit and displayFileLimit hold --max-matches and --limit
+	// (0: no limit). The formatter applies them after the final sort. The
+	// result clone reads them to copy context only for the lines and files
+	// that can show.
+	displayMatchLimit int
+	displayFileLimit  int
 }
 
 // querySyntaxError identifies a query that Zoekt could not parse. The original
@@ -95,17 +99,22 @@ func openShard(path string) (zoekt.Searcher, error) {
 	if err != nil {
 		return nil, err
 	}
-	iFile, err := index.NewIndexFile(f)
+	return openShardFile(f)
+}
+
+// openShardFile maps the open shard file f and returns a Searcher.
+// index.NewIndexFile closes f in all cases: the map keeps the shard.
+func openShardFile(f *os.File) (zoekt.Searcher, error) {
+	indexFile, err := index.NewIndexFile(f)
 	if err != nil {
-		_ = f.Close()
 		return nil, err
 	}
-	s, err := zoektOpen(iFile)
+	searcher, err := zoektOpen(indexFile)
 	if err != nil {
-		iFile.Close()
+		indexFile.Close()
 		return nil, err
 	}
-	return s, nil
+	return searcher, nil
 }
 
 // loadShards opens all .zoekt entries in indexDir and returns individual
@@ -289,36 +298,6 @@ func plainQualifiedIdentifier(name string) bool {
 	return true
 }
 
-// searchShards runs userQ within scope on one load of shards. paths are in
-// the order of searchers; the BM25 rescore reads them. With no searcher it
-// returns errShardUnloadable: damage that the caller repairs.
-func searchShards(
-	ctx context.Context,
-	searchers []zoekt.Searcher,
-	paths []string,
-	userQ query.Q,
-	scope query.Q,
-	config searchConfig,
-) ([]zoekt.FileMatch, error) {
-	q := userQ
-	if scope != nil {
-		// Zoekt gathers no match under a file-name type. So the scope filters
-		// the files and adds no file-name term to their BM25 score. A file in
-		// the scope scores as in an unscoped search. Unlike a double
-		// negation, it keeps Zoekt's shard and file skips.
-		q = query.NewAnd(q, &query.Type{Type: query.TypeFileName, Child: scope})
-		q = query.Simplify(q)
-	}
-	if len(searchers) == 0 {
-		return nil, fmt.Errorf("%w: no loadable shards", errShardUnloadable)
-	}
-	parts, err := bm25ShardParts(ctx, searchers, paths, q, &config)
-	if err != nil {
-		return nil, err
-	}
-	return searchLoadedShards(ctx, searchers, q, config, parts)
-}
-
 // closeShards closes the searchers of one load. The caller calls it after
 // every search of them returns: Close unmaps the shard.
 func closeShards(searchers []zoekt.Searcher) {
@@ -386,7 +365,7 @@ func bm25ShardParts(ctx context.Context, searchers []zoekt.Searcher, paths []str
 		global, final = shardsAverage(shards)
 		command.final.Store(final)
 	} else {
-		config.contextFileLimit = 0
+		config.displayFileLimit = 0
 	}
 	bq := compileBM25Query(q)
 	rebuild := func(file *zoekt.FileMatch, average float64) {
@@ -509,10 +488,12 @@ func zoektSearch(ctx context.Context, searcher zoekt.Searcher, q query.Q, opts *
 	return result, shardCallError(err)
 }
 
-func zoektList(ctx context.Context, searcher zoekt.Searcher, q query.Q, opts *zoekt.ListOptions) (_ *zoekt.RepoList, err error) {
+// zoektList lists every repository of one shard, with Zoekt's default list
+// options.
+func zoektList(ctx context.Context, searcher zoekt.Searcher) (_ *zoekt.RepoList, err error) {
 	defer recoverShardPanic(&err)
 	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
-	list, err := searcher.List(ctx, q, opts)
+	list, err := searcher.List(ctx, &query.Const{Value: true}, nil)
 	return list, shardCallError(err)
 }
 
@@ -596,30 +577,41 @@ func roundScores(files []zoekt.FileMatch) {
 	}
 }
 
+// cloneFileMatches copies the hits out of the shards. The copies of the files
+// are independent, so they spread over the host's CPUs. On Kubernetes, the
+// copy of the hits of `-n 0 e` took about 650 ms on one goroutine and about
+// 210 ms on 18 CPUs.
 func cloneFileMatches(files []zoekt.FileMatch, config searchConfig) []zoekt.FileMatch {
 	if len(files) == 0 {
 		return nil
 	}
 	contextFiles := displayedContextFiles(files, config)
 	out := make([]zoekt.FileMatch, len(files))
-	for i := range files {
-		_, keepContext := contextFiles[i]
-		out[i] = cloneFileMatch(
-			files[i],
-			config.contextMatchLimit,
-			config.afterOnly,
-			contextFiles == nil || keepContext,
-		)
+	workers := min(runtime.GOMAXPROCS(0), len(files))
+	var group sync.WaitGroup
+	for worker := range workers {
+		group.Go(func() {
+			for i := worker; i < len(files); i += workers {
+				_, keepContext := contextFiles[i]
+				out[i] = cloneFileMatch(
+					files[i],
+					config.displayMatchLimit,
+					config.afterOnly,
+					contextFiles == nil || keepContext,
+				)
+			}
+		})
 	}
+	group.Wait()
 	return out
 }
 
-// displayedContextFiles returns the indexes of the best contextFileLimit files
+// displayedContextFiles returns the indexes of the best displayFileLimit files
 // of this corpus: the files that can still show after the global file limit.
 // The node read returns one current copy per file, so a global top N file is
 // in its corpus's top N. A nil map means that all context must be copied.
 func displayedContextFiles(files []zoekt.FileMatch, config searchConfig) map[int]struct{} {
-	limit := config.contextFileLimit
+	limit := config.displayFileLimit
 	if limit <= 0 || len(files) <= limit {
 		return nil
 	}
@@ -648,19 +640,19 @@ func displayedContextFiles(files []zoekt.FileMatch, config searchConfig) map[int
 
 func cloneFileMatch(
 	in zoekt.FileMatch,
-	contextMatchLimit int,
+	displayMatchLimit int,
 	afterOnly bool,
 	keepFileContext bool,
 ) zoekt.FileMatch {
 	out := in
-	out.Branches = cloneStringSlice(in.Branches)
-	out.Content = cloneBytes(in.Content)
-	out.Checksum = cloneBytes(in.Checksum)
+	out.Branches = cloneOrNil(in.Branches)
+	out.Content = cloneOrNil(in.Content)
+	out.Checksum = cloneOrNil(in.Checksum)
 
 	if len(in.LineMatches) > 0 {
 		var contextLines map[int]struct{}
 		if keepFileContext {
-			contextLines = displayedContextLines(in.LineMatches, contextMatchLimit)
+			contextLines = displayedContextLines(in.LineMatches, displayMatchLimit)
 		}
 		out.LineMatches = make([]zoekt.LineMatch, len(in.LineMatches))
 		for i := range in.LineMatches {
@@ -694,43 +686,33 @@ func displayedContextLines(matches []zoekt.LineMatch, limit int) map[int]struct{
 	return lines
 }
 
+// cloneLineMatch copies the bytes of a line match, which point into the shard.
+// The fragments stay shared: Zoekt builds them, and their symbols, on the Go
+// heap for each search (index/contentprovider.go fillContentMatches), so no
+// fragment points into a shard.
 func cloneLineMatch(in zoekt.LineMatch, keepContext, afterOnly bool) zoekt.LineMatch {
 	out := in
-	out.Line = cloneBytes(in.Line)
+	out.Line = cloneOrNil(in.Line)
 	if keepContext {
 		if afterOnly {
 			out.Before = nil
 		} else {
-			out.Before = cloneBytes(in.Before)
+			out.Before = cloneOrNil(in.Before)
 		}
-		out.After = cloneBytes(in.After)
+		out.After = cloneOrNil(in.After)
 	} else {
 		out.Before = nil
 		out.After = nil
 	}
-	if len(in.LineFragments) > 0 {
-		out.LineFragments = make([]zoekt.LineFragmentMatch, len(in.LineFragments))
-		for i := range in.LineFragments {
-			out.LineFragments[i] = cloneLineFragmentMatch(in.LineFragments[i])
-		}
-	}
 	return out
 }
 
-func cloneLineFragmentMatch(in zoekt.LineFragmentMatch) zoekt.LineFragmentMatch {
-	out := in
-	if in.SymbolInfo != nil {
-		symbol := *in.SymbolInfo
-		out.SymbolInfo = &symbol
-	}
-	return out
-}
-
-func cloneBytes(in []byte) []byte {
+// cloneOrNil returns a copy of in, or nil when in is empty.
+func cloneOrNil[T any](in []T) []T {
 	if len(in) == 0 {
 		return nil
 	}
-	out := make([]byte, len(in))
+	out := make([]T, len(in))
 	copy(out, in)
 	return out
 }

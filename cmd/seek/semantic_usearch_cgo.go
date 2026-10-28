@@ -227,6 +227,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
+
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -367,7 +369,7 @@ type semanticUSearchBuildJob struct {
 // the source file, so the live generation would hash the file again at each
 // search until the next bind. The late link keeps that time short, and a
 // failed build makes no link. Each shard stays single-threaded inside
-// USearch; the Go worker pool supplies host-wide parallelism.
+// USearch; up to one shard per CPU builds at a time.
 func buildSemanticUSearchStream(
 	ctx context.Context,
 	dir string,
@@ -392,35 +394,31 @@ func buildSemanticUSearchStream(
 	compatibility, err := semanticUSearchCompatibility()
 	fail(err)
 
-	jobs := make(chan semanticUSearchBuildJob)
 	shardsByNumber := make(map[int]semanticUSearchShard)
 	reuses := make(map[int]semanticUSearchShardReuse)
 	var shardsMu sync.Mutex
 	built := 0
-	var workers sync.WaitGroup
-	for range resources.cpuLimit() {
-		workers.Go(func() {
-			for job := range jobs {
-				if ctx.Err() != nil {
-					continue
-				}
-				shard, reuse, err := prepareSemanticUSearchShard(ctx, dir, compatibility, job, sources, resources)
-				if err != nil {
-					if ctx.Err() == nil {
-						fail(err)
-					}
-					continue
-				}
-				shardsMu.Lock()
-				shardsByNumber[job.shard] = shard
-				if reuse != nil {
-					reuses[job.shard] = *reuse
-				} else {
-					built++
-				}
-				shardsMu.Unlock()
+	var builds errgroup.Group
+	builds.SetLimit(resources.cpuLimit())
+	build := func(job semanticUSearchBuildJob) {
+		if ctx.Err() != nil {
+			return
+		}
+		shard, reuse, err := prepareSemanticUSearchShard(ctx, dir, compatibility, job, sources, resources)
+		if err != nil {
+			if ctx.Err() == nil {
+				fail(err)
 			}
-		})
+			return
+		}
+		shardsMu.Lock()
+		shardsByNumber[job.shard] = shard
+		if reuse != nil {
+			reuses[job.shard] = *reuse
+		} else {
+			built++
+		}
+		shardsMu.Unlock()
 	}
 
 	pending := make(map[int][]semanticCoarseVectors)
@@ -461,16 +459,15 @@ func buildSemanticUSearchStream(
 			}
 			first := int(plan.start/semanticModelBatchRows) - windowFirst
 			last := int((end-1)/semanticModelBatchRows) - windowFirst
-			embeddings := semanticCoarseSet{
+			job := semanticUSearchBuildJob{shard: shardCount, plan: plan, embeddings: semanticCoarseSet{
 				batches: slices.Clone(window[first : last+1]),
 				offset:  int(plan.start % semanticModelBatchRows),
 				rows:    int(plan.rows),
-			}
-			select {
-			case jobs <- semanticUSearchBuildJob{shard: shardCount, plan: plan, embeddings: embeddings}:
-			case <-ctx.Done():
-				return
-			}
+			}}
+			builds.Go(func() error {
+				build(job)
+				return nil
+			})
 			shardCount++
 			queue = queue[1:]
 			// No later shard reads the batches that end at or before end.
@@ -517,8 +514,7 @@ func buildSemanticUSearchStream(
 			fail(fmt.Errorf("USearch shards cover %d rows, the rows file has %d", planned, ready))
 		}
 	}
-	close(jobs)
-	workers.Wait()
+	_ = builds.Wait()
 	if firstErr == nil && ctx.Err() == nil {
 		fail(placeSemanticUSearchShards(dir, reuses, shardsByNumber, resources.cpuLimit()))
 	}
@@ -563,7 +559,6 @@ func prepareSemanticUSearchShard(
 			reuse, err = verifySemanticUSearchShardSource(source)
 		} else {
 			shard.Check, err = copySemanticUSearchShard(source, path)
-			reuse.placed = true
 		}
 		if err == nil {
 			shard.semanticArtifact = source.shard.semanticArtifact
@@ -593,9 +588,9 @@ func prepareSemanticUSearchShard(
 	return shard, nil, nil
 }
 
-// placeSemanticUSearchShards links into dir each verified file of reuses that
-// is not placed yet. It runs on workers goroutines and records the check of
-// each new file in shards.
+// placeSemanticUSearchShards links into dir the verified file of each link
+// source of reuses; the build copied the others already. It runs on workers
+// goroutines and records the check of each new file in shards.
 func placeSemanticUSearchShards(
 	dir string,
 	reuses map[int]semanticUSearchShardReuse,
@@ -625,7 +620,7 @@ func placeSemanticUSearchShards(
 		})
 	}
 	for number, reuse := range reuses {
-		if !reuse.placed {
+		if reuse.source.link {
 			numbers <- number
 		}
 	}
@@ -781,7 +776,7 @@ func planSemanticUSearchShards(
 	plan := semanticUSearchQueryPlan{jobs: make([]semanticUSearchQueryShard, 0, len(shards))}
 	if mask != nil {
 		wantBytes := (generation.manifest.Rows + 7) / 8
-		if mask.mode != semanticFilterPartial || mask.rows != generation.manifest.Rows ||
+		if !mask.partial() || mask.rows != generation.manifest.Rows ||
 			uint64(len(mask.bits)) != wantBytes || len(mask.shardAllowed) != len(shards) {
 			return semanticUSearchQueryPlan{}, fmt.Errorf("partial semantic filter mask does not match generation")
 		}
@@ -858,9 +853,9 @@ func searchSemanticUSearchCandidatesWithMask(
 	return executeSemanticUSearchPlan(ctx, generation, queryVectors, mask, plan)
 }
 
-// executeSemanticUSearchPlan runs the native jobs of plan on up to GOMAXPROCS
-// workers. It merges their rows with plan.exactRows into one sorted unique
-// row set.
+// executeSemanticUSearchPlan runs up to GOMAXPROCS native jobs of plan at a
+// time. It merges their rows with plan.exactRows into one sorted unique row
+// set. The first failed job stops the jobs that have not started.
 func executeSemanticUSearchPlan(
 	ctx context.Context,
 	generation *semanticGeneration,
@@ -877,58 +872,6 @@ func executeSemanticUSearchPlan(
 	if err := ensureSemanticUSearchRuntime(); err != nil {
 		return semanticUSearchCandidateSet{}, err
 	}
-	type result struct {
-		job       semanticUSearchQueryShard
-		hits      [][]semanticHit
-		saturated bool
-		err       error
-	}
-	jobs := make(chan semanticUSearchQueryShard)
-	searchCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	workers := min(runtime.GOMAXPROCS(0), len(plan.jobs))
-	results := make(chan result)
-	var wait sync.WaitGroup
-	for range workers {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
-			for job := range jobs {
-				err := generation.validateUSearchShard(job.index)
-				var hits [][]semanticHit
-				var saturated bool
-				if err == nil {
-					hits, saturated, err = searchSemanticUSearchShardTokens(
-						searchCtx,
-						generation.usearch[job.index],
-						generation.manifest.USearchFiles[job.index],
-						queryVectors,
-						semanticUSearchVectorsPerQuery,
-						mask,
-						job.filtered,
-					)
-				}
-				results <- result{job: job, hits: hits, saturated: saturated, err: err}
-				if err != nil {
-					cancel()
-				}
-			}
-		}()
-	}
-	go func() {
-		defer close(jobs)
-		for _, job := range plan.jobs {
-			select {
-			case jobs <- job:
-			case <-searchCtx.Done():
-				return
-			}
-		}
-	}()
-	go func() {
-		wait.Wait()
-		close(results)
-	}()
 	// Only the row set reaches the exact scores, so each shard's keys go to a
 	// bitmap of the generation's rows. A merge in score order costs time
 	// quadratic in the shard count.
@@ -941,49 +884,61 @@ func executeSemanticUSearchPlan(
 		seen[row/64] |= 1 << (row % 64)
 		return nil
 	}
-	var firstErr error
+	// mu guards seen and saturatedShards: each search marks its rows when it
+	// ends.
+	var mu sync.Mutex
 	saturatedShards := 0
-	for result := range results {
-		if result.err != nil {
-			if firstErr == nil {
-				firstErr = result.err
-			}
-			continue
+	searches, searchCtx := errgroup.WithContext(ctx)
+	searches.SetLimit(runtime.GOMAXPROCS(0))
+	for _, job := range plan.jobs {
+		if searchCtx.Err() != nil {
+			break
 		}
-		if firstErr != nil {
-			continue
-		}
-		if result.saturated {
-			saturatedShards++
-			// An unfiltered job's shard allows all of its rows.
-			shard := generation.manifest.USearchFiles[result.job.index]
-			rowMask := mask
-			if !result.job.filtered {
-				rowMask = nil
+		searches.Go(func() error {
+			if err := generation.validateUSearchShard(job.index); err != nil {
+				return err
 			}
-			if err := markSemanticRowRange(seen, rows, shard.Start, shard.Start+shard.Rows, rowMask); err != nil {
-				firstErr = err
-				cancel()
+			hits, saturated, err := searchSemanticUSearchShardTokens(
+				searchCtx,
+				generation.usearch[job.index],
+				generation.manifest.USearchFiles[job.index],
+				queryVectors,
+				semanticUSearchVectorsPerQuery,
+				mask,
+				job.filtered,
+			)
+			if err != nil {
+				return err
 			}
-			continue
-		}
-	marking:
-		for _, hits := range result.hits {
-			for _, hit := range hits {
-				row, _ := semanticUSearchUnitAndCentroid(hit.row)
-				if err := mark(row); err != nil {
-					firstErr = err
-					cancel()
-					break marking
+			mu.Lock()
+			defer mu.Unlock()
+			if saturated {
+				saturatedShards++
+				// An unfiltered job's shard allows all of its rows.
+				shard := generation.manifest.USearchFiles[job.index]
+				rowMask := mask
+				if !job.filtered {
+					rowMask = nil
+				}
+				return markSemanticRowRange(seen, rows, shard.Start, shard.Start+shard.Rows, rowMask)
+			}
+			for _, tokenHits := range hits {
+				for _, hit := range tokenHits {
+					row, _ := semanticUSearchUnitAndCentroid(hit.row)
+					if err := mark(row); err != nil {
+						return err
+					}
 				}
 			}
-		}
+			return nil
+		})
 	}
+	searchErr := searches.Wait()
 	if err := ctx.Err(); err != nil {
 		return semanticUSearchCandidateSet{}, err
 	}
-	if firstErr != nil {
-		return semanticUSearchCandidateSet{}, firstErr
+	if searchErr != nil {
+		return semanticUSearchCandidateSet{}, searchErr
 	}
 	for _, row := range plan.exactRows {
 		if err := mark(row); err != nil {
@@ -1261,14 +1216,11 @@ func semanticUSearchMasked(
 	if mask == nil {
 		return semanticUSearchExactFallback(ctx, generation, query, floor)
 	}
-	switch mask.mode {
-	case semanticFilterNone:
+	switch mask.allowed {
+	case 0:
 		return nil, nil
-	case semanticFilterAll:
+	case mask.rows:
 		return semanticUSearchExactFallback(ctx, generation, query, floor)
-	case semanticFilterPartial:
-	default:
-		return nil, fmt.Errorf("semantic filter mask has an invalid mode")
 	}
 
 	if mask.allowed <= semanticFilteredExactRows {

@@ -23,9 +23,13 @@ type folderNode struct{}
 
 // prepare refreshes the Git index from one git status capture.
 func (g *gitNode) prepare(ctx context.Context, plan node, execution searchExecution) (openedNode, error) {
+	state, err := gitNodeState(ctx, plan, g.paths)
+	if err != nil {
+		return openedNode{}, gitCorpusError(g.paths.RepoDir, plan.indexDir, err)
+	}
 	// One combined whole-repo index serves both scoped and unscoped
 	// searches; the scope applies at search time.
-	state, indexState, err := g.refresh(ctx, plan, execution)
+	indexState, err := g.refreshState(ctx, plan, state, execution)
 	if err != nil {
 		return openedNode{}, err
 	}
@@ -39,7 +43,7 @@ func (g *gitNode) prepare(ctx context.Context, plan node, execution searchExecut
 		// read sees an edit of a dirty file.
 		version: func() (string, string, bool) {
 			hash := gitCorpusStateHash(g.paths, state)
-			if state.HeadSHA == "no-head" {
+			if state.HeadSHA == gitNoHead {
 				// A node with no commit has no base; its overlay holds
 				// every file.
 				return hash, "", true

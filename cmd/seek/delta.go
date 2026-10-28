@@ -56,21 +56,10 @@ func deltaNeedsCompaction(tombstoned, live int64) bool {
 }
 
 // notIndexedMarkerBytes is the length of the content that Zoekt stores for a
-// document that it keeps by name only. That content is "NOT-INDEXED: " and
-// the explanation of reason (zoekt/index/document.go, SkipReason.explanation).
+// document that it keeps by name only: zoektNotIndexedMarker and the
+// explanation of reason (zoektSkipExplanation).
 func notIndexedMarkerBytes(reason index.SkipReason) int64 {
-	explanation := "unknown skip reason"
-	switch reason {
-	case index.SkipReasonTooLarge:
-		explanation = "exceeds the maximum size limit"
-	case index.SkipReasonTooSmall:
-		explanation = "contains too few trigrams"
-	case index.SkipReasonBinary:
-		explanation = "contains binary content"
-	case index.SkipReasonTooManyTrigrams:
-		explanation = "contains too many trigrams"
-	}
-	return int64(len("NOT-INDEXED: ") + len(explanation))
+	return int64(len(zoektNotIndexedMarker) + len(zoektSkipExplanation(reason)))
 }
 
 // unreadFileMarker is the marker value of a file that a delta has not read

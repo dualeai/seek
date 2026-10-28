@@ -27,7 +27,7 @@ type plannedExternalOperands struct {
 type externalGitRoot struct {
 	paths gitPaths
 	// operands are the canonical paths that the search covers.
-	operands []string
+	operands []gitScopeOperand
 	// state and children are the node capture: its git status, and the
 	// nested repositories that git status and git ls-files listed. They are
 	// set when captured is true. A node that the expansion did not capture
@@ -163,11 +163,8 @@ func resolveOperands(ctx context.Context, operands []string) (plannedExternalOpe
 			repo := paths
 			ro.repo = &repo
 			repoRoot := canonicalCorpusPath(paths.RepoDir)
-			// Correct the operand to its real on-disk byte name before it
-			// sets the byte-exact Git scope. On case- or normalization-
-			// insensitive file systems, os.Stat accepts a mistyped name. But
-			// the Git scope query (gitScopeSpec.query) is exact, so the
-			// wrong-case name would match nothing and give no error.
+			// Give the operand the stored names where onDiskPath could not
+			// (realCaseWithin).
 			ro.canonical = realCaseWithin(repoRoot, canonical, listings)
 			pathsByRepo[repoRoot] = append(pathsByRepo[repoRoot], ro.canonical)
 		}
@@ -208,7 +205,8 @@ func resolveOperands(ctx context.Context, operands []string) (plannedExternalOpe
 				gitIndex[repoRoot] = i
 				result.gitRoots = append(result.gitRoots, externalGitRoot{paths: *ro.repo})
 			}
-			result.gitRoots[i].operands = append(result.gitRoots[i].operands, ro.canonical)
+			result.gitRoots[i].operands = append(result.gitRoots[i].operands,
+				gitScopeOperand{path: ro.canonical, dir: ro.info.IsDir()})
 			continue
 		}
 		// ro.canonical holds the on-disk letter case, so a folder seed compares

@@ -111,7 +111,7 @@ func TestSemanticUSearchRoundTripAndExactFallback(t *testing.T) {
 	}
 	batchQueries := []semanticVector{embeddings[0].fine[0], embeddings[126].fine[0]}
 	batchMask := semanticFilterMask{
-		mode: semanticFilterPartial, rows: uint64(len(rows)), allowed: uint64(allowed),
+		rows: uint64(len(rows)), allowed: uint64(allowed),
 		bits: make([]byte, (len(rows)+7)/8), shardAllowed: make([]uint64, len(shards)),
 	}
 	for row := 0; row < len(rows); row += 2 {
@@ -188,7 +188,6 @@ func TestSemanticUSearchRoundTripAndExactFallback(t *testing.T) {
 
 	for _, row := range []int{0, len(embeddings) - 1} {
 		mask := semanticFilterMask{
-			mode:         semanticFilterPartial,
 			bits:         make([]byte, (len(embeddings)+7)/8),
 			rows:         uint64(len(embeddings)),
 			allowed:      1,
@@ -382,7 +381,6 @@ func TestPlanSemanticUSearchShardsSendsEverySparseShardToExact(t *testing.T) {
 	const shardCount = semanticUSearchMaxShardRows + 1
 	shards := make([]semanticUSearchShard, shardCount)
 	mask := semanticFilterMask{
-		mode:         semanticFilterPartial,
 		rows:         shardCount * 2,
 		allowed:      shardCount,
 		bits:         make([]byte, (shardCount*2+7)/8),
@@ -420,7 +418,6 @@ func TestPlanSemanticUSearchShardsSendsQuarterShardsToExact(t *testing.T) {
 	}
 	rows := uint64(2 * semanticUSearchMaxShardRows)
 	mask := semanticFilterMask{
-		mode:         semanticFilterPartial,
 		rows:         rows,
 		allowed:      semanticUSearchMaxShardRows / 2,
 		bits:         make([]byte, (rows+7)/8),
@@ -584,7 +581,7 @@ func TestSemanticUSearchOptionalExactShardUsesQuarterBoundary(t *testing.T) {
 func TestMarkSemanticRowRangeFollowsMask(t *testing.T) {
 	const rows = 1_000
 	random := rand.New(rand.NewPCG(3, 4))
-	mask := semanticFilterMask{mode: semanticFilterPartial, rows: rows, bits: make([]byte, (rows+7)/8)}
+	mask := semanticFilterMask{rows: rows, bits: make([]byte, (rows+7)/8)}
 	for row := range uint64(rows) {
 		if random.IntN(3) == 0 {
 			mask.bits[row/8] |= 1 << (row & 7)
@@ -1080,7 +1077,7 @@ func BenchmarkPlanSemanticUSearchShardsScale(b *testing.B) {
 				rows += shardRows
 			}
 			mask := semanticFilterMask{
-				mode: semanticFilterPartial, rows: rows,
+				rows: rows,
 				bits: make([]byte, (rows+7)/8), shardAllowed: make([]uint64, shardCount),
 			}
 			for shardIndex, shard := range shards {
@@ -1294,7 +1291,7 @@ func searchSemanticUSearchFilteredCandidates(
 	query *semanticQueryEmbedding,
 	mask *semanticFilterMask,
 ) ([]uint64, error) {
-	if mask == nil || mask.mode != semanticFilterPartial {
+	if mask == nil || !mask.partial() {
 		return nil, fmt.Errorf("partial semantic filter mask is missing")
 	}
 	result, err := searchSemanticUSearchCandidatesWithMask(ctx, generation, query, mask)

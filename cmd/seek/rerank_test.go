@@ -326,18 +326,18 @@ func TestRerankModelSearchConfigClearsDisplayLimitsAndAddsInternalContext(t *tes
 	config := searchConfig{
 		opts:              &zoekt.SearchOptions{NumContextLines: 1},
 		afterOnly:         true,
-		contextMatchLimit: 2,
-		contextFileLimit:  7,
+		displayMatchLimit: 2,
+		displayFileLimit:  7,
 	}
 	got := rerankModelSearchConfig(config)
 	// The model reads three lines of context on each side of a match.
 	if got.opts.NumContextLines != 3 || got.afterOnly {
 		t.Fatalf("internal context config=%+v", got)
 	}
-	if got.contextMatchLimit != 0 || got.contextFileLimit != 0 {
+	if got.displayMatchLimit != 0 || got.displayFileLimit != 0 {
 		t.Fatalf("internal limits=%+v, want none: the display applies them after the rank", got)
 	}
-	if config.opts.NumContextLines != 1 || !config.afterOnly || config.contextMatchLimit != 2 {
+	if config.opts.NumContextLines != 1 || !config.afterOnly || config.displayMatchLimit != 2 {
 		t.Fatalf("internal context conversion mutated its input: %+v", config)
 	}
 }
@@ -407,7 +407,7 @@ func TestNewRerankDocumentUsesBestMatchAndThreeLineContext(t *testing.T) {
 			}},
 		},
 	}
-	document := newRerankDocument(result)
+	document := newRerankDocument(result, "")
 	if document.Path != "api/server.go" || document.Language != "Go" {
 		t.Fatalf("metadata=%+v", document)
 	}
@@ -560,7 +560,7 @@ func TestApplyRerankDisplayConfigHidesModelContext(t *testing.T) {
 	}
 
 	afterOnly := explicitSearchConfig(1, true)
-	afterOnly.contextMatchLimit = 1
+	afterOnly.displayMatchLimit = 1
 	trimmed := applyRerankDisplayConfig([]corpusSearchResult{result}, afterOnly)
 	match := trimmed[0].file.LineMatches[0]
 	if len(match.Before) != 0 || string(match.After) != "a1\n" {

@@ -822,6 +822,29 @@ func TestValidateSemanticManifestChecksMinimumRowsLength(t *testing.T) {
 	}
 }
 
+// TestValidSHA256Hex pins the digest rule that the semantic manifest, the
+// joined generation descriptor, and the runtime manifest share.
+func TestValidSHA256Hex(t *testing.T) {
+	digest := sha256.Sum256([]byte("seek"))
+	lower := hex.EncodeToString(digest[:])
+	for _, test := range []struct {
+		value string
+		want  bool
+	}{
+		{lower, true},
+		{strings.ToUpper(lower), true},
+		{lower[:63], false},
+		{lower[:40], false},
+		{lower + "00", false},
+		{lower[:63] + "g", false},
+		{"", false},
+	} {
+		if got := validSHA256Hex(test.value); got != test.want {
+			t.Errorf("validSHA256Hex(%q)=%t, want %t", test.value, got, test.want)
+		}
+	}
+}
+
 func TestWriteSemanticGenerationRejectsInvalidRows(t *testing.T) {
 	units, embeddings := testSemanticRowsAndVectors(t)
 	units[0].row = 1

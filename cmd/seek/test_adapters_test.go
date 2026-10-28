@@ -100,7 +100,7 @@ func formatCorpusResultsWithContext(
 	pal palette,
 ) string {
 	var sb strings.Builder
-	_, _ = writeCorpusResultsWithContext(&sb, results, limit, maxMatches, displayMode, pal)
+	_ = writeCorpusResultsWithContext(&sb, results, limit, maxMatches, displayMode, pal)
 	return sb.String()
 }
 

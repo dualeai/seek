@@ -206,10 +206,10 @@ func TestDamagedRowsAreRepairedWhileAnotherFileChanges(t *testing.T) {
 }
 
 // TestFileOfHalfTheShardFormatGetsNoVectorRows builds a folder under scaled
-// guard limits (a 10 MiB shard format). A shard takes at least 2 bytes for
-// each byte of content, so the shard of a 6 MiB file always passes the format.
-// The shard guard then keeps the file by name only, and the vector build
-// embeds none of it. A 2 MiB file gets its rows.
+// guard limits (a 2.5 MiB shard format). A shard takes at least 2 bytes for
+// each byte of content, so the shard of a 1.5 MiB file always passes the
+// format. The shard guard then keeps the file by name only, and the vector
+// build embeds none of it. A 512 KiB file gets its rows.
 func TestFileOfHalfTheShardFormatGetsNoVectorRows(t *testing.T) {
 	requireTools(t)
 	swapGuardLimitsForTest(t)
@@ -218,8 +218,8 @@ func TestFileOfHalfTheShardFormatGetsNoVectorRows(t *testing.T) {
 	folder := t.TempDir()
 	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
 	line := "// dispatches a request\n"
-	writeFileAt(t, folder, "large.go", strings.Repeat(line, (6<<20)/len(line)+1))
-	writeFileAt(t, folder, "small.go", strings.Repeat(line, (2<<20)/len(line)))
+	writeFileAt(t, folder, "large.go", strings.Repeat(line, (3<<19)/len(line)+1))
+	writeFileAt(t, folder, "small.go", strings.Repeat(line, (1<<19)/len(line)))
 	output, scorer, err := stubSearch(t, payloadAccept, "alpha beta", folder)
 	if err != nil {
 		t.Fatalf("err=%v output:\n%s", err, output)

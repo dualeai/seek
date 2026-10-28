@@ -1307,3 +1307,26 @@ exec "$SEEK_TEST_REAL_GIT" "$@"
 		t.Fatalf("diff-tree calls=%d, want 1 (the vector figure reuses the text figure): %q", got, logged)
 	}
 }
+
+// TestChangedFolderCandidatesSkipsRemovedFiles gives the estimate a manifest
+// with removed files before, between and after the files that the walk finds.
+// Only the new file and the changed file count.
+func TestChangedFolderCandidatesSkipsRemovedFiles(t *testing.T) {
+	cacheDir := t.TempDir()
+	file := func(name string, size int64) folderCandidate {
+		return folderCandidate{name: name, path: "/folder/" + name, mode: 0o644, size: size, mtime: 1, ctime: 1, dev: 1, ino: uint64(name[0])}
+	}
+	published := []folderCandidate{file("a", 1), file("b", 1), file("c", 1), file("d", 1), file("e", 1), file("g", 1)}
+	if err := writeFolderManifest(cacheDir, "state", published, 0, make([]int64, len(published))); err != nil {
+		t.Fatal(err)
+	}
+	// a, c and g are removed, d changed, f is new, and b and e stay.
+	selected := []folderCandidate{file("b", 1), file("d", 2), file("e", 1), file("f", 1)}
+	var changed []string
+	for _, candidate := range changedFolderCandidates(cacheDir, "state", selected) {
+		changed = append(changed, candidate.name)
+	}
+	if !slices.Equal(changed, []string{"d", "f"}) {
+		t.Fatalf("changed files %v, want [d f]", changed)
+	}
+}

@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/sourcegraph/zoekt/index"
-	"github.com/sourcegraph/zoekt/query"
 	"golang.org/x/sys/unix"
 )
 
@@ -156,8 +155,7 @@ func TestCountedSkipReasonsMatchZoekt(t *testing.T) {
 		t.Fatalf("indexed=%t err=%v", indexed, err)
 	}
 	plan := node{cacheDir: t.TempDir(), indexDir: indexDir}
-	marker := &query.Substring{Pattern: zoektNotIndexedMarker, Content: true, CaseSensitive: true}
-	files, err := searchPlannedCorpusParsed(t.Context(), plan, nil, marker, defaultSearchConfig())
+	files, err := searchPlannedCorpusParsed(t.Context(), plan, nil, notIndexedMarkerQuery(), defaultSearchConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

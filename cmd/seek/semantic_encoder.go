@@ -573,7 +573,6 @@ func (encoder *lateOnStaticRowEncoder) Run(
 		encoder.session,
 		paddedIDs,
 		paddedAttention,
-		semanticModelBatchRows,
 		output,
 	); err != nil {
 		return err

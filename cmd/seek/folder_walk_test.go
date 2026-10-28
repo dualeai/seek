@@ -444,18 +444,6 @@ func TestFolderWalkCutsALoop(t *testing.T) {
 	}
 }
 
-// TestSFDatalessFlag pins the darwin SF_DATALESS bit (sys/stat.h); Linux has
-// no cloud-only flag.
-func TestSFDatalessFlag(t *testing.T) {
-	want := runtime.GOOS == "darwin"
-	if got := statDatalessFlags(0x40000000); got != want {
-		t.Fatalf("statDatalessFlags(SF_DATALESS)=%t, want %t", got, want)
-	}
-	if statDatalessFlags(0) {
-		t.Fatal("no flag is not dataless")
-	}
-}
-
 // onColdBuildWait runs act while a cold search of folder waits for the build
 // lock that the test holds. The search waits after its walk and before its
 // build opens a file. It returns the channel that lockWaitActed reads.

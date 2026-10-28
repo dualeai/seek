@@ -13,20 +13,19 @@ func testLexicalSearchExecution() searchExecution {
 	return searchExecution{policy: lexicalOnlySearch}
 }
 
-// testSemanticSearchExecution offers a model to a corpus build and asks for
-// vector preparation, closing the future when the test ends.
+// testSemanticSearchExecution offers a model to a corpus build, so the build
+// prepares vectors, and closes the future when the test ends.
 //
-// It sets vectors because runSearchCommand decides vectors from the query, and
-// a test that calls a corpus entry point skips that decision. A test that
-// drives a whole search must not use this.
+// It sets the model because runSearchCommand sets it from the query, and a
+// test that calls a corpus entry point skips that decision. A test that drives
+// a whole search must not use this.
 func testSemanticSearchExecution(tb testing.TB, factory semanticModelFactory) searchExecution {
 	tb.Helper()
 	future := newSemanticModelFuture(factory)
 	tb.Cleanup(func() { _ = future.Close() })
 	return searchExecution{
-		policy:  semanticSearch,
-		model:   future,
-		vectors: true,
+		policy: semanticSearch,
+		model:  future,
 	}
 }
 
@@ -66,8 +65,8 @@ func ensureGitCorpusFresh(
 	plan node,
 	paths gitPaths,
 ) (corpusIndexState, error) {
-	_, indexState, err := (&gitNode{paths: paths}).refresh(ctx, plan, testLexicalSearchExecution())
-	return indexState, err
+	opened, err := (&gitNode{paths: paths}).prepare(ctx, plan, testLexicalSearchExecution())
+	return opened.indexState, err
 }
 
 func ensureCombinedGitCorpus(

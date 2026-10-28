@@ -176,7 +176,7 @@ func randomWordText(seed uint64, size int, needle string) []byte {
 }
 
 // TestRun_ShardGuardKeepsOversizedShardsNameOnly lowers the shard limits
-// (swapGuardLimitsForTest) so a 2.5 MiB document "wraps" while a 1.25 MiB one
+// (swapGuardLimitsForTest) so a 512 KiB document "wraps" while a 128 KiB one
 // fits. The wrapped document must keep only its name, the exact-file warning
 // must report it, and every other document must stay searchable.
 func TestRun_ShardGuardKeepsOversizedShardsNameOnly(t *testing.T) {

@@ -713,12 +713,17 @@ func TestPartialLoss_FolderFamily(t *testing.T) {
 // be needed to detect this case.
 //
 // This test records the current limit. If content hashes are added, move this
-// case into partialLossRows.
+// case into partialLossRows. The manifest checks each shard alone, so one
+// commit and one shard show the limit.
 func TestPartialLoss_ContentCorruptionIsNotDetected(t *testing.T) {
+	requireTools(t)
 	ctx := t.Context()
-	c := buildPartialLossCorpus(t)
-
 	const token = "PL_MARK_1"
+	repo := initGitRepo(t, "f1.go", "package main\n// "+token+"\n")
+	paths, plan := planGitTestCorpus(t, repo)
+	reindexGit(t, ctx, paths, plan)
+	c := &plCorpus{repoDir: repo, plan: plan}
+
 	shard := shardCarrying(t, c.plan.indexDir, token)
 	before, err := os.Stat(shard)
 	if err != nil {

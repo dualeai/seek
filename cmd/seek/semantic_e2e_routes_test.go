@@ -110,7 +110,6 @@ func (model *e2eRouteModel) PrepareSemanticQuery(_ context.Context, query string
 		tokens:     make([]float32, windows*lateOnSequenceLength*semanticEmbeddingDimensions),
 		scoreMask:  make([]bool, windows*lateOnSequenceLength),
 		emptyScore: e2eRouteEmptyScore * float32(windows),
-		modelQuery: query,
 	}
 	for window := range windows {
 		token := window * lateOnSequenceLength

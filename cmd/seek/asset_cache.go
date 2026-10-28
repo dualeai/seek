@@ -13,17 +13,18 @@ import (
 )
 
 // installPrivateAsset installs fileName in directory (mode 0700) through a
-// temporary file and a rename, unless valid accepts the file there already.
-// It returns the path.
+// temporary file and a rename, unless the file there already has wantBytes
+// bytes and the SHA-256 wantSHA256 (validFileDigest). It returns the path.
 func installPrivateAsset(
 	directory string,
 	fileName string,
 	temporaryPattern string,
-	valid func(string) bool,
+	wantBytes int64,
+	wantSHA256 string,
 	write func(io.Writer) error,
 ) (string, error) {
 	path := filepath.Join(directory, fileName)
-	if valid(path) {
+	if validFileDigest(path, wantBytes, wantSHA256) {
 		return path, nil
 	}
 	// A collection can remove an empty parent (reranker/<version>) between
@@ -55,7 +56,7 @@ func installPrivateAsset(
 		return "", err
 	}
 	if err := os.Rename(temporaryPath, path); err != nil {
-		if valid(path) {
+		if validFileDigest(path, wantBytes, wantSHA256) {
 			return path, nil
 		}
 		return "", fmt.Errorf("install private asset: %w", err)
@@ -86,9 +87,8 @@ func installSemanticRuntime(engine string, compressed []byte, fileName string) (
 		dir,
 		fileName,
 		"."+folder+"-*.tmp",
-		func(path string) bool {
-			return validFileDigest(path, int64(len(runtimeBytes)), wantSHA256)
-		},
+		int64(len(runtimeBytes)),
+		wantSHA256,
 		func(writer io.Writer) error {
 			_, err := writer.Write(runtimeBytes)
 			return err

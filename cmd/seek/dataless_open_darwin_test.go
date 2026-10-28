@@ -6,7 +6,20 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
+
+// TestSFDatalessFlag pins the darwin SF_DATALESS bit (sys/stat.h). Linux has
+// no cloud-only flag.
+func TestSFDatalessFlag(t *testing.T) {
+	if !statDataless(&unix.Stat_t{Flags: 0x40000000}) {
+		t.Fatal("SF_DATALESS is not dataless")
+	}
+	if statDataless(&unix.Stat_t{}) {
+		t.Fatal("no flag is dataless")
+	}
+}
 
 // TestNamesFromEntriesOnThisVolume checks that storedName reads the stored
 // name from the metadata: on a case-insensitive volume, a lookup as

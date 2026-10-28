@@ -10,9 +10,13 @@ import (
 	"strings"
 )
 
+// gitNoHead is the HeadSHA of a work tree whose HEAD names no commit: a new
+// repository or an orphan branch.
+const gitNoHead = "no-head"
+
 // repoState holds the parsed result of a single git status call.
 type repoState struct {
-	HeadSHA   string   // commit SHA from # branch.oid, or "no-head"
+	HeadSHA   string   // commit SHA from # branch.oid, or gitNoHead
 	RawOutput string   // raw output for state hashing, without child records
 	Files     []string // paths of changed/untracked files
 	// Children are the paths of nested repositories in the work tree: an
@@ -90,14 +94,14 @@ func untrackedBareRepos(repoDir, raw string) []string {
 	return roots
 }
 
-// gitHeadTreeish returns the commit ID of HEAD in dir, or "no-head" when HEAD
+// gitHeadTreeish returns the commit ID of HEAD in dir, or gitNoHead when HEAD
 // names no commit.
 func gitHeadTreeish(ctx context.Context, dir string) (string, error) {
 	cmd := newGitCommand(ctx, dir, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
 	out, err := gitOutput(ctx, cmd, "git rev-parse HEAD")
 	if err != nil {
 		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok && exitErr.ExitCode() == 1 {
-			return "no-head", nil
+			return gitNoHead, nil
 		}
 		return "", err
 	}
@@ -109,7 +113,7 @@ func gitHeadTreeish(ctx context.Context, dir string) (string, error) {
 // NUL-terminated. It drops the untracked entries below the bareRepos
 // directories from Files and RawOutput.
 func parseGitStatusV2Skipping(raw string, bareRepos []string) repoState {
-	state := repoState{HeadSHA: "no-head"}
+	state := repoState{HeadSHA: gitNoHead}
 
 	var kept strings.Builder
 	kept.Grow(len(raw))
@@ -139,7 +143,7 @@ func parseGitStatusV2Skipping(raw string, bareRepos []string) repoState {
 				// Git writes "(initial)" before the first commit. An empty
 				// value names no object either, so it also means no HEAD.
 				if state.HeadSHA == "(initial)" || state.HeadSHA == "" {
-					state.HeadSHA = "no-head"
+					state.HeadSHA = gitNoHead
 				}
 			}
 			kept.WriteString(raw[start:pos])

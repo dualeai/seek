@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -87,14 +88,14 @@ func TestParseGitStatusV2_BranchOid(t *testing.T) {
 func TestParseGitStatusV2_NoHead(t *testing.T) {
 	raw := "# branch.oid (initial)\x00# branch.head main\x00"
 	state := parseGitStatusV2(raw)
-	if state.HeadSHA != "no-head" {
-		t.Errorf("expected HeadSHA %q, got %q", "no-head", state.HeadSHA)
+	if state.HeadSHA != gitNoHead {
+		t.Errorf("expected HeadSHA %q, got %q", gitNoHead, state.HeadSHA)
 	}
 }
 
 func TestParseGitStatusV2_Empty(t *testing.T) {
 	state := parseGitStatusV2("")
-	if state.HeadSHA != "no-head" {
+	if state.HeadSHA != gitNoHead {
 		t.Errorf("expected no-head, got %q", state.HeadSHA)
 	}
 	if len(state.Files) != 0 {
@@ -566,7 +567,7 @@ func TestGitHeadTreeish_UnbornRepository(t *testing.T) {
 	repo := initEmptyGitRepo(t)
 
 	treeish, err := gitHeadTreeish(t.Context(), repo)
-	if err != nil || treeish != "no-head" {
+	if err != nil || treeish != gitNoHead {
 		t.Fatalf("treeish=%q error=%v, want no-head", treeish, err)
 	}
 }
@@ -714,6 +715,29 @@ func TestStateFile_ReadOnlyDir(t *testing.T) {
 	}
 }
 
+// TestWriteCacheFileFromFailedWrite checks that a failed write keeps the old
+// record and removes the temporary file.
+func TestWriteCacheFileFromFailedWrite(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeStateFile(dir, "old"); err != nil {
+		t.Fatal(err)
+	}
+	failed := errors.New("write failed")
+	err := writeCacheFileFrom(dir, stateFile, func(w io.Writer) error {
+		_, _ = io.WriteString(w, "partial")
+		return failed
+	})
+	if !errors.Is(err, failed) {
+		t.Fatalf("err=%v, want the write error", err)
+	}
+	if got := readStateFile(dir); got != "old" {
+		t.Fatalf("state=%q after a failed write, want the old record", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, stateFile+cacheTmpSuffix)); !os.IsNotExist(err) {
+		t.Fatalf("the temporary file remains after a failed write: %v", err)
+	}
+}
+
 func TestComputeStateHash_VersionPrefix(t *testing.T) {
 	// Guard against an accidental stateVersion change. A new version
 	// invalidates all user caches, so the change must be intentional.
@@ -749,7 +773,7 @@ func requireGit(tb testing.TB) {
 
 func TestParseGitStatusV2_OnlyNulBytes(t *testing.T) {
 	state := parseGitStatusV2("\x00\x00\x00")
-	if state.HeadSHA != "no-head" {
+	if state.HeadSHA != gitNoHead {
 		t.Errorf("expected no-head, got %q", state.HeadSHA)
 	}
 	if len(state.Files) != 0 {
@@ -1284,7 +1308,7 @@ func TestStateCaching_ColdUnbornSnapshotRejectsFirstCommit(t *testing.T) {
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
 	state := mustGitRepoStateIn(t, ctx, dir)
-	if state.HeadSHA != "no-head" {
+	if state.HeadSHA != gitNoHead {
 		t.Fatalf("initial HEAD=%q, want no-head", state.HeadSHA)
 	}
 	stateHash := gitCorpusStateHash(paths, state)
@@ -2477,6 +2501,26 @@ func TestWriteSharedCacheFileConcurrentWriters(t *testing.T) {
 	}
 }
 
+// TestWriteSharedCacheFileModeUnderNarrowUmask writes a record under a umask
+// that removes the owner write bit. The record still has mode 0600, so the
+// owner can replace it. The test is not parallel, because the umask is a
+// process setting.
+func TestWriteSharedCacheFileModeUnderNarrowUmask(t *testing.T) {
+	dir := t.TempDir()
+	old := syscall.Umask(0o277)
+	t.Cleanup(func() { syscall.Umask(old) })
+	if err := writeSharedCacheFile(dir, corpusSizeFile, "1"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(dir, corpusSizeFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("record mode %#o, want 0600", info.Mode().Perm())
+	}
+}
+
 // TestPartialPrebuildKeepsADamagedFamilyUnnamed gives a Git node a dirty file
 // that fails with EIO, so the build keeps it by name and writes no state. The
 // test removes the record that tombstones the first copy of u2.go. Then it
@@ -2523,7 +2567,7 @@ func TestPartialPrebuildKeepsADamagedFamilyUnnamed(t *testing.T) {
 	}
 	failOpen(true)
 	_ = build()
-	if scan, err := scanFamilyOptional(plan.indexDir); err != nil || scan.matchesManifest(plan.indexDir) {
+	if scan, err := scanFamilyOptional(plan.indexDir); err != nil || scan.matchesManifest() {
 		t.Fatalf("the partial build named the damaged uncommitted family (err=%v)", err)
 	}
 	failOpen(false)

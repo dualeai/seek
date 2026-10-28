@@ -11,8 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sync"
 	"unsafe"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // A USearch graph shard holds the coarse vectors of whole files. Its keys
@@ -301,12 +302,12 @@ func (sources semanticUSearchShardSources) add(dir string, link bool) {
 	}
 }
 
-// semanticUSearchShardReuse is a source that a build put in its generation,
-// or verified and will link once every shard is ready (placed is false).
+// semanticUSearchShardReuse is a source that a build copied into its
+// generation, or a link source that it verified and links once every shard is
+// ready (placeSemanticUSearchShards).
 type semanticUSearchShardReuse struct {
 	source   semanticUSearchShardSource
 	verified os.FileInfo
-	placed   bool
 }
 
 // verifySemanticUSearchShardSource checks the graph file of a link source
@@ -391,35 +392,29 @@ func refreshSemanticUSearchChecks(dir string) {
 	}
 	checks := make([]semanticRowsCheck, len(manifest.USearchFiles))
 	refreshed := make([]bool, len(manifest.USearchFiles))
-	work := make(chan int)
-	var wait sync.WaitGroup
-	for range min(runtime.GOMAXPROCS(0), len(manifest.USearchFiles)) {
-		wait.Go(func() {
-			for index := range work {
-				shard := manifest.USearchFiles[index]
-				path := filepath.Join(dir, shard.Name)
-				info, err := os.Lstat(path)
-				if err != nil || !info.Mode().IsRegular() || uint64(info.Size()) != shard.Bytes ||
-					semanticRowsCheckOf(info) == shard.Check {
-					continue
-				}
-				semanticShardsHashed.Add(1)
-				if validateSemanticArtifact(path, shard.semanticArtifact) != nil {
-					continue
-				}
-				// The file must be the one that the hash read.
-				if after, err := os.Lstat(path); err == nil && os.SameFile(info, after) &&
-					semanticRowsCheckOf(after) == semanticRowsCheckOf(info) {
-					checks[index], refreshed[index] = semanticRowsCheckOf(info), true
-				}
+	var hashes errgroup.Group
+	hashes.SetLimit(runtime.GOMAXPROCS(0))
+	for index, shard := range manifest.USearchFiles {
+		hashes.Go(func() error {
+			path := filepath.Join(dir, shard.Name)
+			info, err := os.Lstat(path)
+			if err != nil || !info.Mode().IsRegular() || uint64(info.Size()) != shard.Bytes ||
+				semanticRowsCheckOf(info) == shard.Check {
+				return nil
 			}
+			semanticShardsHashed.Add(1)
+			if validateSemanticArtifact(path, shard.semanticArtifact) != nil {
+				return nil
+			}
+			// The file must be the one that the hash read.
+			if after, err := os.Lstat(path); err == nil && os.SameFile(info, after) &&
+				semanticRowsCheckOf(after) == semanticRowsCheckOf(info) {
+				checks[index], refreshed[index] = semanticRowsCheckOf(info), true
+			}
+			return nil
 		})
 	}
-	for index := range manifest.USearchFiles {
-		work <- index
-	}
-	close(work)
-	wait.Wait()
+	_ = hashes.Wait()
 	hashed := manifest.USearchFiles
 	rewriteSemanticManifest(dir, func(manifest *semanticManifest) bool {
 		changed := false

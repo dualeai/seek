@@ -20,7 +20,6 @@ import (
 
 	grafanaregexp "github.com/grafana/regexp"
 	"github.com/sourcegraph/zoekt"
-	"github.com/sourcegraph/zoekt/index"
 	"github.com/sourcegraph/zoekt/query"
 	"golang.org/x/sys/unix"
 )
@@ -171,7 +170,7 @@ func (record *shardStatsRecord) stats(ctx context.Context, path string, searcher
 	if ok && cached.Size == stats.Size && cached.MtimeNS == stats.MtimeNS && cached.Ino == stats.Ino {
 		return cached, nil
 	}
-	list, err := zoektList(ctx, searcher, &query.Const{Value: true}, nil)
+	list, err := zoektList(ctx, searcher)
 	if err != nil {
 		return shardLengthStats{}, err
 	}
@@ -222,17 +221,7 @@ func openShardWithoutTombstones(path string) (zoekt.Searcher, error) {
 	if err != nil {
 		return nil, err
 	}
-	renamed := os.NewFile(uintptr(fd), path+".seek-no-tombstones")
-	indexFile, err := index.NewIndexFile(renamed)
-	if err != nil {
-		return nil, err
-	}
-	searcher, err := zoektOpen(indexFile)
-	if err != nil {
-		indexFile.Close()
-		return nil, err
-	}
-	return searcher, nil
+	return openShardFile(os.NewFile(uintptr(fd), path+".seek-no-tombstones"))
 }
 
 // save writes the record when it gained shards, with only the live shards; a
@@ -303,7 +292,7 @@ func bm25Parts(file *zoekt.FileMatch, bq bm25Query, average float64) bool {
 	}
 	base := map[string]int{}
 	// The multi-line candidates first: each piece takes its candidate's key.
-	merges, pieceKeys, ok := bq.multiLineMerges(file.LineMatches)
+	keys, merges, ok := bq.multiLineMerges(file.LineMatches)
 	if !ok {
 		return false
 	}
@@ -331,7 +320,11 @@ func bm25Parts(file *zoekt.FileMatch, bq bm25Query, average float64) bool {
 			}
 			continue
 		}
-		splits, ok := bq.lineFrequencies(line, pieceKeys)
+		var lineKeys []string
+		if keys != nil {
+			lineKeys, keys = keys[:len(line.LineFragments)], keys[len(line.LineFragments):]
+		}
+		splits, ok := bq.lineFrequencies(line, lineKeys)
 		if !ok {
 			return false
 		}
@@ -657,8 +650,6 @@ func compileBM25Query(q query.Q) bm25Query {
 			for _, child := range typed.Children {
 				walk(child)
 			}
-		case *query.Boost:
-			walk(typed.Child)
 		case *query.Symbol:
 			// A sym: regexp, and a sym: substring shorter than the ngram
 			// size, are symbol regexp candidates (index/matchtree.go).
@@ -888,24 +879,27 @@ func bm25ASCII(name string) bool {
 }
 
 // lineFrequencies returns the splits of one matched line into term frequencies.
-// A match on a symbol counts five, and Zoekt does not mark it on the fragment.
-// So the line's own BM25 score (index/score.go scoreLineBM25, with the line
-// length over 100) decides how many matches of each term were on a symbol. Two
-// or more splits can reach the line score; bm25Parts keeps the one that the
-// file's length ratio fits. A line of two or more terms that needs more than
-// 1<<14 search steps gives false, and the hit keeps Zoekt's score.
-func (bq bm25Query) lineFrequencies(line zoekt.LineMatch, pieceKeys map[uint32]string) ([][]bm25Piece, bool) {
+// keys holds the term key of each fragment of the line (multiLineMerges); when
+// it is nil, the fragments' texts give the keys. A match on a symbol counts
+// five, and Zoekt does not mark it on the fragment. So the line's own BM25
+// score (index/score.go scoreLineBM25, with the line length over 100) decides
+// how many matches of each term were on a symbol. Two or more splits can reach
+// the line score; bm25Parts keeps the one that the file's length ratio fits. A
+// line of two or more terms that needs more than 1<<14 search steps gives
+// false, and the hit keeps Zoekt's score.
+func (bq bm25Query) lineFrequencies(line zoekt.LineMatch, keys []string) ([][]bm25Piece, bool) {
 	ratio := float64(len(line.Line)) / 100
 	counts := map[string]int{}
-	for _, fragment := range line.LineFragments {
+	for index, fragment := range line.LineFragments {
+		if keys != nil {
+			counts[keys[index]]++
+			continue
+		}
 		end := fragment.LineOffset + fragment.MatchLength
 		if fragment.LineOffset < 0 || end > len(line.Line) {
 			return nil, false
 		}
-		key, ok := pieceKeys[fragment.Offset]
-		if !ok {
-			key, ok = bq.contentKey(string(line.Line[fragment.LineOffset:end]))
-		}
+		key, ok := bq.contentKey(string(line.Line[fragment.LineOffset:end]))
 		if !ok {
 			return nil, false
 		}
@@ -972,22 +966,26 @@ func (bq bm25Query) lineFrequencies(line zoekt.LineMatch, pieceKeys map[uint32]s
 // before its line's newline, and the next starts at column 0. A piece that is
 // no candidate alone joins the next pieces, with the newlines between. It
 // stops when the text is one candidate, or the text and the newline after it
-// is. It returns each piece's key (by offset), and the change that makes the
-// candidate count once. Each piece counts on its line, as in Zoekt's line
-// score.
-func (bq bm25Query) multiLineMerges(lines []zoekt.LineMatch) (map[string]int, map[uint32]string, bool) {
+// is. It returns the key of each content fragment, in line and fragment order
+// (a file-name line has none), and the change that makes each candidate count
+// once. Each piece of a candidate takes the candidate's key, and each piece
+// counts on its line, as in Zoekt's line score. With no atom that can span
+// lines, it returns no keys, and lineFrequencies reads them from the texts.
+func (bq bm25Query) multiLineMerges(lines []zoekt.LineMatch) ([]string, map[string]int, bool) {
 	if !bq.multiLine {
 		return nil, nil, true
 	}
-	type piece struct {
-		text   string
-		offset uint32
-		end    uint32
-		alone  bool
-		atEnd  bool
-		atZero bool
+	count := 0
+	for _, line := range lines {
+		if !line.FileName {
+			count += len(line.LineFragments)
+		}
 	}
-	var pieces []piece
+	// The keys serve lineFrequencies, so each fragment gets one contentKey
+	// call. Most hits have no piece that needs a join; only then do the
+	// pieces matter.
+	keys := make([]string, 0, count)
+	joins := false
 	for _, line := range lines {
 		if line.FileName {
 			continue
@@ -997,21 +995,46 @@ func (bq bm25Query) multiLineMerges(lines []zoekt.LineMatch) (map[string]int, ma
 			if fragment.LineOffset < 0 || end > len(line.Line) {
 				return nil, nil, false
 			}
+			key, alone := bq.contentKey(string(line.Line[fragment.LineOffset:end]))
+			keys = append(keys, key)
+			joins = joins || !alone
+		}
+	}
+	if !joins {
+		return keys, nil, true
+	}
+	type piece struct {
+		text   string
+		offset uint32
+		end    uint32
+		// at is the position of the piece's key in keys.
+		at     int
+		alone  bool
+		atEnd  bool
+		atZero bool
+	}
+	pieces := make([]piece, 0, count)
+	for _, line := range lines {
+		if line.FileName {
+			continue
+		}
+		for _, fragment := range line.LineFragments {
+			end := fragment.LineOffset + fragment.MatchLength
 			text := string(line.Line[fragment.LineOffset:end])
 			_, alone := bq.contentKey(text)
 			pieces = append(pieces, piece{
 				text:   text,
 				offset: fragment.Offset,
 				end:    fragment.Offset + uint32(fragment.MatchLength),
+				at:     len(pieces),
 				alone:  alone,
 				atEnd:  end == len(line.Line)-1 && line.Line[end] == '\n',
 				atZero: fragment.LineOffset == 0,
 			})
 		}
 	}
-	slices.SortFunc(pieces, func(left, right piece) int { return int(left.offset) - int(right.offset) })
 	merges := map[string]int{}
-	pieceKeys := map[uint32]string{}
+	slices.SortFunc(pieces, func(left, right piece) int { return int(left.offset) - int(right.offset) })
 	for index := 0; index < len(pieces); {
 		if pieces[index].alone || !pieces[index].atEnd {
 			if !pieces[index].alone {
@@ -1046,12 +1069,12 @@ func (bq bm25Query) multiLineMerges(lines []zoekt.LineMatch) (map[string]int, ma
 			return nil, nil, false
 		}
 		for _, piece := range pieces[index : next+1] {
-			pieceKeys[piece.offset] = key
+			keys[piece.at] = key
 		}
 		merges[key] -= next - index
 		index = next + 1
 	}
-	return merges, pieceKeys, true
+	return keys, merges, true
 }
 
 // bm25TermScore is Zoekt's score of one term (index/score.go tfScore).
@@ -1151,7 +1174,7 @@ func rescoreStrictResults(results []corpusSearchResult, command *bm25Command) {
 }
 
 // rescoreStrictHits does the same for the strict hits of a model query.
-func rescoreStrictHits(hits nodeHits, command *bm25Command) {
+func rescoreStrictHits(hits []nodeHit, command *bm25Command) {
 	average, ok := command.rescoreAverage()
 	if !ok {
 		return

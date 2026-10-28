@@ -24,17 +24,18 @@ func testSemanticRandomUnit(random *rand.Rand) semanticVector {
 	return vector
 }
 
-// testSemanticFineOracle gives the summed fine MaxSim of row in float64 from
-// the binary16 codes, decoded by the IEEE 754 formula.
-func testSemanticFineOracle(row *semanticFineF16Vectors, query []semanticF16Vector) float64 {
+// testSemanticF64Centroids holds the centroids of one row as float64 values.
+type testSemanticF64Centroids [semanticFineCentroidsPerUnit][semanticEmbeddingDimensions]float64
+
+// testSemanticMaxSim gives the summed MaxSim of row for query in float64.
+func testSemanticMaxSim(row *testSemanticF64Centroids, query [][semanticEmbeddingDimensions]float64) float64 {
 	var score float64
 	for token := range query {
 		maximum := math.Inf(-1)
 		for centroid := range row {
 			var dot float64
 			for dimension := range semanticEmbeddingDimensions {
-				dot += semanticF16OracleValue(query[token][dimension]) *
-					semanticF16OracleValue(row[centroid][dimension])
+				dot += query[token][dimension] * row[centroid][dimension]
 			}
 			maximum = max(maximum, dot)
 		}
@@ -167,20 +168,29 @@ func TestSemanticNumKongAllowedCapabilitiesNeedEveryTarget(t *testing.T) {
 
 // TestSemanticFineKernelMatchesFloat64Oracle scores random rows with every
 // kernel family that the host can run, in whole ranges and in rows with gaps.
-// It compares each score with a float64 oracle of the stored codes.
+// It compares each score with a float64 oracle of the stored codes. The oracle
+// and the float32 source score do not change with the family or the row set,
+// so the test computes them once for each row and query.
 func TestSemanticFineKernelMatchesFloat64Oracle(t *testing.T) {
 	random := rand.New(rand.NewPCG(21, 22))
 	const rowCount = 700
-	source := make([][semanticFineCentroidsPerUnit]semanticVector, rowCount)
 	vectors := make([]semanticFineF16Vectors, rowCount)
+	// The binary16 codes, decoded by the IEEE 754 formula, and the float32
+	// source of each code.
+	decoded := make([]testSemanticF64Centroids, rowCount)
+	source := make([]testSemanticF64Centroids, rowCount)
 	for row := range vectors {
 		for centroid := range vectors[row] {
-			source[row][centroid] = testSemanticRandomUnit(random)
-			stored, err := encodeSemanticF16Vector(&source[row][centroid])
+			vector := testSemanticRandomUnit(random)
+			stored, err := encodeSemanticF16Vector(&vector)
 			if err != nil {
 				t.Fatal(err)
 			}
 			vectors[row][centroid] = stored
+			for dimension := range semanticEmbeddingDimensions {
+				decoded[row][centroid][dimension] = semanticF16OracleValue(stored[dimension])
+				source[row][centroid][dimension] = float64(vector[dimension])
+			}
 		}
 	}
 	var gapped []uint64
@@ -189,31 +199,43 @@ func TestSemanticFineKernelMatchesFloat64Oracle(t *testing.T) {
 	}
 	u := math.Ldexp(1, -24)
 	ctx := context.Background()
-	for _, backend := range testSemanticNumKongBackends(t) {
-		for _, tokens := range []int{1, 2, 13, 32, 128} {
+	backends := testSemanticNumKongBackends(t)
+	for _, tokens := range []int{1, 2, 13, 32, 128} {
+		query := make([]semanticVector, tokens)
+		decodedQuery := make([][semanticEmbeddingDimensions]float64, tokens)
+		sourceQuery := make([][semanticEmbeddingDimensions]float64, tokens)
+		for token := range query {
+			query[token] = testSemanticRandomUnit(random)
+			stored, err := encodeSemanticF16Vector(&query[token])
+			if err != nil {
+				t.Fatal(err)
+			}
+			for dimension := range semanticEmbeddingDimensions {
+				decodedQuery[token][dimension] = semanticF16OracleValue(stored[dimension])
+				sourceQuery[token][dimension] = float64(query[token][dimension])
+			}
+		}
+		oracle := make([]float64, rowCount)
+		sourceScore := make([]float64, rowCount)
+		for row := range rowCount {
+			oracle[row] = testSemanticMaxSim(&decoded[row], decodedQuery)
+			sourceScore[row] = testSemanticMaxSim(&source[row], sourceQuery)
+		}
+		// Each dot sums 48 exact float32 products in float32, and the
+		// score sums the token maxima in float32. Both vectors have a
+		// norm of at most sqrt(1.002).
+		dotBound := 47 * u / (1 - 47*u) * 1.002
+		sumBound := float64(tokens) * u / (1 - float64(tokens)*u) * float64(tokens) * 1.002
+		bound := float64(tokens)*dotBound + sumBound
+		// The binary16 rounding moves each component by at most 2^-11
+		// of its value, so a dot moves by at most about 2^-10.
+		codecBound := float64(tokens) * (2*math.Ldexp(1, -11)*1.0011 + math.Ldexp(1, -22))
+		for _, backend := range backends {
 			t.Run(fmt.Sprintf("%s/tokens-%d", semanticNumKongBackendName(backend), tokens), func(t *testing.T) {
-				query := make([]semanticVector, tokens)
-				stored := make([]semanticF16Vector, tokens)
-				for token := range query {
-					query[token] = testSemanticRandomUnit(random)
-					var err error
-					if stored[token], err = encodeSemanticF16Vector(&query[token]); err != nil {
-						t.Fatal(err)
-					}
-				}
 				packed, err := prepareSemanticFineQueryFor(backend, query)
 				if err != nil {
 					t.Fatal(err)
 				}
-				// Each dot sums 48 exact float32 products in float32, and the
-				// score sums the token maxima in float32. Both vectors have a
-				// norm of at most sqrt(1.002).
-				dotBound := 47 * u / (1 - 47*u) * 1.002
-				sumBound := float64(tokens) * u / (1 - float64(tokens)*u) * float64(tokens) * 1.002
-				bound := float64(tokens)*dotBound + sumBound
-				// The binary16 rounding moves each component by at most 2^-11
-				// of its value, so a dot moves by at most about 2^-10.
-				codecBound := float64(tokens) * (2*math.Ldexp(1, -11)*1.0011 + math.Ldexp(1, -22))
 				var worstCodec float64
 				for _, rows := range [][]uint64{nil, gapped} {
 					count := rowCount
@@ -235,24 +257,11 @@ func TestSemanticFineKernelMatchesFloat64Oracle(t *testing.T) {
 						if hit.row != want {
 							t.Fatalf("hit %d row=%d, want %d", index, hit.row, want)
 						}
-						oracle := testSemanticFineOracle(&vectors[hit.row], stored)
-						if difference := math.Abs(float64(hit.score) - oracle); difference > bound {
+						if difference := math.Abs(float64(hit.score) - oracle[hit.row]); difference > bound {
 							t.Fatalf("row %d score=%.9g oracle=%.9g difference=%g bound=%g",
-								hit.row, hit.score, oracle, difference, bound)
+								hit.row, hit.score, oracle[hit.row], difference, bound)
 						}
-						var sourceScore float64
-						for token := range query {
-							maximum := math.Inf(-1)
-							for centroid := range source[hit.row] {
-								var dot float64
-								for dimension := range semanticEmbeddingDimensions {
-									dot += float64(query[token][dimension]) * float64(source[hit.row][centroid][dimension])
-								}
-								maximum = max(maximum, dot)
-							}
-							sourceScore += maximum
-						}
-						worstCodec = max(worstCodec, math.Abs(float64(hit.score)-sourceScore))
+						worstCodec = max(worstCodec, math.Abs(float64(hit.score)-sourceScore[hit.row]))
 					}
 				}
 				if worstCodec > codecBound+bound {

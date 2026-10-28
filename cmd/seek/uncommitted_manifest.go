@@ -86,19 +86,14 @@ func writeUncommittedManifest(cacheDir, state string, entries []uncommittedManif
 }
 
 func deleteUncommittedManifest(cacheDir string) {
-	_ = os.Remove(filepath.Join(cacheDir, uncommittedManifestFileName))
-	_ = os.Remove(filepath.Join(cacheDir, uncommittedManifestFileName+".tmp"))
+	removeCacheFile(cacheDir, uncommittedManifestFileName)
 }
 
 // uncommittedCandidate describes one dirty file at lstat time. The diff
-// against the manifest reads it before any content read.
+// against the manifest reads it before any content read. Its entry has no
+// Marker: only the content read finds one.
 type uncommittedCandidate struct {
-	name  string
-	size  int64
-	mtime int64
-	ino   uint64
-	mode  uint32
-	ctime int64
+	uncommittedManifestEntry
 	// gone marks a path whose Lstat found no file (ENOENT, ENOTDIR). Any
 	// other Lstat error leaves a zero stat that the reader reads.
 	gone bool
@@ -111,22 +106,10 @@ func uncommittedManifestEntries(candidates []uncommittedCandidate) []uncommitted
 	entries := make([]uncommittedManifestEntry, 0, len(candidates))
 	for _, c := range candidates {
 		if !c.gone {
-			entries = append(entries, c.manifestEntry())
+			entries = append(entries, c.uncommittedManifestEntry)
 		}
 	}
 	return entries
-}
-
-// manifestEntry returns the manifest-shaped view of this candidate.
-func (c uncommittedCandidate) manifestEntry() uncommittedManifestEntry {
-	return uncommittedManifestEntry{
-		Name:  c.name,
-		Size:  c.size,
-		Mtime: c.mtime,
-		Ino:   c.ino,
-		Mode:  c.mode,
-		Ctime: c.ctime,
-	}
 }
 
 // statUncommittedCandidates lstats each dirty file under repoDir and returns
@@ -140,7 +123,10 @@ func statUncommittedCandidates(repoDir string, files []string) []uncommittedCand
 		if err := syscall.Lstat(path, &stat); err != nil {
 			// A deleted file needs no read; an error such as ENAMETOOLONG
 			// or EIO leaves a zero stat, so the diff reads it.
-			out = append(out, uncommittedCandidate{name: f, gone: errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ENOTDIR)})
+			out = append(out, uncommittedCandidate{
+				uncommittedManifestEntry: uncommittedManifestEntry{Name: f},
+				gone:                     errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ENOTDIR),
+			})
 			continue
 		}
 		if stat.Mode&syscall.S_IFMT != syscall.S_IFREG {
@@ -148,16 +134,16 @@ func statUncommittedCandidates(repoDir string, files []string) []uncommittedCand
 			// same rule here keeps it out of the manifest.
 			continue
 		}
-		out = append(out, uncommittedCandidate{
-			name:  f,
-			size:  stat.Size,
-			mtime: statMtimeNano(stat),
-			ino:   stat.Ino,
-			mode:  uint32(stat.Mode),
-			ctime: statCtimeNano(stat),
-		})
+		out = append(out, uncommittedCandidate{uncommittedManifestEntry: uncommittedManifestEntry{
+			Name:  f,
+			Size:  stat.Size,
+			Mtime: statMtimeNano(stat),
+			Ino:   stat.Ino,
+			Mode:  uint32(stat.Mode),
+			Ctime: statCtimeNano(stat),
+		}})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
@@ -180,9 +166,9 @@ func diffUncommittedAgainstManifest(
 		c := candidates[i]
 		o := old[j]
 		switch {
-		case c.name == o.Name:
-			if !uncommittedEntryMatches(o, c) {
-				changedPaths = append(changedPaths, c.name)
+		case c.Name == o.Name:
+			if !o.sameStat(c.uncommittedManifestEntry) {
+				changedPaths = append(changedPaths, c.Name)
 				tombstoned += o.heldBytes()
 				if !c.gone {
 					toRead = append(toRead, c)
@@ -190,11 +176,11 @@ func diffUncommittedAgainstManifest(
 			}
 			i++
 			j++
-		case c.name < o.Name:
+		case c.Name < o.Name:
 			// A new path with no file (a tracked file deleted) holds
 			// nothing to read or tombstone.
 			if !c.gone {
-				changedPaths = append(changedPaths, c.name)
+				changedPaths = append(changedPaths, c.Name)
 				toRead = append(toRead, c)
 			}
 			i++
@@ -206,7 +192,7 @@ func diffUncommittedAgainstManifest(
 	}
 	for ; i < len(candidates); i++ {
 		if !candidates[i].gone {
-			changedPaths = append(changedPaths, candidates[i].name)
+			changedPaths = append(changedPaths, candidates[i].Name)
 			toRead = append(toRead, candidates[i])
 		}
 	}
@@ -244,8 +230,7 @@ func copyUncommittedMarkers(entries []uncommittedManifestEntry, manifest uncommi
 	for i < len(entries) && j < len(manifest.Files) {
 		switch entry, old := entries[i], manifest.Files[j]; {
 		case entry.Name == old.Name:
-			if entry.Size == old.Size && entry.Mtime == old.Mtime && entry.Ino == old.Ino &&
-				entry.Mode == old.Mode && entry.Ctime == old.Ctime {
+			if entry.sameStat(old) {
 				entries[i].Marker = old.Marker
 			}
 			i++
@@ -275,7 +260,10 @@ func setUncommittedMarkers(entries []uncommittedManifestEntry, docs []fileConten
 	}
 }
 
-func uncommittedEntryMatches(old uncommittedManifestEntry, c uncommittedCandidate) bool {
-	return old.Size == c.size && old.Mtime == c.mtime && old.Ino == c.ino &&
-		old.Mode == c.mode && old.Ctime == c.ctime
+// sameStat reports whether two entries hold the same lstat fields. It does not
+// compare Name, which the callers match first, or Marker, which the content
+// read sets.
+func (e uncommittedManifestEntry) sameStat(other uncommittedManifestEntry) bool {
+	return e.Size == other.Size && e.Mtime == other.Mtime && e.Ino == other.Ino &&
+		e.Mode == other.Mode && e.Ctime == other.Ctime
 }

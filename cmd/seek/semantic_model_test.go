@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -81,8 +82,11 @@ func TestSemanticModelFutureReusesOneQueryForRetrievalAndRerank(t *testing.T) {
 	wait.Wait()
 
 	model, last, err := future.prepareQuery(t.Context(), "find request handler")
-	if err != nil || model != scorer || last.modelQuery != "find request handler" {
+	if err != nil || model != scorer || last == nil {
 		t.Fatalf("prepare query: model=%T query=%+v err=%v", model, last, err)
+	}
+	if !slices.Equal(scorer.queries, []string{"find request handler"}) {
+		t.Fatalf("prepared query texts=%q, want the one text once", scorer.queries)
 	}
 	for caller, query := range prepared {
 		if query != last {

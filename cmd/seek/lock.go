@@ -172,7 +172,7 @@ func (store corpusStore) acquireBuildLock(ctx context.Context) (*os.File, bool, 
 			_ = f.Close()
 			return nil, false, nil
 		}
-		if perr := pollLock(ctx, lockPath, lockWaitBuild, func() error { return lockFileExclusive(f) }, 100*time.Millisecond, 2*time.Second); perr != nil {
+		if perr := pollLock(ctx, lockPath, lockWaitBuild, func() error { return lockFileExclusive(f) }, buildLockPollMax); perr != nil {
 			_ = f.Close()
 			return nil, false, perr
 		}
@@ -254,7 +254,7 @@ func acquirePublishLock(ctx context.Context, cacheDir string) (*os.File, error) 
 	if err := lockFileExclusive(f); err == nil {
 		return f, nil
 	}
-	if err := pollLock(ctx, lockPath, lockWaitReaders, func() error { return lockFileExclusive(f) }, 20*time.Millisecond, 500*time.Millisecond); err != nil {
+	if err := pollLock(ctx, lockPath, lockWaitReaders, func() error { return lockFileExclusive(f) }, readLockPollMax); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
@@ -269,7 +269,7 @@ func acquireReadLock(ctx context.Context, f *os.File) error {
 	if err := lockFileSharedNB(f); err == nil {
 		return nil
 	}
-	return pollLock(ctx, f.Name(), lockWaitPublish, func() error { return lockFileSharedNB(f) }, 20*time.Millisecond, 500*time.Millisecond)
+	return pollLock(ctx, f.Name(), lockWaitPublish, func() error { return lockFileSharedNB(f) }, readLockPollMax)
 }
 
 // lockFileExclusive attempts a non-blocking exclusive lock on f.
@@ -294,14 +294,35 @@ func unlockFile(f *os.File) {
 	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }
 
+// The sleeps between the tries of a lock wait. A blocking flock cannot stop
+// when the user cancels, so a wait tries a non-blocking flock and sleeps. It
+// sees a free lock at most one sleep, plus jitter, late. Each try costs about
+// 30 to 70 µs of CPU, most of it the timer wakeup. Two processes on an
+// 18-core Mac gave these numbers (100 waits each, 20 s for the CPU):
+//
+//   - A build wait sleeps from 1 ms up to buildLockPollMax. It sees the free
+//     lock 6.5 ms late (median), 15 ms at most, and uses 0.35% of one core.
+//     The peer build uses every core, so the CPU of each try delays that
+//     build. A 2 ms maximum sees the lock 5 ms sooner but uses 1.2% of one
+//     core. On 18 cores, that CPU delays a build of 11 s or more by more than
+//     the 5 ms that it saves.
+//   - A read or publish wait sleeps from 1 ms up to readLockPollMax. It waits
+//     for a publish of some milliseconds, or for searches, so a short delay
+//     comes first: 1.4 ms (median), 3.5 ms at most, and 1.2% of one core.
+const (
+	lockPollFirst    = time.Millisecond
+	buildLockPollMax = 10 * time.Millisecond
+	readLockPollMax  = 2 * time.Millisecond
+)
+
 // pollLock retries lockFn with exponential backoff and jitter until it
 // succeeds, ctx ends, or the user ends the command's lock waits (lockWaits).
-// It counts the wait before it writes reason as one debug line, so an
-// interrupt after that line ends this wait. Jitter (up to 50% of backoff)
-// keeps processes that poll the same lock from retrying at the same time. It
-// retries only a held lock: any other flock error does not clear, so it
-// returns at once.
-func pollLock(ctx context.Context, path, reason string, lockFn func() error, initialBackoff, maxBackoff time.Duration) error {
+// The sleep starts at lockPollFirst and doubles up to maxBackoff. It counts
+// the wait before it writes reason as one debug line, so an interrupt after
+// that line ends this wait. Jitter (up to 50% of backoff) keeps processes that
+// poll the same lock from retrying at the same time. It retries only a held
+// lock: any other flock error does not clear, so it returns at once.
+func pollLock(ctx context.Context, path, reason string, lockFn func() error, maxBackoff time.Duration) error {
 	var ended <-chan struct{}
 	waits := lockWaitsOf(ctx)
 	if waits != nil {
@@ -309,7 +330,7 @@ func pollLock(ctx context.Context, path, reason string, lockFn func() error, ini
 		defer waits.stop()
 	}
 	slog.Debug(reason, "lock", path)
-	backoff := initialBackoff
+	backoff := lockPollFirst
 	for {
 		err := lockFn()
 		if err == nil {
@@ -320,16 +341,13 @@ func pollLock(ctx context.Context, path, reason string, lockFn func() error, ini
 		}
 
 		jitter := time.Duration(rand.Int64N(int64(backoff) / 2))
-		timer := time.NewTimer(backoff + jitter)
 		select {
 		case <-ctx.Done():
-			timer.Stop()
 			return ctx.Err()
 		case <-ended:
-			timer.Stop()
 			waits.ended.Store(true)
 			return fmt.Errorf("lock %s: %w", path, errLockWaitEnded)
-		case <-timer.C:
+		case <-time.After(backoff + jitter):
 		}
 
 		backoff *= 2

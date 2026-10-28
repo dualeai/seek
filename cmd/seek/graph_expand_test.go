@@ -671,12 +671,12 @@ func TestChildrenInScopeAddsEachChildOnce(t *testing.T) {
 	node := &externalGitRoot{
 		captured: true,
 		children: []string{"/r/a/x", "/r/b/y"},
-		operands: []string{"/r/a"},
+		operands: []gitScopeOperand{{path: "/r/a", dir: true}},
 	}
 	if got := node.childrenInScope(); !slices.Equal(got, []string{"/r/a/x"}) {
 		t.Fatalf("first=%q", got)
 	}
-	node.operands = append(node.operands, "/r")
+	node.operands = append(node.operands, gitScopeOperand{path: "/r", dir: true})
 	if got := node.childrenInScope(); !slices.Equal(got, []string{"/r/b/y"}) {
 		t.Fatalf("after widening=%q, want only the new child", got)
 	}

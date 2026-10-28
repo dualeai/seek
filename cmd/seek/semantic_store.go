@@ -201,10 +201,10 @@ type semanticUSearchValidation struct {
 // could check.
 var semanticInferenceRuntime = sync.OnceValue(func() string {
 	bundle, err := lateOnRuntimeForPlatform()
-	if err != nil || bundle.version == "" {
+	if err != nil {
 		return "unknown"
 	}
-	return bundle.version
+	return bundle.Version
 })
 
 func semanticGenerationKey(source string) string {
@@ -396,21 +396,21 @@ func writeSemanticManifest(path string, manifest semanticManifest) error {
 	return nil
 }
 
+// inspectSemanticArtifact returns the length and the SHA-256 of the regular
+// file at path. The length is the count of bytes that the hash read, so both
+// describe the same bytes, and the read needs no stat.
 func inspectSemanticArtifact(path string) (semanticArtifact, error) {
 	file, err := openRegularSemanticFile(path)
 	if err != nil {
 		return semanticArtifact{}, err
 	}
 	defer func() { _ = file.Close() }()
-	info, err := file.Stat()
+	hash := sha256.New()
+	size, err := io.Copy(hash, file)
 	if err != nil {
 		return semanticArtifact{}, err
 	}
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return semanticArtifact{}, err
-	}
-	return semanticArtifact{Bytes: uint64(info.Size()), SHA256: hex.EncodeToString(hash.Sum(nil))}, nil
+	return semanticArtifact{Bytes: uint64(size), SHA256: hex.EncodeToString(hash.Sum(nil))}, nil
 }
 
 // openSemanticGenerationForSearch trusts a rows.bin whose length, device,
@@ -439,12 +439,7 @@ func openSemanticGenerationWithOptions(
 	if rowsOnly {
 		manifest.USearchFiles = nil
 	}
-	rows, err := readCheckedSemanticRows(
-		filepath.Join(dir, semanticRowsFile),
-		manifest.RowsFile,
-		manifest.RowsCheck,
-		manifest.Rows,
-	)
+	rows, err := readCheckedSemanticRows(dir, manifest)
 	if err != nil {
 		return nil, fmt.Errorf("validate %s: %w", semanticRowsFile, err)
 	}
@@ -584,27 +579,25 @@ func validateJSONFields(decoder *json.Decoder) error {
 	return requireJSONEOF(decoder)
 }
 
+// validateJSONValue reads one JSON value and rejects an object with a
+// duplicate key. Decoder.Token returns an error for a token out of place. So a
+// value never starts with a closing delimiter, an object key is always a
+// string, and the token after the last member or element closes its object or
+// array.
 func validateJSONValue(decoder *json.Decoder) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return err
 	}
-	delimiter, ok := token.(json.Delim)
-	if !ok {
-		return nil
-	}
-	switch delimiter {
-	case '{':
+	switch token {
+	case json.Delim('{'):
 		seen := make(map[string]struct{})
 		for decoder.More() {
 			nameToken, err := decoder.Token()
 			if err != nil {
 				return err
 			}
-			name, ok := nameToken.(string)
-			if !ok {
-				return fmt.Errorf("JSON object key is not a string")
-			}
+			name, _ := nameToken.(string)
 			if _, exists := seen[name]; exists {
 				return fmt.Errorf("duplicate JSON field %q", name)
 			}
@@ -613,22 +606,18 @@ func validateJSONValue(decoder *json.Decoder) error {
 				return err
 			}
 		}
-		end, err := decoder.Token()
-		if err != nil || end != json.Delim('}') {
+		if _, err := decoder.Token(); err != nil {
 			return fmt.Errorf("JSON object is not closed")
 		}
-	case '[':
+	case json.Delim('['):
 		for decoder.More() {
 			if err := validateJSONValue(decoder); err != nil {
 				return err
 			}
 		}
-		end, err := decoder.Token()
-		if err != nil || end != json.Delim(']') {
+		if _, err := decoder.Token(); err != nil {
 			return fmt.Errorf("JSON array is not closed")
 		}
-	default:
-		return fmt.Errorf("invalid JSON delimiter %q", delimiter)
 	}
 	return nil
 }
@@ -739,10 +728,16 @@ func checkedSemanticVectorBytes(rows uint64) (uint64, bool) {
 
 // validateSemanticDigest checks that value is a hex SHA-256 digest.
 func validateSemanticDigest(value string) error {
-	if digest, err := hex.DecodeString(value); err != nil || len(digest) != sha256.Size {
+	if !validSHA256Hex(value) {
 		return fmt.Errorf("semantic artifact has an invalid SHA-256")
 	}
 	return nil
+}
+
+// validSHA256Hex reports whether value is a SHA-256 digest in hexadecimal.
+func validSHA256Hex(value string) bool {
+	digest, err := hex.DecodeString(value)
+	return err == nil && len(digest) == sha256.Size
 }
 
 func openRegularSemanticFile(path string) (*os.File, error) {
@@ -776,32 +771,28 @@ func validateSemanticArtifact(path string, want semanticArtifact) error {
 	return nil
 }
 
-// readCheckedSemanticRows reads rows.bin. A file that the recorded check saw
-// is trusted. When the device, inode, mtime, or ctime differs, it hashes the
-// file and compares the hash with the manifest.
-func readCheckedSemanticRows(
-	path string,
-	want semanticArtifact,
-	check semanticRowsCheck,
-	count uint64,
-) ([]semanticUnit, error) {
-	file, err := openRegularSemanticFile(path)
+// readCheckedSemanticRows reads the rows.bin of the generation in dir. A file
+// that the recorded check of manifest saw is trusted. When the device, inode,
+// mtime, or ctime differs, it hashes the file and compares the hash with the
+// manifest.
+func readCheckedSemanticRows(dir string, manifest semanticManifest) ([]semanticUnit, error) {
+	file, err := openRegularSemanticFile(filepath.Join(dir, semanticRowsFile))
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = file.Close() }()
 	info, err := file.Stat()
-	if err != nil || uint64(info.Size()) != want.Bytes {
+	if err != nil || uint64(info.Size()) != manifest.RowsFile.Bytes {
 		return nil, fmt.Errorf("semantic artifact length mismatch")
 	}
-	if semanticRowsCheckOf(info) == check {
-		return readSemanticRowsFrom(file, count, false)
+	if semanticRowsCheckOf(info) == manifest.RowsCheck {
+		return readSemanticRowsFrom(file, manifest.Rows, false)
 	}
-	rows, err := readVerifiedSemanticRows(file, want.SHA256, count)
+	rows, err := readVerifiedSemanticRows(file, manifest.RowsFile.SHA256, manifest.Rows)
 	if err == nil {
 		// The full check passed: record the file as it is now, so later
 		// searches trust it again.
-		refreshSemanticRowsCheck(filepath.Dir(path), semanticRowsCheckOf(info))
+		refreshSemanticRowsCheck(dir, semanticRowsCheckOf(info))
 	}
 	return rows, err
 }
@@ -836,11 +827,12 @@ func rewriteSemanticManifest(dir string, update func(*semanticManifest) bool) {
 
 func semanticRowsCheckOf(info os.FileInfo) semanticRowsCheck {
 	device, inode, mtime := fileInfoIdentity(info)
-	check := semanticRowsCheck{Device: device, Inode: inode, MtimeNs: mtime}
-	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		check.CtimeNs = statCtimeNano(*st)
+	return semanticRowsCheck{
+		Device:  device,
+		Inode:   inode,
+		MtimeNs: mtime,
+		CtimeNs: statCtimeNano(*info.Sys().(*syscall.Stat_t)),
 	}
-	return check
 }
 
 func readVerifiedSemanticRows(

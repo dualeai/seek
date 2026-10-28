@@ -168,19 +168,6 @@ func TestRootCmd_RejectsNegativeLimit(t *testing.T) {
 	}
 }
 
-// TestSearchRunConfigBindsTheModelFactory checks which model factory the run
-// config binds. The semanticSearch policy binds the given factory. The
-// lexicalOnlySearch policy binds no factory, so a --lexical-only search starts
-// no model.
-func TestSearchRunConfigBindsTheModelFactory(t *testing.T) {
-	if config := newSearchRunConfig(semanticSearch, newLateOnSemanticModel); config.newModel == nil {
-		t.Fatalf("semantic run config has no model: %+v", config)
-	}
-	if lexical := newSearchRunConfig(lexicalOnlySearch, newLateOnSemanticModel); lexical.newModel != nil {
-		t.Fatalf("lexical-only run config started a model: %+v", lexical)
-	}
-}
-
 // contextMarkerLine is the line of the marker in the file of
 // newContextLinesFolder. The file has contextMarkerLine-1 lines on each side
 // of the marker.

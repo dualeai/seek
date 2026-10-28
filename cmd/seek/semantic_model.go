@@ -29,7 +29,6 @@ type semanticQueryEmbedding struct {
 	// about the part of a score that the query gets from any document,
 	// whatever its text.
 	emptyScore float32
-	modelQuery string
 }
 
 // validSemanticQuery reports a query with whole windows and a vector per mask
@@ -75,7 +74,9 @@ type semanticModelResult struct {
 }
 
 // semanticModelFuture owns the model of one command. Index build, semantic
-// query, and final reranking borrow the same model.
+// query, and final reranking borrow the same model. runSearchCommand makes the
+// future only when the model stages run, always with a factory, and the model
+// stages are its only users. So no method accepts a nil future or factory.
 type semanticModelFuture struct {
 	factory semanticModelFactory
 	once    sync.Once
@@ -100,7 +101,7 @@ type semanticModelFuture struct {
 // on a built index is the common path. Without this record there, a wrong
 // provider would drop every search to text ranking and never record itself.
 func (future *semanticModelFuture) recordFault(err error) {
-	if future == nil || !errors.Is(err, errDegenerateSemanticVector) {
+	if !errors.Is(err, errDegenerateSemanticVector) {
 		return
 	}
 	future.faultOnce.Do(func() { rejectLateOnAcceleratedProvider(err.Error()) })
@@ -121,9 +122,6 @@ type semanticQueryResult struct {
 }
 
 func (future *semanticModelFuture) start(ctx context.Context) {
-	if future == nil || future.factory == nil {
-		return
-	}
 	future.once.Do(func() {
 		future.started.Store(true)
 		go func() {
@@ -134,9 +132,6 @@ func (future *semanticModelFuture) start(ctx context.Context) {
 }
 
 func (future *semanticModelFuture) model(ctx context.Context) (semanticModel, error) {
-	if future == nil || future.factory == nil {
-		return nil, errRerankUnavailable
-	}
 	future.start(ctx)
 	select {
 	case <-future.ready:
@@ -149,7 +144,7 @@ func (future *semanticModelFuture) model(ctx context.Context) (semanticModel, er
 // startQuery records ownership before returning so Close waits for query work
 // even when index preparation returns before the query goroutine starts.
 func (future *semanticModelFuture) startQuery(ctx context.Context, query string) {
-	if future == nil || query == "" {
+	if query == "" {
 		return
 	}
 	future.queryOnce.Do(func() {
@@ -176,7 +171,7 @@ func (future *semanticModelFuture) prepareQuery(
 	ctx context.Context,
 	query string,
 ) (semanticModel, *semanticQueryEmbedding, error) {
-	if future == nil || query == "" {
+	if query == "" {
 		return nil, nil, errRerankUnavailable
 	}
 	future.startQuery(ctx, query)
@@ -192,9 +187,6 @@ func (future *semanticModelFuture) prepareQuery(
 }
 
 func (future *semanticModelFuture) Close() error {
-	if future == nil {
-		return nil
-	}
 	if future.queryStarted.Load() {
 		<-future.queryReady
 	}
@@ -209,13 +201,16 @@ func (future *semanticModelFuture) Close() error {
 }
 
 type searchExecution struct {
-	policy    searchPolicy
+	// policy is the search policy of the command. The Git build reads it: a
+	// semanticSearch command drops the joined descriptor before a family
+	// changes (decideGitBuild).
+	policy searchPolicy
+	// model is the command's model. It is set only when the model stages run
+	// (a query that the semanticSearch policy plans with model text), and then
+	// every node builds and binds its vector generation before its read. A Git
+	// node with no commit has no base to build; the overlay adds its files.
 	model     *semanticModelFuture
 	resources searchResources
-	// vectors reports that the command's model stages read vectors: every
-	// node builds and binds its generation before its read. A Git node with
-	// no commit has no base to build; the overlay adds its files.
-	vectors bool
 	// opened records the nodes that the command opened (openNode), for the
 	// not-indexed check. Nil records nothing.
 	opened *openedNodes
@@ -226,18 +221,17 @@ type searchExecution struct {
 }
 
 // buildsVectors reports whether a node with the commit head builds and binds a
-// vector generation. It does when the model stages run, the policy allows
-// semantic search, a model exists, and head is not "no-head". A folder node
-// passes an empty head.
+// vector generation. It does when the model stages run and head is not
+// gitNoHead. A folder node passes an empty head.
 func (e searchExecution) buildsVectors(head string) bool {
-	return e.vectors && e.policy == semanticSearch && e.model != nil && head != "no-head"
+	return e.model != nil && head != gitNoHead
 }
 
 // buildsOverlay reports whether a Git node with dirty files builds and binds
 // the overlay of their work-tree bytes. Then every file of the node is in
 // vector retrieval, committed or not, with or without a commit.
 func (e searchExecution) buildsOverlay(dirty bool) bool {
-	return e.vectors && e.policy == semanticSearch && e.model != nil && dirty
+	return e.model != nil && dirty
 }
 
 // semanticBuildFailed logs a failed vector build that keeps the text index,

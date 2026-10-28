@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -104,12 +103,7 @@ func TestPrepareNativeGitDeltaAcceptsLargeFullBase(t *testing.T) {
 	if source.name == "" || !source.numbered || source.num != 0 {
 		t.Fatalf("base shard=%+v, want numbered shard zero", source)
 	}
-	for i := 1; i <= maxCommittedDeltaShards; i++ {
-		name := fmt.Sprintf("%s.%05d%s", source.prefix, i, shardSuffix)
-		if err := os.Link(filepath.Join(plan.indexDir, source.name), filepath.Join(plan.indexDir, name)); err != nil {
-			t.Fatalf("link synthetic base shard %d: %v", i, err)
-		}
-	}
+	linkCommittedShards(t, plan.indexDir, source, 1, maxCommittedDeltaShards)
 	scan, err = scanFamily(plan.indexDir)
 	if err != nil {
 		t.Fatal(err)
@@ -117,13 +111,6 @@ func TestPrepareNativeGitDeltaAcceptsLargeFullBase(t *testing.T) {
 	baseShards := maxCommittedDeltaShards + 1
 	if got := nativeCommittedShardCount(scan); got != baseShards || !scan.contiguous(familyCommitted) {
 		t.Fatalf("synthetic full base has %d shards and contiguous=%t, want %d contiguous shards", got, scan.contiguous(familyCommitted), baseShards)
-	}
-	names := make([]string, 0, len(scan.members))
-	for _, member := range scan.members {
-		names = append(names, member.name)
-	}
-	if err := writeFamilyManifest(plan.indexDir, names); err != nil {
-		t.Fatal(err)
 	}
 	state, ok := readCommittedGitState(plan.cacheDir)
 	if !ok {
@@ -140,9 +127,9 @@ func TestPrepareNativeGitDeltaAcceptsLargeFullBase(t *testing.T) {
 	gitRunIn(t, repoDir, "add", "next.go")
 	gitRunIn(t, repoDir, "commit", "-m", "delta above large full base")
 	target := captureHeadForTest(t, repoDir)
-	delta, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, target, scan)
-	if err != nil || !eligible {
-		t.Fatalf("large-base delta: eligible=%t error=%v", eligible, err)
+	delta, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, target, scan)
+	if err != nil || delta == nil {
+		t.Fatalf("large-base delta: eligible=%t error=%v", delta != nil, err)
 	}
 	if delta.nextState.baseShards != baseShards || delta.nextState.baseHead != state.baseHead {
 		t.Fatalf("next state=%+v, want base_shards=%d base_head=%s", delta.nextState, baseShards, state.baseHead)

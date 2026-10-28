@@ -114,10 +114,9 @@ func validGitObjectID(raw []byte) bool {
 	return true
 }
 
+// parseGitDecimal parses a decimal count of Git output. The caller gives a
+// non-empty field (splitGitHeader).
 func parseGitDecimal(raw []byte) (int64, bool) {
-	if len(raw) == 0 {
-		return 0, false
-	}
 	const maxInt64 = int64(^uint64(0) >> 1)
 	var n int64
 	for _, c := range raw {
@@ -352,9 +351,7 @@ func readNativeGitBatchHeader(reader *bufio.Reader) ([]byte, error) {
 		}
 		return nil, err
 	}
-	if len(header) == 0 || header[len(header)-1] != '\n' {
-		return nil, io.ErrUnexpectedEOF
-	}
+	// With no error, ReadSlice gives a slice that ends in the newline.
 	return header[:len(header)-1], nil
 }
 

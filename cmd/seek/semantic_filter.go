@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	mathbits "math/bits"
 	"strings"
 	"unicode/utf8"
@@ -19,47 +18,42 @@ type semanticPathFilter struct {
 	caseSensitive bool
 }
 
-func newSemanticSubstringFilter(node *query.Substring) (semanticPathFilter, error) {
-	if node.Pattern == "" {
-		return semanticPathFilter{}, fmt.Errorf("invalid semantic filename substring")
-	}
+// newSemanticSubstringFilter builds the filter of a file: substring. Zoekt
+// makes the pattern from the literal of a parsed regular expression, so it is
+// valid UTF-8, and its quoted form always compiles.
+func newSemanticSubstringFilter(node *query.Substring) semanticPathFilter {
 	filter := semanticPathFilter{
 		substring:     node.Pattern,
 		caseSensitive: node.CaseSensitive,
 	}
 	if !node.CaseSensitive {
 		if utf8.RuneCountInString(node.Pattern) < 3 {
-			compiled, err := grafanaregexp.Compile("(?i)" + grafanaregexp.QuoteMeta(node.Pattern))
-			if err != nil {
-				return semanticPathFilter{}, fmt.Errorf("compile semantic filename substring: %w", err)
-			}
-			filter.regexp = compiled
+			filter.regexp = grafanaregexp.MustCompile("(?i)" + grafanaregexp.QuoteMeta(node.Pattern))
 		} else {
 			filter.substring = strings.ToLower(node.Pattern)
 		}
 	}
-	return filter, nil
+	return filter
 }
 
-func newSemanticRegexpFilter(node *query.Regexp) (semanticPathFilter, error) {
-	if node.Regexp == nil {
-		return semanticPathFilter{}, fmt.Errorf("invalid semantic filename regular expression")
-	}
+// newSemanticRegexpFilter builds the filter of a file: regular expression. It
+// compiles the pattern that compileRegexpAtoms compiled when it parsed the
+// query, so the compile cannot fail.
+func newSemanticRegexpFilter(node *query.Regexp) semanticPathFilter {
 	prefix := ""
 	if !node.CaseSensitive {
 		prefix = "(?i)"
 	}
-	compiled, err := grafanaregexp.Compile(prefix + node.RegexpString())
-	if err != nil {
-		return semanticPathFilter{}, fmt.Errorf("compile semantic filename regular expression: %w", err)
-	}
-	return semanticPathFilter{regexp: compiled}, nil
+	return semanticPathFilter{regexp: grafanaregexp.MustCompile(prefix + node.RegexpString())}
 }
 
 // newSemanticPathFilter builds the filter of one file: atom. The caller gives
 // only an atom that fileNameAtom accepts: a substring or a regular expression
-// with FileName set and Content not set.
-func newSemanticPathFilter(atom query.Q) (semanticPathFilter, error) {
+// with FileName set and Content not set. The atom is an explicit file: atom of
+// the parsed query. The strict query holds each of them, because
+// query.ExpandFileContent leaves a file: atom as it is. The relaxed and filter
+// queries hold no other file: atom (planRerankQuery).
+func newSemanticPathFilter(atom query.Q) semanticPathFilter {
 	if substring, ok := atom.(*query.Substring); ok {
 		return newSemanticSubstringFilter(substring)
 	}
@@ -81,22 +75,13 @@ func (filter semanticPathFilter) matches(path string) bool {
 	}
 }
 
-type semanticFilterMode uint8
-
-const (
-	semanticFilterAll semanticFilterMode = iota + 1
-	semanticFilterNone
-	semanticFilterPartial
-)
-
-// semanticFilterMask has one bit for each global semantic row. The modes
-// semanticFilterAll and semanticFilterNone have no bits and no shardAllowed. A
-// semanticFilterPartial mask has (rows+7)/8 bitmap bytes and one count for each
-// USearch shard, in manifest order. allowed counts the selected rows.
-// exactRows holds the complete sorted selection only when its length equals
-// allowed.
+// semanticFilterMask has one bit for each global semantic row. allowed counts
+// the selected rows. A mask that selects no row (allowed is 0) or every row
+// (allowed equals rows) has no bits and no shardAllowed. A partial mask has
+// (rows+7)/8 bitmap bytes and one count for each USearch shard, in manifest
+// order. exactRows holds the complete sorted selection only when its length
+// equals allowed.
 type semanticFilterMask struct {
-	mode         semanticFilterMode
 	bits         []byte
 	rows         uint64
 	allowed      uint64
@@ -185,19 +170,18 @@ func buildSemanticFilterMask(
 		}
 		at = end
 	}
-	switch allowed {
-	case 0:
-		return semanticFilterMask{mode: semanticFilterNone, rows: rowCount}, nil
-	case rowCount:
-		return semanticFilterMask{
-			mode: semanticFilterAll, rows: rowCount, allowed: allowed,
-		}, nil
-	default:
-		return semanticFilterMask{
-			mode: semanticFilterPartial, bits: bits, rows: rowCount,
-			allowed: allowed, shardAllowed: shardAllowed, exactRows: exactRows,
-		}, nil
+	if allowed == 0 || allowed == rowCount {
+		return semanticFilterMask{rows: rowCount, allowed: allowed}, nil
 	}
+	return semanticFilterMask{
+		bits: bits, rows: rowCount,
+		allowed: allowed, shardAllowed: shardAllowed, exactRows: exactRows,
+	}, nil
+}
+
+// partial reports whether the mask selects some rows, but not all of them.
+func (mask semanticFilterMask) partial() bool {
+	return mask.allowed != 0 && mask.allowed != mask.rows
 }
 
 func setSemanticFilterRange(bits []byte, start, end uint64) {

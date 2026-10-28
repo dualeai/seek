@@ -799,7 +799,7 @@ func TestDeltaUncommitted_OnlyAMissingFileIsGone(t *testing.T) {
 		t.Fatalf("entries=%+v, want the long path only", entries)
 	}
 	toRead, changed, _ := diffUncommittedAgainstManifest(candidates, uncommittedManifest{})
-	if len(toRead) != 1 || toRead[0].name != long || !slices.Equal(changed, []string{long}) {
+	if len(toRead) != 1 || toRead[0].Name != long || !slices.Equal(changed, []string{long}) {
 		t.Fatalf("toRead=%+v changed=%v, want the long path only", toRead, changed)
 	}
 }

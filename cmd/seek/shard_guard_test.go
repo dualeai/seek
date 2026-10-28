@@ -48,17 +48,17 @@ func guardShardReport(t *testing.T, dir string) (int, map[string][]string) {
 	return wrapped, contents
 }
 
-// The guard tests scale Zoekt's limits down, so they index a few MiB, not
-// tens of MiB. A document above guardShardMax that Zoekt keeps fills a shard
-// of its own, and a shard file above guardShardFormatLimit counts as wrapped.
-// A random-word shard takes about 2.8 MiB plus 3.9 bytes per content byte.
-// So the 1.25 MiB fits.txt makes about 7.7 MiB and fits. The 2.5 MiB
-// wraps.txt makes about 12.6 MiB and wraps.
+// The guard tests scale Zoekt's limits down, so they index less than 1 MiB,
+// not tens of MiB. A document above guardShardMax that Zoekt keeps fills a
+// shard of its own, and a shard file above guardShardFormatLimit counts as
+// wrapped. A random-word shard takes about 12 bytes per content byte at 128
+// KiB and about 8.5 at 512 KiB. So the 128 KiB fits.txt makes about 1.5 MiB
+// and fits. The 512 KiB wraps.txt makes about 4.3 MiB and wraps.
 const (
 	// Below deltaShardMin (1 MiB), so a delta Builder uses it as its shard
 	// target too (deltaShardMax).
-	guardShardMax         = 1 << 19  // 512 KiB
-	guardShardFormatLimit = 10 << 20 // 10 MiB
+	guardShardMax         = 1 << 16 // 64 KiB
+	guardShardFormatLimit = 5 << 19 // 2.5 MiB
 )
 
 // swapGuardLimitsForTest sets shardMax and shardFormatLimit to the guard
@@ -74,9 +74,9 @@ func swapGuardLimitsForTest(tb testing.TB) {
 // guard limits, fits.txt fits and wraps.txt wraps.
 func guardDocs(order ...string) []fileContent {
 	documents := map[string]fileContent{
-		"bin.dat":   {name: "bin.dat", content: make([]byte, 5<<18)},
-		"fits.txt":  {name: "fits.txt", content: randomWordText(3, 5<<18, "guard_fits_needle")},
-		"wraps.txt": {name: "wraps.txt", content: randomWordText(4, 5<<19, "guard_wraps_needle")},
+		"bin.dat":   {name: "bin.dat", content: make([]byte, 1<<17)},
+		"fits.txt":  {name: "fits.txt", content: randomWordText(3, 1<<17, "guard_fits_needle")},
+		"wraps.txt": {name: "wraps.txt", content: randomWordText(4, 1<<19, "guard_wraps_needle")},
 	}
 	docs := make([]fileContent, len(order))
 	for i, name := range order {

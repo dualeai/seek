@@ -316,6 +316,35 @@ func TestBM25LineSplitAmbiguity(t *testing.T) {
 	}
 }
 
+// TestBM25MultiLineKeysFollowTheLines gives a candidate that spans two lines,
+// with the lines in Zoekt's score order, not in file order. Each piece of the
+// candidate takes its key at its own place in the line order. The other
+// fragments keep their own keys, and the candidate counts once.
+func TestBM25MultiLineKeysFollowTheLines(t *testing.T) {
+	bq := compileBM25Query(query.NewAnd(
+		&query.Substring{Pattern: "nil\n}", Content: true, CaseSensitive: true},
+		&query.Substring{Pattern: "foo", Content: true, CaseSensitive: true},
+	))
+	// The file is "x foo nil\n} foo\n": "nil" ends line 1, "}" starts line 2.
+	lines := []zoekt.LineMatch{
+		{Line: []byte("} foo\n"), LineFragments: []zoekt.LineFragmentMatch{
+			{LineOffset: 0, Offset: 10, MatchLength: 1},
+			{LineOffset: 2, Offset: 12, MatchLength: 3},
+		}},
+		{Line: []byte("x foo nil\n"), LineFragments: []zoekt.LineFragmentMatch{
+			{LineOffset: 2, Offset: 2, MatchLength: 3},
+			{LineOffset: 6, Offset: 6, MatchLength: 3},
+		}},
+	}
+	keys, merges, ok := bq.multiLineMerges(lines)
+	if want := []string{"nil\n}", "foo", "foo", "nil\n}"}; !ok || !slices.Equal(keys, want) {
+		t.Fatalf("keys=%q ok=%t, want %q", keys, ok, want)
+	}
+	if len(merges) != 1 || merges["nil\n}"] != -1 {
+		t.Fatalf("merges=%v, want the candidate counted once", merges)
+	}
+}
+
 // TestBM25ShardCountsIgnoreTombstones edits a dirty file, so a delta shard
 // tombstones it in the older uncommitted shard. A fresh listing of that shard
 // still counts the tombstoned file, as Zoekt's average does. A record entry of

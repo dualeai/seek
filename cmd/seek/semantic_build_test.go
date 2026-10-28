@@ -9,12 +9,16 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
+
+	ctags "github.com/sourcegraph/go-ctags"
 )
 
 // semanticBuildTestEmbedder is a build model whose embed call runs the
@@ -639,6 +643,64 @@ func TestBuildSemanticGenerationKeepsCollectorErrorAfterInternalCancellation(t *
 	}
 }
 
+// TestBuildSemanticGenerationKeepsGraphErrorAfterInternalCancellation puts a
+// directory where the first graph shard goes, so the shard save fails and
+// cancels the build. The source then reports that cancellation, as the Git
+// source does after an internal cancel. The build returns the save error, not
+// the cancellation.
+func TestBuildSemanticGenerationKeepsGraphErrorAfterInternalCancellation(t *testing.T) {
+	requireTools(t)
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, semanticUSearchShardName(0)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	documents := make(chan fileContent, 1)
+	documents <- fileContent{name: "app.go", content: []byte("package sample\nfunc Alpha() {}\n")}
+	close(documents)
+	embedder := semanticBuildTestEmbedder{embed: func(_ context.Context, units []semanticUnit) ([]semanticUnitEmbedding, error) {
+		embeddings := make([]semanticUnitEmbedding, len(units))
+		for index := range embeddings {
+			embeddings[index] = testSemanticUnitEmbedding(semanticVector{0: 1})
+		}
+		return embeddings, nil
+	}}
+	err := buildSemanticGeneration(t.Context(), dir, "source-graph-error", embedder, searchResources{},
+		func(ctx context.Context) (<-chan fileContent, func() error) {
+			return documents, ctx.Err
+		}, &semanticReuseIndex{})
+	if err == nil || errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "USearch") {
+		t.Fatalf("semantic build error=%v, want the graph shard save error", err)
+	}
+}
+
+// semanticStubParser finds no symbol, so each file is one unit.
+type semanticStubParser struct{}
+
+func (semanticStubParser) Parse(string, []byte) ([]*ctags.Entry, error) { return nil, nil }
+func (semanticStubParser) Close()                                       {}
+
+// TestExtractSemanticDocumentsSendsWindowError gives the extractor a closed
+// tokenizer, so the window split of its one file fails. The extractor must
+// send that error to the build loop, which keeps the first error of the build.
+func TestExtractSemanticDocumentsSendsWindowError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		jobs := make(chan semanticSourceDocument, 1)
+		jobs <- semanticSourceDocument{content: fileContent{name: "app.go", content: []byte("package sample\nfunc Alpha() {}\n")}}
+		close(jobs)
+		results := make(chan semanticExtractedFile)
+		go extractSemanticDocuments(t.Context(), semanticStubParser{}, nil, &semanticReuseIndex{}, searchResources{}, jobs, results)
+		synctest.Wait()
+		select {
+		case result := <-results:
+			if result.err == nil {
+				t.Fatal("extractor sent no window error")
+			}
+		default:
+			t.Fatal("extractor ended without sending its window error")
+		}
+	})
+}
+
 // TestBuildSemanticGenerationHashesRawContent builds a generation from one
 // file whose byte 0xff is not valid UTF-8. Each stored row must hold the
 // SHA-256 of the raw bytes, which the search computes from the shard copy
@@ -1012,12 +1074,7 @@ func TestBuildSemanticFolderGenerationFailsOnTransientRead(t *testing.T) {
 	writeFileAt(t, folder, "b.go", "package sample\n// beta\n")
 	var selected []folderCandidate
 	for _, name := range []string{"a.go", "b.go"} {
-		path := filepath.Join(folder, name)
-		info, err := os.Lstat(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		selected = append(selected, newFolderCandidate(name, path, info))
+		selected = append(selected, testFolderCandidate(t, name, filepath.Join(folder, name)))
 	}
 	realOpen := folderOpenFile
 	folderOpenFile = func(path string) (*os.File, error) {
@@ -1041,5 +1098,44 @@ func TestBuildSemanticFolderGenerationFailsOnTransientRead(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(dir, semanticManifestFile)); !os.IsNotExist(statErr) {
 		t.Fatalf("the failed build wrote a manifest: %v", statErr)
+	}
+}
+
+// TestStartSemanticCtagsParsersClosesTheStartedParsers starts four ctags
+// workers at the same time. One start gets a fatal error, and the three others
+// start. The start returns that error and stops the three ctags processes.
+func TestStartSemanticCtagsParsersClosesTheStartedParsers(t *testing.T) {
+	dir := t.TempDir()
+	command := filepath.Join(dir, "ctags")
+	writeExecutable(t, command, `#!/bin/sh
+if mkdir "$ZQ_CTAGS_DIR/failed" 2>/dev/null; then
+	echo '{"_type":"error","message":"zqfatal","fatal":true}'
+	exit 1
+fi
+echo $$ >"$ZQ_CTAGS_DIR/pid.$$"
+echo '{"_type":"program","name":"zqctags"}'
+exec cat >/dev/null
+`)
+	t.Setenv("CTAGS_COMMAND", command)
+	t.Setenv("ZQ_CTAGS_DIR", dir)
+	parsers, err := startSemanticCtagsParsers(4)
+	if err == nil || parsers != nil {
+		t.Fatalf("parsers=%v err=%v, want no parser and an error", parsers, err)
+	}
+	if !strings.HasPrefix(err.Error(), "start semantic ctags worker: ") || !strings.Contains(err.Error(), "zqfatal") {
+		t.Fatalf("err=%q, want the start error of the failed worker", err)
+	}
+	pids, err := filepath.Glob(filepath.Join(dir, "pid.*"))
+	if err != nil || len(pids) != 3 {
+		t.Fatalf("started workers %v (err=%v), want 3", pids, err)
+	}
+	for _, path := range pids {
+		pid, err := strconv.Atoi(strings.TrimPrefix(filepath.Ext(path), "."))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+			t.Errorf("ctags process %d runs after the failed start (err=%v)", pid, err)
+		}
 	}
 }

@@ -2,13 +2,12 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -99,7 +98,7 @@ func readJoinedGeneration(cacheDir string) (joinedGenerationDescriptor, error) {
 		(descriptor.SemanticKey == "" && descriptor.OverlayKey == "") {
 		return joinedGenerationDescriptor{}, fmt.Errorf("joined generation descriptor is incomplete")
 	}
-	if digest, err := hex.DecodeString(descriptor.FamilySHA); err != nil || len(digest) != sha256.Size {
+	if !validSHA256Hex(descriptor.FamilySHA) {
 		return joinedGenerationDescriptor{}, fmt.Errorf("joined generation family digest is invalid")
 	}
 	return descriptor, nil
@@ -164,16 +163,8 @@ func (store corpusStore) joinedGenerationsMatch(
 }
 
 func joinedFamilyDigest(indexDir string) (string, error) {
-	file, err := openRegularSemanticFile(filepath.Join(indexDir, familyManifestFile))
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = file.Close() }()
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
+	artifact, err := inspectSemanticArtifact(filepath.Join(indexDir, familyManifestFile))
+	return artifact.SHA256, err
 }
 
 // publishSemanticGeneration moves the build in stagingDir to the generation
@@ -247,20 +238,17 @@ func (store corpusStore) bindSemanticGenerations(
 	if err := store.writeJoinedGenerations(state, source, overlay); err != nil {
 		return fmt.Errorf("activate joined generation: %w", err)
 	}
-	keep := map[string]struct{}{}
 	var live []string
 	for _, bound := range []string{source, overlay} {
 		if bound != "" {
-			dir := semanticGenerationDir(store.indexDir, bound)
-			keep[filepath.Base(dir)] = struct{}{}
-			live = append(live, dir)
+			live = append(live, semanticGenerationDir(store.indexDir, bound))
 		}
 	}
 	// The windows that only the replaced generations hold go to the unit
 	// store first. So a later build copies them and does not embed them
 	// again.
 	archiveSupersededUnits(store.indexDir, live...)
-	removeSemanticGenerationsExcept(store.indexDir, keep)
+	removeSemanticGenerationsExcept(store.indexDir, live...)
 	// The removal changed the ctime of each graph file that the new
 	// generation links: record the checks again, so searches trust them.
 	for _, dir := range live {
@@ -271,24 +259,15 @@ func (store corpusStore) bindSemanticGenerations(
 
 func removeJoinedGeneration(cacheDir string) {
 	removeCacheFile(cacheDir, joinedGenerationFile)
-	removeCacheFile(cacheDir, joinedGenerationFile+".tmp")
 }
 
 // removeSemanticGenerationsExcept removes every semantic generation directory
-// in indexDir whose name is not in keep. The caller must hold the publish lock.
-func removeSemanticGenerationsExcept(indexDir string, keep map[string]struct{}) {
-	entries, err := os.ReadDir(indexDir)
-	if err != nil {
-		return
-	}
-	for _, entry := range entries {
-		name := entry.Name()
-		if !entry.IsDir() || !strings.HasPrefix(name, semanticGenerationPrefix) {
-			continue
+// of indexDir (semanticGenerationDirsIn) that keep does not name. The caller
+// must hold the publish lock.
+func removeSemanticGenerationsExcept(indexDir string, keep ...string) {
+	for _, dir := range semanticGenerationDirsIn(indexDir, "") {
+		if !slices.Contains(keep, dir) {
+			_ = os.RemoveAll(dir)
 		}
-		if _, ok := keep[name]; ok {
-			continue
-		}
-		_ = os.RemoveAll(filepath.Join(indexDir, name))
 	}
 }

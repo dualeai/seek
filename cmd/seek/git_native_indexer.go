@@ -15,7 +15,7 @@ import (
 // the build then checks the commit (capturedCommitMissing). A separate check
 // here costs one Git process per committed build and delta. Only a build that
 // reads the commit calls it (gitBuildPlan.snapshot), and such a build has a
-// commit: the "no-head" value is an error.
+// commit: the gitNoHead value is an error.
 func captureGitSnapshot(captured string) (gitObjectID, error) {
 	oid, err := parseGitObjectID([]byte(captured))
 	if err != nil {

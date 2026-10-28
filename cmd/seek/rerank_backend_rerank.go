@@ -50,20 +50,16 @@ var lateOnCompressedModel []byte
 //go:embed rerank_assets/tokenizer.json.zst
 var lateOnCompressedTokenizer []byte
 
+// lateOnRuntimeBundle is the ONNX Runtime library that this target embeds:
+// the fields of its manifest (rerank_backend_assets_<target>.go), and the
+// compressed library.
 type lateOnRuntimeBundle struct {
-	fileName   string
-	version    string
+	Target     string `json:"target"`
+	FileName   string `json:"file_name"`
+	Version    string `json:"version"`
+	Bytes      int64  `json:"bytes"`
+	SHA256     string `json:"sha256"`
 	compressed []byte
-	bytes      int64
-	sha256     string
-}
-
-type lateOnRuntimeManifest struct {
-	Target   string `json:"target"`
-	FileName string `json:"file_name"`
-	Version  string `json:"version"`
-	Bytes    int64  `json:"bytes"`
-	SHA256   string `json:"sha256"`
 }
 
 // lateOnModel lazily creates its row encoders, each with one ONNX session,
@@ -180,15 +176,15 @@ func lateOnRuntimeBundleFromManifest(
 	manifestJSON []byte,
 	compressed []byte,
 ) (lateOnRuntimeBundle, error) {
-	var manifest lateOnRuntimeManifest
-	if err := json.Unmarshal(manifestJSON, &manifest); err != nil {
+	var bundle lateOnRuntimeBundle
+	if err := json.Unmarshal(manifestJSON, &bundle); err != nil {
 		return lateOnRuntimeBundle{}, fmt.Errorf("decode runtime manifest: %w", err)
 	}
 	target := runtime.GOOS + "-" + runtime.GOARCH
-	if manifest.Target != target {
+	if bundle.Target != target {
 		return lateOnRuntimeBundle{}, fmt.Errorf(
 			"runtime manifest target is %q, want %q",
-			manifest.Target,
+			bundle.Target,
 			target,
 		)
 	}
@@ -196,25 +192,25 @@ func lateOnRuntimeBundleFromManifest(
 	if runtime.GOOS == "darwin" {
 		wantFileName = "libonnxruntime.dylib"
 	}
-	if manifest.FileName != wantFileName || manifest.Version == "" || manifest.Bytes <= 0 {
+	if bundle.FileName != wantFileName || bundle.Version == "" || bundle.Bytes <= 0 {
 		return lateOnRuntimeBundle{}, fmt.Errorf("runtime manifest is incomplete")
 	}
-	digest, err := hex.DecodeString(manifest.SHA256)
-	if err != nil || len(digest) != sha256.Size {
+	if !validSHA256Hex(bundle.SHA256) {
 		return lateOnRuntimeBundle{}, fmt.Errorf("runtime manifest has an invalid SHA-256")
 	}
 	if len(compressed) == 0 {
 		return lateOnRuntimeBundle{}, fmt.Errorf("compressed runtime is empty")
 	}
-	return lateOnRuntimeBundle{
-		fileName:   manifest.FileName,
-		version:    manifest.Version,
-		compressed: compressed,
-		bytes:      manifest.Bytes,
-		sha256:     manifest.SHA256,
-	}, nil
+	bundle.compressed = compressed
+	return bundle, nil
 }
 
+// newLateOnSemanticModel makes the model. Three steps before its first query do
+// not depend on each other, so they overlap: the runtime check reads and
+// hashes the installed library, the tokenizer build parses its asset, and the
+// model asset decodes for the first encoder. On warm searches of the Seek
+// repository, the overlap took 40 to 55 ms off searches of 500 to 590 ms. A
+// runtime error still comes before a tokenizer error.
 func newLateOnSemanticModel(ctx context.Context) (semanticModel, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -223,13 +219,21 @@ func newLateOnSemanticModel(ctx context.Context) (semanticModel, error) {
 	if err != nil {
 		return nil, err
 	}
-	runtimePath, err := ensureLateOnRuntime(bundle)
-	if err != nil {
-		return nil, fmt.Errorf("prepare ONNX Runtime: %w", err)
+	go func() { _, _ = lateOnModelBytes() }()
+	var runtimePath string
+	var runtimeErr error
+	installed := make(chan struct{})
+	go func() {
+		runtimePath, runtimeErr = ensureLateOnRuntime(bundle)
+		close(installed)
+	}()
+	punctuation, punctuationErr := lateOnTokenizers.punctuationIDs(ctx)
+	<-installed
+	if runtimeErr != nil {
+		return nil, fmt.Errorf("prepare ONNX Runtime: %w", runtimeErr)
 	}
-	punctuation, err := lateOnTokenizers.punctuationIDs(ctx)
-	if err != nil {
-		return nil, err
+	if punctuationErr != nil {
+		return nil, punctuationErr
 	}
 	if err := ensureLateOnEnvironment(runtimePath); err != nil {
 		return nil, err
@@ -263,18 +267,19 @@ func ensureLateOnEnvironment(runtimePath string) error {
 	return lateOnEnvironmentErr
 }
 
+// runLateOnSessionRows runs one static batch of semanticModelBatchRows rows
+// through session: the model has that fixed batch size.
 func runLateOnSessionRows(
 	ctx context.Context,
 	session *ort.DynamicAdvancedSession,
 	inputIDs []int64,
 	attention []int64,
-	batchSize int,
 	outputTensor *ort.Tensor[float32],
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	shape := ort.NewShape(int64(batchSize), lateOnSequenceLength)
+	shape := ort.NewShape(semanticModelBatchRows, lateOnSequenceLength)
 	idsTensor, err := ort.NewTensor(shape, inputIDs)
 	if err != nil {
 		return fmt.Errorf("create input IDs: %w", err)
@@ -290,23 +295,21 @@ func runLateOnSessionRows(
 		return fmt.Errorf("create LateOn run options: %w", err)
 	}
 	defer func() { _ = runOptions.Destroy() }()
-	watchStop := make(chan struct{})
-	watchDone := make(chan struct{})
-	go func() {
-		defer close(watchDone)
-		select {
-		case <-ctx.Done():
-			_ = runOptions.Terminate()
-		case <-watchStop:
-		}
-	}()
+	// A cancel stops the run. A Terminate that started must end before the
+	// deferred Destroy.
+	terminated := make(chan struct{})
+	stopTerminate := context.AfterFunc(ctx, func() {
+		defer close(terminated)
+		_ = runOptions.Terminate()
+	})
 	runErr := session.RunWithOptions(
 		[]ort.Value{idsTensor, attentionTensor},
 		[]ort.Value{outputTensor},
 		runOptions,
 	)
-	close(watchStop)
-	<-watchDone
+	if !stopTerminate() {
+		<-terminated
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -316,20 +319,12 @@ func runLateOnSessionRows(
 	return nil
 }
 
+// EmbedSemanticUnits embeds one build batch: 1 to semanticModelBatchRows units
+// (sendBatch). Run rejects a batch of any other size.
 func (s *lateOnModel) EmbedSemanticUnits(
 	ctx context.Context,
 	units []semanticUnit,
 ) ([]semanticUnitEmbedding, error) {
-	if len(units) == 0 {
-		return nil, ctx.Err()
-	}
-	if len(units) > semanticModelBatchRows {
-		return nil, fmt.Errorf(
-			"semantic model batch has %d rows, limit is %d",
-			len(units),
-			semanticModelBatchRows,
-		)
-	}
 	encoder, err := s.semanticRowEncoder(ctx, false)
 	if err != nil {
 		return nil, err
@@ -412,7 +407,8 @@ func (s *lateOnModel) PrepareSemanticQuery(
 	if encodeErr != nil {
 		return nil, encodeErr
 	}
-	inputIDs, attention, masks := packLateOnRows(windows, nil, true)
+	// A query keeps its punctuation tokens: no punctuation set.
+	inputIDs, attention, masks := packLateOnRows(windows, nil)
 	// The static batch always runs semanticModelBatchRows rows, so the empty
 	// document in the row after the last window costs no model call.
 	inputIDs = append(inputIDs, emptyIDs...)
@@ -455,7 +451,6 @@ func (s *lateOnModel) PrepareSemanticQuery(
 		tokens:     tokens,
 		scoreMask:  scoreMask,
 		emptyScore: emptyScore,
-		modelQuery: modelQuery,
 	}, nil
 }
 
@@ -466,9 +461,6 @@ func (s *lateOnModel) ScoresWithSemanticQuery(
 ) ([]float32, error) {
 	if !validSemanticQuery(prepared) {
 		return nil, fmt.Errorf("semantic query embedding is invalid")
-	}
-	if len(documents) == 0 {
-		return nil, nil
 	}
 	encoder, err := s.semanticRowEncoder(ctx, true)
 	if err != nil {
@@ -484,9 +476,6 @@ func (s *lateOnModel) ScoresWithSemanticQuery(
 		batch := documents[start:min(start+semanticModelBatchRows, len(documents))]
 		group.Go(func() error {
 			values, err := s.scoreDocumentBatch(groupCtx, encoder, prepared, batch)
-			if err == nil && len(values) != len(batch) {
-				err = fmt.Errorf("semantic scorer returned %d scores for %d documents", len(values), len(batch))
-			}
 			copy(scores[start:], values)
 			return err
 		})
@@ -498,7 +487,8 @@ func (s *lateOnModel) ScoresWithSemanticQuery(
 }
 
 // scoreDocumentBatch scores at most semanticModelBatchRows documents against
-// the prepared query with one encoder call.
+// the prepared query with one encoder call. It gives one score per document
+// (lateOnMaxSimPrepared), or an error.
 func (s *lateOnModel) scoreDocumentBatch(
 	ctx context.Context,
 	encoder *lateOnStaticRowEncoder,
@@ -702,7 +692,7 @@ func tokenizeLateOnSemanticUnits(
 			return nil, nil, nil, err
 		}
 	}
-	inputIDs, attention, masks := packLateOnRows(encoded, punctuation, false)
+	inputIDs, attention, masks := packLateOnRows(encoded, punctuation)
 	return inputIDs, attention, masks, nil
 }
 
@@ -737,14 +727,15 @@ func tokenizeLateOnDocuments(
 			return nil, nil, nil, err
 		}
 	}
-	inputIDs, attention, masks := packLateOnRows(encoded, punctuation, false)
+	inputIDs, attention, masks := packLateOnRows(encoded, punctuation)
 	return inputIDs, attention, masks, nil
 }
 
+// packLateOnRows pads each row of token IDs to lateOnSequenceLength. Its mask
+// keeps every token that is not in punctuation; a nil set keeps every token.
 func packLateOnRows(
 	encoded [][]int,
 	punctuation map[int]struct{},
-	query bool,
 ) ([]int64, []int64, [][]bool) {
 	inputIDs := make([]int64, len(encoded)*lateOnSequenceLength)
 	attention := make([]int64, len(inputIDs))
@@ -761,7 +752,7 @@ func packLateOnRows(
 			inputIDs[position] = int64(id)
 			attention[position] = 1
 			_, isPunctuation := punctuation[id]
-			masks[row][column] = query || !isPunctuation
+			masks[row][column] = !isPunctuation
 		}
 	}
 	return inputIDs, attention, masks
@@ -931,7 +922,8 @@ func sanitizeLateOnDocumentInput(
 		sanitizedMatchEnd
 }
 
-// truncateLateOnDocumentTokens packs one annotated document into limit tokens.
+// truncateLateOnDocumentTokens packs one annotated document into limit tokens
+// (a positive limit). spans holds one span for each ID, as encode gives them.
 // The byte offsets refer to the prefixed serialized text. It keeps the model
 // prefix and separator. It uses at most one quarter of the content slots for
 // metadata, and centers the rest of the evidence on the match. When no token
@@ -948,7 +940,7 @@ func truncateLateOnDocumentTokens(
 	if len(ids) <= limit {
 		return ids
 	}
-	if limit <= 0 || len(spans) != len(ids) || matchEnd <= matchAt {
+	if matchEnd <= matchAt {
 		return truncateLateOnHead(ids, limit)
 	}
 
@@ -1049,13 +1041,9 @@ func lateOnQueryWindows(tokenizer *lateOnTokenizer, modelQuery string) ([][]int,
 	return windows, nil
 }
 
+// truncateLateOnHead keeps the first limit-1 IDs and a separator. The caller
+// gives a positive limit below len(encoded).
 func truncateLateOnHead(encoded []int, limit int) []int {
-	if len(encoded) <= limit {
-		return encoded
-	}
-	if limit <= 0 {
-		return nil
-	}
 	encoded = append([]int(nil), encoded[:limit]...)
 	encoded[len(encoded)-1] = lateOnSEPTokenID
 	return encoded
@@ -1077,29 +1065,22 @@ func decodeLateOnAsset(compressed []byte) ([]byte, error) {
 	return decoded, nil
 }
 
-// ensureLateOnRuntime installs the ONNX Runtime library of bundle in
-// reranker/<version>/<sha256> of the cache, unless a file with its digest is
-// there. It returns the path. It marks the directory as used for GC
-// (touchRuntimeUse).
+// ensureLateOnRuntime installs the ONNX Runtime library of bundle in its cache
+// folder (lateOnRuntimeDir), unless a file with its digest is there. It
+// returns the path. It marks the directory as used for GC (touchRuntimeUse).
 func ensureLateOnRuntime(bundle lateOnRuntimeBundle) (string, error) {
 	cacheRoot, err := seekUserCacheRoot()
 	if err != nil {
 		return "", err
 	}
-	directory := filepath.Join(
-		cacheRoot,
-		"reranker",
-		bundle.version,
-		bundle.sha256,
-	)
+	directory := lateOnRuntimeDir(cacheRoot, bundle)
 	defer touchRuntimeUse(directory)
 	return installPrivateAsset(
 		directory,
-		bundle.fileName,
+		bundle.FileName,
 		".onnxruntime-*.tmp",
-		func(path string) bool {
-			return validFileDigest(path, bundle.bytes, bundle.sha256)
-		},
+		bundle.Bytes,
+		bundle.SHA256,
 		func(writer io.Writer) error {
 			decoder, err := zstd.NewReader(
 				bytes.NewReader(bundle.compressed),
@@ -1112,17 +1093,24 @@ func ensureLateOnRuntime(bundle lateOnRuntimeBundle) (string, error) {
 			hash := sha256.New()
 			written, err := io.Copy(
 				io.MultiWriter(writer, hash),
-				io.LimitReader(decoder, bundle.bytes+1),
+				io.LimitReader(decoder, bundle.Bytes+1),
 			)
 			if err != nil {
 				return err
 			}
-			if written != bundle.bytes || hex.EncodeToString(hash.Sum(nil)) != bundle.sha256 {
+			if written != bundle.Bytes || hex.EncodeToString(hash.Sum(nil)) != bundle.SHA256 {
 				return fmt.Errorf("extracted runtime digest mismatch")
 			}
 			return nil
 		},
 	)
+}
+
+// lateOnRuntimeDir is the cache folder of the ONNX Runtime library of bundle:
+// reranker/<version>/<sha256>. The collector keeps the folder of this binary's
+// bundle and removes the others (retiredRuntimes).
+func lateOnRuntimeDir(cacheRoot string, bundle lateOnRuntimeBundle) string {
+	return filepath.Join(cacheRoot, rerankerDir, bundle.Version, bundle.SHA256)
 }
 
 func validFileDigest(path string, wantBytes int64, wantSHA256 string) bool {

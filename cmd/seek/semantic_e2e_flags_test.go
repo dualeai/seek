@@ -132,7 +132,13 @@ func e2eFlagContextShapes(tag string) map[string]e2eFlagContextFile {
 // vector scan, not the test, picks the unit that each file prints. A search
 // with -C 0 gives that hit line: it must start a unit of the work-tree copy.
 // Each flag then prints the hit line and up to N lines on each side that the
-// flag selects. The start and the end of the file cut them.
+// flag selects. The start and the end of the file cut them. The -C 6 search
+// runs on a cold and on a warm cache, so a defect that changes only a cold
+// search with context lines fails. The value is above 3, because a vector hit
+// always reads at least 3 lines on each side (searchContextLines), and a lost
+// line below that does not print. The -C 0 search and the flags run on that
+// warm cache: they act only on the lines that the search reads from the shard
+// copy of each hit, and a cold search reads the same copy.
 func TestE2EFlagContextLinesOfAVectorHit(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -174,14 +180,16 @@ func TestE2EFlagContextLinesOfAVectorHit(t *testing.T) {
 		}
 	}
 	t.Chdir(t.TempDir())
-	search := func(args []string) (string, error) {
-		return e2eFlagColdWarm(t, func() (string, error) {
-			return seekWith(t, modelFactory(&hybridTestScorer{mode: payloadAccept}), args...)
-		})
+	search := func(t *testing.T, args []string) (string, error) {
+		return seekWith(t, modelFactory(&hybridTestScorer{mode: payloadAccept}), args...)
 	}
 
+	coldWarm := []string{"-C", "6", e2eFlagQuery, f.path("tree")}
+	if output, err := e2eFlagColdWarm(t, func() (string, error) { return search(t, coldWarm) }); err != nil {
+		t.Fatalf("%v: %v\n%s", coldWarm, err, output)
+	}
 	probe := []string{"-C", "0", e2eFlagQuery, f.path("tree")}
-	output, err := search(probe)
+	output, err := search(t, probe)
 	if err != nil {
 		t.Fatalf("%v: %v\n%s", probe, err, output)
 	}
@@ -217,7 +225,7 @@ func TestE2EFlagContextLinesOfAVectorHit(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			args := append(slices.Clone(test.flags), e2eFlagQuery, f.path("tree"))
-			output, err := search(args)
+			output, err := search(t, args)
 			if err != nil {
 				t.Fatalf("%v: %v\n%s", args, err, output)
 			}
@@ -270,7 +278,11 @@ func TestE2EFlagNoBeforeContextFlag(t *testing.T) {
 // that hold both description words. The test model accepts every file. A
 // vector hit is one match. With -C 0 it prints one line. Each -m of 1 or more
 // prints its block as -m 0 does with the same context. -m cuts only the text
-// file to its first matches.
+// file to its first matches. The -m 1 -C 1 search runs on a cold and on a
+// warm cache, so a defect that changes only a cold search with -m or -C fails.
+// The rows run on that warm cache: -m and -C act only on the lines that the
+// search reads from the shard copy of each hit, and a cold search reads the
+// same copy.
 func TestE2EFlagMaxMatchesKeepsEachVectorHit(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -295,10 +307,21 @@ func TestE2EFlagMaxMatchesKeepsEachVectorHit(t *testing.T) {
 	gitRunIn(t, repo, "commit", "-q", "-m", "max matches fixture")
 	writeFixtureFile(t, vectorPaths[2], e2eFlagContextShapes("untracked.go")["mid"].content(false))
 	t.Chdir(t.TempDir())
+	search := func(t *testing.T, args []string) (string, error) {
+		return seekWith(t, modelFactory(&hybridTestScorer{mode: payloadAccept}), args...)
+	}
+	coldWarm := []string{"-m", "1", "-C", "1", e2eFlagQuery, f.path("tree")}
+	if output, err := e2eFlagColdWarm(t, func() (string, error) { return search(t, coldWarm) }); err != nil {
+		t.Fatalf("%v: %v\n%s", coldWarm, err, output)
+	}
+	all, err := search(t, []string{"-m", "0", e2eFlagQuery, f.path("tree")})
+	if err != nil {
+		t.Fatalf("-m 0: %v\n%s", err, all)
+	}
 
 	// unlimited maps each -C value ("" for the default) to the vector blocks
-	// of the first row with that value, which has -m 0.
-	unlimited := make(map[string]map[string]string)
+	// of the first search with that value, which has -m 0.
+	unlimited := map[string]map[string]string{"": bodyTexts(all)}
 	for _, test := range []struct {
 		flags []string
 		// context is the -C value of flags, or "" for the default.
@@ -318,9 +341,7 @@ func TestE2EFlagMaxMatchesKeepsEachVectorHit(t *testing.T) {
 	} {
 		t.Run(strings.Join(append([]string{"flags"}, test.flags...), " "), func(t *testing.T) {
 			args := append(slices.Clone(test.flags), e2eFlagQuery, f.path("tree"))
-			output, err := e2eFlagColdWarm(t, func() (string, error) {
-				return seekWith(t, modelFactory(&hybridTestScorer{mode: payloadAccept}), args...)
-			})
+			output, err := search(t, args)
 			if err != nil {
 				t.Fatalf("%v: %v\n%s", args, err, output)
 			}
@@ -531,9 +552,16 @@ func TestE2EFlagColorOfAVectorHit(t *testing.T) {
 	}
 
 	unsetenv("NO_COLOR")
-	unsetenv("CLICOLOR_FORCE")
 	t.Setenv("TERM", "xterm-256color")
-	plain, err := e2eFlagColdWarm(t, search)
+	// The color search runs on a cold and on a warm cache, so a defect that
+	// changes only a cold search with color fails.
+	t.Setenv("CLICOLOR_FORCE", "1")
+	color, err := e2eFlagColdWarm(t, search)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsetenv("CLICOLOR_FORCE")
+	plain, err := search()
 	if err != nil || strings.Contains(plain, "\x1b") {
 		t.Fatalf("err=%v, want plain output through a pipe:\n%q", err, plain)
 	}
@@ -542,11 +570,6 @@ func TestE2EFlagColorOfAVectorHit(t *testing.T) {
 		t.Fatalf("plain output prints %v, want %v:\n%s", got, want, plain)
 	}
 
-	t.Setenv("CLICOLOR_FORCE", "1")
-	color, err := e2eFlagColdWarm(t, search)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if got := e2eFlagANSI.ReplaceAllString(color, ""); got != plain {
 		t.Fatalf("the color output without its codes differs from the plain output:\n%q\nplain:\n%q", got, plain)
 	}
@@ -567,6 +590,7 @@ func TestE2EFlagColorOfAVectorHit(t *testing.T) {
 		t.Errorf("a vector hit has a match color:\n%q", color)
 	}
 
+	t.Setenv("CLICOLOR_FORCE", "1")
 	t.Setenv("NO_COLOR", "1")
 	forced, err := search()
 	if err != nil || forced != plain {

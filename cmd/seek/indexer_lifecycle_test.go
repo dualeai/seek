@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"testing/synctest"
 
+	"github.com/sourcegraph/zoekt"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -111,6 +114,36 @@ func TestIndexDocuments_BuilderInitFail_ReleasesWeight(t *testing.T) {
 	_, err := indexDocuments(t.Context(), bogusFile, "test_repo", t.TempDir(), ch, 1)
 	if err == nil {
 		t.Fatal("expected NewBuilder failure with regular-file indexDir; precondition lost")
+	}
+}
+
+// TestIndexDocuments_AddErrorOutlivesProducerCancel uses a ctags that fails
+// each parse. A shardMax of 60 bytes keeps each document below one shard, so
+// the Add of the second document flushes the first shard and returns the
+// ctags failure. The consumer then cancels its producer. The Git full build passes
+// a producer cancel that also ends the consumer's context, as this test does.
+// The third document must not replace the add error with that cancellation.
+// The documents carry their read weight, and the deferred check finds it
+// released.
+func TestIndexDocuments_AddErrorOutlivesProducerCancel(t *testing.T) {
+	done := withReadSemLock(t)
+	defer done()
+	// The ctags passes Zoekt's feature check and fails each parse.
+	ctags := filepath.Join(t.TempDir(), "parse-failing-ctags")
+	writeExecutable(t, ctags, "#!/bin/sh\nif [ \"$1\" = --help ]; then echo +interactive; exit 0; fi\nexit 7\n")
+	forceCtagsCommand(t, ctags)
+	swapForTest(t, &shardMax, 60)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ch := make(chan fileContent, 3)
+	for _, name := range []string{"first", "second", "third"} {
+		ch <- makeFileContent(t, name+".go", []byte("package "+name+"\nfunc F() {}\n"))
+	}
+	close(ch)
+
+	_, err := indexDocumentsWithRepository(ctx, t.TempDir(), zoekt.Repository{Name: "test_repo"}, ch, 1, cancel)
+	if err == nil || errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "add document second.go") {
+		t.Fatalf("err=%v, want the add error of the failing ctags", err)
 	}
 }
 

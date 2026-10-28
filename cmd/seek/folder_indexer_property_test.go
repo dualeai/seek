@@ -96,13 +96,9 @@ func FuzzReadOneFolderFileStreaming_Sizes(f *testing.F) {
 		dir := t.TempDir()
 		p := filepath.Join(dir, "fuzz.bin")
 		writeSparseFile(t, p, size)
-		info, err := os.Lstat(p)
-		if err != nil {
-			t.Fatal(err)
-		}
-		// The walk makes candidates with newFolderCandidate, and the build
+		// The walk makes candidates with folderCandidateOf, and the build
 		// gives the reader a failure function.
-		c := newFolderCandidate("fuzz.bin", p, info)
+		c := testFolderCandidate(t, "fuzz.bin", p)
 		out := make(chan fileContent, 1)
 		ctx, fail := context.WithCancelCause(t.Context())
 		defer fail(nil)
@@ -163,10 +159,7 @@ func TestEnsureFolderCorpusFresh_SingleFileAroundReadWeightCap(t *testing.T) {
 			writeSparseFile(t, filepath.Join(root, "tiny.bin"), 16)
 			before := availableWeight(readSemaphore)
 
-			info, err := os.Lstat(huge)
-			if err != nil {
-				t.Fatal(err)
-			}
+			candidate := testFolderCandidate(t, "huge.bin", huge)
 			synctest.Test(t, func(t *testing.T) {
 				defer swapReadSemaphoreForTest(maxReadWeightBytes)()
 				// Busy readers hold the whole budget, so the reader waits for
@@ -177,7 +170,7 @@ func TestEnsureFolderCorpusFresh_SingleFileAroundReadWeightCap(t *testing.T) {
 				out := make(chan fileContent, 1)
 				ctx, fail := context.WithCancelCause(t.Context())
 				defer fail(nil)
-				go readOneFolderFileStreaming(ctx, newFolderCandidate("huge.bin", huge, info), out, fail)
+				go readOneFolderFileStreaming(ctx, candidate, out, fail)
 				synctest.Wait()
 				file, err := os.OpenFile(huge, os.O_WRONLY, 0)
 				if err != nil {

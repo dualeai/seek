@@ -70,7 +70,7 @@ func TestReadUncommittedCandidates_BoundedDrainOnOversize(t *testing.T) {
 	candidates := make([]uncommittedCandidate, fileCount)
 	for i := range fileCount {
 		name := testFileName("dirty", i)
-		candidates[i] = uncommittedCandidate{name: name, size: 1}
+		candidates[i] = uncommittedCandidate{uncommittedManifestEntry: uncommittedManifestEntry{Name: name, Size: 1}}
 		path := filepath.Join(repoDir, name)
 		if err := os.WriteFile(path, payload, 0o644); err != nil {
 			t.Fatal(err)
@@ -79,7 +79,7 @@ func TestReadUncommittedCandidates_BoundedDrainOnOversize(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, candidates[i].ino, candidates[i].mtime = fileInfoIdentity(info)
+		_, candidates[i].Ino, candidates[i].Mtime = fileInfoIdentity(info)
 	}
 
 	docs, _, err := readUncommittedCandidates(t.Context(), repoDir, candidates)

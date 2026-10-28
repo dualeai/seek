@@ -33,12 +33,9 @@ type displayOperands struct {
 	typedAsPath map[string]bool
 }
 
-// newDisplayOperands resolves the path operands, or "." when there are none.
-// An operand with no absolute path is skipped.
+// newDisplayOperands resolves the path operands. The caller gives "." when
+// the user gave no path. An operand with no absolute path is skipped.
 func newDisplayOperands(operands []string) displayOperands {
-	if len(operands) == 0 {
-		operands = []string{"."}
-	}
 	resolved := displayOperands{
 		byRoot:      make(map[string]displayOperand, len(operands)),
 		typedAsPath: make(map[string]bool, len(operands)),
@@ -196,9 +193,6 @@ func fileNameAtom(q query.Q) bool {
 func hasFileNameAtom(halves map[query.Q]struct{}, queries ...query.Q) bool {
 	found := false
 	for _, q := range queries {
-		if q == nil {
-			continue
-		}
 		query.VisitAtoms(q, func(atom query.Q) {
 			if _, half := halves[atom]; !half {
 				found = found || fileNameAtom(atom)
@@ -244,19 +238,11 @@ func nodeHeaderQuery(ctx context.Context, read *nodeRead, qp queryPlan, operands
 		headers[index] = filepath.ToSlash(header)
 	}
 	sets := map[query.Q]query.Q{}
-	var compileErr error
-	out := rewriteFileNameAtoms(qp, func(atom query.Q) query.Q {
-		if compileErr != nil {
-			return atom
-		}
+	return rewriteFileNameAtoms(qp, func(atom query.Q) query.Q {
 		if set, ok := sets[atom]; ok {
 			return set
 		}
-		var filter semanticPathFilter
-		filter, compileErr = newSemanticPathFilter(atom)
-		if compileErr != nil {
-			return atom
-		}
+		filter := newSemanticPathFilter(atom)
 		set := &query.FileNameSet{Set: map[string]struct{}{}}
 		for index, header := range headers {
 			if filter.matches(header) {
@@ -270,20 +256,13 @@ func nodeHeaderQuery(ctx context.Context, read *nodeRead, qp queryPlan, operands
 		scored := query.NewAnd(set, query.NewOr(atom, &query.Not{Child: atom}))
 		sets[atom] = scored
 		return scored
-	})
-	if compileErr != nil {
-		return queryPlan{}, compileErr
-	}
-	return out, nil
+	}), nil
 }
 
 // rewriteFileNameAtoms replaces each explicit file: atom of the strict, relaxed
 // and filter queries of qp; a bare word's file-name half stays.
 func rewriteFileNameAtoms(qp queryPlan, replace func(query.Q) query.Q) queryPlan {
 	rewrite := func(q query.Q) query.Q {
-		if q == nil {
-			return nil
-		}
 		return query.Map(q, func(atom query.Q) query.Q {
 			if _, half := qp.halves[atom]; half || !fileNameAtom(atom) {
 				return atom

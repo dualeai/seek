@@ -115,10 +115,7 @@ func TestStreamFolderFiles_OutputChannelUnbuffered(t *testing.T) {
 	if err := os.WriteFile(path, []byte("folder stream marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	candidate := testFolderCandidate(t, "note.txt", path)
 
 	// The test is the consumer: it gives back the weight of each document,
 	// and done checks that no weight leaks.
@@ -129,7 +126,7 @@ func TestStreamFolderFiles_OutputChannelUnbuffered(t *testing.T) {
 	defer fail(nil)
 	ch := streamFolderFilesWithMarkers(
 		ctx,
-		[]folderCandidate{newFolderCandidate("note.txt", path, info)},
+		[]folderCandidate{candidate},
 		4,
 		fail,
 		make([]int64, 1),
@@ -233,7 +230,12 @@ func TestFolderCorpusFingerprintMatchesFullState(t *testing.T) {
 	}
 }
 
-func TestFstatatRegularFileModeMatchesFileInfo(t *testing.T) {
+// TestFolderCandidateOfMatchesFileInfo checks the candidate of a regular
+// file. The walk (fstatatRegularFile) and a later check of the file
+// (lstatFolderCandidate) give the same candidate, with the mode that os.Lstat
+// reports, setuid too. A symlink gives no candidate, and a missing file gives
+// the lstat error.
+func TestFolderCandidateOfMatchesFileInfo(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "mode.go")
 	if err := os.WriteFile(path, []byte("package keep\n"), 0o755); err != nil {
@@ -248,7 +250,7 @@ func TestFstatatRegularFileModeMatchesFileInfo(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = dir.Close() }()
-	stat, ok := fstatatRegularFile(int(dir.Fd()), "mode.go")
+	walked, ok := fstatatRegularFile(int(dir.Fd()), "mode.go")
 	if !ok {
 		t.Fatal("expected regular file stat")
 	}
@@ -256,9 +258,34 @@ func TestFstatatRegularFileModeMatchesFileInfo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stat.mode != info.Mode() {
-		t.Fatalf("mode mismatch: fstatat=%v lstat=%v", stat.mode, info.Mode())
+	if walked.mode != info.Mode() || walked.size != info.Size() {
+		t.Fatalf("fstatat mode=%v size=%d, want the lstat mode=%v size=%d", walked.mode, walked.size, info.Mode(), info.Size())
 	}
+	walked.name, walked.path = "mode.go", path
+	if checked, regular, err := lstatFolderCandidate("mode.go", path); err != nil || !regular || checked != walked {
+		t.Fatalf("lstat candidate %+v (regular=%t, err=%v), want the walk candidate %+v", checked, regular, err, walked)
+	}
+	link := filepath.Join(root, "link.go")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, regular, err := lstatFolderCandidate("link.go", link); err != nil || regular {
+		t.Fatalf("symlink: regular=%t err=%v, want no candidate and no error", regular, err)
+	}
+	if _, _, err := lstatFolderCandidate("gone.go", filepath.Join(root, "gone.go")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing file: err=%v, want ErrNotExist", err)
+	}
+}
+
+// testFolderCandidate returns the candidate of the regular file at path, named
+// name, as the walk makes it.
+func testFolderCandidate(t *testing.T, name, path string) folderCandidate {
+	t.Helper()
+	candidate, regular, err := lstatFolderCandidate(name, path)
+	if err != nil || !regular {
+		t.Fatalf("candidate of %s: regular=%t err=%v", path, regular, err)
+	}
+	return candidate
 }
 
 // folderSearchNames runs a lexical search of root through the root command.

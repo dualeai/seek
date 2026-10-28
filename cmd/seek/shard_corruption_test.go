@@ -100,7 +100,7 @@ func shardScanOutcome(path string, content query.Q) string {
 	opts := searchOpts
 	listing := &query.Type{Type: query.TypeFileName, Child: &query.Const{Value: true}}
 	_, listingErr := zoektSearch(ctx, searcher, listing, &opts)
-	_, listErr := zoektList(ctx, searcher, &query.Const{Value: true}, nil)
+	_, listErr := zoektList(ctx, searcher)
 	_, searchErr := zoektSearch(ctx, searcher, content, &opts)
 	return "listing=" + shardScanClass(listingErr) + " list=" + shardScanClass(listErr) + " search=" + shardScanClass(searchErr)
 }

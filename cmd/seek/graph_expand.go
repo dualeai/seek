@@ -119,7 +119,7 @@ func (x *graphExpansion) nodeError(root string, err error) error {
 // operands are the paths of the node that the search covers; the root path
 // covers the whole node. A node reached through another spelling of its root
 // (letter case, a symlink) keeps its first root: the operands move onto it.
-func (x *graphExpansion) addGitNode(paths gitPaths, operands []string) {
+func (x *graphExpansion) addGitNode(paths gitPaths, operands []gitScopeOperand) {
 	root := canonicalCorpusPath(paths.RepoDir)
 	key, err := filesystemIdentity(root)
 	if err != nil {
@@ -137,10 +137,10 @@ func (x *graphExpansion) addGitNode(paths gitPaths, operands []string) {
 	nodeRoot := canonicalCorpusPath(gitRoot.paths.RepoDir)
 	widened := false
 	for _, operand := range operands {
-		if rel, ok := relWithin(root, operand); ok {
-			operand = filepath.Join(nodeRoot, rel)
+		if rel, ok := relWithin(root, operand.path); ok {
+			operand.path = filepath.Join(nodeRoot, rel)
 		}
-		if !slices.ContainsFunc(gitRoot.operands, func(covering string) bool { return pathWithin(covering, operand) }) {
+		if !slices.ContainsFunc(gitRoot.operands, func(covering gitScopeOperand) bool { return pathWithin(covering.path, operand.path) }) {
 			gitRoot.operands = append(gitRoot.operands, operand)
 			widened = true
 		}
@@ -206,7 +206,7 @@ func (x *graphExpansion) addGitChild(parentRoot, dir string) {
 		if !ok || childRoot == parentRoot || !pathWithin(parentRoot, childRoot) {
 			return nil
 		}
-		x.addGitNode(paths, []string{childRoot})
+		x.addGitNode(paths, []gitScopeOperand{{path: childRoot, dir: true}})
 		return nil
 	})
 }
@@ -244,7 +244,7 @@ func (x *graphExpansion) addFolderNode(root externalRoot) {
 		x.folders[plan.id].folder = capture
 		x.mu.Unlock()
 		for _, paths := range gitRoots {
-			x.addGitNode(paths, []string{canonicalCorpusPath(paths.RepoDir)})
+			x.addGitNode(paths, []gitScopeOperand{{path: canonicalCorpusPath(paths.RepoDir), dir: true}})
 		}
 		return nil
 	})
@@ -341,7 +341,7 @@ func (node *externalGitRoot) childrenInScope() []string {
 		if _, done := node.emitted[child]; done {
 			continue
 		}
-		if slices.ContainsFunc(node.operands, func(operand string) bool { return pathWithin(operand, child) }) {
+		if slices.ContainsFunc(node.operands, func(operand gitScopeOperand) bool { return pathWithin(operand.path, child) }) {
 			if node.emitted == nil {
 				node.emitted = make(map[string]struct{})
 			}
@@ -355,14 +355,26 @@ func (node *externalGitRoot) childrenInScope() []string {
 // captureGitNode runs one git status and one git ls-files for a Git node. It
 // returns the status and the directories of the nested repositories: the
 // "? dir/" entries and changed gitlinks of git status, and the gitlinks of git
-// ls-files.
+// ls-files. git ls-files only reads the index, so it runs while git status
+// runs. A refresh of the index by git status changes no entry that git
+// ls-files lists.
 func captureGitNode(ctx context.Context, paths gitPaths) (repoState, []string, error) {
+	cmd := newGitCommand(ctx, paths.RepoDir, "ls-files", "-z", "--stage")
+	type listing struct {
+		out []byte
+		err error
+	}
+	listed := make(chan listing, 1)
+	go func() {
+		out, err := gitOutput(ctx, cmd, "git ls-files")
+		listed <- listing{out, err}
+	}()
 	state, err := gitRepoStateIn(ctx, paths.RepoDir)
+	list := <-listed
 	if err != nil {
 		return repoState{}, nil, err
 	}
-	cmd := newGitCommand(ctx, paths.RepoDir, "ls-files", "-z", "--stage")
-	out, err := gitOutput(ctx, cmd, "git ls-files")
+	out, err := list.out, list.err
 	if err != nil {
 		return repoState{}, nil, err
 	}

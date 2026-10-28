@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -105,7 +106,8 @@ func folderReadSource(stream func(context.Context, context.CancelCauseFunc) <-ch
 }
 
 // runSemanticBuild waits for the command's model and runs build with it. A
-// command with no model gets errRerankUnavailable (semanticModelFuture.model).
+// build runs it only when the model stages run (searchExecution.buildsVectors
+// or buildsOverlay), so model is not nil.
 func runSemanticBuild(
 	ctx context.Context,
 	model *semanticModelFuture,
@@ -326,7 +328,7 @@ func buildSemanticGitGeneration(
 	if err := requireNativeGitVersion(ctx); err != nil {
 		return err
 	}
-	reuse := loadSemanticReuse(indexDir, dir, lineage, "", nil)
+	reuse := loadSemanticReuse(indexDir, dir, lineage, "", nil, "")
 	defer reuse.Close()
 	return buildSemanticGeneration(
 		ctx,
@@ -363,7 +365,7 @@ func buildSemanticFolderGeneration(
 	for index, candidate := range selected {
 		names[index] = candidate.name
 	}
-	reuse := loadSemanticReuse(indexDir, dir, lineage, base, names)
+	reuse := loadSemanticReuse(indexDir, dir, lineage, base, names, "")
 	defer reuse.Close()
 	return buildSemanticGeneration(
 		ctx,
@@ -395,19 +397,9 @@ func buildSemanticGeneration(
 		return err
 	}
 	workerCount := resources.cpuLimit()
-	parsers := make([]ctags.Parser, workerCount)
-	for index := range parsers {
-		// TODO(https://github.com/sourcegraph/go-ctags/issues/27): go-ctags
-		// drops a tag whose reply line has 4,096 bytes or more, with no
-		// error. Such a symbol then gets no unit of its own.
-		parser, err := ctags.New(ctags.Options{Bin: os.Getenv("CTAGS_COMMAND")})
-		if err != nil {
-			for _, opened := range parsers[:index] {
-				opened.Close()
-			}
-			return fmt.Errorf("start semantic ctags worker: %w", err)
-		}
-		parsers[index] = parser
+	parsers, err := startSemanticCtagsParsers(workerCount)
+	if err != nil {
+		return err
 	}
 	defer func() {
 		for _, parser := range parsers {
@@ -435,9 +427,7 @@ func buildSemanticGeneration(
 	var extractWait sync.WaitGroup
 	for worker, parser := range parsers {
 		extractWait.Go(func() {
-			extractSemanticDocuments(
-				buildCtx, parser, tokenizers[worker], reuse, resources, jobs, extracted, cancel,
-			)
+			extractSemanticDocuments(buildCtx, parser, tokenizers[worker], reuse, resources, jobs, extracted)
 		})
 	}
 	go func() {
@@ -643,24 +633,17 @@ func buildSemanticGeneration(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if streamErr != nil && errors.Is(streamErr, context.Canceled) &&
-		output.err != nil && !errors.Is(output.err, context.Canceled) {
-		// A collector failure cancels the internal source. Keep that first
-		// fatal error instead of replacing it with the resulting source
-		// cancellation.
-		return output.err
+	// A failed stage cancels the build, and the other stages can then return
+	// that cancellation: the Git source and an extractor do. So an error that
+	// is not a cancellation comes first, in this order.
+	stageErrs := []error{streamErr, extractionErr, output.err, usearchOutput.err}
+	for _, err := range stageErrs {
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return err
+		}
 	}
-	if streamErr != nil {
-		return streamErr
-	}
-	if extractionErr != nil {
-		return extractionErr
-	}
-	if usearchOutput.err != nil && (output.err == nil || errors.Is(output.err, context.Canceled)) {
-		return usearchOutput.err
-	}
-	if output.err != nil {
-		return output.err
+	if err := cmp.Or(stageErrs...); err != nil {
+		return err
 	}
 	if output.rows != uint64(len(rows)) {
 		return fmt.Errorf(
@@ -703,6 +686,37 @@ func buildSemanticGeneration(
 		)
 	}
 	return err
+}
+
+// startSemanticCtagsParsers starts one ctags parser per extraction worker, all
+// at the same time. Each start waits for the first reply of its process: 18
+// starts in series took 170 ms, and at the same time 37 ms. A failed start
+// closes the parsers that started and returns the error of the first worker.
+func startSemanticCtagsParsers(count int) ([]ctags.Parser, error) {
+	parsers := make([]ctags.Parser, count)
+	errs := make([]error, count)
+	var wait sync.WaitGroup
+	for index := range parsers {
+		wait.Go(func() {
+			// TODO(https://github.com/sourcegraph/go-ctags/issues/27): go-ctags
+			// drops a tag whose reply line has 4,096 bytes or more, with no
+			// error. Such a symbol then gets no unit of its own.
+			parsers[index], errs[index] = ctags.New(ctags.Options{Bin: os.Getenv(envCtagsCommand)})
+		})
+	}
+	wait.Wait()
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		for _, parser := range parsers {
+			if parser != nil {
+				parser.Close()
+			}
+		}
+		return nil, fmt.Errorf("start semantic ctags worker: %w", err)
+	}
+	return parsers, nil
 }
 
 // takeSemanticWindowTokenizers takes one tokenizer per extraction worker for
@@ -755,6 +769,10 @@ func dispatchSemanticDocuments(
 	done <- sequence
 }
 
+// extractSemanticDocuments parses and windows the files of jobs and sends
+// each to results. It does not cancel ctx on an error: the build loop gets
+// the error first and cancels the build. A cancel here would race the send,
+// and the build would lose its first error.
 func extractSemanticDocuments(
 	ctx context.Context,
 	parser ctags.Parser,
@@ -763,7 +781,6 @@ func extractSemanticDocuments(
 	resources searchResources,
 	jobs <-chan semanticSourceDocument,
 	results chan<- semanticExtractedFile,
-	cancel context.CancelFunc,
 ) {
 	for job := range jobs {
 		document := job.content
@@ -787,9 +804,7 @@ func extractSemanticDocuments(
 				if len(units) > 0 {
 					units, packErr = windowSemanticUnits(ctx, tokenizer, units, reuse.base)
 				}
-				if packErr != nil {
-					cancel()
-				} else {
+				if packErr == nil {
 					reuse.markReused(units)
 				}
 			}
@@ -975,7 +990,7 @@ func collectSemanticBatches(
 			cancel()
 		}
 	}
-	writer, err := newSemanticRowWriter(dir)
+	writer, err := newSemanticRowWriter(dir, coarseReady)
 	fail(err)
 	for encoded != nil || copied != nil {
 		select {
@@ -997,34 +1012,36 @@ func collectSemanticBatches(
 				fail(fmt.Errorf("semantic model batch has mismatched rows"))
 				continue
 			}
-			fail(writer.writeEmbedded(batch.units, batch.embeddings, coarseReady))
+			fail(writer.writeEmbedded(batch.units, batch.embeddings))
 		case rows, ok := <-copied:
 			if !ok {
 				copied = nil
 				continue
 			}
 			if output.err == nil {
-				fail(writer.writeCopied(rows, coarseReady))
+				fail(writer.writeCopied(rows))
 			}
 		}
 	}
 	if writer != nil {
 		var err error
-		output.rows, output.vectorsArtifact, output.coarseArtifact, err = writer.finish(output.err == nil, coarseReady)
+		output.rows, output.vectorsArtifact, output.coarseArtifact, err = writer.finish(output.err == nil)
 		fail(err)
 	}
 	done <- output
 }
 
 // semanticRowWriter places vectors at row offsets and tracks which rows and
-// 128-row coarse blocks are complete.
+// 128-row coarse blocks are complete. It sends each complete block to
+// coarseReady, the USearch stream; nil sends none.
 type semanticRowWriter struct {
-	fine   *os.File
-	coarse *os.File
-	seen   []bool
-	rows   uint64
-	blocks map[uint64]*semanticCoarseBlock
-	buffer []byte
+	fine        *os.File
+	coarse      *os.File
+	coarseReady chan<- semanticCoarseBatch
+	seen        []bool
+	rows        uint64
+	blocks      map[uint64]*semanticCoarseBlock
+	buffer      []byte
 }
 
 type semanticCoarseBlock struct {
@@ -1034,7 +1051,7 @@ type semanticCoarseBlock struct {
 
 // newSemanticRowWriter creates the fine and coarse vector files of a new
 // generation in dir. It fails when either file exists.
-func newSemanticRowWriter(dir string) (*semanticRowWriter, error) {
+func newSemanticRowWriter(dir string, coarseReady chan<- semanticCoarseBatch) (*semanticRowWriter, error) {
 	fine, err := os.OpenFile(filepath.Join(dir, semanticVectorsFile), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
@@ -1044,15 +1061,13 @@ func newSemanticRowWriter(dir string) (*semanticRowWriter, error) {
 		_ = fine.Close()
 		return nil, err
 	}
-	return &semanticRowWriter{fine: fine, coarse: coarse, blocks: make(map[uint64]*semanticCoarseBlock)}, nil
+	return &semanticRowWriter{
+		fine: fine, coarse: coarse, coarseReady: coarseReady, blocks: make(map[uint64]*semanticCoarseBlock),
+	}, nil
 }
 
 // writeEmbedded encodes and writes the vectors that the model gave units.
-func (w *semanticRowWriter) writeEmbedded(
-	units []semanticUnit,
-	embeddings []semanticUnitEmbedding,
-	coarseReady chan<- semanticCoarseBatch,
-) error {
+func (w *semanticRowWriter) writeEmbedded(units []semanticUnit, embeddings []semanticUnitEmbedding) error {
 	return w.writeRuns(len(units), func(i int) uint64 { return units[i].row }, func(i int, fine, coarse []byte) (semanticCoarseSNORM16Vectors, error) {
 		err := encodeSemanticFineVectors(fine, &embeddings[i].fine, units[i].row)
 		if err != nil {
@@ -1066,13 +1081,13 @@ func (w *semanticRowWriter) writeEmbedded(
 		}
 		putSemanticCoarse(coarse, &stored)
 		return stored, nil
-	}, coarseReady)
+	})
 }
 
 // writeCopied writes the stored vectors that each copied row refers to. The
 // reuse index made each reference only for a row in range with valid codes
 // (semanticRowVectorsValid, semanticVectorsValid).
-func (w *semanticRowWriter) writeCopied(rows []semanticCopiedRow, coarseReady chan<- semanticCoarseBatch) error {
+func (w *semanticRowWriter) writeCopied(rows []semanticCopiedRow) error {
 	return w.writeRuns(len(rows), func(i int) uint64 { return rows[i].row }, func(i int, fine, coarse []byte) (semanticCoarseSNORM16Vectors, error) {
 		// The mapped rows and store records are little-endian bytes
 		// (mapSemanticRows): copy them as they are.
@@ -1081,7 +1096,7 @@ func (w *semanticRowWriter) writeCopied(rows []semanticCopiedRow, coarseReady ch
 		stored := *sourceCoarse
 		copy(coarse, unsafe.Slice((*byte)(unsafe.Pointer(&stored)), semanticCoarseVectorBytesPerUnit))
 		return stored, nil
-	}, coarseReady)
+	})
 }
 
 // writeRuns encodes count rows and writes each run of consecutive rows with
@@ -1090,7 +1105,6 @@ func (w *semanticRowWriter) writeRuns(
 	count int,
 	rowOf func(int) uint64,
 	encode func(i int, fine, coarse []byte) (semanticCoarseSNORM16Vectors, error),
-	coarseReady chan<- semanticCoarseBatch,
 ) error {
 	const fineBytes, coarseBytes = semanticFineVectorBytesPerUnit, semanticCoarseVectorBytesPerUnit
 	if need := count * (fineBytes + coarseBytes); cap(w.buffer) < need {
@@ -1120,7 +1134,7 @@ func (w *semanticRowWriter) writeRuns(
 		first = last
 	}
 	for i := range count {
-		if err := w.complete(rowOf(i), &stored[i], coarseReady); err != nil {
+		if err := w.complete(rowOf(i), &stored[i]); err != nil {
 			return err
 		}
 	}
@@ -1147,7 +1161,7 @@ func putSemanticCoarse(dst []byte, stored *semanticCoarseSNORM16Vectors) {
 
 // complete records one written row and sends its 128-row block to the
 // USearch stream when the block is full.
-func (w *semanticRowWriter) complete(row uint64, stored *semanticCoarseSNORM16Vectors, coarseReady chan<- semanticCoarseBatch) error {
+func (w *semanticRowWriter) complete(row uint64, stored *semanticCoarseSNORM16Vectors) error {
 	for uint64(len(w.seen)) <= row {
 		w.seen = append(w.seen, false)
 	}
@@ -1168,8 +1182,8 @@ func (w *semanticRowWriter) complete(row uint64, stored *semanticCoarseSNORM16Ve
 	block.count++
 	if block.count == semanticModelBatchRows {
 		delete(w.blocks, sequence)
-		if coarseReady != nil {
-			coarseReady <- semanticCoarseBatch{sequence: int(sequence), coarse: block.coarse[:]}
+		if w.coarseReady != nil {
+			w.coarseReady <- semanticCoarseBatch{sequence: int(sequence), coarse: block.coarse[:]}
 		}
 	}
 	return nil
@@ -1177,7 +1191,7 @@ func (w *semanticRowWriter) complete(row uint64, stored *semanticCoarseSNORM16Ve
 
 // finish checks that every row from 0 was written, sends the last short
 // block, sizes both files, and closes them.
-func (w *semanticRowWriter) finish(ok bool, coarseReady chan<- semanticCoarseBatch) (uint64, semanticSizedArtifact, semanticSizedArtifact, error) {
+func (w *semanticRowWriter) finish(ok bool) (uint64, semanticSizedArtifact, semanticSizedArtifact, error) {
 	var err error
 	if ok {
 		if uint64(len(w.seen)) != w.rows {
@@ -1186,8 +1200,8 @@ func (w *semanticRowWriter) finish(ok bool, coarseReady chan<- semanticCoarseBat
 		// When every row from 0 was written once, every full block was sent.
 		// Only the last block can remain, and it is short.
 		for sequence, block := range w.blocks {
-			if err == nil && coarseReady != nil {
-				coarseReady <- semanticCoarseBatch{sequence: int(sequence), coarse: block.coarse[:block.count]}
+			if err == nil && w.coarseReady != nil {
+				w.coarseReady <- semanticCoarseBatch{sequence: int(sequence), coarse: block.coarse[:block.count]}
 			}
 		}
 	}
@@ -1229,11 +1243,7 @@ func buildSemanticOverlayGeneration(
 	// base is the staged base generation of the same build, or "": the
 	// overlay reuses its windows, so a modified file embeds only its changed
 	// windows.
-	var extra []string
-	if base != "" {
-		extra = append(extra, base)
-	}
-	reuse := loadSemanticReuse(indexDir, dir, lineage, "", nil, extra...)
+	reuse := loadSemanticReuse(indexDir, dir, lineage, "", nil, base)
 	defer reuse.Close()
 	return buildSemanticGeneration(
 		ctx,

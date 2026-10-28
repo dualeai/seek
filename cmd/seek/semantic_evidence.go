@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"os"
 	"path/filepath"
 
 	"github.com/sourcegraph/zoekt"
@@ -179,9 +178,8 @@ func evidenceMismatch(plan node, name string, attempt int) evidenceMismatchKind 
 		if entry.Name != name {
 			continue
 		}
-		path := filepath.Join(plan.root, filepath.FromSlash(name))
-		info, err := os.Lstat(path)
-		if err != nil || !folderManifestFileMatchesCandidate(entry, newFolderCandidate(name, path, info)) {
+		candidate, regular, err := lstatFolderCandidate(name, filepath.Join(plan.root, filepath.FromSlash(name)))
+		if err != nil || !regular || !folderManifestFileMatchesCandidate(entry, candidate) {
 			return mismatchChangedAgain
 		}
 		return mismatchDamagedRows
@@ -192,14 +190,8 @@ func evidenceMismatch(plan node, name string, attempt int) evidenceMismatchKind 
 // folderFileChangedSince reports whether the file of a walk record differs on
 // disk from that record.
 func folderFileChangedSince(candidate folderCandidate) bool {
-	info, err := os.Lstat(candidate.path)
-	return err != nil || newFolderCandidate(candidate.name, candidate.path, info) != candidate
-}
-
-// nameOnlyContent reports whether content is a complete NOT-INDEXED marker:
-// the content that Zoekt stores for a file that it keeps by name only.
-func nameOnlyContent(content []byte) bool {
-	return bytes.HasPrefix(content, []byte(zoektNotIndexedMarker)) && bytes.IndexByte(content, '\n') < 0
+	current, regular, err := lstatFolderCandidate(candidate.name, candidate.path)
+	return err != nil || !regular || current != candidate
 }
 
 // checkedSemanticCandidate checks the shard bytes of a file against its row:

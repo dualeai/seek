@@ -3,7 +3,7 @@ package main
 // gitBuildInputs is what the Git build reads under its build lock, after the
 // swap repair, before it acts.
 type gitBuildInputs struct {
-	head            string // the captured commit; "no-head" with no commit
+	head            string // the captured commit; gitNoHead with no commit
 	preState        string // the capture's state hash
 	cachedState     string // the published .state
 	dirty           bool   // the capture has dirty files
@@ -45,7 +45,7 @@ func (p gitBuildPlan) snapshot() bool { return p.committed || p.semantic }
 // noHeadArtifacts reports a node with no commit that still has committed
 // shards: a branch that lost its commits.
 func (in gitBuildInputs) noHeadArtifacts() bool {
-	return in.head == "no-head" && in.committedMember
+	return in.head == gitNoHead && in.committedMember
 }
 
 // gitBuildCurrent reports a node with nothing to build: the index holds the
@@ -62,7 +62,7 @@ func decideGitBuild(in gitBuildInputs) gitBuildPlan {
 	plan := gitBuildPlan{
 		// The published shards hold another commit, the committed family no
 		// longer matches its manifest, or a missing blob arrived.
-		committed: in.head != "no-head" &&
+		committed: in.head != gitNoHead &&
 			(in.publishedHead != in.head || !in.committedIntact || in.arrival.lexical),
 		clearCommitted: in.noHeadArtifacts(),
 		semantic:       vectorGenerationNeeded(in.vectors, in.basePresent, in.arrival.semantic),

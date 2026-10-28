@@ -83,7 +83,7 @@ func seedFolderDelta(buildDir, repoName string, paths []string) bool {
 // not sufficient because the manifest can record more family members.
 func folderFamilyUsable(indexDir string) bool {
 	sc, err := scanFamilyOptional(indexDir)
-	return err == nil && sc.familyComplete(indexDir)
+	return err == nil && sc.familyComplete()
 }
 
 // ensureFolderCorpusFreshWithExecution makes the Zoekt family and, when
@@ -107,7 +107,7 @@ func ensureFolderCorpusFreshWithExecution(
 	if warmScanErr != nil {
 		return corpusSearchable, folderCorpusError(plan, warmScanErr)
 	}
-	hasShards := warmScan.familyComplete(plan.indexDir)
+	hasShards := warmScan.familyComplete()
 
 	var stateHash string
 	var selected []folderCandidate
@@ -216,7 +216,7 @@ func ensureFolderCorpusFreshWithExecution(
 		stateHash:    stateHash,
 		currentState: readStateFile(plan.cacheDir),
 		hasShard:     sc.hasShard(familyAll),
-		intact:       sc.matchesManifest(plan.indexDir),
+		intact:       sc.matchesManifest(),
 		vectors:      semanticRequired,
 	}
 	if in.vectors {
@@ -279,7 +279,6 @@ func ensureFolderCorpusFreshWithExecution(
 				ctx,
 				plan,
 				buildDir,
-				repoName,
 				selected,
 				execution.resources.cpuLimit(),
 				build.delta,
@@ -313,6 +312,11 @@ func ensureFolderCorpusFreshWithExecution(
 	runJoinedIndexBuilds(lexicalBuild, semanticBuild)
 	if lexicalErr != nil {
 		dropStateUnlessPublished()
+		// The build loop keeps an add error over a later cancel. A cancel
+		// while the producer drains still ends the search, not the index.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			lexicalErr = ctxErr
+		}
 		return corpusSearchable, folderCorpusError(plan, lexicalErr)
 	}
 	if semanticErr != nil {
@@ -353,7 +357,7 @@ func ensureFolderCorpusFreshWithExecution(
 	if build.lexical {
 		// Publish the shard family and state while the publish lock excludes
 		// readers. The joined descriptor is the last activation record.
-		if err := plan.publishGeneration(ctx, buildDir, familyAll, func() error {
+		if err := plan.publishGeneration(ctx, buildDir, func() error {
 			if err := writeStateFile(plan.cacheDir, stateHash); err != nil {
 				return err
 			}
@@ -442,16 +446,16 @@ func indexFolderDocuments(
 	ctx context.Context,
 	plan node,
 	dir string,
-	repoName string,
 	selected []folderCandidate,
 	parallelism int,
 	tryDelta bool,
 	cachedState string,
 ) (bool, int64, []int64, error) {
+	repoName := folderRepoName(plan)
 	if tryDelta {
 		shardCount := repositoryShardCount(dir, repoName)
 		if shardCount > 0 && shardCount <= maxFolderDeltaShards {
-			indexedAny, tombstoned, markers, err := indexFolderDocumentsDelta(ctx, plan, dir, repoName, selected, parallelism, cachedState)
+			indexedAny, tombstoned, markers, err := indexFolderDocumentsDelta(ctx, plan, dir, selected, parallelism, cachedState)
 			if err == nil {
 				return indexedAny, tombstoned, markers, nil
 			}
@@ -499,11 +503,11 @@ func indexFolderDocumentsDelta(
 	ctx context.Context,
 	plan node,
 	dir string,
-	repoName string,
 	selected []folderCandidate,
 	parallelism int,
 	cachedState string,
 ) (bool, int64, []int64, error) {
+	repoName := folderRepoName(plan)
 	var changedDocs []fileContent
 	var changedPaths []string
 	var tombstoned int64
@@ -651,7 +655,7 @@ func enumerateIndexedFolderChecksums(ctx context.Context, indexDir, repoName str
 	oldChecksums := make(map[string]uint64)
 	var shardBytes int64
 	for _, searcher := range searchers {
-		list, err := zoektList(ctx, searcher, &query.Const{Value: true}, nil)
+		list, err := zoektList(ctx, searcher)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -811,23 +815,10 @@ func writeFolderManifest(cacheDir, state string, selected []folderCandidate, dea
 			Marker:   max(markers[i], 0),
 		}
 	}
-	path := filepath.Join(cacheDir, folderManifestFileName)
-	tmp := path + ".tmp"
-	// The encoder writes the encoded manifest to the file in one write. The
-	// rename publishes only a complete file.
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = os.Remove(tmp) }()
-	if err := json.NewEncoder(f).Encode(manifest); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	// The encoder writes the encoded manifest to the file in one write.
+	return writeCacheFileFrom(cacheDir, folderManifestFileName, func(w io.Writer) error {
+		return json.NewEncoder(w).Encode(manifest)
+	})
 }
 
 // changedFolderDocumentsFromManifest compares selected files with the manifest
@@ -911,31 +902,12 @@ func folderManifestFileMatchesCandidate(file folderManifestEntry, candidate fold
 		file.Dataless == candidate.dataless
 }
 
-func newFolderCandidate(name, path string, info os.FileInfo) folderCandidate {
-	dev, ino, mtime := fileInfoIdentity(info)
-	candidate := folderCandidate{
-		name:  name,
-		path:  path,
-		mode:  info.Mode(),
-		size:  info.Size(),
-		mtime: mtime,
-		dev:   dev,
-		ino:   ino,
-	}
-	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		candidate.ctime = statCtimeNano(*st)
-		candidate.dataless = statDatalessFlags(statFlags(*st))
-	}
-	return candidate
-}
-
 // fileInfoIdentity returns the device, inode, and mtime in nanoseconds of
-// info. With no Stat_t, it returns zeros and the ModTime.
+// info. Seek builds for darwin and linux only, where the os package gives a
+// *syscall.Stat_t for every FileInfo.
 func fileInfoIdentity(info os.FileInfo) (uint64, uint64, int64) {
-	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		return uint64(st.Dev), st.Ino, statMtimeNano(*st)
-	}
-	return 0, 0, info.ModTime().UnixNano()
+	st := info.Sys().(*syscall.Stat_t)
+	return uint64(st.Dev), st.Ino, statMtimeNano(*st)
 }
 
 // newFolderStateHasher starts the state hash of a folder node with the format

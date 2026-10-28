@@ -711,7 +711,7 @@ func TestRun_UnbornRepositoryRepairsMatchingStateCommittedArtifacts(t *testing.T
 				t.Fatal(err)
 			}
 			state := mustGitRepoStateIn(t, t.Context(), dir)
-			if state.HeadSHA != "no-head" {
+			if state.HeadSHA != gitNoHead {
 				t.Fatalf("HEAD=%q, want no-head", state.HeadSHA)
 			}
 			if err := writeStateFile(plan.cacheDir, gitCorpusStateHash(paths, state)); err != nil {
@@ -2618,8 +2618,8 @@ func forceFailingCtags(t *testing.T) {
 func forceCtagsCommand(t *testing.T, path string) {
 	t.Helper()
 	t.Setenv("CTAGS_COMMAND", path)
-	ctagsOnce, ctagsErr = sync.Once{}, nil
-	t.Cleanup(func() { ctagsOnce, ctagsErr = sync.Once{}, nil })
+	checkCtagsCached = sync.OnceValue(checkCtags)
+	t.Cleanup(func() { checkCtagsCached = sync.OnceValue(checkCtags) })
 }
 
 // captureStdout runs fn with os.Stdout on a pipe and returns what fn wrote
@@ -3389,7 +3389,7 @@ func TestScoped_RankingEqualsUnscopedIntersectScope(t *testing.T) {
 }
 
 // TestScoped_FileOperandRegexpEqualsFileNameSet checks that both scope filters
-// of gitScopeSpec.query keep the file operands and drop their siblings. Up to
+// of gitScopeQuery keep the file operands and drop their siblings. Up to
 // maxRegexpFileOperands file operands become anchored file-name regexps. One
 // operand more makes the scope a FileNameSet.
 func TestScoped_FileOperandRegexpEqualsFileNameSet(t *testing.T) {

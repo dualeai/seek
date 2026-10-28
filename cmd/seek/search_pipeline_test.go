@@ -21,9 +21,9 @@ func testContentID(seed byte) semanticContentID {
 // hand-worked order and keeps all 24 hits. Each hit has its own content, so
 // no hit collapses into another.
 func TestMergeHitsIgnoresInputOrder(t *testing.T) {
-	var nodes []nodeHits
+	var nodes [][]nodeHit
 	for node := range 4 {
-		var hits nodeHits
+		var hits []nodeHit
 		for file := range 6 {
 			hits = append(hits, nodeHit{
 				corpus:      corpusID(fmt.Sprintf("corpus-%d", node)),
@@ -71,7 +71,7 @@ func TestMergeHitsIgnoresInputOrder(t *testing.T) {
 // content) and two name-only files with no content ID stay separate.
 func TestDuplicateCollapseRepresentative(t *testing.T) {
 	same := testContentID(7)
-	hits := nodeHits{
+	hits := []nodeHit{
 		{corpus: "c", displayRoot: "/z", path: "a.go", contentID: same, match: "m", score: 1},
 		{corpus: "b", displayRoot: "/a", path: "a.go", contentID: same, match: "m", score: 1},
 		{corpus: "d", displayRoot: "/m", path: "a.go", contentID: same, match: "m", score: 1},
@@ -106,13 +106,13 @@ func TestAcceptanceIsPerFile(t *testing.T) {
 	// 4.04 lifts (4.04 - 3) / 4 = 0.26, above it.
 	const tokens, emptyScore = 4, 3
 	verdict := func(poolSize int) bool {
-		scored := make(nodeHits, poolSize)
+		scored := make([]nodeHit, poolSize)
 		scores := make([]float32, poolSize)
 		for index := range scored {
-			scored[index] = nodeHit{corpus: "c", path: fmt.Sprintf("noise%05d.go", index), semantic: true}
+			scored[index] = nodeHit{corpus: "c", path: fmt.Sprintf("noise%05d.go", index)}
 			scores[index] = 3.6
 		}
-		scored[poolSize/2] = nodeHit{corpus: "c", path: "relevant.go", semantic: true}
+		scored[poolSize/2] = nodeHit{corpus: "c", path: "relevant.go"}
 		scores[poolSize/2] = 4.04
 		accepted := acceptFiles(scored, scores, emptyScore, tokens, nil)
 		return slices.ContainsFunc(accepted, func(hit nodeHit) bool { return hit.path == "relevant.go" }) &&
@@ -121,7 +121,7 @@ func TestAcceptanceIsPerFile(t *testing.T) {
 	if !verdict(128) || !verdict(4096) {
 		t.Fatal("the relevant file's verdict depends on the pool size")
 	}
-	strict := nodeHits{{corpus: "c", path: "strict.go", strict: true}}
+	strict := []nodeHit{{corpus: "c", path: "strict.go", strict: true}}
 	if accepted := acceptFiles(strict, []float32{0}, emptyScore, tokens, nil); len(accepted) != 1 {
 		t.Fatalf("a strict all-word file was not admitted: %+v", accepted)
 	}
@@ -132,13 +132,13 @@ func TestAcceptanceIsPerFile(t *testing.T) {
 // semantic files with no limit on their count. A name-only file enters only as
 // a strict match and never gets a model score.
 func TestCandidateFilesKeepsNameOnlyOutOfTheModel(t *testing.T) {
-	hits := nodeHits{
+	hits := []nodeHit{
 		{path: "strict.go", strict: true},
-		{path: "semantic.go", semantic: true},
+		{path: "semantic.go"},
 		{path: "strict.bin", strict: true, nameOnly: true},
 	}
 	for index := range 300 {
-		hits = append(hits, nodeHit{path: fmt.Sprintf("more%03d.go", index), semantic: true})
+		hits = append(hits, nodeHit{path: fmt.Sprintf("more%03d.go", index)})
 	}
 	scored, nameOnly := candidateFiles(hits)
 	if len(scored) != 302 || len(nameOnly) != 1 || nameOnly[0].path != "strict.bin" {

@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -104,7 +103,7 @@ func lateOnCoreMLCacheDirectoryForKey(key string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	directory := filepath.Join(cacheRoot, "reranker", "coreml", "mlprogram-static", key)
+	directory := filepath.Join(providerArtifactRoot(cacheRoot), "mlprogram-static", key)
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return "", fmt.Errorf("create Core ML model cache: %w", err)
 	}
@@ -175,7 +174,6 @@ func lateOnProbeSession(
 		session,
 		ids,
 		attention,
-		semanticModelBatchRows,
 		output,
 	); err != nil {
 		return err
@@ -541,30 +539,12 @@ func lateOnProbeVerdict(
 	return lateOnVerdictTrusted, true, "matches the CPU provider"
 }
 
-// writeLateOnProviderVerdict stores the verdict beside the compiled model. A
-// write failure only costs the next process another probe, so it never fails
-// the search.
+// writeLateOnProviderVerdict stores the verdict beside the compiled model.
+// Processes write it with no lock, so each write has its own temporary file
+// (writeSharedCacheFile). A write failure only costs the next process another
+// probe, so it never fails the search.
 func writeLateOnProviderVerdict(path string, verdict string) {
-	temporary, err := os.CreateTemp(filepath.Dir(path), ".verdict-*")
-	if err != nil {
-		slog.Debug("Could not record the semantic provider verdict", "error", err)
-		return
-	}
-	name := temporary.Name()
-	_, writeErr := temporary.WriteString(verdict + "\n")
-	closeErr := temporary.Close()
-	if writeErr != nil || closeErr != nil {
-		_ = os.Remove(name)
-		slog.Debug("Could not record the semantic provider verdict", "error", errors.Join(writeErr, closeErr))
-		return
-	}
-	if err := os.Chmod(name, 0o600); err != nil {
-		_ = os.Remove(name)
-		slog.Debug("Could not record the semantic provider verdict", "error", err)
-		return
-	}
-	if err := os.Rename(name, path); err != nil {
-		_ = os.Remove(name)
+	if err := writeSharedCacheFile(filepath.Dir(path), filepath.Base(path), verdict+"\n"); err != nil {
 		slog.Debug("Could not record the semantic provider verdict", "error", err)
 	}
 }

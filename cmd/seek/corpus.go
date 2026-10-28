@@ -69,9 +69,9 @@ type node struct {
 	// scope is the search-time filter for a scoped Git search. A scoped and an
 	// unscoped search of one repo read the same combined whole-repo index
 	// (cacheDir/indexDir); scope only limits which loaded documents match. The
-	// filter adds no BM25 term (searchShards), so each matched document gets
-	// the score of the unscoped search. A scoped result set is the part of the
-	// unscoped result set that the scope holds.
+	// filter adds no BM25 term (nodeRead.search), so each matched document
+	// gets the score of the unscoped search. A scoped result set is the part
+	// of the unscoped result set that the scope holds.
 	scope query.Q
 	// behavior is the kind's work (nodeKind); nil when the node only names a
 	// cache place, as for the error of a failed Git node (gitNodeError).
@@ -129,8 +129,6 @@ type corpusSearchResult struct {
 	also []corpusCopy
 	// header is the display path that the formatter prints (applyHeaders).
 	header string
-	// modelBase is the model path base of the node (modelPathBase).
-	modelBase string
 }
 
 // corpusCopy is one collapsed copy: the formatter prints its header, the same
@@ -242,7 +240,7 @@ func newCorpusPlan(kind corpusKind, rt rootType, root string, extraIDParts ...st
 	}
 	idParts = append(idParts, extraIDParts...)
 	id := newCorpusID(idParts...)
-	cacheDir := filepath.Join(cacheRoot, "corpora", string(id))
+	cacheDir := filepath.Join(cacheRoot, corporaDir, string(id))
 	return node{
 		id:          id,
 		kind:        kind,
@@ -250,13 +248,13 @@ func newCorpusPlan(kind corpusKind, rt rootType, root string, extraIDParts ...st
 		root:        root,
 		displayRoot: root,
 		cacheDir:    cacheDir,
-		indexDir:    filepath.Join(cacheDir, "index"),
+		indexDir:    filepath.Join(cacheDir, corpusIndexDir),
 	}, nil
 }
 
 // planGitCorpus plans a Git node. operands are the paths that the search
 // covers; none, or the work-tree root, covers the whole node.
-func planGitCorpus(paths gitPaths, operands []string) (node, error) {
+func planGitCorpus(paths gitPaths, operands []gitScopeOperand) (node, error) {
 	plan, err := buildGitCorpusPlan(paths.RepoDir, paths.CommonDir)
 	if err != nil {
 		return node{}, err
@@ -267,11 +265,7 @@ func planGitCorpus(paths gitPaths, operands []string) (node, error) {
 	}
 	// A scoped search reads the combined whole-repo index; the scope applies
 	// at search time.
-	spec, err := buildGitScopeSpec(plan.root, operands)
-	if err != nil {
-		return node{}, err
-	}
-	if plan.scope, err = spec.query(); err != nil {
+	if plan.scope, err = gitScopeQuery(plan.root, operands); err != nil {
 		return node{}, err
 	}
 	return plan, nil
@@ -307,9 +301,6 @@ func seekUserCacheRoot() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve user cache directory: %w", err)
 	}
-	if dir == "" {
-		return "", fmt.Errorf("resolve user cache directory: empty path")
-	}
 	return filepath.Join(dir, "seek"), nil
 }
 
@@ -337,15 +328,29 @@ func canonicalCorpusPath(path string) string {
 }
 
 // realCaseWithin rewrites the part of path below root to the directory-entry
-// names on disk. On a case- or normalization-insensitive file system (the
-// macOS default), an operand can have a different case or Unicode
-// normalization than Git stored. The Git scope (gitScopeSpec.query) compares
-// names byte for byte, so without this rewrite the search would miss a
-// tracked file and give no error. os.SameFile (device and inode) finds the
-// entry, so case and NFC/NFD both match. It corrects the components from the
-// top down, so a parent has its real name before Seek reads its children. A
-// stat or read error leaves that component as typed. listings holds the
-// directories already read, so many operands in one directory read it once.
+// names on disk. On a case- or normalization-insensitive file system, an
+// operand can have another letter case or Unicode form than the stored name.
+// Some steps compare names byte for byte: the Git scope of more than
+// maxRegexpFileOperands files (gitScopeQuery) and the paths of the folder
+// seeds. os.SameFile (device and inode) finds the entry. It corrects the
+// components from the top down, so a parent has its real name before Seek
+// reads its children. A stat or read error leaves that component as typed.
+// listings holds the directories already read, so many operands in one
+// directory read it once.
+//
+// resolveOperands calls it after onDiskPath. On APFS, HFS+, exFAT, and FAT32
+// disk images, it changed the path only where onDiskPath does not give the
+// stored names:
+//   - On macOS, at or below a directory that the user cannot read: onDiskPath
+//     cannot open that directory, but the listing of its parent gives its
+//     name.
+//   - On macOS exFAT and FAT32: F_GETPATH can give a directory name with the
+//     letter case that the user typed, and it gives NFC. The listing gives
+//     the stored name, in NFD. Git on macOS keeps names in NFC
+//     (core.precomposeunicode), so there a non-ASCII directory name in NFD
+//     misses the Git scope.
+//   - On Linux, onDiskPath does nothing. This is the only correction on a
+//     case-insensitive file system (ext4 casefold, vfat, exFAT, CIFS).
 func realCaseWithin(root, path string, listings dirListings) string {
 	rel, ok := relWithin(root, path)
 	if !ok || rel == "." {

@@ -22,11 +22,10 @@ type nativeGitDelta struct {
 	changedPaths []string
 	targetInfos  []gitBlobInfo
 	nextState    committedGitState
-	// baseLiveBytes and oldBytes are the live bytes of the base and the bytes
-	// of the old blobs that the delta tombstones. indexNativeGitDelta sets the
-	// live bytes of nextState from them and the new blobs that it reads.
-	baseLiveBytes int64
-	oldBytes      int64
+	// keptLiveBytes is the live bytes of the base less the bytes of the old
+	// blobs that the delta tombstones. indexNativeGitDelta adds the new blobs
+	// that it reads to set the live bytes of nextState.
+	keptLiveBytes int64
 }
 
 // nativeGitBlobMode reports a tree-entry mode of a blob that the index reads:
@@ -84,7 +83,7 @@ func nativeGitDeltaStaticMetadataEqual(existing, target *zoekt.Repository) bool 
 }
 
 // prepareNativeGitDelta checks whether target can extend the published
-// committed family. eligible=false with no error selects native full indexing;
+// committed family. A nil delta with no error selects native full indexing;
 // an error stops the build. It selects full indexing for:
 //   - an incomplete or incompatible base;
 //   - no usable Ctags;
@@ -101,19 +100,19 @@ func prepareNativeGitDelta(
 	store corpusStore,
 	target gitObjectID,
 	scan familyScan,
-) (*nativeGitDelta, bool, error) {
+) (*nativeGitDelta, error) {
 	cacheDir, indexDir := store.cacheDir, store.indexDir
-	if !scan.hasShard(familyCommitted) || !scan.contiguous(familyCommitted) || !scan.matchesManifestFamily(indexDir, familyCommitted) {
-		return nil, false, nil
+	if !scan.hasShard(familyCommitted) || !scan.contiguous(familyCommitted) || !scan.matchesManifestFamily(familyCommitted) {
+		return nil, nil
 	}
 	if err := requireNativeGitVersion(ctx); err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	// This also resolves the verified `ctags` fallback before index options are
 	// compared with the base. If Ctags is unavailable, let native full decide
 	// whether the target needs a Builder at all.
 	if err := checkCtagsCached(); err != nil {
-		return nil, false, nil
+		return nil, nil
 	}
 
 	repository := nativeGitRepository(repoDir, target)
@@ -127,23 +126,23 @@ func prepareNativeGitDelta(
 		return err
 	})
 	if err != nil || !ok || existing == nil {
-		return nil, false, nil
+		return nil, nil
 	}
 	existingHead, ok := recordedHeadVersion(existing)
 	if !ok {
-		return nil, false, nil
+		return nil, nil
 	}
 	baseOID, err := parseGitObjectID([]byte(existingHead))
 	if err != nil || len(baseOID) != len(target) || baseOID == target {
-		return nil, false, nil
+		return nil, nil
 	}
 	committedState, ok := readCommittedGitState(cacheDir)
 	currentShards := nativeCommittedShardCount(scan)
 	if !ok || committedState.head != baseOID || nativeGitDeltaShardLimitExceeded(currentShards, committedState.baseShards) {
-		return nil, false, nil
+		return nil, nil
 	}
 	if !nativeGitDeltaStaticMetadataEqual(existing, &repository) {
-		return nil, false, nil
+		return nil, nil
 	}
 	baseOptions := opts
 	baseRepository := repository
@@ -154,33 +153,33 @@ func prepareNativeGitDelta(
 		state, _ = baseOptions.IndexState()
 		return nil
 	}) != nil || state != index.IndexStateEqual {
-		return nil, false, nil
+		return nil, nil
 	}
 	baseExists, err := nativeGitCommitExists(ctx, repoDir, baseOID)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if !baseExists {
-		return nil, false, nil
+		return nil, nil
 	}
 
 	diff, err := readNativeGitDiff(ctx, repoDir, baseOID, target, maxNativeGitDeltaPaths)
 	if errors.Is(err, errNativeGitDeltaTooLarge) {
-		return nil, false, nil
+		return nil, nil
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	targetInfos, oldBytes, err := scanNativeGitDeltaChanges(ctx, repoDir, diff)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	var payloadBytes, newBytes int64
 	for _, info := range targetInfos {
 		if !info.oversize {
 			payloadBytes += info.size
 			if payloadBytes >= indexWindow(ctx) {
-				return nil, false, nil
+				return nil, nil
 			}
 		}
 		if !info.nameOnly() {
@@ -190,7 +189,7 @@ func prepareNativeGitDelta(
 	tombstoned := committedState.deadBytes + oldBytes
 	liveBytes := max(committedState.liveBytes-oldBytes+newBytes, 0)
 	if deltaNeedsCompaction(tombstoned, liveBytes) {
-		return nil, false, nil
+		return nil, nil
 	}
 
 	changedPaths := make([]string, 0, len(diff))
@@ -203,15 +202,14 @@ func prepareNativeGitDelta(
 		repository:    repository,
 		changedPaths:  changedPaths,
 		targetInfos:   targetInfos,
-		baseLiveBytes: committedState.liveBytes,
-		oldBytes:      oldBytes,
+		keptLiveBytes: committedState.liveBytes - oldBytes,
 		nextState: committedGitState{
 			head:       target,
 			baseHead:   committedState.baseHead,
 			baseShards: committedState.baseShards,
 			deadBytes:  tombstoned,
 		},
-	}, true, nil
+	}, nil
 }
 
 // scanNativeGitDeltaChanges checks the new blobs that diff-tree names, so delta
@@ -310,7 +308,7 @@ func indexNativeGitDelta(
 	}
 	// The admission counted the new blobs by size: the reads give the bytes
 	// that their shard documents hold, a marker for a binary blob.
-	delta.nextState.liveBytes = max(delta.baseLiveBytes-delta.oldBytes+heldBytes, 0)
+	delta.nextState.liveBytes = max(delta.keptLiveBytes+heldBytes, 0)
 	if _, err := indexDeltaDocumentsWithRepository(buildDir, delta.repository, documents, parallelism, delta.changedPaths); err != nil {
 		return fmt.Errorf("%w: %w", errNativeDeltaFallback, err)
 	}

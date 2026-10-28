@@ -99,7 +99,8 @@ func (r *nodeRead) shards(ctx context.Context) (nodeShards, error) {
 }
 
 // search runs q on the node's shards within the node's scope, on the current
-// copy of each file.
+// copy of each file. With no loaded shard it reports errShardUnloadable:
+// damage that openNode repairs.
 func (r *nodeRead) search(ctx context.Context, q query.Q, config searchConfig) ([]zoekt.FileMatch, error) {
 	if r.lock == nil {
 		return nil, fmt.Errorf("%w: a search of a closed node read", errInvariant)
@@ -111,7 +112,22 @@ func (r *nodeRead) search(ctx context.Context, q query.Q, config searchConfig) (
 	if shards.current != nil {
 		q = query.NewAnd(q, shards.current)
 	}
-	files, err := searchShards(ctx, shards.searchers, shards.paths, q, r.plan.scope, config)
+	if r.plan.scope != nil {
+		// Zoekt gathers no match under a file-name type. So the scope filters
+		// the files and adds no file-name term to their BM25 score. A file in
+		// the scope scores as in an unscoped search. Unlike a double
+		// negation, it keeps Zoekt's shard and file skips.
+		q = query.NewAnd(q, &query.Type{Type: query.TypeFileName, Child: r.plan.scope})
+		q = query.Simplify(q)
+	}
+	if len(shards.searchers) == 0 {
+		return nil, r.damage(fmt.Errorf("%w: no loadable shards", errShardUnloadable))
+	}
+	parts, err := bm25ShardParts(ctx, shards.searchers, shards.paths, q, &config)
+	if err != nil {
+		return nil, r.damage(err)
+	}
+	files, err := searchLoadedShards(ctx, shards.searchers, q, config, parts)
 	if err != nil {
 		return nil, r.damage(err)
 	}

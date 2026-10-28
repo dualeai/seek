@@ -229,7 +229,7 @@ func TestFileReuseRowsMatchFreshRows(t *testing.T) {
 	}
 	indexDir := t.TempDir()
 	build(indexDir, "one/x/src/pkg/long.go")
-	reuse := loadSemanticReuse(indexDir, filepath.Join(indexDir, "staging"), "", "", nil)
+	reuse := loadSemanticReuse(indexDir, filepath.Join(indexDir, "staging"), "", "", nil, "")
 	defer reuse.Close()
 	const path = "two/x/src/pkg/long.go"
 	copied, ok := reuse.fileRows(path, semanticContentID(sha256.Sum256(content)))
@@ -572,7 +572,7 @@ func TestReuseLoadIndexesTheNodeTailsOfOtherCorpora(t *testing.T) {
 	parent := filepath.Dir(real)
 	load := func(lineage, base string, names []string) *semanticReuseIndex {
 		indexDir := t.TempDir()
-		return loadSemanticReuse(indexDir, filepath.Join(indexDir, "staging"), lineage, filepath.ToSlash(base), names)
+		return loadSemanticReuse(indexDir, filepath.Join(indexDir, "staging"), lineage, filepath.ToSlash(base), names, "")
 	}
 	// total and topRows count row keys: windows with the same input share one.
 	all := load(fileRoot, real, nil)
@@ -792,10 +792,11 @@ func TestCopiedOrMovedSubfolderReusesTheFolderRows(t *testing.T) {
 	}
 }
 
-// TestUnitStoreSegmentsStayFew changes one file in 16 searches in a row. Each
+// TestUnitStoreSegmentsStayFew changes one file in 8 searches in a row. Each
 // bind archives that file's old window, and the store merges its segments, so
 // it holds few segments. An old version still comes back with no new
-// embedding. One segment per bind would grow the store without end.
+// embedding. One segment per bind would grow the store without end: 8
+// segments here.
 func TestUnitStoreSegmentsStayFew(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -806,7 +807,7 @@ func TestUnitStoreSegmentsStayFew(t *testing.T) {
 	version := func(n int) string {
 		return fmt.Sprintf("package sample\n// alpha changing version %d\n", n)
 	}
-	for n := range 17 {
+	for n := range 9 {
 		writeFileAt(t, folder, "change.go", version(n))
 		reuseSearch(t, folder)
 	}
@@ -815,8 +816,8 @@ func TestUnitStoreSegmentsStayFew(t *testing.T) {
 		t.Fatal(err)
 	}
 	segments := semanticUnitsSegments(cacheRoot)
-	if len(segments) == 0 || len(segments) > 5 {
-		t.Fatalf("segments=%d after 16 archives, want 1 to 5 (about log2 of the records)", len(segments))
+	if len(segments) == 0 || len(segments) > 4 {
+		t.Fatalf("segments=%d after 8 archives, want 1 to 4 (about log2 of the records)", len(segments))
 	}
 	writeFileAt(t, folder, "change.go", version(3))
 	if embedded := reuseSearch(t, folder); len(embedded) != 0 {

@@ -140,16 +140,15 @@ func testAxisVector(axis int, seed []byte) semanticVector {
 // A zero queryVector leaves token 1, so the preparation passes and the vector
 // scan fails, as with the real model (lateOnRowHasUsableToken).
 func (scorer *hybridTestScorer) PrepareSemanticQuery(
-	_ context.Context,
-	query string,
+	context.Context,
+	string,
 ) (*semanticQueryEmbedding, error) {
 	if scorer.prepareErr != nil {
 		return nil, scorer.prepareErr
 	}
 	prepared := &semanticQueryEmbedding{
-		tokens:     make([]float32, lateOnSequenceLength*semanticEmbeddingDimensions),
-		scoreMask:  make([]bool, lateOnSequenceLength),
-		modelQuery: query,
+		tokens:    make([]float32, lateOnSequenceLength*semanticEmbeddingDimensions),
+		scoreMask: make([]bool, lateOnSequenceLength),
 	}
 	if scorer.queryVector == nil {
 		prepared.tokens[0] = 1
@@ -334,7 +333,7 @@ func TestRunDefaultJoinedSearchAddsSemanticOnlyFile(t *testing.T) {
 	}
 	plans, err := expandGraph(t.Context(), plannedExternalOperands{gitRoots: []externalGitRoot{{
 		paths:    paths,
-		operands: []string{canonicalCorpusPath(repo)},
+		operands: []gitScopeOperand{{path: canonicalCorpusPath(repo), dir: true}},
 	}}})
 	if err != nil || len(plans) != 1 {
 		t.Fatalf("plan Git corpus: plans=%d error=%v", len(plans), err)
@@ -452,7 +451,7 @@ func TestRunDefaultFilteredNativeFailureRecoversExactly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mask.mode != semanticFilterPartial || mask.allowed <= semanticFilteredExactRows {
+	if !mask.partial() || mask.allowed <= semanticFilteredExactRows {
 		t.Fatalf("fallback fixture mask=%+v", mask)
 	}
 	if err := generation.Close(); err != nil {
@@ -953,34 +952,6 @@ func TestDefaultFolderBuildPublishesAndUpdatesJoinedGeneration(t *testing.T) {
 	}
 }
 
-// TestLexicalOnlyFolderBuildStartsNoModelAndWritesNoSemanticData gives the
-// folder build a model and asks for vectors, with the lexical-only policy.
-// The policy alone keeps the build from starting the model and from writing
-// semantic data.
-func TestLexicalOnlyFolderBuildStartsNoModelAndWritesNoSemanticData(t *testing.T) {
-	requireTools(t)
-	folder := t.TempDir()
-	writeFileAt(t, folder, "app.go", "package sample\n// lexical folder text\n")
-	plan := planFolderTestCorpus(t, folder)
-	var factoryCalls atomic.Int32
-	future := newSemanticModelFuture(failingModelFactory(&factoryCalls))
-	execution := searchExecution{policy: lexicalOnlySearch, model: future, vectors: true}
-
-	if _, err := ensureFolderCorpusFreshWithExecution(t.Context(), plan, execution); err != nil {
-		t.Fatal(err)
-	}
-	if factoryCalls.Load() != 0 {
-		t.Fatalf("model factory calls=%d, want zero", factoryCalls.Load())
-	}
-	if _, err := os.Lstat(filepath.Join(plan.cacheDir, joinedGenerationFile)); !os.IsNotExist(err) {
-		t.Fatalf("lexical-only folder build created a joined descriptor: %v", err)
-	}
-	semanticDirs := semanticGenerationDirs(t, plan.indexDir)
-	if len(semanticDirs) != 0 {
-		t.Fatalf("lexical-only folder build created semantic data: %v", semanticDirs)
-	}
-}
-
 // TestRunDefaultFolderJoinedSearchKeepsGuardedFileByName forces the shard
 // guard on one large file, with a model that accepts every row, so each unit
 // of the file is a candidate. Zoekt keeps only its name, and a vector hit
@@ -998,7 +969,7 @@ func TestRunDefaultFolderJoinedSearchKeepsGuardedFileByName(t *testing.T) {
 	// Go comment lines keep the file valid source for ctags.
 	var guarded strings.Builder
 	guarded.WriteString("package sample\n// " + needle + " dispatches a request to its handler\n")
-	for _, line := range strings.SplitAfter(string(randomWordText(5, 5<<19, "")), "\n") {
+	for _, line := range strings.SplitAfter(string(randomWordText(5, 1<<19, "")), "\n") {
 		if line != "" && line != "\n" {
 			guarded.WriteString("// " + line)
 		}

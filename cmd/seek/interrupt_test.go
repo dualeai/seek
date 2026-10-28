@@ -164,7 +164,7 @@ func TestLockWaitsEndOnlyTheRunningWaits(t *testing.T) {
 			return syscall.EWOULDBLOCK
 		}
 		return nil
-	}, time.Millisecond, time.Millisecond)
+	}, time.Millisecond)
 	if err != nil || tries != 3 {
 		t.Fatalf("a later wait gave %v after %d tries, want the lock after 3", err, tries)
 	}
@@ -189,7 +189,7 @@ func TestLockWaitIsCountedBeforeItsLogLine(t *testing.T) {
 		counted <- ended
 	})
 	err := pollLock(ctx, "/cache/.lock", "Waiting for a test lock", func() error { return syscall.EWOULDBLOCK },
-		time.Millisecond, time.Millisecond)
+		time.Millisecond)
 	if !<-counted || !errors.Is(err, errLockWaitEnded) {
 		t.Fatalf("the wait was not counted at its log line (err=%v)", err)
 	}

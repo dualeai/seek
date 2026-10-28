@@ -22,7 +22,7 @@ import (
 )
 
 // The one search pipeline moves three stage types between its stages: a
-// queryPlan in, nodeHits from each node, and one ranked list of nodeHits out
+// queryPlan in, nodeHit values from each node, and one ranked list of them out
 // (rankModelQuery). A query with no model stage gets corpusSearchResult values
 // from each node (strictNode) and has no ranked list.
 
@@ -146,11 +146,10 @@ type nodeHit struct {
 	// start is the start of the first matched unit, the last tie key.
 	start uint64
 	score float32
-	// strict marks a strict all-word lexical match; lexical, a relaxed one;
-	// semantic, a unit within the retrieval radius.
+	// strict marks a strict all-word lexical match; lexical, a relaxed one.
+	// A hit with neither is a unit within the retrieval radius.
 	strict   bool
 	lexical  bool
-	semantic bool
 	nameOnly bool
 	// lexicalParts are the BM25 parts of a relaxed match (bm25Parts), which
 	// the command rescore reads.
@@ -163,8 +162,6 @@ type nodeHit struct {
 	display  corpusSearchResult
 	document rerankDocument
 }
-
-type nodeHits []nodeHit
 
 func (hit nodeHit) displayPath() string {
 	return filepath.Join(hit.displayRoot, hit.path)
@@ -181,7 +178,7 @@ type nodeHitKey struct {
 
 // nodeHitKeys gives the tie key of each hit. A sort reads the keys, so it
 // builds each display path once and moves no hit.
-func nodeHitKeys(hits nodeHits) []nodeHitKey {
+func nodeHitKeys(hits []nodeHit) []nodeHitKey {
 	keys := make([]nodeHitKey, len(hits))
 	for index := range hits {
 		keys[index] = nodeHitKey{score: hits[index].score, path: hits[index].displayPath(), start: hits[index].start}
@@ -221,7 +218,7 @@ func sortByNodeHitKey(positions []int, keys []nodeHitKey) {
 // representative is the copy with the smallest tie key, and the other paths
 // follow in order. The same (corpus, path) twice keeps its first, best hit. No
 // step cuts a node's hits. The result is a new slice.
-func mergeNodeHits(hits nodeHits) nodeHits {
+func mergeNodeHits(hits []nodeHit) []nodeHit {
 	order := make([]int, len(hits))
 	for index := range order {
 		order[index] = index
@@ -237,7 +234,7 @@ func mergeNodeHits(hits nodeHits) nodeHits {
 	}
 	seenFiles := make(map[fileKey]struct{}, len(hits))
 	representative := make(map[copyKey]int, len(hits))
-	out := make(nodeHits, 0, len(hits))
+	out := make([]nodeHit, 0, len(hits))
 	for _, index := range order {
 		hit := &hits[index]
 		file := fileKey{corpus: hit.corpus, path: hit.path}
@@ -268,7 +265,7 @@ func mergeNodeHits(hits nodeHits) nodeHits {
 // 31,238 files of a Kubernetes checkout for a description. A name-only file (a
 // binary file, a macOS dataless file, a missing blob) has no model text. It
 // enters only as a strict all-word match, and the model never scores it.
-func candidateFiles(hits nodeHits) (scored nodeHits, nameOnly nodeHits) {
+func candidateFiles(hits []nodeHit) (scored []nodeHit, nameOnly []nodeHit) {
 	for _, hit := range hits {
 		if hit.nameOnly {
 			nameOnly = append(nameOnly, hit)
@@ -287,12 +284,12 @@ func candidateFiles(hits nodeHits) (scored nodeHits, nameOnly nodeHits) {
 // k = 60). scores holds one raw model score per scored candidate. The nameOnly
 // files come after them in tie order.
 func acceptFiles(
-	scored nodeHits,
+	scored []nodeHit,
 	scores []float32,
 	emptyScore float32,
 	activeTokens int,
-	nameOnly nodeHits,
-) nodeHits {
+	nameOnly []nodeHit,
+) []nodeHit {
 	keys := nodeHitKeys(scored)
 	lexicalRank := ranks(len(scored), func(left, right int) int {
 		if c := lexicalClass(&scored[left]) - lexicalClass(&scored[right]); c != 0 {
@@ -332,7 +329,7 @@ func acceptFiles(
 		kept = append(kept, index)
 	}
 	sortByNodeHitKey(kept, keys)
-	accepted := make(nodeHits, 0, len(kept)+len(nameOnly))
+	accepted := make([]nodeHit, 0, len(kept)+len(nameOnly))
 	for _, index := range kept {
 		accepted = append(accepted, scored[index])
 		accepted[len(accepted)-1].score = keys[index].score
@@ -491,7 +488,7 @@ func removeDamagedVectors(ctx context.Context, plan node) {
 	defer releaseLock(lock)
 	removeJoinedGeneration(plan.cacheDir)
 	archiveSupersededUnits(plan.indexDir)
-	removeSemanticGenerationsExcept(plan.indexDir, nil)
+	removeSemanticGenerationsExcept(plan.indexDir)
 	slog.Warn("Vector index damage detected; rebuilding the vectors", "root", plan.root)
 }
 
@@ -573,13 +570,13 @@ func (nodes *openedNodes) has(id corpusID) bool {
 
 // nodeOpenError marks a node that failed to open: its build, its Git state, a
 // read error, or damage that the repair retry did not fix. The orchestrator
-// skips such a node with one warning.
+// skips such a node with one warning that names the cause in err. No error
+// with this mark leaves searchNodes, so nothing unwraps it.
 type nodeOpenError struct {
 	err error
 }
 
 func (e *nodeOpenError) Error() string { return e.err.Error() }
-func (e *nodeOpenError) Unwrap() error { return e.err }
 
 // asNodeFailure marks err as a failure of one node. A cancellation and
 // an environment failure (environmentFailure) stay as they are and end the
@@ -610,7 +607,16 @@ func environmentFailure(err error) bool {
 	if _, ctags := errors.AsType[*ctagsUnavailableError](err); ctags {
 		return true
 	}
-	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) || errors.Is(err, errInvariant)
+	return outOfFileDescriptors(err) || errors.Is(err, errInvariant)
+}
+
+// outOfFileDescriptors reports EMFILE or ENFILE: the process or the system
+// has no free file descriptor. That is no property of the file, folder, node,
+// or tool that the failed call names. So no caller records it as one: a read
+// stops and publishes nothing, and a node failure ends the command
+// (environmentFailure).
+func outOfFileDescriptors(err error) bool {
+	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE)
 }
 
 // interruptedChild reports a child process (Git, ctags) that a terminal
@@ -667,7 +673,7 @@ func searchNodes[T any](
 	ctx context.Context,
 	plans []node,
 	search func(context.Context, node) ([]T, dirtyFileSet, error),
-) ([]T, dirtyFilesByCorpus, error) {
+) ([]T, map[corpusID]dirtyFileSet, error) {
 	type nodeResult struct {
 		plan    node
 		results []T
@@ -700,7 +706,7 @@ func searchNodes[T any](
 		return nil, nil, err
 	}
 	var all []T
-	dirtyByCorpus := make(dirtyFilesByCorpus)
+	dirtyByCorpus := make(map[corpusID]dirtyFileSet)
 	for _, outcome := range outcomes {
 		if !outcome.run {
 			continue
@@ -843,7 +849,7 @@ func strictNode(ctx context.Context, plan node, qp queryPlan, config searchConfi
 // scope allow. It gives one hit per file with its display result and its
 // model document.
 func retrieveNode(ctx context.Context, plan node, qp queryPlan, config searchConfig, execution searchExecution) ([]nodeHit, dirtyFileSet, error) {
-	var hits nodeHits
+	var hits []nodeHit
 	var dirty dirtyFileSet
 	var nameOnly int64
 	err := openNode(ctx, plan, execution, func(node openedNode) error {
@@ -871,7 +877,7 @@ func retrieveNode(ctx context.Context, plan node, qp queryPlan, config searchCon
 // retrieval on the bound generation and the overlay. It then reads the
 // relaxed lexical rank of each semantic file, and the text of each semantic
 // file from the shards (readSemanticEvidence).
-func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config searchConfig, execution searchExecution, nameOnlyFiles *int64) (nodeHits, error) {
+func readNodeEvidence(ctx context.Context, node openedNode, qp queryPlan, config searchConfig, execution searchExecution, nameOnlyFiles *int64) ([]nodeHit, error) {
 	plan := node.plan
 	read, ctx, err := openNodeRead(ctx, plan, node.dirty)
 	if err != nil {
@@ -1243,7 +1249,7 @@ func nodeEvidenceHits(
 	strict []corpusSearchResult,
 	semanticFiles []semanticFileCandidate,
 	relaxedScores map[string]relaxedLexical,
-) nodeHits {
+) []nodeHit {
 	// A clean path takes its content ID from the base rows, a dirty path from
 	// the overlay rows, so identical dirty copies collapse too.
 	clean := make(map[string]struct{}, len(strict))
@@ -1259,8 +1265,9 @@ func nodeEvidenceHits(
 	generationContentIDs(generation, clean, contentIDs)
 	overlayIDs := make(map[string]semanticContentID, len(changed))
 	generationContentIDs(overlay, changed, overlayIDs)
-	hits := make(nodeHits, 0, len(strict)+len(semanticFiles))
+	hits := make([]nodeHit, 0, len(strict)+len(semanticFiles))
 	byPath := make(map[string]int, len(strict))
+	modelBase := plan.modelPathBase()
 	for _, result := range strict {
 		path := result.file.FileName
 		hit := nodeHit{
@@ -1271,7 +1278,7 @@ func nodeEvidenceHits(
 			strict:      true,
 			match:       lexicalMatchKey(result.file),
 			display:     result,
-			document:    newRerankDocument(result),
+			document:    newRerankDocument(result, modelBase),
 		}
 		if !dirty.contains(path) {
 			id, ok := contentIDs[path]
@@ -1287,7 +1294,6 @@ func nodeEvidenceHits(
 	}
 	for _, candidate := range semanticFiles {
 		if at, ok := byPath[candidate.unit.path]; ok {
-			hits[at].semantic = true
 			hits[at].start = candidate.unit.start
 			hits[at].document = candidate.document
 			continue
@@ -1307,7 +1313,6 @@ func nodeEvidenceHits(
 			score:        float32(score),
 			lexical:      lexical,
 			lexicalParts: relaxed.parts,
-			semantic:     true,
 			display:      candidate.result,
 			document:     candidate.document,
 		})
@@ -1329,7 +1334,7 @@ func lexicalMatchKey(file zoekt.FileMatch) string {
 // the candidate set, the model score of each candidate in batches, and the
 // per-file acceptance. It gives the accepted files in display order. A model
 // error gives the strict order with one debug line.
-func rankModelQuery(ctx context.Context, hits nodeHits, qp queryPlan, execution searchExecution) (nodeHits, error) {
+func rankModelQuery(ctx context.Context, hits []nodeHit, qp queryPlan, execution searchExecution) ([]nodeHit, error) {
 	merged := mergeNodeHits(hits)
 	scored, nameOnly := candidateFiles(merged)
 	if len(scored) == 0 {
@@ -1363,7 +1368,7 @@ func rankModelQuery(ctx context.Context, hits nodeHits, qp queryPlan, execution 
 	}
 	slog.Debug("Model stages failed; using strict order", "provider", semanticProviderName(), "error", err)
 	execution.model.recordFault(err)
-	var strict nodeHits
+	var strict []nodeHit
 	for _, hit := range merged {
 		if hit.strict {
 			strict = append(strict, hit)
@@ -1373,7 +1378,7 @@ func rankModelQuery(ctx context.Context, hits nodeHits, qp queryPlan, execution 
 }
 
 // presentRanked turns the ranked hits into display results in rank order.
-func presentRanked(hits nodeHits) []corpusSearchResult {
+func presentRanked(hits []nodeHit) []corpusSearchResult {
 	out := make([]corpusSearchResult, len(hits))
 	for index, hit := range hits {
 		result := hit.display

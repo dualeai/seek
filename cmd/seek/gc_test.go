@@ -72,12 +72,8 @@ func cacheRootForTest(tb testing.TB) string {
 // and when the test ends.
 func resetNFSCheck(tb testing.TB) {
 	tb.Helper()
-	nfsCheckOnce = sync.Once{}
-	nfsCached = false
-	tb.Cleanup(func() {
-		nfsCheckOnce = sync.Once{}
-		nfsCached = false
-	})
+	cacheRootOnNFS = sync.OnceValue(checkCacheRootOnNFS)
+	tb.Cleanup(func() { cacheRootOnNFS = sync.OnceValue(checkCacheRootOnNFS) })
 }
 
 // captureStdoutGC is captureStdout for a function with no error.
@@ -399,7 +395,7 @@ func TestGC_TouchUsed_NFSGate_SkipsWhenCached(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	// Pretend cache is on NFS.
-	nfsCheckOnce.Do(func() { nfsCached = true })
+	cacheRootOnNFS = func() bool { return true }
 
 	touchUsed(dir)
 
@@ -1792,7 +1788,7 @@ func TestSweepRetiredRuntimesKeepsThisBinarysRuntimes(t *testing.T) {
 		return path
 	}
 	kept := []string{
-		dir(old, rerankerDir, bundle.version, bundle.sha256),
+		dir(old, rerankerDir, bundle.Version, bundle.SHA256),
 		dir(old, "semantic", "usearch", semanticUSearchAssetKey()),
 		dir(old, "semantic", "numkong", semanticNumKongAssetKey()),
 		dir(old, rerankerDir, "coreml", "mlprogram-static", "key"),
@@ -1805,7 +1801,7 @@ func TestSweepRetiredRuntimesKeepsThisBinarysRuntimes(t *testing.T) {
 	gone := []string{
 		stale,
 		dir(old, rerankerDir, "0.0.1", "retired"),
-		dir(old, rerankerDir, bundle.version, "retired-sha"),
+		dir(old, rerankerDir, bundle.Version, "retired-sha"),
 		dir(old, "semantic", "usearch", "retired"),
 		dir(old, "semantic", "numkong", "retired"),
 		dir(now, "semantic", "usearch", providerArtifactDiscardPrefix+"cut"),

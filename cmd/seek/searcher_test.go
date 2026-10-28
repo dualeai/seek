@@ -39,7 +39,7 @@ func TestCloneFileMatchesCopiesContextOnlyForDisplayedLines(t *testing.T) {
 	}}
 
 	config := defaultSearchConfig()
-	config.contextMatchLimit = 2
+	config.displayMatchLimit = 2
 	cloned := cloneFileMatches(input, config)
 	if got := len(cloned[0].LineMatches); got != 3 {
 		t.Fatalf("line matches=%d, want 3", got)
@@ -106,7 +106,7 @@ func TestCloneFileMatchesCopiesContextOnlyForPossibleDisplayedFiles(t *testing.T
 	}
 	full := cloneFileMatches(input, defaultSearchConfig())
 	config := defaultSearchConfig()
-	config.contextFileLimit = 2
+	config.displayFileLimit = 2
 	selected := cloneFileMatches(input, config)
 
 	for i, file := range selected {
@@ -139,7 +139,7 @@ func TestDisplayedContextFilesUsesFormatterTieOrder(t *testing.T) {
 		{FileName: "a.go", Score: 10},
 	}
 	config := defaultSearchConfig()
-	config.contextFileLimit = 1
+	config.displayFileLimit = 1
 
 	selected := displayedContextFiles(files, config)
 	if _, ok := selected[1]; !ok {
@@ -169,7 +169,7 @@ func TestPerCorpusContextLimitPreservesGlobalTopFiles(t *testing.T) {
 	filesB := []zoekt.FileMatch{file("other.go", 1)}
 
 	config := defaultSearchConfig()
-	config.contextFileLimit = 2
+	config.displayFileLimit = 2
 	selective := append(
 		wrapCorpusResults(planA, cloneFileMatches(filesA, config)),
 		wrapCorpusResults(planB, cloneFileMatches(filesB, config))...,
@@ -308,14 +308,14 @@ func TestSearchPlannedCorpusParsed_ContextFileSelectionAfterShardMerge(t *testin
 			}
 
 			config := explicitSearchConfig(1, false)
-			config.contextFileLimit = 1
+			config.displayFileLimit = 1
 			selected, err := searchPlannedCorpusParsed(t.Context(), plan, nil, q, config)
 			if err != nil {
 				t.Fatalf("selective search: %v", err)
 			}
 
 			fullConfig := config
-			fullConfig.contextFileLimit = 0
+			fullConfig.displayFileLimit = 0
 			full, err := searchPlannedCorpusParsed(t.Context(), plan, nil, q, fullConfig)
 			if err != nil {
 				t.Fatalf("full search: %v", err)

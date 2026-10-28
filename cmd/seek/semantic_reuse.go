@@ -196,12 +196,11 @@ func sharedLineage(mine, other string) bool {
 }
 
 // semanticLineageHolds reports whether the root of folder lineage outer holds
-// the root of folder lineage inner and is not the same root.
+// the root of folder lineage inner (pathWithin) and is not the same root.
 func semanticLineageHolds(outer, inner string) bool {
 	outerRoot, outerFolder := strings.CutPrefix(outer, semanticFolderLineagePrefix)
 	innerRoot, innerFolder := strings.CutPrefix(inner, semanticFolderLineagePrefix)
-	return outerFolder && innerFolder && outerRoot != innerRoot &&
-		(outerRoot == "/" || strings.HasPrefix(innerRoot, outerRoot+"/"))
+	return outerFolder && innerFolder && outerRoot != innerRoot && pathWithin(outerRoot, innerRoot)
 }
 
 // loadSemanticReuse opens what a build in staging can copy from. These are
@@ -210,9 +209,9 @@ func semanticLineageHolds(outer, inner string) bool {
 // lineage (sharedLineage). A node with no lineage reads no other corpus: an
 // unrelated corpus shares nothing and costs load time and memory. base is the
 // node's model path base (modelPathBase). Each generation keys its rows with
-// the base that its manifest records. extra adds generations that the build
-// staged and did not publish yet. A source that does not open is skipped:
-// reuse only saves model work.
+// the base that its manifest records. stagedBase, when not empty, adds the
+// generation that the build staged and did not publish yet. A source that does
+// not open is skipped: reuse only saves model work.
 //
 // Every shared generation loads, whatever its size. A size limit that skips a
 // corpus would make the build embed again what that corpus holds. names are
@@ -232,7 +231,7 @@ func semanticLineageHolds(outer, inner string) bool {
 // that needs them pays about the full index. With 1 row per file, the full
 // index takes 14-16 ms and the tails 4-11 ms. Every load also reads rows.bin
 // (26-35 ms at 500,000 rows).
-func loadSemanticReuse(indexDir, staging, lineage, base string, names []string, extra ...string) *semanticReuseIndex {
+func loadSemanticReuse(indexDir, staging, lineage, base string, names []string, stagedBase string) *semanticReuseIndex {
 	started := time.Now()
 	cacheRoot, rootErr := seekUserCacheRoot()
 	dirs := semanticGenerationDirsIn(indexDir, staging)
@@ -242,7 +241,7 @@ func loadSemanticReuse(indexDir, staging, lineage, base string, names []string, 
 	// holder marks the generations of a corpus whose root holds the node's.
 	holder := make([]bool, len(dirs))
 	if len(dirs) == 0 && lineage != "" && rootErr == nil {
-		corpora, _ := filepath.Glob(filepath.Join(cacheRoot, corporaDir, "*", "index"))
+		corpora, _ := filepath.Glob(filepath.Join(cacheRoot, corporaDir, "*", corpusIndexDir))
 		for _, other := range corpora {
 			otherLineage := readCacheFile(filepath.Dir(other), semanticLineageFile)
 			if other == indexDir || !sharedLineage(lineage, otherLineage) {
@@ -255,9 +254,10 @@ func loadSemanticReuse(indexDir, staging, lineage, base string, names []string, 
 			}
 		}
 	}
-	// extra holds generations that are built but not yet published, such as
-	// the staged base of the same build.
-	dirs = append(dirs, extra...)
+	if stagedBase != "" {
+		dirs = append(dirs, stagedBase)
+		holder = append(holder, false)
+	}
 	generations := make([]*semanticGeneration, len(dirs))
 	var wait sync.WaitGroup
 	for index, dir := range dirs {
@@ -271,7 +271,6 @@ func loadSemanticReuse(indexDir, staging, lineage, base string, names []string, 
 		})
 	}
 	wait.Wait()
-	holder = append(holder, make([]bool, len(extra))...)
 	// A holder generation takes the tail rule (add) when two sets cover at
 	// most half of its files (semanticGenerationShape). The sets are the
 	// names, and the files whose tail is not plain, which add keeps too. The
