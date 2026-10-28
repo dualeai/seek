@@ -603,8 +603,8 @@ var errInvariant = errors.New("internal error")
 // environmentFailure reports an error that every node would meet, so it ends
 // the command with exit 2 and is no node failure. Such errors are a missing
 // ctags, no free file descriptor (EMFILE, ENFILE: no property of a node), and
-// a Seek defect. runSearchCommand checks the cache root once, before the
-// expansion (checkCacheRoot).
+// a Seek defect. searchGraph checks the cache root once, before the expansion
+// (checkCacheRoot).
 func environmentFailure(err error) bool {
 	if _, ctags := errors.AsType[*ctagsUnavailableError](err); ctags {
 		return true

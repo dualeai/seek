@@ -160,10 +160,8 @@ func hasVerboseArg(args []string) bool {
 	return verbose
 }
 
-// runSearchCommand runs one search. It plans the query, expands the path
-// operands into the node graph, and prepares and searches every node. For a
-// query that gives the model text, the model ranks the results. Then it writes
-// the results.
+// runSearchCommand runs one search. It plans the query, searches the node
+// graph of the path operands (searchGraph), and writes the results.
 // When it writes no result, it returns errNoMatch, or the user's interrupt
 // after an interrupt ended a lock wait (noMatchOrInterrupted).
 func runSearchCommand(
@@ -177,6 +175,35 @@ func runSearchCommand(
 	if err != nil {
 		return err
 	}
+	return searchGraph(ctx, plan, pathOperands, config, runConfig, func(ctx context.Context, graph searchedGraph) error {
+		return writeSearchedGraph(ctx, plan, config, graph)
+	})
+}
+
+// searchedGraph is the search of one command after the node searches. results
+// holds the results before the display orders them and sets the headers.
+type searchedGraph struct {
+	operands  []string
+	plans     []node
+	execution searchExecution
+	results   []corpusSearchResult
+	dirty     map[corpusID]dirtyFileSet
+	nameOnly  *atomic.Int64
+}
+
+// searchGraph expands the path operands into the node graph, and prepares and
+// searches every node. For a query that gives the model text, the model ranks
+// the results. Then it gives the searched graph to show. It closes the model
+// and enforces the cache budget after show returns, so the output does not
+// wait for them. On an error it does not call show.
+func searchGraph(
+	ctx context.Context,
+	plan queryPlan,
+	pathOperands []string,
+	config searchConfig,
+	runConfig searchRunConfig,
+	show func(context.Context, searchedGraph) error,
+) error {
 	// No path operand means the current directory. After this line no code
 	// sees the difference.
 	if len(pathOperands) == 0 {
@@ -250,20 +277,34 @@ func runSearchCommand(
 		}
 		allResults = applyRerankDisplayConfig(presentRanked(accepted), config)
 	}
+	return show(ctx, searchedGraph{
+		operands:  pathOperands,
+		plans:     plans,
+		execution: execution,
+		results:   allResults,
+		dirty:     dirtyByCorpus,
+		nameOnly:  nameOnly,
+	})
+}
 
-	warnUnindexedFileOperands(ctx, plans, execution.opened, pathOperands, allResults, dirtyByCorpus)
+// writeSearchedGraph warns for each file operand that the index keeps by name
+// only and that has no match, and writes the results of graph to stdout. With
+// no result it returns noMatchOrInterrupted.
+func writeSearchedGraph(ctx context.Context, plan queryPlan, config searchConfig, graph searchedGraph) error {
+	allResults := graph.results
+	warnUnindexedFileOperands(ctx, graph.plans, graph.execution.opened, graph.operands, allResults, graph.dirty)
 	if len(allResults) == 0 {
 		return noMatchOrInterrupted(ctx)
 	}
 	if namesOnlyQuery(plan.raw) {
 		keepFileNamesOnly(allResults)
 	}
-	applyHeaders(allResults, execution.operands)
+	applyHeaders(allResults, graph.execution.operands)
 
 	// Show corpus context when the graph has more than one node. The graph
 	// expansion found every node before the search.
 	displayMode := hideCorpusContext
-	if len(plans) > 1 {
+	if len(graph.plans) > 1 {
 		displayMode = showCorpusContext
 	}
 	pal := plainPalette
@@ -271,7 +312,7 @@ func runSearchCommand(
 		pal = ansiPalette
 	}
 	output := bufio.NewWriter(os.Stdout)
-	err = writeCorpusResultsWithContext(
+	err := writeCorpusResultsWithContext(
 		output,
 		allResults,
 		config.displayFileLimit,
@@ -281,8 +322,8 @@ func runSearchCommand(
 	)
 	// One notice per search counts the files indexed by name only, after the
 	// results. A search with no result keeps its silent exit 1.
-	if err == nil && nameOnly != nil {
-		if files := nameOnly.Load(); files > 0 {
+	if err == nil && graph.nameOnly != nil {
+		if files := graph.nameOnly.Load(); files > 0 {
 			_, err = output.WriteString(nameOnlyNoticeLine(files))
 		}
 	}

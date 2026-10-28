@@ -16,7 +16,7 @@ func testLexicalSearchExecution() searchExecution {
 // testSemanticSearchExecution offers a model to a corpus build, so the build
 // prepares vectors, and closes the future when the test ends.
 //
-// It sets the model because runSearchCommand sets it from the query, and a
+// It sets the model because searchGraph sets it from the query, and a
 // test that calls a corpus entry point skips that decision. A test that drives
 // a whole search must not use this.
 func testSemanticSearchExecution(tb testing.TB, factory semanticModelFactory) searchExecution {

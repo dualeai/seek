@@ -74,7 +74,7 @@ type semanticModelResult struct {
 }
 
 // semanticModelFuture owns the model of one command. Index build, semantic
-// query, and final reranking borrow the same model. runSearchCommand makes the
+// query, and final reranking borrow the same model. searchGraph makes the
 // future only when the model stages run, always with a factory, and the model
 // stages are its only users. So no method accepts a nil future or factory.
 type semanticModelFuture struct {

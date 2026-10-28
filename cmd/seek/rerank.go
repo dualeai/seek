@@ -408,8 +408,8 @@ func rerankFilter(node query.Q) bool {
 }
 
 // rerankModelSearchConfig collects at least the standard symmetric context for
-// model input. runSearchCommand applies the original config again before
-// display (applyRerankDisplayConfig).
+// model input. searchGraph applies the original config again before display
+// (applyRerankDisplayConfig).
 func rerankModelSearchConfig(config searchConfig) searchConfig {
 	out := config
 	opts := *config.opts

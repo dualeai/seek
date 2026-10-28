@@ -168,42 +168,29 @@ func bm25NodeScores(t *testing.T, pattern string, operands ...string) map[string
 	return scores
 }
 
-// bm25NodeSearch runs the strict route of runSearchCommand up to the display:
-// it searches the nodes of operands with searchNodes and strictNode, then
-// rescores the hits. The output hides the scores, so the test reads them
-// here. It returns each file's score by path and the command's BM25 state.
-// TestBM25LayoutIndependent and TestBM25ContextFollowsTheFinalScore check
-// through seek that runSearchCommand runs the same route.
+// bm25NodeSearch runs pattern as a lexical-only search command up to its
+// display (searchGraph), as runSearchCommand does. The output hides the
+// scores, so the test reads them before the display. It returns each file's
+// score by path and the command's BM25 state, which the searches read from
+// the context.
 func bm25NodeSearch(t *testing.T, pattern string, operands ...string) (map[string]float64, *bm25Command) {
 	t.Helper()
-	ctx := withSkippedNodes(context.Background())
-	plans, err := planCorpora(ctx, operands)
+	plan, err := planQuery(pattern, lexicalOnlySearch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx = withIndexWindow(ctx, len(plans))
-	qp, err := planQuery(pattern, lexicalOnlySearch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	execution := searchExecution{
-		policy:    lexicalOnlySearch,
-		resources: liveSearchResources(),
-		opened:    &openedNodes{},
-		// The operands give the headers that file: atoms read, as in a search.
-		operands: newDisplayOperands(operands),
-	}
-	ctx, command := withBM25Command(ctx, len(plans))
-	all, _, err := searchNodes(ctx, plans, func(nodeCtx context.Context, plan node) ([]corpusSearchResult, dirtyFileSet, error) {
-		return strictNode(nodeCtx, plan, qp, defaultSearchConfig(), execution)
-	})
+	scores := map[string]float64{}
+	var command *bm25Command
+	err = searchGraph(context.Background(), plan, operands, defaultSearchConfig(), searchRunConfig{policy: lexicalOnlySearch},
+		func(ctx context.Context, graph searchedGraph) error {
+			for _, result := range graph.results {
+				scores[filepath.Join(result.displayRoot, result.file.FileName)] = result.file.Score
+			}
+			command, _ = ctx.Value(bm25CommandKey{}).(*bm25Command)
+			return nil
+		})
 	if err != nil {
 		t.Fatalf("%s: %v", pattern, err)
-	}
-	rescoreStrictResults(all, command)
-	scores := map[string]float64{}
-	for _, result := range all {
-		scores[filepath.Join(result.displayRoot, result.file.FileName)] = result.file.Score
 	}
 	return scores, command
 }
