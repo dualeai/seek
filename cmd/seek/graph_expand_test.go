@@ -45,9 +45,9 @@ func graphSearch(t *testing.T, marker string, operands ...string) map[string]str
 }
 
 // TestGraphEdgeTable searches "." from the root of the graph that edgeGraph
-// builds. Each file of each edge kind is found once with its corpus tag. The
-// files of a Git-ignored folder, which holds a repository, and the files behind
-// a symlink stay absent.
+// builds. The search finds each file of each edge kind once, with its corpus
+// tag. The files of a Git-ignored folder, which holds a repository, and the
+// files behind a symlink stay absent.
 func TestGraphEdgeTable(t *testing.T) {
 	requireTools(t)
 	const marker = "zqgraphedgemarker"
@@ -95,7 +95,7 @@ func TestGraphExpandDotFromEveryFolder(t *testing.T) {
 }
 
 // TestGraphIgnoredFolderSearchedFromInside names a Git-ignored folder as the
-// operand: its loose file and the repository inside it are found.
+// operand: the search finds its loose file and the repository inside it.
 func TestGraphIgnoredFolderSearchedFromInside(t *testing.T) {
 	requireTools(t)
 	const marker = "zqgraphignoredmarker"
@@ -110,7 +110,7 @@ func TestGraphIgnoredFolderSearchedFromInside(t *testing.T) {
 
 // TestGraphParentStateStableWhenChildChanges changes a submodule and an
 // untracked nested repository. The children are their own nodes, so the parent
-// state does not change and the parent is not rebuilt.
+// state does not change, and Seek does not rebuild the parent.
 func TestGraphParentStateStableWhenChildChanges(t *testing.T) {
 	requireTools(t)
 	const marker = "zqgraphchildmarker"
@@ -152,7 +152,8 @@ func TestGraphParentStateStableWhenChildChanges(t *testing.T) {
 }
 
 // TestGraphBareRepoRunsNoGit puts a bare repository below a folder root. Its
-// files are Git internals: none is found, and no Git process runs in it.
+// files are Git internals: the search finds none, and no Git process runs in
+// it.
 func TestGraphBareRepoRunsNoGit(t *testing.T) {
 	requireTools(t)
 	const marker = "zqgraphbaremarker"
@@ -592,7 +593,7 @@ func TestCapturedStateLastsUntilAChange(t *testing.T) {
 
 // TestGitNodeSkipsUntrackedBareRepo puts an untracked bare repository inside a
 // Git work tree. Git lists its files as untracked, but they are Git internals:
-// none is found; an ordinary untracked file still is.
+// the search finds none of them, and still finds an ordinary untracked file.
 func TestGitNodeSkipsUntrackedBareRepo(t *testing.T) {
 	requireTools(t)
 	const marker = "zqgitbaremarker"
@@ -646,8 +647,14 @@ func TestGraphFailedChildWarnsOnce(t *testing.T) {
 func TestValidGitHead(t *testing.T) {
 	sha := strings.Repeat("a1", 20)
 	for head, want := range map[string]bool{
-		"ref: refs/heads/main\n":        true,
-		"ref:refs/heads/main\n":         true,
+		"ref: refs/heads/main\n":     true,
+		"ref:refs/heads/main\n":      true,
+		"ref:\t\r refs/heads/main\n": true,
+		"ref:\vrefs/heads/main\n":    false,
+		"ref:\frefs/heads/main\n":    false,
+		// Git reads 255 bytes of HEAD: "refs/" must end by byte 255.
+		"ref:" + strings.Repeat(" ", 246) + "refs/heads/main\n": true,
+		"ref:" + strings.Repeat(" ", 247) + "refs/heads/main\n": false,
 		"ref: HEAD\n":                   false,
 		sha + "\n":                      true,
 		strings.ToUpper(sha) + "\n":     true,

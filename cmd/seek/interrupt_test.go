@@ -170,9 +170,9 @@ func TestLockWaitsEndOnlyTheRunningWaits(t *testing.T) {
 	}
 }
 
-// TestLockWaitIsCountedBeforeItsLogLine checks that a wait counts when its
-// debug line is written. So an interrupt that a reader of the line sends ends
-// the wait.
+// TestLockWaitIsCountedBeforeItsLogLine checks that pollLock counts a wait
+// before it writes the debug line of the wait. So an interrupt that a reader
+// of the line sends ends the wait.
 func TestLockWaitIsCountedBeforeItsLogLine(t *testing.T) {
 	waits := newLockWaits()
 	canceled, cancel := context.WithCancel(t.Context())
@@ -182,8 +182,8 @@ func TestLockWaitIsCountedBeforeItsLogLine(t *testing.T) {
 	captureTestLogsWithAction(t, slog.LevelError, "Waiting for a test lock", func() {
 		ended := waits.endRunning()
 		if !ended {
-			// The interrupt cannot end a wait that is not counted: the
-			// context ends it, so the test fails instead of hanging.
+			// The interrupt cannot end a wait that pollLock did not count:
+			// the context ends it, so the test fails instead of hanging.
 			cancel()
 		}
 		counted <- ended

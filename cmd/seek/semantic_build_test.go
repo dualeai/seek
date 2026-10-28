@@ -101,8 +101,8 @@ func testEmbeddedBatch(rows []uint64, vector semanticVector) semanticEncodedBatc
 
 // TestCollectSemanticBatchesWritesRowsAtOffsets mixes model rows, out of
 // order, with rows copied from a live generation. Every row lands at its
-// offset in both vector files. Each 128-row block goes to the USearch stream
-// once.
+// offset in both vector files. The USearch stream gets the full first 128-row
+// block and the short last block.
 func TestCollectSemanticBatchesWritesRowsAtOffsets(t *testing.T) {
 	source := &semanticGeneration{
 		vectors: testSemanticFineVectors([]semanticUnitEmbedding{
@@ -679,9 +679,10 @@ type semanticStubParser struct{}
 func (semanticStubParser) Parse(string, []byte) ([]*ctags.Entry, error) { return nil, nil }
 func (semanticStubParser) Close()                                       {}
 
-// TestExtractSemanticDocumentsSendsWindowError gives the extractor a closed
-// tokenizer, so the window split of its one file fails. The extractor must
-// send that error to the build loop, which keeps the first error of the build.
+// TestExtractSemanticDocumentsSendsWindowError gives the extractor a nil
+// tokenizer, which reports itself closed, so the window split of its one file
+// fails. The extractor must send that error to the build loop, which keeps the
+// first error of the build.
 func TestExtractSemanticDocumentsSendsWindowError(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		jobs := make(chan semanticSourceDocument, 1)

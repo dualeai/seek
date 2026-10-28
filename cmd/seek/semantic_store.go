@@ -162,8 +162,8 @@ type semanticManifest struct {
 }
 
 // semanticGeneration owns one open semantic generation. vectors and coarse
-// alias the memory in vectorMap and coarseMap and must not be used after
-// Close. A generation validates each graph before its first native use.
+// alias the memory in vectorMap and coarseMap, so no caller may read them
+// after Close. A generation validates each graph before its first native use.
 type semanticGeneration struct {
 	manifest          semanticManifest
 	rows              []semanticUnit
@@ -469,14 +469,14 @@ func openSemanticGenerationWithOptions(
 }
 
 // validateUSearchShard checks the graph shard at index once. The open makes a
-// path and a check state for each shard of the manifest, and the search plan
-// gives only the index of a manifest shard.
+// path and a check state for each shard of the manifest. The search plan gives
+// only the index of a manifest shard.
 func (generation *semanticGeneration) validateUSearchShard(index int) error {
 	validation := &generation.usearchValidation[index]
 	validation.once.Do(func() {
 		shard := generation.manifest.USearchFiles[index]
-		// A shard that the check at build saw is trusted, as rows.bin is.
-		// Any other file gets a full hash.
+		// The check trusts a shard that the check at build saw, as it trusts
+		// rows.bin. Any other file gets a full hash.
 		if info, err := os.Lstat(generation.usearch[index]); err == nil && info.Mode().IsRegular() &&
 			uint64(info.Size()) == shard.Bytes && semanticRowsCheckOf(info) == shard.Check {
 			return
@@ -519,9 +519,12 @@ func readSemanticManifestChecked(dir, source string, graph bool) (semanticManife
 	return manifest, nil
 }
 
-// readSemanticManifestUnchecked decodes the manifest of dir and does not check
-// its source. So a build can name the source of another generation. The open
-// that follows checks the manifest in full.
+// readSemanticManifestUnchecked decodes the manifest of dir and checks none of
+// its values. So a caller can read the source of another generation, or
+// rewrite a manifest. A caller that reads the rows or the vectors opens the
+// generation, which checks the manifest (readSemanticManifestChecked). A
+// rows-only open, as in openGenerationAt, does not check the USearch shard
+// list.
 func readSemanticManifestUnchecked(dir string) (semanticManifest, error) {
 	file, err := openRegularSemanticFile(filepath.Join(dir, semanticManifestFile))
 	if err != nil {
@@ -581,8 +584,8 @@ func validateJSONFields(decoder *json.Decoder) error {
 
 // validateJSONValue reads one JSON value and rejects an object with a
 // duplicate key. Decoder.Token returns an error for a token out of place. So a
-// value never starts with a closing delimiter, an object key is always a
-// string, and the token after the last member or element closes its object or
+// value never starts with a closing delimiter, and an object key is always a
+// string. The token after the last member or element closes its object or
 // array.
 func validateJSONValue(decoder *json.Decoder) error {
 	token, err := decoder.Token()
@@ -734,12 +737,16 @@ func validateSemanticDigest(value string) error {
 	return nil
 }
 
-// validSHA256Hex reports whether value is a SHA-256 digest in hexadecimal.
+// validSHA256Hex reports whether value is a SHA-256 digest in hexadecimal, in
+// either letter case.
 func validSHA256Hex(value string) bool {
 	digest, err := hex.DecodeString(value)
 	return err == nil && len(digest) == sha256.Size
 }
 
+// openRegularSemanticFile opens path when it is a regular file. It fails when
+// path is a symbolic link, or when the file changes between the check and the
+// open.
 func openRegularSemanticFile(path string) (*os.File, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -771,10 +778,10 @@ func validateSemanticArtifact(path string, want semanticArtifact) error {
 	return nil
 }
 
-// readCheckedSemanticRows reads the rows.bin of the generation in dir. A file
-// that the recorded check of manifest saw is trusted. When the device, inode,
-// mtime, or ctime differs, it hashes the file and compares the hash with the
-// manifest.
+// readCheckedSemanticRows reads the rows.bin of the generation in dir. It
+// trusts a file that the recorded check of manifest saw. When the device,
+// inode, mtime, or ctime differs, it hashes the file and compares the hash with
+// the manifest.
 func readCheckedSemanticRows(dir string, manifest semanticManifest) ([]semanticUnit, error) {
 	file, err := openRegularSemanticFile(filepath.Join(dir, semanticRowsFile))
 	if err != nil {
@@ -835,6 +842,9 @@ func semanticRowsCheckOf(info os.FileInfo) semanticRowsCheck {
 	}
 }
 
+// readVerifiedSemanticRows is the full check of rows.bin. It parses count
+// rows, computes each unit ID again, and compares the SHA-256 of the bytes
+// that it read with wantSHA256.
 func readVerifiedSemanticRows(
 	reader io.Reader,
 	wantSHA256 string,
@@ -853,8 +863,8 @@ func readVerifiedSemanticRows(
 }
 
 // readSemanticRowsFrom parses rows. verifyIDs computes each unit ID again,
-// which the full check does. A file that the recorded check saw is trusted, so
-// its open hashes nothing.
+// which the full check does. The open trusts a file that the recorded check
+// saw, so it hashes nothing and does not compute the IDs.
 func readSemanticRowsFrom(reader io.Reader, count uint64, verifyIDs bool) ([]semanticUnit, error) {
 	buffered := bufio.NewReaderSize(reader, 256<<10)
 	var header [semanticRowsHeaderBytes]byte
@@ -1038,7 +1048,7 @@ func exactSemanticSortedRows(
 }
 
 // exactSemanticRowSelection scores every row of vectors when rows is nil. This
-// keeps a full recovery scan from allocating one uint64 for every row. The
+// keeps a full scan from allocating one uint64 for every row. The
 // workers keep only the rows that reach floor, so the one sort sees only those
 // rows.
 func exactSemanticRowSelection(

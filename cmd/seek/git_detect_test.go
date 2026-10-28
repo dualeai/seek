@@ -471,7 +471,7 @@ func TestDetectBareRepoAt_True(t *testing.T) {
 }
 
 func TestDetectBareRepoAt_FalseOnRegularRepo(t *testing.T) {
-	// A regular repo with `.git/` must NOT be classified as bare.
+	// detectBareRepoAt must report false for a regular repo with `.git/`.
 	root := t.TempDir()
 	writeGitTriadAt(t, filepath.Join(root, ".git"))
 	if detectBareRepoAt(root) {

@@ -17,8 +17,9 @@
 #   ./cicd/bench-field.sh --keep         # keep workdir for re-runs
 #
 # Builds this checkout by default. Set SEEK_BIN=/path/to/seek to compare
-# another binary. The script owns WORKDIR; it deletes, resets, cleans, and
-# changes files only in the workload folders under it.
+# another binary. The script owns WORKDIR. Apart from the default build of
+# this checkout, it deletes, resets, cleans, and changes files only in
+# WORKDIR.
 #
 # The default exact query still builds or updates both index parts. Pass an
 # already-built binary through SEEK_BIN when the build tools are unavailable.
@@ -62,8 +63,8 @@ esac
 mkdir -p "$WORKDIR"
 echo "workdir: $WORKDIR" >&2
 
-# Sandbox the seek cache so cold-index iterations don't wipe the
-# developer's real cache. Honoured by seek's seekUserCacheRoot.
+# Put the seek cache in the workdir, so the cold-index runs do not remove the
+# developer's real cache. seekUserCacheRoot reads SEEK_CACHE_DIR.
 export SEEK_CACHE_DIR="$WORKDIR/cache"
 mkdir -p "$SEEK_CACHE_DIR"
 
@@ -95,10 +96,10 @@ elif [ ! -x "$SEEK_BIN" ]; then
   exit 2
 fi
 
-# time_ns CMD ...: print elapsed nanoseconds. /usr/bin/time -p prints
-# "real X.XX" on stderr. Capture stderr to a tmp file (subshell redirect
-# folding doesn't carry command's stderr correctly with set -e).
-# Fails any non-zero status: timed field queries are expected to match.
+# time_ns CMD ...: print the elapsed time in nanoseconds. /usr/bin/time -p
+# writes "real X.XX" to stderr. Write stderr to a temporary file: with set -e, a
+# redirect in a subshell does not keep the stderr of the command.
+# It fails on a non-zero status, because each timed field query must match.
 time_ns() {
   local tmp real rc
   tmp=$(mktemp)
@@ -118,7 +119,8 @@ time_ns() {
   awk -v r="${real:-0}" 'BEGIN{printf "%d\n", r * 1000000000}'
 }
 
-# fmt_dur NS: render nanoseconds as ms or s with one decimal.
+# fmt_dur NS: print nanoseconds as whole milliseconds below 1 s, else as
+# seconds with one decimal.
 fmt_dur() {
   awk -v ns="$1" 'BEGIN{
     ms = ns/1000000.0
@@ -225,10 +227,10 @@ bench_warm() {
     | sort -n | sed -n "${mid}p"
 }
 
-# bench_dirty_reindex ROOT PCT: warm baseline; mutate PCT%; time reindex.
-# State carries across calls: dirty 1% then dirty 10% leaves the workload
-# with 11% cumulative mutations. Seek's state hash detects only newly
-# mutated files, so each measurement still reflects the per-PCT delta.
+# bench_dirty_reindex ROOT PCT: run a warm search, change PCT% of the files,
+# then time the reindex. The changes add up across calls: dirty 1% then dirty
+# 10% leaves up to 11% of the files changed. Seek indexes only the files that
+# changed since its last build, so each run times the delta of its PCT.
 bench_dirty_reindex() {
   local root="$1" pct="$2"
   "$SEEK_BIN" 'package' "$root" >/dev/null

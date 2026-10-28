@@ -23,6 +23,14 @@ import (
 	"github.com/sourcegraph/zoekt/query"
 )
 
+// maxFolderDeltaShards is the most shards that a folder family can hold above
+// its last full build (folderManifest.BaseShards) when a delta starts. Above
+// it, the build rebuilds the family in full. The build checks the count only
+// when a delta starts, and one delta can add a whole index window of shards.
+// The count leaves out the shards of the full build: a full rebuild writes
+// them again, so it cannot reduce them.
+// folderManifestFileName holds the folderManifest of the last build, in
+// format folderManifestVersion.
 const (
 	maxFolderDeltaShards   = 64
 	folderManifestVersion  = 3
@@ -52,7 +60,8 @@ type folderCandidate struct {
 }
 
 // heldBytes is the content bytes that the shard document of the file holds,
-// with marker as shardHeldBytes takes it. A cloud-only file has no bytes.
+// with marker as shardHeldBytes takes it. Seek has no bytes of a cloud-only
+// file, so the file counts as its marker.
 func (c folderCandidate) heldBytes(marker int64) int64 {
 	return shardHeldBytes(marker, c.size, c.dataless)
 }
@@ -164,8 +173,8 @@ func ensureFolderCorpusFreshWithExecution(
 	}
 	defer unlock()
 
-	// The node walks again under the lock when it has no state, when the
-	// fingerprint gave a file count and no file list, or when a peer published
+	// The node walks again under the lock when it has no state, or a file
+	// count with no file list. It also walks again when a peer published
 	// another state.
 	walk := !stateReady || (!selectedLoaded && selectedCount > 0)
 	if stateReady {
@@ -269,13 +278,14 @@ func ensureFolderCorpusFreshWithExecution(
 	}
 	var lexicalBuild func()
 	// tombstoned is the content that deltas tombstoned since the last full
-	// build, and markers the marker bytes of each selected file, for the
-	// folder manifest.
+	// build, markers the marker bytes of each selected file, and baseShards
+	// the shard count of the last full build, for the folder manifest.
 	var tombstoned int64
 	var markers []int64
+	var baseShards int
 	if build.lexical && selectedCount > 0 {
 		lexicalBuild = func() {
-			indexedAny, tombstoned, markers, lexicalErr = indexFolderDocuments(
+			indexedAny, tombstoned, markers, baseShards, lexicalErr = indexFolderDocuments(
 				ctx,
 				plan,
 				buildDir,
@@ -392,7 +402,7 @@ func ensureFolderCorpusFreshWithExecution(
 	// lexical build, the published state is stateHash, so the manifest of that
 	// build stays, with its tombstoned bytes.
 	if build.lexical && selectedCount > 0 {
-		if err := writeFolderManifest(plan.cacheDir, stateHash, selected, tombstoned, markers); err != nil {
+		if err := writeFolderManifest(plan.cacheDir, stateHash, selected, tombstoned, markers, baseShards); err != nil {
 			slog.Debug("Failed to write folder manifest", "error", err)
 		}
 	}
@@ -434,14 +444,15 @@ func folderCorpusError(plan node, err error) error {
 	}
 }
 
-// indexFolderDocuments indexes selected into dir, the build directory. It
-// makes a delta on the prior shards in dir when tryDelta holds and the family
-// has at most maxFolderDeltaShards shards. Else, or when the delta fails, it
-// makes a full build. It returns the bytes that deltas tombstoned since the
-// last full build (zero after a full build). For the folder manifest, it also
-// returns the marker bytes of each file by index of selected
-// (nameOnlyMarkerBytes). A read error that can pass fails the build with a
-// folderReadError.
+// indexFolderDocuments indexes selected into dir, the build directory. It makes
+// a delta on the prior shards in dir when tryDelta holds and the shard cap
+// admits the family (folderDeltaShardLimitExceeded). Else, or when the delta
+// fails, it makes a full build. It returns the bytes that deltas tombstoned
+// since the last full build (zero after a full build). For the folder manifest,
+// it also returns the marker bytes of each file by index of selected
+// (nameOnlyMarkerBytes). Its fourth result is the shard count of the last full
+// build (folderManifest.BaseShards). A read error that can pass fails the build
+// with a folderReadError.
 func indexFolderDocuments(
 	ctx context.Context,
 	plan node,
@@ -450,14 +461,22 @@ func indexFolderDocuments(
 	parallelism int,
 	tryDelta bool,
 	cachedState string,
-) (bool, int64, []int64, error) {
+) (bool, int64, []int64, int, error) {
 	repoName := folderRepoName(plan)
 	if tryDelta {
+		// The delta reads the manifest of the cached state. A missing one
+		// records no base, so the cap then counts every shard.
+		var cached *folderManifest
+		base := 0
+		if manifest, ok := readFolderManifest(plan.cacheDir, cachedState); ok {
+			cached = &manifest
+			base = manifest.BaseShards
+		}
 		shardCount := repositoryShardCount(dir, repoName)
-		if shardCount > 0 && shardCount <= maxFolderDeltaShards {
-			indexedAny, tombstoned, markers, err := indexFolderDocumentsDelta(ctx, plan, dir, selected, parallelism, cachedState)
+		if shardCount > 0 && !folderDeltaShardLimitExceeded(shardCount, base) {
+			indexedAny, tombstoned, markers, err := indexFolderDocumentsDelta(ctx, plan, dir, selected, parallelism, cached)
 			if err == nil {
-				return indexedAny, tombstoned, markers, nil
+				return indexedAny, tombstoned, markers, base, nil
 			}
 			// Log why the delta fell back to a full build: its payload
 			// reached the window, its tombstones need a compaction, or the
@@ -470,8 +489,8 @@ func indexFolderDocuments(
 			default:
 				slog.Debug("Folder delta indexing failed, falling back to full rebuild", "error", err)
 			}
-		} else if shardCount > maxFolderDeltaShards {
-			slog.Debug("Folder delta shard limit reached, falling back to full rebuild", "shards", shardCount)
+		} else if shardCount > 0 {
+			slog.Debug("Folder delta shard limit reached, falling back to full rebuild", "shards", shardCount, "base_shards", base)
 		}
 	}
 	readCtx, cancel := context.WithCancelCause(ctx)
@@ -480,32 +499,44 @@ func indexFolderDocuments(
 	fileCh := streamFolderFilesWithMarkers(readCtx, selected, parallelism, cancel, markers)
 	indexed, err := indexDocuments(readCtx, dir, repoName, plan.root, fileCh, parallelism)
 	if readErr, ok := errors.AsType[*folderReadError](context.Cause(readCtx)); ok {
-		return false, 0, nil, readErr
+		return false, 0, nil, 0, readErr
 	}
-	return indexed, 0, markers, err
+	if err != nil {
+		return indexed, 0, markers, 0, err
+	}
+	// A full build prunes the older shards (indexDocumentsWithRepository),
+	// so dir holds only its shards.
+	return indexed, 0, markers, repositoryShardCount(dir, repoName), nil
 }
 
-// indexFolderDocumentsDelta writes the changed files of the folder into a
-// delta on the prior shards in dir. It runs up to parallelism shard jobs at
-// the same time. A delta of removals only adds no document; Zoekt then writes
-// only the tombstones (indexDeltaDocumentsWithRepository). It returns the
-// bytes that deltas tombstoned since the last full build, and the markers of
-// indexFolderDocuments. It returns errDeltaCompaction when the tombstoned
-// bytes reach both the live bytes and one shard (deltaNeedsCompaction). The
-// rule runs before the reads, with an upper bound of each unread file's shard
-// bytes (unreadFileMarker). It runs again after them, with the bytes that
-// each read file's shard document holds. It returns
-// errDeltaPayloadExceedsWindow when the changed content reaches the build's
-// window, with or without a manifest of the cached state. With no such
-// manifest, the dead bytes are what the shards list beyond the live files. So
-// a missing, failed, or older manifest does not reset them.
+// folderDeltaShardLimitExceeded reports a folder family that a delta must not
+// extend. That family has fewer shards than its full base, or more than
+// maxFolderDeltaShards shards above it. base is 0 when no manifest records it.
+func folderDeltaShardLimitExceeded(current, base int) bool {
+	return current < base || current-base > maxFolderDeltaShards
+}
+
+// indexFolderDocumentsDelta writes the changed files of the folder into a delta
+// on the prior shards in dir. It runs up to parallelism shard jobs at the same
+// time. A delta of removals only adds no document; Zoekt then writes only the
+// tombstones (indexDeltaDocumentsWithRepository). It returns the bytes that
+// deltas tombstoned since the last full build, and the markers of
+// indexFolderDocuments. cached is the manifest of the cached state, or nil. It
+// returns errDeltaCompaction when the tombstoned bytes reach both the live
+// bytes and one shard (deltaNeedsCompaction). The rule runs before the reads,
+// with an upper bound of each unread file's shard bytes (unreadFileMarker). It
+// runs again after them, with the bytes that each read file's shard document
+// holds. It returns errDeltaPayloadExceedsWindow when the changed content
+// reaches the build's window, with or without a manifest of the cached state.
+// With no such manifest, the dead bytes are what the shards list beyond the
+// live files. So a missing, failed, or older manifest does not reset them.
 func indexFolderDocumentsDelta(
 	ctx context.Context,
 	plan node,
 	dir string,
 	selected []folderCandidate,
 	parallelism int,
-	cachedState string,
+	cached *folderManifest,
 ) (bool, int64, []int64, error) {
 	repoName := folderRepoName(plan)
 	var changedDocs []fileContent
@@ -515,7 +546,8 @@ func indexFolderDocumentsDelta(
 	for i := range markers {
 		markers[i] = unreadFileMarker
 	}
-	if manifest, ok := readFolderManifest(plan.cacheDir, cachedState); ok {
+	if cached != nil {
+		manifest := *cached
 		tombstoned = manifest.DeadBytes + folderManifestDiff(selected, manifest, markers)
 		if deltaNeedsCompaction(tombstoned, folderLiveBytes(selected, markers)) {
 			return false, 0, nil, errDeltaCompaction
@@ -577,7 +609,7 @@ func folderLiveBytes(selected []folderCandidate, markers []int64) int64 {
 }
 
 // folderLiveBytesWithNames is folderLiveBytes with the name bytes, as Zoekt
-// counts a document in index.RepoStats.ContentBytes.
+// counts a document in zoekt.RepoStats.ContentBytes.
 func folderLiveBytesWithNames(selected []folderCandidate, markers []int64) int64 {
 	live := folderLiveBytes(selected, markers)
 	for _, candidate := range selected {
@@ -638,7 +670,7 @@ func setFolderMarkers(selected []folderCandidate, docs []fileContent, markers []
 // enumerateIndexedFolderChecksums returns the content checksum of each live
 // document of repoName in indexDir. It also returns the content and name
 // bytes that its shards hold, with the tombstoned documents
-// (index.RepoStats.ContentBytes).
+// (zoekt.RepoStats.ContentBytes).
 func enumerateIndexedFolderChecksums(ctx context.Context, indexDir, repoName string) (map[string]uint64, int64, error) {
 	searchers, err := loadShards(indexDir)
 	if err != nil {
@@ -750,8 +782,12 @@ type folderManifest struct {
 	State   string `json:"state"`
 	// DeadBytes is the content that deltas tombstoned since the last full
 	// build (deltaNeedsCompaction).
-	DeadBytes int64                 `json:"dead_bytes"`
-	Files     []folderManifestEntry `json:"files"`
+	DeadBytes int64 `json:"dead_bytes"`
+	// BaseShards is the shard count of the last full build, or 0 when the
+	// build that wrote the manifest did not know it. The delta cap counts
+	// only the shards above it (folderDeltaShardLimitExceeded).
+	BaseShards int                   `json:"base_shards,omitempty"`
+	Files      []folderManifestEntry `json:"files"`
 }
 
 // folderManifestEntry is the stat record of one file in a folderManifest.
@@ -792,15 +828,16 @@ func readFolderManifest(cacheDir, expectedState string) (folderManifest, bool) {
 	return manifest, manifest.Version == folderManifestVersion && manifest.State == expectedState
 }
 
-// writeFolderManifest writes the manifest of selected, with deadBytes and the
-// marker bytes of each file by index. It stores an unreadFileMarker as zero,
-// because a manifest never stores that value.
-func writeFolderManifest(cacheDir, state string, selected []folderCandidate, deadBytes int64, markers []int64) error {
+// writeFolderManifest writes the manifest of selected, with deadBytes, the
+// marker bytes of each file by index, and baseShards. It stores an
+// unreadFileMarker as zero, because a manifest never stores that value.
+func writeFolderManifest(cacheDir, state string, selected []folderCandidate, deadBytes int64, markers []int64, baseShards int) error {
 	manifest := folderManifest{
-		Version:   folderManifestVersion,
-		State:     state,
-		DeadBytes: deadBytes,
-		Files:     make([]folderManifestEntry, len(selected)),
+		Version:    folderManifestVersion,
+		State:      state,
+		DeadBytes:  deadBytes,
+		BaseShards: baseShards,
+		Files:      make([]folderManifestEntry, len(selected)),
 	}
 	for i, candidate := range selected {
 		manifest.Files[i] = folderManifestEntry{
@@ -1205,7 +1242,9 @@ var folderOpenFile = openWorkTreeFile
 var errFolderFileGrew = errors.New("file grew beyond its stat size")
 
 // folderReadError is a read error that can pass (EMFILE, EIO, ESTALE, a
-// network timeout): the build stops and publishes nothing.
+// network timeout). It stops a folder build, which then publishes nothing. A
+// Git text build keeps the dirty file by name instead, except on EMFILE or
+// ENFILE (dirtyFailure).
 type folderReadError struct {
 	path string
 	err  error
@@ -1214,10 +1253,11 @@ type folderReadError struct {
 func (e *folderReadError) Error() string { return fmt.Sprintf("read %s: %v", e.path, e.err) }
 func (e *folderReadError) Unwrap() error { return e.err }
 
-// folderReadIsLasting reports a read error that the next search would see
-// again: the file stays searchable by name. A permission fix changes the
-// ctime, which the state hash sees. ELOOP comes from the Lstat of the dirty
-// reader when a directory of the path is a symlink loop.
+// folderReadIsLasting reports a read error that a retry in the same build
+// would see again: the file stays searchable by name. The fix of each error
+// changes the state hash: a chmod changes the ctime, and a file that grew has
+// a new size. ELOOP comes from the Lstat of the dirty reader when a directory
+// of the path is a symlink loop.
 func folderReadIsLasting(err error) bool {
 	return errors.Is(err, fs.ErrPermission) || errors.Is(err, errFolderFileGrew) ||
 		errors.Is(err, syscall.ENAMETOOLONG) || errors.Is(err, syscall.ELOOP)

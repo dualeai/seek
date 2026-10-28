@@ -24,7 +24,8 @@ const (
 	// vector. It covers three errors. An accepted input squared norm differs
 	// from 1 by up to 0.001. The binary16 rounding has a relative error of at
 	// most 2^-11 for each component, so it adds at most 0.000978. The check
-	// sums in float32. The worst valid vector stays below 0.001982.
+	// in C sums in float32 (semantic_numkong.go). The worst valid vector stays
+	// below 0.001982.
 	// TestSemanticF16NormToleranceCoversRounding checks the bound.
 	semanticF16SquaredNormTolerance = 0.002
 )

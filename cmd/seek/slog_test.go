@@ -22,8 +22,8 @@ func captureTestLogs(t *testing.T, minLevel slog.Level) *testLogRecorder {
 
 // captureTestLogsWithSignal is captureTestLogs with a signal for one lock
 // wait. pollLock writes one debug line for each lock wait. The channel gets a
-// value for each such line whose message is reason, a lockWait constant, and
-// whose "lock" attribute is lock. A wait on another lock sends nothing. The
+// value for each such line whose message is reason (such as lockWaitBuild)
+// and whose "lock" attribute is lock. A wait on another lock sends nothing. The
 // channel holds one value: a record that comes before the test receives the
 // last value adds none.
 func captureTestLogsWithSignal(t *testing.T, minLevel slog.Level, reason, lock string) (*testLogRecorder, <-chan struct{}) {

@@ -46,11 +46,11 @@ const (
 
 // semanticUSearchShardRowsFor gives the shard size of a generation of rows
 // rows on cpus CPUs. It is the largest power of two from 256 to 4,096 that is
-// at most rows / cpus, or 256 when rows / cpus is smaller. So a generation of
-// 256 rows or more per CPU builds its graphs on all CPUs. One shard of 4,096
-// rows takes 436 ms on one CPU, and 16 shards of 256 rows take 17 ms on 16
-// CPUs. A power of two keeps the size, and so the cut, the same when a commit
-// adds or removes a few rows.
+// at most rows / cpus. When rows / cpus is below 256, it is 256. So a
+// generation of 256 rows or more per CPU builds its graphs on all CPUs. One
+// shard of 4,096 rows takes 436 ms on one CPU, and 16 shards of 256 rows take
+// 17 ms on 16 CPUs. A power of two keeps the size, and so the cut, the same
+// when a commit adds or removes a few rows.
 func semanticUSearchShardRowsFor(rows uint64, cpus int) uint64 {
 	perCPU := rows / uint64(max(1, cpus))
 	size := uint64(semanticUSearchMaxShardRows)
@@ -246,10 +246,11 @@ func semanticUSearchCutAnchorHit(anchor, rows, spacing uint64) bool {
 }
 
 // semanticUSearchShardID identifies the graph of one shard. It hashes the
-// USearch runtime and layout, and the row count. It also hashes the key, the
-// unit ID, and the coarse vectors of each row. Two generations can hold one
-// key with other vectors (another model provider), so the vectors are in the
-// ID. A graph file with this ID holds exactly these vectors under these keys.
+// USearch runtime and layout, and the row count. It also hashes the model
+// input key, the unit ID, and the coarse vectors of each row. Two generations
+// can hold one model input key with other vectors (another model provider), so
+// the vectors are in the ID. A graph file with this ID holds exactly these
+// vectors, under the shard keys of their rows.
 func semanticUSearchShardID(
 	compatibility string,
 	plan semanticUSearchShardPlan,
@@ -303,8 +304,8 @@ func (sources semanticUSearchShardSources) add(dir string, link bool) {
 }
 
 // semanticUSearchShardReuse is a source that a build copied into its
-// generation, or a link source that it verified and links once every shard is
-// ready (placeSemanticUSearchShards).
+// generation. Or it is a link source that the build verified, and that it
+// links once every shard is ready (placeSemanticUSearchShards).
 type semanticUSearchShardReuse struct {
 	source   semanticUSearchShardSource
 	verified os.FileInfo

@@ -342,8 +342,7 @@ func canonicalCorpusPath(path string) string {
 // disk images, it changed the path only where onDiskPath does not give the
 // stored names:
 //   - On macOS, at or below a directory that the user cannot read: onDiskPath
-//     cannot open that directory, but the listing of its parent gives its
-//     name.
+//     cannot open it, but the listing of its parent gives its name.
 //   - On macOS exFAT and FAT32: F_GETPATH can give a directory name with the
 //     letter case that the user typed, and it gives NFC. The listing gives
 //     the stored name, in NFD. Git on macOS keeps names in NFC
@@ -364,7 +363,7 @@ func realCaseWithin(root, path string, listings dirListings) string {
 }
 
 // dirListings caches directory listings for the case lookups of one command.
-// A read error is cached as an empty listing.
+// It keeps a read error as an empty listing.
 type dirListings map[string][]os.DirEntry
 
 func (listings dirListings) read(dir string) []os.DirEntry {

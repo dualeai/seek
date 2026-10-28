@@ -37,7 +37,8 @@ func TestFolderDrift_NextBuildIndexesTheDrift(t *testing.T) {
 		t.Fatal("the first build left no usable family")
 	}
 
-	// Add a file while the build runs.
+	// second.go makes the next build run, and late.go arrives while that
+	// build waits to publish.
 	writeFileAt(t, folder, "second.go", "package sample\n// forces a rebuild\n")
 	release := holdReadLock(t, plan.cacheDir)
 	_, waiting := captureTestLogsWithSignal(t, slog.LevelWarn, lockWaitReaders, filepath.Join(plan.cacheDir, lockFile))
@@ -80,7 +81,7 @@ func TestFolderDrift_NextBuildIndexesTheDrift(t *testing.T) {
 
 // firstShardInfo returns the FileInfo of shard 0, which a delta build keeps and
 // a full build replaces. It asks the family scan for the shard number rather
-// than sorting names, so it does not restate how a shard name is formed.
+// than sorting names, so it does not restate the rule of shard names.
 func firstShardInfo(tb testing.TB, indexDir string) os.FileInfo {
 	tb.Helper()
 	scan, err := scanFamily(indexDir)

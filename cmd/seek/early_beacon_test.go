@@ -63,9 +63,9 @@ func TestEnsureFolderCorpusFresh_MultiShardEarlyBeaconSurvives(t *testing.T) {
 		t.Fatalf("expected >= 2 shards, got %d", n)
 	}
 
-	// Both beacons must be found. The early beacon proves that the later shards
-	// left the first shard searchable, and the late beacon proves that the
-	// final shard flushed.
+	// The search must find both beacons. The early beacon proves that the
+	// later shards left the first shard searchable, and the late beacon
+	// proves that the final shard flushed.
 	for _, b := range []struct{ name, marker string }{{"early", earlyBeacon}, {"late", lateBeacon}} {
 		results, err := searchPlannedCorpusForTest(ctx, plan, b.marker)
 		if err != nil {

@@ -169,8 +169,8 @@ func TestSemanticNumKongAllowedCapabilitiesNeedEveryTarget(t *testing.T) {
 // TestSemanticFineKernelMatchesFloat64Oracle scores random rows with every
 // kernel family that the host can run, in whole ranges and in rows with gaps.
 // It compares each score with a float64 oracle of the stored codes. The oracle
-// and the float32 source score do not change with the family or the row set,
-// so the test computes them once for each row and query.
+// and the float32 source score do not change with the family or the row set.
+// So the test computes them once for each row and query.
 func TestSemanticFineKernelMatchesFloat64Oracle(t *testing.T) {
 	random := rand.New(rand.NewPCG(21, 22))
 	const rowCount = 700

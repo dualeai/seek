@@ -167,6 +167,9 @@ func (future *semanticModelFuture) startQuery(ctx context.Context, query string)
 	})
 }
 
+// prepareQuery waits for the model and the prepared query of the command. The
+// future prepares one query text only: a call with another text, or with no
+// text, gets errRerankUnavailable.
 func (future *semanticModelFuture) prepareQuery(
 	ctx context.Context,
 	query string,
@@ -205,8 +208,8 @@ type searchExecution struct {
 	// semanticSearch command drops the joined descriptor before a family
 	// changes (decideGitBuild).
 	policy searchPolicy
-	// model is the command's model. It is set only when the model stages run
-	// (a query that the semanticSearch policy plans with model text), and then
+	// model is the command's model. It is set only when the model stages run:
+	// for a query that the semanticSearch policy plans with model text. Then
 	// every node builds and binds its vector generation before its read. A Git
 	// node with no commit has no base to build; the overlay adds its files.
 	model     *semanticModelFuture

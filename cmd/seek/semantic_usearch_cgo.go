@@ -310,9 +310,10 @@ func semanticUSearchCompatibility() (string, error) {
 }
 
 // semanticUSearchLayout identifies settings that affect stored index
-// compatibility. semanticUSearchCompatibility adds the loaded runtime version.
-// The host-sized shard size is not here: the manifest records it, and the
-// search reads each shard's rows from the manifest.
+// compatibility. semanticUSearchCompatibility adds the loaded runtime version
+// and the digest of the bundled library. The host-sized shard size is not
+// here: the manifest records it, and the search reads each shard's rows from
+// the manifest.
 func semanticUSearchLayout() string {
 	return fmt.Sprintf(
 		"metric%d-quant%d-m%d-add%d-search%d-threads%d-c%d-maxrows%d-filecut-v%d",

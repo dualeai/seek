@@ -15,6 +15,8 @@ import (
 // Search commands use exit code 1 for this normal outcome and print no error.
 var errNoMatch = errors.New("no match")
 
+// exitCodeForError gives the exit code of a command: 0 with no error, 1 for
+// errNoMatch, and 2 for any other error.
 func exitCodeForError(err error) int {
 	switch {
 	case err == nil:
@@ -38,6 +40,9 @@ func reportCLIError(w io.Writer, err error, verbose bool) {
 	}
 }
 
+// newCLILogger writes text records to w from the Warn level, or from the
+// Debug level with verbose. Its handler promotes Zoekt index-damage notices
+// (zoektWarningHandler).
 func newCLILogger(w io.Writer, verbose bool) *slog.Logger {
 	level := slog.LevelWarn
 	if verbose {

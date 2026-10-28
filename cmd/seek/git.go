@@ -109,9 +109,10 @@ func gitHeadTreeish(ctx context.Context, dir string) (string, error) {
 }
 
 // parseGitStatusV2Skipping parses git status --porcelain=v2 --branch
-// --no-renames -z output. With -z, ALL records (headers and entries) are
-// NUL-terminated. It drops the untracked entries below the bareRepos
-// directories from Files and RawOutput.
+// --no-renames -z output. With -z, a NUL byte ends each record, header or
+// entry. It puts the nested repositories in Children, not in Files or
+// RawOutput. It drops the untracked entries below the bareRepos directories
+// from Files and RawOutput.
 func parseGitStatusV2Skipping(raw string, bareRepos []string) repoState {
 	state := repoState{HeadSHA: gitNoHead}
 
@@ -120,8 +121,6 @@ func parseGitStatusV2Skipping(raw string, bareRepos []string) repoState {
 	seen := make(map[string]struct{})
 	pos := 0
 
-	// Parse NUL-terminated records. With -z, both header lines (# ...)
-	// and entry records use NUL as the terminator.
 	for pos < len(raw) {
 		end := strings.IndexByte(raw[pos:], 0)
 		if end < 0 {

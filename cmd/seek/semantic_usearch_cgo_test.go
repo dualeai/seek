@@ -19,10 +19,10 @@ import (
 )
 
 // TestSemanticUSearchCompatibilityUsesLoadedRuntime checks the identity that a
-// manifest stores. It names the version that the loaded runtime reports, and
-// the storage layout. That version must be the one that
-// cicd/rerank-assets-upgrade.sh pins. The asset key, the directory of the
-// extracted runtime, follows the runtime bytes.
+// manifest stores. It names the version that the loaded runtime reports, the
+// asset key, and the storage layout. That version must be the one that
+// cicd/rerank-assets-upgrade.sh pins. The asset key, which also names the
+// directory of the extracted runtime, follows the runtime bytes.
 func TestSemanticUSearchCompatibilityUsesLoadedRuntime(t *testing.T) {
 	compatibility, err := semanticUSearchCompatibility()
 	if err != nil {

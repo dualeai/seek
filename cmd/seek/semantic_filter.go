@@ -99,9 +99,9 @@ const semanticFilteredExactRows = 256
 // of one file. It writes bitmap ranges and shard counts during that same pass,
 // for the bitmap filter of USearch's filtered search. The open of a
 // generation checks that each row holds its index and a path
-// (readSemanticRowsFrom), and that the shards cover the rows in order
-// (validateSemanticUSearchShardMetadata). So the mask does not check them
-// again.
+// (readSemanticRowsFrom). It also checks that the shards cover the rows in
+// order (validateSemanticUSearchShardMetadata). So the mask does not check
+// them again.
 func buildSemanticFilterMask(
 	ctx context.Context,
 	generation *semanticGeneration,
@@ -199,6 +199,10 @@ func setSemanticFilterRange(bits []byte, start, end uint64) {
 	}
 }
 
+// addSemanticFilterShardRange adds the rows in [start, end) to the count of
+// each shard that holds them. The caller gives the ranges in row order. So
+// shardAt keeps the first shard that a later range can reach, and the next
+// call starts there.
 func addSemanticFilterShardRange(
 	shards []semanticUSearchShard,
 	counts []uint64,

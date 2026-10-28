@@ -266,9 +266,9 @@ func TestExplicitFileAtomInOrReadsTheHeader(t *testing.T) {
 	}
 }
 
-// TestHeaderTakesTheDeepestFirstOperand checks which operand gives a header:
-// the deepest root that holds the file, the first operand typed for one root,
-// ".", and the root "/". A relative path has no holder.
+// TestHeaderTakesTheDeepestFirstOperand checks which operand gives a header.
+// The cases are the deepest root that holds the file, the first operand typed
+// for one root, ".", and the root "/". A relative path has no holder.
 func TestHeaderTakesTheDeepestFirstOperand(t *testing.T) {
 	root := canonicalCorpusPath(t.TempDir())
 	file := filepath.Join(root, "sub", "deep", "a.go")

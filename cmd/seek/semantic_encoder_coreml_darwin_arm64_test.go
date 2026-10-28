@@ -389,8 +389,8 @@ func TestReadLateOnProviderRecordRejectsMalformedRecords(t *testing.T) {
 	if got := readLateOnProviderRecord(path).faults; got != 1 {
 		t.Fatalf("counted %d faults, want 1", got)
 	}
-	// A lone old fault expires, so a host that saw one benign cancellation
-	// stops paying for a probe on every search.
+	// A lone old fault expires. So a host that saw one benign fault (a vector
+	// whose norm cancels to zero) stops paying for a probe on every search.
 	expired := time.Now().Add(-lateOnProviderFaultWindow - time.Hour).Unix()
 	if err := os.WriteFile(path, fmt.Appendf(nil, "recheck 1 %d\n", expired), 0o600); err != nil {
 		t.Fatal(err)

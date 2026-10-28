@@ -354,7 +354,7 @@ func TestSuggestFlagError_NoSuggestionWhenTooFar(t *testing.T) {
 
 // TestSuggestFlagError_SubcommandInheritedFlag checks that a typo of an
 // inherited persistent flag on the gc subcommand still gets a suggestion. gc
-// sets no flag error function and declares no --verbose, so the hint needs
+// sets no flag error function and declares no --verbose. So the hint needs
 // the function of the root and the parsed flag set of gc.
 func TestSuggestFlagError_SubcommandInheritedFlag(t *testing.T) {
 	root := newQuietRootCmd()

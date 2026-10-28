@@ -886,13 +886,13 @@ func TestDisplayLimitsApplyAfterTheRank(t *testing.T) {
 	}
 }
 
-// TestDeletedSemanticSourceKeepsOtherNodes deletes a folder file while its
-// unit is embedded (a change during a build), with a model that accepts every
-// row. The command still answers with the file of the other node. It prints
-// the deleted file with the text that the index holds, as a strict hit does.
-// The next search reads the tree again and prints no deleted file. The delete
-// runs inside the embed call, so the test cannot prove the timing against the
-// latency of a real model call.
+// TestDeletedSemanticSourceKeepsOtherNodes deletes a folder file while the
+// build embeds its unit (a change during a build), with a model that accepts
+// every row. The command still answers with the file of the other node. It
+// prints the deleted file with the text that the index holds, as a strict hit
+// does. The next search reads the tree again and prints no deleted file. The
+// delete runs inside the embed call, so the test cannot prove the timing
+// against the latency of a real model call.
 func TestDeletedSemanticSourceKeepsOtherNodes(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)

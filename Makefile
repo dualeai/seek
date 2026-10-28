@@ -18,8 +18,8 @@ upgrade:
 	go mod tidy
 
 # Maintainer-only: download fixed search sources, derive the model, and update
-# tracked model, tokenizer, ONNX Runtime, and USearch resources. No build or
-# release target invokes this.
+# the tracked model, tokenizer, ONNX Runtime, USearch, and NumKong resources. No
+# build or release target invokes this.
 search-assets-upgrade:
 	bash ./cicd/rerank-assets-upgrade.sh
 

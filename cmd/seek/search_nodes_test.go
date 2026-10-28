@@ -161,8 +161,8 @@ func TestCommandWindowFollowsTheGraph(t *testing.T) {
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 	// A fixed 2 GiB read budget is the 2048 MiB row of
-	// TestBuildSlotsFromReadBudget. Its windows are computed by hand: 9 slots
-	// share (2048 - 200) MiB, two windows for each build.
+	// TestBuildSlotsFromReadBudget. The want values below are computed by
+	// hand: 9 slots share (2048 - 200) MiB, two windows for each build.
 	oldBudget := readBudgetBytes
 	readBudgetBytes = 2 << 30
 	defer func() { readBudgetBytes = oldBudget }()
@@ -280,14 +280,17 @@ func TestRunSizesTheWindowFromTheGraph(t *testing.T) {
 }
 
 // TestBuildsWithFewLargeDocumentTokensFinish builds 12 folder nodes at once.
-// Each file fills a shard of its own, and a window holds 4 large documents.
-// Each build has more readers than that, and the read budget is the one that
-// the indexWindowFor proof needs. The builds must finish and give all weight
-// back. Builds share no large-document token. With shared tokens, a consumer
-// that waits for a token keeps its document. The token holders wait for
-// readers that the read budget blocks, so the builds can hang under load. The
-// test sets GOMAXPROCS, so each build has more readers than tokens on every
-// host. A hang runs until the go test timeout, which prints each goroutine.
+// Each file fills a shard of its own. A large window ends at 4 documents
+// (largeDocumentParallelism), or when its content reaches the window. The
+// window holds 4.5 documents, so the 4 tokens end each window. Each build has
+// more readers than 4, and the read budget is the one that the indexWindowFor
+// proof needs. The builds must finish and give all weight back. A token bound
+// that blocks a reader, in place of ending the window, fails the test. Each
+// build also keeps its own tokens. With shared tokens, the holders can wait
+// for readers that the read budget blocks, so builds can hang under load. The
+// test does not force that load, so it does not prove this rule. The test sets
+// GOMAXPROCS, so each build has more readers than tokens on every host. A hang
+// runs until the go test timeout, which prints each goroutine.
 func TestBuildsWithFewLargeDocumentTokensFinish(t *testing.T) {
 	requireTools(t)
 	const tokens = 4
@@ -298,7 +301,7 @@ func TestBuildsWithFewLargeDocumentTokensFinish(t *testing.T) {
 	defer testReadSemMu.Unlock()
 	const nodes = 12
 	const doc int64 = 96 << 10
-	window := doc * 5 / 2
+	window := doc * 9 / 2
 	restore := swapReadSemaphoreForTest(2*nodes*window + 2*doc)
 	defer restore()
 	restoreWindow := swapIndexWindowBytesForTest(window)
@@ -451,8 +454,8 @@ func TestSearchNodesRealIndexingBeyondTheWindow(t *testing.T) {
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
-	// Four builds keep the proof for this budget: 2 x 4 x window + 2 x file
-	// (each build has a lexical and a semantic consumer).
+	// Four builds keep the proof for this budget: 2 x 4 x window + 2 x file.
+	// Each build has a lexical and a semantic consumer.
 	const testBudget int64 = 8*1024*1024 + 512*1024
 	const testWindow int64 = 1 * 1024 * 1024
 	const perCorpusBytes int64 = 2 * 1024 * 1024

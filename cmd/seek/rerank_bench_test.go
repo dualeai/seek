@@ -72,8 +72,8 @@ func BenchmarkCLIProcess(b *testing.B) {
 	}
 	eligibleArgs := []string{queryText, fixture}
 	eligibleDisplayContextZeroArgs := []string{"-C", "0", queryText, fixture}
-	// The relaxed lexical query starts with one content candidate. Semantic
-	// retrieval can expand it before final scoring.
+	// The strict query matches only candidate_00.go. Semantic retrieval can
+	// add files before the final scoring.
 	semanticExpansionArgs := []string{"candidate0 candidate_00", fixture}
 
 	// Keep the lexical-only no-model check in its own cache, so the semantic
@@ -443,6 +443,9 @@ func lateOnBenchmarkDocuments(count int) []rerankDocument {
 	return documents
 }
 
+// lateOnBenchmarkTruncatedDocuments returns count documents whose text holds
+// more tokens than one model row, so the tokenizer cuts each one around its
+// match.
 func lateOnBenchmarkTruncatedDocuments(count int) []rerankDocument {
 	const match = "parseRequestHandler"
 	before := strings.Repeat("prefixContextValue ", 55)
@@ -500,6 +503,9 @@ func mustRunSeekBenchmark(
 	}
 }
 
+// runSeekBenchmarkCommand runs binary in directory with NO_COLOR and cache as
+// SEEK_CACHE_DIR. It returns stdout and stderr together, or nothing with
+// discardOutput.
 func runSeekBenchmarkCommand(
 	ctx context.Context,
 	binary, cache, directory string,
@@ -526,8 +532,8 @@ func runSeekBenchmarkCommand(
 }
 
 // removeProviderVerdicts deletes every recorded provider verdict under the
-// cache, keeping the compiled models beside them. The next run therefore
-// repeats the provider check without repeating the Core ML compile.
+// cache and keeps the compiled models beside them. So the next run repeats
+// the provider check but not the Core ML compile.
 func removeProviderVerdicts(b *testing.B, cacheDir string) {
 	b.Helper()
 	root := filepath.Join(cacheDir, "reranker", "coreml")

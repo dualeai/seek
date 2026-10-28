@@ -14,10 +14,11 @@ import (
 	"github.com/sourcegraph/zoekt/index"
 )
 
-// This command protocol is the only reader for committed Git data. The full
-// and the delta committed builds both use it with captured full object IDs.
-// There is no go-git or zoekt/gitindex fallback. Git reads the objects, and
-// index.Builder writes the documents to staging.
+// This command protocol is the only reader of committed Git content for the
+// builds. The full and the delta committed builds and the semantic build use
+// it with captured full object IDs. There is no go-git or zoekt/gitindex
+// fallback. Git reads the objects, and index.Builder writes the text-index
+// documents to staging.
 //
 // A full scan uses ls-tree, then one buffered batch-command session. `info`
 // gets the blob sizes before `contents` asks for the accepted bodies. So no
@@ -50,8 +51,8 @@ var errNativeGitDeltaTooLarge = errors.New("native Git delta has too many change
 type gitObjectID string
 
 // gitTreeEntry is one ls-tree record: the mode, the object ID, and the path.
-// A batch request reads only the object ID and the path, so the other blob
-// requests leave the mode empty.
+// A batch request uses only the object ID and the path, so a request that
+// does not come from ls-tree leaves the mode empty.
 type gitTreeEntry struct {
 	mode string
 	oid  gitObjectID
@@ -363,6 +364,10 @@ func splitGitHeader(header []byte) (a, b, c []byte, ok bool) {
 	return a, b, c, first && second && len(a) > 0 && len(b) > 0 && len(c) > 0 && bytes.IndexByte(c, ' ') < 0
 }
 
+// parseNativeGitBatchHeader checks one cat-file reply header for the blob want
+// and returns its size. A "missing" reply gives errGitBlobMissing. A non-nil
+// wantSize is the size of the info reply: the contents reply must give it
+// again.
 func parseNativeGitBatchHeader(header []byte, want gitObjectID, wantSize *int64) (int64, error) {
 	if oid, ok := bytes.CutSuffix(header, []byte(" missing")); ok && string(want) == string(oid) {
 		return 0, errGitBlobMissing

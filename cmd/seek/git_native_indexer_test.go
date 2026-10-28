@@ -147,7 +147,8 @@ func TestNativeGitSHA256FullAndDelta(t *testing.T) {
 }
 
 // TestNativeGitFullKeepsHeadInEveryShard builds a commit into several shards
-// with a small shardMax. Every file is indexed, and every shard records HEAD.
+// with a small shardMax. The build indexes every file, and every shard records
+// HEAD.
 func TestNativeGitFullKeepsHeadInEveryShard(t *testing.T) {
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)

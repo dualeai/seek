@@ -75,11 +75,11 @@ func (writer corpusFormatWriter) writeRune(value rune)    { _, _ = writer.WriteR
 // writeCorpusResultsWithContext streams the file blocks to w in rank order,
 // each block as soon as it is ready. It ranks the results, keeps the first
 // limit files (all when limit <= 0), and keeps at most maxMatches lines of
-// each. No result writes nothing.
+// each. With no result, it writes nothing.
 //
 // A block depends only on its own result, so the blocks render on all CPUs,
-// each into its own buffer, and the writer copies each one out as soon as it
-// and the blocks before it are ready. On Kubernetes, the 117 MB of `-n 0 the`
+// each into its own buffer. The writer copies each block out as soon as it and
+// the blocks before it are ready. On Kubernetes, the 117 MB of `-n 0 the`
 // took about 420 ms to render on one goroutine and about 90 ms this way.
 func writeCorpusResultsWithContext(
 	w io.Writer,
@@ -150,7 +150,7 @@ func writeCorpusResultsWithContext(
 // rankCorpusResultsForDisplay sorts a copy of results for display. Each node
 // read returns one current copy per file, so the results need no
 // deduplication. Equal results keep their input order, as in a stable sort. A
-// result is 384 bytes, so the sort moves positions and copies each result
+// result is 352 bytes, so the sort moves positions and copies each result
 // once. On 30,000 results, a stable sort of the results took 40 to 55 ms.
 func rankCorpusResultsForDisplay(results []corpusSearchResult) []corpusSearchResult {
 	order := make([]int, len(results))
@@ -198,10 +198,10 @@ func compareCorpusResults(left, right *corpusSearchResult) int {
 // loop needs ascending lines to skip context that overlaps. It never changes
 // the caller's slice.
 //
-// The sorts move positions, and each kept line is copied once. A line match
-// is more than 100 bytes, and Zoekt returns the lines by score, so a sort of
-// the matches themselves moves each one many times. The line numbers of one
-// file differ, so the order is the same for any sort.
+// The sorts move positions, and the function copies each kept line once. A line
+// match is more than 100 bytes, and Zoekt returns the lines by score. So a sort
+// of the matches themselves would move each one many times. The line numbers of
+// one file differ, so the order is the same for any sort.
 func normalizeLineMatches(lms []zoekt.LineMatch, maxMatches int) ([]zoekt.LineMatch, int) {
 	if len(lms) < 2 {
 		return lms, 0
@@ -271,6 +271,9 @@ func keepFileNamesOnly(results []corpusSearchResult) {
 	}
 }
 
+// formatCorpusFileMatch writes the block of one file. The block holds the
+// header, the also line of the copies, and each match line with its context.
+// A last note counts the hiddenMatches lines that the match limit dropped.
 func formatCorpusFileMatch(sb corpusFormatWriter, result corpusSearchResult, displayMode corpusDisplayMode, hiddenMatches int, pal palette) {
 	fm := result.file
 	lang := fm.Language
@@ -413,7 +416,7 @@ func formatCorpusFileMatch(sb corpusFormatWriter, result corpusSearchResult, dis
 
 // writeLineNum writes the line number, in color when pal has one. It writes
 // no padding or indent: a dense gutter saves tokens for agents. The digits go
-// straight into the free space of the buffer: strconv.Itoa allocates a string
+// straight into the free space of the buffer. strconv.Itoa allocates a string
 // for each number of 100 or more, and this runs for each output line.
 func writeLineNum(sb corpusFormatWriter, lineNum int, pal palette) {
 	sb.writeString(pal.lineNo)
@@ -486,7 +489,7 @@ func writeMatchLineContent(sb corpusFormatWriter, content []byte, frags []zoekt.
 
 	// 2. Window long lines around the matches. The window runs from
 	// matchCtxBytes before the first span to matchCtxBytes after the last
-	// span. So every span is fully in it, and no match is cut.
+	// span. So every span is fully in it, and the window cuts no match.
 	winStart, winEnd := 0, n
 	if n > maxLineBytes && len(spans) > 0 {
 		// 3. Keep cuts on rune boundaries. A cut in a rune would damage the

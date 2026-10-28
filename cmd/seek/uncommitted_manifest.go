@@ -17,7 +17,11 @@ const (
 	uncommittedManifestFileName = ".uncommitted-manifest-v1"
 	uncommittedManifestVersion  = 4
 	// maxUncommittedDeltaShards is the most shards that the uncommitted family
-	// can hold before a delta; above it, the build does a full rebuild. It is
+	// can hold above its last full build (uncommittedManifest.BaseShards) when
+	// a delta starts. Above it, the build does a full rebuild. The build checks
+	// the count only when a delta starts, and one delta can add a whole index
+	// window of shards. The count leaves out the shards of the full build: a
+	// full rebuild writes them again, so it cannot reduce them. The cap is
 	// lower than the committed cap (maxCommittedDeltaShards) for two reasons.
 	// An editor changes one dirty file per save, and each shard costs every
 	// search an open and a lookup. A delta of removals only adds no shard:
@@ -32,8 +36,12 @@ type uncommittedManifest struct {
 	State   string `json:"state"`
 	// DeadBytes is the content that deltas tombstoned since the last full
 	// build (deltaNeedsCompaction).
-	DeadBytes int64                      `json:"dead_bytes"`
-	Files     []uncommittedManifestEntry `json:"files"`
+	DeadBytes int64 `json:"dead_bytes"`
+	// BaseShards is the shard count of the last full build, or 0 when the
+	// build that wrote the manifest did not know it. The delta cap counts
+	// only the shards above it (uncommittedDeltaShardLimitExceeded).
+	BaseShards int                        `json:"base_shards,omitempty"`
+	Files      []uncommittedManifestEntry `json:"files"`
 }
 
 type uncommittedManifestEntry struct {
@@ -70,15 +78,22 @@ func readUncommittedManifest(cacheDir, expectedState string) (uncommittedManifes
 }
 
 // writeUncommittedManifest writes entries bound to state, with deadBytes, the
-// content that deltas tombstoned since the last full build. It does not sort
-// them: the caller gives them sorted by name, as statUncommittedCandidates
-// returns them, because the next diff merges two sorted lists. It stores an
+// content that deltas tombstoned since the last full build, and baseShards,
+// the shard count of that build. It does not sort the entries: the caller
+// gives them sorted by name, as statUncommittedCandidates returns them,
+// because the next diff merges two sorted lists. It stores an
 // unreadFileMarker as zero, because a manifest never stores that value.
-func writeUncommittedManifest(cacheDir, state string, entries []uncommittedManifestEntry, deadBytes int64) error {
+func writeUncommittedManifest(cacheDir, state string, entries []uncommittedManifestEntry, deadBytes int64, baseShards int) error {
 	for i := range entries {
 		entries[i].Marker = max(entries[i].Marker, 0)
 	}
-	data, err := json.Marshal(uncommittedManifest{Version: uncommittedManifestVersion, State: state, DeadBytes: deadBytes, Files: entries})
+	data, err := json.Marshal(uncommittedManifest{
+		Version:    uncommittedManifestVersion,
+		State:      state,
+		DeadBytes:  deadBytes,
+		BaseShards: baseShards,
+		Files:      entries,
+	})
 	if err != nil {
 		return err
 	}
@@ -204,7 +219,8 @@ func diffUncommittedAgainstManifest(
 }
 
 // heldBytes is the content bytes that the shard document of the entry holds
-// (shardHeldBytes). A file kept by name (size -1) has no bytes.
+// (shardHeldBytes). Seek has no bytes of a file kept by name (size -1), so the
+// file counts as its marker.
 func (e uncommittedManifestEntry) heldBytes() int64 {
 	return shardHeldBytes(e.Marker, e.Size, e.Size < 0)
 }

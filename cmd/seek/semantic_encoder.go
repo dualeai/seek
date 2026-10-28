@@ -69,9 +69,9 @@ const lateOnProviderEnv = "SEEK_PROVIDER"
 // the automatic choice. An unknown value is an error: a silent fallback would
 // defeat the reason the operator pinned it.
 func lateOnForcedProvider() (string, error) {
-	// Plain conditions, not a switch: on targets without an accelerator both
-	// provider names hold the same value, which a switch rejects as a duplicate
-	// case.
+	// A list of accepted names, not a switch. On targets without an
+	// accelerator, both provider names hold the same value, and a switch
+	// rejects that as a duplicate case.
 	value := strings.ToLower(strings.TrimSpace(os.Getenv(lateOnProviderEnv)))
 	if value == "" || value == "auto" {
 		return "", nil

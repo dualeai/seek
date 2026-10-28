@@ -703,8 +703,8 @@ func TestRunDefaultSemanticBuildFailureKeepsLexicalSearchAndCanRepair(t *testing
 	if err != nil || output != lexicalOutput {
 		t.Fatalf("semantic build fallback: error=%v output=%q, want the lexical output %q", err, output, lexicalOutput)
 	}
-	// One failed build stops embedding; the query is still prepared and the
-	// strict candidates are scored once, and the model is closed once.
+	// One failed build stops the embedding. The search still prepares the
+	// query, scores the strict candidates once, and closes the model once.
 	if scorer.embeds.Load() != 1 || scorer.prepares.Load() != 1 ||
 		scorer.scores.Load() != 1 || scorer.closes.Load() != 1 {
 		t.Fatalf("fallback calls embed=%d prepare=%d score=%d close=%d",
@@ -1077,9 +1077,9 @@ func TestFolderFileSavedDuringTheBuildIsATreeChange(t *testing.T) {
 
 // TestFolderFileWrittenDuringEveryBuildKeepsTheNode writes a folder file
 // between the two reads of every build, as a log or an autosave does. The
-// model accepts every row, so the file would print if its rows were searched.
-// The retry cannot tell that edit from damage, so the file gives no vector
-// hit. The node keeps its strict hit, with no damage warning and no skip.
+// model accepts every row, so the file would print if the search read its
+// rows. The retry sees the file change again, so the file gives no vector hit.
+// The node keeps its strict hit, with no damage warning and no skip.
 func TestFolderFileWrittenDuringEveryBuildKeepsTheNode(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)

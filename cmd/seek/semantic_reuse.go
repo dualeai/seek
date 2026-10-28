@@ -144,8 +144,8 @@ func (plan node) folderSemanticSource(state string) string {
 
 // modelPathBase is the slash path that the model reads a node's file paths
 // from (semanticModelPath). A Git node needs none: its repository-relative
-// paths do not depend on the search root. A folder node is rooted at its
-// search root, so its node-relative paths change with the root. The model
+// paths do not depend on the search root. The paths of a folder node are
+// relative to its search root, so they change with the root. The model
 // reads its files by absolute path. So a folder build can copy the vectors of
 // a folder that holds it or that it holds. A file root's base is the file's
 // directory.
@@ -203,15 +203,15 @@ func semanticLineageHolds(outer, inner string) bool {
 	return outerFolder && innerFolder && outerRoot != innerRoot && pathWithin(outerRoot, innerRoot)
 }
 
-// loadSemanticReuse opens what a build in staging can copy from. These are
-// the other generations of indexDir and the unit store. A node with no other
-// generation also reads the live generations of the corpora that share its
+// loadSemanticReuse opens what a semantic build can copy from. These are the
+// generations of indexDir and the unit store. A node with no generation in
+// indexDir also reads the live generations of the corpora that share its
 // lineage (sharedLineage). A node with no lineage reads no other corpus: an
 // unrelated corpus shares nothing and costs load time and memory. base is the
 // node's model path base (modelPathBase). Each generation keys its rows with
 // the base that its manifest records. stagedBase, when not empty, adds the
-// generation that the build staged and did not publish yet. A source that does
-// not open is skipped: reuse only saves model work.
+// generation that the build staged and did not publish yet. It skips a source
+// that does not open: reuse only saves model work.
 //
 // Every shared generation loads, whatever its size. A size limit that skips a
 // corpus would make the build embed again what that corpus holds. names are
@@ -231,10 +231,10 @@ func semanticLineageHolds(outer, inner string) bool {
 // that needs them pays about the full index. With 1 row per file, the full
 // index takes 14-16 ms and the tails 4-11 ms. Every load also reads rows.bin
 // (26-35 ms at 500,000 rows).
-func loadSemanticReuse(indexDir, staging, lineage, base string, names []string, stagedBase string) *semanticReuseIndex {
+func loadSemanticReuse(indexDir, lineage, base string, names []string, stagedBase string) *semanticReuseIndex {
 	started := time.Now()
 	cacheRoot, rootErr := seekUserCacheRoot()
-	dirs := semanticGenerationDirsIn(indexDir, staging)
+	dirs := semanticGenerationDirsIn(indexDir)
 	// The bind of the build removes the node's other generations, so their
 	// graph files can move to the new generation as links.
 	own := len(dirs)
@@ -247,7 +247,7 @@ func loadSemanticReuse(indexDir, staging, lineage, base string, names []string, 
 			if other == indexDir || !sharedLineage(lineage, otherLineage) {
 				continue
 			}
-			found := semanticGenerationDirsIn(other, staging)
+			found := semanticGenerationDirsIn(other)
 			dirs = append(dirs, found...)
 			for range found {
 				holder = append(holder, semanticLineageHolds(otherLineage, lineage))
@@ -502,9 +502,10 @@ func (index *semanticReuseIndex) Close() {
 	closeSemanticUnits(index.units)
 }
 
-// semanticGenerationDirsIn lists the published generations of indexDir,
-// except skip.
-func semanticGenerationDirsIn(indexDir, skip string) []string {
+// semanticGenerationDirsIn lists the published generations of indexDir. A
+// build stages its generation in a build directory (newBuildDir), so the list
+// never holds the generation of a build in progress.
+func semanticGenerationDirsIn(indexDir string) []string {
 	entries, err := os.ReadDir(indexDir)
 	if err != nil {
 		return nil
@@ -512,7 +513,7 @@ func semanticGenerationDirsIn(indexDir, skip string) []string {
 	var dirs []string
 	for _, entry := range entries {
 		dir := filepath.Join(indexDir, entry.Name())
-		if entry.IsDir() && strings.HasPrefix(entry.Name(), semanticGenerationPrefix) && dir != skip {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), semanticGenerationPrefix) {
 			dirs = append(dirs, dir)
 		}
 	}

@@ -446,7 +446,7 @@ func lstatFolderCandidate(name, path string) (candidate folderCandidate, ok bool
 }
 
 // folderCandidateOf returns the stat fields of the regular file that st
-// describes, with no name and no path, and reports false for any other file
+// describes, with no name and no path. It reports false for any other file
 // type. entry is the directory entry name that fileIsDataless reads. The walk
 // and each later check of one file make the candidate here, so two candidates
 // of one file differ only when the file changed.

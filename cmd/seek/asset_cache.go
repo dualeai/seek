@@ -12,9 +12,10 @@ import (
 	"strings"
 )
 
-// installPrivateAsset installs fileName in directory (mode 0700) through a
-// temporary file and a rename, unless the file there already has wantBytes
-// bytes and the SHA-256 wantSHA256 (validFileDigest). It returns the path.
+// installPrivateAsset installs fileName in directory, unless the file there
+// already has wantBytes bytes and the SHA-256 wantSHA256 (validFileDigest).
+// The install writes a temporary file and renames it, and gives the directory
+// and the file mode 0700. It returns the path.
 func installPrivateAsset(
 	directory string,
 	fileName string,
@@ -66,9 +67,9 @@ func installPrivateAsset(
 
 // installSemanticRuntime installs the bundled library of a vector engine in
 // semantic/<engine>/<asset key> of the cache, unless a file with its digest is
-// there, and returns its path. engine names the library in errors (USearch,
-// NumKong), and in lowercase it names the folder. It marks the folder as used
-// for GC (touchRuntimeUse).
+// there. It returns the path of the file. engine names the library in
+// errors (USearch, NumKong), and in lowercase it names the folder. It marks
+// the folder as used for GC (touchRuntimeUse).
 func installSemanticRuntime(engine string, compressed []byte, fileName string) (string, error) {
 	runtimeBytes, err := decodeLateOnAsset(compressed)
 	if err != nil {

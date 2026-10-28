@@ -43,14 +43,15 @@ var errDeltaCompaction = errors.New("deltas tombstoned as many bytes as the fami
 // Both count the bytes that the shard documents hold (heldContentBytes). A
 // file kept by name only counts as its NOT-INDEXED marker, because a search
 // reads only that marker. A delta adds tombstones but never removes a
-// document, and a delta of removals only adds no shard, so the shard caps
-// never stop it. Without this rule, dead documents stay in every shard and
-// every .meta, and each search reads them. After a removal of 36,000 of 40,000
-// files (140 MB of dead content), a warm search took 63 ms and 155 MiB. After
-// the full build that this rule starts, it took 47 ms and 55 MiB. The index
-// shrank from 396 MB to 38 MB, and the full build took about 4 s once. That
-// is about 0.1 ms per dead MB. So less than one shard of dead content costs a
-// search less than about 1 ms. A delta of a small family stays a delta.
+// document. A delta of removals only adds no shard, so a run of such deltas
+// never reaches a shard cap. Without this rule, dead documents stay in
+// every shard and every .meta, and each search reads them. After a removal of
+// 36,000 of 40,000 files (140 MB of dead content), a warm search took 63 ms
+// and 155 MiB. After the full build that this rule starts, it took 47 ms and
+// 55 MiB. The index shrank from 396 MB to 38 MB, and the full build took
+// about 4 s once. That is about 0.1 ms per dead MB. So less than one shard of
+// dead content costs a search less than about 1 ms. A delta of a small family
+// stays a delta.
 func deltaNeedsCompaction(tombstoned, live int64) bool {
 	return tombstoned >= max(live, int64(shardMax))
 }

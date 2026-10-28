@@ -32,7 +32,9 @@ const (
 	// TODO(https://github.com/sourcegraph/zoekt/issues/1205): fail on a hang
 	// in place of the heap cap once Zoekt returns an error on a cut-off
 	// varint.
-	shardScanHeapCap  = 128 << 20
+	shardScanHeapCap = 128 << 20
+	// shardScanHangExit is the exit code of a scan child whose heap passed
+	// shardScanHeapCap.
 	shardScanHangExit = 3
 )
 

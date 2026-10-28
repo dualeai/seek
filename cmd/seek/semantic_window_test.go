@@ -434,9 +434,9 @@ func TestWindowHeaderMarksACutPath(t *testing.T) {
 // ".go", below a long folder, so the path line crosses the header's token
 // share. When the two keys are equal, the header did not hold the whole path
 // line, and both rows must mark the cut. The boundary is a line that fills the
-// share up to its newline. Each row marks the cut exactly when its path line
-// through the newline passes the share. The lengths must give equal keys and
-// uncut names.
+// share up to its newline. The row of each base name marks the cut exactly
+// when its path line through the newline passes the share. The lengths must
+// give equal keys and uncut names.
 func TestEqualPathLineKeysAreMarkedCut(t *testing.T) {
 	tokenizer, err := lateOnTokenizers.take(t.Context())
 	if err != nil {

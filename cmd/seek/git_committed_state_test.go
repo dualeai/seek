@@ -71,8 +71,8 @@ func TestCommittedGitStateEncodingAndDamage(t *testing.T) {
 	}
 	// State cleanup keeps the committed record. It describes the delta base of
 	// the family that is still on disk, and a failed build does not change that
-	// family. A stale record is rejected by prepareNativeGitDelta, which
-	// compares it with the commit read from the shard itself.
+	// family. prepareNativeGitDelta rejects a stale record: it compares the
+	// record with the commit that the shard itself records.
 	deleteStateFiles(cacheDir)
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("state cleanup removed the committed record: %v", err)
@@ -238,9 +238,9 @@ exec "$SEEK_TEST_REAL_GIT" "$@"
 
 // TestWarmSearchReadsNoCommittedState replaces the committed state of a built
 // node with a FIFO. A warm search that opened it for reading would wait for a
-// writer, so the search must end with no read of it. Only a committed build
-// reads the state, to admit a delta. A search that waits stops the test at
-// the go test timeout.
+// writer, so the search must end with no read of it. Only a node that
+// rebuilds reads the state: its cache estimate, and its committed build to
+// admit a delta. A search that waits stops the test at the go test timeout.
 func TestWarmSearchReadsNoCommittedState(t *testing.T) {
 	requireTools(t)
 	dir := initGitRepo(t, "warm.go", "package warm\n// warm_state_marker\n")

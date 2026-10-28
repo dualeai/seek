@@ -198,8 +198,8 @@ func nodeMissingBlobRecords(cacheDir, head string, semantic bool) map[string]mis
 	return records
 }
 
-// missingBlobCheckDue reports whether the object store changed since a record
-// of the node was written. With no record, it runs no Git command.
+// missingBlobCheckDue reports whether the object store changed since Seek
+// wrote a record of the node. With no record, it runs no Git command.
 func missingBlobCheckDue(ctx context.Context, repoDir, cacheDir, head string, semantic bool) bool {
 	records := nodeMissingBlobRecords(cacheDir, head, semantic)
 	if len(records) == 0 {

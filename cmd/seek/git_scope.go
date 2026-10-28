@@ -79,6 +79,8 @@ func gitScopeQuery(root string, operands []gitScopeOperand) (query.Q, error) {
 	return query.NewOr(queries...), nil
 }
 
+// collapseDirectoryScopes drops each directory of dirs that another one holds.
+// dirs must be sorted, so a directory comes before the directories below it.
 func collapseDirectoryScopes(dirs []string) []string {
 	if len(dirs) < 2 {
 		return dirs

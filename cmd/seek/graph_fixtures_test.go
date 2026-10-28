@@ -12,9 +12,9 @@ import (
 	"time"
 )
 
-// graphFixture builds folder and Git trees for graph-level tests. Global and
-// system Git config are isolated, so runner config (for example git-lfs) does
-// not change results.
+// graphFixture builds folder and Git trees for graph-level tests. It replaces
+// the global Git config with a test file and turns off the system config. So
+// runner config (for example git-lfs) does not change results.
 type graphFixture struct {
 	t            *testing.T
 	root         string
@@ -125,9 +125,9 @@ const (
 	vectorEmptyNameFilter  hostileVector = "emptyNameFilter"
 )
 
-// HostileRepo creates a repository at rel whose config runs a marker script
-// through vector during a normal search. The committed file holds marker so
-// the search must still find it.
+// HostileRepo creates a repository at rel whose setting (vector) runs a marker
+// script when Git runs in it for a normal search. The committed file holds
+// marker, so the search must still find it.
 func (f *graphFixture) HostileRepo(rel string, vector hostileVector, marker string) string {
 	f.t.Helper()
 	file := string(vector) + ".txt"
@@ -300,10 +300,10 @@ func localGitConfig(t *testing.T, dir string) string {
 	return gitOutputIn(t, dir, "config", "--local", "--list")
 }
 
-// lockFolderTree sets mode 0555 on root and on each folder in it, so no entry
-// can be added to or removed from the tree. It fails the test when the test
-// user can still add an entry, as root can. The returned unlock puts back the
-// modes; it runs once, and the test cleanup also runs it.
+// lockFolderTree sets mode 0555 on root and on each folder in it, so the test
+// user cannot add or remove an entry in the tree. It fails the test when the
+// test user can still add an entry, as root can. The returned unlock puts back
+// the modes; it runs once, and the test cleanup also runs it.
 func lockFolderTree(t *testing.T, root string) (unlock func()) {
 	t.Helper()
 	modes := map[string]fs.FileMode{}

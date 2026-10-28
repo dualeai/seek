@@ -1078,7 +1078,7 @@ func TestStateCaching_BothSucceed_DirtyFileChangedAfterStateCapture(t *testing.T
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
 
-	// Capture pre-state (app.go is dirty → in state.Files)
+	// Capture the pre-state: app.go is dirty, so it is in state.Files.
 	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 	if len(state.Files) == 0 {
@@ -1963,7 +1963,7 @@ func TestComputeStateHash_RepresentativeInputs(t *testing.T) {
 		if len(h) != 16 {
 			t.Errorf("computeStateHash(%q): expected 16 chars, got %d", input[:min(len(input), 20)], len(h))
 		}
-		// Verify determinism (same input → same output)
+		// The same input gives the same output.
 		h2 := computeStateHash(input)
 		if h != h2 {
 			t.Errorf("computeStateHash not deterministic for input len=%d", len(input))
@@ -1992,7 +1992,7 @@ func TestComputeStateHash_NulBytesInInput(t *testing.T) {
 // TestIntegration_AtomicWriteDetected verifies that when a dirty file is
 // replaced via atomic write (the vim/emacs pattern), seek detects the change
 // and re-indexes. The size and mtime stay the same, and git status does not
-// change: only the file identity tells the change.
+// change: only the inode and the ctime tell the change.
 func TestIntegration_AtomicWriteDetected(t *testing.T) {
 	requireTools(t)
 
@@ -2114,7 +2114,7 @@ func TestStreamDirtyFiles_EmptyFileList(t *testing.T) {
 func TestStreamDirtyFiles_TooLargeByNameMissingFiltered(t *testing.T) {
 	swapForTest(t, &documentContentLimit, testDocumentContentLimit)
 	dir := t.TempDir()
-	// A too-large file is sent by name only; a missing file is filtered.
+	// The reader sends a too-large file by name only and drops a missing file.
 	name := "big.dat"
 	data := make([]byte, testDocumentContentLimit+1)
 	if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {

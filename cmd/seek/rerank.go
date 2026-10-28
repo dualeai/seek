@@ -26,8 +26,9 @@ const (
 
 var errRerankUnavailable = errors.New("re-ranker unavailable")
 
-// rerankQueryPlan is the model part of a query plan: the text that the model
-// reads, the relaxed query that finds candidate files, and the filters.
+// rerankQueryPlan is the model part of a query plan. It holds the text that
+// the model reads and the filters. It also holds the relaxed query, which
+// gives each semantic file its lexical rank.
 type rerankQueryPlan struct {
 	modelQuery string
 	relaxedQ   query.Q
@@ -72,12 +73,12 @@ type searchRunConfig struct {
 }
 
 // planRerankQuery plans the model routes from Zoekt's parsed tree, after
-// Zoekt's own simplification, so a route never depends on how the query was
-// spelled. A query of files that gives the model text uses the model: one
+// Zoekt's own simplification, so a route never depends on how the user spelled
+// the query. A query of files that gives the model text uses the model: one
 // word, an identifier and a phrase too. Description atoms feed the model;
 // filters stay with Zoekt; modifiers change no route (querySupport in
 // query_support_table_test.go). An or that holds descriptions gives the model
-// every description atom in it, in query order. Relaxed retrieval takes any
+// every description atom in it, in query order. The relaxed query matches any
 // one of them. The strict query keeps the or, and its filters bound the
 // vectors. A query of filters only gives the model the text of its positive
 // patterns (rerankFilterText): sym:Foo reads Foo.
@@ -119,7 +120,7 @@ func planRerankQuery(raw query.Q) (rerankQueryPlan, bool) {
 			continue
 		}
 		if rerankFilter(child) {
-			// Relaxed retrieval keeps the filter as Zoekt reads it, as it
+			// The relaxed query keeps the filter as Zoekt reads it, as it
 			// keeps a punctuation token.
 			filterText = rerankFilterText(child, filterText)
 			relaxedFilters = append(relaxedFilters, child)
@@ -129,7 +130,7 @@ func planRerankQuery(raw query.Q) (rerankQueryPlan, bool) {
 			continue
 		}
 		// An or that holds descriptions is not a filter: its atoms feed the
-		// model and relaxed retrieval, and the strict query keeps the or. Its
+		// model and the relaxed query, and the strict query keeps the or. Its
 		// filters still bound the vectors.
 		for _, atom := range rerankDescriptionAtoms(child, nil) {
 			term, text, _ := rerankDescriptionAtom(atom)
@@ -247,7 +248,7 @@ func rerankFilterText(node query.Q, text []string) []string {
 }
 
 // rerankDescriptionAtom returns a description atom as the content-only node
-// of relaxed retrieval, and the text that the model reads. A description atom
+// of the relaxed query, and the text that the model reads. A description atom
 // is a word, phrase, or regular expression with a literal letter or digit. It
 // is not a file or content filter.
 func rerankDescriptionAtom(node query.Q) (query.Q, string, bool) {
@@ -312,8 +313,8 @@ func hasWordCharacter(text string) bool {
 	}) >= 0
 }
 
-// regexpModelText renders a parsed regular expression close to how it was
-// typed, for the model to read. Go's printer adds flag groups such as
+// regexpModelText renders a parsed regular expression close to how the user
+// typed it, for the model to read. Go's printer adds flag groups such as
 // (?-s:...) that no user wrote. Zoekt removes capture groups, so the renderer
 // puts back the parentheses that the tree needs:
 //   - an empty group in a sequence (Foo() or a::b());
@@ -487,6 +488,9 @@ func bestLineMatch(matches []zoekt.LineMatch) int {
 	return best
 }
 
+// rerankLineMatchSpan gives the byte span of line that covers its valid
+// fragments: from the smallest start to the largest end. With no valid
+// fragment, it gives the whole line.
 func rerankLineMatchSpan(
 	line []byte,
 	fragments []zoekt.LineFragmentMatch,
@@ -559,6 +563,11 @@ func rerankPathTail(value string) string {
 	return value[at+1:]
 }
 
+// rerankTextWindowBounds gives the byte range of text, at most limit bytes on
+// rune boundaries, that keeps the match. It keeps only the start of a match
+// longer than limit bytes. It gives the rest of the room to the text around
+// the match, half before it where the text allows. With no valid match, it
+// keeps the head.
 func rerankTextWindowBounds(text string, matchAt, matchEnd, limit int) (int, int) {
 	if limit <= 0 || text == "" {
 		return 0, 0
@@ -640,6 +649,8 @@ func applyRerankDisplayConfig(
 	return out
 }
 
+// trimRerankContext keeps the limit context lines next to the match: the last
+// lines of a before context, or the first lines of an after context.
 func trimRerankContext(data []byte, limit int, before bool) []byte {
 	lines := splitContextBytes(data)
 	if limit <= 0 || len(lines) == 0 {

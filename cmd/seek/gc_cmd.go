@@ -72,7 +72,7 @@ func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 		return fmt.Errorf("enumerate corpora: %w", err)
 	}
 
-	// Live eviction: runGC empties the trash, takes the lock, and renames and
+	// Live eviction: runGC takes the lock, empties the trash, and renames and
 	// removes each corpus. `--force` and `--all` both skip the throttle gate:
 	// `--all` is an explicit request, and .last-gc does not apply. writer is
 	// not nil, so runGC streams the table of the corpora to stdout. It has the
@@ -273,7 +273,7 @@ const gcRootWidth = 52
 
 // formatRoot renders a corpusDisplayInfo for the ROOT column. It marks a
 // missing source with [gone]. It cuts a path longer than gcRootWidth from the
-// left and keeps its end, so a base name that fits in the kept bytes stays
+// left and keeps its end. So a base name that fits in the kept bytes stays
 // whole. It removes control characters: a newline is valid in a POSIX path,
 // but it would break the layout of one row per corpus. The cut is on a rune
 // boundary, so a multibyte path never shows a partial rune.
@@ -318,6 +318,8 @@ func sanitizeCell(s string) string {
 	return b.String()
 }
 
+// truncateHash fits a corpus hash in the 10-byte CORPUS column: a longer hash
+// keeps its first 5 and last 2 characters around "...".
 func truncateHash(h corpusID) string {
 	s := string(h)
 	if len(s) <= 10 {

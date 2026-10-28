@@ -76,7 +76,7 @@ func TestClassifyVisibility_Matrix(t *testing.T) {
 	// The worktree root itself is never ignored.
 	paths = append(paths, repo)
 	wantByPath[repo] = true
-	// A path outside the worktree is short-circuited before git runs.
+	// classifyVisibility decides a path outside the worktree before Git runs.
 	outside := filepath.Dir(repo)
 	paths = append(paths, outside)
 	wantByPath[outside] = false
@@ -103,7 +103,7 @@ func TestGitVisibility_SubmoduleInteriorRoutesOutside(t *testing.T) {
 
 	inner := initGitRepoNoRemote(t, "inner.txt", "x\n")
 	outer := initGitRepoNoRemote(t, "outer.txt", "y\n")
-	// File-protocol submodules are disabled by default; allow it for the add.
+	// Git refuses file-protocol submodules by default; the add allows them.
 	gitRunIn(t, outer, "-c", "protocol.file.allow=always", "submodule", "add", inner, "modsub")
 	gitRunIn(t, outer, "commit", "-m", "add submodule")
 	// An ignored file alongside the submodule so the exit-128 per-path retry
@@ -129,8 +129,8 @@ func TestGitVisibility_SubmoduleInteriorRoutesOutside(t *testing.T) {
 }
 
 // TestGitVisibility_AllPrefilteredNoSubprocess gives only the worktree root
-// and an outside path. Both are decided before Git runs, so no check-ignore
-// subprocess runs and the empty-within early return is taken.
+// and an outside path. classifyVisibility decides both before Git runs, so it
+// starts no check-ignore process: it returns early with no path within.
 func TestGitVisibility_AllPrefilteredNoSubprocess(t *testing.T) {
 	requireGit(t)
 

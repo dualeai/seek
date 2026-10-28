@@ -63,8 +63,8 @@ func (segment *semanticUnitSegment) find(key semanticRowKey) ([]byte, bool) {
 	return nil, false
 }
 
-// openSemanticUnits maps every segment of the store, newest first. A segment
-// that does not map is skipped: the store only saves model work.
+// openSemanticUnits maps every segment of the store, newest first. It skips a
+// segment that does not map: the store only saves model work.
 func openSemanticUnits(cacheRoot string) []*semanticUnitSegment {
 	dir := semanticUnitsDirFor(cacheRoot)
 	entries, err := os.ReadDir(dir)
@@ -130,11 +130,11 @@ func closeSemanticUnits(segments []*semanticUnitSegment) {
 // then removed. With one segment per bind, the segment count would grow with
 // no limit. Every build maps and probes each segment: 1,000 extra segments
 // cost 180 ms on a one-file change. With the merge, the store holds about
-// log2 of its record count in segments. Each record is written again about as
-// often.
+// log2 of its record count in segments. The merge writes each record again
+// about as often.
 func archiveSupersededUnits(indexDir string, keep ...string) {
 	var others []string
-	for _, dir := range semanticGenerationDirsIn(indexDir, "") {
+	for _, dir := range semanticGenerationDirsIn(indexDir) {
 		if !slices.Contains(keep, dir) {
 			others = append(others, dir)
 		}
@@ -222,6 +222,14 @@ func archiveSupersededUnits(indexDir string, keep ...string) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return
 	}
+	// The temporary name also ends in .seg, so openSemanticUnits and
+	// semanticUnitsSegments list it. Then the budget counts a segment that a
+	// crash left, and eviction removes it. No other sweep does. A partial
+	// segment fails the header check, which holds the final record count. A
+	// complete one maps as a valid segment. A writer that merges it holds its
+	// records, so this rename can fail with no loss. An eviction that removes
+	// it makes the rename fail too. That plan would also remove the renamed
+	// segment, which is as new and at least as large.
 	name := fmt.Sprintf("%020d-%d%s", time.Now().UnixNano(), os.Getpid(), semanticUnitsSegmentExt)
 	temp := filepath.Join(dir, "."+name)
 	file, err := os.OpenFile(temp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
@@ -262,7 +270,9 @@ func archiveSupersededUnits(indexDir string, keep ...string) {
 	}
 }
 
-// openGenerationAt opens the generation in dir for reading its rows.
+// openGenerationAt opens the generation in dir for its rows and vectors
+// (openSemanticGenerationRows), whatever its source: it takes the source from
+// the manifest.
 func openGenerationAt(dir string) (*semanticGeneration, error) {
 	manifest, err := readSemanticManifestUnchecked(dir)
 	if err != nil {
@@ -303,7 +313,8 @@ func semanticVectorsValid(fine *semanticFineF16Vectors, coarse *semanticCoarseSN
 	return true
 }
 
-// semanticUnitsSegments lists the store's segments as eviction candidates.
+// semanticUnitsSegments lists the segments of every store (one for each
+// row-key prefix) as eviction candidates.
 func semanticUnitsSegments(cacheRoot string) []corpusDirEntry {
 	base := filepath.Join(cacheRoot, corporaDir, semanticUnitsDir)
 	stores, err := os.ReadDir(base)

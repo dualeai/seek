@@ -162,7 +162,7 @@ func TestDeltaUncommitted_EmptyDirtySetCleansShards(t *testing.T) {
 	paths, plan := planGitTestCorpus(t, dir)
 	reindexGit(t, ctx, paths, plan)
 
-	// Dirty the file, index → uncommitted shards exist.
+	// Dirty the file and index it, so uncommitted shards exist.
 	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// dirty_phase\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -171,8 +171,8 @@ func TestDeltaUncommitted_EmptyDirtySetCleansShards(t *testing.T) {
 		t.Fatal("expected at least one uncommitted shard after dirty cycle")
 	}
 
-	// Revert the file to its committed content. The next cycle's dirty set
-	// is empty → shards must be cleaned and the manifest dropped.
+	// Revert the file to its committed content. The dirty set of the next
+	// cycle is empty, so the build must remove the shards and the manifest.
 	gitRunIn(t, dir, "checkout", "--", "app.go")
 	reindexGit(t, ctx, paths, plan)
 
@@ -256,7 +256,11 @@ func TestDeltaUncommitted_ShardThresholdTriggersFullRebuild(t *testing.T) {
 	paths, plan := planGitTestCorpus(t, dir)
 	reindexGit(t, ctx, paths, plan)
 
-	cycles := maxUncommittedDeltaShards + 2
+	// The full build of cycle 0 writes one shard, and each later cycle adds
+	// one delta shard. A delta can take the family to
+	// maxUncommittedDeltaShards+1 delta shards, so the cycle after that one
+	// rebuilds the family in full.
+	cycles := maxUncommittedDeltaShards + 3
 	shardSeries := make([]int, 0, cycles)
 	for i := range cycles {
 		shards := dirtyAndIndex(t, ctx, paths, plan, "app.go", fmt.Sprintf("package main\n// uthreshold_cycle_%d\n", i))
@@ -290,6 +294,126 @@ func TestDeltaUncommitted_ShardThresholdTriggersFullRebuild(t *testing.T) {
 	latest := fmt.Sprintf("uthreshold_cycle_%d", cycles-1)
 	if r, _ := searchPlannedCorpusForTest(ctx, plan, latest); len(r) == 0 {
 		t.Fatalf("latest dirty marker %s must remain findable post-rebuild", latest)
+	}
+}
+
+// TestDeltaUncommitted_DeltaAboveLargeFullBase gives a work tree whose full
+// uncommitted build writes more shards than maxUncommittedDeltaShards. The cap
+// counts only the shards that deltas add since the full build. So each edit
+// of one dirty file takes a delta, which keeps uncommitted shard 0. The second
+// edit checks that the delta keeps the base count in the manifest.
+func TestDeltaUncommitted_DeltaAboveLargeFullBase(t *testing.T) {
+	requireTools(t)
+	// Zoekt ends a shard when its content passes shardMax. Each file holds
+	// more than half of it, so each shard holds two files.
+	const fileBytes = 3000
+	swapForTest(t, &shardMax, 4096)
+	dir := initGitRepo(t, "app.go", "package main\n// large_base_baseline\n")
+	const fileCount = 2 * (maxUncommittedDeltaShards + 4)
+	for i := range fileCount {
+		content := bytes.Repeat([]byte{byte('a' + i%26)}, fileBytes)
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("dirty_%d.txt", i)), content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx := t.Context()
+	paths, plan := planGitTestCorpus(t, dir)
+	reindexGit(t, ctx, paths, plan)
+	base := repositoryShardCount(plan.indexDir, repoUncommitted)
+	if base <= maxUncommittedDeltaShards {
+		t.Fatalf("the full build wrote %d uncommitted shards, want more than %d", base, maxUncommittedDeltaShards)
+	}
+	// firstShard returns uncommitted shard 0, which a delta keeps and a full
+	// build replaces.
+	firstShard := func() os.FileInfo {
+		t.Helper()
+		scan, err := scanFamily(plan.indexDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, member := range scan.members {
+			if member.uncommitted && member.shard && member.numbered && member.num == 0 {
+				info, err := os.Stat(filepath.Join(plan.indexDir, member.name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return info
+			}
+		}
+		t.Fatalf("no uncommitted shard 0 in %s", plan.indexDir)
+		return nil
+	}
+	baseBefore := firstShard()
+
+	for edit := 1; edit <= 2; edit++ {
+		marker := fmt.Sprintf("large_base_delta_beacon_%d", edit)
+		shards := dirtyAndIndex(t, ctx, paths, plan, fmt.Sprintf("dirty_%d.txt", edit), marker+"\n")
+		if !os.SameFile(baseBefore, firstShard()) {
+			t.Fatalf("edit %d: the build replaced uncommitted shard 0: a full rebuild ran, not a delta", edit)
+		}
+		if shards != base+edit {
+			t.Fatalf("edit %d: shards=%d, want the %d base shards and %d delta shards", edit, shards, base, edit)
+		}
+		results, err := searchPlannedCorpusForTest(ctx, plan, marker)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 1 {
+			t.Fatalf("edit %d: got %d files for the edited content, want 1", edit, len(results))
+		}
+		if edit == 1 {
+			// A commit of a new file changes HEAD and no dirty file, so the
+			// build only refreshes the uncommitted manifest. The refresh must
+			// keep the base count, or the next edit rebuilds in full.
+			writeFixtureFile(t, filepath.Join(dir, "committed.txt"), "large_base_commit\n")
+			gitRunIn(t, dir, "add", "committed.txt")
+			gitRunIn(t, dir, "commit", "-q", "-m", "unrelated")
+			reindexGit(t, ctx, paths, plan)
+		}
+	}
+}
+
+// TestUncommittedDeltaPossible_ShardCapCountsShardsAboveTheFullBase checks the
+// bounds of the uncommitted cap on a live family of empty shard files. The cap
+// counts only the shards above the full-build count of the manifest. With base
+// 0, the manifest has no base_shards field, as the manifest of an older build.
+// The cap then counts every shard.
+func TestUncommittedDeltaPossible_ShardCapCountsShardsAboveTheFullBase(t *testing.T) {
+	repoDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repoDir, "a.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const base = maxUncommittedDeltaShards + 8
+	for _, tc := range []struct {
+		name   string
+		shards int
+		base   int
+		delta  bool
+	}{
+		{name: "large-full-base", shards: base, base: base, delta: true},
+		{name: "cap-above-base", shards: base + maxUncommittedDeltaShards, base: base, delta: true},
+		{name: "above-cap-above-base", shards: base + maxUncommittedDeltaShards + 1, base: base},
+		{name: "no-base-at-cap", shards: maxUncommittedDeltaShards, delta: true},
+		{name: "no-base-above-cap", shards: maxUncommittedDeltaShards + 1},
+		{name: "base-ahead-of-family", shards: 10, base: 11},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cacheDir, indexDir := t.TempDir(), t.TempDir()
+			for i := range tc.shards {
+				name := fmt.Sprintf("%s_v16.%05d.zoekt", repoUncommitted, i)
+				if err := os.WriteFile(filepath.Join(indexDir, name), nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := writeUncommittedManifest(cacheDir, "cached", nil, 0, tc.base); err != nil {
+				t.Fatal(err)
+			}
+			store := corpusStore{cacheDir: cacheDir, indexDir: indexDir}
+			got := uncommittedDeltaPossible(t.Context(), repoDir, store, "cached", true, []string{"a.go"})
+			if (got != nil) != tc.delta {
+				t.Fatalf("delta=%t, want %t (shards=%d base=%d)", got != nil, tc.delta, tc.shards, tc.base)
+			}
+		})
 	}
 }
 
@@ -349,8 +473,8 @@ func TestDeltaUncommitted_ManifestRecordsEveryDirtyFile(t *testing.T) {
 		}
 	}
 
-	// Manifest must be sorted by name so the sorted-merge diff in
-	// diffUncommittedAgainstManifest works against future candidate lists.
+	// The manifest must sort its entries by name, each name once: the next
+	// build merges it with sorted candidates (diffUncommittedAgainstManifest).
 	for i := 1; i < len(manifest.Files); i++ {
 		if manifest.Files[i-1].Name >= manifest.Files[i].Name {
 			t.Fatalf("manifest entries not sorted: %q then %q", manifest.Files[i-1].Name, manifest.Files[i].Name)

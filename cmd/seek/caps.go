@@ -84,10 +84,11 @@ func indexWindowFor(readBudget int64, builds int) int64 {
 type indexWindowKey struct{}
 
 // withIndexWindow sets the window of a command whose graph has nodes nodes,
-// before its first build. At most that many builds run. So a search of one
-// node gets the whole budget in its window, and a search of many nodes gets
-// one window per build slot. Each build takes its two windows from
-// buildWindows, so commands that run at the same time share the budget.
+// before its first build. At most that many builds run. So the two windows of
+// the one build of a one-node search take the whole build budget
+// (buildWindowBytes). A search of many nodes splits the budget among its build
+// slots. Each build takes its two windows from buildWindows, so commands that
+// run at the same time share the budget.
 func withIndexWindow(ctx context.Context, nodes int) context.Context {
 	return context.WithValue(ctx, indexWindowKey{}, indexWindowFor(readBudgetBytes, nodes))
 }

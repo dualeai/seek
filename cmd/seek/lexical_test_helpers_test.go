@@ -60,6 +60,8 @@ func prepareAndSearchCorpus(
 	return strictNode(ctx, plan, queryPlan{strict: userQ}, config, testLexicalSearchExecution())
 }
 
+// ensureGitCorpusFresh runs the node refresh of a search (gitNode.prepare) on
+// the Git node at plan with a lexical execution. It returns the index state.
 func ensureGitCorpusFresh(
 	ctx context.Context,
 	plan node,
@@ -69,6 +71,9 @@ func ensureGitCorpusFresh(
 	return opened.indexState, err
 }
 
+// ensureCombinedGitCorpus refreshes the whole-repository index of plan for
+// state (gitNode.refreshState) with a lexical execution. It takes no git
+// status of its own.
 func ensureCombinedGitCorpus(
 	ctx context.Context,
 	plan node,

@@ -13,11 +13,12 @@ import (
 	"github.com/sourcegraph/zoekt/query"
 )
 
-// cancellationTestModel is the test model with a build that fails
-// (errRerankUnavailable), so no vector exists and only strict hits can print.
-// With failureStage "prepare", its query preparation calls fail and returns
-// that error. Else the preparation succeeds, and its scoring does that. So a
-// test can cancel the command inside the model call.
+// cancellationTestModel is the test model that fails at one stage. Its test
+// also fails the build (embedErr errRerankUnavailable), so no vector exists
+// and only strict hits can print. With failureStage "prepare", each query
+// preparation returns the error of fail. Else the preparation succeeds, and
+// each score call returns that error. fail can cancel the command, so a test
+// can cancel inside the model call.
 // A test with it proves the route after a model failure. An ordinary error
 // gives the strict fallback. A cancelled command gives no output and the
 // cancellation. It cannot prove that a cancellation stops a real model call in

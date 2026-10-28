@@ -12,7 +12,7 @@ import (
 
 const matchCapMarker = "zqmatchcap"
 
-// matchCapFiles lands in one shard: two files with 10,000 matching lines each
+// matchCapFiles fits in one shard: two files with 10,000 matching lines each
 // and one file with a single match. A per-shard cap of 10,000 matches hides at
 // least one file in any document order.
 var matchCapFiles = map[string]int{"a_big.txt": 10_000, "b_big.txt": 10_000, "z_small.txt": 1}

@@ -395,6 +395,11 @@ func TestRun_EmptyUnbornRepositoryReturnsNoMatch(t *testing.T) {
 	}
 }
 
+// TestEnsureCombinedGitCorpusPublishesEmptyNativeSnapshot moves a warm Git node
+// to an empty commit, with no family manifest and a stale uncommitted
+// manifest. The refresh must give corpusKnownEmpty and keep no shard and no
+// uncommitted manifest. It records the new HEAD, and a second refresh reuses
+// the empty node.
 func TestEnsureCombinedGitCorpusPublishesEmptyNativeSnapshot(t *testing.T) {
 	requireTools(t)
 	dir := initGitRepo(t, "old.go", "package old\n// old_empty_transition_marker\n")
@@ -419,8 +424,8 @@ func TestEnsureCombinedGitCorpusPublishesEmptyNativeSnapshot(t *testing.T) {
 	gitRunIn(t, dir, "rm", "-rf", "--ignore-unmatch", ".")
 	gitRunIn(t, dir, "commit", "--allow-empty", "-m", "empty")
 	state = mustGitRepoStateIn(t, t.Context(), dir)
-	// The corpus is known empty only while its empty marker holds the current
-	// state, so this result and the reuse below check the marker.
+	// The refresh gives corpusKnownEmpty only while the empty marker holds the
+	// current state, so this result and the reuse below check the marker.
 	if got, err := ensureCombinedGitCorpus(t.Context(), plan, paths, state); err != nil || got != corpusKnownEmpty {
 		t.Fatalf("publish empty native corpus: state=%v error=%v marker=%q shards=%v", got, err,
 			readEmptyStateFile(plan.cacheDir), familyShardFilesForTest(t, plan.indexDir, familyAll))
@@ -484,6 +489,11 @@ func hideLooseGitObject(t *testing.T, commonDir, oid string) func() {
 	return restore
 }
 
+// TestNativeGitMissingObjectKeepsPublishedFamily hides a tree or a blob of a
+// new commit, then builds the node. The build must fail, change no published
+// file and leave no build directory. The prior generation stays searchable. In
+// the tree case, a full build fails after it staged shards. With the object
+// back, the next build indexes the commit.
 func TestNativeGitMissingObjectKeepsPublishedFamily(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -571,6 +581,10 @@ func TestNativeGitMissingObjectKeepsPublishedFamily(t *testing.T) {
 	}
 }
 
+// TestRun_KnownEmptyRemovesCommittedSidecarBeforeShardNameReuse gives a Git
+// node a committed .meta sidecar, then empties the node on an unborn branch.
+// The empty node must keep no shard file and no sidecar. A new commit then
+// reuses the shard names, and the search must find its content.
 func TestRun_KnownEmptyRemovesCommittedSidecarBeforeShardNameReuse(t *testing.T) {
 	requireTools(t)
 	dir := initGitRepo(t, "same.go", "package same\n// sidecar_first_marker\n")
@@ -676,6 +690,11 @@ func TestRun_UnbornRepositoryClearsWarmCommittedIndex(t *testing.T) {
 	}
 }
 
+// TestRun_UnbornRepositoryRepairsMatchingStateCommittedArtifacts writes state
+// and HEAD files that match an unborn branch, beside committed shard files that
+// remain from the last commit. In the meta_only case, only .meta files remain.
+// The search must find the new file, not the old commit, and remove the
+// committed files.
 func TestRun_UnbornRepositoryRepairsMatchingStateCommittedArtifacts(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -2124,6 +2143,11 @@ func TestRun_EmptyNativeGitSnapshotsDoNotRequireCtags(t *testing.T) {
 	}
 }
 
+// TestRun_EmptyCommittedFamilyWithDirtyShardUsesWarmPath searches a Git node
+// whose committed family is empty (a gitlink-only tree) and whose dirty file
+// has a shard. With a corrupt uncommitted manifest and no ctags, the next
+// search must still find the dirty file with no error and no warning. A
+// rebuild would fail without ctags and serve the old shards with a warning.
 func TestRun_EmptyCommittedFamilyWithDirtyShardUsesWarmPath(t *testing.T) {
 	requireTools(t)
 	dir := initGitlinkOnlyRepo(t)
@@ -2146,8 +2170,12 @@ func TestRun_EmptyCommittedFamilyWithDirtyShardUsesWarmPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	forceMissingCtags(t)
+	logs := captureTestLogs(t, slog.LevelWarn)
 	if out, err := seek(t, "--lexical-only", "empty_committed_dirty_marker"); err != nil || !strings.Contains(out, "empty_committed_dirty_marker") {
 		t.Fatalf("warm dirty search: error=%v output=%q", err, out)
+	}
+	if records := logs.Records(); len(records) != 0 {
+		t.Fatalf("warm dirty search rebuilt the index: warnings=%v", records)
 	}
 }
 
@@ -2253,6 +2281,10 @@ func TestRun_ReservedZoektNameKeepsCommittedFamily(t *testing.T) {
 	}
 }
 
+// TestRun_FirstNativeFailureDoesNotOpenLegacyGeneration builds a searchable
+// decoy index under the cache identity of an older plan of the same
+// repository. With no ctags, the first build of the current node fails. The
+// search must fail and print nothing, and the current index gets no shard.
 func TestRun_FirstNativeFailureDoesNotOpenLegacyGeneration(t *testing.T) {
 	requireTools(t)
 	repoDir := initGitRepo(t, "legacy.go", "package legacy\n// LEGACY_GENERATION_DECOY\n")
@@ -3472,8 +3504,8 @@ func TestRace_ConcurrentScopedUnscopedSameRepo(t *testing.T) {
 }
 
 // TestRun_SharedCommittedIndexUpdatesOnHeadChange checks that a new commit
-// updates the index of a scoped search, with a delta or a full build. An index
-// that is not updated does not hold the new content.
+// updates the index of a scoped search, with a delta or a full build. A stale
+// index does not hold the new content.
 func TestRun_SharedCommittedIndexUpdatesOnHeadChange(t *testing.T) {
 	requireTools(t)
 

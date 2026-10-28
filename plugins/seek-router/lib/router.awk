@@ -34,8 +34,9 @@ function push_token() {
 	token_started = 0
 }
 
-# Accept literal POSIX-shell words, quotes, and backslash escapes. Reject every
-# form that can expand, redirect, start another command, or run in background.
+# Accept literal POSIX-shell words, quotes, backslash escapes, and one pipe.
+# Reject every other form that can expand, redirect, start another command, or
+# run in the background.
 function tokenize(source,    i, char, next_char, mode, length_source) {
 	argc = 0
 	pipe_at = 0

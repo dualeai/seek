@@ -74,8 +74,8 @@ func TestCommittedShardHead_UnknownWithoutACommittedShard(t *testing.T) {
 		t.Fatal("an empty scan reported a commit")
 	}
 
-	// An unnumbered name is not a family member, so the path lookup rejects it
-	// before any read.
+	// An unnumbered name is not shard 0, so the path lookup rejects it before
+	// any read.
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "not-a-shard.zoekt"), []byte("junk"), 0o644); err != nil {
 		t.Fatal(err)

@@ -801,9 +801,9 @@ func TestE2ERouteFilterInSomeUSearchShards(t *testing.T) {
 // returns each of them; only the radius tells them apart. The Git node has an
 // inside and an outside file in its committed rows and in its untracked
 // overlay. The model would accept every one of them. On every route the
-// inside files show, and the outside files never reach the model. The cosines
-// are chosen. The test proves the radius cut on each route. It proves neither
-// where real vectors put a file nor that tau or delta are right.
+// inside files show, and the outside files never reach the model. The test
+// chooses the cosines. It proves the radius cut on each route. It proves
+// neither where real vectors put a file nor that tau or delta are right.
 func TestE2ERouteRadiusBoundsEveryRoute(t *testing.T) {
 	requireTools(t)
 	const margin = 0.0018
@@ -879,8 +879,8 @@ func TestE2ERouteRadiusBoundsEveryRoute(t *testing.T) {
 // w/b row has a fine MeanMaxSim of about c, in the radius. A w/s row has about
 // c/W, outside it. On every route the long query returns every w/b file and no
 // other file. A two-word description has one window, and on the exact route
-// it returns both kinds. The cosines are chosen; only the window count comes
-// from the tokenizer.
+// it returns both kinds. The test chooses the cosines; only the window count
+// comes from the tokenizer.
 func TestE2ERouteLongQueryWindowsOnEveryRoute(t *testing.T) {
 	requireTools(t)
 	model := newE2ERouteModel(t)
@@ -961,7 +961,7 @@ func TestE2ERouteLongQueryWindowsOnEveryRoute(t *testing.T) {
 // no lexical match has no lexical evidence. So the output must follow the
 // model scores when the vector scores order the files the other way. It must
 // also follow them when all vector scores are equal. The expected order comes
-// from the fixture. The scores are chosen. The test proves the fusion rule
+// from the fixture. The test chooses the scores. It proves the fusion rule
 // for vector-only hits; it proves nothing about the real model's ranking.
 func TestE2ERouteModelScoresOrderVectorHits(t *testing.T) {
 	requireTools(t)

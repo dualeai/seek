@@ -2,11 +2,11 @@ package main
 
 // Partial-loss regression matrix.
 //
-// Losing a subset of files in a corpus index directory must cause repair on the
-// next search. Each damage row checks the same contract:
+// When a corpus index directory loses some of its files, the next search must
+// repair it. Each damage row checks the same contract:
 //
-//   - each live marker is found in exactly its source file;
-//   - tombstoned markers do not return;
+//   - the search finds each live marker in exactly its source file;
+//   - no tombstoned marker comes back;
 //   - the first search repairs the damage; and
 //   - two later searches do not change the repaired shard family.
 //
@@ -46,8 +46,8 @@ type plMarker struct {
 // plCorpus is a delta-stacked committed family plus the marker ledger that
 // describes what a correct answer looks like.
 //
-// Each committed delta adds a shard and updates .meta sidecars. The fixture
-// therefore contains a real multi-shard family with tombstones.
+// Each committed delta adds a shard and updates .meta sidecars. So the fixture
+// holds a real multi-shard family with tombstones.
 type plCorpus struct {
 	repoDir string
 	plan    node
@@ -72,12 +72,13 @@ func buildPartialLossCorpus(t *testing.T) *plCorpus {
 	reindexGit(t, ctx, paths, plan)
 	c.live = append(c.live, plMarker{"PL_SEED", "seed.go"})
 
-	// ghost.go is committed with one marker and later rewritten with another:
-	// the first becomes a tombstone, the second stays live.
+	// The fixture commits ghost.go with one marker and later rewrites it with
+	// another: the first marker becomes a tombstone, the second stays live.
 	writeTrackedFile(t, repo, "ghost.go", "package main\n// PL_GHOST\n")
 	reindexGit(t, ctx, paths, plan)
 
-	// gone.go is committed and later deleted: its marker becomes a tombstone.
+	// The fixture commits gone.go and later deletes it: its marker becomes a
+	// tombstone.
 	writeTrackedFile(t, repo, "gone.go", "package main\n// PL_GONE\n")
 	reindexGit(t, ctx, paths, plan)
 
@@ -230,6 +231,8 @@ func committedMetaPaths(t *testing.T, indexDir string) []string {
 	return plFamilyGlob(t, indexDir, "*.zoekt.meta")
 }
 
+// plFamilyGlob returns the files of indexDir that match pattern, sorted, with
+// no file of the uncommitted family.
 func plFamilyGlob(t *testing.T, indexDir, pattern string) []string {
 	t.Helper()
 	all, err := filepath.Glob(filepath.Join(indexDir, pattern))
@@ -315,11 +318,13 @@ type plRow struct {
 	// untracked file). restorePristine puts back only the cache. So such a
 	// row gets a private repository and cache, not the shared fixture.
 	ownFixture bool
-	// damage mutates the corpus on disk between two seek invocations, exactly
-	// as an external process would.
+	// damage changes the corpus on disk between two searches, as an outside
+	// process would.
 	damage func(t *testing.T, c *plCorpus)
 }
 
+// partialLossRows returns the damage rows of
+// TestPartialLoss_GitCommittedFamily.
 func partialLossRows() []plRow {
 	return []plRow{
 		{
@@ -471,8 +476,8 @@ func partialLossRows() []plRow {
 				plRemove(t, shardCarrying(t, c.plan.indexDir, "PL_SEED"))
 				// A commit that supersedes a live marker. After the rebuild
 				// PL_MARK_2 must be gone and PL_SUPERSEDER must be the only
-				// hit. The new token deliberately shares no substring with the
-				// old one, so a hit on the old token can only be stale content.
+				// hit. The new content of f2.go does not hold the old token,
+				// so a hit on the old token can only be stale content.
 				writeTrackedFile(t, c.repoDir, "f2.go", "package main\n// PL_SUPERSEDER\n")
 				c.dead = append(c.dead, plMarker{"PL_MARK_2", "f2.go"})
 				for i := range c.live {
@@ -625,8 +630,10 @@ func plPrepareRow(t *testing.T, shared *plCorpus, row plRow) (*plCorpus, func())
 	return &local, func() { shared.assertRepoUntouched(t) }
 }
 
-// TestPartialLoss_GitCommittedFamily is the matrix. One shared fixture, one
-// pristine restore per row, one row per damage mode.
+// TestPartialLoss_GitCommittedFamily is the matrix: one row per damage mode.
+// A row that changes only the cache starts from the shared fixture, restored
+// to its pristine copy. A row that changes the repository (ownFixture) builds
+// its own fixture.
 func TestPartialLoss_GitCommittedFamily(t *testing.T) {
 	shared := buildPartialLossCorpus(t)
 
@@ -644,8 +651,11 @@ func TestPartialLoss_GitCommittedFamily(t *testing.T) {
 // Folder corpus parity
 // ---------------------------------------------------------------------------
 
-// TestPartialLoss_FolderFamily applies the same check to a folder corpus. A
-// small shardMax gives the folder family several shards.
+// TestPartialLoss_FolderFamily deletes the last shard of a folder family. A
+// small shardMax gives the family several shards. The first refresh must
+// repair the family: the search then finds each marker in exactly its file,
+// also after a second refresh. Unlike the Git matrix, it checks one damage
+// mode, no tombstone and no family snapshot.
 func TestPartialLoss_FolderFamily(t *testing.T) {
 	requireTools(t)
 	ctx := t.Context()
@@ -707,12 +717,12 @@ func TestPartialLoss_FolderFamily(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestPartialLoss_ContentCorruptionIsNotDetected records one damage mode that
-// the manifest does not detect: a byte flipped inside a shard's
-// content with the header intact. Size, document count, and shard membership
-// stay unchanged, so the publish manifest cannot find it. Content hashes would
-// be needed to detect this case.
+// the manifest does not detect: a flipped byte inside the content of a shard,
+// with the header intact. Size, document count, and shard membership stay the
+// same, so the publish manifest cannot find it. Only content hashes could
+// detect this case.
 //
-// This test records the current limit. If content hashes are added, move this
+// This test records the current limit. If Seek adds content hashes, move this
 // case into partialLossRows. The manifest checks each shard alone, so one
 // commit and one shard show the limit.
 func TestPartialLoss_ContentCorruptionIsNotDetected(t *testing.T) {
@@ -770,8 +780,8 @@ func TestPartialLoss_ContentCorruptionIsNotDetected(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // plSoleCorpusIndexDir finds the one populated corpus under an isolated cache
-// root. Used only by the process-level row, which cannot share the in-process
-// corpus plan.
+// root. Only the process-level test uses it, because that test cannot share
+// the in-process corpus plan.
 func plSoleCorpusIndexDir(t *testing.T, cacheRoot string) string {
 	t.Helper()
 	entries, err := filepath.Glob(filepath.Join(cacheRoot, corporaDir, "*", "index"))

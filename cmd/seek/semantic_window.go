@@ -13,9 +13,9 @@ import (
 // vector. A window holds the tokens of one unit only. Each window repeats the
 // unit's header (semanticWindowHeader). Its row keeps the byte span of its own
 // body tokens, so the final model scores the window that the vector found. A
-// unit's score is its best window. A window ends at a line or word start when
-// one is in its second half. base is the model path base of the units' node
-// (modelPathBase).
+// file's hit is its best window (semanticHitFiles). A window ends at a line or
+// word start when one is in its second half. base is the model path base of
+// the units' node (modelPathBase).
 func windowSemanticUnits(
 	ctx context.Context,
 	tokenizer *lateOnTokenizer,

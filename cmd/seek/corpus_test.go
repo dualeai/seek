@@ -10,7 +10,8 @@ import (
 )
 
 // TestResolveOperands_PathReadErrorsPreserveOperand resolves a missing path
-// and a broken symlink: the error message names the operand as it was typed.
+// and a broken symlink: the error message names the operand as the user typed
+// it.
 func TestResolveOperands_PathReadErrorsPreserveOperand(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -51,8 +52,9 @@ func TestResolveOperands_PathReadErrorsPreserveOperand(t *testing.T) {
 
 // TestPlanGitCorpus_WalkAndRevParseShareID plans one repository twice. The
 // first plan comes from detectGitBoundary, as the walk finds the repository
-// (the typed path). The second comes from git rev-parse, as an operand
-// resolves (the real path). Both plans must have one corpus ID.
+// (the typed path). The second comes from git rev-parse, as for a `.git` entry
+// that the file-system check cannot confirm (the real path). Both plans must
+// have one corpus ID.
 func TestPlanGitCorpus_WalkAndRevParseShareID(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
@@ -750,8 +752,8 @@ func TestPlanCorpora_ExternalGitRootAndNestedOperandsCollapseToSingleGitPlan(t *
 
 	// The repository root, a nested directory, and a nested file of one
 	// repository all go to one Git corpus. The root operand widens the scope
-	// to the whole worktree (gitScopeQuery gives no filter), so one unscoped
-	// Git plan holds all three, with no corpus for the file.
+	// to the whole worktree: gitScopeQuery gives no filter. So one unscoped
+	// Git plan holds all three, and the file gets no corpus of its own.
 	plans, err := planCorpora(context.Background(), []string{nestedFile, externalRepo, nested})
 	if err != nil {
 		t.Fatalf("planCorpora: %v", err)
@@ -789,8 +791,8 @@ func fakeGitPathsForPlanTest(t testing.TB, repoDir string) gitPaths {
 }
 
 // TestPathWithinMatchesRelWithin checks that pathWithin and relWithin give the
-// same containment, also for the file-system root "/" and for a sibling whose
-// name starts with the root name.
+// same containment. The cases include the file-system root "/" and a sibling
+// whose name starts with the root name.
 func TestPathWithinMatchesRelWithin(t *testing.T) {
 	for _, tc := range []struct {
 		root, path string

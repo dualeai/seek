@@ -277,7 +277,7 @@ func TestSemanticUSearchShardPlannerWaitsForTheHostSize(t *testing.T) {
 //     shards.
 //   - Files of 2 rows each: every file end can take a cut, so a cut at 15/16
 //     of the size with no anchor moves each later cut with the edit. Anchors
-//     are sparse here, so an edit can move a cut that is just at 15/16 to the
+//     are sparse here. So an edit can move a cut that is just at 15/16 to the
 //     next anchor, and the cuts of a few shards after it. The 40 edits change
 //     at most 3 shards for each edit on average.
 func TestSemanticUSearchShardPlannerKeepsShardsAfterAnEdit(t *testing.T) {

@@ -27,14 +27,14 @@ type displayOperands struct {
 	// byRoot holds the first operand of each root (header).
 	byRoot map[string]displayOperand
 	// typedAsPath holds each operand root and each folder above one. The
-	// value is true when every operand at or below the folder is typed as the
-	// path of its root below the folder: "" for the folder itself
+	// value is true when each operand at or below the folder is typed as its
+	// root's path below the folder. That path is "" for the folder itself
 	// (headersArePaths).
 	typedAsPath map[string]bool
 }
 
 // newDisplayOperands resolves the path operands. The caller gives "." when
-// the user gave no path. An operand with no absolute path is skipped.
+// the user gave no path. It skips an operand with no absolute path.
 func newDisplayOperands(operands []string) displayOperands {
 	resolved := displayOperands{
 		byRoot:      make(map[string]displayOperand, len(operands)),
@@ -84,7 +84,7 @@ func parentFolder(dir string) (string, bool) {
 }
 
 // header is the display path of the file at abs, or abs when no operand holds
-// it. Each root is a clean absolute path (canonicalCorpusPath, onDiskPath), so
+// it. Each root is a clean absolute path (canonicalCorpusPath, onDiskPath). So
 // only abs and its parent folders can be the root of an operand that holds
 // abs. header looks them up, deepest first: the cost does not grow with the
 // operand count.
@@ -141,7 +141,7 @@ func applyHeaders(results []corpusSearchResult, operands displayOperands) {
 			}
 			// The header and the node path share the path below the
 			// operand. A highlight there moves to its place in the header.
-			// A highlight in a part that the header drops is removed.
+			// The rewrite removes a highlight in a part that the header drops.
 			var fragments []zoekt.LineFragmentMatch
 			if name := result.file.FileName; string(line.Line) == name {
 				shared := sharedPathSuffix(headerLine, name)

@@ -13,10 +13,11 @@ import (
 // after each call.
 //
 // It asserts:
-//   - each call ends with no error, and the index has a shard,
+//   - each call ends with no error;
+//   - at the end, the index has a shard;
 //   - the live heap after a GC grows by at most 8 MiB from call 100 to the
-//     end,
-//   - the HeapAlloc peak stays at or below 1500 MiB (a leak guard),
+//     end;
+//   - the HeapAlloc peak stays at or below 1500 MiB (a leak guard);
 //   - readSemaphore has its start weight again at the end.
 func TestSoak_LargeFolderStaysFresh(t *testing.T) {
 	requireTools(t)

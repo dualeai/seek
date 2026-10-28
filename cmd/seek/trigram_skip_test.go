@@ -63,6 +63,9 @@ func expectSearchMatch(t *testing.T, dir string, operands []string, term, header
 	}
 }
 
+// TestRun_HighTrigramDocumentKeepsSearchableContent searches a document that
+// Zoekt's default TrigramMax skips, in a folder, as an exact file, and as a
+// committed and a dirty Git file. Each search finds the needle at its end.
 func TestRun_HighTrigramDocumentKeepsSearchableContent(t *testing.T) {
 	requireTools(t)
 

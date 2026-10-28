@@ -836,7 +836,7 @@ func TestGitCorpusFormatting_ContextLines_EmptyByteSlice(t *testing.T) {
 }
 
 func TestGitCorpusFormatting_ContextLines_BeforeNoTrailingNewline(t *testing.T) {
-	// Before bytes without trailing newline should still be counted correctly.
+	// The formatter counts Before bytes with no trailing newline correctly too.
 	files := []zoekt.FileMatch{
 		{
 			FileName:   "app.go",
@@ -946,8 +946,10 @@ func TestGitCorpusFormatting_SpecialCharsInLine(t *testing.T) {
 	}
 }
 
+// TestGitCorpusFormatting_LineNumber_MaxUint32 formats a match on the
+// largest line number of a uint32, and its context line. The context line
+// arithmetic must not overflow, and each line keeps its number.
 func TestGitCorpusFormatting_LineNumber_MaxUint32(t *testing.T) {
-	// A large line number: the context line arithmetic must not overflow.
 	files := []zoekt.FileMatch{
 		{
 			FileName:   "big.go",
@@ -957,16 +959,15 @@ func TestGitCorpusFormatting_LineNumber_MaxUint32(t *testing.T) {
 			LineMatches: []zoekt.LineMatch{
 				{
 					Line:       []byte("match\n"),
-					LineNumber: 1<<31 - 1, // max int32
+					LineNumber: math.MaxUint32,
 					Before:     []byte("before\n"),
 				},
 			},
 		},
 	}
-	// Should not panic
 	result := formatGitCorpusResultsForTest(files, 0, 0)
-	if !strings.Contains(result, "match") {
-		t.Error("expected match to appear in output")
+	if want := "4294967294 before\n4294967295 match\n"; !strings.Contains(result, want) {
+		t.Errorf("output %q, want the lines %q", result, want)
 	}
 }
 
@@ -996,7 +997,7 @@ func TestGitCorpusFormatting_LineNumbers_NoPaddingNoIndent(t *testing.T) {
 	}
 }
 
-// --- Limit / MaxMatches tests ---
+// --- limit and maxMatches tests ---
 
 // extractFileHeaders returns the "## filename" headers from formatted output.
 func extractFileHeaders(output string) []string {
@@ -1019,8 +1020,8 @@ func TestGitCorpusFormatting_Limit_TopN(t *testing.T) {
 		}
 	}
 	result := formatGitCorpusResultsForTest(files, 3, 0)
-	// Anchor on the "## " header so that, for example, "file_09.go" can't
-	// alias "file_900.go".
+	// The "## " prefix anchors each name at the header start, so that
+	// "file_09.go" cannot match inside a longer name such as "old_file_09.go".
 	for _, want := range []string{"## file_09.go", "## file_08.go", "## file_07.go"} {
 		if !strings.Contains(result, want) {
 			t.Errorf("expected %s in limited output", want)
@@ -1170,7 +1171,7 @@ func TestGitCorpusFormatting_Limit_FileOnlyMatch(t *testing.T) {
 	}
 }
 
-// --- MaxMatches tests ---
+// --- maxMatches tests ---
 
 func TestGitCorpusFormatting_MaxMatches_Basic(t *testing.T) {
 	matches := make([]zoekt.LineMatch, 10)
@@ -1281,7 +1282,7 @@ func TestGitCorpusFormatting_MaxMatches_FileOnlyMatch(t *testing.T) {
 	}
 }
 
-// --- Combined limit + maxMatches tests ---
+// --- limit and maxMatches together ---
 
 func TestGitCorpusFormatting_LimitAndMaxMatches_Combined(t *testing.T) {
 	files := make([]zoekt.FileMatch, 10)

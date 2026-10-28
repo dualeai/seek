@@ -580,8 +580,8 @@ func stopWhenFakeGitStarts(t *testing.T, pidFile string, stop func()) (pidLine f
 	}
 }
 
-// expiringContext expires with context.DeadlineExceeded when expire is
-// called, as a timeout does, but at a point the test chooses.
+// expiringContext expires with context.DeadlineExceeded when the test calls
+// expire, as a timeout does, but at a point that the test chooses.
 type expiringContext struct {
 	context.Context
 	done chan struct{}

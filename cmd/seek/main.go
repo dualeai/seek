@@ -19,6 +19,9 @@ import (
 	"golang.org/x/term"
 )
 
+// errGitIndexStateChanged reports that the files of a node, or the HEAD of a
+// Git node, changed after the node's capture. When a read returns it,
+// openNode opens the node once more from a new capture.
 var errGitIndexStateChanged = errors.New("git index state changed")
 
 // version is the release version. The build and release commands set it with
@@ -76,8 +79,8 @@ func main() {
 
 	// Help, version, completion, and explicit GC calls do not start automatic
 	// GC. A GC command already owns cache maintenance, and its dry-run form
-	// must remain read-only. Search calls run automatic GC after their output
-	// is flushed.
+	// must remain read-only. Search calls run automatic GC after they flush
+	// their output.
 	if shouldRunOpportunisticGC(args) {
 		fireOpportunisticGC(runOpportunisticGC, gcRunTimeout)
 	}
@@ -466,6 +469,8 @@ func watchInterrupts(signals <-chan os.Signal, cancel context.CancelFunc, waits 
 	}
 }
 
+// normalizeCommittedTreeish maps an empty HEAD to gitNoHead, so the two forms
+// of "no commit" compare equal.
 func normalizeCommittedTreeish(headSHA string) string {
 	if headSHA == "" || headSHA == gitNoHead {
 		return gitNoHead

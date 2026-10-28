@@ -55,7 +55,7 @@ func TestColor_MatchSpanWrapped(t *testing.T) {
 }
 
 func TestColor_AdjacentFragmentsCoalesce(t *testing.T) {
-	// "foo" [0,3) and "bar" [3,6) are touching → one color pair, not two.
+	// "foo" [0,3) and "bar" [3,6) touch, so they get one color pair, not two.
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("foobar baz\n", 1, frag(0, 3), frag(3, 3))}}
 	out := fmtOneFile(fm, ansiPalette)
@@ -109,7 +109,8 @@ func TestColor_AnsiStrippedEqualsPlain(t *testing.T) {
 }
 
 func TestColor_NonAdjacentMatchesBothColored(t *testing.T) {
-	// "x ONE y TWO z": ONE@2 and TWO@8 are apart, and both must be colored.
+	// "x ONE y TWO z": ONE@2 and TWO@8 are apart, and the output must color
+	// both.
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("x ONE y TWO z\n", 1, frag(2, 3), frag(8, 3))}}
 	out := fmtOneFile(fm, ansiPalette)
@@ -155,7 +156,8 @@ func TestLongLine_MatchAtStartNoHeadMarker(t *testing.T) {
 	fm := zoekt.FileMatch{FileName: "min.js", Language: "JavaScript", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch(line, 1, frag(0, 4))}}
 	out := fmtOneFile(fm, plainPalette)
-	// Match at offset 0 → winStart clamps to 0 → no leading "…+N bytes ".
+	// A match at offset 0 sets winStart to 0, so the line has no leading
+	// "…+N bytes " marker.
 	body := strings.SplitN(out, "\n", 2)[1]
 	if strings.HasPrefix(strings.TrimPrefix(body, "1 "), "…+") {
 		t.Fatalf("unexpected head marker for start-anchored match, got:\n%q", out)
@@ -179,7 +181,8 @@ func TestLongLine_ZeroLengthAndEOLFragmentsSkipped(t *testing.T) {
 }
 
 func TestLongLine_ContextLineCapped(t *testing.T) {
-	// A long before-context line is tail-trimmed (no match logic).
+	// The formatter cuts the tail of a long before-context line: a context
+	// line has no match to keep.
 	big := strings.Repeat("z", 2000)
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{{
@@ -191,8 +194,8 @@ func TestLongLine_ContextLineCapped(t *testing.T) {
 	if strings.Contains(out, big) {
 		t.Fatalf("long context line should be capped, got %d bytes", len(out))
 	}
-	// 2000 source bytes, all ASCII → cut at the 1024-byte line cap (no rune
-	// backup), so the marker reports exactly 976 bytes dropped.
+	// 2000 source bytes, all ASCII: the cut is at the 1024-byte line cap (no
+	// rune backup), so the marker reports exactly 976 bytes dropped.
 	wantLine := "\n4 " + strings.Repeat("z", 1024) + " …+976 bytes\n"
 	if !strings.Contains(out, wantLine) {
 		t.Fatalf("expected the capped context line %q, got:\n%q", wantLine, out)
@@ -220,13 +223,11 @@ func TestSanitize_ControlBytesStrippedTabKept(t *testing.T) {
 }
 
 func TestSanitize_ControlInsideMatchColorStillValid(t *testing.T) {
-	// ESC embedded inside the matched span is dropped; color codes stay paired
-	// and the only escapes present are our palette codes.
+	// The output drops an ESC inside the matched span. It holds one match
+	// code only, and that code and a reset enclose "needle".
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("x ne\x1bedle y\n", 1, frag(2, 7))}}
 	out := fmtOneFile(fm, ansiPalette)
-	// The embedded ESC is dropped; the only ESC bytes left are our palette
-	// codes, and every match-start is paired with a reset.
 	if strings.Contains(out, "ne\x1bedle") {
 		t.Fatalf("embedded ESC must be stripped, got:\n%q", out)
 	}
@@ -273,9 +274,9 @@ func TestNotices_NoneWhenNothingDropped(t *testing.T) {
 }
 
 func TestLongLine_WindowCutLandsOnRuneBoundary(t *testing.T) {
-	// Place a 4-byte emoji so the computed window start
-	// (matchStart-matchCtxBytes) lands MID-rune. Without backupToRuneBoundary
-	// the window would slice the emoji and emit broken UTF-8.
+	// The computed window start (matchStart-matchCtxBytes) falls inside a
+	// 4-byte emoji. Without backupToRuneBoundary, the window would cut the
+	// emoji and write broken UTF-8.
 	const emoji = "🎉" // U+1F389, 4 bytes
 	matchStart := matchCtxBytes + 100
 	winStart := matchStart - matchCtxBytes
@@ -320,10 +321,11 @@ func TestSanitize_DisplayRootControlBytesStripped(t *testing.T) {
 // --- Trojan Source / BiDi -------------------------------------------------
 
 func TestSanitize_BidiOverridesStripped(t *testing.T) {
-	// U+202E (RLO) + U+202C (PDF): the Trojan-Source visual-spoofing pair must
-	// be removed; the surrounding text stays intact.
+	// The line holds U+202E (RLO), U+202C (PDF), U+2066 (LRI), and U+2028
+	// (line separator). Each can change how the line looks, so the output
+	// must drop each one. The text around them stays.
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
-		LineMatches: []zoekt.LineMatch{lineMatch("access = \u202Euser\u202C x\n", 1)}}
+		LineMatches: []zoekt.LineMatch{lineMatch("access = \u202Euser\u202C \u2066x\u2028\n", 1)}}
 	out := fmtOneFile(fm, plainPalette)
 	for _, r := range []rune{'\u202E', '\u202C', '\u2066', '\u2028'} {
 		if strings.ContainsRune(out, r) {
@@ -348,9 +350,9 @@ func TestSanitize_ZeroWidthJoinerKept(t *testing.T) {
 // --- Defensive: unsorted fragments ----------------------------------------
 
 func TestColor_UnsortedFragmentsNoSpanLoss(t *testing.T) {
-	// "aXbbbY c": X@1, Y@5. Deliver fragments OUT OF ORDER (Y then X). Without
-	// the defensive sort, span coalescing would drop the second span with no
-	// error.
+	// "aXbbbY c": X@1, Y@5. The fragments come out of order (Y, then X).
+	// Without the sort, the merge of the spans would drop the second span
+	// with no error.
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("aXbbbY c\n", 1, frag(5, 1), frag(1, 1))}}
 	out := fmtOneFile(fm, ansiPalette)
@@ -395,9 +397,9 @@ func TestColor_OverlappingFragmentsCoalesce(t *testing.T) {
 }
 
 func TestColor_ManyFragmentsSpillToHeap(t *testing.T) {
-	// >16 fragments on one line forces the stack-backed [16]span buffer to
-	// spill to a heap-grown slice; all spans must still render. Exercises the
-	// spill path that the [16] capacity bound otherwise leaves untested.
+	// More than 16 fragments on one line make the [16]span array on the
+	// stack grow into a slice on the heap. All spans must still render. No
+	// other test reaches that path.
 	const count = 20
 	// "x" is at each even offset: 0, 2, 4, and so on.
 	line := strings.Repeat("x ", count) + "\n"
@@ -413,7 +415,7 @@ func TestColor_ManyFragmentsSpillToHeap(t *testing.T) {
 	}
 }
 
-// --- stripRune: direct unit oracle for the security predicate -------------
+// --- stripRune: runes that it drops and keeps, with class edges -----------
 
 func TestStripRune(t *testing.T) {
 	cases := []struct {

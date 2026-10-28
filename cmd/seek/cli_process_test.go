@@ -456,8 +456,8 @@ func runCLIProcessOnLine(t *testing.T, cacheDir, dir string, args []string, matc
 }
 
 // lockWaitLine matches the stderr line of a lock wait of a CLI process. The
-// line holds reason, one of the lockWait constants, and the path of the lock,
-// so a wait on another lock does not match.
+// line holds reason (lockWaitBuild, lockWaitReaders, or lockWaitPublish) and
+// the path of the lock, so a wait on another lock does not match.
 func lockWaitLine(reason, lock string) func(line string) bool {
 	return func(line string) bool {
 		return strings.Contains(line, reason) && strings.Contains(line, lock)

@@ -595,10 +595,11 @@ func newPinnedLateOnModel(t *testing.T) *lateOnModel {
 
 // lateOnReferenceScoreCheck scores one description against three fixed
 // documents. Every provider must give the reference scores (want) within 0.01,
-// in the same order. With gate false, a difference in a score or in the order
-// is logged, not failed. provider names the provider of scorer after its first
-// call. semanticProviderName gives the provider of the last model that built
-// an encoder. That is not the process model if another test built one later.
+// in the same order. With gate false, the check logs a difference in a score or
+// in the order and does not fail. provider names the provider of scorer after
+// its first call. semanticProviderName gives the provider of the last model
+// that built an encoder. That is not the process model if another test built
+// one later.
 //
 // A provider that passes the run-time check in verifyLateOnAcceleratedProvider
 // but fails here shows that the check accepts too much. Then make
@@ -980,8 +981,8 @@ func TestLateOnRowUsableTokenScansEveryMaskedToken(t *testing.T) {
 	if !lateOnRowHasUsableToken(documents, 0, mask) {
 		t.Fatal("a non-finite first token ended the scan")
 	}
-	// Row 1 is untouched, so it stays unusable. This also proves the row offset
-	// is applied, because row 0 is usable.
+	// The test does not write row 1, so it stays unusable. Row 0 is usable,
+	// so this also proves that the check applies the row offset.
 	if lateOnRowHasUsableToken(documents, 1, mask) {
 		t.Fatal("an empty second row reported a usable token")
 	}
@@ -1045,9 +1046,9 @@ func TestLateOnProbeRowsCoverActiveTokens(t *testing.T) {
 	if !reflect.DeepEqual(ids, again) || !reflect.DeepEqual(attention, againAttention) {
 		t.Fatal("the probe row is not stable between calls")
 	}
-	// Every attended token must be one that the model can embed, and no other
-	// token is attended. Otherwise the check compares the two providers on
-	// padding.
+	// Every attended token must be one that the model can embed, and the
+	// probe attends no other token. Otherwise the check compares the two
+	// providers on padding.
 	for row := range semanticModelBatchRows {
 		base := row * lateOnSequenceLength
 		for token := range lateOnSequenceLength {
@@ -1091,8 +1092,8 @@ func TestLateOnOutputsAgreeSeparatesFaultFromNoise(t *testing.T) {
 	}
 
 	// A uniform shrink keeps every cosine at 1 but lowers every score by the
-	// same factor, which is the shape of the macOS 15 fault. It must be
-	// rejected.
+	// same factor, which is the shape of the macOS 15 fault. The check must
+	// reject it.
 	scaled := make([]float32, batch)
 	for index, value := range reference {
 		scaled[index] = value * 0.87
@@ -1122,7 +1123,7 @@ func TestLateOnOutputsAgreeSeparatesFaultFromNoise(t *testing.T) {
 		t.Fatal("a zero token vector agreed")
 	}
 
-	// A direction change past the limit must be rejected.
+	// The check must reject a direction change past the limit.
 	turned := append([]float32(nil), reference...)
 	turnedAt := (lastRow + 7) * semanticEmbeddingDimensions
 	turned[turnedAt] = -turned[turnedAt]
@@ -1130,7 +1131,7 @@ func TestLateOnOutputsAgreeSeparatesFaultFromNoise(t *testing.T) {
 		t.Fatal("a turned token agreed")
 	}
 
-	// Noise well inside the measured provider spread must be accepted.
+	// The check must accept noise well inside the measured provider spread.
 	noisy := append([]float32(nil), reference...)
 	for index := range noisy {
 		noisy[index] *= 1 + float32(index%3)*1e-6
@@ -1188,7 +1189,7 @@ func TestDegenerateScoringErrorCarriesTheProviderSentinel(t *testing.T) {
 	if !errors.Is(err, errDegenerateSemanticVector) {
 		t.Fatalf("error = %v, want the degenerate-output sentinel", err)
 	}
-	// A shape failure is not a provider fault and must not be reported as one.
+	// A shape failure is no provider fault, and its error must not claim one.
 	_, shapeErr := lateOnMaxSimPrepared(query[:10], queryMask, documents, [][]bool{documentMask})
 	if errors.Is(shapeErr, errDegenerateSemanticVector) {
 		t.Fatalf("a shape error claimed a provider fault: %v", shapeErr)
@@ -1261,7 +1262,7 @@ func (c *heldBuildContext) Err() error {
 
 // closeDuringBuild starts a call of model that builds an encoder for the
 // index build, and holds the build at its start (heldBuildContext). It starts
-// Close while the build is held, then lets the build go on. The call passed
+// Close while it holds the build, then lets the build go on. The call passed
 // the closed check before Close, so it must get its encoder. Close must wait
 // for the build and close what it made.
 func closeDuringBuild(t *testing.T, model *lateOnModel) {

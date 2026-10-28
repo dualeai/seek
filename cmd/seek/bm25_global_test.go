@@ -403,8 +403,8 @@ func TestBM25ShardCountsIgnoreTombstones(t *testing.T) {
 	if want.Docs == 0 || got.Docs != want.Docs || got.Content != want.Content {
 		t.Fatalf("shard %s: counts %+v after the tombstone, want %+v", tombstoned, got, want)
 	}
-	// Another shard file with the same name and size: a bogus count with
-	// another inode is listed again.
+	// Another shard file with the same name and size: the search lists the
+	// shard again when the record gives a bogus count with another inode.
 	bogus := after
 	entry := bogus[tombstoned]
 	entry.Content, entry.Ino = 1, entry.Ino+1
@@ -472,8 +472,8 @@ func TestBM25InPlaceAverageReadsItsOwnShards(t *testing.T) {
 	if shards := shardCount(filepath.Join(root, "whole")); shards != 1 {
 		t.Fatalf("whole: %d shards, want 1", shards)
 	}
-	// From here each file of split gets its own shard. With one shard Zoekt's
-	// score is final and no rescore runs.
+	// whole has one shard, so Zoekt's scores are final and no rescore runs.
+	// From here each file of split gets its own shard.
 	swapForTest(t, &shardMax, 64)
 	split, command := bm25NodeSearch(t, "case:yes foo", filepath.Join(root, "split"))
 	if shards := shardCount(filepath.Join(root, "split")); shards < 2 {
@@ -492,9 +492,9 @@ func TestBM25InPlaceAverageReadsItsOwnShards(t *testing.T) {
 
 // TestBM25FileAtomTermInAnyLayout searches with explicit file: atoms as one
 // node whose headers are its index paths and as two nodes whose headers are
-// not. In both, Zoekt scores the atom on the index path, through the clause
-// atom-or-not-atom beside the header set. So the scores are the same, also
-// for filter-only queries.
+// not. In both, Zoekt scores the atom on the index path. The one node scores
+// it directly, and the two nodes through the clause atom-or-not-atom beside
+// the header set. So the scores are the same, also for filter-only queries.
 func TestBM25FileAtomTermInAnyLayout(t *testing.T) {
 	requireTools(t)
 	root := t.TempDir()

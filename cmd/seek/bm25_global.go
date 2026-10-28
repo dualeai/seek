@@ -247,8 +247,9 @@ func (record *shardStatsRecord) save(live []string) {
 	}
 }
 
-// parseZoektBM25Debug reads the low-priority flag and the summed term
-// frequencies from Zoekt's BM25 debug line (index/score.go scoreFileBM25):
+// parseZoektBM25Debug reads the low-priority flag, the summed term frequencies
+// and the length ratio from Zoekt's BM25 debug line (index/score.go
+// scoreFileBM25). The line is
 // "bm25-score: S (low-priority: B) <- sum-termFrequencies: N, length-ratio: L".
 // A boosted score, or any other form, gives false.
 func parseZoektBM25Debug(debug string) (lowPriority bool, sum int, ratio float64, ok bool) {
@@ -422,7 +423,7 @@ func bm25Parts(file *zoekt.FileMatch, bq bm25Query, average float64) bool {
 }
 
 // bm25MaxSplitStates bounds the distinct frequency sets that one hit tries; a
-// hit with more keeps Zoekt's score (no result is cut).
+// hit with more keeps Zoekt's score (Seek drops no result).
 const bm25MaxSplitStates = 4096
 
 // bm25GroupOptions joins the lines whose split lists are equal. k such lines
@@ -569,8 +570,8 @@ type bm25Query struct {
 	substrings map[string]struct{}
 	// regexps match the whole text of a content regexp candidate.
 	regexps []*grafanaregexp.Regexp
-	// multiLine is set when a content candidate can span lines: a regexp,
-	// or a substring with a newline.
+	// multiLine marks a query with a content candidate that can span lines:
+	// a regexp, or a substring with a newline.
 	multiLine bool
 }
 
@@ -967,10 +968,11 @@ func (bq bm25Query) lineFrequencies(line zoekt.LineMatch, keys []string) ([][]bm
 // no candidate alone joins the next pieces, with the newlines between. It
 // stops when the text is one candidate, or the text and the newline after it
 // is. It returns the key of each content fragment, in line and fragment order
-// (a file-name line has none), and the change that makes each candidate count
-// once. Each piece of a candidate takes the candidate's key, and each piece
-// counts on its line, as in Zoekt's line score. With no atom that can span
-// lines, it returns no keys, and lineFrequencies reads them from the texts.
+// (a file-name line has none). It also returns the change that makes each
+// candidate count once. Each piece of a candidate takes the candidate's key,
+// and each piece counts on its line, as in Zoekt's line score. With no atom
+// that can span lines, it returns no keys, and lineFrequencies reads them from
+// the texts.
 func (bq bm25Query) multiLineMerges(lines []zoekt.LineMatch) ([]string, map[string]int, bool) {
 	if !bq.multiLine {
 		return nil, nil, true
@@ -1156,7 +1158,7 @@ func (command *bm25Command) rescoreAverage() (float64, bool) {
 }
 
 // rescoreStrictResults gives each strict result its score under the global
-// average, before the merge orders them.
+// average, before the display orders them (rankCorpusResultsForDisplay).
 func rescoreStrictResults(results []corpusSearchResult, command *bm25Command) {
 	average, ok := command.rescoreAverage()
 	if !ok {
@@ -1173,7 +1175,9 @@ func rescoreStrictResults(results []corpusSearchResult, command *bm25Command) {
 	slog.Debug("Rescored strict hits with the global average", "hits", len(results), "kept", kept, "average", average)
 }
 
-// rescoreStrictHits does the same for the strict hits of a model query.
+// rescoreStrictHits does the same for the hits of a model query, before the
+// merge orders them. It gives each strict hit its score and each relaxed hit
+// its lexical rank score.
 func rescoreStrictHits(hits []nodeHit, command *bm25Command) {
 	average, ok := command.rescoreAverage()
 	if !ok {

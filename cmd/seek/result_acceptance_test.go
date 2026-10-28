@@ -21,9 +21,9 @@ func TestMeanMaxSimPassesStrictBoundary(t *testing.T) {
 	if !meanMaxSimPasses(math.Nextafter32(threshold, 1), 0, 1) {
 		t.Fatal("the float32 above the threshold did not pass")
 	}
-	// Over 4 tokens, (3.6 - 3.2) / 4 = 0.1 is under the threshold of 0.25,
-	// and (3.6 - 2.0) / 4 = 0.4 is above it. The score alone, 3.6 / 4 = 0.9,
-	// and the difference alone, 0.4, are above it.
+	// Over 4 tokens, (3.6 - 3.2) / 4 = 0.1 is under the threshold of 0.25.
+	// (3.6 - 2.0) / 4 = 0.4 is above it. The score alone, 3.6 / 4 = 0.9, and
+	// the difference alone, 0.4, are above it.
 	if meanMaxSimPasses(3.6, 3.2, 4) {
 		t.Fatal("a score with a lift under the threshold passed")
 	}

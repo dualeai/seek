@@ -55,8 +55,8 @@ func TestBinaryNoticeCountsOnlyFilterPassingFiles(t *testing.T) {
 	}
 }
 
-// TestNameOnlyNoticeCountsOversizedFiles sets a small content limit: a text
-// file above it is indexed by name only and counted.
+// TestNameOnlyNoticeCountsOversizedFiles sets a small content limit: Seek
+// indexes a text file above it by name only, and the notice counts it.
 func TestNameOnlyNoticeCountsOversizedFiles(t *testing.T) {
 	requireTools(t)
 	swapForTest(t, &documentContentLimit, 64)
@@ -70,11 +70,11 @@ func TestNameOnlyNoticeCountsOversizedFiles(t *testing.T) {
 	}
 }
 
-// TestNameOnlyNoticeCountRows proves the count rules. A name-only file that
-// already prints is not counted again. Zoekt's own too-small files are not
-// counted. A real text file that starts with the marker is not counted. An
-// unreadable file is counted. A user who ignores file modes, as root does,
-// reads the mode-000 file: it then prints as a match, and no file is counted.
+// TestNameOnlyNoticeCountRows proves the count rules. The notice does not
+// count a name-only file that already prints. It does not count Zoekt's own
+// too-small files, or a real text file that starts with the marker. It counts
+// an unreadable file. A user who ignores file modes, as root does, reads the
+// mode-000 file: it then prints as a match, and the notice counts no file.
 func TestNameOnlyNoticeCountRows(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()

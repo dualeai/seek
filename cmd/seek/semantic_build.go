@@ -86,6 +86,11 @@ type semanticCoarseBatch struct {
 	coarse   []semanticCoarseVectors
 }
 
+// semanticDocumentSource streams the files of a build. The folder source sends
+// them in name order, and the Git source in git ls-tree order. The overlay
+// source of the dirty files sends each file when its read ends. The function
+// that it also returns gives the read error of the source after the channel
+// closes.
 type semanticDocumentSource func(context.Context) (<-chan fileContent, func() error)
 
 // folderReadSource gives a document source that streams files with stream.
@@ -179,6 +184,8 @@ func (controller *semanticConcurrencyController) activeLimit(cpuLimit int) int {
 	return max(1, controller.limit)
 }
 
+// noteActive starts a measurement window when active calls fill the width. A
+// window that already runs at this width keeps its start.
 func (controller *semanticConcurrencyController) noteActive(active int, now time.Time) {
 	if active < controller.limit ||
 		(controller.windowSaturated && controller.windowLimit == controller.limit) {
@@ -207,6 +214,9 @@ func (controller *semanticConcurrencyController) noteInputClosed() {
 	controller.invalidateWindow()
 }
 
+// noteCompletion counts one finished call of rows rows in the window. It
+// reports true when the window holds enough calls to evaluate: the width in
+// calls for the warm-up, and twice the width after it.
 func (controller *semanticConcurrencyController) noteCompletion(rows int) bool {
 	if !controller.windowSaturated || controller.windowLimit != controller.limit {
 		return false
@@ -220,6 +230,12 @@ func (controller *semanticConcurrencyController) noteCompletion(rows int) bool {
 	return controller.windowBatches >= required
 }
 
+// evaluate measures a complete window and sets the next width. The warm-up
+// window measures only memory. After a wider probe, a memory drop larger than
+// the free memory returns to the previous width. A wider width whose rate is
+// not above the best rate returns to the best width, which then caps the
+// width. Else the width doubles, up to cpuLimit and the cap. The free memory
+// also limits the added calls, at the measured cost of one added call.
 func (controller *semanticConcurrencyController) evaluate(
 	now time.Time,
 	cpuLimit int,
@@ -328,7 +344,7 @@ func buildSemanticGitGeneration(
 	if err := requireNativeGitVersion(ctx); err != nil {
 		return err
 	}
-	reuse := loadSemanticReuse(indexDir, dir, lineage, "", nil, "")
+	reuse := loadSemanticReuse(indexDir, lineage, "", nil, "")
 	defer reuse.Close()
 	return buildSemanticGeneration(
 		ctx,
@@ -365,7 +381,7 @@ func buildSemanticFolderGeneration(
 	for index, candidate := range selected {
 		names[index] = candidate.name
 	}
-	reuse := loadSemanticReuse(indexDir, dir, lineage, base, names, "")
+	reuse := loadSemanticReuse(indexDir, lineage, base, names, "")
 	defer reuse.Close()
 	return buildSemanticGeneration(
 		ctx,
@@ -740,6 +756,9 @@ func takeSemanticWindowTokenizers(ctx context.Context, count int) ([]*lateOnToke
 	return tokenizers, nil
 }
 
+// dispatchSemanticDocuments numbers the documents in source order and sends
+// them to jobs. It sends to done the number of documents that it sent. After
+// a cancel, it drains documents and releases their read weight.
 func dispatchSemanticDocuments(
 	ctx context.Context,
 	documents <-chan fileContent,
@@ -827,6 +846,9 @@ func extractSemanticDocuments(
 	}
 }
 
+// encodeSemanticBatches runs one model call for each batch, as many at the
+// same time as the concurrency controller and the CPU leases allow. It sends
+// each result to encoded in completion order. A failed call cancels the build.
 func encodeSemanticBatches(
 	ctx context.Context,
 	embedder semanticModel,
@@ -1006,8 +1028,8 @@ func collectSemanticBatches(
 				fail(batch.err)
 				continue
 			}
-			// The build cuts each batch at 1 to semanticModelBatchRows rows; the
-			// model must give one embedding for each.
+			// The build cuts each batch at 1 to semanticModelBatchRows rows;
+			// the model must give one embedding for each.
 			if len(batch.units) != len(batch.embeddings) {
 				fail(fmt.Errorf("semantic model batch has mismatched rows"))
 				continue
@@ -1189,7 +1211,7 @@ func (w *semanticRowWriter) complete(row uint64, stored *semanticCoarseSNORM16Ve
 	return nil
 }
 
-// finish checks that every row from 0 was written, sends the last short
+// finish checks that the writer wrote every row from 0, sends the last short
 // block, sizes both files, and closes them.
 func (w *semanticRowWriter) finish(ok bool) (uint64, semanticSizedArtifact, semanticSizedArtifact, error) {
 	var err error
@@ -1197,8 +1219,8 @@ func (w *semanticRowWriter) finish(ok bool) (uint64, semanticSizedArtifact, sema
 		if uint64(len(w.seen)) != w.rows {
 			err = fmt.Errorf("semantic build wrote %d of %d rows", w.rows, len(w.seen))
 		}
-		// When every row from 0 was written once, every full block was sent.
-		// Only the last block can remain, and it is short.
+		// When the writer wrote every row from 0 once, it sent every full
+		// block. Only the last block can remain, and it is short.
 		for sequence, block := range w.blocks {
 			if err == nil && w.coarseReady != nil {
 				w.coarseReady <- semanticCoarseBatch{sequence: int(sequence), coarse: block.coarse[:block.count]}
@@ -1224,10 +1246,10 @@ func releaseSemanticBuildBatch(batch semanticBuildBatch) {
 }
 
 // buildSemanticOverlayGeneration embeds the work-tree bytes of a Git node's
-// dirty files. Each file is read once, and its windows are keyed by the bytes
-// read. A window that a live generation or the unit store holds is copied, not
-// embedded again. Deleted files have no rows; the read masks the base rows of
-// every dirty path.
+// dirty files. It reads each file once and keys its windows by the bytes that
+// it read. It copies a window that a live generation or the unit store holds
+// and does not embed it again. Deleted files have no rows; the read masks the
+// base rows of every dirty path.
 func buildSemanticOverlayGeneration(
 	ctx context.Context,
 	repoDir string,
@@ -1243,7 +1265,7 @@ func buildSemanticOverlayGeneration(
 	// base is the staged base generation of the same build, or "": the
 	// overlay reuses its windows, so a modified file embeds only its changed
 	// windows.
-	reuse := loadSemanticReuse(indexDir, dir, lineage, "", nil, base)
+	reuse := loadSemanticReuse(indexDir, lineage, "", nil, base)
 	defer reuse.Close()
 	return buildSemanticGeneration(
 		ctx,

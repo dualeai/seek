@@ -106,6 +106,10 @@ func expectWarnings(t *testing.T, got []string, want ...string) {
 	}
 }
 
+// TestRun_WarnsOnlyForUnindexedExactFiles checks the not-indexed warning. It
+// names each exact file operand that the index keeps by name only and that has
+// no content match. A text file, a folder operand and an unscoped Git search
+// get no warning.
 func TestRun_WarnsOnlyForUnindexedExactFiles(t *testing.T) {
 	requireTools(t)
 	const absent = "zz_absent_term"

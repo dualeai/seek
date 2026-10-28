@@ -97,8 +97,8 @@ func TestRun_EmptyGitRepoReturnsNoMatch(t *testing.T) {
 	}
 }
 
-// TestIntegration_StagedButNotCommitted verifies that staged (git add) but
-// not yet committed files are detected by git status and searchable.
+// TestIntegration_StagedButNotCommitted verifies that git status lists a file
+// that is staged (git add) but not committed, and that the search finds it.
 func TestIntegration_StagedButNotCommitted(t *testing.T) {
 	requireTools(t)
 
@@ -208,8 +208,8 @@ func TestIntegration_NestedUntrackedFileSearchable(t *testing.T) {
 // EDGE CASES: boundary conditions and unusual but valid states
 // ===========================================================================
 
-// TestParseGitStatusV2_TrailingGarbageAfterLastNul verifies that content
-// after the last NUL byte (no final NUL terminator) is safely ignored.
+// TestParseGitStatusV2_TrailingGarbageAfterLastNul verifies that the parser
+// ignores the content after the last NUL byte (no final NUL terminator).
 func TestParseGitStatusV2_TrailingGarbageAfterLastNul(t *testing.T) {
 	raw := "# branch.oid abc123\x00? file.go\x00trailing garbage without nul"
 	state := parseGitStatusV2(raw)
@@ -223,8 +223,8 @@ func TestParseGitStatusV2_TrailingGarbageAfterLastNul(t *testing.T) {
 	}
 }
 
-// TestParseGitStatusV2_ConsecutiveNulBytes verifies empty records between
-// NUL bytes are skipped (len < 2).
+// TestParseGitStatusV2_ConsecutiveNulBytes verifies that an empty record
+// between NUL bytes (len < 2) adds no file.
 func TestParseGitStatusV2_ConsecutiveNulBytes(t *testing.T) {
 	raw := "# branch.oid abc\x00\x00\x00? file.go\x00\x00"
 	state := parseGitStatusV2(raw)
@@ -257,8 +257,8 @@ func TestParseGitStatusV2_PathWithSpacesAndUnicode(t *testing.T) {
 	}
 }
 
-// TestExtractV2Path_TooFewFields verifies that when entry has fewer fields
-// than skipFields, empty string is returned (not a panic).
+// TestExtractV2Path_TooFewFields verifies that extractV2Path returns "", with
+// no panic, when entry has fewer fields than skipFields.
 func TestExtractV2Path_TooFewFields(t *testing.T) {
 	cases := []struct {
 		entry      string
@@ -372,10 +372,10 @@ func TestStreamDirtyFiles_FIFOSkipped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Lstat returns ModeNamedPipe, so the reader skips the FIFO before any
-	// open: only a regular file passes. A plain open of a FIFO with no writer
-	// blocks, so a reader that opens it stops the test at the go test
-	// timeout.
+	// The lstat of the reader (dirtyLstat) gives the FIFO type, so the reader
+	// skips the FIFO before any open: only a regular file passes. A plain open
+	// of a FIFO with no writer blocks, so a reader that opens it stops the test
+	// at the go test timeout.
 	fifoPath := filepath.Join(dir, "fifo")
 	if err := syscall.Mkfifo(fifoPath, 0o644); err != nil {
 		t.Fatal(err)
@@ -615,7 +615,7 @@ func TestIntegration_SubmoduleDirtySkipped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Seek must work and skip the dirty submodule directory.
+	// The dirty submodule is its own node: the host search must not fail on it.
 	files, err := runSeekInRepo(t, dir, "submodule_host_marker")
 	if err != nil {
 		t.Fatalf("search with dirty submodule failed: %v", err)
@@ -625,8 +625,8 @@ func TestIntegration_SubmoduleDirtySkipped(t *testing.T) {
 	}
 }
 
-// TestGitRepoState_CancelledContext verifies that cancellation is not hidden as
-// an empty repository state.
+// TestGitRepoState_CancelledContext verifies that gitRepoStateIn returns the
+// cancellation, not an empty repository state.
 func TestGitRepoState_CancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -733,8 +733,8 @@ func TestStreamDirtyFiles_HighConcurrency(t *testing.T) {
 // while the reader reads them, as a file can go between git status and the
 // read. The reader reads each of the 50 files that stay. A deleted file gives
 // no document, or its content when the read came first, and no error.
-// TestStreamDirtyFiles_MixedExistingAndMissing checks a file that is gone
-// before the read starts.
+// TestStreamDirtyFiles_MixedValidAndInvalid checks a file that is gone before
+// the read starts.
 func TestStreamDirtyFiles_RacyDeletion(t *testing.T) {
 	dir := t.TempDir()
 	const numFiles = 100
@@ -800,9 +800,9 @@ func TestAcquireBuildLock_ContextCancellation(t *testing.T) {
 	}
 }
 
-// TestIntegration_VeryLargeUncommittedFile verifies that other files are still
-// indexed when an uncommitted file exceeds testDocumentContentLimit; that file
-// is indexed by name only.
+// TestIntegration_VeryLargeUncommittedFile verifies that Seek still indexes
+// the other files when an uncommitted file exceeds testDocumentContentLimit.
+// It indexes that file by name only.
 func TestIntegration_VeryLargeUncommittedFile(t *testing.T) {
 	swapForTest(t, &documentContentLimit, testDocumentContentLimit)
 	requireTools(t)
@@ -831,7 +831,7 @@ func TestIntegration_VeryLargeUncommittedFile(t *testing.T) {
 	if len(files) == 0 {
 		t.Fatal("expected match for small file when large file is present")
 	}
-	// The large file is found by its name and not by its content.
+	// The search finds the large file by its name and not by its content.
 	named, err := seek(t, "--lexical-only", "file:huge.dat", dir)
 	if err != nil || !strings.Contains(named, "huge.dat") {
 		t.Fatalf("the large file is not found by name: err=%v\n%s", err, named)
@@ -934,8 +934,8 @@ func TestIntegration_CoreQuotePath(t *testing.T) {
 	}
 }
 
-// TestIntegration_StatusShowUntrackedFilesNo verifies seek's explicit
-// untracked-file mode is not weakened by user Git status configuration.
+// TestIntegration_StatusShowUntrackedFilesNo verifies that a user Git status
+// setting does not weaken the explicit untracked-file mode of seek.
 func TestIntegration_StatusShowUntrackedFilesNo(t *testing.T) {
 	requireTools(t)
 

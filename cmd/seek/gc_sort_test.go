@@ -215,8 +215,8 @@ func TestGCCmd_DryRun_NoCorpora(t *testing.T) {
 }
 
 // TestGCCmd_SortedCtxCancel_EvictsNothing checks the sorted branch of runGC,
-// which measures every corpus before it evicts one. A context canceled before
-// the run evicts nothing, as runGC states for a cancel during the
+// which measures every corpus before it evicts one. A run whose context ends
+// before it starts evicts nothing, as runGC states for a cancel during the
 // measurement. The other cancellation tests use the default name order, which
 // takes the interleaved branch.
 func TestGCCmd_SortedCtxCancel_EvictsNothing(t *testing.T) {
@@ -306,8 +306,8 @@ func TestGC_PlanCorpusEviction(t *testing.T) {
 	}
 }
 
-// rowProbeWriter records whether a marker file still exists when the row of a
-// given corpus is written. The interleaved pass prints row 1 before it sweeps
+// rowProbeWriter records whether a marker file still exists when runGC writes
+// the row of a given corpus. The interleaved pass prints row 1 before it sweeps
 // the later corpora, so a marker in the last corpus is still there. A pass
 // that sweeps every corpus before it prints a row has already removed it.
 type rowProbeWriter struct {

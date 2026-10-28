@@ -108,8 +108,8 @@ func detectGitFileBoundary(absDir, gitFile string) (gitPaths, detectStatus) {
 
 // moduleWorktreeIs reports a Git directory whose core.worktree names dir. Git
 // writes this setting for a submodule whose Git directory lives in the
-// superproject, in any superproject layout. A `.git` file that points to the
-// Git directory of another directory is not confirmed.
+// superproject, in any superproject layout. So the check does not confirm a
+// `.git` file that points to the Git directory of another directory.
 func moduleWorktreeIs(gitDir, dir string) bool {
 	worktree, ok := readCoreWorktree(filepath.Join(gitDir, "config"))
 	if !ok {
@@ -170,7 +170,7 @@ func hasGitTriad(gitDir, commonDir string) bool {
 // objects/, and refs/ in the directory itself, and no `.git` child. The
 // operand check and the Git status parse use it. The folder walk reads the
 // same entries from the directory listing that it already has
-// (gitListingMarks), with no check of the HEAD content.
+// (gitListingMarks), then checks the HEAD content (validGitHead).
 func detectBareRepoAt(absDir string) bool {
 	if _, err := os.Lstat(filepath.Join(absDir, ".git")); err == nil {
 		return false
@@ -198,8 +198,8 @@ func openNoFollow(path string) (*os.File, error) {
 // of many GB cannot use up the memory of Seek.
 //
 // The file holds one line of the form `gitdir: <path>\n`. The path can be
-// relative to the directory that holds the `.git` file, or absolute. A `\r\n`
-// line end and spaces around the path are accepted. A missing prefix, an
+// relative to the directory that holds the `.git` file, or absolute. It
+// accepts a `\r\n` line end and spaces around the path. A missing prefix, an
 // empty path, or a NUL byte in the path is an error.
 func parseGitFilePointer(gitFile string) (string, error) {
 	line, err := readFirstLineNoFollow(gitFile)
@@ -245,8 +245,8 @@ func readGitFileNoFollow(path string) (string, error) {
 // an empty string and the error: parseGitFilePointer returns the error, and
 // readGitPathFile reports no path.
 //
-// NUL-byte rejection is NOT done here: parseGitFilePointer returns a specific
-// error for it, and readGitPathFile reports no path.
+// It does not reject a NUL byte: parseGitFilePointer returns a specific error
+// for it, and readGitPathFile reports no path.
 func readFirstLineNoFollow(path string) (string, error) {
 	text, err := readGitFileNoFollow(path)
 	if err != nil {

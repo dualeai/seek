@@ -183,9 +183,9 @@ func recordCorpusSize(dir string) int64 {
 }
 
 // checkCacheBudget stops a search before any build when its new generations
-// and the corpora it reuses do not fit the budget. Every other corpus can be
-// evicted after the search, and a rebuilt corpus's old generation does not
-// count.
+// and the corpora it reuses do not fit the budget. enforceCacheBudget can
+// evict every other corpus after the search, and a rebuilt corpus's old
+// generation does not count.
 func checkCacheBudget(ctx context.Context, plans []node, vectors bool) error {
 	// The first pass counts every file by its stat size. Only when that does
 	// not fit does the search read file heads to count binary files as 0.
@@ -238,7 +238,7 @@ func corporaBytes(cacheRoot string) int64 {
 	return total
 }
 
-// fileSize returns the size of path, or 0 when it cannot be read.
+// fileSize returns the size of path, or 0 when its stat fails.
 func fileSize(path string) int64 {
 	if info, err := os.Stat(path); err == nil {
 		return info.Size()
@@ -268,13 +268,13 @@ func corpusSizes(entries []corpusDirEntry, record bool) map[corpusID]int64 {
 // plannedCacheBytes estimates the cache that the search needs: for a node
 // that the search rebuilds, its new generation; for any other node, its
 // ledger size. rebuilds reports whether any node rebuilds. The kind of each
-// node gives its estimate (nodeKind.estimate), with the rule of the build: a
-// node rebuilds with no published state, a state other than the capture, or
-// no generation for the vectors that the search wants. probe reads file heads
-// so that binary files count 0; without it every file counts by its size. A
-// vector build copies the rows of a node's live generation. So with a live
-// generation it adds only the changed content, and with none it adds all of
-// it.
+// node gives its estimate (nodeKind.estimate) with the rule of the build. A
+// node rebuilds when it has no published state, a state other than the
+// capture, or no generation for the vectors that the search wants. probe
+// reads file heads so that binary files count 0; without it every file counts
+// by its size. A vector build copies the rows of a node's live generation. So
+// with a live generation it adds only the changed content, and with none it
+// adds all of it.
 //
 // Each estimate reads the node's capture with no freshness check. The graph
 // expansion gives every node of plans its capture (graphExpansion.plans), and
@@ -313,8 +313,8 @@ func plannedCacheBytes(ctx context.Context, plans []node, vectors, probe bool) (
 func (*folderNode) estimate(ctx context.Context, plan node, vectors, probe bool) (bytes int64, rebuild bool, err error) {
 	published := readStateFile(plan.cacheDir)
 	state, selected := plan.folder.stateHash, plan.folder.selected
-	// decideFolderBuild uses the same rule. The manifest is read only when
-	// the search wants vectors.
+	// decideFolderBuild uses the same rule. The estimate reads the semantic
+	// manifest only when the search wants vectors.
 	present := vectors && semanticManifestPresent(plan.indexDir, plan.folderSemanticSource(state))
 	vectorsMissing := vectorGenerationNeeded(vectors, present, false)
 	if published == state && !vectorsMissing {
@@ -428,7 +428,7 @@ func (g *gitNode) estimate(ctx context.Context, plan node, vectors, probe bool) 
 // liveBaseSource gives the commit of a base generation in indexDir that the
 // current model can reuse.
 func liveBaseSource(indexDir string) (string, bool) {
-	for _, dir := range semanticGenerationDirsIn(indexDir, "") {
+	for _, dir := range semanticGenerationDirsIn(indexDir) {
 		manifest, err := readSemanticManifestUnchecked(dir)
 		if err != nil || !semanticSourceHasGraph(manifest.Source) || validateSemanticManifest(manifest, manifest.Source) != nil {
 			continue

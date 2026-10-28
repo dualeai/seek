@@ -15,8 +15,12 @@ import (
 	"time"
 )
 
-// The tests of this file check that the shard swap and the shared read lock
-// (LOCK_SH) keep search results stable while a node builds again.
+// The tests of this file run searches, GC, and an eviction while a node builds
+// again. The shard swap and the shared read lock (LOCK_SH) must keep search
+// results stable, and GC must not remove a node that a build holds. An
+// eviction can move the cache directory away during a build. Then the Git
+// node must recover in the same command, and the folder node in the next
+// search.
 
 // TestFix_NoShardGapDuringReindexing edits a dirty file twice. A search of a
 // Git node refreshes the dirty content before it reads the shards. So each
@@ -66,8 +70,9 @@ func TestFix_NoShardGapDuringReindexing(t *testing.T) {
 // TestFix_SharedLockBlocksSearchDuringIndexing holds LOCK_EX while
 // acquireReadLock runs: the read lock waits until LOCK_EX is free.
 // acquireReadLock is the lock of every node read (openNodeRead). Its
-// non-blocking shared lock fails while a LOCK_EX is held, so a search waits
-// for a publish (acquirePublishLock) to end before it reads shards.
+// non-blocking shared lock fails while another open file holds LOCK_EX, so a
+// search waits for a publish (acquirePublishLock) to end before it reads
+// shards.
 func TestFix_SharedLockBlocksSearchDuringIndexing(t *testing.T) {
 	lockDir := t.TempDir()
 	lockPath := filepath.Join(lockDir, "test.lock")
@@ -101,8 +106,8 @@ func TestFix_SharedLockBlocksSearchDuringIndexing(t *testing.T) {
 		done <- err
 	}()
 
-	// The debug line of the wait shows that LOCK_SH waits while LOCK_EX is
-	// held.
+	// The debug line of the wait shows that LOCK_SH waits while the holder
+	// keeps LOCK_EX.
 	select {
 	case <-waiting:
 	case err := <-done:
@@ -331,9 +336,9 @@ func readPublishFIFO(t *testing.T, path string, built chan error) string {
 // they are the scan hits of the base and the overlay. A read that binds
 // vectors binds the base and the overlay of one state, so it finds both scan
 // hits. A read that meets a peer's build reads text only, with neither.
-// A read that sees the state move (errGitIndexStateChanged) is counted, not
-// failed. Each reader stops after 2 reads, so a publish that waits for the
-// readers runs.
+// The test counts a read that sees the state move (errGitIndexStateChanged)
+// and does not fail it. Each reader stops after 2 reads, so a publish that
+// waits for the readers runs.
 //
 // After each publish, the test takes the publish lock and moves the committed
 // family aside. A swap does the same before it renames the new family in. Then
@@ -412,8 +417,8 @@ func TestDescriptionReadDuringRepublish_Stress(t *testing.T) {
 			})
 		}
 		// A reader's build can hold the build lock, so this build serves the
-		// current shards. Build until the commit is published, by this build
-		// or a reader's, and wait for the build lock between tries.
+		// current shards. Build until this build or a reader's publishes the
+		// commit, and wait for the build lock between tries.
 		for readStateFile(plan.cacheDir) != preState {
 			peer, err := (&gitNode{paths: paths}).build(ctx, plan.corpusStore, state, preState, execution)
 			if err != nil {
@@ -485,8 +490,9 @@ func waitForBuildLock(t *testing.T, cacheDir string) {
 	releaseLock(lock)
 }
 
-// TestGC_SkipsCorpusWithBuildInProgress verifies that GC honors .build.lock
-// while a temp-swap build runs outside the publish lock.
+// TestGC_SkipsCorpusWithBuildInProgress checks that GC keeps a corpus over the
+// budget while a build holds its .build.lock. A temp-swap build holds that
+// lock, not the publish lock.
 func TestGC_SkipsCorpusWithBuildInProgress(t *testing.T) {
 	root := cacheRootForTest(t)
 	// Over the budget, so the GC would evict the corpus unless the guard
@@ -494,7 +500,7 @@ func TestGC_SkipsCorpusWithBuildInProgress(t *testing.T) {
 	t.Setenv(envCacheBudget, "1")
 	dir := seedCorpus(t, root, fakeCorpusHash(91), time.Now().Add(-30*24*time.Hour))
 
-	// Simulate an in-flight builder holding the build lock.
+	// Hold the build lock, as a running build does.
 	holdBuildLock(t, dir)
 
 	runGC(t.Context(), gcOptions{})
@@ -514,7 +520,7 @@ func TestGC_SkipsCorpusWithBuildInProgress(t *testing.T) {
 // prepares the node again in the same command and finds the file. Folder: the
 // publish of an edit waits for a read lock. The publish sees the eviction
 // when it checks the index directory under its lock, so it makes no path
-// again. The read cannot open its lock, so the node is skipped with one
+// again. The read cannot open its lock, so the search skips the node with one
 // warning whose cause is that open. A publish that misses the eviction fails
 // the build, and the cause of the skip is then the build's error. The next
 // search builds again and finds the edit.

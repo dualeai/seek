@@ -118,13 +118,13 @@ func TestIndexDocuments_BuilderInitFail_ReleasesWeight(t *testing.T) {
 }
 
 // TestIndexDocuments_AddErrorOutlivesProducerCancel uses a ctags that fails
-// each parse. A shardMax of 60 bytes keeps each document below one shard, so
+// each parse. A shardMax of 60 bytes keeps each document below one shard. So
 // the Add of the second document flushes the first shard and returns the
-// ctags failure. The consumer then cancels its producer. The Git full build passes
-// a producer cancel that also ends the consumer's context, as this test does.
-// The third document must not replace the add error with that cancellation.
-// The documents carry their read weight, and the deferred check finds it
-// released.
+// ctags failure. The consumer then cancels its producer. The Git full build
+// passes a producer cancel that also ends the consumer's context, as this test
+// does. The third document must not replace the add error with that
+// cancellation. The documents carry their read weight, and the deferred check
+// finds it released.
 func TestIndexDocuments_AddErrorOutlivesProducerCancel(t *testing.T) {
 	done := withReadSemLock(t)
 	defer done()

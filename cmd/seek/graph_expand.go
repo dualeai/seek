@@ -33,7 +33,7 @@ import (
 //   - A folder inside a Git node belongs to that node.
 //   - Git -> Git-ignored folder: no edge. Name the folder as an operand to
 //     search it.
-//   - Symlink: no edge. Only an operand is resolved through a symlink.
+//   - Symlink: no edge. Seek resolves a symlink only in an operand.
 //   - Bare repository: no edge, no content, and no Git process.
 //   - Mount point: crossed.
 //
@@ -145,7 +145,7 @@ func (x *graphExpansion) addGitNode(paths gitPaths, operands []gitScopeOperand) 
 			widened = true
 		}
 	}
-	// Only a wider scope can hold a child that is not added yet.
+	// Only a wider scope can hold a child that the expansion did not add yet.
 	var children []string
 	if widened {
 		children = gitRoot.childrenInScope()
@@ -292,10 +292,11 @@ func (x *graphExpansion) plans() ([]node, error) {
 }
 
 // folderNodeCovered reports whether the walk of another folder node reaches
-// the root of plan. The root must be below that node, and below no directory
-// that its walk did not enter. byRoot holds the captured folder nodes by root.
-// The check looks up only the paths that hold the root (pathHolders), so a
-// search with many file operands does not compare each node with all others.
+// the root of plan. The root must be at or below the root of that node, and
+// at or below no directory that its walk did not enter. byRoot holds the
+// captured folder nodes by root. The check looks up only the paths that hold
+// the root (pathHolders). So a search with many file operands does not
+// compare each node with all others.
 func folderNodeCovered(plan *node, byRoot map[string][]*node) bool {
 	holders := pathHolders(plan.root)
 	for _, root := range holders {
@@ -330,8 +331,8 @@ func pathHolders(path string) []string {
 }
 
 // childrenInScope returns the captured children inside the operands of node
-// that were not returned before, so each child is added once. The caller holds
-// the expansion lock.
+// that it did not return before, so the expansion adds each child once. The
+// caller holds the expansion lock.
 func (node *externalGitRoot) childrenInScope() []string {
 	if !node.captured {
 		return nil
@@ -419,7 +420,7 @@ func classifyGitDir(ctx context.Context, dir string) (gitPaths, bool, error) {
 		return gitPaths{}, false, nil
 	}
 	if _, err := os.Lstat(filepath.Join(dir, gitEntryName)); errors.Is(err, fs.ErrPermission) {
-		// The directory cannot be read: Git would fail on it too, and its
+		// Seek cannot read the directory: Git would fail on it too, and its
 		// message would blame Git.
 		return gitPaths{}, false, newPathOperandError(pathOperandRead, dir, err)
 	}
@@ -636,12 +637,15 @@ func validGitHead(path string) bool {
 		return false
 	}
 	defer func() { _ = f.Close() }()
-	var buf [256]byte
+	// Git reads at most 255 bytes of HEAD, so a ref that ends after them is
+	// not valid.
+	var buf [255]byte
 	n, _ := io.ReadFull(f, buf[:])
 	line := string(buf[:n])
 	if ref, ok := strings.CutPrefix(line, "ref:"); ok {
-		// Git skips any white space after "ref:", newlines too.
-		return strings.HasPrefix(strings.TrimLeft(ref, " \t\r\n\v\f"), "refs/")
+		// Git skips only spaces, tabs, and line ends after "ref:" (its
+		// isspace). It rejects a HEAD with \v or \f there.
+		return strings.HasPrefix(strings.TrimLeft(ref, " \t\r\n"), "refs/")
 	}
 	const sha1HexDigits = 40
 	if len(line) < sha1HexDigits {

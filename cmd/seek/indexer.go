@@ -77,9 +77,9 @@ var shardMax = 10 * 1024 * 1024 // 10 MiB
 // still indexes full content and runs symbol analysis.
 var largeDocumentParallelism = max(3, runtime.GOMAXPROCS(0))
 
-// computeStateHash computes the xxHash64 of the given state string.
-// In production, the input is a repoStateFingerprint (raw git status output
-// enriched with file stats).
+// computeStateHash returns the xxHash64 of stateVersion and rawOutput as 16
+// hex digits. In production, the input is gitCorpusFingerprint: the format
+// versions, the index options, the path identities, and repoStateFingerprint.
 func computeStateHash(rawOutput string) string {
 	h := xxhash.New()
 	_, _ = h.WriteString(stateVersion)
@@ -101,14 +101,16 @@ func formatHex16(v uint64) string {
 
 // repoStateFingerprint returns raw Git status output and the stat fields of
 // each dirty file: path, mtime, size, inode, mode, and ctime. The folder walk
-// keeps the same fields. Git status porcelain does not include working-tree
-// content hashes, so these fields detect common changes to files that are
-// already dirty. This is a metadata fingerprint, not a content hash; an edit
-// that keeps every observed field can keep the same fingerprint.
+// keeps these fields too (folderCandidate). Git status porcelain does not
+// include working-tree content hashes, so these fields detect common changes
+// to files that are already dirty. This is a metadata fingerprint, not a
+// content hash; an edit that keeps every observed field can keep the same
+// fingerprint.
 //
-// A node capture calls it once, and the build publishes that state. A dirty
-// file that changes after the capture changes the fingerprint of the next
-// capture, so the next search builds again.
+// The refresh of a node hashes its capture, and the build publishes that
+// state. A dirty file that changes after the capture changes the fingerprint
+// of the next capture, so the next search builds again. The read hashes the
+// capture again to see such an edit (gitNode.prepare).
 func repoStateFingerprint(repoDir string, state repoState) string {
 	if len(state.Files) == 0 {
 		return state.RawOutput
@@ -165,8 +167,8 @@ func readCacheFile(cacheDir, name string) string {
 }
 
 // cacheTmpSuffix ends the name of the temporary file of writeCacheFileFrom.
-// removeCacheFile removes that file with its record, and the gc orphan sweep
-// removes an old one (isOrphanManifestTmpName).
+// removeCacheFile removes that file with its record. The gc orphan sweep
+// removes an old one of a manifest (isOrphanManifestTmpName).
 const cacheTmpSuffix = ".tmp"
 
 // writeCacheFile atomically writes value to cacheDir/name
@@ -212,7 +214,7 @@ func removeCacheFile(cacheDir, name string) {
 }
 
 // sharedTmpInfix marks the temp files of writeSharedCacheFile; the gc
-// orphan sweep removes old ones.
+// orphan sweep removes old ones of .bm25-v2 and .size.
 const sharedTmpInfix = ".tmp-"
 
 // writeSharedCacheFile writes value to cacheDir/name through a temp file of
@@ -260,8 +262,8 @@ func deleteEmptyStateFiles(cacheDir string) {
 	removeCacheFile(cacheDir, emptyFile)
 }
 
-// deleteStateFiles removes the cached working-tree state and its tmp files, so
-// a failed indexing cycle re-checks the corpus on the next search.
+// deleteStateFiles removes .state, .head, and .empty with their temporary
+// files, so a failed indexing cycle checks the corpus again on the next search.
 //
 // It keeps .git-committed-v1. That file describes the committed family still on
 // disk: a failed build did not change that family, or recorded it right after
@@ -699,8 +701,9 @@ func (g *gitNode) buildLocked(
 		}
 	}
 	// recordFamily writes the family manifest and, once, the committed
-	// records. The manifest names the committed shards of the swap and, with
-	// uncommitted, the uncommitted files that the directory holds. It runs
+	// records. The manifest names the committed shards of the swap, or those
+	// on disk when no swap ran. With uncommitted, it also names the
+	// uncommitted files that the directory holds. It runs
 	// right after the committed publish, and again at the end. So a failed
 	// uncommitted step keeps records that name the published committed
 	// family. The manifest does not name an uncommitted family that this
@@ -822,7 +825,8 @@ func (g *gitNode) buildLocked(
 		deleteStateFiles(cacheDir)
 		return fmt.Errorf("write empty state file: %w", err)
 	}
-	// Persist HEAD so working-tree-only changes skip the committed indexer.
+	// Persist HEAD: the commit check reads it when no committed shard records
+	// the commit (headFile).
 	if err := writeHeadFile(cacheDir, state.HeadSHA); err != nil {
 		deleteStateFiles(cacheDir)
 		slog.Warn("Failed to write head file", "error", err)
@@ -913,7 +917,8 @@ func buildCommittedGitStage(
 				// the delta did not change, so the record keeps their blobs.
 				return delta.nextState, deltaMissingBlobs(arrival.lexicalCarry, delta.changedPaths, delta.targetInfos), nil
 			case !errors.Is(err, errNativeDeltaFallback):
-				// A cancel, or a Git read error that a full build reads again.
+				// A cancel, or a Git read error: a full build would read the
+				// same blob again.
 				return committedGitState{}, nil, err
 			}
 			// The delta's seed links or its Builder failed: build the family
@@ -1007,7 +1012,8 @@ func shardsExist(indexDir string) bool {
 // the last committed full build. This shard check permits a delta when the
 // existing added count equals this value, so that delta can take the family
 // above the threshold. The next update selects a native full build. This value
-// does not limit the full base shard count. It matches maxFolderDeltaShards.
+// does not limit the full base shard count. It has the value of
+// maxFolderDeltaShards, which also counts only the shards above the full base.
 const maxCommittedDeltaShards = 64
 
 // fallbackGitRepositoryName returns the opaque name of the committed Git
@@ -1417,7 +1423,7 @@ func indexUncommitted(
 	if len(delta.changed) == 0 {
 		// No dirty file changed (a HEAD change, a vector build): the family
 		// stays, whatever its shard count.
-		if err := writeUncommittedManifest(store.cacheDir, preState, delta.entries, delta.tombstoned); err != nil {
+		if err := writeUncommittedManifest(store.cacheDir, preState, delta.entries, delta.tombstoned, delta.manifest.BaseShards); err != nil {
 			slog.Debug("Failed to refresh uncommitted manifest", "error", err)
 		}
 		return nil
@@ -1467,8 +1473,10 @@ type uncommittedDelta struct {
 // can take, or nil for a full rebuild. A delta needs:
 //   - a manifest of the cached state;
 //   - a family that matches .family-v1 (familyIntact);
-//   - a contiguous family of at most maxUncommittedDeltaShards shards (any
-//     count when only kept files changed);
+//   - a contiguous family with at most maxUncommittedDeltaShards shards above
+//     the shard count of its last full build (any count when only kept files
+//     changed). With no such count in the manifest, the cap counts every
+//     shard;
 //   - tombstoned content that does not need a compaction
 //     (deltaNeedsCompaction);
 //   - files to read that fit one index window.
@@ -1487,7 +1495,8 @@ func uncommittedDeltaPossible(ctx context.Context, repoDir string, store corpusS
 	}
 	if !familyIntact {
 		// The family lost a shard, has a damaged shard, or a move stopped part
-		// way. A keep or a delta would record the rest as complete.
+		// way. A manifest refresh with no change, or a delta, would record the
+		// rest as complete.
 		slog.Debug("Uncommitted family does not match its manifest; full rebuild", "index_dir", indexDir)
 		return nil
 	}
@@ -1517,11 +1526,12 @@ func uncommittedDeltaPossible(ctx context.Context, repoDir string, store corpusS
 	if len(changed) == 0 {
 		return delta // the locked part only refreshes the manifest
 	}
-	// The delta falls back to a full rebuild for these: build it before the
-	// lock instead. A delta of removals only reads no file, and Zoekt writes
-	// only its tombstones.
-	if len(existing) > maxUncommittedDeltaShards && !onlyKept(changed, manifest) {
-		slog.Debug("Uncommitted delta shard limit reached, falling back to full rebuild", "shards", len(existing))
+	// The delta falls back to a full rebuild in the cases below: build it
+	// before the lock instead. A delta of removals only is not such a case by
+	// itself: it reads no file, and Zoekt writes only its tombstones.
+	if uncommittedDeltaShardLimitExceeded(len(existing), manifest.BaseShards) && !onlyKept(changed, manifest) {
+		slog.Debug("Uncommitted delta shard limit reached, falling back to full rebuild",
+			"shards", len(existing), "base_shards", manifest.BaseShards)
 		return nil
 	}
 	// Before the reads, each changed file counts at an upper bound of its
@@ -1540,6 +1550,14 @@ func uncommittedDeltaPossible(ctx context.Context, repoDir string, store corpusS
 		}
 	}
 	return delta
+}
+
+// uncommittedDeltaShardLimitExceeded reports an uncommitted family that a
+// delta must not extend. That family has fewer shards than its full base, or
+// more than maxUncommittedDeltaShards shards above it. base is 0 when no
+// manifest records it.
+func uncommittedDeltaShardLimitExceeded(current, base int) bool {
+	return current < base || current-base > maxUncommittedDeltaShards
 }
 
 // uncommittedStage is a full uncommitted family built in a build directory
@@ -1629,11 +1647,14 @@ func (stage *uncommittedStage) publish(store corpusStore, preState string) error
 		return fmt.Errorf("publish uncommitted shards: %w", err)
 	}
 	removeRepositoryShardTemps(store.indexDir, repoUncommitted)
+	// The stage holds only the shards of this full build: the base of the
+	// delta cap.
+	baseShards := len(incoming)
 	if err := stage.failure.noted(); err != nil {
-		writePendingUncommittedManifest(store.cacheDir, stage.entries, err, 0)
+		writePendingUncommittedManifest(store.cacheDir, stage.entries, err, 0, baseShards)
 		return err
 	}
-	if err := writeUncommittedManifest(store.cacheDir, preState, stage.entries, 0); err != nil {
+	if err := writeUncommittedManifest(store.cacheDir, preState, stage.entries, 0, baseShards); err != nil {
 		slog.Debug("Failed to write uncommitted manifest", "error", err)
 	}
 	return nil
@@ -1674,7 +1695,7 @@ func tryUncommittedDelta(
 		// Every changed file is a kept file that failed again: the family
 		// holds it by name already, so write no shard and no tombstone.
 		releaseFileContentWeights(docs)
-		writePendingUncommittedManifest(cacheDir, entries, noted, delta.manifest.DeadBytes)
+		writePendingUncommittedManifest(cacheDir, entries, noted, delta.manifest.DeadBytes, delta.manifest.BaseShards)
 		return noted
 	}
 	// The reads give the bytes that each changed file's shard document holds.
@@ -1691,10 +1712,10 @@ func tryUncommittedDelta(
 	if noted != nil {
 		// The delta applied every change and kept some files by name: no
 		// state, and a pending manifest that marks them.
-		writePendingUncommittedManifest(cacheDir, entries, noted, delta.tombstoned)
+		writePendingUncommittedManifest(cacheDir, entries, noted, delta.tombstoned, delta.manifest.BaseShards)
 		return noted
 	}
-	if err := writeUncommittedManifest(cacheDir, preState, entries, delta.tombstoned); err != nil {
+	if err := writeUncommittedManifest(cacheDir, preState, entries, delta.tombstoned, delta.manifest.BaseShards); err != nil {
 		slog.Debug("Failed to write uncommitted manifest", "error", err)
 	}
 	return nil
@@ -1711,7 +1732,7 @@ func tryUncommittedDelta(
 // keep the held weight below the build's window, and the global readSemaphore
 // cannot stay full:
 //   - Before the reads: uncommittedDeltaPossible gives no delta when the sum
-//     of candidate.size (from the earlier lstat) reaches the window.
+//     of candidate.Size (from the earlier lstat) reaches the window.
 //   - During the reads: when the weight of the documents read reaches the
 //     window, it cancels the inner context. The workers stop at their next
 //     Acquire, and it releases the weight of every document. This check also
@@ -2000,10 +2021,11 @@ func indexDocumentsWithRepository(
 // writePendingUncommittedManifest writes the manifest of a published family
 // that kept some files by name (noted, the *dirtyFilesKept of
 // dirtyFailure.noted). The manifest has no state, a kept mark on those files,
-// and deadBytes. So the next search's delta reads the kept files again.
-func writePendingUncommittedManifest(cacheDir string, entries []uncommittedManifestEntry, noted error, deadBytes int64) {
+// deadBytes, and baseShards. So the next search's delta reads the kept files
+// again.
+func writePendingUncommittedManifest(cacheDir string, entries []uncommittedManifestEntry, noted error, deadBytes int64, baseShards int) {
 	kept := noted.(*dirtyFilesKept)
-	if err := writeUncommittedManifest(cacheDir, "", markKept(entries, kept.files), deadBytes); err != nil {
+	if err := writeUncommittedManifest(cacheDir, "", markKept(entries, kept.files), deadBytes, baseShards); err != nil {
 		deleteUncommittedManifest(cacheDir)
 	}
 }

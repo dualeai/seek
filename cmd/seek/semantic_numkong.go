@@ -91,7 +91,11 @@ enum {
 // A backend holds the kernels of one CPU family. viable is the set of
 // families that the lookup can return. The binary16 dots kernels must come
 // from the family itself, so that the pack and the scores use one layout.
-// The other kernels can come from a slower family of the set.
+// The other kernels can come from a slower family of the set. The three
+// float32 dots kernels also need one layout, and they always come from one
+// family. In NumKong 7.8.4, the lookup reads only the kind and viable, not the
+// CPU. It tries the families in one fixed order (c/dispatch_f32.c). Each
+// family has all three float32 dots kernels or none of them.
 typedef struct {
     char const* name;
     seek_nk_capability_t capability;

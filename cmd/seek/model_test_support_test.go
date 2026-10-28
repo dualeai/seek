@@ -331,7 +331,7 @@ func failingModelFactory(starts *atomic.Int32) semanticModelFactory {
 }
 
 // stubSearch runs args through the root command, as main does, with a new
-// hybridTestScorer in mode, and returns the output, the observed model and the
+// hybridTestScorer in mode. It returns the output, the observed model and the
 // error.
 //   - With payloadAccept, every row is a candidate and the model accepts every
 //     candidate. A test proves which rows a search reads and which files
@@ -502,7 +502,7 @@ func printedFiles(output string) []string {
 // The description takes the model route, where the copies with the same bytes
 // print as one result. The test model in its far mode adds no file, so the
 // strict hits print. A "-n 1" search then puts the footer in the body of its
-// last result, and a header with no text gives no panic.
+// last result. A header with no text gives one result with no path.
 func TestPrintedResultsReadsSearchOutput(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)

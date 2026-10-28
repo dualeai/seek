@@ -96,8 +96,9 @@ func (b *nativeGitBatch) writeCommands(verb string, ids []gitObjectID) <-chan er
 	return done
 }
 
-// abort waits for the request writer. The batch is already failing, so a
-// writer error only goes to the debug log.
+// abort stops the Git child and waits for it to end (abortNativeGitChild),
+// unless the session already ended. Then it waits for the request writer. The
+// batch is already failing, so a writer error only goes to the debug log.
 func (b *nativeGitBatch) abort(writeDone <-chan error) {
 	if !b.finished {
 		abortNativeGitChild(b.execCmd, b.stdin)

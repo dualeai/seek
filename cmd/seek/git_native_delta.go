@@ -62,6 +62,9 @@ func nativeCommittedShardCount(scan familyScan) int {
 	return count
 }
 
+// nativeGitDeltaShardLimitExceeded reports a family that a delta must not
+// extend. That family has no recorded full base, fewer shards than that base,
+// or more than maxCommittedDeltaShards shards above it.
 func nativeGitDeltaShardLimitExceeded(current, base int) bool {
 	return base < 1 || current < base || current-base > maxCommittedDeltaShards
 }
@@ -108,9 +111,9 @@ func prepareNativeGitDelta(
 	if err := requireNativeGitVersion(ctx); err != nil {
 		return nil, err
 	}
-	// This also resolves the verified `ctags` fallback before index options are
-	// compared with the base. If Ctags is unavailable, let native full decide
-	// whether the target needs a Builder at all.
+	// This also resolves the verified `ctags` fallback before IndexState
+	// compares the index options with the base. If Ctags is unavailable, the
+	// native full build decides whether the target needs a Builder at all.
 	if err := checkCtagsCached(); err != nil {
 		return nil, nil
 	}

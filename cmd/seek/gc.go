@@ -15,7 +15,8 @@ import (
 )
 
 const (
-	// Cache-root level files.
+	// Files and folders of the cache root. gcTrashDir is in the corpora
+	// folder.
 	gcStampFile = ".last-gc"
 	gcLockFile  = "gc.lock"
 	corporaDir  = "corpora"
@@ -30,7 +31,9 @@ const (
 	// keep no current atime.
 	usedFile          = ".used"
 	defaultGCInterval = 24 * time.Hour
-	gcRunTimeout      = 5 * time.Second
+	// gcRunTimeout bounds the automatic GC after a command, so the command
+	// ends soon after its output (fireOpportunisticGC).
+	gcRunTimeout = 5 * time.Second
 	// providerArtifactMaxAge is the age at which GC removes a compiled
 	// accelerator model that no search used, and the runtime directory of
 	// another Seek version. The cache budget does not cover them.
@@ -49,6 +52,9 @@ const (
 		"On Linux, you can instead unset SEEK_CACHE_DIR and set XDG_CACHE_HOME."
 )
 
+// corpusDirEntry is one eviction candidate: a corpus directory
+// (enumerateCorpusDirs) or a unit-store segment (semanticUnitsSegments).
+// usedAt is its last use, which orders the eviction.
 type corpusDirEntry struct {
 	name   corpusID
 	path   string
@@ -96,7 +102,7 @@ func (r gcRowResult) String() string {
 }
 
 // shortErr renders an error for the ACTION cell. It keeps the first line and
-// at most 60 bytes, cut on a rune boundary (utf8Prefix), so a
+// at most 60 bytes, cut on a rune boundary (utf8Prefix). So a
 // "trashed: <reason>" or "failed: <reason>" row stays on one terminal line. A
 // nil error gives "unknown", so the table never fails.
 func shortErr(err error) string {
@@ -272,8 +278,9 @@ func runGC(ctx context.Context, opts gcOptions) {
 		// the sort, so a canceled run evicts a part that depends on the sort.
 		// A cancel during the measurement evicts nothing (run again with
 		// --force). With --sort=age, a corpus with no .used marker takes the
-		// time of its directory. The sweep of temporary files moves that time
-		// when it removes a file, so such a corpus can show as young.
+		// time of its directory, read before the sweep. The sweep of temporary
+		// files moves that time when it removes a file, so a later run can
+		// show such a corpus as young.
 		for _, e := range entries {
 			if ctx.Err() != nil {
 				break
@@ -518,8 +525,8 @@ func shouldRunGC(cacheRoot string, interval time.Duration) bool {
 // a large cold build.
 const buildTmpMaxAge = time.Hour
 
-// providerArtifactDiscardPrefix marks a compiled model or runtime that is being
-// removed. A removal in place is not atomic. A cut removal changes the
+// providerArtifactDiscardPrefix marks a compiled model or runtime that a sweep
+// is removing. A removal in place is not atomic. A cut removal changes the
 // directory's modification time, so the age test sees the directory as new.
 // It also leaves a broken compiled model or runtime where Seek expects a whole
 // one. A rename first marks the leftover, so a later sweep removes it at any

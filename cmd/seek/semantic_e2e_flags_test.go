@@ -133,12 +133,12 @@ func e2eFlagContextShapes(tag string) map[string]e2eFlagContextFile {
 // with -C 0 gives that hit line: it must start a unit of the work-tree copy.
 // Each flag then prints the hit line and up to N lines on each side that the
 // flag selects. The start and the end of the file cut them. The -C 6 search
-// runs on a cold and on a warm cache, so a defect that changes only a cold
-// search with context lines fails. The value is above 3, because a vector hit
-// always reads at least 3 lines on each side (searchContextLines), and a lost
-// line below that does not print. The -C 0 search and the flags run on that
-// warm cache: they act only on the lines that the search reads from the shard
-// copy of each hit, and a cold search reads the same copy.
+// runs on a cold and on a warm cache. So a defect that changes only a cold
+// search with context lines fails. The value is above 3: a vector hit always
+// reads at least 3 lines on each side (searchContextLines). So a line that the
+// search loses below 3 does not print. The -C 0 search and the flags run on
+// that warm cache. They act only on the lines that the search reads from the
+// shard copy of each hit, and a cold search reads the same copy.
 func TestE2EFlagContextLinesOfAVectorHit(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)
@@ -279,10 +279,10 @@ func TestE2EFlagNoBeforeContextFlag(t *testing.T) {
 // vector hit is one match. With -C 0 it prints one line. Each -m of 1 or more
 // prints its block as -m 0 does with the same context. -m cuts only the text
 // file to its first matches. The -m 1 -C 1 search runs on a cold and on a
-// warm cache, so a defect that changes only a cold search with -m or -C fails.
-// The rows run on that warm cache: -m and -C act only on the lines that the
-// search reads from the shard copy of each hit, and a cold search reads the
-// same copy.
+// warm cache. So a defect that changes only a cold search with -m or -C fails.
+// The rows run on that warm cache. -m and -C act only on the lines that the
+// search reads from the shard copy of each hit. A cold search reads the same
+// copy.
 func TestE2EFlagMaxMatchesKeepsEachVectorHit(t *testing.T) {
 	requireTools(t)
 	f := newGraphFixture(t)

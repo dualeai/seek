@@ -10,8 +10,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// markDataless makes fileIsDataless report cloud.txt as cloud-only and its
-// mode 000. noOpen is true when the test user cannot open a mode-000 file.
+// markDataless writes dir/cloud.txt with mode 000 and makes fileIsDataless
+// report it as cloud-only. noOpen is true when the test user cannot open a
+// mode-000 file.
 // Then any open of cloud.txt fails, so a passing check proves no open. A user
 // who ignores file modes, as root does, opens it.
 func markDataless(t *testing.T, dir string) (path string, noOpen bool) {
@@ -68,7 +69,9 @@ func TestStatOperandDoesNotOpenDatalessFiles(t *testing.T) {
 // path names no file, and onDiskPath gives it back unchanged.
 func TestOnDiskPathOfFileReadsTheDirectory(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "Dir")
-	markDataless(t, dir)
+	if _, noOpen := markDataless(t, dir); !noOpen {
+		t.Fatal("the test user opens a mode-000 file, so the test cannot prove that onDiskPath does not open it")
+	}
 	root, err := filepath.EvalSymlinks(filepath.Dir(dir))
 	if err != nil {
 		t.Fatal(err)

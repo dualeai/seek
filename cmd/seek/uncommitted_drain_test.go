@@ -19,7 +19,7 @@ func TestUncommittedDeltaPossible_StatSizesAtTheWindowGiveNoDelta(t *testing.T) 
 	if err := os.WriteFile(filepath.Join(indexDir, repoUncommitted+"_v16.00000.zoekt"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeUncommittedManifest(cacheDir, "cached", nil, 0); err != nil {
+	if err := writeUncommittedManifest(cacheDir, "cached", nil, 0, 1); err != nil {
 		t.Fatal(err)
 	}
 	const fileSize = 512 * 1024

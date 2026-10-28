@@ -41,8 +41,9 @@ func capturedCommitMissing(ctx context.Context, repoDir string, build gitBuildPl
 // no zoekt.* Git config and no remote, so it sets no URL, ID, or raw config.
 // Seek shows none of these fields, and a config read costs one Git process per
 // committed build and delta. The repo: filter matches the opaque name. It
-// sets no repository rank and no commit time: Zoekt reads them only in its
-// classic scorer, and every Seek search uses BM25 (searchOpts.UseBM25Scoring).
+// sets no repository rank and no commit time. Only Zoekt's classic scorer
+// reads the rank, and no Zoekt search reads the commit time. Every Seek search
+// uses BM25 (searchOpts.UseBM25Scoring).
 func nativeGitRepository(repoDir string, snapshot gitObjectID) zoekt.Repository {
 	return zoekt.Repository{
 		Name:     fallbackGitRepositoryName(repoDir),
@@ -55,11 +56,11 @@ func nativeGitRepository(repoDir string, snapshot gitObjectID) zoekt.Repository 
 // committed file but gitlinks. Seek indexes all content, so no path exclusion
 // file, such as .sourcegraph/ignore, applies. Thus the build needs no Git
 // process to read such a file.
-// The error channel gets one value when the stream ends; missing, when set,
-// then holds the blobs that the stream read as missing. When contentBytes is
-// set, the stream adds to it the bytes that the shard documents of the sent
-// documents hold (heldContentBytes), before the error channel gets its value.
-// A binary blob then counts as its marker.
+// The error channel gets one value when the stream ends. A non-nil missing
+// then holds the blobs that the stream read as missing. The stream adds to a
+// non-nil contentBytes the bytes that the shard documents of the sent
+// documents hold (heldContentBytes). It adds them before the error channel
+// gets its value. A binary blob counts as its marker.
 func streamNativeGitDocuments(
 	ctx context.Context,
 	repoDir string,
@@ -116,8 +117,8 @@ func streamNativeGitDocuments(
 
 // indexNativeGitFull writes one captured commit to indexDir through the shared
 // Builder sink. It indexes every committed blob, skips gitlinks, and emits
-// oversize blob names without their bodies. In a partial clone, a missing blob
-// is indexed by name and added to missing when missing is set. indexDir is
+// oversize blob names without their bodies. In a partial clone, it indexes a
+// missing blob by name, and adds it to a non-nil missing. indexDir is
 // caller-owned staging; the caller validates HEAD and publishes it. It returns
 // the content bytes that it indexed, the live bytes of the committed state
 // (deltaNeedsCompaction).

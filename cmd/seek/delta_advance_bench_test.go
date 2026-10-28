@@ -14,10 +14,11 @@ import (
 // The setup takes a forward chain of recent commit SHAs that ends at the
 // current HEAD. It makes a temporary clone under b.TempDir(), checks out a
 // local benchmark branch at the oldest commit, and builds a base index. Each
-// timed iteration resets the clone to the next SHA and times the node refresh
-// that a search runs (gitNode.refresh). The sampled chain has at most ten
-// advances. When b.Loop runs more rounds, the benchmark resets the clone to
-// the oldest commit, indexes it outside the timer, and replays the chain.
+// iteration resets the clone to the next SHA outside the timer, then times the
+// node refresh that a search runs (gitNode.prepare). The sampled chain has at
+// most ten advances. When b.Loop runs more rounds, the benchmark resets the
+// clone to the oldest commit, indexes it outside the timer, and replays the
+// chain.
 // Each timed iteration advances by one real commit, not between two distant
 // commits.
 //
@@ -80,9 +81,9 @@ func BenchmarkLargeRepo_CommittedAdvance(b *testing.B) {
 }
 
 // BenchmarkLargeRepo_UncommittedRealistic measures quick editor saves through
-// the node refresh that a search runs (gitNode.refresh): git status, the index
-// checks, and the build. Seek must make this case fast: an editor that saves
-// one file again and again.
+// the node refresh that a search runs (gitNode.prepare): git status, the index
+// checks, and the build. The timer also covers the write of each save. Seek
+// must make this case fast: an editor that saves one file again and again.
 func BenchmarkLargeRepo_UncommittedRealistic(b *testing.B) {
 	repoDir := cloneBenchRepoAt(b, requireBenchRepo(b), "HEAD")
 	paths, plan := setupLargeRepoBench(b, repoDir)

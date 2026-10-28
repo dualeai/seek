@@ -16,7 +16,7 @@ import (
 )
 
 // reuseSearch runs the descriptive search "alpha beta" with a fresh test
-// model in the far mode and returns the path of each unit that the model
+// model in the far mode. It returns the path of each unit that the model
 // embedded.
 func reuseSearch(t *testing.T, root string) []string {
 	t.Helper()
@@ -28,7 +28,7 @@ func reuseSearch(t *testing.T, root string) []string {
 	return paths
 }
 
-// reuseSearchWith runs the descriptive search "alpha beta" with model and
+// reuseSearchWith runs the descriptive search "alpha beta" with model. It
 // returns a copy of each unit that the model embedded, in call order, and the
 // output.
 func reuseSearchWith(t *testing.T, model semanticModel, root string) ([]semanticUnit, string) {
@@ -229,7 +229,7 @@ func TestFileReuseRowsMatchFreshRows(t *testing.T) {
 	}
 	indexDir := t.TempDir()
 	build(indexDir, "one/x/src/pkg/long.go")
-	reuse := loadSemanticReuse(indexDir, filepath.Join(indexDir, "staging"), "", "", nil, "")
+	reuse := loadSemanticReuse(indexDir, "", "", nil, "")
 	defer reuse.Close()
 	const path = "two/x/src/pkg/long.go"
 	copied, ok := reuse.fileRows(path, semanticContentID(sha256.Sum256(content)))
@@ -571,8 +571,7 @@ func TestReuseLoadIndexesTheNodeTailsOfOtherCorpora(t *testing.T) {
 	fileRoot := semanticFolderLineagePrefix + filepath.ToSlash(filepath.Join(real, "top.go"))
 	parent := filepath.Dir(real)
 	load := func(lineage, base string, names []string) *semanticReuseIndex {
-		indexDir := t.TempDir()
-		return loadSemanticReuse(indexDir, filepath.Join(indexDir, "staging"), lineage, filepath.ToSlash(base), names, "")
+		return loadSemanticReuse(t.TempDir(), lineage, filepath.ToSlash(base), names, "")
 	}
 	// total and topRows count row keys: windows with the same input share one.
 	all := load(fileRoot, real, nil)
@@ -664,8 +663,8 @@ func TestSkippedTailsThatAreNotPlainStayIndexed(t *testing.T) {
 
 // TestMarkReusedRunsInParallel calls markReused from 32 workers, as the build
 // does. Files that can match another tail index the pending row keys once,
-// while the others read only the first index. Each such file sees its pending
-// row key. Run with -race.
+// while the others read only the rows that add indexed. Each such file sees
+// its pending row key. Run with -race.
 func TestMarkReusedRunsInParallel(t *testing.T) {
 	generation := &semanticGeneration{}
 	for index := range 1_000 {
@@ -750,11 +749,12 @@ func TestSemanticModelPathTailIsTheTailOfTheModelPath(t *testing.T) {
 	}
 }
 
-// TestCopiedOrMovedSubfolderReusesTheFolderRows searches a folder, then copies
-// or moves one of its deep subfolders inside it and searches the subfolder.
-// Its files keep the last 4 path parts and the content, so the build copies
-// their rows from the folder's generation. Only a file whose tail names the
-// moved folder embeds again.
+// TestCopiedOrMovedSubfolderReusesTheFolderRows searches a folder, then
+// searches its new subfolder b. The copy case copies the deep files of the
+// subfolder a into b. The move case renames a to b. The deep files keep the
+// last 4 path parts and the content, so the build copies their rows from the
+// folder's generation. Only a file whose tail names the moved folder embeds
+// again.
 func TestCopiedOrMovedSubfolderReusesTheFolderRows(t *testing.T) {
 	requireTools(t)
 	for _, row := range []struct {
@@ -792,11 +792,11 @@ func TestCopiedOrMovedSubfolderReusesTheFolderRows(t *testing.T) {
 	}
 }
 
-// TestUnitStoreSegmentsStayFew changes one file in 8 searches in a row. Each
-// bind archives that file's old window, and the store merges its segments, so
-// it holds few segments. An old version still comes back with no new
-// embedding. One segment per bind would grow the store without end: 8
-// segments here.
+// TestUnitStoreSegmentsStayFew writes a new version of one file before each
+// of 9 searches. Each bind after the first archives that file's old window,
+// and the store merges its segments, so it holds few segments. An old version
+// still comes back with no new embedding. One segment per bind would grow the
+// store without end: 8 segments here.
 func TestUnitStoreSegmentsStayFew(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)

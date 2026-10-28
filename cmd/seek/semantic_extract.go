@@ -21,7 +21,7 @@ const (
 	semanticUnitMaxBytes = 16 << 10
 	// semanticExtractorID names the extraction rule, eligibility included
 	// (semanticContentIsEligible). The generation key and the manifest check
-	// read it, so a generation of another rule is built again.
+	// read it, so the next build replaces a generation of another rule.
 	semanticExtractorID = "ctags-gaps-v7-windows-zoekt-text-zoekt-language-half-format"
 )
 
@@ -212,11 +212,13 @@ func semanticLineStarts(content []byte) []int {
 }
 
 // appendSemanticSpan splits the span start:end of content and assigns a
-// stable ID to each part. Each part is a copy of span, which holds the fields
-// of the whole span (path, content ID, kind, parser result, language and
-// symbol), with its own offsets and text. idBuffer must point to caller-owned
-// scratch storage. The caller reuses that storage for all spans from one
-// source file.
+// stable ID to each part. span holds the fields of the whole span: path,
+// content ID, kind, parser result, language and symbol. Each part is a copy of
+// span with its own offsets and text. A part has at most semanticUnitMaxBytes.
+// A part before the last ends after its last newline, when that newline is past
+// the first quarter of semanticUnitMaxBytes. idBuffer must point to
+// caller-owned scratch storage. The caller reuses that storage for all spans
+// from one source file.
 func appendSemanticSpan(
 	units []semanticUnit,
 	span semanticUnit,
@@ -254,8 +256,8 @@ func makeSemanticUnitID(unit semanticUnit) semanticUnitID {
 // encoding starts with the version prefix, the length-prefixed path and
 // content ID, and the little-endian start and end. Then come the kind and
 // parser-result bytes and the length-prefixed unit language and symbol.
-// buffer is caller-owned scratch storage. The returned slice can be reused and
-// is not part of the ID.
+// buffer is caller-owned scratch storage. The caller can reuse the returned
+// slice; it is not part of the ID.
 func makeSemanticUnitIDBuffered(unit semanticUnit, buffer []byte) (semanticUnitID, []byte) {
 	const prefix = "seek-semantic-unit-v1\x00"
 	wantBytes := len(prefix) + 4*8 + len(unit.path) + len(unit.contentID) + 2*8 + 2 +
@@ -279,6 +281,8 @@ func appendSemanticUnitIDField[T ~string | ~[]byte](buffer []byte, value T) []by
 	return append(buffer, value...)
 }
 
+// writeSemanticHashField writes the little-endian length of value, then
+// value. So two lists of fields give the same bytes only when they are equal.
 func writeSemanticHashField(writer hash.Hash, value []byte) {
 	var size [8]byte
 	binary.LittleEndian.PutUint64(size[:], uint64(len(value)))

@@ -49,7 +49,7 @@ func addNameOnlyFiles(ctx context.Context, files int64) {
 // atom. The atoms that content cannot change (file names, languages, sets)
 // keep their meaning. A content atom takes the value that lets a file match:
 // true where the query asks for it, and false under a negation. Content that
-// is not indexed could hold it or lack it.
+// Zoekt did not index could hold it or lack it.
 func nameOnlyFilter(q query.Q) (query.Q, bool) {
 	content := false
 	var walk func(q query.Q, positive bool) query.Q

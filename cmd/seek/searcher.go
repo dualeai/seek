@@ -45,6 +45,8 @@ var searchOpts = zoekt.SearchOptions{
 	UseBM25Scoring:     true,
 }
 
+// searchConfig holds the Zoekt options, the BM25 rescore flag, and the display
+// settings of one search.
 type searchConfig struct {
 	// opts holds the Zoekt options. It is never nil.
 	opts *zoekt.SearchOptions
@@ -159,14 +161,16 @@ func loadShardPaths(paths []string) ([]zoekt.Searcher, error) {
 	return searchers, nil
 }
 
-// errShardUnloadable marks index damage. That is a shard that exists but cannot
-// be opened (truncated, unreadable, a directory, or a dangling symlink), or an
-// index with no shard. openNode removes the family manifest that the read saw
-// (removeDamagedFamilyManifest) and opens the node once more.
+// errShardUnloadable marks index damage. That is a shard that exists but that
+// Seek cannot open (truncated, unreadable, a directory, or a dangling
+// symlink), or an index with no shard. openNode removes the family manifest
+// that the read saw (removeDamagedFamilyManifest) and opens the node once
+// more.
 //
 // The repair covers both families. With no manifest, the committed family
-// rebuilds (gitBuildPlan.committed). The uncommitted family then takes no keep
-// and no delta (uncommittedDeltaPossible), so it rebuilds in full.
+// rebuilds (gitBuildPlan.committed). The uncommitted family then takes no
+// manifest refresh and no delta (uncommittedDeltaPossible), so it rebuilds in
+// full.
 var errShardUnloadable = errors.New("index damage")
 
 // parseQueryHalves parses pattern and expands each bare word into a file-name
@@ -273,6 +277,8 @@ func parsePlainDescriptionFallback(pattern string) (query.Q, bool) {
 	return parsed, err == nil
 }
 
+// plainProgrammingName reports a term that ends in ++, [] or () after a
+// qualified identifier (plainQualifiedIdentifier).
 func plainProgrammingName(term string) bool {
 	for _, suffix := range []string{"++", "[]", "()"} {
 		if strings.HasSuffix(term, suffix) {
@@ -282,6 +288,9 @@ func plainProgrammingName(term string) bool {
 	return false
 }
 
+// plainQualifiedIdentifier reports one or more identifiers joined by "::".
+// An identifier holds letters, digits and underscores, and does not start
+// with a digit.
 func plainQualifiedIdentifier(name string) bool {
 	for _, part := range strings.Split(name, "::") {
 		if part == "" {
@@ -308,8 +317,9 @@ func closeShards(searchers []zoekt.Searcher) {
 
 // bm25ShardParts prepares the rescore of a bm25 search. It records each
 // shard's counts for the command's average and asks Zoekt for its score debug
-// line. It returns the function that rebuilds each hit's parts. Other searches
-// get nil.
+// line. It returns the function that rebuilds each hit's parts. It returns nil
+// when Zoekt's scores stay. That is a search that is not bm25, a search of one
+// node with one shard, or a shard whose counts Seek cannot read.
 func bm25ShardParts(ctx context.Context, searchers []zoekt.Searcher, paths []string, q query.Q, config *searchConfig) (func(int, []zoekt.FileMatch), error) {
 	command, ok := ctx.Value(bm25CommandKey{}).(*bm25Command)
 	if !ok || !config.bm25 || !config.opts.UseBM25Scoring || len(paths) != len(searchers) {
@@ -479,8 +489,8 @@ func searchLoadedShards(
 // Seek calls the shards itself, so every Zoekt shard call goes through these
 // five functions. A memory fault in a damaged mapping becomes a panic too
 // (debug.SetPanicOnFault). They cover only the Zoekt call. A panic in Seek's
-// own code still stops the process, so a Seek bug is not taken for index
-// damage.
+// own code still stops the process, so Seek does not take its own bug for
+// index damage.
 func zoektSearch(ctx context.Context, searcher zoekt.Searcher, q query.Q, opts *zoekt.SearchOptions) (_ *zoekt.SearchResult, err error) {
 	defer recoverShardPanic(&err)
 	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
@@ -531,7 +541,7 @@ func shardCallError(err error) error {
 }
 
 // recoverShardPanic sets *err from the panic of a Zoekt shard call
-// (shardSearchPanic). It must be deferred directly by that call.
+// (shardSearchPanic). That call must defer it directly.
 func recoverShardPanic(err *error) {
 	if recovered := recover(); recovered != nil {
 		*err = shardSearchPanic(recovered)
@@ -609,7 +619,7 @@ func cloneFileMatches(files []zoekt.FileMatch, config searchConfig) []zoekt.File
 // displayedContextFiles returns the indexes of the best displayFileLimit files
 // of this corpus: the files that can still show after the global file limit.
 // The node read returns one current copy per file, so a global top N file is
-// in its corpus's top N. A nil map means that all context must be copied.
+// in its corpus's top N. A nil map means that the clone copies all context.
 func displayedContextFiles(files []zoekt.FileMatch, config searchConfig) map[int]struct{} {
 	limit := config.displayFileLimit
 	if limit <= 0 || len(files) <= limit {
@@ -638,6 +648,9 @@ func displayedContextFiles(files []zoekt.FileMatch, config searchConfig) map[int
 	return selected
 }
 
+// cloneFileMatch copies one hit out of the shard memory. The context of a
+// line stays only when keepFileContext is set and the line can show
+// (displayedContextLines). afterOnly drops each before context.
 func cloneFileMatch(
 	in zoekt.FileMatch,
 	displayMatchLimit int,
@@ -672,8 +685,9 @@ func cloneFileMatch(
 }
 
 // displayedContextLines returns the source lines whose context can reach the
-// formatter. A nil map means that all context must be copied. Search results
-// refer to shard memory, so every displayed byte must be copied before close.
+// formatter. A nil map means that the clone copies all context. Search
+// results point into shard memory, so the clone copies every displayed byte
+// before the shards close.
 func displayedContextLines(matches []zoekt.LineMatch, limit int) map[int]struct{} {
 	if limit <= 0 || len(matches) <= limit {
 		return nil
@@ -687,8 +701,8 @@ func displayedContextLines(matches []zoekt.LineMatch, limit int) map[int]struct{
 }
 
 // cloneLineMatch copies the bytes of a line match, which point into the shard.
-// The fragments stay shared: Zoekt builds them, and their symbols, on the Go
-// heap for each search (index/contentprovider.go fillContentMatches), so no
+// The fragments stay shared. Zoekt builds them and their symbols on the Go
+// heap for each search (index/contentprovider.go fillContentMatches). So no
 // fragment points into a shard.
 func cloneLineMatch(in zoekt.LineMatch, keepContext, afterOnly bool) zoekt.LineMatch {
 	out := in

@@ -20,7 +20,7 @@ import (
 )
 
 // benchmarkRefreshGit runs the node refresh that a search runs
-// (gitNode.refresh): git status, the index checks, and the build when the
+// (gitNode.prepare): git status, the index checks, and the build when the
 // state changed. A stale index is an error: the benchmark must time a build
 // that publishes.
 func benchmarkRefreshGit(ctx context.Context, paths gitPaths, plan node) error {
@@ -221,6 +221,8 @@ func BenchmarkResolveGitPaths_Subprocess(b *testing.B) {
 
 const benchmarkFormatterCorpusID corpusID = "benchmark"
 
+// benchmarkGitResults wraps files as the results of one Git node and sets
+// their headers (withHeaders).
 func benchmarkGitResults(files []zoekt.FileMatch) []corpusSearchResult {
 	return withHeaders(wrapCorpusResults(node{
 		id:   benchmarkFormatterCorpusID,
@@ -464,8 +466,8 @@ func benchmarkStreamFiles(b *testing.B, numFiles int) {
 // --- End-to-end benchmarks: they need Git and ctags ---
 
 // BenchmarkPlannedGitCorpus_ColdIndex times the first build and search of a
-// new repository. The Git commands that make the repository are outside the
-// timer.
+// new repository (runSeekInPlannedGitCorpus). The timer stops while the round
+// makes the repository and plans its node (planGitTestCorpus).
 func BenchmarkPlannedGitCorpus_ColdIndex(b *testing.B) {
 	requireTools(b)
 	ctx := b.Context()
@@ -1038,9 +1040,9 @@ func BenchmarkExternalExactFile_WarmSearch(b *testing.B) {
 }
 
 // BenchmarkMultiCorpus_WarmSearchAndFormat searches two warm folder nodes one
-// after the other and formats their results. It skips the command route
-// (searchNodes, the BM25 rescore, the headers); BenchmarkMultiNode_WarmSearch
-// times that route.
+// after the other, sets the headers with no path operand (withHeaders), and
+// formats the results. It skips searchNodes and the BM25 rescore of the
+// command route; BenchmarkMultiNode_WarmSearch times that route.
 func BenchmarkMultiCorpus_WarmSearchAndFormat(b *testing.B) {
 	requireTools(b)
 	ctx := b.Context()
@@ -1105,6 +1107,8 @@ func BenchmarkWriteCorpusResults_TwoCorpora(b *testing.B) {
 	}
 }
 
+// benchmarkCorpusResultsForFormatting returns 200 results with headers: the
+// same 100 file names in two folder nodes.
 func benchmarkCorpusResultsForFormatting() []corpusSearchResult {
 	results := make([]corpusSearchResult, 0, 200)
 	for i := range 100 {
@@ -1152,7 +1156,7 @@ func BenchmarkChangedFolderDocumentsFromManifest_1000Files_1Changed(b *testing.B
 	if err != nil {
 		b.Fatalf("old folder state: %v", err)
 	}
-	if err := writeFolderManifest(plan.cacheDir, "old-state", oldSelected, 0, make([]int64, len(oldSelected))); err != nil {
+	if err := writeFolderManifest(plan.cacheDir, "old-state", oldSelected, 0, make([]int64, len(oldSelected)), 0); err != nil {
 		b.Fatalf("write folder manifest: %v", err)
 	}
 	manifest, ok := readFolderManifest(plan.cacheDir, "old-state")
@@ -1224,6 +1228,9 @@ func BenchmarkFolderCorpus_DirtyReindexAndSearch_1File(b *testing.B) {
 	benchmarkFolderCorpusDirtyReindex(b, true)
 }
 
+// benchmarkFolderCorpusDirtyReindex edits one file of a warm folder node of
+// 200 files in each round, outside the timer. It times the refresh, and with
+// searchAfterRefresh also the search of the new marker.
 func benchmarkFolderCorpusDirtyReindex(b *testing.B, searchAfterRefresh bool) {
 	b.Helper()
 	requireTools(b)
@@ -1643,6 +1650,9 @@ func BenchmarkLargeRepo_DirtyReindex_50Files(b *testing.B) {
 	benchmarkLargeRepoDirtyN(b, 50)
 }
 
+// benchmarkLargeRepoDirtyN edits n source files of a clone of SEEK_BENCH_REPO
+// in each round, outside the timer. It times the refresh and the search of the
+// new marker.
 func benchmarkLargeRepoDirtyN(b *testing.B, n int) {
 	b.Helper()
 	repoDir := cloneBenchRepoAt(b, requireBenchRepo(b), "HEAD")
@@ -1963,11 +1973,12 @@ func BenchmarkGitCommitted_1CommitAhead(b *testing.B) {
 }
 
 // BenchmarkGitUncommitted_RapidEdits_N16 saves one file 16 times in each
-// round, as an editor does, and times git status and the build of each save.
+// round, as an editor does. It times the write, git status and the build of
+// each save.
 // Each save after the first writes one small delta shard and tombstones the
-// earlier copy of the file. When the family holds more than
-// maxUncommittedDeltaShards shards, the next save rebuilds it in full, so the
-// shard count stays bounded.
+// earlier copy of the file. When deltas added more than
+// maxUncommittedDeltaShards shards since the last full build, the next save
+// rebuilds the family in full. So the shard count stays bounded.
 func BenchmarkGitUncommitted_RapidEdits_N16(b *testing.B) {
 	requireTools(b)
 
@@ -1992,8 +2003,9 @@ func BenchmarkGitUncommitted_RapidEdits_N16(b *testing.B) {
 // BenchmarkGitBranch_Switch_Unrelated measures the worst case: each round
 // switches between two branches that differ in 16 of the 21 indexed files.
 // Delta builds add tombstones until the delta shard count passes
-// maxCommittedDeltaShards; the next update then does a full build. The time
-// per round includes the cost of the delta builds and of the full builds.
+// maxCommittedDeltaShards; the next update then does a full build. Each round
+// times the git checkout and the node refresh. So the time per round includes
+// the cost of the delta builds and of the full builds.
 func BenchmarkGitBranch_Switch_Unrelated(b *testing.B) {
 	requireTools(b)
 
@@ -2214,8 +2226,10 @@ func BenchmarkGC_RunGC_FullEvict_N100(b *testing.B) {
 
 // BenchmarkGC_RunGC_StreamingSorted_N100 times the path of
 // `seek gc --force --sort=size`. It measures each row (corpusDirSize and the
-// display information), sorts the rows (sortGCRows), and evicts in table
-// order. The silent benchmarks above do not run these steps.
+// display information), sorts the rows (sortGCRows), and renders them in table
+// order, each after its eviction check. The 1P budget plans no eviction, so
+// the pass evicts no corpus. The silent benchmarks above do not run these
+// steps.
 func BenchmarkGC_RunGC_StreamingSorted_N100(b *testing.B) {
 	resetNFSCheck(b)
 	root := cacheRootForTest(b)
@@ -2356,7 +2370,7 @@ func BenchmarkWriteFolderManifest_100k(b *testing.B) {
 	b.ReportAllocs()
 	dir := b.TempDir()
 	for b.Loop() {
-		if err := writeFolderManifest(dir, "state-x", selected, 0, markers); err != nil {
+		if err := writeFolderManifest(dir, "state-x", selected, 0, markers, 0); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -2451,7 +2465,7 @@ func BenchmarkDetectGitBoundary_LinkedWorktreeBackref(b *testing.B) {
 // runs the model stages, also the cases named Strict. Each search loads every
 // shard of the node, so the time of a case grows with the number of shard
 // loads per node read. The body calls only runSearchCommand, so a change
-// inside the node read does not change the benchmark.
+// inside the node read needs no change to the benchmark code.
 func BenchmarkManyShardGit_WarmSearch(b *testing.B) {
 	requireTools(b)
 	setTestUserCache(b)
@@ -2544,7 +2558,7 @@ func BenchmarkMultiNode_WarmSearch(b *testing.B) {
 }
 
 // writeBenchmarkNodeFiles writes count Go files of about 2 KiB below
-// dir/sub. Each file holds the words "handler" and "parses".
+// dir/sub. Each file holds the text "handler" in a name and the word "parses".
 func writeBenchmarkNodeFiles(b *testing.B, dir, sub string, count int) {
 	b.Helper()
 	for i := range count {

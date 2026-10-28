@@ -50,7 +50,8 @@ func splicePassthroughSeparator(args []string, flags *pflag.FlagSet) []string {
 		if flag := lookupExactFlag(flags, name); flag != nil {
 			// Skip the value argument of a flag that takes one in the
 			// space-separated form (`-n 5`, not `-n=5`). Else the next
-			// iteration would see `5` (or `-5`) as a splice point.
+			// iteration would read `5` as the query and stop the scan, or
+			// read `-5` as a query and put `--` before it.
 			if flag.NoOptDefVal == "" && !hasEq && i+1 < len(args) {
 				i++
 			}
@@ -71,6 +72,9 @@ func splicePassthroughSeparator(args []string, flags *pflag.FlagSet) []string {
 	return args
 }
 
+// lookupExactFlag returns the flag that token names in full: `--name` or the
+// one-letter `-x`. Any other form gives nil, so a Zoekt query such as
+// `-file:test` names no flag.
 func lookupExactFlag(flags *pflag.FlagSet, token string) *pflag.Flag {
 	if name, ok := strings.CutPrefix(token, "--"); ok && name != "" {
 		return flags.Lookup(name)
@@ -111,9 +115,10 @@ the meaning-based index and all model work.`,
 		Args: rootArgsValidator,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			slog.SetDefault(newCLILogger(os.Stderr, flags.verbose))
-			// Report a bad provider pin here, at the default log level. The
-			// encoder would report it as one more reason to keep lexical
-			// search, and the fallback path shows that only with --verbose.
+			// Stop on a bad provider pin here, with a command error that
+			// shows without --verbose. The encoder would report it as one
+			// more reason to keep lexical search, and the fallback path shows
+			// that only with --verbose.
 			//
 			// Only the root search command can use the model; every
 			// subcommand is management or output. `gc`, `completion` and a

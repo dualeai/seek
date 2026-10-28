@@ -201,10 +201,10 @@ func fileOperandIdentities(files []string) map[string][]string {
 }
 
 // singleFileOperands returns the file operands that can name root, the file of
-// a single-file corpus: the same file, or the same path when root cannot be
-// read. One identity per corpus keeps the work linear in the operands. A stat
-// of each corpus and operand pair took 2 s of a 2.9 s search of 1,000 file
-// operands.
+// a single-file corpus. These name the same file, or the same path when the
+// stat of root fails. One identity per corpus keeps the work linear in the
+// operands. A stat of each corpus and operand pair took 2 s of a 2.9 s search
+// of 1,000 file operands.
 func singleFileOperands(root string, files []string, byIdentity map[string][]string) []string {
 	if identity, err := filesystemIdentity(root); err == nil {
 		return byIdentity[identity]

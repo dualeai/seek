@@ -172,8 +172,8 @@ func TestPlanCorpora_TrackedAndIgnoredFileSameRepoSplit(t *testing.T) {
 
 // TestRealCaseWithin checks that realCaseWithin keeps a path typed with the
 // on-disk case as it is. On a case-insensitive file system, it must change a
-// path typed with another case to the on-disk names, which the steps that
-// compare names byte for byte need. On a case-sensitive file system, that
+// path typed with another case to the on-disk names. The steps that compare
+// names byte for byte need those names. On a case-sensitive file system, that
 // path names no file, so it stays as typed. Below a directory that the test
 // user cannot read, onDiskPath cannot open that directory, and realCaseWithin
 // still gives the stored names.

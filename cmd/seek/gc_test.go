@@ -366,7 +366,8 @@ func TestGC_TOCTOU_RefreshedUsedUnderLock_SkipsEvict(t *testing.T) {
 
 func TestGC_TrashDir_NotEnumeratedAsCorpus(t *testing.T) {
 	root := cacheRootForTest(t)
-	// Place a non-hex name and the .trash dir; neither should be enumerated.
+	// Place a non-hex name and the .trash dir; enumerateCorpusDirs must skip
+	// both.
 	if err := os.MkdirAll(filepath.Join(root, corporaDir, gcTrashDir, "leftover"), 0o755); err != nil {
 		t.Fatalf("mkdir trash entry: %v", err)
 	}
@@ -427,8 +428,8 @@ func TestGCCmd_DryRun_NoEvictions(t *testing.T) {
 // TestGCCmd_DryRun_TableLayout compares the header and the row of a one-corpus
 // dry-run table with hand-written lines. In both lines the columns start at
 // byte 2 (CORPUS), 14 (ROOT), 68 (AGE), 76 (SIZE) and 84 (ACTION). The other
-// table tests find rows by their hash and action only, so this test is the one
-// that pins the header text and the column widths.
+// table tests find rows by their hash and action only. So only this test pins
+// the header text and the column widths.
 func TestGCCmd_DryRun_TableLayout(t *testing.T) {
 	root := cacheRootForTest(t)
 	seedCorpus(t, root, fakeCorpusHash(1), time.Now().Add(-49*time.Hour))
@@ -624,7 +625,7 @@ func TestGCCmd_LockContention_PrintsSkipMessage(t *testing.T) {
 // context canceled before the call. The loop must stop before it evicts or
 // measures a row, so every corpus stays on disk. The summary counts the
 // printed rows (gcTableStats.rendered), not the corpora found. With no row,
-// the summary line is not printed.
+// runGC prints no summary line.
 func TestGCCmd_CtxCanceled_SummaryUsesRenderedCount(t *testing.T) {
 	root := cacheRootForTest(t)
 	// Over the budget, so an uncanceled run evicts every corpus.
@@ -642,7 +643,7 @@ func TestGCCmd_CtxCanceled_SummaryUsesRenderedCount(t *testing.T) {
 		}
 	})
 
-	// No corpus is evicted.
+	// GC evicts no corpus.
 	for i, dir := range dirs {
 		if _, err := os.Stat(dir); err != nil {
 			t.Fatalf("ctx pre-cancel should have prevented eviction of corpus %d: %v", i, err)
@@ -722,7 +723,7 @@ func TestGC_IsCorpusHashName(t *testing.T) {
 
 // TestRace_ConcurrentGCInvocations runs 20 GCs at the same time on corpora
 // over the budget. gc.lock lets one GC run at a time, and a GC that finds it
-// held skips; at the end every corpus is evicted.
+// held skips; at the end no seeded corpus stays.
 func TestRace_ConcurrentGCInvocations(t *testing.T) {
 	root := cacheRootForTest(t)
 	// Over the budget, so GC evicts every corpus that no search holds.
@@ -1032,8 +1033,8 @@ func TestGC_FireOpportunisticGC_PassesContextWithDeadline(t *testing.T) {
 func TestGC_RunGC_CtxCanceledBreaksLoop(t *testing.T) {
 	resetNFSCheck(t)
 	root := cacheRootForTest(t)
-	// Over the budget, so the GC would evict the corpus unless the guard
-	// under test holds it.
+	// Over the budget, so the GC would evict the corpora unless the guard
+	// under test holds them.
 	t.Setenv(envCacheBudget, "1")
 	stale := time.Now().Add(-30 * 24 * time.Hour)
 	for i := 0; i < 50; i++ {
@@ -1045,7 +1046,7 @@ func TestGC_RunGC_CtxCanceledBreaksLoop(t *testing.T) {
 
 	runGC(ctx, gcOptions{skipThrottle: true})
 
-	// No corpus is evicted: the loop checks ctx before the first entry.
+	// GC evicts no corpus: the loop checks ctx before the first entry.
 	entries, err := enumerateCorpusDirs(filepath.Join(root, corporaDir))
 	if err != nil {
 		t.Fatalf("enumerate: %v", err)
@@ -1171,7 +1172,7 @@ func TestGC_RunGC_CtxCanceledEmptyCorpora(t *testing.T) {
 }
 
 // TestGC_RunGC_CtxCancelMidLoop cancels the context while the eviction loop
-// runs: some corpora are evicted, and the rest stay. Unlike a context that
+// runs: GC evicts some corpora, and the rest stay. Unlike a context that
 // ends before the call, this is the order that a real timeout gives.
 func TestGC_RunGC_CtxCancelMidLoop(t *testing.T) {
 	resetNFSCheck(t)
@@ -1215,8 +1216,8 @@ poll:
 	if err != nil {
 		t.Fatalf("enumerate: %v", err)
 	}
-	// All seeded corpora are over the budget, so a run that is not canceled
-	// evicts all of them. A cancel at the first eviction must keep the rest.
+	// All seeded corpora are over the budget, so an uncanceled run evicts all
+	// of them. A cancel at the first eviction must keep the rest.
 	if len(entries) == 0 {
 		t.Fatalf("mid-loop cancel should leave some corpora intact; all evicted")
 	}
@@ -1244,8 +1245,9 @@ func TestGC_Integration_DryRunShowsRealPath(t *testing.T) {
 
 	out := runGCCapture(t, "--dry-run")
 
-	// Repository.Source is canonicalized (on macOS, /var → /private/var), so
-	// the test matches the basename, not the full path.
+	// Repository.Source holds the path with symlinks resolved (on macOS,
+	// /var → /private/var), so the test matches the basename, not the full
+	// path.
 	base := filepath.Base(repoDir)
 	if !strings.Contains(out, base) {
 		t.Fatalf("dry-run output missing repo basename %q. output:\n%s", base, out)
@@ -1280,8 +1282,9 @@ func TestGC_IsCorpusHashName_AcceptsProductionHash(t *testing.T) {
 // marks its corpus as used, on both routes of the root command. The first
 // search builds the text index and the vectors, and the build also touches
 // .used. So the test ages .used before each warm search. A warm search builds
-// nothing, so only the touch of its route can make .used fresh: retrieveNode
-// for a query that the model reads, strictNode for --lexical-only.
+// nothing, so only the touch of its route can make .used fresh. That route is
+// retrieveNode for a query that the model reads, and strictNode for
+// --lexical-only.
 func TestGC_Integration_PrepareAndSearchTouchesUsed(t *testing.T) {
 	requireTools(t)
 	resetNFSCheck(t)
@@ -1439,9 +1442,8 @@ func TestSweepAgedProviderArtifacts(t *testing.T) {
 		t.Fatalf("an unused model with an aged marker survived: %v", err)
 	}
 
-	// A directory a previous sweep marked and did not finish is removed
-	// whatever its age, so a truncated removal cannot hide behind a refreshed
-	// timestamp.
+	// The sweep removes a directory that an earlier sweep marked and did not
+	// finish, whatever its age: a cut removal makes the directory time new.
 	leftover := filepath.Join(base, providerArtifactDiscardPrefix+"cccccccccccccccccccccccccccccccc")
 	if err := os.MkdirAll(leftover, 0o700); err != nil {
 		t.Fatal(err)
@@ -1454,7 +1456,7 @@ func TestSweepAgedProviderArtifacts(t *testing.T) {
 		t.Fatalf("the fresh compiled model was removed: %v", err)
 	}
 
-	// A cancelled collection stops rather than half-removing more directories.
+	// A canceled collection removes no more directories.
 	aged2 := filepath.Join(base, "dddddddddddddddddddddddddddddddd")
 	if err := os.MkdirAll(aged2, 0o700); err != nil {
 		t.Fatal(err)
@@ -1510,8 +1512,8 @@ func TestGCDryRunReportsProviderArtifacts(t *testing.T) {
 func TestRunGCCollectsCompiledModelsAndRuntimes(t *testing.T) {
 	// Other tests check the helpers directly. This test proves that runGC
 	// calls both sweeps with the 14-day bound. An item of 15 days goes and one
-	// of 13 days stays, so a call site that is removed or has another bound
-	// fails.
+	// of 13 days stays, so the test fails when runGC drops a call or uses
+	// another bound.
 	cacheRoot := t.TempDir()
 	t.Setenv("SEEK_CACHE_DIR", cacheRoot)
 	aged := plantProviderArtifact(t, cacheRoot, "22222222222222222222222222222222", 15*24*time.Hour)
@@ -1701,10 +1703,9 @@ func plantProviderArtifact(tb testing.TB, cacheRoot, key string, age time.Durati
 	return dir
 }
 
-// TestOrphanManifestTmpNames checks the temp names that the orphan sweep
-// removes. They are the fixed .tmp name of the family manifest and the temp
-// files of writeSharedCacheFile (.bm25-v2, .size). The records and .state
-// stay.
+// TestOrphanManifestTmpNames checks temp names that the orphan sweep removes:
+// the fixed .tmp name of the family manifest and the temp files of
+// writeSharedCacheFile (.bm25-v2, .size). The records and .state stay.
 func TestOrphanManifestTmpNames(t *testing.T) {
 	for name, want := range map[string]bool{
 		familyManifestFile + ".tmp":           true,

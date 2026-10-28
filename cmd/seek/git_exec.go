@@ -255,15 +255,15 @@ type repoGitConfig struct {
 	// Drivers from the global and system config, such as Git LFS, stay on: the
 	// user installed them.
 	filterDrivers []string
-	// partialClone reports a promisor remote: missing blobs are expected and
-	// are never fetched (GIT_NO_LAZY_FETCH). In other repositories a missing
-	// blob is damage.
+	// partialClone reports a promisor remote: a missing blob is normal, and
+	// Git never fetches it (GIT_NO_LAZY_FETCH). In other repositories a
+	// missing blob is damage.
 	partialClone bool
 }
 
 // repoConfigCache holds one repoGitConfig per repository directory. One search
-// command is one process, so an entry lives for one command. A failed read is
-// not cached.
+// command is one process, so an entry lives for one command. It keeps no
+// failed read.
 var repoConfigCache sync.Map
 
 // repoIsPartialClone reports a promisor remote. A config that Seek cannot read

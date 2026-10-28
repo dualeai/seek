@@ -168,10 +168,10 @@ func joinedFamilyDigest(indexDir string) (string, error) {
 }
 
 // publishSemanticGeneration moves the build in stagingDir to the generation
-// of source and checks it. A valid generation of source stays, and the build
-// is discarded, unless replace is set. A generation that holds a name-only
-// file whose blob arrived is valid but stale. The build after that arrival
-// sets replace.
+// of source and checks it. A valid generation of source stays, and the
+// function discards the build, unless replace is set. A generation that holds
+// a name-only file whose blob arrived is valid but stale. The build after that
+// arrival sets replace.
 func publishSemanticGeneration(indexDir, stagingDir, source string, replace bool) error {
 	finalDir := semanticGenerationDir(indexDir, source)
 	if err := validateSemanticGeneration(indexDir, source); err == nil && !replace {
@@ -265,7 +265,7 @@ func removeJoinedGeneration(cacheDir string) {
 // of indexDir (semanticGenerationDirsIn) that keep does not name. The caller
 // must hold the publish lock.
 func removeSemanticGenerationsExcept(indexDir string, keep ...string) {
-	for _, dir := range semanticGenerationDirsIn(indexDir, "") {
+	for _, dir := range semanticGenerationDirsIn(indexDir) {
 		if !slices.Contains(keep, dir) {
 			_ = os.RemoveAll(dir)
 		}

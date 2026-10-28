@@ -172,6 +172,9 @@ func lateOnRuntimeForPlatform() (lateOnRuntimeBundle, error) {
 	return lateOnRuntimeBundleFromManifest(lateOnRuntimeManifestJSON, lateOnCompressedRuntime)
 }
 
+// lateOnRuntimeBundleFromManifest decodes the manifest of the embedded
+// runtime. It checks that the manifest names this target and its library file,
+// with a version, a size and a SHA-256.
 func lateOnRuntimeBundleFromManifest(
 	manifestJSON []byte,
 	compressed []byte,
@@ -206,8 +209,8 @@ func lateOnRuntimeBundleFromManifest(
 }
 
 // newLateOnSemanticModel makes the model. Three steps before its first query do
-// not depend on each other, so they overlap: the runtime check reads and
-// hashes the installed library, the tokenizer build parses its asset, and the
+// not depend on each other, so they overlap. The runtime check reads and
+// hashes the installed library. The tokenizer build parses its asset, and the
 // model asset decodes for the first encoder. On warm searches of the Seek
 // repository, the overlap took 40 to 55 ms off searches of 500 to 590 ms. A
 // runtime error still comes before a tokenizer error.
@@ -253,6 +256,9 @@ func newLateOnSessionOptions() (*ort.SessionOptions, error) {
 	return options, nil
 }
 
+// ensureLateOnEnvironment loads the ONNX Runtime library at runtimePath and
+// turns off its telemetry, once per process. Each later call returns the
+// result of the first.
 func ensureLateOnEnvironment(runtimePath string) error {
 	lateOnEnvironmentOnce.Do(func() {
 		ort.SetSharedLibraryPath(runtimePath)
@@ -383,6 +389,9 @@ func (s *lateOnModel) embedSemanticUnitBatch(
 	return vectors, nil
 }
 
+// PrepareSemanticQuery encodes the query windows (lateOnQueryWindows) and the
+// empty document in one model call. It gives the token vectors of the query,
+// their score mask, and the score of the empty document (emptyScore).
 func (s *lateOnModel) PrepareSemanticQuery(
 	ctx context.Context,
 	modelQuery string,
@@ -454,6 +463,8 @@ func (s *lateOnModel) PrepareSemanticQuery(
 	}, nil
 }
 
+// ScoresWithSemanticQuery gives the MaxSim score of each document against the
+// prepared query, in the order of documents.
 func (s *lateOnModel) ScoresWithSemanticQuery(
 	ctx context.Context,
 	prepared *semanticQueryEmbedding,
@@ -574,6 +585,9 @@ func (s *lateOnModel) Close() error {
 	return closeErr
 }
 
+// newLateOnTokenizer parses the tokenizer asset and checks the IDs of its
+// special tokens. It also gives the IDs of the ASCII punctuation characters
+// that encode to one token.
 func newLateOnTokenizer(
 	content []byte,
 ) (*lateOnTokenizer, map[int]struct{}, error) {
@@ -666,6 +680,8 @@ func (t *lateOnTokenizer) Close() error {
 	return err
 }
 
+// sanitizeLateOnTokenizerInput replaces invalid UTF-8 and each NUL byte with
+// U+FFFD: the native tokenizer takes a C string, which cannot hold a NUL.
 func sanitizeLateOnTokenizerInput(text string) string {
 	text = strings.ToValidUTF8(text, "\uFFFD")
 	return strings.ReplaceAll(text, "\x00", "\uFFFD")
@@ -872,6 +888,8 @@ func lateOnRowHasUsableToken(documents []float32, document int, mask []bool) boo
 	return false
 }
 
+// encodeLateOnDocument gives the token IDs of one serialized document, at most
+// limit of them, around its match (truncateLateOnDocumentTokens).
 func encodeLateOnDocument(
 	tokenizer *lateOnTokenizer,
 	document rerankDocument,

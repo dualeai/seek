@@ -16,7 +16,7 @@ import (
 )
 
 // TestPlanRerankQuery plans a plain three-word description. The model reads
-// the whole text, the plan keeps no filter, and relaxed retrieval is an or of
+// the whole text, the plan keeps no filter, and the relaxed query is an or of
 // the three words as content atoms.
 func TestPlanRerankQuery(t *testing.T) {
 	raw, _, _, err := parseQueryHalves("Handle shell completion")
@@ -823,7 +823,7 @@ func TestPlanRerankQueryFilterTextOutlivesItsMask(t *testing.T) {
 
 // TestPlanRerankQueryOrMaskKeepsOnlyFilters plans queries with a punctuation
 // atom or a nested type:file next to their filters. Neither one changes the
-// model text or the semantic mask. Relaxed retrieval drops them too, but it
+// model text or the semantic mask. The relaxed query drops them too, but it
 // keeps the punctuation inside a filter. The expected plans are worked out by
 // hand.
 func TestPlanRerankQueryOrMaskKeepsOnlyFilters(t *testing.T) {

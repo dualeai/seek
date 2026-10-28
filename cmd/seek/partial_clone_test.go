@@ -57,8 +57,9 @@ func TestPartialCloneWarnsOncePerCommand(t *testing.T) {
 }
 
 // TestPartialCloneNeedsNoLazyFetchGit searches a partial clone with a Git
-// that ignores GIT_NO_LAZY_FETCH. No Git command runs in the clone: the node
-// is skipped with one warning that gives the version message.
+// that ignores GIT_NO_LAZY_FETCH. No Git command other than git config runs in
+// the clone: Seek skips the node with one warning that gives the version
+// message.
 func TestPartialCloneNeedsNoLazyFetchGit(t *testing.T) {
 	requireTools(t)
 	clone := newPartialClone(t)
@@ -251,8 +252,9 @@ func TestPartialCloneBlobArrivesDuringDelta(t *testing.T) {
 	gitRunIn(t, clone, "pull", "-q", "--ff-only")
 	// The shim keeps its stdout open until the fetch ends, so the recheck
 	// reads the end of the cat-file output only after the blob arrived. The
-	// rename of the armed file lets one cat-file run the fetch. The prepare
-	// before the build runs `git cat-file --batch`, which the shim passes on.
+	// rename of the armed file lets one cat-file run the fetch. The cache
+	// estimate before the build runs `git cat-file --batch`, which the shim
+	// passes on.
 	armed := filepath.Join(t.TempDir(), "armed")
 	t.Setenv("SEEK_TEST_ARMED", armed)
 	t.Setenv("SEEK_TEST_CLONE", clone)

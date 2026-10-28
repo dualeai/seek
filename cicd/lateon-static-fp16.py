@@ -38,10 +38,10 @@ def set_dimension(dimension, value):
 
 
 def replace_rotary_negation(model):
-    """Keep the pinned LateOn rotary operations in CoreML FP16 partitions.
+    """Keep the pinned LateOn rotary operations in Core ML FP16 partitions.
 
     The node-name match is specific to the pinned source graph. Review this
-    rewrite when the model revision or CoreML provider changes.
+    rewrite when the model revision or the Core ML provider changes.
     """
     if any(value.name == ROTARY_NEGATIVE_ONE for value in model.graph.initializer):
         raise ValueError(f"initializer already exists: {ROTARY_NEGATIVE_ONE}")

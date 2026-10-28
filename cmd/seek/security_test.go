@@ -102,8 +102,8 @@ func TestAppendConfigEnvKeepsCallerPairs(t *testing.T) {
 }
 
 // TestFilterDriverReadFailureFailsClosed makes the driver-list read fail. The
-// repository's Git commands must then fail, not run with the driver on: the
-// node is skipped with one warning that gives the cause.
+// repository's Git commands must then fail, not run with the driver on. The
+// search skips the node, a warning gives the cause, and no marker script runs.
 func TestFilterDriverReadFailureFailsClosed(t *testing.T) {
 	requireTools(t)
 	const marker = "zqfailclosedmarker"
@@ -124,7 +124,8 @@ func TestFilterDriverReadFailureFailsClosed(t *testing.T) {
 }
 
 // TestRepoFilterOverridesReadOncePerRepo runs three Git commands in one
-// repository: the driver list is read once, and it holds the local driver.
+// repository: Seek reads the driver list once, and the list holds the local
+// driver.
 func TestRepoFilterOverridesReadOncePerRepo(t *testing.T) {
 	requireGit(t)
 	f := newGraphFixture(t)
@@ -172,7 +173,7 @@ func TestParseRepoGitConfigPartialClone(t *testing.T) {
 }
 
 // TestSearchReadsDriverListOncePerRepo searches a folder with three
-// repositories: each repository's driver list is read once per command.
+// repositories: the command reads the driver list of each repository once.
 func TestSearchReadsDriverListOncePerRepo(t *testing.T) {
 	requireTools(t)
 	const marker = "zqdriverreadmarker"

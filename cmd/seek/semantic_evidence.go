@@ -41,8 +41,9 @@ type semanticFileCandidate struct {
 // is index damage. openNode then removes the family manifest and opens the
 // node once more from a new capture. evidenceMismatch judges each mismatch
 // first. An edit of a folder file since the walk is a tree change. A mismatch
-// that the repair did not remove makes openNode rebuild the vectors
-// (nodeRepair), and that file gives no vector hit. A shard copy that is a
+// that the repair did not remove makes openNode remove the node's vector
+// generations (nodeRepair), so the next build makes them again. That file
+// gives no vector hit. A shard copy that is a
 // NOT-INDEXED marker has no text to show, as for a strict search, so that file
 // gives no hit. The candidates must have different paths.
 func readSemanticEvidence(

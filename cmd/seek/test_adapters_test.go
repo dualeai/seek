@@ -40,8 +40,9 @@ func parseSearchQuery(pattern string) (query.Q, error) {
 
 // executeParsedShardSearchForTest is a test adapter for
 // searchPlannedCorpusParsed. It searches one index directory as a node with no
-// scope. The node's cache directory is the parent of indexDir, as in a planned
-// node (cacheDir/index), so the read lock file goes there.
+// scope and no dirty file. The node's cache directory is the parent of
+// indexDir, as in a planned node (cacheDir/index), so the read lock file goes
+// there.
 func executeParsedShardSearchForTest(
 	ctx context.Context,
 	indexDir string,
@@ -61,7 +62,7 @@ func formatGitCorpusResultsForTest(files []zoekt.FileMatch, limit, maxMatches in
 }
 
 // withHeaders sets the headers of results as the command does before it
-// prints them (applyHeaders), with no path operand: each header is the path
+// prints them (applyHeaders), with no path operand. So each header is the path
 // joined to its display root. It returns results.
 func withHeaders(results []corpusSearchResult) []corpusSearchResult {
 	applyHeaders(results, displayOperands{})

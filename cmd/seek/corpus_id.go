@@ -74,8 +74,9 @@ func gitCorpusStateHash(paths gitPaths, state repoState) string {
 }
 
 // pathIdentityOrClean returns the file identity (dev:ino) of path, so a state
-// hash does not depend on how the path was typed. When stat fails, it returns
-// the clean path.
+// hash does not depend on the spelling of the path. The path can come from
+// the operand, a .git file, a commondir file, or Git output. When stat fails,
+// it returns the clean path.
 func pathIdentityOrClean(path string) string {
 	if id, err := filesystemIdentity(path); err == nil {
 		return id

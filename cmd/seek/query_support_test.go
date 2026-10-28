@@ -118,7 +118,7 @@ func TestQuerySupportRowsRoute(t *testing.T) {
 					}
 				} else if !ok || plan.modelQuery != base.modelQuery ||
 					strings.ReplaceAll(fmt.Sprint(plan.relaxedQ), "case_", "") == fmt.Sprint(base.relaxedQ) {
-					// A filter stays in relaxed retrieval.
+					// A filter stays in the relaxed query.
 					t.Fatalf("filter %q: eligible=%t model=%q relaxed=%v",
 						row.example, ok, plan.modelQuery, plan.relaxedQ)
 				}

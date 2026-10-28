@@ -1044,9 +1044,10 @@ func TestSemanticContentIDUsesRawBytes(t *testing.T) {
 	}
 }
 
-// TestUSearchShardTrustedOnlyAsChecked opens a generation three times. The
-// open trusts an untouched shard with no hash. It hashes a touched shard,
-// which passes. A touched shard with other bytes of the same length fails.
+// TestUSearchShardTrustedOnlyAsChecked opens a generation three times and
+// checks its shard after each open. The check trusts an untouched shard with
+// no hash. It hashes a touched shard, which passes. A touched shard with other
+// bytes of the same length fails.
 func TestUSearchShardTrustedOnlyAsChecked(t *testing.T) {
 	units, embeddings := testSemanticRowsAndVectors(t)
 	dir := filepath.Join(t.TempDir(), "semantic")

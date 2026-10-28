@@ -29,9 +29,9 @@ type externalGitRoot struct {
 	// operands are the canonical paths that the search covers.
 	operands []gitScopeOperand
 	// state and children are the node capture: its git status, and the
-	// nested repositories that git status and git ls-files listed. They are
-	// set when captured is true. A node that the expansion did not capture
-	// failed, and has no plan.
+	// nested repositories that git status and git ls-files listed. They hold
+	// data only when captured is true. A node that the expansion did not
+	// capture failed, and has no plan.
 	state    repoState
 	children []string
 	// emitted holds the children that childrenInScope already returned.
@@ -80,9 +80,10 @@ func newPathOperandError(operation pathOperandOperation, operand string, cause e
 	return &pathOperandError{operation: operation, operand: operand, cause: cause}
 }
 
-// statOperand resolves one path operand and reads its type. A file operand is
-// opened once, so a file that exists but cannot be read is a node failure like
-// an unreadable folder. abs is set when the path resolves.
+// statOperand resolves one path operand and reads its type. It opens a file
+// operand once, so a file that exists but that Seek cannot read is a node
+// failure, as an unreadable folder is. It returns the absolute path whenever
+// the path resolves, also with an error.
 func statOperand(operand string) (string, os.FileInfo, error) {
 	abs, err := filepath.Abs(operand)
 	if err != nil {
@@ -95,8 +96,8 @@ func statOperand(operand string) (string, os.FileInfo, error) {
 	if !info.IsDir() && !info.Mode().IsRegular() {
 		return abs, nil, fmt.Errorf("unsupported path operand: %s", operand)
 	}
-	// The open proves read access. A cloud-only file is not opened: the open
-	// would download it, and the build never reads its bytes.
+	// The open proves read access. Seek does not open a cloud-only file: the
+	// open would download it, and the build never reads its bytes.
 	var st unix.Stat_t
 	if info.Mode().IsRegular() && (unix.Stat(abs, &st) != nil || !fileIsDataless(abs, &st)) {
 		file, err := os.Open(abs)
@@ -126,8 +127,8 @@ func resolveOperands(ctx context.Context, operands []string) (plannedExternalOpe
 	for _, operand := range operands {
 		abs, info, err := statOperand(operand)
 		if errors.Is(err, fs.ErrPermission) {
-			// The operand exists but cannot be read: a node failure, not an
-			// operand error.
+			// The operand exists, but Seek cannot read it: a node failure,
+			// not an operand error.
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return result, ctxErr
 			}
