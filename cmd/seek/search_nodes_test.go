@@ -279,18 +279,24 @@ func TestRunSizesTheWindowFromTheGraph(t *testing.T) {
 	lockWaitActed(t, acted)
 }
 
-// TestBuildsWithFewLargeDocumentTokensFinish builds 12 folder nodes at once.
+// TestBuildsWithFewLargeDocumentTokensFinish builds 4 folder nodes at once.
 // Each file fills a shard of its own. A large window ends at 4 documents
 // (largeDocumentParallelism), or when its content reaches the window. The
-// window holds 4.5 documents, so the 4 tokens end each window. Each build has
-// more readers than 4, and the read budget is the one that the indexWindowFor
-// proof needs. The builds must finish and give all weight back. A token bound
-// that blocks a reader, in place of ending the window, fails the test. Each
-// build also keeps its own tokens. With shared tokens, the holders can wait
-// for readers that the read budget blocks, so builds can hang under load. The
-// test does not force that load, so it does not prove this rule. The test sets
-// GOMAXPROCS, so each build has more readers than tokens on every host. A hang
-// runs until the go test timeout, which prints each goroutine.
+// window holds 4.5 documents, so the 4 tokens end each window but the last.
+// Each node has 9 files, so each build ends two windows on its tokens. Each
+// build has more readers than 4, and the read budget is the one that the
+// indexWindowFor proof needs. The builds must finish and give all weight back.
+// A token bound that blocks a reader, in place of ending the window, fails the
+// test. Each build also keeps its own tokens. With shared tokens, the holders
+// can wait for readers that the read budget blocks, so builds can hang under
+// load. The test does not force that load, so it does not prove this rule. The
+// test sets GOMAXPROCS, so each build has more readers than tokens on every
+// host. A hang runs until the go test timeout, which prints each goroutine. A
+// token that blocks a reader hangs a single build, so a few nodes are enough.
+// Each build that runs at the same time adds much memory under -race: Zoekt
+// allocates two 16 MiB trigram arrays for each shard. With 12 nodes of 20
+// files, the test used 6 to 8.5 GB under -race on macOS, and it took 100 s on a
+// 4-CPU Linux runner.
 func TestBuildsWithFewLargeDocumentTokensFinish(t *testing.T) {
 	requireTools(t)
 	const tokens = 4
@@ -299,7 +305,7 @@ func TestBuildsWithFewLargeDocumentTokensFinish(t *testing.T) {
 	defer goroutineLeakGuard(t)()
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
-	const nodes = 12
+	const nodes = 4
 	const doc int64 = 96 << 10
 	window := doc * 9 / 2
 	restore := swapReadSemaphoreForTest(2*nodes*window + 2*doc)
@@ -312,7 +318,7 @@ func TestBuildsWithFewLargeDocumentTokensFinish(t *testing.T) {
 
 	plans := make([]node, nodes)
 	for index := range plans {
-		plans[index] = planSynthCorpus(t, writeRandomFolder(t, 20*doc, doc))
+		plans[index] = planSynthCorpus(t, writeRandomFolder(t, 9*doc, doc))
 	}
 	userQ, err := parseSearchQuery("zzz_no_match_zzz")
 	if err != nil {
