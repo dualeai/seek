@@ -1,7 +1,7 @@
 #!/bin/sh
-# Assert the skill frontmatter a harness needs is present and parseable.
-# The skill ships to harnesses with no hook support, so it has to stand on its
-# own even when the router never runs.
+# Check that the skill has the frontmatter that a harness needs, and that the
+# frontmatter parses. The skill also goes to harnesses with no hook support, so
+# it must work when the router never runs.
 set -u
 
 file=${1:-}

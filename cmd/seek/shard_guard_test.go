@@ -48,35 +48,35 @@ func guardShardReport(t *testing.T, dir string) (int, map[string][]string) {
 	return wrapped, contents
 }
 
-// The guard tests scale Zoekt's limits down, so they index a few MiB, not
-// tens of MiB. A document above guardShardMax that Zoekt keeps fills a shard
-// of its own, and a shard file above guardShardFormatLimit counts as wrapped.
-// A random-word shard takes about 2.8 MiB plus 3.9 bytes per content byte: the
-// 1.25 MiB fits.txt makes about 7.7 MiB and fits, and the 2.5 MiB wraps.txt
-// makes about 12.7 MiB and wraps.
+// The guard tests scale Zoekt's limits down, so they index less than 1 MiB,
+// not tens of MiB. A document above guardShardMax that Zoekt keeps fills a
+// shard of its own, and a shard file above guardShardFormatLimit counts as
+// wrapped. A random-word shard takes about 12 bytes per content byte at 128
+// KiB and about 8.5 at 512 KiB. So the 128 KiB fits.txt makes about 1.5 MiB
+// and fits. The 512 KiB wraps.txt makes about 4.3 MiB and wraps.
 const (
-	// Below folderDeltaShardMax (1 MiB), so the default and folder delta
-	// builders keep different shard sizes.
-	guardShardMax         = 1 << 19  // 512 KiB
-	guardShardFormatLimit = 10 << 20 // 10 MiB
+	// Below deltaShardMin (1 MiB), so a delta Builder uses it as its shard
+	// target too (deltaShardMax).
+	guardShardMax         = 1 << 16 // 64 KiB
+	guardShardFormatLimit = 5 << 19 // 2.5 MiB
 )
 
 // swapGuardLimitsForTest sets shardMax and shardFormatLimit to the guard
 // test values for one test.
 func swapGuardLimitsForTest(tb testing.TB) {
 	tb.Helper()
-	swapShardMaxForTest(tb, guardShardMax)
-	swapShardFormatLimitForTest(tb, guardShardFormatLimit)
+	swapForTest(tb, &shardMax, guardShardMax)
+	swapForTest(tb, &shardFormatLimit, guardShardFormatLimit)
 }
 
-// guardDocs returns a document that Zoekt skips at Add (NUL bytes, so it does
-// not flush), one that fits, and one that wraps under the guard limits, in the
-// given order of names. Each is above guardShardMax.
+// guardDocs returns the documents named in order, each above guardShardMax.
+// Zoekt skips bin.dat at Add (NUL bytes), so it does not flush. Under the
+// guard limits, fits.txt fits and wraps.txt wraps.
 func guardDocs(order ...string) []fileContent {
 	documents := map[string]fileContent{
-		"bin.dat":   {name: "bin.dat", content: make([]byte, 5<<18)},
-		"fits.txt":  {name: "fits.txt", content: randomWordText(3, 5<<18, "guard_fits_needle")},
-		"wraps.txt": {name: "wraps.txt", content: randomWordText(4, 5<<19, "guard_wraps_needle")},
+		"bin.dat":   {name: "bin.dat", content: make([]byte, 1<<17)},
+		"fits.txt":  {name: "fits.txt", content: randomWordText(3, 1<<17, "guard_fits_needle")},
+		"wraps.txt": {name: "wraps.txt", content: randomWordText(4, 1<<19, "guard_wraps_needle")},
 	}
 	docs := make([]fileContent, len(order))
 	for i, name := range order {
@@ -85,6 +85,9 @@ func guardDocs(order ...string) []fileContent {
 	return docs
 }
 
+// expectGuardedShards checks the shards in dir: no file above
+// shardFormatLimit, fits.txt once with its content, wraps.txt once as its
+// NOT-INDEXED marker, and bin.dat once.
 func expectGuardedShards(t *testing.T, dir string) {
 	t.Helper()
 	wrapped, contents := guardShardReport(t, dir)
@@ -102,11 +105,12 @@ func expectGuardedShards(t *testing.T, dir string) {
 	}
 }
 
+// TestGuardWrappedShards_SkippedDocumentDoesNotShiftMapping builds the guard
+// documents with each builder and in each order. guardWrappedShards must find
+// the shard of each isolated document: a document that Zoekt skips takes no
+// shard of its own.
 func TestGuardWrappedShards_SkippedDocumentDoesNotShiftMapping(t *testing.T) {
 	requireTools(t)
-	if testing.Short() {
-		t.Skip("indexes 5 MiB per build")
-	}
 	orders := map[string][]string{
 		// A skipped document first must not shift the mapping.
 		"skipped first": {"bin.dat", "fits.txt", "wraps.txt"},
@@ -114,12 +118,12 @@ func TestGuardWrappedShards_SkippedDocumentDoesNotShiftMapping(t *testing.T) {
 		"fits after wraps": {"wraps.txt", "fits.txt", "bin.dat"},
 	}
 	builders := map[string]func(dir string, docs []fileContent) error{
-		"delta default shard size": func(dir string, docs []fileContent) error {
-			_, err := indexDeltaDocuments(dir, "guard", "", docs, 0, nil)
+		"delta with parallelism 1": func(dir string, docs []fileContent) error {
+			_, err := indexDeltaDocuments(dir, "guard", "", docs, 1, nil)
 			return err
 		},
-		"delta folder shard size": func(dir string, docs []fileContent) error {
-			_, err := indexDeltaDocuments(dir, "guard", "", docs, folderDeltaShardMax, nil)
+		"delta with parallelism 3": func(dir string, docs []fileContent) error {
+			_, err := indexDeltaDocuments(dir, "guard", "", docs, 3, nil)
 			return err
 		},
 		"windows with parallelism 3": func(dir string, docs []fileContent) error {
@@ -147,8 +151,8 @@ func TestGuardWrappedShards_SkippedDocumentDoesNotShiftMapping(t *testing.T) {
 }
 
 // TestIsolatesShard_MatchesZoektFlush checks isolatesShard against Zoekt
-// itself: each document is added to an empty Builder before a small one, and
-// Zoekt's shards show whether the document filled a shard alone.
+// itself. The test adds each document to an empty Builder before a small one.
+// Shard 0 then shows whether the document filled a shard alone.
 func TestIsolatesShard_MatchesZoektFlush(t *testing.T) {
 	requireTools(t)
 	const shardMax = 1024

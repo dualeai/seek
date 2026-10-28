@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -9,9 +10,8 @@ import (
 	"testing"
 )
 
-// Builders shared by the classification gap tests. They sit on top of the
-// existing initGitRepo* helpers and writeFileAt.
-
+// writeTrackedFile writes name in repo and commits it. It returns the path of
+// the file.
 func writeTrackedFile(tb testing.TB, repo, name, content string) string {
 	tb.Helper()
 	writeFileAt(tb, repo, name, content)
@@ -20,49 +20,45 @@ func writeTrackedFile(tb testing.TB, repo, name, content string) string {
 	return filepath.Join(repo, name)
 }
 
+// writeUntrackedFile writes name in repo with no commit. It returns the path
+// of the file.
 func writeUntrackedFile(tb testing.TB, repo, name, content string) string {
 	tb.Helper()
 	writeFileAt(tb, repo, name, content)
 	return filepath.Join(repo, name)
 }
 
+// writeIgnoredFile adds name to the .gitignore of repo, commits the
+// .gitignore, and writes name. It returns the path of the file.
 func writeIgnoredFile(tb testing.TB, repo, name, content string) string {
 	tb.Helper()
-	appendFileAt(tb, repo, ".gitignore", name+"\n")
+	ignore, err := os.OpenFile(filepath.Join(repo, ".gitignore"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	_, err = ignore.WriteString(name + "\n")
+	if err = errors.Join(err, ignore.Close()); err != nil {
+		tb.Fatal(err)
+	}
 	gitRunIn(tb, repo, "add", ".gitignore")
 	gitRunIn(tb, repo, "commit", "-m", "ignore "+name)
 	writeFileAt(tb, repo, name, content)
 	return filepath.Join(repo, name)
 }
 
-func appendFileAt(tb testing.TB, repo, name, content string) {
+// planForOperands plans the nodes of operands and stops the test on an error.
+func planForOperands(tb testing.TB, operands ...string) []node {
 	tb.Helper()
-	p := filepath.Join(repo, name)
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	defer func() { _ = f.Close() }()
-	if _, err := f.WriteString(content); err != nil {
-		tb.Fatal(err)
-	}
-}
-
-func planForOperands(tb testing.TB, repo string, operands ...string) []corpusPlan {
-	tb.Helper()
-	paths, err := resolveGitPaths(context.Background(), repo)
-	if err != nil {
-		tb.Fatalf("resolve git paths: %v", err)
-	}
-	plans, err := planCorpora(context.Background(), &paths, operands)
+	plans, err := planCorpora(context.Background(), operands)
 	if err != nil {
 		tb.Fatalf("planCorpora: %v", err)
 	}
 	return plans
 }
 
-// I3 — an untracked-but-visible file routes to the repo's scoped git corpus
-// (its content is reached via the dirty layer), not a standalone folder corpus.
+// TestPlanCorpora_UntrackedVisibleFileUsesScopedGitCorpus checks that an
+// untracked file that Git does not ignore goes to the scoped Git node of its
+// repo. It gets no folder node. The dirty overlay holds its content.
 func TestPlanCorpora_UntrackedVisibleFileUsesScopedGitCorpus(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
@@ -70,19 +66,20 @@ func TestPlanCorpora_UntrackedVisibleFileUsesScopedGitCorpus(t *testing.T) {
 	repo := initGitRepo(t, "committed.go", "package main\n")
 	file := writeUntrackedFile(t, repo, "fresh.go", "package main\n")
 
-	plans := planForOperands(t, repo, file)
+	plans := planForOperands(t, file)
 	if len(plans) != 1 {
 		t.Fatalf("expected one plan, got %d: %#v", len(plans), plans)
 	}
 	if plans[0].kind != corpusKindGit || plans[0].scope == nil {
 		t.Fatalf("untracked visible file should be a scoped git corpus, got kind=%q scope=%v", plans[0].kind, plans[0].scope)
 	}
-	if plans[0].root != canonicalCorpusPath(repo) {
-		t.Fatalf("root mismatch: got %q want %q", plans[0].root, canonicalCorpusPath(repo))
+	if plans[0].root != resolvedPath(t, repo) {
+		t.Fatalf("root mismatch: got %q want %q", plans[0].root, resolvedPath(t, repo))
 	}
 }
 
-// I4 — a tracked file inside a nested repo routes to the INNER repo.
+// TestPlanCorpora_FileInNestedGitUsesChildRepo checks that a tracked file of a
+// nested repo goes to the node of the nested repo, not of the parent.
 func TestPlanCorpora_FileInNestedGitUsesChildRepo(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
@@ -91,16 +88,17 @@ func TestPlanCorpora_FileInNestedGitUsesChildRepo(t *testing.T) {
 	nested := initGitRepoNoRemoteAt(t, filepath.Join(parent, "child"), "child.go", "package child\n")
 	file := filepath.Join(nested, "child.go")
 
-	plans := planForOperands(t, parent, file)
+	plans := planForOperands(t, file)
 	if len(plans) != 1 {
 		t.Fatalf("expected one plan, got %d: %#v", len(plans), plans)
 	}
-	if plans[0].kind != corpusKindGit || plans[0].root != canonicalCorpusPath(nested) {
-		t.Fatalf("nested file should route to inner repo %q, got kind=%q root=%q", canonicalCorpusPath(nested), plans[0].kind, plans[0].root)
+	if plans[0].kind != corpusKindGit || plans[0].root != resolvedPath(t, nested) {
+		t.Fatalf("nested file should route to inner repo %q, got kind=%q root=%q", resolvedPath(t, nested), plans[0].kind, plans[0].root)
 	}
 }
 
-// I5 — multiple files of one repo collapse to a single scoped git plan.
+// TestPlanCorpora_MultipleFilesSameRepoCollapseToOnePlan checks that two
+// files of one repo give one scoped Git node.
 func TestPlanCorpora_MultipleFilesSameRepoCollapseToOnePlan(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
@@ -109,7 +107,7 @@ func TestPlanCorpora_MultipleFilesSameRepoCollapseToOnePlan(t *testing.T) {
 	b := writeTrackedFile(t, repo, "b.go", "package main\n")
 	a := filepath.Join(repo, "a.go")
 
-	plans := planForOperands(t, repo, a, b)
+	plans := planForOperands(t, a, b)
 	if len(plans) != 1 {
 		t.Fatalf("expected one collapsed plan, got %d: %#v", len(plans), plans)
 	}
@@ -118,8 +116,9 @@ func TestPlanCorpora_MultipleFilesSameRepoCollapseToOnePlan(t *testing.T) {
 	}
 }
 
-// A file covered by a directory operand of the same repo does not spawn a
-// second plan; both share one scoped git corpus.
+// TestPlanCorpora_FileAndDirSameRepoCollapseToOnePlan checks that a file
+// below a directory operand of the same repo adds no second node. Both
+// operands share one scoped Git node.
 func TestPlanCorpora_FileAndDirSameRepoCollapseToOnePlan(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
@@ -129,7 +128,7 @@ func TestPlanCorpora_FileAndDirSameRepoCollapseToOnePlan(t *testing.T) {
 	dir := filepath.Join(repo, "sub")
 	file := filepath.Join(repo, "sub", "x.go")
 
-	plans := planForOperands(t, repo, dir, file)
+	plans := planForOperands(t, dir, file)
 	if len(plans) != 1 {
 		t.Fatalf("expected one plan, got %d: %#v", len(plans), plans)
 	}
@@ -138,9 +137,10 @@ func TestPlanCorpora_FileAndDirSameRepoCollapseToOnePlan(t *testing.T) {
 	}
 }
 
-// I1/I6 — a tracked file and an ignored file in the SAME repo split: the
-// tracked file is git-scoped, the ignored file falls back to its own
-// folder/file corpus so its content is still searched.
+// TestPlanCorpora_TrackedAndIgnoredFileSameRepoSplit checks that a tracked
+// file and an ignored file of one repo give two nodes. The tracked file goes
+// to the scoped Git node. The ignored file gets a file node of its own, so
+// the search still reads its content.
 func TestPlanCorpora_TrackedAndIgnoredFileSameRepoSplit(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
@@ -149,11 +149,11 @@ func TestPlanCorpora_TrackedAndIgnoredFileSameRepoSplit(t *testing.T) {
 	tracked := filepath.Join(repo, "tracked.go")
 	ignored := writeIgnoredFile(t, repo, "secret.txt", "shh\n")
 
-	plans := planForOperands(t, repo, tracked, ignored)
+	plans := planForOperands(t, tracked, ignored)
 	if len(plans) != 2 {
 		t.Fatalf("expected two plans (git + folder fallback), got %d: %#v", len(plans), plans)
 	}
-	var git, folder *corpusPlan
+	var git, folder *node
 	for i := range plans {
 		switch plans[i].kind {
 		case corpusKindGit:
@@ -162,19 +162,26 @@ func TestPlanCorpora_TrackedAndIgnoredFileSameRepoSplit(t *testing.T) {
 			folder = &plans[i]
 		}
 	}
-	if git == nil || git.root != canonicalCorpusPath(repo) || git.scope == nil {
+	if git == nil || git.root != resolvedPath(t, repo) || git.scope == nil {
 		t.Fatalf("expected scoped git plan rooted at repo (scope!=nil), got %#v", plans)
 	}
-	if folder == nil || folder.rootType != rootTypeFile || folder.root != canonicalCorpusPath(ignored) {
+	if folder == nil || folder.rootType != rootTypeFile || folder.root != resolvedPath(t, ignored) {
 		t.Fatalf("expected ignored file to fall back to a file corpus, got %#v", plans)
 	}
 }
 
-// realCaseWithin must preserve a correctly-typed path exactly, and on a
-// case/normalization-insensitive filesystem correct a mistyped one to the
-// real on-disk name (so the byte-exact git scope matches).
+// TestRealCaseWithin checks that realCaseWithin keeps a path typed with the
+// on-disk case as it is. On a case-insensitive file system, it must change a
+// path typed with another case to the on-disk names. The steps that compare
+// names byte for byte need those names. On a case-sensitive file system, that
+// path names no file, so it stays as typed. Below a directory that the test
+// user cannot read, onDiskPath cannot open that directory, and realCaseWithin
+// still gives the stored names.
 func TestRealCaseWithin(t *testing.T) {
-	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(filepath.Join(root, "Sub"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -185,49 +192,29 @@ func TestRealCaseWithin(t *testing.T) {
 	if got := realCaseWithin(root, exact, dirListings{}); got != exact {
 		t.Fatalf("exact path must be preserved: got %q want %q", got, exact)
 	}
-	// Only meaningful where the FS resolves a different-case path.
 	wrong := filepath.Join(root, "sub", "real.txt")
+	want := exact
 	if _, err := os.Stat(wrong); err != nil {
-		t.Skip("case-sensitive filesystem; correction path not exercisable")
+		want = wrong
 	}
-	if got := realCaseWithin(root, wrong, dirListings{}); got != exact {
-		t.Errorf("case correction: got %q want %q", got, exact)
+	if got := realCaseWithin(root, wrong, dirListings{}); got != want {
+		t.Errorf("case correction: got %q want %q", got, want)
+	}
+
+	writeFixtureFile(t, filepath.Join(root, "Locked", "Real.txt"), "x")
+	chmodUnreadableOrFatal(t, filepath.Join(root, "Locked"), 0o311)
+	typed := filepath.Join(root, "locked", "REAL.txt")
+	want = filepath.Join(root, "Locked", "Real.txt")
+	if _, err := os.Stat(typed); err != nil {
+		want = typed
+	}
+	if got := realCaseWithin(root, onDiskPath(typed), dirListings{}); got != want {
+		t.Errorf("below an unreadable directory: got %q want %q", got, want)
 	}
 }
 
-// Golden guard for the dirty-scope key. The key hashes only slash-relative
-// names (no absolute paths), so a frozen hex literal is portable. It pins the
-// whole serialization — tag, part order, separator AND the hash encoding —
-// so any drift that would silently invalidate on-disk cache keys without a
-// deliberate version bump fails here. Regenerate the literal only when the
-// key formula is changed on purpose (and bump seekCacheLayoutVersion).
-func TestGitDirtyScopeKey_FormulaStable(t *testing.T) {
-	requireGit(t)
-	setTestUserCache(t)
-
-	repo := initGitRepo(t, "a.go", "package main\n")
-	writeTrackedFile(t, repo, "b.go", "package main\n")
-	paths, err := resolveGitPaths(context.Background(), repo)
-	if err != nil {
-		t.Fatalf("resolve git paths: %v", err)
-	}
-	plan, err := planCurrentGitCorpusWithOperands(paths, []string{
-		filepath.Join(repo, "a.go"), filepath.Join(repo, "b.go"),
-	})
-	if err != nil {
-		t.Fatalf("plan: %v", err)
-	}
-	// Frozen: hashParts("git_dirty_scope_v1", "include_dirs", "",
-	// "include_files", "a.go\x00b.go", "exclude_dirs", "", "exclude_files", "").
-	const want = "710eba413e54cee6e5183a58b23bb6b3"
-	if plan.dirtyScope == nil || plan.dirtyScope.key != want {
-		t.Fatalf("dirty-scope key drifted: got %v want %q", plan.dirtyScope, want)
-	}
-}
-
-// The set of corpus IDs a planning run produces must not depend on the
-// order operands are passed (closes the order-independence concern without
-// a full fuzzer).
+// TestPlanCorpora_OperandOrderIndependent checks that the set of node IDs
+// does not depend on the order of the operands.
 func TestPlanCorpora_OperandOrderIndependent(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
@@ -239,7 +226,7 @@ func TestPlanCorpora_OperandOrderIndependent(t *testing.T) {
 	nestedFile := filepath.Join(nested, "c.go")
 
 	ids := func(operands ...string) []string {
-		plans := planForOperands(t, repo, operands...)
+		plans := planForOperands(t, operands...)
 		out := make([]string, 0, len(plans))
 		for _, p := range plans {
 			out = append(out, string(p.id))
@@ -256,8 +243,9 @@ func TestPlanCorpora_OperandOrderIndependent(t *testing.T) {
 	}
 }
 
-// I10 — a symlink whose resolved target is gitignored falls back to a
-// file corpus (routing follows the resolved target).
+// TestPlanCorpora_SymlinkToIgnoredFileFallsBack checks that a symlink to an
+// ignored file gives a file node at the target. The route follows the
+// resolved target.
 func TestPlanCorpora_SymlinkToIgnoredFileFallsBack(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
@@ -269,14 +257,14 @@ func TestPlanCorpora_SymlinkToIgnoredFileFallsBack(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	plans := planForOperands(t, repo, link)
+	plans := planForOperands(t, link)
 	if len(plans) != 1 {
 		t.Fatalf("expected one plan, got %d: %#v", len(plans), plans)
 	}
 	if plans[0].kind != corpusKindFolder || plans[0].rootType != rootTypeFile {
 		t.Fatalf("symlink to ignored file should fall back to a file corpus, got kind=%q rootType=%q", plans[0].kind, plans[0].rootType)
 	}
-	if plans[0].root != canonicalCorpusPath(target) {
-		t.Fatalf("root should be the resolved target %q, got %q", canonicalCorpusPath(target), plans[0].root)
+	if plans[0].root != resolvedPath(t, target) {
+		t.Fatalf("root should be the resolved target %q, got %q", resolvedPath(t, target), plans[0].root)
 	}
 }

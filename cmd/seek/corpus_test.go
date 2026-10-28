@@ -2,73 +2,17 @@ package main
 
 import (
 	"context"
-	"errors"
-	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
 
-func TestResolveDefaultSearchRoot_OutsideGitReturnsTypedError(t *testing.T) {
-	requireGit(t)
-	t.Chdir(t.TempDir())
-	paths, err := resolveDefaultSearchRoot(t.Context(), nil)
-	if paths != nil {
-		t.Fatalf("paths=%+v, want nil", paths)
-	}
-	if _, ok := errors.AsType[*searchRootError](err); !ok {
-		t.Fatalf("error=%v, want searchRootError", err)
-	}
-	if _, ok := errors.AsType[*exec.ExitError](err); !ok {
-		t.Fatalf("error=%v, want wrapped Git exit error", err)
-	}
-}
-
-func TestResolveDefaultSearchRoot_ExplicitOperandNeedsNoGitRoot(t *testing.T) {
-	t.Setenv("PATH", t.TempDir())
-	t.Chdir(t.TempDir())
-	paths, err := resolveDefaultSearchRoot(t.Context(), []string{"."})
-	if err != nil || paths != nil {
-		t.Fatalf("paths=%+v error=%v, want nil paths and error", paths, err)
-	}
-}
-
-func TestResolveDefaultSearchRoot_MissingGitReturnsTypedError(t *testing.T) {
-	t.Setenv("PATH", t.TempDir())
-	t.Chdir(t.TempDir())
-	paths, err := resolveDefaultSearchRoot(t.Context(), nil)
-	if paths != nil {
-		t.Fatalf("paths=%+v, want nil", paths)
-	}
-	if _, ok := errors.AsType[*gitUnavailableError](err); !ok {
-		t.Fatalf("error=%v, want gitUnavailableError", err)
-	}
-	if !errors.Is(err, exec.ErrNotFound) {
-		t.Fatalf("error=%v, want wrapped exec.ErrNotFound", err)
-	}
-}
-
-func TestResolveDefaultSearchRoot_CancellationIsNotAPathError(t *testing.T) {
-	requireGit(t)
-	t.Chdir(t.TempDir())
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-
-	paths, err := resolveDefaultSearchRoot(ctx, nil)
-	if paths != nil {
-		t.Fatalf("paths=%+v, want nil", paths)
-	}
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("error=%v, want context.Canceled", err)
-	}
-	if _, ok := errors.AsType[*searchRootError](err); ok {
-		t.Fatalf("error=%v, must not be searchRootError", err)
-	}
-}
-
-func TestCollectExternalOperands_PathReadErrorsPreserveOperand(t *testing.T) {
+// TestResolveOperands_PathReadErrorsPreserveOperand resolves a missing path
+// and a broken symlink: the error message names the operand as the user typed
+// it.
+func TestResolveOperands_PathReadErrorsPreserveOperand(t *testing.T) {
 	tests := []struct {
 		name    string
 		operand func(t *testing.T) string
@@ -86,7 +30,7 @@ func TestCollectExternalOperands_PathReadErrorsPreserveOperand(t *testing.T) {
 				root := t.TempDir()
 				link := filepath.Join(root, "broken-link")
 				if err := os.Symlink(filepath.Join(root, "missing-target"), link); err != nil {
-					t.Skipf("symlink unavailable: %v", err)
+					t.Fatalf("make the broken symlink: %v", err)
 				}
 				return link
 			},
@@ -95,69 +39,55 @@ func TestCollectExternalOperands_PathReadErrorsPreserveOperand(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			operand := tc.operand(t)
-			_, err := collectExternalOperands(t.Context(), []string{operand})
-			pathErr, ok := errors.AsType[*pathOperandError](err)
-			if !ok {
-				t.Fatalf("error=%v, want pathOperandError", err)
+			_, err := resolveOperands(t.Context(), []string{operand})
+			if err == nil {
+				t.Fatal("no error, want a missing path")
 			}
-			if pathErr.operation != pathOperandRead || pathErr.operand != operand {
-				t.Fatalf("error=%+v, want read operation for raw operand %q", pathErr, operand)
-			}
-			if !errors.Is(err, fs.ErrNotExist) {
-				t.Fatalf("error=%v, want fs.ErrNotExist", err)
+			if got, want := formatCLIError(err), "seek: path does not exist: "+strconv.Quote(operand); got != want {
+				t.Fatalf("message %q, want %q", got, want)
 			}
 		})
 	}
 }
 
-// TestPlanDiscoveredGitCorpus_MatchesExplicitID — a discovered plan
-// for the same physical repo as an explicit operand must produce the
-// same corpusID so dedup works without coordinating through user-facing
-// state. corpusID is keyed on (kind, root_type, root, dev:ino, …).
-func TestPlanDiscoveredGitCorpus_MatchesExplicitID(t *testing.T) {
-	root := t.TempDir()
+// TestPlanGitCorpus_WalkAndRevParseShareID plans one repository twice. The
+// first plan comes from detectGitBoundary, as the walk finds the repository
+// (the typed path). The second comes from git rev-parse, as for a `.git` entry
+// that the file-system check cannot confirm (the real path). Both plans must
+// have one corpus ID.
+func TestPlanGitCorpus_WalkAndRevParseShareID(t *testing.T) {
+	requireGit(t)
 	setTestUserCache(t)
-	// Build a triad-satisfying .git/ so detectGitBoundary confirms.
-	gitDir := filepath.Join(root, ".git")
-	for _, sub := range []string{"objects", "refs"} {
-		if err := os.MkdirAll(filepath.Join(gitDir, sub), 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	b, status := detectGitBoundary(root, root)
+	root := initGitRepo(t, "a.txt", "a\n")
+	b, status := detectGitBoundary(root)
 	if status != boundaryConfirmed {
 		t.Fatalf("status=%v, want boundaryConfirmed", status)
 	}
-	discovered, err := planDiscoveredGitCorpus(b)
+	explicitPaths, err := resolveGitPaths(t.Context(), root)
 	if err != nil {
-		t.Fatalf("planDiscoveredGitCorpus: %v", err)
+		t.Fatal(err)
 	}
-	explicit, err := planCurrentGitCorpus(b.toGitPaths())
+	discovered, err := planGitCorpus(b, nil)
 	if err != nil {
-		t.Fatalf("planCurrentGitCorpus: %v", err)
+		t.Fatalf("planGitCorpus: %v", err)
 	}
-	// Discovered plan's userExplicit must be zero-value (false).
-	if discovered.userExplicit {
-		t.Fatal("discovered plan must not be userExplicit")
+	explicit, err := planGitCorpus(explicitPaths, nil)
+	if err != nil {
+		t.Fatalf("planGitCorpus: %v", err)
 	}
-	// IDs must match — same root, same dev:ino, same versioning.
 	if discovered.id != explicit.id {
 		t.Fatalf("ID mismatch: discovered=%q explicit=%q", discovered.id, explicit.id)
 	}
 }
 
-func TestPlanCurrentGitCorpus_UserCacheLayout(t *testing.T) {
+func TestPlanGitCorpus_UserCacheLayout(t *testing.T) {
 	root := t.TempDir()
 	setTestUserCache(t)
 
-	paths := fakeGitPathsForPlanTest(root)
-	plan, err := planCurrentGitCorpus(paths)
+	paths := fakeGitPathsForPlanTest(t, root)
+	plan, err := planGitCorpus(paths, nil)
 	if err != nil {
-		t.Fatalf("planCurrentGitCorpus: %v", err)
+		t.Fatalf("planGitCorpus: %v", err)
 	}
 
 	if plan.kind != corpusKindGit {
@@ -166,7 +96,7 @@ func TestPlanCurrentGitCorpus_UserCacheLayout(t *testing.T) {
 	if plan.rootType != rootTypeWorktree {
 		t.Fatalf("expected worktree root, got %q", plan.rootType)
 	}
-	wantRoot := canonicalCorpusPath(root)
+	wantRoot := resolvedPath(t, root)
 	if plan.root != wantRoot {
 		t.Fatalf("expected root %q, got %q", wantRoot, plan.root)
 	}
@@ -187,18 +117,18 @@ func TestPlanCurrentGitCorpus_UserCacheLayout(t *testing.T) {
 	}
 }
 
-func TestPlanCurrentGitCorpus_IsStable(t *testing.T) {
+func TestPlanGitCorpus_IsStable(t *testing.T) {
 	root := t.TempDir()
 	setTestUserCache(t)
 
-	paths := fakeGitPathsForPlanTest(root)
-	first, err := planCurrentGitCorpus(paths)
+	paths := fakeGitPathsForPlanTest(t, root)
+	first, err := planGitCorpus(paths, nil)
 	if err != nil {
-		t.Fatalf("planCurrentGitCorpus first: %v", err)
+		t.Fatalf("planGitCorpus first: %v", err)
 	}
-	second, err := planCurrentGitCorpus(paths)
+	second, err := planGitCorpus(paths, nil)
 	if err != nil {
-		t.Fatalf("planCurrentGitCorpus second: %v", err)
+		t.Fatalf("planGitCorpus second: %v", err)
 	}
 	if first.id != second.id {
 		t.Fatalf("expected stable corpus ID, got %q then %q", first.id, second.id)
@@ -212,14 +142,14 @@ func TestZoektCompatibilityVersion_RotatesCacheKeys(t *testing.T) {
 	root := t.TempDir()
 	setTestUserCache(t)
 
-	paths := fakeGitPathsForPlanTest(root)
+	paths := fakeGitPathsForPlanTest(t, root)
 	state := repoState{HeadSHA: "abc", RawOutput: "# branch.oid abc\x00"}
 	info, err := os.Stat(root)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	gitBefore, err := planCurrentGitCorpus(paths)
+	gitBefore, err := planGitCorpus(paths, nil)
 	if err != nil {
 		t.Fatalf("plan Git corpus before upgrade: %v", err)
 	}
@@ -235,7 +165,7 @@ func TestZoektCompatibilityVersion_RotatesCacheKeys(t *testing.T) {
 	zoektCompatibilityVersion = original + "-upgrade-test"
 	t.Cleanup(func() { zoektCompatibilityVersion = original })
 
-	gitAfter, err := planCurrentGitCorpus(paths)
+	gitAfter, err := planGitCorpus(paths, nil)
 	if err != nil {
 		t.Fatalf("plan Git corpus after upgrade: %v", err)
 	}
@@ -264,17 +194,30 @@ func TestZoektCompatibilityVersion_RotatesCacheKeys(t *testing.T) {
 	}
 }
 
+// TestGitCorpusFingerprint_ChangesWithGitIdentity checks that the
+// fingerprint follows the file identity of the Git common dir. Another
+// directory changes it; another path to the same directory does not.
 func TestGitCorpusFingerprint_ChangesWithGitIdentity(t *testing.T) {
 	root := t.TempDir()
 	state := repoState{HeadSHA: "abc", RawOutput: "# branch.oid abc\x00"}
-	paths := fakeGitPathsForPlanTest(root)
+	paths := fakeGitPathsForPlanTest(t, root)
 	other := paths
 	other.CommonDir = filepath.Join(root, ".git-worktree-common")
+	if err := os.MkdirAll(other.CommonDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := paths
+	alias.CommonDir = filepath.Join(t.TempDir(), "git-link")
+	if err := os.Symlink(paths.CommonDir, alias.CommonDir); err != nil {
+		t.Fatal(err)
+	}
 
 	first := gitCorpusFingerprint(paths, state)
-	second := gitCorpusFingerprint(other, state)
-	if first == second {
-		t.Fatal("expected git corpus fingerprint to include Git common dir")
+	if gitCorpusFingerprint(other, state) == first {
+		t.Fatal("expected git corpus fingerprint to include the Git common dir identity")
+	}
+	if gitCorpusFingerprint(alias, state) != first {
+		t.Fatal("expected git corpus fingerprint to ignore the path to the Git common dir")
 	}
 }
 
@@ -282,14 +225,9 @@ func TestPlanCorpora_ExternalGitRepoPathUsesGitCorpus(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
 
-	currentRepo := initGitRepo(t, "current.go", "package current\n")
-	currentPaths, err := resolveGitPaths(context.Background(), currentRepo)
-	if err != nil {
-		t.Fatalf("resolve current git paths: %v", err)
-	}
 	externalRepo := initGitRepo(t, "external.go", "package external\n")
 
-	plans, err := planCorpora(context.Background(), &currentPaths, []string{externalRepo})
+	plans, err := planCorpora(context.Background(), []string{externalRepo})
 	if err != nil {
 		t.Fatalf("planCorpora: %v", err)
 	}
@@ -303,8 +241,8 @@ func TestPlanCorpora_ExternalGitRepoPathUsesGitCorpus(t *testing.T) {
 	if plan.rootType != rootTypeWorktree {
 		t.Fatalf("external Git repo should use worktree root, got %q", plan.rootType)
 	}
-	if plan.root != canonicalCorpusPath(externalRepo) {
-		t.Fatalf("external Git root mismatch: got %q want %q", plan.root, canonicalCorpusPath(externalRepo))
+	if plan.root != resolvedPath(t, externalRepo) {
+		t.Fatalf("external Git root mismatch: got %q want %q", plan.root, resolvedPath(t, externalRepo))
 	}
 }
 
@@ -313,13 +251,9 @@ func TestPlanCorpora_CurrentGitDefaultDiscoversVisibleNestedGit(t *testing.T) {
 	setTestUserCache(t)
 
 	currentRepo := initGitRepo(t, "current.go", "package current\n")
-	currentPaths, err := resolveGitPaths(context.Background(), currentRepo)
-	if err != nil {
-		t.Fatalf("resolve current git paths: %v", err)
-	}
 	nestedRepo := initGitRepoNoRemoteAt(t, filepath.Join(currentRepo, "nested"), "nested.go", "package nested\n")
 
-	plans, err := planCorpora(context.Background(), &currentPaths, nil)
+	plans, err := planCorpora(context.Background(), []string{currentRepo})
 	if err != nil {
 		t.Fatalf("planCorpora: %v", err)
 	}
@@ -327,29 +261,23 @@ func TestPlanCorpora_CurrentGitDefaultDiscoversVisibleNestedGit(t *testing.T) {
 		t.Fatalf("expected parent Git plan plus visible nested Git plan, got %d: %#v", len(plans), plans)
 	}
 
-	var parentPlan, childPlan *corpusPlan
+	var parentPlan, childPlan *node
 	for i := range plans {
 		switch plans[i].root {
-		case canonicalCorpusPath(currentRepo):
+		case resolvedPath(t, currentRepo):
 			parentPlan = &plans[i]
-		case canonicalCorpusPath(nestedRepo):
+		case resolvedPath(t, nestedRepo):
 			childPlan = &plans[i]
 		}
 	}
 	if parentPlan == nil {
 		t.Fatalf("expected parent Git plan, got %#v", plans)
 	}
-	if !parentPlan.userExplicit {
-		t.Fatal("default current Git plan should be user-explicit")
-	}
-	if parentPlan.scope == nil {
-		t.Fatal("expected parent Git plan to exclude visible nested Git root")
+	if parentPlan.scope != nil {
+		t.Fatalf("parent Git plan should cover the whole node (the child is its own node), got %#v", parentPlan.scope)
 	}
 	if childPlan == nil {
 		t.Fatalf("expected child Git plan, got %#v", plans)
-	}
-	if childPlan.userExplicit {
-		t.Fatal("visible nested Git plan discovered from default root should not be user-explicit")
 	}
 }
 
@@ -358,15 +286,11 @@ func TestPlanCorpora_ExactFilesAndDirectoriesUseScopedGitCorpus(t *testing.T) {
 	setTestUserCache(t)
 
 	currentRepo := initGitRepo(t, "current.go", "package current\n")
-	currentPaths, err := resolveGitPaths(context.Background(), currentRepo)
-	if err != nil {
-		t.Fatalf("resolve current git paths: %v", err)
-	}
 	cases := []struct {
 		name        string
 		target      func(t *testing.T) string
 		wantKind    corpusKind
-		wantRoot    func(target string) string
+		wantRoot    func(target string) string // the check resolves symlinks
 		wantRootTyp rootType
 		wantScope   bool
 	}{
@@ -385,7 +309,7 @@ func TestPlanCorpora_ExactFilesAndDirectoriesUseScopedGitCorpus(t *testing.T) {
 				return target
 			},
 			wantKind:    corpusKindGit,
-			wantRoot:    func(string) string { return canonicalCorpusPath(currentRepo) },
+			wantRoot:    func(string) string { return currentRepo },
 			wantRootTyp: rootTypeWorktree,
 			wantScope:   true,
 		},
@@ -399,7 +323,7 @@ func TestPlanCorpora_ExactFilesAndDirectoriesUseScopedGitCorpus(t *testing.T) {
 				return target
 			},
 			wantKind:    corpusKindGit,
-			wantRoot:    func(string) string { return canonicalCorpusPath(currentRepo) },
+			wantRoot:    func(string) string { return currentRepo },
 			wantRootTyp: rootTypeWorktree,
 			wantScope:   true,
 		},
@@ -409,14 +333,9 @@ func TestPlanCorpora_ExactFilesAndDirectoriesUseScopedGitCorpus(t *testing.T) {
 				externalRepo := initGitRepo(t, "external.go", "package external\n")
 				return filepath.Join(externalRepo, "external.go")
 			},
-			wantKind: corpusKindGit,
-			wantRoot: func(target string) string {
-				paths, err := resolveGitPaths(context.Background(), filepath.Dir(target))
-				if err != nil {
-					t.Fatalf("resolve external git paths: %v", err)
-				}
-				return canonicalCorpusPath(paths.RepoDir)
-			},
+			// The repository root is the directory of the file.
+			wantKind:    corpusKindGit,
+			wantRoot:    func(target string) string { return filepath.Dir(target) },
 			wantRootTyp: rootTypeWorktree,
 			wantScope:   true,
 		},
@@ -430,14 +349,9 @@ func TestPlanCorpora_ExactFilesAndDirectoriesUseScopedGitCorpus(t *testing.T) {
 				}
 				return target
 			},
-			wantKind: corpusKindGit,
-			wantRoot: func(target string) string {
-				paths, err := resolveGitPaths(context.Background(), target)
-				if err != nil {
-					t.Fatalf("resolve external git paths: %v", err)
-				}
-				return canonicalCorpusPath(paths.RepoDir)
-			},
+			// The repository root is the parent of the nested directory.
+			wantKind:    corpusKindGit,
+			wantRoot:    func(target string) string { return filepath.Dir(target) },
 			wantRootTyp: rootTypeWorktree,
 			wantScope:   true,
 		},
@@ -451,14 +365,14 @@ func TestPlanCorpora_ExactFilesAndDirectoriesUseScopedGitCorpus(t *testing.T) {
 				return target
 			},
 			wantKind:    corpusKindFolder,
-			wantRoot:    func(target string) string { return canonicalCorpusPath(target) },
+			wantRoot:    func(target string) string { return target },
 			wantRootTyp: rootTypeDirectory,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			target := tc.target(t)
-			plans, err := planCorpora(context.Background(), &currentPaths, []string{target})
+			plans, err := planCorpora(context.Background(), []string{target})
 			if err != nil {
 				t.Fatalf("planCorpora: %v", err)
 			}
@@ -472,7 +386,7 @@ func TestPlanCorpora_ExactFilesAndDirectoriesUseScopedGitCorpus(t *testing.T) {
 			if plan.rootType != tc.wantRootTyp {
 				t.Fatalf("root type mismatch: got %q want %q", plan.rootType, tc.wantRootTyp)
 			}
-			if want := tc.wantRoot(target); plan.root != want {
+			if want := resolvedPath(t, tc.wantRoot(target)); plan.root != want {
 				t.Fatalf("root mismatch: got %q want %q", plan.root, want)
 			}
 			if gotScope := plan.scope != nil; gotScope != tc.wantScope {
@@ -482,27 +396,24 @@ func TestPlanCorpora_ExactFilesAndDirectoriesUseScopedGitCorpus(t *testing.T) {
 	}
 }
 
-// A scoped Git directory plan reuses the unscoped combined corpus ID and index
-// directory. It adds a search scope, a Git path scope, and an over-cap fallback.
+// TestPlanCorpora_ScopedGitDirectoryReusesCombinedCorpusID checks that the
+// plan of a Git subdirectory has the corpus ID of the whole repository. So it
+// reads the same index, and it adds a search scope.
 func TestPlanCorpora_ScopedGitDirectoryReusesCombinedCorpusID(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
 
 	currentRepo := initGitRepo(t, "current.go", "package current\n")
-	currentPaths, err := resolveGitPaths(context.Background(), currentRepo)
-	if err != nil {
-		t.Fatalf("resolve current git paths: %v", err)
-	}
 	scope := filepath.Join(currentRepo, "scope")
 	if err := os.MkdirAll(scope, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	unscoped, err := planCorpora(context.Background(), &currentPaths, nil)
+	unscoped, err := planCorpora(context.Background(), []string{currentRepo})
 	if err != nil {
 		t.Fatalf("plan unscoped: %v", err)
 	}
-	scoped, err := planCorpora(context.Background(), &currentPaths, []string{scope})
+	scoped, err := planCorpora(context.Background(), []string{scope})
 	if err != nil {
 		t.Fatalf("plan scoped: %v", err)
 	}
@@ -512,31 +423,21 @@ func TestPlanCorpora_ScopedGitDirectoryReusesCombinedCorpusID(t *testing.T) {
 	if len(scoped) != 1 {
 		t.Fatalf("expected one scoped plan, got %#v", scoped)
 	}
-	if scoped[0].dirtyScope == nil {
-		t.Fatal("expected scoped Git directory plan to carry dirty scope")
-	}
 	if scoped[0].scope == nil {
 		t.Fatal("expected scoped Git directory plan to carry a search scope filter")
 	}
 	if unscoped[0].id != scoped[0].id {
 		t.Fatalf("scoped search must reuse the unscoped combined corpus ID, got %q vs %q", unscoped[0].id, scoped[0].id)
 	}
-	if scoped[0].scopedIndexDir == "" {
-		t.Fatal("expected scoped plan to carry an over-cap fallback dir")
-	}
 }
 
-// Distinct scopes of one repository share the combined whole-repo index and
-// use different search scopes and over-cap fallback directories.
+// TestPlanCorpora_ScopedGitDirectoriesShareCombinedIndex checks that two
+// subdirectories of one repository share the index of the whole repository.
 func TestPlanCorpora_ScopedGitDirectoriesShareCombinedIndex(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
 
 	currentRepo := initGitRepo(t, "current.go", "package current\n")
-	currentPaths, err := resolveGitPaths(context.Background(), currentRepo)
-	if err != nil {
-		t.Fatalf("resolve current git paths: %v", err)
-	}
 	platform := filepath.Join(currentRepo, "platform")
 	infra := filepath.Join(currentRepo, "infra")
 	for _, dir := range []string{platform, infra} {
@@ -545,11 +446,11 @@ func TestPlanCorpora_ScopedGitDirectoriesShareCombinedIndex(t *testing.T) {
 		}
 	}
 
-	platformPlans, err := planCorpora(context.Background(), &currentPaths, []string{platform})
+	platformPlans, err := planCorpora(context.Background(), []string{platform})
 	if err != nil {
 		t.Fatalf("plan platform: %v", err)
 	}
-	infraPlans, err := planCorpora(context.Background(), &currentPaths, []string{infra})
+	infraPlans, err := planCorpora(context.Background(), []string{infra})
 	if err != nil {
 		t.Fatalf("plan infra: %v", err)
 	}
@@ -564,12 +465,6 @@ func TestPlanCorpora_ScopedGitDirectoriesShareCombinedIndex(t *testing.T) {
 	if platformPlan.indexDir != infraPlan.indexDir {
 		t.Fatalf("distinct scopes must share one combined index, got %q vs %q", platformPlan.indexDir, infraPlan.indexDir)
 	}
-	if platformPlan.scopedIndexDir == "" || infraPlan.scopedIndexDir == "" {
-		t.Fatalf("expected scoped plans to carry an over-cap fallback dir, got platform=%#v infra=%#v", platformPlan, infraPlan)
-	}
-	if platformPlan.scopedIndexDir == infraPlan.scopedIndexDir {
-		t.Fatalf("distinct scopes must not share the over-cap fallback dir %q", platformPlan.scopedIndexDir)
-	}
 }
 
 func TestPlanCorpora_NestedGitDirectoryOperandUsesChildGitCorpus(t *testing.T) {
@@ -577,17 +472,13 @@ func TestPlanCorpora_NestedGitDirectoryOperandUsesChildGitCorpus(t *testing.T) {
 	setTestUserCache(t)
 
 	currentRepo := initGitRepo(t, "current.go", "package current\n")
-	currentPaths, err := resolveGitPaths(context.Background(), currentRepo)
-	if err != nil {
-		t.Fatalf("resolve current git paths: %v", err)
-	}
 	nestedRepo := initGitRepoNoRemoteAt(t, filepath.Join(currentRepo, "nested"), "nested.go", "package nested\n")
 	nestedScope := filepath.Join(nestedRepo, "pkg")
 	if err := os.MkdirAll(nestedScope, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	plans, err := planCorpora(context.Background(), &currentPaths, []string{nestedScope})
+	plans, err := planCorpora(context.Background(), []string{nestedScope})
 	if err != nil {
 		t.Fatalf("planCorpora: %v", err)
 	}
@@ -598,14 +489,11 @@ func TestPlanCorpora_NestedGitDirectoryOperandUsesChildGitCorpus(t *testing.T) {
 	if plan.kind != corpusKindGit {
 		t.Fatalf("nested Git subdir should use Git corpus, got kind=%q root=%q", plan.kind, plan.root)
 	}
-	if plan.root != canonicalCorpusPath(nestedRepo) {
-		t.Fatalf("nested Git root mismatch: got %q want %q", plan.root, canonicalCorpusPath(nestedRepo))
+	if plan.root != resolvedPath(t, nestedRepo) {
+		t.Fatalf("nested Git root mismatch: got %q want %q", plan.root, resolvedPath(t, nestedRepo))
 	}
 	if plan.scope == nil {
 		t.Fatal("nested Git subdir should produce a scoped child Git plan")
-	}
-	if !plan.userExplicit {
-		t.Fatal("direct nested Git directory operand should be user-explicit")
 	}
 }
 
@@ -614,10 +502,6 @@ func TestPlanCorpora_GitDirectoryOperandDiscoversVisibleNestedGit(t *testing.T) 
 	setTestUserCache(t)
 
 	currentRepo := initGitRepo(t, "current.go", "package current\n")
-	currentPaths, err := resolveGitPaths(context.Background(), currentRepo)
-	if err != nil {
-		t.Fatalf("resolve current git paths: %v", err)
-	}
 	scope := filepath.Join(currentRepo, "scope")
 	if err := os.MkdirAll(scope, 0o755); err != nil {
 		t.Fatal(err)
@@ -629,7 +513,7 @@ func TestPlanCorpora_GitDirectoryOperandDiscoversVisibleNestedGit(t *testing.T) 
 	gitRunIn(t, currentRepo, "commit", "-m", "add scope")
 	nestedRepo := initGitRepoNoRemoteAt(t, filepath.Join(scope, "nested"), "nested.go", "package nested\n")
 
-	plans, err := planCorpora(context.Background(), &currentPaths, []string{scope})
+	plans, err := planCorpora(context.Background(), []string{scope})
 	if err != nil {
 		t.Fatalf("planCorpora: %v", err)
 	}
@@ -637,12 +521,12 @@ func TestPlanCorpora_GitDirectoryOperandDiscoversVisibleNestedGit(t *testing.T) 
 		t.Fatalf("expected parent Git plan plus visible nested Git plan, got %d: %#v", len(plans), plans)
 	}
 
-	var parentPlan, childPlan *corpusPlan
+	var parentPlan, childPlan *node
 	for i := range plans {
 		switch plans[i].root {
-		case canonicalCorpusPath(currentRepo):
+		case resolvedPath(t, currentRepo):
 			parentPlan = &plans[i]
-		case canonicalCorpusPath(nestedRepo):
+		case resolvedPath(t, nestedRepo):
 			childPlan = &plans[i]
 		}
 	}
@@ -655,14 +539,8 @@ func TestPlanCorpora_GitDirectoryOperandDiscoversVisibleNestedGit(t *testing.T) 
 	if parentPlan.scope == nil {
 		t.Fatal("expected parent Git plan to stay scoped and exclude child Git root")
 	}
-	if !parentPlan.userExplicit {
-		t.Fatal("parent Git directory operand should be user-explicit")
-	}
 	if childPlan.scope != nil {
 		t.Fatalf("visible nested Git plan should own the whole child root, got %#v", childPlan.scope)
-	}
-	if childPlan.userExplicit {
-		t.Fatal("visible nested Git plan discovered from parent operand should not be user-explicit")
 	}
 }
 
@@ -671,10 +549,6 @@ func TestPlanCorpora_GitDirectoryOperandDiscoversSubmoduleGitlink(t *testing.T) 
 	setTestUserCache(t)
 
 	currentRepo := initGitRepo(t, "current.go", "package current\n")
-	currentPaths, err := resolveGitPaths(context.Background(), currentRepo)
-	if err != nil {
-		t.Fatalf("resolve current git paths: %v", err)
-	}
 	scope := filepath.Join(currentRepo, "scope")
 	if err := os.MkdirAll(scope, 0o755); err != nil {
 		t.Fatal(err)
@@ -690,14 +564,14 @@ func TestPlanCorpora_GitDirectoryOperandDiscoversSubmoduleGitlink(t *testing.T) 
 	gitRunIn(t, currentRepo, "commit", "-m", "add submodule")
 	submoduleRoot := filepath.Join(scope, "sub")
 
-	plans, err := planCorpora(context.Background(), &currentPaths, []string{scope})
+	plans, err := planCorpora(context.Background(), []string{scope})
 	if err != nil {
 		t.Fatalf("planCorpora: %v", err)
 	}
 
-	var childPlan *corpusPlan
+	var childPlan *node
 	for i := range plans {
-		if plans[i].root == canonicalCorpusPath(submoduleRoot) {
+		if plans[i].root == resolvedPath(t, submoduleRoot) {
 			childPlan = &plans[i]
 			break
 		}
@@ -708,20 +582,12 @@ func TestPlanCorpora_GitDirectoryOperandDiscoversSubmoduleGitlink(t *testing.T) 
 	if childPlan.scope != nil {
 		t.Fatalf("submodule Git plan should own the whole child root, got %#v", childPlan.scope)
 	}
-	if childPlan.userExplicit {
-		t.Fatal("submodule Git plan discovered from parent operand should not be user-explicit")
-	}
 }
 
 func TestPlanCorpora_ParentFolderAndNestedGitSubdirBroadenChildGitPlan(t *testing.T) {
 	requireGit(t)
 	setTestUserCache(t)
 
-	currentRepo := initGitRepo(t, "current.go", "package current\n")
-	currentPaths, err := resolveGitPaths(context.Background(), currentRepo)
-	if err != nil {
-		t.Fatalf("resolve current git paths: %v", err)
-	}
 	parent := t.TempDir()
 	nestedRepo := initGitRepoNoRemoteAt(t, filepath.Join(parent, "nested"), "nested.go", "package nested\n")
 	nestedScope := filepath.Join(nestedRepo, "pkg")
@@ -729,7 +595,7 @@ func TestPlanCorpora_ParentFolderAndNestedGitSubdirBroadenChildGitPlan(t *testin
 		t.Fatal(err)
 	}
 
-	plans, err := planCorpora(context.Background(), &currentPaths, []string{parent, nestedScope})
+	plans, err := planCorpora(context.Background(), []string{parent, nestedScope})
 	if err != nil {
 		t.Fatalf("planCorpora: %v", err)
 	}
@@ -737,7 +603,7 @@ func TestPlanCorpora_ParentFolderAndNestedGitSubdirBroadenChildGitPlan(t *testin
 		t.Fatalf("expected parent folder plus child Git plan, got %d: %#v", len(plans), plans)
 	}
 
-	var folderPlan, gitPlan *corpusPlan
+	var folderPlan, gitPlan *node
 	for i := range plans {
 		switch plans[i].kind {
 		case corpusKindFolder:
@@ -752,14 +618,21 @@ func TestPlanCorpora_ParentFolderAndNestedGitSubdirBroadenChildGitPlan(t *testin
 	if gitPlan == nil {
 		t.Fatalf("expected child Git plan, got %#v", plans)
 	}
-	if gitPlan.root != canonicalCorpusPath(nestedRepo) {
-		t.Fatalf("child Git root mismatch: got %q want %q", gitPlan.root, canonicalCorpusPath(nestedRepo))
+	if gitPlan.root != resolvedPath(t, nestedRepo) {
+		t.Fatalf("child Git root mismatch: got %q want %q", gitPlan.root, resolvedPath(t, nestedRepo))
 	}
 	if gitPlan.scope != nil {
-		t.Fatalf("child Git plan should broaden to the root covered by parent folder exclusion, got %#v", gitPlan.scope)
+		t.Fatalf("child Git plan should cover the whole child node, got %#v", gitPlan.scope)
 	}
-	if len(folderPlan.excludeRoots) != 1 || folderPlan.excludeRoots[0] != canonicalCorpusPath(nestedRepo) {
-		t.Fatalf("parent folder should exclude child Git root, got %#v", folderPlan.excludeRoots)
+	// The parent folder's walk lists no file of the child Git root.
+	_, selected, err := folderCorpusState(context.Background(), *folderPlan)
+	if err != nil {
+		t.Fatalf("walk the parent folder: %v", err)
+	}
+	for _, candidate := range selected {
+		if strings.HasPrefix(candidate.name, "nested/") {
+			t.Fatalf("parent folder walk lists %q of the child Git root", candidate.name)
+		}
 	}
 }
 
@@ -767,11 +640,6 @@ func TestPlanCorpora_BroadenedChildGitDiscoversGrandchildOutsideOriginalScope(t 
 	requireGit(t)
 	setTestUserCache(t)
 
-	currentRepo := initGitRepo(t, "current.go", "package current\n")
-	currentPaths, err := resolveGitPaths(context.Background(), currentRepo)
-	if err != nil {
-		t.Fatalf("resolve current git paths: %v", err)
-	}
 	parent := t.TempDir()
 	childRepo := initEmptyGitRepoNoRemoteAt(t, filepath.Join(parent, "child"))
 	childPkg := filepath.Join(childRepo, "pkg")
@@ -785,25 +653,25 @@ func TestPlanCorpora_BroadenedChildGitDiscoversGrandchildOutsideOriginalScope(t 
 	gitRunIn(t, childRepo, "commit", "-m", "add pkg")
 	grandchildRepo := initGitRepoNoRemoteAt(t, filepath.Join(childRepo, "other", "grand"), "grand.go", "package grand\n")
 
-	plans, err := planCorpora(context.Background(), &currentPaths, []string{parent, childPkg})
+	plans, err := planCorpora(context.Background(), []string{parent, childPkg})
 	if err != nil {
 		t.Fatalf("planCorpora: %v", err)
 	}
 
-	var childPlan, grandchildPlan *corpusPlan
+	var childPlan, grandchildPlan *node
 	for i := range plans {
 		switch plans[i].root {
-		case canonicalCorpusPath(childRepo):
+		case resolvedPath(t, childRepo):
 			childPlan = &plans[i]
-		case canonicalCorpusPath(grandchildRepo):
+		case resolvedPath(t, grandchildRepo):
 			grandchildPlan = &plans[i]
 		}
 	}
 	if childPlan == nil {
 		t.Fatalf("expected broadened child Git plan, got %#v", plans)
 	}
-	if childPlan.scope == nil {
-		t.Fatalf("child Git plan should carry a search exclusion for the grandchild, got %#v", childPlan)
+	if childPlan.scope != nil {
+		t.Fatalf("child Git plan should cover the whole node (the grandchild is its own node), got %#v", childPlan.scope)
 	}
 	if grandchildPlan == nil {
 		t.Fatalf("expected grandchild Git plan discovered after broadening, got %#v", plans)
@@ -818,10 +686,6 @@ func TestPlanCorpora_SameGitDirectoryOperandsMergeIntoOneScopedPlan(t *testing.T
 	setTestUserCache(t)
 
 	currentRepo := initGitRepo(t, "current.go", "package current\n")
-	currentPaths, err := resolveGitPaths(context.Background(), currentRepo)
-	if err != nil {
-		t.Fatalf("resolve current git paths: %v", err)
-	}
 	a := filepath.Join(currentRepo, "a")
 	ab := filepath.Join(a, "b")
 	for _, dir := range []string{a, ab} {
@@ -830,7 +694,7 @@ func TestPlanCorpora_SameGitDirectoryOperandsMergeIntoOneScopedPlan(t *testing.T
 		}
 	}
 
-	plans, err := planCorpora(context.Background(), &currentPaths, []string{a, ab})
+	plans, err := planCorpora(context.Background(), []string{a, ab})
 	if err != nil {
 		t.Fatalf("planCorpora: %v", err)
 	}
@@ -841,8 +705,8 @@ func TestPlanCorpora_SameGitDirectoryOperandsMergeIntoOneScopedPlan(t *testing.T
 	if plan.kind != corpusKindGit {
 		t.Fatalf("expected Git plan, got kind=%q root=%q", plan.kind, plan.root)
 	}
-	if plan.root != canonicalCorpusPath(currentRepo) {
-		t.Fatalf("root mismatch: got %q want %q", plan.root, canonicalCorpusPath(currentRepo))
+	if plan.root != resolvedPath(t, currentRepo) {
+		t.Fatalf("root mismatch: got %q want %q", plan.root, resolvedPath(t, currentRepo))
 	}
 	if plan.scope == nil {
 		t.Fatal("expected scoped Git plan")
@@ -854,13 +718,9 @@ func TestPlanCorpora_CurrentGitNestedGitRootUsesChildGitCorpus(t *testing.T) {
 	setTestUserCache(t)
 
 	currentRepo := initGitRepo(t, "current.go", "package current\n")
-	currentPaths, err := resolveGitPaths(context.Background(), currentRepo)
-	if err != nil {
-		t.Fatalf("resolve current git paths: %v", err)
-	}
 	nestedRepo := initGitRepoNoRemoteAt(t, filepath.Join(currentRepo, "nested"), "nested.go", "package nested\n")
 
-	plans, err := planCorpora(context.Background(), &currentPaths, []string{nestedRepo})
+	plans, err := planCorpora(context.Background(), []string{nestedRepo})
 	if err != nil {
 		t.Fatalf("planCorpora: %v", err)
 	}
@@ -871,11 +731,8 @@ func TestPlanCorpora_CurrentGitNestedGitRootUsesChildGitCorpus(t *testing.T) {
 	if plan.kind != corpusKindGit {
 		t.Fatalf("nested Git root should use Git corpus, got kind=%q root=%q", plan.kind, plan.root)
 	}
-	if plan.root != canonicalCorpusPath(nestedRepo) {
-		t.Fatalf("nested Git root mismatch: got %q want %q", plan.root, canonicalCorpusPath(nestedRepo))
-	}
-	if !plan.userExplicit {
-		t.Fatal("direct nested Git root operand should be user-explicit")
+	if plan.root != resolvedPath(t, nestedRepo) {
+		t.Fatalf("nested Git root mismatch: got %q want %q", plan.root, resolvedPath(t, nestedRepo))
 	}
 }
 
@@ -883,11 +740,6 @@ func TestPlanCorpora_ExternalGitRootAndNestedOperandsCollapseToSingleGitPlan(t *
 	requireGit(t)
 	setTestUserCache(t)
 
-	currentRepo := initGitRepo(t, "current.go", "package current\n")
-	currentPaths, err := resolveGitPaths(context.Background(), currentRepo)
-	if err != nil {
-		t.Fatalf("resolve current git paths: %v", err)
-	}
 	externalRepo := initGitRepo(t, "external.go", "package external\n")
 	nested := filepath.Join(externalRepo, "nested")
 	if err := os.MkdirAll(nested, 0o755); err != nil {
@@ -898,11 +750,11 @@ func TestPlanCorpora_ExternalGitRootAndNestedOperandsCollapseToSingleGitPlan(t *
 		t.Fatal(err)
 	}
 
-	// The repo root, a nested directory, and a nested file of the SAME repo
-	// all route to one git corpus. The repo-root operand widens the scope to
-	// the whole worktree (rootIncluded), so a single unscoped git plan owns
-	// everything — no separate per-file corpus.
-	plans, err := planCorpora(context.Background(), &currentPaths, []string{nestedFile, externalRepo, nested})
+	// The repository root, a nested directory, and a nested file of one
+	// repository all go to one Git corpus. The root operand widens the scope
+	// to the whole worktree: gitScopeQuery gives no filter. So one unscoped
+	// Git plan holds all three, and the file gets no corpus of its own.
+	plans, err := planCorpora(context.Background(), []string{nestedFile, externalRepo, nested})
 	if err != nil {
 		t.Fatalf("planCorpora: %v", err)
 	}
@@ -913,25 +765,58 @@ func TestPlanCorpora_ExternalGitRootAndNestedOperandsCollapseToSingleGitPlan(t *
 	if plan.kind != corpusKindGit {
 		t.Fatalf("expected git corpus, got %q", plan.kind)
 	}
-	if plan.root != canonicalCorpusPath(externalRepo) {
-		t.Fatalf("external Git root mismatch: got %q want %q", plan.root, canonicalCorpusPath(externalRepo))
+	if plan.root != resolvedPath(t, externalRepo) {
+		t.Fatalf("external Git root mismatch: got %q want %q", plan.root, resolvedPath(t, externalRepo))
 	}
 	if plan.scope != nil {
 		t.Fatalf("expected whole-repo scope (nil) when the repo root is an operand, got %#v", plan.scope)
 	}
 }
 
-// fakeGitPathsForPlanTest is only for pure corpus planning tests. Integration
-// tests should resolve real Git paths and fail if resolution breaks.
-func fakeGitPathsForPlanTest(repoDir string) gitPaths {
+// fakeGitPathsForPlanTest gives the Git paths of repoDir with no Git process,
+// for planning tests only. Integration tests resolve real Git paths and fail
+// when the resolution breaks. It makes the .git directory: a corpus ID uses
+// its file identity.
+func fakeGitPathsForPlanTest(t testing.TB, repoDir string) gitPaths {
+	t.Helper()
 	absRepoDir, err := filepath.Abs(repoDir)
 	if err != nil {
 		absRepoDir = repoDir
 	}
 	gitDir := filepath.Join(absRepoDir, ".git")
-	return gitPaths{
-		RepoDir:    absRepoDir,
-		CommonDir:  gitDir,
-		ConfigPath: filepath.Join(gitDir, "config"),
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return gitPaths{RepoDir: absRepoDir, CommonDir: gitDir}
+}
+
+// TestPathWithinMatchesRelWithin checks that pathWithin and relWithin give the
+// same containment. The cases include the file-system root "/" and a sibling
+// whose name starts with the root name.
+func TestPathWithinMatchesRelWithin(t *testing.T) {
+	for _, tc := range []struct {
+		root, path string
+		want       bool
+	}{
+		{"/", "/", true},
+		{"/", "/a", true},
+		{"/", "/a/b", true},
+		{"/a", "/a", true},
+		{"/a", "/a/b", true},
+		{"/a", "/ab", false},
+		{"/a", "/", false},
+		{"/a/b", "/a", false},
+		{"/a", "/b/a", false},
+		// The Git scope compares slash paths below the work-tree root.
+		{"a", "a", true},
+		{"a", "a/b", true},
+		{"a", "ab", false},
+	} {
+		if got := pathWithin(tc.root, tc.path); got != tc.want {
+			t.Errorf("pathWithin(%q, %q)=%t, want %t", tc.root, tc.path, got, tc.want)
+		}
+		if _, got := relWithin(tc.root, tc.path); got != tc.want {
+			t.Errorf("relWithin(%q, %q) inside=%t, want %t", tc.root, tc.path, got, tc.want)
+		}
 	}
 }

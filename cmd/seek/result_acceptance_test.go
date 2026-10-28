@@ -1,293 +1,140 @@
 package main
 
 import (
-	"log/slog"
 	"math"
-	"reflect"
+	"slices"
 	"testing"
 )
 
-func alwaysAcceptRerankPolicyForTest() *rerankAcceptancePolicy {
-	policy := newRerankAcceptancePolicy(-math.MaxFloat32)
-	policy.route = "test"
-	return policy
-}
-
-func TestNewRerankScoreBatchKeepsQueryMetadata(t *testing.T) {
-	prepared := &semanticQueryEmbedding{
-		scoreMask: []bool{true, false, true},
-		truncated: true,
-	}
-	values := []float32{2, 1}
-	batch, err := newRerankScoreBatch(prepared, values)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if batch.activeQueryTokens != 2 || !batch.queryTruncated ||
-		!reflect.DeepEqual(batch.values, values) {
-		t.Fatalf("score batch=%+v", batch)
-	}
-	if _, err := newRerankScoreBatch(nil, values); err == nil {
-		t.Fatal("nil query metadata did not fail")
-	}
-	if _, err := newRerankScoreBatch(
-		&semanticQueryEmbedding{scoreMask: []bool{false}},
-		values,
-	); err == nil {
-		t.Fatal("query without active tokens did not fail")
-	}
-}
-
+// TestMeanMaxSimPassesStrictBoundary proves that a lift equal to the
+// threshold (pipelineTauFile) fails and the next float32 above it passes. It
+// also proves that the rule subtracts the empty-document score and then
+// divides by the token count.
 func TestMeanMaxSimPassesStrictBoundary(t *testing.T) {
-	threshold := rerankAcceptanceMinimumMeanMaxSim
-	if meanMaxSimPasses(threshold, 1, threshold) {
+	const threshold = pipelineTauFile
+	if meanMaxSimPasses(threshold, 0, 1) {
 		t.Fatal("threshold equality passed")
 	}
-	if meanMaxSimPasses(math.Nextafter32(threshold, 0), 1, threshold) {
+	if meanMaxSimPasses(math.Nextafter32(threshold, 0), 0, 1) {
 		t.Fatal("the float32 below the threshold passed")
 	}
-	if !meanMaxSimPasses(math.Nextafter32(threshold, 1), 1, threshold) {
+	if !meanMaxSimPasses(math.Nextafter32(threshold, 1), 0, 1) {
 		t.Fatal("the float32 above the threshold did not pass")
+	}
+	// Over 4 tokens, (3.6 - 3.2) / 4 = 0.1 is under the threshold of 0.25.
+	// (3.6 - 2.0) / 4 = 0.4 is above it. The score alone, 3.6 / 4 = 0.9, and
+	// the difference alone, 0.4, are above it.
+	if meanMaxSimPasses(3.6, 3.2, 4) {
+		t.Fatal("a score with a lift under the threshold passed")
+	}
+	if !meanMaxSimPasses(3.6, 2.0, 4) {
+		t.Fatal("a score with a lift above the threshold did not pass")
 	}
 }
 
+// TestRerankAcceptanceCalibrationContract pins the inputs of the per-file
+// acceptance: tau_file, the retrieval delta, the rank fusion, and the model
+// compatibility of their measurement. When one changes, measure them again.
 func TestRerankAcceptanceCalibrationContract(t *testing.T) {
 	const wantCompatibility = "lateon-code-edge-proxy-no-symbol-centroids-v5-76339ee2c2f5a452923bf85c0a72d6bb"
-	if hybridAcceptanceMinimumMeanMaxSim != 0.600 {
-		t.Fatalf("joined minimum=%g, want 0.600", hybridAcceptanceMinimumMeanMaxSim)
+	if pipelineTauFile != 0.25 {
+		t.Fatalf("tau_file=%g, want 0.25", pipelineTauFile)
 	}
-	if rerankAcceptanceMinimumMeanMaxSim != 0.575 {
-		t.Fatalf("lexical re-rank minimum=%g, want 0.575", rerankAcceptanceMinimumMeanMaxSim)
+	if semanticRetrievalDelta != 0.1158 {
+		t.Fatalf("delta=%g, want 0.1158", semanticRetrievalDelta)
 	}
-	if rerankCandidateLimit != 128 {
-		t.Fatalf("candidate pool=%d, want calibrated size 128", rerankCandidateLimit)
-	}
-	if hybridBranchQuota != 64 || hybridSemanticUnitLimit != 1024 {
-		t.Fatalf(
-			"joined candidate inputs: branch quota=%d semantic units=%d, want 64 and 1024",
-			hybridBranchQuota,
-			hybridSemanticUnitLimit,
-		)
-	}
-	if hybridAcceptanceRoute != "joined" || rerankAcceptanceRoute != "lexical-rerank" {
-		t.Fatalf("routes=%q and %q", hybridAcceptanceRoute, rerankAcceptanceRoute)
+	if rerankRRFConstant != 60 || rerankLexicalWeight != 2 {
+		t.Fatalf("rank fusion k=%g weight=%g, want 60 and 2", rerankRRFConstant, rerankLexicalWeight)
 	}
 	if got := semanticModelCompatibility(); got != wantCompatibility {
 		t.Fatalf("bundled compatibility=%q, want %q", got, wantCompatibility)
 	}
 }
 
-func TestApplyRerankAcceptanceRejectsWholeLowSupportQuery(t *testing.T) {
-	logs := captureTestLogs(t, slog.LevelDebug)
-	candidates := []rerankCandidate{
-		{result: rerankTestResult("equal.go", 2)},
-		{result: rerankTestResult("low.go", 1)},
-	}
-	batch := rerankScoreBatch{
-		values:            []float32{1, 0.8},
-		activeQueryTokens: 2,
-	}
+// acceptanceRetryGo is one retry function, the text that follows the package
+// line. acceptanceRealFiles holds it at four paths.
+const acceptanceRetryGo = "\n// retryOp runs op until it succeeds, and doubles the wait after each failed attempt.\nfunc retryOp(ctx context.Context, op func() error) error {\n\twait := 100 * time.Millisecond\n\tfor attempt := 0; attempt < 5; attempt++ {\n\t\tif err := op(); err == nil {\n\t\t\treturn nil\n\t\t}\n\t\ttime.Sleep(wait)\n\t\twait *= 2\n\t}\n\treturn errors.New(\"gave up\")\n}\n"
 
-	policy := newRerankAcceptancePolicy(0.6)
-	policy.route = hybridAcceptanceRoute
-	got, gotBatch, appendRelaxed, err := applyRerankAcceptance(
-		candidates,
-		batch,
-		nil,
-		policy,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 0 || len(gotBatch.values) != 0 || appendRelaxed {
-		t.Fatalf("rejected query kept candidates=%d scores=%v tail=%t", len(got), gotBatch.values, appendRelaxed)
-	}
-	records := logs.Records()
-	if len(records) != 1 || records[0].Message != "Rejected model expansion" {
-		t.Fatalf("rejection logs=%v", records)
-	}
-	attrs := testLogAttrs(records[0])
-	if attrs["route"] != hybridAcceptanceRoute ||
-		attrs["reason"] != "score not above minimum" ||
-		attrs["best_mean_max_sim"] != float64(float32(0.5)) ||
-		attrs["minimum_mean_max_sim"] != float64(float32(0.6)) {
-		t.Fatalf("rejection log attributes=%v", attrs)
-	}
+// acceptanceRetryCopies are the paths of acceptanceRetryGo in
+// acceptanceRealFiles.
+var acceptanceRetryCopies = []string{"internal/x.go", "net/backoff.go", "net/retry.go", "rank/r1.go"}
+
+// acceptanceRealFiles is a small repository of real text: seven files on other
+// topics and the four copies of acceptanceRetryGo. Each copy has the package
+// line of its folder, and net/backoff.go also has a copyright line, so no two
+// copies have the same bytes. Copies with the same bytes become one result,
+// and the model scores only one of them.
+var acceptanceRealFiles = [][2]string{
+	{"auth/token.go", "package auth\n\n// authenticateRequest checks the bearer token of an incoming request.\nfunc authenticateRequest(r *http.Request) error {\n\ttoken := strings.TrimPrefix(r.Header.Get(\"Authorization\"), \"Bearer \")\n\treturn validateToken(token)\n}\n"},
+	{"ui/colors.go", "package ui\n\n// terminalColorCode maps a color name to its ANSI code.\nfunc terminalColorCode(name string) int { return ansiColors[name] }\n"},
+	{"cache/lru.go", "package cache\n\n// evict removes the least recently used entry when the cache is full.\nfunc (c *LRU) evict() {\n\toldest := c.list.Back()\n\tc.list.Remove(oldest)\n\tdelete(c.items, oldest.Value.(*entry).key)\n}\n"},
+	{"config/load.go", "package config\n\n// Load reads the YAML configuration file and fills in the defaults.\nfunc Load(path string) (*Config, error) {\n\tdata, err := os.ReadFile(path)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tvar c Config\n\treturn &c, yaml.Unmarshal(data, &c)\n}\n"},
+	{"docs/install.md", "# Install\n\nInstall the tool with Homebrew. Configure Universal Ctags on the PATH.\n"},
+	{"db/migrate.go", "package db\n\n// Migrate applies every pending schema migration in a transaction.\nfunc Migrate(tx *sql.Tx, steps []string) error {\n\tfor _, step := range steps {\n\t\tif _, err := tx.Exec(step); err != nil {\n\t\t\treturn err\n\t\t}\n\t}\n\treturn nil\n}\n"},
+	{"gen/zq.go", "package gen\n\n// zqnear30 zqmodel9 is a generated identifier table.\nvar zqTable = map[string]int{\"zqnear30\": 1}\n"},
+	{"net/retry.go", "package net\n" + acceptanceRetryGo},
+	{"net/backoff.go", "// Copyright 2026 The Authors.\n\npackage net\n" + acceptanceRetryGo},
+	{"rank/r1.go", "package rank\n" + acceptanceRetryGo},
+	{"internal/x.go", "package internal\n" + acceptanceRetryGo},
 }
 
-func TestApplyRerankAcceptanceAdmitsWholeSupportedQuery(t *testing.T) {
-	logs := captureTestLogs(t, slog.LevelDebug)
-	candidates := []rerankCandidate{
-		{result: rerankTestResult("weak.go", 2)},
-		{result: rerankTestResult("strong.go", 1)},
+// TestModelAcceptanceOnRealText runs two descriptions with the real model on a
+// Git repository of real text (acceptanceRealFiles). The model paths are
+// relative to the repository, so no temporary name enters the model input.
+//
+// A sentence of 51 tokens with no topic admits no file, and the model scores
+// no candidate. Each of its tokens is about as similar to a file as to the
+// empty document. So no row has a fine lift in the radius. A threshold on the
+// score per token alone admits each file for it (0.742 to 0.756 per token).
+// The cause is that each token with no topic adds to the score of any text.
+//
+// No file holds the word "operations", so no file is a strict match for
+// "retry failed operations", and only the model adds the retry function. The
+// model scores each of its four copies and no other file, because no other
+// file has a row in the retrieval radius. The four copies print, and no other
+// file prints: each copy gets the same verdict. Their lifts are 0.310 to
+// 0.335 per token on the CPU and Core ML providers.
+//
+// The test costs 4 model batches: the build, two queries, and one score call.
+func TestModelAcceptanceOnRealText(t *testing.T) {
+	requireTools(t)
+	repo := initEmptyGitRepo(t)
+	for _, file := range acceptanceRealFiles {
+		writeFileAt(t, repo, file[0], file[1])
 	}
-	batch := rerankScoreBatch{
-		values:            []float32{0.4, 1.5},
-		activeQueryTokens: 2,
-	}
-	policy := newRerankAcceptancePolicy(0.6)
-	policy.route = rerankAcceptanceRoute
+	gitRunIn(t, repo, "add", ".")
+	gitRunIn(t, repo, "commit", "-q", "-m", "real text")
+	setTestUserCache(t)
+	t.Chdir(repo)
+	obs := observeModel(sharedModel(t))
 
-	got, gotBatch, appendRelaxed, err := applyRerankAcceptance(
-		candidates,
-		batch,
-		nil,
-		policy,
-	)
-	if err != nil {
-		t.Fatal(err)
+	const noTopic = "I want to find the code that does the thing that I am looking for here, and I would like to see where it is done and how it works in this project, so please show me the part of the code that does it."
+	output, err := seekWith(t, obs.factory(), noTopic, ".")
+	_, report := obs.scoredPaths()
+	if exitCodeForError(err) != 1 || output != "" {
+		t.Fatalf("a sentence with no topic: exit status %d (err=%v), want 1 and no output; %s\n%s",
+			exitCodeForError(err), err, report, output)
 	}
-	if !appendRelaxed || !reflect.DeepEqual(got, candidates) ||
-		!reflect.DeepEqual(gotBatch.values, batch.values) {
-		t.Fatalf("accepted query changed candidates=%+v scores=%v tail=%t", got, gotBatch.values, appendRelaxed)
+	if obs.prepares.Load() == 0 || obs.scores.Load() != 0 {
+		t.Fatalf("a sentence with no topic: the model prepared %d queries and made %d score calls, want no score call; %s",
+			obs.prepares.Load(), obs.scores.Load(), report)
 	}
-	records := logs.Records()
-	if len(records) != 1 || records[0].Message != "Accepted model expansion" {
-		t.Fatalf("acceptance logs=%v", records)
-	}
-	attrs := testLogAttrs(records[0])
-	if attrs["best_mean_max_sim"] != float64(float32(0.75)) ||
-		attrs["route"] != rerankAcceptanceRoute ||
-		attrs["reason"] != "score above minimum" || attrs["candidates"] != int64(2) {
-		t.Fatalf("acceptance log attributes=%v", attrs)
-	}
-}
 
-func TestApplyRerankAcceptanceStrictEvidencePreservesExpansion(t *testing.T) {
-	logs := captureTestLogs(t, slog.LevelDebug)
-	strict := rerankTestResult("strict.go", 2)
-	expanded := rerankTestResult("expanded.go", 1)
-	candidates := []rerankCandidate{{result: strict}, {result: expanded}}
-	batch := rerankScoreBatch{values: []float32{0.1, 0.1}, activeQueryTokens: 1}
-
-	policy := newRerankAcceptancePolicy(0.6)
-	policy.route = hybridAcceptanceRoute
-	got, gotBatch, appendRelaxed, err := applyRerankAcceptance(
-		candidates,
-		batch,
-		[]corpusSearchResult{strict},
-		policy,
-	)
-	if err != nil {
-		t.Fatal(err)
+	output, err = seekWith(t, obs.factory(), "retry failed operations", ".")
+	_, report = obs.scoredPaths()
+	if got := printedFiles(output); err != nil || !slices.Equal(got, acceptanceRetryCopies) {
+		t.Fatalf("retry failed operations: err=%v printed %v, want the copies %v; %s\n%s",
+			err, got, acceptanceRetryCopies, report, output)
 	}
-	if !appendRelaxed || !reflect.DeepEqual(got, candidates) ||
-		!reflect.DeepEqual(gotBatch.values, batch.values) {
-		t.Fatalf("strict evidence changed candidates=%+v scores=%v tail=%t", got, gotBatch.values, appendRelaxed)
+	obs.mu.Lock()
+	var scored []string
+	for _, record := range obs.scored {
+		scored = append(scored, record.document.Path)
 	}
-	records := logs.Records()
-	if len(records) != 1 || records[0].Message != "Accepted model expansion" {
-		t.Fatalf("strict acceptance logs=%v", records)
-	}
-	attrs := testLogAttrs(records[0])
-	if attrs["route"] != hybridAcceptanceRoute ||
-		attrs["reason"] != "strict lexical support" || attrs["strict_files"] != int64(1) {
-		t.Fatalf("strict acceptance log attributes=%v", attrs)
-	}
-}
-
-func TestApplyRerankAcceptanceTruncatedQueryDropsExpansion(t *testing.T) {
-	strict := rerankTestResult("strict.go", 10)
-	expanded := rerankTestResult("expanded.go", 9)
-	candidates := []rerankCandidate{
-		{result: strict, lexicalRank: 1},
-		{result: expanded, lexicalRank: 2},
-	}
-	batch := rerankScoreBatch{
-		values:            []float32{100, 100},
-		activeQueryTokens: 2,
-		queryTruncated:    true,
-	}
-	got, gotBatch, appendRelaxed, err := applyRerankAcceptance(
-		candidates,
-		batch,
-		[]corpusSearchResult{strict},
-		newRerankAcceptancePolicy(0.6),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if appendRelaxed || len(got) != 0 || len(gotBatch.values) != 0 {
-		t.Fatalf("strict-only result=%+v scores=%v tail=%t", got, gotBatch.values, appendRelaxed)
-	}
-}
-
-func TestApplyRerankAcceptanceMissingPolicyFails(t *testing.T) {
-	candidates := []rerankCandidate{{result: rerankTestResult("expanded.go", 1)}}
-	batch := rerankScoreBatch{values: []float32{-10}, activeQueryTokens: 1}
-	if _, _, _, err := applyRerankAcceptance(candidates, batch, nil, nil); err == nil {
-		t.Fatal("missing acceptance policy did not fail")
-	}
-}
-
-func TestApplyRerankAcceptanceRejectsInvalidInputs(t *testing.T) {
-	candidates := []rerankCandidate{{result: rerankTestResult("expanded.go", 1)}}
-	validPolicy := newRerankAcceptancePolicy(0.6)
-	for _, test := range []struct {
-		name   string
-		batch  rerankScoreBatch
-		policy *rerankAcceptancePolicy
-	}{
-		{name: "wrong score count", batch: rerankScoreBatch{activeQueryTokens: 1}, policy: validPolicy},
-		{name: "no query tokens", batch: rerankScoreBatch{values: []float32{1}}, policy: validPolicy},
-		{name: "non-finite score", batch: rerankScoreBatch{values: []float32{float32(math.NaN())}, activeQueryTokens: 1}, policy: validPolicy},
-		{name: "non-finite threshold", batch: rerankScoreBatch{values: []float32{1}, activeQueryTokens: 1}, policy: newRerankAcceptancePolicy(float32(math.Inf(1)))},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if _, _, _, err := applyRerankAcceptance(candidates, test.batch, nil, test.policy); err == nil {
-				t.Fatal("invalid acceptance input did not fail")
-			}
-		})
-	}
-}
-
-func TestFuseRerankCandidatesCannotRestoreRejectedRelaxedTail(t *testing.T) {
-	rejected := rerankTestResult("rejected.go", 8)
-	unscoredTail := rerankTestResult("tail.go", 7)
-	candidates := []rerankCandidate{{result: rejected, lexicalRank: 1}}
-	batch := rerankScoreBatch{values: []float32{0.6}, activeQueryTokens: 1}
-	got, err := fuseRerankCandidates(
-		candidates,
-		batch,
-		nil,
-		[]corpusSearchResult{rejected, unscoredTail},
-		newRerankAcceptancePolicy(0.6),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 0 {
-		t.Fatalf("rejected fusion restored %v", got)
-	}
-}
-
-func TestFuseRerankCandidatesTruncatedQueryAppendsStrictTailOnly(t *testing.T) {
-	strict := rerankTestResult("strict.go", 10)
-	secondStrict := rerankTestResult("second-strict.go", 8)
-	expanded := rerankTestResult("expanded.go", 9)
-	unscoredRelaxed := rerankTestResult("relaxed-tail.go", 8)
-	candidates := []rerankCandidate{
-		{result: strict, lexicalRank: 1},
-		{result: expanded, lexicalRank: 2},
-		{result: secondStrict, lexicalRank: 3},
-	}
-	batch := rerankScoreBatch{
-		values:            []float32{1, 100, 2},
-		activeQueryTokens: 1,
-		queryTruncated:    true,
-	}
-	got, err := fuseRerankCandidates(
-		candidates,
-		batch,
-		[]corpusSearchResult{strict, secondStrict},
-		[]corpusSearchResult{strict, expanded, secondStrict, unscoredRelaxed},
-		newRerankAcceptancePolicy(0.6),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 2 || got[0].file.FileName != "strict.go" ||
-		got[1].file.FileName != "second-strict.go" {
-		t.Fatalf("strict-only fusion=%+v", got)
+	obs.mu.Unlock()
+	slices.Sort(scored)
+	if !slices.Equal(scored, acceptanceRetryCopies) {
+		t.Fatalf("retry failed operations: the model scored %v, want each copy once %v; %s\n%s",
+			scored, acceptanceRetryCopies, report, output)
 	}
 }

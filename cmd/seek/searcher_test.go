@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/sourcegraph/zoekt"
+	"github.com/sourcegraph/zoekt/query"
 )
 
 func TestExplicitSearchConfigCopiesDefaults(t *testing.T) {
@@ -18,10 +22,7 @@ func TestExplicitSearchConfigCopiesDefaults(t *testing.T) {
 	if config.opts.NumContextLines != 360 || !config.afterOnly {
 		t.Fatalf("unexpected context config: %+v", config)
 	}
-	if config.opts.TotalMaxMatchCount != 10000 || config.opts.ShardMaxMatchCount != 10000 {
-		t.Fatalf("context changed match budgets: %+v", config.opts)
-	}
-	if searchOpts.NumContextLines != searchContextLines || searchOpts.TotalMaxMatchCount != 10000 || searchOpts.ShardMaxMatchCount != 10000 {
+	if searchOpts.NumContextLines != searchContextLines {
 		t.Fatalf("explicitSearchConfig changed the package defaults: %+v", searchOpts)
 	}
 }
@@ -38,7 +39,7 @@ func TestCloneFileMatchesCopiesContextOnlyForDisplayedLines(t *testing.T) {
 	}}
 
 	config := defaultSearchConfig()
-	config.contextMatchLimit = 2
+	config.displayMatchLimit = 2
 	cloned := cloneFileMatches(input, config)
 	if got := len(cloned[0].LineMatches); got != 3 {
 		t.Fatalf("line matches=%d, want 3", got)
@@ -95,23 +96,22 @@ func TestCloneFileMatchesCopiesContextOnlyForPossibleDisplayedFiles(t *testing.T
 		}
 	}
 
+	// A node read gives one current copy per file.
 	input := []zoekt.FileMatch{
-		newFile("same.go", "repo", 100),
-		newFile("dirty.go", "repo", 90),
+		newFile("low.go", "repo", 1),
+		newFile("dirty.go", repoUncommitted, 90),
 		newFile("b.go", "repo", 50),
 		newFile("c.go", "repo", 40),
-		newFile("same.go", repoUncommitted, 1),
+		newFile("top.go", "repo", 100),
 	}
 	full := cloneFileMatches(input, defaultSearchConfig())
 	config := defaultSearchConfig()
-	config.contextFileLimit = 2
-	config.contextGitCorpus = true
-	config.contextDirtyFiles = dirtyFileSet{"dirty.go": {}}
+	config.displayFileLimit = 2
 	selected := cloneFileMatches(input, config)
 
 	for i, file := range selected {
 		gotContext := len(file.LineMatches[0].Before) > 0 && len(file.LineMatches[0].After) > 0
-		wantContext := i == 2 || i == 3
+		wantContext := i == 1 || i == 4
 		if gotContext != wantContext {
 			t.Fatalf("file %d %s context=%t, want %t", i, file.FileName, gotContext, wantContext)
 		}
@@ -120,36 +120,17 @@ func TestCloneFileMatchesCopiesContextOnlyForPossibleDisplayedFiles(t *testing.T
 		}
 	}
 
-	plan := corpusPlan{id: corpusID("repo"), kind: corpusKindGit}
-	dirty := dirtyFilesByCorpus{plan.id: config.contextDirtyFiles}
-	want := formatCorpusResultsWithContext(wrapCorpusResults(plan, full), dirty, 2, 0, hideCorpusContext, plainPalette)
-	got := formatCorpusResultsWithContext(wrapCorpusResults(plan, selected), dirty, 2, 0, hideCorpusContext, plainPalette)
+	plan := node{id: corpusID("repo"), kind: corpusKindGit}
+	want := formatCorpusResultsWithContext(withHeaders(wrapCorpusResults(plan, full)), 2, 0, hideCorpusContext, plainPalette)
+	got := formatCorpusResultsWithContext(withHeaders(wrapCorpusResults(plan, selected)), 2, 0, hideCorpusContext, plainPalette)
 	if got != want {
 		t.Fatalf("selective context changed output:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
 
-	input[2].LineMatches[0].Before[0] = 'X'
-	if selected[2].LineMatches[0].Before[0] == 'X' {
+	input[4].LineMatches[0].Before[0] = 'X'
+	if selected[4].LineMatches[0].Before[0] == 'X' {
 		t.Fatal("selected file context aliases shard memory")
 	}
-
-	config.resultFileLimit = 2
-	retained := cloneFileMatches(input, config)
-	if len(retained) != 2 || retained[0].FileName != "b.go" || retained[1].FileName != "c.go" {
-		t.Fatalf("retained files=%v, want b.go and c.go", fileMatchNames(retained))
-	}
-	if len(retained[0].LineMatches[0].Before) == 0 ||
-		len(retained[1].LineMatches[0].After) == 0 {
-		t.Fatal("retained files lost display context")
-	}
-}
-
-func fileMatchNames(files []zoekt.FileMatch) []string {
-	names := make([]string, len(files))
-	for i := range files {
-		names[i] = files[i].FileName
-	}
-	return names
 }
 
 func TestDisplayedContextFilesUsesFormatterTieOrder(t *testing.T) {
@@ -158,7 +139,7 @@ func TestDisplayedContextFilesUsesFormatterTieOrder(t *testing.T) {
 		{FileName: "a.go", Score: 10},
 	}
 	config := defaultSearchConfig()
-	config.contextFileLimit = 1
+	config.displayFileLimit = 1
 
 	selected := displayedContextFiles(files, config)
 	if _, ok := selected[1]; !ok {
@@ -182,13 +163,13 @@ func TestPerCorpusContextLimitPreservesGlobalTopFiles(t *testing.T) {
 			}},
 		}
 	}
-	planA := corpusPlan{id: corpusID("a"), kind: corpusKindFolder, displayRoot: "/a"}
-	planB := corpusPlan{id: corpusID("b"), kind: corpusKindFolder, displayRoot: "/b"}
+	planA := node{id: corpusID("a"), kind: corpusKindFolder, displayRoot: "/a"}
+	planB := node{id: corpusID("b"), kind: corpusKindFolder, displayRoot: "/b"}
 	filesA := []zoekt.FileMatch{file("first.go", 100), file("second.go", 99), file("third.go", 98)}
 	filesB := []zoekt.FileMatch{file("other.go", 1)}
 
 	config := defaultSearchConfig()
-	config.contextFileLimit = 2
+	config.displayFileLimit = 2
 	selective := append(
 		wrapCorpusResults(planA, cloneFileMatches(filesA, config)),
 		wrapCorpusResults(planB, cloneFileMatches(filesB, config))...,
@@ -197,14 +178,17 @@ func TestPerCorpusContextLimitPreservesGlobalTopFiles(t *testing.T) {
 		wrapCorpusResults(planA, cloneFileMatches(filesA, defaultSearchConfig())),
 		wrapCorpusResults(planB, cloneFileMatches(filesB, defaultSearchConfig()))...,
 	)
-	want := formatCorpusResultsWithContext(full, nil, 2, 0, showCorpusContext, plainPalette)
-	got := formatCorpusResultsWithContext(selective, nil, 2, 0, showCorpusContext, plainPalette)
+	want := formatCorpusResultsWithContext(withHeaders(full), 2, 0, showCorpusContext, plainPalette)
+	got := formatCorpusResultsWithContext(withHeaders(selective), 2, 0, showCorpusContext, plainPalette)
 	if got != want {
 		t.Fatalf("per-corpus context selection changed global output:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
 }
 
-func TestExecuteParsedSearch_ContextModes(t *testing.T) {
+// TestSearchPlannedCorpusParsed_ContextModes reads one node through the
+// production node read and checks that each search config gives its context
+// lines.
+func TestSearchPlannedCorpusParsed_ContextModes(t *testing.T) {
 	requireTools(t)
 
 	var content strings.Builder
@@ -232,6 +216,7 @@ func TestExecuteParsedSearch_ContextModes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	plan := node{cacheDir: t.TempDir(), indexDir: indexDir}
 
 	cases := []struct {
 		name       string
@@ -246,7 +231,7 @@ func TestExecuteParsedSearch_ContextModes(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			files, err := executeParsedShardSearchForTest(t.Context(), indexDir, q, tc.config)
+			files, err := searchPlannedCorpusParsed(t.Context(), plan, nil, q, tc.config)
 			if err != nil {
 				t.Fatalf("search: %v", err)
 			}
@@ -264,10 +249,17 @@ func TestExecuteParsedSearch_ContextModes(t *testing.T) {
 	}
 }
 
-func TestExecuteParsedSearchScopedDirs_ContextFileSelectionAfterShardMerge(t *testing.T) {
+// TestSearchPlannedCorpusParsed_ContextFileSelectionAfterShardMerge puts a
+// committed and an uncommitted shard in one index directory, as a Git node
+// does, and reads the node. The read hides the committed copy of a.go,
+// because the uncommitted copy wins. With a context file limit of 1, only the
+// best file after the merge of the two shards keeps its context lines. This
+// holds in each shard order.
+func TestSearchPlannedCorpusParsed_ContextFileSelectionAfterShardMerge(t *testing.T) {
 	requireTools(t)
 
 	const content = "package p\n// before\n// TWO_SHARD_CONTEXT_MARKER\n// after\n"
+	// indexShard writes the one shard of repository into indexDir.
 	indexShard := func(indexDir, repository string, names ...string) {
 		t.Helper()
 		docs := make(chan fileContent, len(names))
@@ -282,51 +274,54 @@ func TestExecuteParsedSearchScopedDirs_ContextFileSelectionAfterShardMerge(t *te
 		if !indexedAny {
 			t.Fatalf("expected %s shard", repository)
 		}
-		shards, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
-		if err != nil {
-			t.Fatalf("list %s shards: %v", repository, err)
-		}
-		if len(shards) != 1 {
-			t.Fatalf("%s shards=%d, want 1", repository, len(shards))
-		}
 	}
-
-	committedDir := t.TempDir()
-	uncommittedDir := t.TempDir()
-	indexShard(committedDir, "repo", "a.go", "z.go")
-	indexShard(uncommittedDir, repoUncommitted, "a.go")
 
 	q, err := parseSearchQuery("TWO_SHARD_CONTEXT_MARKER")
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan := corpusPlan{id: corpusID("repo"), kind: corpusKindGit}
 
+	// The node lists its shards by file name, and a shard name starts with
+	// its repository name: "repo" sorts before "uncommitted", and "zrepo"
+	// after it.
 	orders := []struct {
-		name string
-		dirs []string
+		name      string
+		committed string
 	}{
-		{name: "committed first", dirs: []string{committedDir, uncommittedDir}},
-		{name: "uncommitted first", dirs: []string{uncommittedDir, committedDir}},
+		{name: "committed first", committed: "repo"},
+		{name: "uncommitted first", committed: "zrepo"},
 	}
 	for _, order := range orders {
 		t.Run(order.name, func(t *testing.T) {
+			plan := node{id: corpusID("repo"), kind: corpusKindGit, cacheDir: t.TempDir(), indexDir: t.TempDir()}
+			indexShard(plan.indexDir, order.committed, "a.go", "z.go")
+			indexShard(plan.indexDir, repoUncommitted, "a.go")
+			shards, err := familyShardNames(plan.indexDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(shards) != 2 {
+				t.Fatalf("shards=%v, want one committed and one uncommitted shard", shards)
+			}
+			if first := filepath.Base(shards[0]); strings.HasPrefix(first, repoUncommitted) != (order.committed == "zrepo") {
+				t.Fatalf("first shard %s, want the %s", first, order.name)
+			}
+
 			config := explicitSearchConfig(1, false)
-			config.contextFileLimit = 1
-			config.contextGitCorpus = true
-			selected, err := executeParsedSearchScopedDirs(t.Context(), order.dirs, q, nil, config)
+			config.displayFileLimit = 1
+			selected, err := searchPlannedCorpusParsed(t.Context(), plan, nil, q, config)
 			if err != nil {
 				t.Fatalf("selective search: %v", err)
 			}
 
 			fullConfig := config
-			fullConfig.contextFileLimit = 0
-			full, err := executeParsedSearchScopedDirs(t.Context(), order.dirs, q, nil, fullConfig)
+			fullConfig.displayFileLimit = 0
+			full, err := searchPlannedCorpusParsed(t.Context(), plan, nil, q, fullConfig)
 			if err != nil {
 				t.Fatalf("full search: %v", err)
 			}
-			if len(selected) != 3 || len(full) != 3 {
-				t.Fatalf("result counts selective=%d full=%d, want 3 each", len(selected), len(full))
+			if len(selected) != 2 || len(full) != 2 {
+				t.Fatalf("result counts selective=%d full=%d, want 2 each", len(selected), len(full))
 			}
 
 			type resultKey struct {
@@ -347,24 +342,23 @@ func TestExecuteParsedSearchScopedDirs_ContextFileSelectionAfterShardMerge(t *te
 			}
 
 			wantContext := map[resultKey]bool{
-				{name: "a.go", repository: "repo"}:          false,
 				{name: "a.go", repository: repoUncommitted}: true,
-				{name: "z.go", repository: "repo"}:          false,
+				{name: "z.go", repository: order.committed}: false,
 			}
 			if !maps.Equal(withContext, wantContext) {
 				t.Fatalf("files with context=%v, want %v", withContext, wantContext)
 			}
 
 			want := formatCorpusResultsWithContext(
-				wrapCorpusResults(plan, full), nil, 1, 0, hideCorpusContext, plainPalette,
+				withHeaders(wrapCorpusResults(plan, full)), 1, 0, hideCorpusContext, plainPalette,
 			)
 			got := formatCorpusResultsWithContext(
-				wrapCorpusResults(plan, selected), nil, 1, 0, hideCorpusContext, plainPalette,
+				withHeaders(wrapCorpusResults(plan, selected)), 1, 0, hideCorpusContext, plainPalette,
 			)
 			if got != want {
 				t.Fatalf("selective context changed merged-shard output:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 			}
-			for _, text := range []string{"a.go", "[uncommitted]", "… 1 more files (showing 1 of 2)"} {
+			for _, text := range []string{"a.go", "[uncommitted]", "… 1 more file (showing 1 of 2)"} {
 				if !strings.Contains(got, text) {
 					t.Fatalf("output does not contain %q:\n%s", text, got)
 				}
@@ -373,7 +367,10 @@ func TestExecuteParsedSearchScopedDirs_ContextFileSelectionAfterShardMerge(t *te
 	}
 }
 
-func TestLoadShards_FailsClosedOnPartialCorruptShard(t *testing.T) {
+// TestNodeRead_FailsClosedOnPartialCorruptShard reads a node whose index
+// holds a good shard and a corrupt one. The read returns index damage, which
+// the caller repairs, and no partial result.
+func TestNodeRead_FailsClosedOnPartialCorruptShard(t *testing.T) {
 	requireTools(t)
 
 	indexDir := t.TempDir()
@@ -394,48 +391,207 @@ func TestLoadShards_FailsClosedOnPartialCorruptShard(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	results, err := executeUnscopedShardSearchForTest(context.Background(), indexDir, "load_shards_marker")
+	q, err := parseSearchQuery("load_shards_marker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := node{cacheDir: t.TempDir(), indexDir: indexDir}
+	results, err := searchPlannedCorpusParsed(context.Background(), plan, nil, q, defaultSearchConfig())
 	if err == nil {
 		t.Fatal("expected corrupt shard to fail closed")
 	}
 	if len(results) != 0 {
 		t.Fatalf("corrupt shard search should not return partial results: %#v", results)
 	}
-	if !strings.Contains(err.Error(), "load shard") {
-		t.Fatalf("unexpected error: %v", err)
+	var damage *shardDamage
+	if !errors.As(err, &damage) || !errors.Is(err, errShardUnloadable) || !strings.Contains(err.Error(), "load shard") {
+		t.Fatalf("error=%v, want shard damage that names the shard load", err)
 	}
 }
 
-func TestExecuteParsedSearchScopedDirs_IgnoresEmptyOptionalDir(t *testing.T) {
+// TestSearchLoadedShardsRecoversAShardPanic checks the two panic classes of a
+// shard search. A panic that names a corrupt shard or index, or a Go runtime
+// error, is index damage that the node read repairs. Any other panic is a
+// plain error. The other shard still runs.
+func TestSearchLoadedShardsRecoversAShardPanic(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		value  any
+		damage bool
+	}{
+		{"corrupt shard", fmt.Errorf(`corrupt shard "a.zoekt" while searching repository "r", document 3: %w`, errors.New("reading content")), true},
+		{"query type", "type *query.Type", false},
+		{"runtime error", recoveredRuntimeError(), true},
+		{"error string", fmt.Errorf("index out of range [9] with length 2"), false},
+		{"negated case", "type *query.caseQ", false},
+		{"corrupt index", "corrupt index: subrepo 127 beyond [[]]", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var healthyRan atomic.Bool
+			healthy := &cancellationTestShard{search: func(context.Context) (*zoekt.SearchResult, error) {
+				healthyRan.Store(true)
+				return &zoekt.SearchResult{Files: []zoekt.FileMatch{{FileName: "ok.go"}}}, nil
+			}}
+			broken := &cancellationTestShard{search: func(context.Context) (*zoekt.SearchResult, error) {
+				panic(test.value)
+			}}
+			files, err := searchLoadedShards(t.Context(), []zoekt.Searcher{healthy, broken}, &query.Const{Value: true}, defaultSearchConfig(), nil)
+			if err == nil || len(files) != 0 || strings.Contains(err.Error(), "shard search panicked") == test.damage {
+				t.Fatalf("files=%v err=%v, want no files and the shard panic", files, err)
+			}
+			if got := errors.Is(err, errShardUnloadable); got != test.damage {
+				t.Fatalf("index damage=%v, want %v (err=%v)", got, test.damage, err)
+			}
+			if !healthyRan.Load() {
+				t.Fatal("the healthy shard did not run")
+			}
+		})
+	}
+}
+
+// recoveredRuntimeError returns the value of a real Go runtime panic.
+func recoveredRuntimeError() (value any) {
+	defer func() { value = recover() }()
+	var values []int
+	index := 9
+	_ = values[index]
+	return nil
+}
+
+// TestZoektShardCallsReturnPanicsAsErrors checks the reads that call a Zoekt
+// shard outside searchLoadedShards. They are the BM25 counts (a List, then a
+// listing) and the current-copy listing of an uncommitted shard. A shard whose
+// calls panic with a runtime error gives index damage, not a crash.
+func TestZoektShardCallsReturnPanicsAsErrors(t *testing.T) {
+	broken := &cancellationTestShard{search: func(context.Context) (*zoekt.SearchResult, error) {
+		panic(recoveredRuntimeError())
+	}}
+	// broken.List panics with a nil dereference: its embedded Searcher is nil.
+	path := filepath.Join(t.TempDir(), "index", repoUncommitted+"_v16.00000.zoekt")
+	writeFixtureFile(t, path, "shard bytes\n")
+	record := readShardStatsRecord(filepath.Dir(path))
+	if _, err := record.stats(t.Context(), path, broken); !errors.Is(err, errShardUnloadable) {
+		t.Fatalf("BM25 counts: err=%v, want index damage", err)
+	}
+	committed := filepath.Join(filepath.Dir(path), "git-0_v16.00000.zoekt")
+	if _, err := currentCopies(t.Context(), []zoekt.Searcher{nil, broken}, []string{committed, path}, nil); !errors.Is(err, errShardUnloadable) {
+		t.Fatalf("current-copy listing: err=%v, want index damage", err)
+	}
+}
+
+// TestCurrentCopiesSkipsTheListingWithNoCommittedShard checks that a node with
+// only uncommitted shards gets no clause and lists no shard: no committed copy
+// exists to hide.
+func TestCurrentCopiesSkipsTheListingWithNoCommittedShard(t *testing.T) {
+	listed := &cancellationTestShard{search: func(context.Context) (*zoekt.SearchResult, error) {
+		t.Error("the listing ran with no committed shard")
+		return &zoekt.SearchResult{}, nil
+	}}
+	path := filepath.Join(t.TempDir(), repoUncommitted+"_v16.00000.zoekt")
+	clause, err := currentCopies(t.Context(), []zoekt.Searcher{listed}, []string{path}, dirtyFileSet{"a.go": {}})
+	if err != nil || clause != nil {
+		t.Fatalf("clause=%v err=%v, want no clause", clause, err)
+	}
+}
+
+// TestNullShardMetadataIsNoCrash writes "null" into the .meta file of each
+// shard of a Git node: Zoekt then gives a nil repository record with no
+// error. The metadata reads drop it, so the next search, the committed head
+// check and gc's display read do not stop the process.
+func TestNullShardMetadataIsNoCrash(t *testing.T) {
 	requireTools(t)
-
-	indexDir := t.TempDir()
-	docs := make(chan fileContent, 1)
-	docs <- fileContent{name: "good.go", content: []byte("package good\n// optional_empty_dir_marker\n")}
-	close(docs)
-
-	indexedAny, err := indexDocuments(context.Background(), indexDir, "test", t.TempDir(), docs, 1)
-	if err != nil {
-		t.Fatalf("indexDocuments: %v", err)
+	setTestUserCache(t)
+	repo := initGitRepo(t, "a.go", "package a\n// zqnullmeta\n")
+	t.Chdir(repo)
+	if _, err := seek(t, "--lexical-only", "zqnullmeta"); err != nil {
+		t.Fatal(err)
 	}
-	if !indexedAny {
-		t.Fatal("expected a valid shard")
-	}
-	q, err := parseSearchQuery("optional_empty_dir_marker")
+	cache, err := seekUserCacheRoot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	results, err := executeParsedSearchScopedDirs(
-		context.Background(),
-		[]string{indexDir, t.TempDir()},
-		q,
-		nil,
-		defaultSearchConfig(),
-	)
-	if err != nil {
-		t.Fatalf("search with empty optional dir: %v", err)
+	shards, _ := filepath.Glob(filepath.Join(cache, "corpora", "*", "index", "*.zoekt"))
+	if len(shards) == 0 {
+		t.Fatal("no shard")
 	}
-	if len(results) != 1 || results[0].FileName != "good.go" {
-		t.Fatalf("expected result from non-empty shard dir only, got %#v", results)
+	for _, shard := range shards {
+		writeFixtureFile(t, shard+".meta", "null")
+		repos, err := zoektReadMetadata(shard)
+		if slices.Contains(repos, nil) {
+			t.Fatalf("zoektReadMetadata(%s) = %v, %v: a nil record", shard, repos, err)
+		}
+		readCorpusDisplayInfo(filepath.Dir(filepath.Dir(shard)))
+	}
+	_, _ = seek(t, "--lexical-only", "zqnullmeta")
+}
+
+// TestDeltaBuilderWithNullShardMetadataIsNoCrash seeds an index, writes
+// "null" into the .meta file of its shard, and runs a delta on it. Zoekt's
+// delta Builder reads the records of the old shards through the shard-call
+// guard: the delta fails as index damage, and the process keeps running.
+func TestDeltaBuilderWithNullShardMetadataIsNoCrash(t *testing.T) {
+	requireTools(t)
+	indexDir := t.TempDir()
+	source := t.TempDir()
+	seed := make(chan fileContent, 1)
+	seed <- makeFileContent(t, "seed.go", []byte("package seed\nfunc Seed() {}\n"))
+	close(seed)
+	if _, err := indexDocuments(t.Context(), indexDir, "null_meta_repo", source, seed, 1); err != nil {
+		t.Fatal(err)
+	}
+	shards, _ := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
+	if len(shards) == 0 {
+		t.Fatal("no shard")
+	}
+	for _, shard := range shards {
+		writeFixtureFile(t, shard+".meta", "null")
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("the delta panicked: %v", recovered)
+		}
+	}()
+	changed := []fileContent{makeFileContent(t, "seed.go", []byte("package seed\nfunc Changed() {}\n"))}
+	if _, err := indexDeltaDocuments(indexDir, "null_meta_repo", source, changed, 1, []string{"seed.go"}); !errors.Is(err, errShardUnloadable) {
+		t.Fatalf("a delta on a shard with a null record gave %v, want index damage", err)
+	}
+	// The failed Finish leaves no temporary shard in the live directory.
+	if temps, _ := filepath.Glob(filepath.Join(indexDir, "*.tmp")); len(temps) != 0 {
+		t.Fatalf("the failed delta left %v", temps)
+	}
+}
+
+// TestFullBuildLaterWindowWithNullRecordIsNoCrash runs a full build whose
+// large document opens a second window, a delta Builder. Before the input
+// ends, it writes "null" into the .meta file of the first window's shard. The
+// second window's Finish reads that record through the shard-call guard. The
+// build fails as index damage, and the process keeps running.
+func TestFullBuildLaterWindowWithNullRecordIsNoCrash(t *testing.T) {
+	requireTools(t)
+	swapForTest(t, &shardMax, 1024)
+	indexDir := t.TempDir()
+	source := t.TempDir()
+	files := make(chan fileContent)
+	go func() {
+		// The channel closes after the write, so the last Finish reads it.
+		defer close(files)
+		large := []byte(strings.Repeat("large text line\n", 200))
+		files <- makeFileContent(t, "small.go", []byte("package small\nfunc Small() {}\n"))
+		files <- makeFileContent(t, "large.txt", large)
+		// The build takes the next document only after it finishes the first
+		// window and adds large.txt. So the first shard and its record exist
+		// when this send returns. With a parallelism of 3, the second large
+		// document stays in the open window, and no Finish runs before the
+		// channel closes.
+		files <- makeFileContent(t, "large2.txt", large)
+		writeFixtureFile(t, filepath.Join(indexDir, "window_repo_v16.00000.zoekt.meta"), "null")
+	}()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("the full build panicked: %v", recovered)
+		}
+	}()
+	if _, err := indexDocuments(t.Context(), indexDir, "window_repo", source, files, 3); !errors.Is(err, errShardUnloadable) {
+		t.Fatalf("the build gave %v, want index damage", err)
 	}
 }

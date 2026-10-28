@@ -3,12 +3,16 @@ package main
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"testing/synctest"
 )
 
+// TestSemanticCPUParallelismProvidesCapacityForEffectiveCPU checks
+// semanticModelCallLimit on 1 to 256 CPUs. An accelerator gets one call per
+// CPU. CPU sessions get enough calls to use every CPU, with less than one
+// session of threads to spare.
 func TestSemanticCPUParallelismProvidesCapacityForEffectiveCPU(t *testing.T) {
 	t.Parallel()
 	previousThreads := 0
@@ -38,29 +42,8 @@ func TestSemanticCPUParallelismProvidesCapacityForEffectiveCPU(t *testing.T) {
 	}
 }
 
-type countingSemanticScorer struct {
-	prepareCalls   atomic.Int32
-	scoreCalls     atomic.Int32
-	closeCalls     atomic.Int32
-	scoreMask      []bool
-	queryTruncated bool
-}
-
-func (*countingSemanticScorer) PackSemanticUnits(
-	_ context.Context,
-	units []semanticUnit,
-) ([]semanticUnit, error) {
-	return units, nil
-}
-
-func (scorer *countingSemanticScorer) Scores(
-	ctx context.Context,
-	query string,
-	documents []rerankDocument,
-) ([]float32, error) {
-	return scoreWithTestSemanticEmbedder(ctx, scorer, query, documents)
-}
-
+// scoreWithTestSemanticEmbedder prepares query and scores documents with it,
+// as the search pipeline does through the model future.
 func scoreWithTestSemanticEmbedder(
 	ctx context.Context,
 	embedder semanticModel,
@@ -74,104 +57,63 @@ func scoreWithTestSemanticEmbedder(
 	return embedder.ScoresWithSemanticQuery(ctx, prepared, documents)
 }
 
-func (*countingSemanticScorer) EmbedSemanticUnits(
-	context.Context,
-	[]semanticUnit,
-) ([]semanticUnitEmbedding, error) {
-	return nil, nil
-}
-
-func (scorer *countingSemanticScorer) PrepareSemanticQuery(
-	_ context.Context,
-	query string,
-) (*semanticQueryEmbedding, error) {
-	scorer.prepareCalls.Add(1)
-	scoreMask := append([]bool(nil), scorer.scoreMask...)
-	if len(scoreMask) == 0 {
-		scoreMask = []bool{true}
-	}
-	return &semanticQueryEmbedding{
-		modelQuery: query,
-		scoreMask:  scoreMask,
-		truncated:  scorer.queryTruncated,
-	}, nil
-}
-
-func (scorer *countingSemanticScorer) ScoresWithSemanticQuery(
-	_ context.Context,
-	_ *semanticQueryEmbedding,
-	documents []rerankDocument,
-) ([]float32, error) {
-	scorer.scoreCalls.Add(1)
-	return make([]float32, len(documents)), nil
-}
-
-func (scorer *countingSemanticScorer) Close() error {
-	scorer.closeCalls.Add(1)
-	return nil
-}
-
-func (*countingSemanticScorer) SemanticCallCPUs(context.Context) int { return 1 }
-
+// TestSemanticModelFutureReusesOneQueryForRetrievalAndRerank prepares one
+// query from 9 callers, as the retrieval of each node and the final ranking
+// do. The future starts the model once and prepares the query once. Each
+// caller gets that model and the same prepared query. Close closes the model
+// once.
 func TestSemanticModelFutureReusesOneQueryForRetrievalAndRerank(t *testing.T) {
-	scorer := &countingSemanticScorer{
-		scoreMask:      []bool{true, false, true},
-		queryTruncated: true,
-	}
-	var factoryCalls atomic.Int32
-	future := newSemanticModelFuture(func(context.Context) (semanticModel, error) {
-		factoryCalls.Add(1)
-		return scorer, nil
-	})
+	scorer := observeModel(&hybridTestScorer{})
+	future := newSemanticModelFuture(scorer.factory())
 
 	const callers = 8
+	prepared := make([]*semanticQueryEmbedding, callers)
 	var wait sync.WaitGroup
-	for range callers {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
-			_, prepared, err := future.prepareQuery(t.Context(), "find request handler")
-			if err != nil {
-				t.Errorf("prepare query: %v", err)
+	for caller := range callers {
+		wait.Go(func() {
+			model, query, err := future.prepareQuery(t.Context(), "find request handler")
+			if err != nil || model != scorer {
+				t.Errorf("prepare query: model=%T err=%v", model, err)
 				return
 			}
-			if prepared.modelQuery != "find request handler" {
-				t.Errorf("prepared query=%q", prepared.modelQuery)
-			}
-		}()
+			prepared[caller] = query
+		})
 	}
 	wait.Wait()
 
-	batch, err := future.scores(
-		t.Context(),
-		"find request handler",
-		[]rerankDocument{{Text: "handler"}},
-	)
-	if err != nil {
-		t.Fatal(err)
+	model, last, err := future.prepareQuery(t.Context(), "find request handler")
+	if err != nil || model != scorer || last == nil {
+		t.Fatalf("prepare query: model=%T query=%+v err=%v", model, last, err)
 	}
-	if batch.activeQueryTokens != 2 || !batch.queryTruncated || len(batch.values) != 1 {
-		t.Fatalf("score metadata=%+v", batch)
+	if !slices.Equal(scorer.queries, []string{"find request handler"}) {
+		t.Fatalf("prepared query texts=%q, want the one text once", scorer.queries)
+	}
+	for caller, query := range prepared {
+		if query != last {
+			t.Fatalf("caller %d got another prepared query", caller)
+		}
 	}
 	if err := future.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if got := factoryCalls.Load(); got != 1 {
+	if got := scorer.starts.Load(); got != 1 {
 		t.Fatalf("model factory calls=%d, want 1", got)
 	}
-	if got := scorer.prepareCalls.Load(); got != 1 {
+	if got := scorer.prepares.Load(); got != 1 {
 		t.Fatalf("query model calls=%d, want 1", got)
 	}
-	if got := scorer.scoreCalls.Load(); got != 1 {
-		t.Fatalf("final score calls=%d, want 1", got)
-	}
-	if got := scorer.closeCalls.Load(); got != 1 {
+	if got := scorer.closes.Load(); got != 1 {
 		t.Fatalf("model close calls=%d, want 1", got)
 	}
 }
 
+// waitingQueryScorer is hybridTestScorer with a query preparation that waits
+// for release and then returns err. A test with it proves that the
+// model future waits for a started query before it closes the model. It also
+// proves that the future keeps the query result for later callers. It cannot
+// prove that a real model call stops when its context ends.
 type waitingQueryScorer struct {
-	countingSemanticScorer
+	hybridTestScorer
 	release <-chan struct{}
 	err     error
 }
@@ -181,10 +123,14 @@ func (scorer *waitingQueryScorer) PrepareSemanticQuery(
 	query string,
 ) (*semanticQueryEmbedding, error) {
 	<-scorer.release
-	prepared, _ := scorer.countingSemanticScorer.PrepareSemanticQuery(ctx, query)
+	prepared, _ := scorer.hybridTestScorer.PrepareSemanticQuery(ctx, query)
 	return prepared, scorer.err
 }
 
+// TestSemanticModelFutureCloseWaitsForStartedQuery starts a query and closes
+// the future before the query ends: on success, on a query failure, and on a
+// cancelled context. Close waits for the query, then closes the model once.
+// A later caller gets the stored query result.
 func TestSemanticModelFutureCloseWaitsForStartedQuery(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -207,12 +153,10 @@ func TestSemanticModelFutureCloseWaitsForStartedQuery(t *testing.T) {
 						close(release)
 					}
 				}()
-				scorer := &waitingQueryScorer{release: release, err: test.err}
-				future := newSemanticModelFuture(func(context.Context) (semanticModel, error) {
-					return scorer, nil
-				})
-				// Close right after startQuery: it must already see the query as
-				// started and wait for it.
+				scorer := observeModel(&waitingQueryScorer{release: release, err: test.err})
+				future := newSemanticModelFuture(scorer.factory())
+				// Close right after startQuery: it must already see the query
+				// as started and wait for it.
 				future.startQuery(ctx, "find request handler")
 				closed := make(chan error, 1)
 				go func() { closed <- future.Close() }()
@@ -221,7 +165,7 @@ func TestSemanticModelFutureCloseWaitsForStartedQuery(t *testing.T) {
 					cancel()
 					synctest.Wait()
 				}
-				if scorer.closeCalls.Load() != 0 {
+				if scorer.closes.Load() != 0 {
 					t.Fatal("model closed while the query still used it")
 				}
 				close(release)
@@ -229,8 +173,8 @@ func TestSemanticModelFutureCloseWaitsForStartedQuery(t *testing.T) {
 				if err := <-closed; err != nil {
 					t.Fatal(err)
 				}
-				if scorer.prepareCalls.Load() != 1 || scorer.closeCalls.Load() != 1 {
-					t.Fatalf("calls prepare=%d close=%d", scorer.prepareCalls.Load(), scorer.closeCalls.Load())
+				if scorer.prepares.Load() != 1 || scorer.closes.Load() != 1 {
+					t.Fatalf("calls prepare=%d close=%d", scorer.prepares.Load(), scorer.closes.Load())
 				}
 				// A later caller gets the stored query result.
 				if _, _, err := future.prepareQuery(t.Context(), "find request handler"); !errors.Is(err, test.err) {

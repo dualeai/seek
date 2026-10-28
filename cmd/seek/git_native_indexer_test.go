@@ -1,26 +1,24 @@
 package main
 
 import (
-	"errors"
-	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/sourcegraph/zoekt"
 )
 
-func captureHeadForTest(t *testing.T, repoDir string) gitSnapshot {
+func captureHeadForTest(t *testing.T, repoDir string) gitObjectID {
 	t.Helper()
 	head := gitOutputIn(t, repoDir, "rev-parse", "HEAD")
-	snapshot, ok, err := captureGitSnapshot(t.Context(), repoDir, head)
-	if err != nil || !ok {
-		t.Fatalf("capture HEAD: ok=%t error=%v", ok, err)
+	snapshot, err := captureGitSnapshot(head)
+	if err != nil {
+		t.Fatalf("capture HEAD: %v", err)
 	}
 	return snapshot
 }
@@ -28,91 +26,67 @@ func captureHeadForTest(t *testing.T, repoDir string) gitSnapshot {
 func TestCaptureGitSnapshotAndRepositoryMetadata(t *testing.T) {
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
-	if _, _, err := captureGitSnapshot(t.Context(), repoDir, "no-head"); err != nil {
-		t.Fatalf("capture unborn snapshot: %v", err)
-	}
 	if err := os.WriteFile(filepath.Join(repoDir, "main.go"), []byte("package main\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitRunIn(t, repoDir, "add", "main.go")
 	gitRunIn(t, repoDir, "commit", "-m", "snapshot")
+	// Seek reads no zoekt.* config and no remote: neither changes the metadata.
 	gitRunIn(t, repoDir, "config", "zoekt.name", "native-metadata")
 	gitRunIn(t, repoDir, "config", "zoekt.web-url", "https://github.com/dualeai/seek")
-	gitRunIn(t, repoDir, "config", "zoekt.web-url-type", "github")
 	gitRunIn(t, repoDir, "config", "zoekt.repoid", "42")
 	gitRunIn(t, repoDir, "config", "zoekt.tenantID", "7")
-	gitRunIn(t, repoDir, "config", "zoekt.github-stars", "100")
+	gitRunIn(t, repoDir, "config", "remote.origin.url", "git@github.com:sourcegraph/zoekt.git")
 
 	head := gitOutputIn(t, repoDir, "rev-parse", "HEAD")
-	snapshot, ok, err := captureGitSnapshot(t.Context(), repoDir, head)
-	if err != nil || !ok {
-		t.Fatalf("capture snapshot: ok=%t error=%v", ok, err)
-	}
-	if snapshot.commitOID.String() != head {
-		t.Fatalf("snapshot commit=%s, want %s", snapshot.commitOID, head)
-	}
-	wantUnix, err := strconv.ParseInt(gitOutputIn(t, repoDir, "show", "-s", "--format=%ct", head), 10, 64)
+	snapshot, err := captureGitSnapshot(head)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("capture snapshot: %v", err)
 	}
-	if snapshot.commitTime.Unix() != wantUnix {
-		t.Fatalf("snapshot time=%d, want %d", snapshot.commitTime.Unix(), wantUnix)
+	if snapshot.String() != head {
+		t.Fatalf("snapshot commit=%s, want %s", snapshot, head)
 	}
-
-	repository, err := nativeGitRepository(t.Context(), repoDir, snapshot)
-	if err != nil {
-		t.Fatal(err)
+	want := zoekt.Repository{
+		Name:     fallbackGitRepositoryName(repoDir),
+		Source:   repoDir,
+		Branches: []zoekt.RepositoryBranch{{Name: "HEAD", Version: head}},
 	}
-	if repository.Name != "native-metadata" || repository.Source != repoDir {
-		t.Fatalf("repository identity=%q source=%q", repository.Name, repository.Source)
-	}
-	if repository.URL != "https://github.com/dualeai/seek" {
-		t.Fatalf("repository URL=%q", repository.URL)
-	}
-	if repository.CommitURLTemplate != "" || repository.FileURLTemplate != "" || repository.LineFragmentTemplate != "" {
-		t.Fatalf("provider-neutral repository has URL templates: %+v", repository)
-	}
-	if repository.ID != 42 || repository.TenantID != 7 || repository.Rank != 0 {
-		t.Fatalf("repository numeric metadata=%+v", repository)
-	}
-	if len(repository.Branches) != 1 || repository.Branches[0].Name != "HEAD" || repository.Branches[0].Version != head {
-		t.Fatalf("repository branches=%v", repository.Branches)
-	}
-	if repository.LatestCommitDate.Unix() != wantUnix || repository.RawConfig["name"] != "native-metadata" {
-		t.Fatalf("repository time/raw config=%s/%v", repository.LatestCommitDate, repository.RawConfig)
+	if got := nativeGitRepository(repoDir, snapshot); !reflect.DeepEqual(got, want) {
+		t.Fatalf("repository metadata:\ngot  %+v\nwant %+v", got, want)
 	}
 }
 
-func TestCaptureGitSnapshotPreservesCommitTimezone(t *testing.T) {
-	requireTools(t)
-	repoDir := initEmptyGitRepoNoRemote(t)
-	if err := os.WriteFile(filepath.Join(repoDir, "main.go"), []byte("package main\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitRunIn(t, repoDir, "add", ".")
-	t.Setenv("GIT_AUTHOR_DATE", "2026-01-31T23:30:00-07:00")
-	t.Setenv("GIT_COMMITTER_DATE", "2026-01-31T23:30:00-07:00")
-	gitRunIn(t, repoDir, "commit", "-m", "offset")
-
-	snapshot := captureHeadForTest(t, repoDir)
-	want, err := time.Parse(time.RFC3339, gitOutputIn(t, repoDir, "show", "-s", "--format=%cI", "HEAD"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, gotOffset := snapshot.commitTime.Zone()
-	_, wantOffset := want.Zone()
-	if !snapshot.commitTime.Equal(want) || gotOffset != wantOffset {
-		t.Fatalf("commit time=%s offset=%d, want %s offset=%d", snapshot.commitTime, gotOffset, want, wantOffset)
-	}
-}
-
-func TestCaptureGitSnapshotRejectsInvalidCommit(t *testing.T) {
-	requireTools(t)
-	repoDir := initEmptyGitRepo(t)
-	for _, captured := range []string{"short", "ABCDEF0123456789ABCDEF0123456789ABCDEF01", "0123456789abcdef0123456789abcdef01234567"} {
-		if _, _, err := captureGitSnapshot(t.Context(), repoDir, captured); err == nil {
+// TestCaptureGitSnapshotRejectsMalformedCommit checks the form of the ID only.
+// TestGitBuildWithAMissingCapturedCommitFails covers a well-formed ID of a
+// missing commit.
+func TestCaptureGitSnapshotRejectsMalformedCommit(t *testing.T) {
+	for _, captured := range []string{"short", "ABCDEF0123456789ABCDEF0123456789ABCDEF01"} {
+		if _, err := captureGitSnapshot(captured); err == nil {
 			t.Fatalf("capture %q succeeded", captured)
 		}
+	}
+}
+
+// TestGitBuildWithAMissingCapturedCommitFails builds a state whose commit is
+// missing, as when the commit disappears after git status. The build fails
+// and deletes the state, so the next search builds again.
+func TestGitBuildWithAMissingCapturedCommitFails(t *testing.T) {
+	requireTools(t)
+	repoDir := initGitRepo(t, "base.go", "package base\n// MISSING_COMMIT_BASE\n")
+	paths, plan := planGitTestCorpus(t, repoDir)
+	reindexGit(t, t.Context(), paths, plan)
+	if readStateFile(plan.cacheDir) == "" {
+		t.Fatal("the first build wrote no state")
+	}
+	state := mustGitRepoStateIn(t, t.Context(), repoDir)
+	// A well-formed ID of no object in the repository.
+	state.HeadSHA = strings.Repeat("0", len(state.HeadSHA)-1) + "1"
+	err := runIndexingWithCache(t.Context(), paths, plan.corpusStore, state, gitCorpusStateHash(paths, state))
+	if err == nil {
+		t.Fatal("the build of a missing commit succeeded")
+	}
+	if got := readStateFile(plan.cacheDir); got != "" {
+		t.Fatalf("state=%q after the failed build, want none", got)
 	}
 }
 
@@ -121,7 +95,7 @@ func TestNativeGitSHA256FullAndDelta(t *testing.T) {
 	repoDir := t.TempDir()
 	cmd := exec.Command("git", "init", "--object-format=sha256", repoDir)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Skipf("installed Git does not support SHA-256 repositories: %v: %s", err, out)
+		t.Fatalf("the installed Git cannot make a SHA-256 repository: %v: %s", err, out)
 	}
 	gitRunIn(t, repoDir, "config", "user.email", "test@test.com")
 	gitRunIn(t, repoDir, "config", "user.name", "Test")
@@ -134,9 +108,9 @@ func TestNativeGitSHA256FullAndDelta(t *testing.T) {
 	if len(head) != 64 {
 		t.Fatalf("SHA-256 HEAD has %d bytes", len(head))
 	}
-	snapshot, ok, err := captureGitSnapshot(t.Context(), repoDir, head)
-	if err != nil || !ok || snapshot.commitOID.String() != head {
-		t.Fatalf("capture SHA-256: snapshot=%+v ok=%t error=%v", snapshot, ok, err)
+	snapshot, err := captureGitSnapshot(head)
+	if err != nil || snapshot.String() != head {
+		t.Fatalf("capture SHA-256: snapshot=%+v error=%v", snapshot, err)
 	}
 
 	paths, plan := planGitTestCorpus(t, repoDir)
@@ -154,16 +128,16 @@ func TestNativeGitSHA256FullAndDelta(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	delta, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.cacheDir, plan.indexDir, target, scan)
-	if err != nil || !eligible {
-		t.Fatalf("prepare SHA-256 delta: eligible=%t error=%v", eligible, err)
+	delta, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, target, scan)
+	if err != nil || delta == nil {
+		t.Fatalf("prepare SHA-256 delta: eligible=%t error=%v", delta != nil, err)
 	}
 	deltaDir := t.TempDir()
-	if err := indexNativeGitDelta(t.Context(), paths.RepoDir, deltaDir, scan.paths(familyCommitted), delta); err != nil {
+	if err := indexNativeGitDelta(t.Context(), paths.RepoDir, deltaDir, scan.paths(familyCommitted), delta, indexParallelism()); err != nil {
 		t.Fatalf("build SHA-256 delta: %v", err)
 	}
 	fullDir := t.TempDir()
-	if err := indexNativeGitFull(t.Context(), paths.RepoDir, fullDir, target, nil, 1); err != nil {
+	if _, err := indexNativeGitFull(t.Context(), paths.RepoDir, fullDir, target, 1, nil); err != nil {
 		t.Fatalf("build SHA-256 full: %v", err)
 	}
 	if got, want := nativeVisibleDocuments(t, deltaDir), nativeVisibleDocuments(t, fullDir); !slices.Equal(got, want) {
@@ -172,101 +146,10 @@ func TestNativeGitSHA256FullAndDelta(t *testing.T) {
 	assertNativeRepositoryParity(t, deltaDir, fullDir)
 }
 
-func TestNativeGitRepositoryIgnoresOriginHosting(t *testing.T) {
-	requireTools(t)
-	repoDir := initEmptyGitRepo(t)
-	if err := os.WriteFile(filepath.Join(repoDir, "main.go"), []byte("package main\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitRunIn(t, repoDir, "add", ".")
-	gitRunIn(t, repoDir, "commit", "-m", "origin")
-	snapshot := captureHeadForTest(t, repoDir)
-	for _, origin := range []string{
-		"git@github.com:sourcegraph/zoekt.git",
-		"https://gitlab.example/group/repo.git",
-		"ssh://git@gerrit.example/project",
-	} {
-		gitRunIn(t, repoDir, "config", "remote.origin.url", origin)
-		repository, err := nativeGitRepository(t.Context(), repoDir, snapshot)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if repository.Name != fallbackGitRepositoryName(repoDir) || repository.URL != "" ||
-			repository.CommitURLTemplate != "" || repository.FileURLTemplate != "" || repository.Rank != 0 {
-			t.Fatalf("origin %q changed provider-neutral metadata: %+v", origin, repository)
-		}
-	}
-}
-
-func TestNativeGitRepositoryNormalizesConfigKeys(t *testing.T) {
-	requireTools(t)
-	repoDir := initGitRepo(t, "main.go", "package main\n")
-	gitRunIn(t, repoDir, "config", "zoekt.name", "case-test")
-	gitRunIn(t, repoDir, "config", "zoekt.tenantID", "17")
-	gitRunIn(t, repoDir, "config", "zoekt.latestCommitDate", "1")
-	repository, err := nativeGitRepository(t.Context(), repoDir, captureHeadForTest(t, repoDir))
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := map[string]string{
-		"name":             "case-test",
-		"tenantid":         "17",
-		"latestcommitdate": "1",
-	}
-	wantRank := nativeGitCommitRank(repository.LatestCommitDate)
-	if repository.TenantID != 17 || repository.Rank != wantRank || !maps.Equal(repository.RawConfig, want) {
-		t.Fatalf("tenant=%d rank=%d raw config=%v, want rank=%d config=%v", repository.TenantID, repository.Rank, repository.RawConfig, wantRank, want)
-	}
-
-	paths, plan := planGitTestCorpus(t, repoDir)
-	reindexGit(t, t.Context(), paths, plan)
-	persisted := zoektRepositoryMetadata(t, plan.indexDir)
-	if persisted.Rank != wantRank || !maps.Equal(persisted.RawConfig, want) {
-		t.Fatalf("persisted rank=%d raw config=%v, want rank=%d config=%v", persisted.Rank, persisted.RawConfig, wantRank, want)
-	}
-}
-
-func TestNativeGitRepositoryConfigDoesNotRequireOrigin(t *testing.T) {
-	requireTools(t)
-	repoDir := initEmptyGitRepoNoRemote(t)
-	if err := os.WriteFile(filepath.Join(repoDir, "main.go"), []byte("package main\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitRunIn(t, repoDir, "add", ".")
-	gitRunIn(t, repoDir, "commit", "-m", "no origin")
-	gitRunIn(t, repoDir, "config", "zoekt.repoid", "42")
-	repository, err := nativeGitRepository(t.Context(), repoDir, captureHeadForTest(t, repoDir))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if repository.Name != fallbackGitRepositoryName(repoDir) || repository.ID != 42 || repository.RawConfig["repoid"] != "42" {
-		t.Fatalf("no-origin repository=%+v", repository)
-	}
-}
-
-func TestNativeGitRepositoryKeepsExplicitWebURLOpaque(t *testing.T) {
-	repository := zoekt.Repository{Name: "fallback"}
-	applyNativeGitConfig(&repository, nativeGitConfig{zoekt: map[string]string{
-		"web-url":      "custom+transport://example.test/repo?view=raw",
-		"web-url-type": "github",
-	}})
-	if repository.Name != "fallback" || repository.URL != "custom+transport://example.test/repo?view=raw" ||
-		repository.CommitURLTemplate != "" || repository.FileURLTemplate != "" || repository.LineFragmentTemplate != "" {
-		t.Fatalf("provider-neutral metadata=%+v", repository)
-	}
-}
-
-func TestNativeGitRepositoryRejectsDirtyShardNames(t *testing.T) {
-	for _, name := range []string{"uncommitted", "Uncommitted", "uncommitted_v17", "UNCOMMITTED_vcustom"} {
-		repository := zoekt.Repository{Name: "safe-fallback"}
-		applyNativeGitConfig(&repository, nativeGitConfig{zoekt: map[string]string{"name": name}})
-		if repository.Name != "safe-fallback" {
-			t.Fatalf("configured name %q replaced safe fallback with %q", name, repository.Name)
-		}
-	}
-}
-
-func TestNativeGitFullRotatesBuilderWindows(t *testing.T) {
+// TestNativeGitFullKeepsHeadInEveryShard builds a commit into several shards
+// with a small shardMax. The build indexes every file, and every shard records
+// HEAD.
+func TestNativeGitFullKeepsHeadInEveryShard(t *testing.T) {
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
 	wantPaths := make([]string, 0, 4)
@@ -281,16 +164,12 @@ func TestNativeGitFullRotatesBuilderWindows(t *testing.T) {
 	gitRunIn(t, repoDir, "add", ".")
 	gitRunIn(t, repoDir, "commit", "-m", "builder windows")
 	snapshot := captureHeadForTest(t, repoDir)
-
-	testReadSemMu.Lock()
-	restoreWindow := swapIndexWindowBytesForTest(16)
-	defer func() {
-		restoreWindow()
-		testReadSemMu.Unlock()
-	}()
+	// Each document is about 45 bytes: below this target, so no document
+	// fills a shard alone, and each shard holds two documents.
+	swapForTest(t, &shardMax, 64)
 
 	indexDir := t.TempDir()
-	if err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, nil, 1); err != nil {
+	if _, err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, 1, nil); err != nil {
 		t.Fatalf("native full: %v", err)
 	}
 	shards, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
@@ -298,15 +177,15 @@ func TestNativeGitFullRotatesBuilderWindows(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(shards) < 2 {
-		t.Fatalf("builder did not rotate: shards=%v", shards)
+		t.Fatalf("build made one shard: shards=%v", shards)
 	}
 	if got := zoektIndexedPaths(t, indexDir); !slices.Equal(got, wantPaths) {
 		t.Fatalf("indexed paths=%v, want %v", got, wantPaths)
 	}
 	for _, repository := range zoektCommittedRepositoryMetadata(t, indexDir) {
 		if len(repository.Branches) != 1 || repository.Branches[0].Name != "HEAD" ||
-			repository.Branches[0].Version != snapshot.commitOID.String() {
-			t.Fatalf("rotated shard metadata=%+v", repository)
+			repository.Branches[0].Version != snapshot.String() {
+			t.Fatalf("shard metadata=%+v", repository)
 		}
 	}
 }
@@ -317,7 +196,7 @@ func TestReadNativeGitTreeEmptyAndRepeatedBlob(t *testing.T) {
 	gitRunIn(t, repoDir, "commit", "--allow-empty", "-m", "empty")
 	empty := captureHeadForTest(t, repoDir)
 	count := 0
-	if err := readNativeGitTree(t.Context(), repoDir, empty, nil, func(entries []gitTreeEntry) error {
+	if err := readNativeGitTree(t.Context(), repoDir, empty, func(entries []gitTreeEntry) error {
 		count += len(entries)
 		return nil
 	}); err != nil || count != 0 {
@@ -338,7 +217,7 @@ func TestReadNativeGitTreeEmptyAndRepeatedBlob(t *testing.T) {
 	gitRunIn(t, repoDir, "commit", "-m", "repeated blob")
 	snapshot := captureHeadForTest(t, repoDir)
 	var entries []gitTreeEntry
-	if err := readNativeGitTree(t.Context(), repoDir, snapshot, nil, func(chunk []gitTreeEntry) error {
+	if err := readNativeGitTree(t.Context(), repoDir, snapshot, func(chunk []gitTreeEntry) error {
 		entries = append(entries, chunk...)
 		return nil
 	}); err != nil {
@@ -349,14 +228,16 @@ func TestReadNativeGitTreeEmptyAndRepeatedBlob(t *testing.T) {
 	}
 }
 
-func TestNativeGitFullScopeUsesRootIgnoreAndExclusions(t *testing.T) {
+// TestNativeGitFullIndexesEveryCommittedBlob commits a root
+// .sourcegraph/ignore that names a file. Seek reads no ignore file, so the
+// full build indexes every committed blob.
+func TestNativeGitFullIndexesEveryCommittedBlob(t *testing.T) {
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
 	for name, content := range map[string]string{
 		".sourcegraph/ignore": "scope/ignored.go\n",
 		"scope/keep.go":       "package keep\n// SCOPE_KEEP\n",
 		"scope/ignored.go":    "package ignored\n// SCOPE_IGNORED\n",
-		"scope/excluded.go":   "package excluded\n// SCOPE_EXCLUDED\n",
 		"other/out.go":        "package out\n// SCOPE_OUT\n",
 	} {
 		path := filepath.Join(repoDir, name)
@@ -370,91 +251,11 @@ func TestNativeGitFullScopeUsesRootIgnoreAndExclusions(t *testing.T) {
 	gitRunIn(t, repoDir, "add", ".")
 	gitRunIn(t, repoDir, "commit", "-m", "scope")
 	snapshot := captureHeadForTest(t, repoDir)
-	scope := &gitDirtyScope{includeDirs: []string{"scope"}, excludeFiles: []string{"scope/excluded.go"}}
 	indexDir := t.TempDir()
-	if err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, scope, 1); err != nil {
-		t.Fatalf("scoped native full: %v", err)
+	if _, err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, 1, nil); err != nil {
+		t.Fatalf("native full: %v", err)
 	}
-	if got, want := zoektIndexedPaths(t, indexDir), []string{"scope/keep.go"}; !slices.Equal(got, want) {
-		t.Fatalf("scoped paths=%v, want %v", got, want)
-	}
-}
-
-func TestReadNativeGitIgnoreRejectsOversizeControlFile(t *testing.T) {
-	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
-	requireTools(t)
-	repoDir := initEmptyGitRepo(t)
-	path := filepath.Join(repoDir, ".sourcegraph", "ignore")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Truncate(path, int64(testDocumentContentLimit)+1); err != nil {
-		t.Fatal(err)
-	}
-	gitRunIn(t, repoDir, "add", ".")
-	gitRunIn(t, repoDir, "commit", "-m", "oversize ignore")
-	err := func() error {
-		_, err := readNativeGitIgnore(t.Context(), repoDir, captureHeadForTest(t, repoDir))
-		return err
-	}()
-	if err == nil || !strings.Contains(err.Error(), "exceeds") {
-		t.Fatalf("error=%v", err)
-	}
-}
-
-func TestNativeGitBudgetCountsIgnoredBlobs(t *testing.T) {
-	requireTools(t)
-	repoDir := initEmptyGitRepo(t)
-	if err := os.MkdirAll(filepath.Join(repoDir, ".sourcegraph"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repoDir, ".sourcegraph", "ignore"), []byte("ignored.go\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repoDir, "ignored.go"), []byte("package ignored\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitRunIn(t, repoDir, "add", ".")
-	gitRunIn(t, repoDir, "commit", "-m", "ignored budget")
-
-	oldFiles := gitCandidateFileLimit
-	gitCandidateFileLimit = 1
-	t.Cleanup(func() { gitCandidateFileLimit = oldFiles })
-	err := indexNativeGitFull(t.Context(), repoDir, t.TempDir(), captureHeadForTest(t, repoDir), nil, 1)
-	if !errors.Is(err, errGitCommittedCapExceeded) {
-		t.Fatalf("error=%v, want committed candidate cap", err)
-	}
-}
-
-func TestNativeGitBudgetCountsIgnoredBlobBytes(t *testing.T) {
-	requireTools(t)
-	repoDir := initEmptyGitRepo(t)
-	if err := os.MkdirAll(filepath.Join(repoDir, ".sourcegraph"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	ignoreContent := []byte("ignored.go\n")
-	ignoredContent := []byte("package ignored\n")
-	if err := os.WriteFile(filepath.Join(repoDir, ".sourcegraph", "ignore"), ignoreContent, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(repoDir, "ignored.go"), ignoredContent, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	gitRunIn(t, repoDir, "add", ".")
-	gitRunIn(t, repoDir, "commit", "-m", "ignored byte budget")
-
-	oldBytes := gitCorpusIndexedByteLimit
-	gitCorpusIndexedByteLimit = int64(len(ignoreContent) + len(ignoredContent) - 1)
-	t.Cleanup(func() { gitCorpusIndexedByteLimit = oldBytes })
-	err := indexNativeGitFull(t.Context(), repoDir, t.TempDir(), captureHeadForTest(t, repoDir), nil, 1)
-	if !errors.Is(err, errGitCommittedCapExceeded) {
-		t.Fatalf("error=%v, want committed byte cap", err)
-	}
-	capErr, ok := errors.AsType[indexCapExceededError](err)
-	if !ok || capErr.metric != indexCapIndexedBytes {
-		t.Fatalf("error=%v, want indexed-byte cap", err)
+	if got, want := zoektIndexedPaths(t, indexDir), []string{".sourcegraph/ignore", "other/out.go", "scope/ignored.go", "scope/keep.go"}; !slices.Equal(got, want) {
+		t.Fatalf("paths=%v, want %v", got, want)
 	}
 }

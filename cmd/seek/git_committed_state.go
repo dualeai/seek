@@ -9,113 +9,73 @@ import (
 )
 
 const (
-	committedGitStateFile    = ".git-committed-v1"
-	committedGitStateVersion = "v1"
+	committedGitStateFile = ".git-committed-v1"
+	// committedGitStateVersion names the contents rule of the committed
+	// family: v2 holds every committed blob. A state of another version
+	// selects one native full build, so no delta extends a base of another
+	// rule.
+	committedGitStateVersion = "v2"
 )
 
-// committedGitState tracks the published committed family. head and budget
-// describe its current commit and work totals. A full scan seeds those fields;
-// an admitted delta updates them from old and new blob IDs in diff-tree without
-// walking the unchanged target tree. baseHead and baseShards remain the commit
-// and shard count of the last full build, so the delta threshold does not
-// reject a large base.
+// committedGitState tracks the published committed family. head is its
+// current commit: a full build sets it, and an admitted delta moves it.
+// baseHead and baseShards remain the commit and shard count of the last full
+// build, so the delta threshold does not reject a large base. liveBytes is the
+// content of the live blobs, and deadBytes the content that deltas tombstoned
+// since the last full build (deltaNeedsCompaction).
 type committedGitState struct {
 	head       gitObjectID
 	baseHead   gitObjectID
-	budget     gitIndexBudget
 	baseShards int
+	liveBytes  int64
+	deadBytes  int64
 }
 
 func readCommittedGitState(cacheDir string) (committedGitState, bool) {
 	data, err := os.ReadFile(filepath.Join(cacheDir, committedGitStateFile))
-	if err != nil || len(data) == 0 || data[len(data)-1] != '\n' {
-		return committedGitState{}, false
-	}
-	raw := strings.TrimSuffix(string(data), "\n")
-	lines := strings.Split(raw, "\n")
-	if len(lines) != 6 || lines[0] != committedGitStateVersion {
-		return committedGitState{}, false
-	}
-	value := func(line, prefix string) (string, bool) {
-		if !strings.HasPrefix(line, prefix) {
-			return "", false
-		}
-		v := strings.TrimPrefix(line, prefix)
-		return v, v != ""
-	}
-	headRaw, ok := value(lines[1], "head ")
-	if !ok {
-		return committedGitState{}, false
-	}
-	head, err := parseGitObjectID([]byte(headRaw))
 	if err != nil {
 		return committedGitState{}, false
 	}
-	parseNonnegative := func(line, prefix string) (int64, bool) {
-		rawValue, ok := value(line, prefix)
-		if !ok {
-			return 0, false
-		}
-		n, err := strconv.ParseInt(rawValue, 10, 64)
-		return n, err == nil && n >= 0
-	}
-	baseHeadRaw, ok := value(lines[2], "base_head ")
-	if !ok {
+	// Six lines, each with its newline: the split ends with one empty string.
+	lines := strings.Split(string(data), "\n")
+	if len(lines) != 7 || lines[0] != committedGitStateVersion || lines[6] != "" {
 		return committedGitState{}, false
 	}
-	baseHead, err := parseGitObjectID([]byte(baseHeadRaw))
-	if err != nil || len(baseHead) != len(head) {
+	headRaw, headOK := strings.CutPrefix(lines[1], "head ")
+	baseRaw, baseOK := strings.CutPrefix(lines[2], "base_head ")
+	shardsRaw, shardsOK := strings.CutPrefix(lines[3], "base_shards ")
+	liveRaw, liveOK := strings.CutPrefix(lines[4], "live_bytes ")
+	deadRaw, deadOK := strings.CutPrefix(lines[5], "dead_bytes ")
+	head, headErr := parseGitObjectID([]byte(headRaw))
+	baseHead, baseErr := parseGitObjectID([]byte(baseRaw))
+	baseShards, shardsErr := strconv.Atoi(shardsRaw)
+	liveBytes, liveErr := strconv.ParseInt(liveRaw, 10, 64)
+	deadBytes, deadErr := strconv.ParseInt(deadRaw, 10, 64)
+	if !headOK || !baseOK || !shardsOK || !liveOK || !deadOK ||
+		headErr != nil || baseErr != nil || shardsErr != nil || liveErr != nil || deadErr != nil ||
+		len(baseHead) != len(head) || baseShards < 0 || liveBytes < 0 || deadBytes < 0 {
 		return committedGitState{}, false
 	}
-	candidates, ok := parseNonnegative(lines[3], "candidates ")
-	if !ok || candidates > gitCandidateFileLimit {
-		return committedGitState{}, false
-	}
-	indexedBytes, ok := parseNonnegative(lines[4], "indexed_bytes ")
-	if !ok || indexedBytes > gitCorpusIndexedByteLimit {
-		return committedGitState{}, false
-	}
-	baseShards64, ok := parseNonnegative(lines[5], "base_shards ")
-	if !ok || baseShards64 > int64(maxInt()) {
-		return committedGitState{}, false
-	}
-	return committedGitState{
-		head:     head,
-		baseHead: baseHead,
-		budget: gitIndexBudget{
-			candidates:   candidates,
-			indexedBytes: indexedBytes,
-		},
-		baseShards: int(baseShards64),
-	}, true
+	return committedGitState{head: head, baseHead: baseHead, baseShards: baseShards, liveBytes: liveBytes, deadBytes: deadBytes}, true
 }
 
 func writeCommittedGitState(cacheDir string, state committedGitState) error {
-	head, headErr := parseGitObjectID([]byte(state.head))
-	baseHead, baseHeadErr := parseGitObjectID([]byte(state.baseHead))
-	if headErr != nil || baseHeadErr != nil || head != state.head || baseHead != state.baseHead ||
-		len(state.head) != len(state.baseHead) || state.budget.candidates < 0 ||
-		state.budget.candidates > gitCandidateFileLimit || state.budget.indexedBytes < 0 ||
-		state.budget.indexedBytes > gitCorpusIndexedByteLimit || state.baseShards < 0 {
+	if !validGitObjectID([]byte(state.head)) || !validGitObjectID([]byte(state.baseHead)) ||
+		len(state.head) != len(state.baseHead) || state.baseShards < 0 || state.liveBytes < 0 || state.deadBytes < 0 {
 		return fmt.Errorf("invalid committed Git state")
 	}
 	value := fmt.Sprintf(
-		"%s\nhead %s\nbase_head %s\ncandidates %d\nindexed_bytes %d\nbase_shards %d\n",
+		"%s\nhead %s\nbase_head %s\nbase_shards %d\nlive_bytes %d\ndead_bytes %d\n",
 		committedGitStateVersion,
 		state.head,
 		state.baseHead,
-		state.budget.candidates,
-		state.budget.indexedBytes,
 		state.baseShards,
+		state.liveBytes,
+		state.deadBytes,
 	)
 	return writeCacheFile(cacheDir, committedGitStateFile, value)
 }
 
 func deleteCommittedGitState(cacheDir string) {
 	removeCacheFile(cacheDir, committedGitStateFile)
-	removeCacheFile(cacheDir, committedGitStateFile+".tmp")
-}
-
-func maxInt() int {
-	return int(^uint(0) >> 1)
 }

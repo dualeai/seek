@@ -1,35 +1,37 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"cmp"
 	"fmt"
 	"io"
 	"math"
-	"path/filepath"
-	"sort"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/sourcegraph/zoekt"
+	"github.com/sourcegraph/zoekt/query"
 )
 
-// Long-line caps. A match line longer than maxLineBytes is windowed around
-// its matches (keeping matchCtxBytes of source on each side); a context line
-// longer than maxLineBytes is tail-trimmed. Both bounds are SOURCE bytes —
-// ANSI color escapes and the "…+N bytes" markers do not count toward them.
-//
-// TODO: expose as a config flag if someone asks. Kept as consts to honour the
-// "zero new flags" contract.
+// maxLineBytes and matchCtxBytes cap long lines. A match line longer than
+// maxLineBytes shows a window around its matches, with matchCtxBytes of source
+// on each side. A context line longer than maxLineBytes loses its tail. Both
+// bounds count source bytes only: ANSI color codes and the "…+N bytes"
+// markers do not count. The CLI has no flag for them.
 const (
 	maxLineBytes  = 1024
 	matchCtxBytes = 512
 )
 
-// palette holds the ANSI codes used to colorize output. The zero value
-// (plainPalette) emits no codes, so the plain path is byte-identical to the
-// pre-color formatter. Color is presentation-only and chosen once per run from
-// useColor; tests pass plainPalette so golden strings stay stable.
+// palette holds the ANSI codes that color the output. The zero value
+// (plainPalette) writes no codes. Each run chooses the palette once
+// (useColor). Tests pass plainPalette, so the expected strings stay fixed.
 type palette struct {
 	file, lineNo, match, reset string
 }
@@ -44,6 +46,7 @@ var (
 	}
 )
 
+// dirtyFileSet holds the names of the dirty files of a Git node's capture.
 type dirtyFileSet map[string]struct{}
 
 func (s dirtyFileSet) contains(name string) bool {
@@ -51,8 +54,8 @@ func (s dirtyFileSet) contains(name string) bool {
 	return ok
 }
 
-type dirtyFilesByCorpus map[corpusID]dirtyFileSet
-
+// corpusDisplayMode selects whether a file header shows the node's root and
+// kind (multi-node output).
 type corpusDisplayMode uint8
 
 const (
@@ -60,363 +63,232 @@ const (
 	showCorpusContext
 )
 
-// corpusFormatWriter writes formatted results and keeps the first write
-// error, so the formatters can ignore errors until finish.
-type corpusFormatWriter struct {
-	w   io.Writer
-	err error
-}
+// corpusFormatWriter drops each write's error: bufio.Writer keeps the first
+// one, and Flush returns it.
+type corpusFormatWriter struct{ *bufio.Writer }
 
-func (writer *corpusFormatWriter) Write(data []byte) (int, error) {
-	if writer.err != nil {
-		return 0, writer.err
-	}
-	written, err := writer.w.Write(data)
-	if err == nil && written != len(data) {
-		err = io.ErrShortWrite
-	}
-	writer.err = err
-	return written, err
-}
+func (writer corpusFormatWriter) writeBytes(data []byte)  { _, _ = writer.Write(data) }
+func (writer corpusFormatWriter) writeString(text string) { _, _ = writer.WriteString(text) }
+func (writer corpusFormatWriter) writeByte(value byte)    { _ = writer.WriteByte(value) }
+func (writer corpusFormatWriter) writeRune(value rune)    { _, _ = writer.WriteRune(value) }
 
-func (writer *corpusFormatWriter) WriteString(text string) (int, error) {
-	if writer.err != nil {
-		return 0, writer.err
-	}
-	written, err := io.WriteString(writer.w, text)
-	if err == nil && written != len(text) {
-		err = io.ErrShortWrite
-	}
-	writer.err = err
-	return written, err
-}
-
-func (writer *corpusFormatWriter) WriteByte(value byte) error {
-	if writer.err != nil {
-		return writer.err
-	}
-	if byteWriter, ok := writer.w.(io.ByteWriter); ok {
-		writer.err = byteWriter.WriteByte(value)
-		return writer.err
-	}
-	data := [1]byte{value}
-	_, err := writer.Write(data[:])
-	return err
-}
-
-func (writer *corpusFormatWriter) WriteRune(value rune) (int, error) {
-	if value < unicode.MaxASCII {
-		return 1, writer.WriteByte(byte(value))
-	}
-	if writer.err != nil {
-		return 0, writer.err
-	}
-	if runeWriter, ok := writer.w.(interface {
-		WriteRune(rune) (int, error)
-	}); ok {
-		written, err := runeWriter.WriteRune(value)
-		writer.err = err
-		return written, err
-	}
-	return writer.WriteString(string(value))
-}
-
-func (writer *corpusFormatWriter) writeBytes(data []byte) {
-	_, _ = writer.Write(data)
-}
-
-func (writer *corpusFormatWriter) writeString(text string) {
-	_, _ = writer.WriteString(text)
-}
-
-func (writer *corpusFormatWriter) writeByte(value byte) {
-	_ = writer.WriteByte(value)
-}
-
-func (writer *corpusFormatWriter) writeRune(value rune) {
-	_, _ = writer.WriteRune(value)
-}
-
-func (writer *corpusFormatWriter) finish() error {
-	return writer.err
-}
-
-func formatCorpusResultsWithContext(
-	results []corpusSearchResult,
-	dirtyByCorpus dirtyFilesByCorpus,
-	limit int,
-	maxMatches int,
-	displayMode corpusDisplayMode,
-	pal palette,
-) string {
-	deduped, hiddenMatches, totalFiles := prepareCorpusResultsForDisplay(
-		results,
-		dirtyByCorpus,
-		limit,
-		maxMatches,
-	)
-	if len(deduped) == 0 {
-		return ""
-	}
-
-	// Pre-size the builder from the number of files and matches.
-	matches := 0
-	for _, result := range deduped {
-		matches += len(result.file.LineMatches)
-	}
-	var sb strings.Builder
-	sb.Grow(len(deduped)*200 + matches*80)
-	writer := corpusFormatWriter{w: &sb}
-	renderCorpusResults(&writer, deduped, hiddenMatches, totalFiles, displayMode, pal)
-	_ = writer.finish()
-	return sb.String()
-}
-
-// writeCorpusResultsWithContext streams each file block to w. It avoids one
-// corpus-sized output string when an unlimited search returns many files.
+// writeCorpusResultsWithContext streams the file blocks to w in rank order,
+// each block as soon as it is ready. It ranks the results, keeps the first
+// limit files (all when limit <= 0), and keeps at most maxMatches lines of
+// each. With no result, it writes nothing.
+//
+// A block depends only on its own result, so the blocks render on all CPUs,
+// each into its own buffer. The writer copies each block out as soon as it and
+// the blocks before it are ready. On Kubernetes, the 117 MB of `-n 0 the`
+// took about 420 ms to render on one goroutine and about 90 ms this way.
 func writeCorpusResultsWithContext(
 	w io.Writer,
 	results []corpusSearchResult,
-	dirtyByCorpus dirtyFilesByCorpus,
 	limit int,
 	maxMatches int,
 	displayMode corpusDisplayMode,
 	pal palette,
-) (bool, error) {
-	deduped, hiddenMatches, totalFiles := prepareCorpusResultsForDisplay(
-		results,
-		dirtyByCorpus,
-		limit,
-		maxMatches,
-	)
-	if len(deduped) == 0 {
-		return false, nil
+) error {
+	if len(results) == 0 {
+		return nil
 	}
-	writer := corpusFormatWriter{w: w}
-	renderCorpusResults(&writer, deduped, hiddenMatches, totalFiles, displayMode, pal)
-	return true, writer.finish()
-}
-
-func renderCorpusResults(
-	writer *corpusFormatWriter,
-	results []corpusSearchResult,
-	hiddenMatches []int,
-	totalFiles int,
-	displayMode corpusDisplayMode,
-	pal palette,
-) {
-	for index, result := range results {
+	ranked := rankCorpusResultsForDisplay(results)
+	totalFiles := len(ranked)
+	if limit > 0 && len(ranked) > limit {
+		ranked = ranked[:limit]
+	}
+	// NewWriter returns w itself when w is a large enough bufio.Writer.
+	writer := corpusFormatWriter{bufio.NewWriter(w)}
+	blocks := make([][]byte, len(ranked))
+	ready := make([]chan struct{}, len(ranked))
+	for index := range ready {
+		ready[index] = make(chan struct{})
+	}
+	var next atomic.Int64
+	for range min(runtime.GOMAXPROCS(0), len(ranked)) {
+		go func() {
+			blockWriter := corpusFormatWriter{bufio.NewWriter(nil)}
+			for {
+				index := int(next.Add(1)) - 1
+				if index >= len(ranked) {
+					return
+				}
+				var block bytes.Buffer
+				blockWriter.Reset(&block)
+				result := ranked[index]
+				lines, hidden := normalizeLineMatches(result.file.LineMatches, maxMatches)
+				result.file.LineMatches = lines
+				formatCorpusFileMatch(blockWriter, result, displayMode, hidden, pal)
+				_ = blockWriter.Flush()
+				blocks[index] = block.Bytes()
+				close(ready[index])
+			}
+		}()
+	}
+	for index := range ranked {
+		<-ready[index]
 		if index > 0 {
-			_ = writer.WriteByte('\n')
+			writer.writeByte('\n')
 		}
-		formatCorpusFileMatch(writer, result, displayMode, hiddenMatches[index], pal)
+		writer.writeBytes(blocks[index])
+		blocks[index] = nil
 	}
-	if hidden := totalFiles - len(results); hidden > 0 {
-		_ = writer.WriteByte('\n')
+	if hidden := totalFiles - len(ranked); hidden > 0 {
+		writer.writeByte('\n')
 		_, _ = fmt.Fprintf(
 			writer,
-			"… %d more files (showing %d of %d)\n",
+			"… %d more %s (showing %d of %d)\n",
 			hidden,
-			len(results),
+			plural(hidden, "file", "files"),
+			len(ranked),
 			totalFiles,
 		)
 	}
+	return writer.Flush()
 }
 
-func prepareCorpusResultsForDisplay(
-	results []corpusSearchResult,
-	dirtyByCorpus dirtyFilesByCorpus,
-	limit int,
-	maxMatches int,
-) ([]corpusSearchResult, []int, int) {
-	if len(results) == 0 {
-		return nil, nil, 0
+// rankCorpusResultsForDisplay sorts a copy of results for display. Each node
+// read returns one current copy per file, so the results need no
+// deduplication. Equal results keep their input order, as in a stable sort. A
+// result is 352 bytes, so the sort moves positions and copies each result
+// once. On 30,000 results, a stable sort of the results took 40 to 55 ms.
+func rankCorpusResultsForDisplay(results []corpusSearchResult) []corpusSearchResult {
+	order := make([]int, len(results))
+	for index := range order {
+		order[index] = index
 	}
-	deduped := rankCorpusResultsForDisplay(results, dirtyByCorpus)
-	totalFiles := len(deduped)
-	if limit > 0 && len(deduped) > limit {
-		deduped = deduped[:limit]
-	}
-	hiddenMatches := make([]int, len(deduped))
-	for index := range deduped {
-		deduped[index].file.LineMatches, hiddenMatches[index] =
-			normalizeLineMatches(deduped[index].file.LineMatches, maxMatches)
-	}
-	return deduped, hiddenMatches, totalFiles
-}
-
-func rankCorpusResultsForDisplay(
-	results []corpusSearchResult,
-	dirtyByCorpus dirtyFilesByCorpus,
-) []corpusSearchResult {
-	ranked := deduplicateCorpusResults(results, dirtyByCorpus)
-	sort.SliceStable(ranked, func(i, j int) bool {
-		left := ranked[i]
-		right := ranked[j]
-		if left.rankOverride > 0 && right.rankOverride > 0 && left.rankOverride != right.rankOverride {
-			return left.rankOverride < right.rankOverride
+	slices.SortFunc(order, func(left, right int) int {
+		if c := compareCorpusResults(&results[left], &results[right]); c != 0 {
+			return c
 		}
-		return lessCorpusResultBM25(left, right)
+		return cmp.Compare(left, right)
 	})
+	ranked := make([]corpusSearchResult, len(results))
+	for position, index := range order {
+		ranked[position] = results[index]
+	}
 	return ranked
 }
 
-func rankCorpusResultsBM25(
-	results []corpusSearchResult,
-	dirtyByCorpus dirtyFilesByCorpus,
-) []corpusSearchResult {
-	ranked := deduplicateCorpusResults(results, dirtyByCorpus)
-	sort.SliceStable(ranked, func(i, j int) bool {
-		return lessCorpusResultBM25(ranked[i], ranked[j])
-	})
-	return ranked
+// compareCorpusResults orders by the model rank when both results have one.
+// Else it orders by score (highest first), then by file name, display root,
+// and corpus ID, so the order is fixed.
+func compareCorpusResults(left, right *corpusSearchResult) int {
+	if left.rankOverride > 0 && right.rankOverride > 0 && left.rankOverride != right.rankOverride {
+		return cmp.Compare(left.rankOverride, right.rankOverride)
+	}
+	switch {
+	case left.file.Score > right.file.Score:
+		return -1
+	case left.file.Score < right.file.Score:
+		return 1
+	}
+	if c := strings.Compare(left.file.FileName, right.file.FileName); c != 0 {
+		return c
+	}
+	if c := strings.Compare(left.displayRoot, right.displayRoot); c != 0 {
+		return c
+	}
+	return strings.Compare(string(left.corpusID), string(right.corpusID))
 }
 
-func lessCorpusResultBM25(left, right corpusSearchResult) bool {
-	if left.file.Score != right.file.Score {
-		return left.file.Score > right.file.Score
-	}
-	if left.file.FileName != right.file.FileName {
-		return left.file.FileName < right.file.FileName
-	}
-	if left.displayRoot != right.displayRoot {
-		return left.displayRoot < right.displayRoot
-	}
-	return left.corpusID < right.corpusID
-}
-
-func deduplicateCorpusResults(
-	results []corpusSearchResult,
-	dirtyByCorpus dirtyFilesByCorpus,
-) []corpusSearchResult {
-	byPath := make(map[corpusResultKey]dedupEntry, len(results))
-	for i, result := range results {
-		isUncommitted := result.kind == corpusKindGit && result.file.Repository == repoUncommitted
-		key := corpusResultKey{corpusID: result.corpusID, fileName: result.file.FileName}
-		chooseDedupEntry(byPath, key, i, isUncommitted)
-	}
-	out := make([]corpusSearchResult, 0, len(byPath))
-	for _, entry := range byPath {
-		result := results[entry.idx]
-		dirtyFiles := dirtyByCorpus[result.corpusID]
-		if !entry.uncommitted && dirtyFiles.contains(result.file.FileName) {
-			continue
-		}
-		out = append(out, result)
-	}
-	return out
-}
-
-type corpusResultKey struct {
-	corpusID corpusID
-	fileName string
-}
-
-type dedupEntry struct {
-	idx         int
-	uncommitted bool
-}
-
-func chooseDedupEntry[K comparable](entries map[K]dedupEntry, key K, idx int, uncommitted bool) {
-	existing, ok := entries[key]
-	if !ok || (uncommitted && !existing.uncommitted) {
-		entries[key] = dedupEntry{idx: idx, uncommitted: uncommitted}
-	}
-}
-
-// normalizeLineMatches keeps the best distinct lines, then orders them for
-// display. Current zoekt emits one LineMatch per source line, but duplicate
-// handling keeps this formatter safe for synthetic and future callers.
+// normalizeLineMatches keeps the best maxMatches lines (every line when
+// maxMatches <= 0), orders them for display, and returns how many it drops.
+// The rank selects the kept lines before the sort by line number. The render
+// loop needs ascending lines to skip context that overlaps. It never changes
+// the caller's slice.
 //
-// Ranking must select the survivors before line sorting. The render loop also
-// needs ascending lines to suppress overlapping context correctly. The helper
-// never changes the caller's slice.
+// The sorts move positions, and the function copies each kept line once. A line
+// match is more than 100 bytes, and Zoekt returns the lines by score. So a sort
+// of the matches themselves would move each one many times. The line numbers of
+// one file differ, so the order is the same for any sort.
 func normalizeLineMatches(lms []zoekt.LineMatch, maxMatches int) ([]zoekt.LineMatch, int) {
 	if len(lms) < 2 {
 		return lms, 0
 	}
-
-	strictlyOrdered := true
-	for i := 1; i < len(lms); i++ {
-		if lms[i].LineNumber <= lms[i-1].LineNumber {
-			strictlyOrdered = false
-			break
-		}
-	}
-	if strictlyOrdered && (maxMatches <= 0 || len(lms) <= maxMatches) {
+	byLine := func(left, right zoekt.LineMatch) int { return cmp.Compare(left.LineNumber, right.LineNumber) }
+	if slices.IsSortedFunc(lms, byLine) && (maxMatches <= 0 || len(lms) <= maxMatches) {
 		return lms, 0
 	}
 
-	// Never write through to the caller's slice: it shares backing arrays with
-	// the search result, which the caller may still hold.
-	out := make([]zoekt.LineMatch, 0, len(lms))
-	at := make(map[int]int, len(lms))
-	for _, lm := range lms {
-		i, seen := at[lm.LineNumber]
-		if !seen {
-			i = len(out)
-			out = append(out, lm)
-			at[lm.LineNumber] = i
-			continue
-		}
-		// Union the fragments so a merged line stays fully colored. Copy
-		// rather than append in place; out[i].LineFragments still aliases the
-		// caller's array at this point.
-		if len(out[i].LineFragments) == 0 && len(lm.LineFragments) == 0 {
-			continue
-		}
-		merged := make([]zoekt.LineFragmentMatch, 0, len(out[i].LineFragments)+len(lm.LineFragments))
-		merged = append(merged, out[i].LineFragments...)
-		merged = append(merged, lm.LineFragments...)
-		out[i].LineFragments = merged
+	order := make([]int, len(lms))
+	for index := range order {
+		order[index] = index
 	}
-
-	unique := len(out)
-	if maxMatches > 0 && len(out) > maxMatches {
-		sort.Slice(out, func(i, j int) bool {
-			leftScore := stableLineMatchScore(out[i].Score)
-			rightScore := stableLineMatchScore(out[j].Score)
+	if maxMatches > 0 && len(order) > maxMatches {
+		slices.SortFunc(order, func(left, right int) int {
+			leftScore := stableLineMatchScore(lms[left].Score)
+			rightScore := stableLineMatchScore(lms[right].Score)
 			if leftScore != rightScore {
-				return leftScore > rightScore
+				return cmp.Compare(rightScore, leftScore)
 			}
-			return out[i].LineNumber < out[j].LineNumber
+			return cmp.Compare(lms[left].LineNumber, lms[right].LineNumber)
 		})
-		out = out[:maxMatches]
+		order = order[:maxMatches]
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].LineNumber < out[j].LineNumber })
-	return out, unique - len(out)
+	slices.SortFunc(order, func(left, right int) int { return cmp.Compare(lms[left].LineNumber, lms[right].LineNumber) })
+	// Never write to the caller's slice: it shares its array with the search
+	// result, which the caller can still hold.
+	out := make([]zoekt.LineMatch, len(order))
+	for position, index := range order {
+		out[position] = lms[index]
+	}
+	return out, len(lms) - len(out)
 }
 
-// Zoekt can add equal term scores in different orders. Round scores to 12
-// decimal places before the line-number tie-break so parallel searches agree.
+// stableLineMatchScore rounds score to 12 decimal places for the line rank.
+// Zoekt can add equal term scores in different orders. With the rounding, the
+// line-number tie-break decides, and parallel searches agree.
+// TODO(https://github.com/sourcegraph/zoekt/issues/1187): drop the rounding
+// once Zoekt sums in a fixed order.
 func stableLineMatchScore(score float64) float64 {
 	return math.Round(score * 1e12)
 }
 
-func formatCorpusFileMatch(sb *corpusFormatWriter, result corpusSearchResult, displayMode corpusDisplayMode, hiddenMatches int, pal palette) {
+// namesOnlyQuery reports a query whose root is type:file: an output mode that
+// prints file names only on every route.
+func namesOnlyQuery(raw query.Q) bool {
+	typed, ok := query.Simplify(raw).(*query.Type)
+	return ok && typed.Type == query.TypeFileName
+}
+
+// keepFileNamesOnly gives each result the one name line that Zoekt's own
+// type:file search returns. So a model route that ranked content matches
+// prints the same names-only form. A result that has Zoekt's name line keeps
+// it with its highlight.
+func keepFileNamesOnly(results []corpusSearchResult) {
+	for index := range results {
+		file := &results[index].file
+		name := zoekt.LineMatch{Line: []byte(file.FileName), FileName: true}
+		for _, line := range file.LineMatches {
+			if line.FileName {
+				name = line
+				break
+			}
+		}
+		file.LineMatches = []zoekt.LineMatch{name}
+		file.ChunkMatches = nil
+	}
+}
+
+// formatCorpusFileMatch writes the block of one file. The block holds the
+// header, the also line of the copies, and each match line with its context.
+// A last note counts the hiddenMatches lines that the match limit dropped.
+func formatCorpusFileMatch(sb corpusFormatWriter, result corpusSearchResult, displayMode corpusDisplayMode, hiddenMatches int, pal palette) {
 	fm := result.file
 	lang := fm.Language
 	if lang == "" {
 		lang = "unknown"
 	}
 
-	// File header. In multi-corpus mode emit the absolute, directly-openable
-	// path (displayRoot joined to the corpus-relative FileName) so an agent
-	// never has to reconstruct it; the corpus tag then only marks the kind.
-	// In single-corpus mode emit the operand-relative displayName, which
-	// collapses an explicitly-selected file to its basename so the output
-	// reads as the file the user selected.
+	// The file header is the operand as typed, with the path below it
+	// (applyHeaders). The [git] or [folder] tag marks the node kind in
+	// multi-node output.
 	showRoot := displayMode == showCorpusContext && result.displayRoot != ""
 	sb.writeString("## ")
-	if showRoot {
-		writeColoredSanitizedString(sb, pal.file, pal.reset, filepath.Join(result.displayRoot, fm.FileName))
-	} else {
-		name := result.displayName
-		if name == "" {
-			name = fm.FileName
-		}
-		writeColoredSanitizedString(sb, pal.file, pal.reset, name)
-	}
+	sb.writeString(pal.file)
+	writeSanitizedString(sb, result.header)
+	sb.writeString(pal.reset)
 	sb.writeString(" (")
 	writeSanitizedString(sb, lang)
 	sb.writeByte(')')
@@ -435,22 +307,34 @@ func formatCorpusFileMatch(sb *corpusFormatWriter, result corpusSearchResult, di
 		}
 	}
 	sb.writeByte('\n')
+	// Copies with the same content and match print once: the other
+	// paths follow the header, in tie order.
+	if len(result.also) > 0 {
+		sb.writeString("also: ")
+		for index, duplicate := range result.also {
+			if index > 0 {
+				sb.writeString(", ")
+			}
+			writeSanitizedString(sb, duplicate.header)
+		}
+		sb.writeByte('\n')
+	}
 
-	// Track the last line number we emitted so we can insert a blank separator
-	// between non-contiguous regions of context.
+	// lastEmittedLine is the last line number that the loop wrote. A blank
+	// line separates two regions of context that do not touch.
 	lastEmittedLine := 0
 
 	for i, lm := range fm.LineMatches {
-		matchLine := int(lm.LineNumber)
+		matchLine := lm.LineNumber
 
-		// Compute context "before" line count and boundaries.
-		// Count without materializing context lines on the hot path.
+		// Count the "before" context lines and find their bounds. The count
+		// makes no slice of lines, because this code runs for each match line.
 		beforeCount := countContextLines(lm.Before)
 		firstBeforeLine := matchLine - beforeCount
 		skipLines := 0
 		if firstBeforeLine < 1 {
-			// Guard against before-context exceeding file start (matchLine near 0)
-			// or file-only matches where matchLine=0 and beforeLines is empty.
+			// The before-context can start before the file (matchLine near 0).
+			// A file-name match has matchLine=0 and an empty lm.Before.
 			skipLines = 1 - firstBeforeLine
 			if skipLines >= beforeCount {
 				beforeCount = 0
@@ -458,33 +342,38 @@ func formatCorpusFileMatch(sb *corpusFormatWriter, result corpusSearchResult, di
 			firstBeforeLine = 1
 		}
 
-		// Insert a blank separator if there is a gap between the previous
-		// region (match + its after-context) and this region (before-context +
-		// match). Skip for the very first match.
+		// Write a blank separator when a gap is between the previous region
+		// (match and its after-context) and this region (before-context and
+		// match). The first match gets none.
 		if i > 0 && firstBeforeLine > lastEmittedLine+1 {
 			sb.writeByte('\n')
 		}
 
-		// Emit "before" context lines directly from bytes, skipping any that
-		// overlap with the previous region's already-emitted lines.
+		// Write the "before" context lines from the bytes. Skip each line that
+		// the previous region already wrote. The loops cut one line at a time,
+		// as splitContextBytes splits them, with no slice of lines for each
+		// match.
 		if beforeCount > 0 {
-			parts := splitContextBytes(lm.Before)
-			for idx, line := range parts {
-				if idx < skipLines {
-					continue
+			rest := bytes.TrimSuffix(lm.Before, []byte("\n"))
+			for idx := 0; ; idx++ {
+				line, next, more := bytes.Cut(rest, []byte("\n"))
+				if idx >= skipLines {
+					if lineNum := firstBeforeLine + (idx - skipLines); lineNum > lastEmittedLine {
+						writeContextLine(sb, lineNum, line, pal)
+					}
 				}
-				lineNum := firstBeforeLine + (idx - skipLines)
-				if lineNum > lastEmittedLine {
-					writeContextLine(sb, lineNum, line, pal)
+				if !more {
+					break
 				}
+				rest = next
 			}
 		}
 
-		// Emit the match line itself: "<lineNo> [kind] <content>".
+		// Write the match line: "<lineNo> [kind] <content>".
 		writeLineNum(sb, matchLine, pal)
 		sb.writeByte(' ')
 
-		// Symbol kind from first line fragment
+		// The symbol kind comes from the first line fragment.
 		if len(lm.LineFragments) > 0 && lm.LineFragments[0].SymbolInfo != nil && lm.LineFragments[0].SymbolInfo.Kind != "" {
 			sb.writeByte('[')
 			writeSanitizedString(sb, lm.LineFragments[0].SymbolInfo.Kind)
@@ -496,59 +385,58 @@ func formatCorpusFileMatch(sb *corpusFormatWriter, result corpusSearchResult, di
 
 		lastEmittedLine = matchLine
 
-		// Emit "after" context lines directly from bytes, but stop before any
-		// line that would overlap with the next match's before-context or the
-		// next match itself.
-		afterCount := countContextLines(lm.After)
-		afterLimit := afterCount
+		// Write the "after" context lines from the bytes. Stop before a line
+		// that the next match's before-context or the next match holds.
+		afterLimit := countContextLines(lm.After)
 		if i+1 < len(fm.LineMatches) {
-			nextMatch := int(fm.LineMatches[i+1].LineNumber)
-			nextBeforeLen := countContextLines(fm.LineMatches[i+1].Before)
-			nextFirstBefore := nextMatch - nextBeforeLen
-			for k := range afterCount {
-				if matchLine+1+k >= nextFirstBefore {
-					afterLimit = k
-					break
-				}
-			}
+			next := fm.LineMatches[i+1]
+			nextFirstBefore := next.LineNumber - countContextLines(next.Before)
+			afterLimit = min(afterLimit, max(0, nextFirstBefore-matchLine-1))
 		}
 
 		if afterLimit > 0 {
-			parts := splitContextBytes(lm.After)
-			for k := 0; k < afterLimit && k < len(parts); k++ {
+			rest := bytes.TrimSuffix(lm.After, []byte("\n"))
+			for k := 0; k < afterLimit; k++ {
+				line, next, more := bytes.Cut(rest, []byte("\n"))
 				lineNum := matchLine + 1 + k
-				writeContextLine(sb, lineNum, parts[k], pal)
+				writeContextLine(sb, lineNum, line, pal)
 				lastEmittedLine = lineNum
+				if !more {
+					break
+				}
+				rest = next
 			}
 		}
 	}
 
 	if hiddenMatches > 0 {
-		_, _ = fmt.Fprintf(sb, "… %d more matches in this file\n", hiddenMatches)
+		_, _ = fmt.Fprintf(sb, "… %d more %s in this file\n", hiddenMatches, plural(hiddenMatches, "match", "matches"))
 	}
 }
 
-// writeLineNum writes the (optionally colored) line number. No padding or
-// indent — the gutter is intentionally dense to save tokens for agents.
-func writeLineNum(sb *corpusFormatWriter, lineNum int, pal palette) {
+// writeLineNum writes the line number, in color when pal has one. It writes
+// no padding or indent: a dense gutter saves tokens for agents. The digits go
+// straight into the free space of the buffer. strconv.Itoa allocates a string
+// for each number of 100 or more, and this runs for each output line.
+func writeLineNum(sb corpusFormatWriter, lineNum int, pal palette) {
 	sb.writeString(pal.lineNo)
-	sb.writeString(strconv.Itoa(lineNum))
+	sb.writeBytes(strconv.AppendInt(sb.AvailableBuffer(), int64(lineNum), 10))
 	sb.writeString(pal.reset)
 }
 
-// writeContextLine writes a context line: line number, a space, then the
-// sanitized (and length-capped) content.
-func writeContextLine(sb *corpusFormatWriter, lineNum int, content []byte, pal palette) {
+// writeContextLine writes a context line: the line number, a space, then the
+// sanitized content with its length cap.
+func writeContextLine(sb corpusFormatWriter, lineNum int, content []byte, pal palette) {
 	writeLineNum(sb, lineNum, pal)
 	sb.writeByte(' ')
 	writeCappedContent(sb, content)
 	sb.writeByte('\n')
 }
 
-// writeCappedContent writes a context line's content: if it exceeds
-// maxLineBytes it is cut at a rune boundary and a "…+N bytes" marker appended.
-// Context lines carry no match, so a simple tail trim is safe.
-func writeCappedContent(sb *corpusFormatWriter, content []byte) {
+// writeCappedContent writes a context line's content. Past maxLineBytes, it
+// cuts the content at a rune boundary and adds a "…+N bytes" marker. A
+// context line holds no match, so a cut of its tail is safe.
+func writeCappedContent(sb corpusFormatWriter, content []byte) {
 	n := len(content)
 	if n <= maxLineBytes {
 		writeSanitized(sb, content)
@@ -559,47 +447,34 @@ func writeCappedContent(sb *corpusFormatWriter, content []byte) {
 	_, _ = fmt.Fprintf(sb, " …+%d bytes", n-end)
 }
 
-// writeMatchLineContent writes a match line's content, windowing very long
-// lines AROUND their matches (so the match stays visible even if it sits deep
-// in a minified line) and coloring each matched span. The line is segmented at
-// raw fragment offsets first, then each segment is sanitized — so offsets are
-// never re-indexed and a control byte inside a match cannot shift the spans.
-func writeMatchLineContent(sb *corpusFormatWriter, content []byte, frags []zoekt.LineFragmentMatch, pal palette) {
+// writeMatchLineContent writes a match line's content and colors each matched
+// span. A very long line shows a window around its matches, so a match deep in
+// a minified line stays visible. It cuts the line at the raw fragment offsets
+// first, then sanitizes each segment. So the offsets never change, and a
+// control byte in a match cannot move the spans.
+func writeMatchLineContent(sb corpusFormatWriter, content []byte, frags []zoekt.LineFragmentMatch, pal palette) {
 	n := len(content)
 
-	// 1. Build clamped, non-empty, coalesced spans. zoekt documents fragments
-	// as sorted ascending by offset and non-overlapping, but only enforces that
-	// on its ChunkMatch path — not the LineMatch path seek uses. So sort the
-	// local spans defensively before coalescing: a single out-of-order fragment
-	// would otherwise be silently dropped by the "start <= prev.end" merge.
+	// 1. Build clamped, non-empty, merged spans. Zoekt documents fragments as
+	// sorted by offset and not overlapping. It makes sure of that only on its
+	// ChunkMatch path, not on the LineMatch path that Seek uses. So sort the
+	// spans before the merge. Else the "start <= prev.end" merge would drop a
+	// fragment out of order with no sign.
 	//
-	// A stack-backed array keeps the common case (≤16 fragments per line) off the
-	// heap; only a pathologically fragmented line spills to a heap-grown slice.
+	// An array on the stack keeps the usual case (16 fragments or fewer per
+	// line) off the heap. Only a line with very many fragments grows a slice on
+	// the heap.
 	type span struct{ start, end int }
 	var buf [16]span
 	spans := buf[:0]
 	for _, f := range frags {
-		s := f.LineOffset
-		e := f.LineOffset + f.MatchLength
-		if s < 0 {
-			s = 0
-		}
-		if e > n {
-			e = n
-		}
-		if s >= e { // zero-length, or match at/after the trimmed newline
+		s, e := max(f.LineOffset, 0), min(f.LineOffset+f.MatchLength, n)
+		if s >= e { // zero length, or a match at or after the trimmed newline
 			continue
 		}
 		spans = append(spans, span{s, e})
 	}
-	// Insertion sort by start. We avoid sort.Slice deliberately: its interface
-	// dispatch forces `spans` to escape to the heap (one alloc per match line).
-	// Fragments are almost always already sorted, so this is O(n) in practice.
-	for i := 1; i < len(spans); i++ {
-		for j := i; j > 0 && spans[j-1].start > spans[j].start; j-- {
-			spans[j-1], spans[j] = spans[j], spans[j-1]
-		}
-	}
+	slices.SortFunc(spans, func(left, right span) int { return cmp.Compare(left.start, right.start) })
 	merged := spans[:0]
 	for _, sp := range spans {
 		if k := len(merged); k > 0 && sp.start <= merged[k-1].end {
@@ -612,43 +487,29 @@ func writeMatchLineContent(sb *corpusFormatWriter, content []byte, frags []zoekt
 	}
 	spans = merged
 
-	// 2. Window long lines around the matches. Every span lies fully inside
-	// [firstStart-CTX, lastEnd+CTX], so windowing never bisects a match.
+	// 2. Window long lines around the matches. The window runs from
+	// matchCtxBytes before the first span to matchCtxBytes after the last
+	// span. So every span is fully in it, and the window cuts no match.
 	winStart, winEnd := 0, n
-	headDropped, tailDropped := 0, 0
 	if n > maxLineBytes && len(spans) > 0 {
-		winStart = spans[0].start - matchCtxBytes
-		if winStart < 0 {
-			winStart = 0
-		}
-		winEnd = spans[len(spans)-1].end + matchCtxBytes
-		if winEnd > n {
-			winEnd = n
-		}
-		// 3. Keep cuts on rune boundaries: a mid-rune split would corrupt the
-		// segment and break sanitization across separate segments.
-		winStart = backupToRuneBoundary(content, winStart)
-		winEnd = backupToRuneBoundary(content, winEnd)
-		headDropped = winStart
-		tailDropped = n - winEnd
+		// 3. Keep cuts on rune boundaries. A cut in a rune would damage the
+		// segment and break the sanitization of the segments on each side.
+		winStart = backupToRuneBoundary(content, max(spans[0].start-matchCtxBytes, 0))
+		winEnd = backupToRuneBoundary(content, min(spans[len(spans)-1].end+matchCtxBytes, n))
 	}
 
-	if headDropped > 0 {
-		_, _ = fmt.Fprintf(sb, "…+%d bytes ", headDropped)
+	if winStart > 0 {
+		_, _ = fmt.Fprintf(sb, "…+%d bytes ", winStart)
 	}
 
-	// 4. Walk spans inside the window, coloring each matched (visible) span.
+	// 4. Walk the spans in the window, and color each visible matched span.
 	cur := winStart
 	for _, sp := range spans {
 		s, e := sp.start, sp.end
-		if e <= winStart || s >= winEnd { // defensive; spans are inside the window
+		// Invalid UTF-8 can move winEnd back over a span.
+		s, e = max(s, winStart), min(e, winEnd)
+		if s >= e {
 			continue
-		}
-		if s < winStart {
-			s = winStart
-		}
-		if e > winEnd {
-			e = winEnd
 		}
 		if cur < s {
 			writeSanitized(sb, content[cur:s])
@@ -667,21 +528,21 @@ func writeMatchLineContent(sb *corpusFormatWriter, content []byte, frags []zoekt
 		writeSanitized(sb, content[cur:winEnd])
 	}
 
-	if tailDropped > 0 {
-		_, _ = fmt.Fprintf(sb, " …+%d bytes", tailDropped)
+	if winEnd < n {
+		_, _ = fmt.Fprintf(sb, " …+%d bytes", n-winEnd)
 	}
 }
 
-// stripRune reports whether output must omit r. It drops C0, C1, and DEL control
-// characters except tab. It also drops bidirectional formatting and line or
-// paragraph separators because they can alter the displayed source layout. It
-// keeps zero-width joiners for scripts and emoji sequences.
+// stripRune reports whether output must omit r. It drops C0, C1, and DEL
+// control characters except tab. It also drops bidirectional formatting and
+// line or paragraph separators because they can alter the displayed source
+// layout. It keeps zero-width joiners for scripts and emoji sequences.
 func stripRune(r rune) bool {
 	if r < 0x80 {
 		// Strip C0 controls and DEL, but keep tab.
 		return (r < 0x20 || r == 0x7f) && r != '\t'
 	}
-	if unicode.IsControl(r) { // C1 controls (U+0080–U+009F)
+	if unicode.IsControl(r) { // C1 controls (U+0080 to U+009F)
 		return true
 	}
 	switch r {
@@ -695,20 +556,29 @@ func stripRune(r rune) bool {
 	return false
 }
 
-// writeSanitized writes b after it removes code points selected by stripRune.
-// It iterates runes because C1 values overlap UTF-8 continuation bytes. When no
-// rune is removed, it writes the original bytes unchanged.
+// writeSanitized writes b after it removes the code points that stripRune
+// selects. It reads runes, because C1 values overlap UTF-8 continuation bytes.
+// When it removes no rune, it writes the original bytes unchanged.
 //
-// Invalid UTF-8: a clean line is written verbatim (bytes preserved); a line that
-// also needs stripping goes through the rune path, where invalid bytes decode to
-// U+FFFD.
-func writeSanitized(sb *corpusFormatWriter, b []byte) {
+// Invalid UTF-8: a clean line goes out as it is, with its bytes. A line that
+// also needs a removal goes through the rune path, where invalid bytes decode
+// to U+FFFD.
+//
+// The check decodes the bytes in place. A range over string(b) copies the
+// bytes first, on the heap past 32 bytes, and all the output goes through
+// here.
+func writeSanitized(sb corpusFormatWriter, b []byte) {
 	clean := true
-	for _, r := range string(b) {
+	for index := 0; index < len(b); {
+		r, size := rune(b[index]), 1
+		if r >= utf8.RuneSelf {
+			r, size = utf8.DecodeRune(b[index:])
+		}
 		if stripRune(r) {
 			clean = false
 			break
 		}
+		index += size
 	}
 	if clean {
 		sb.writeBytes(b)
@@ -722,7 +592,8 @@ func writeSanitized(sb *corpusFormatWriter, b []byte) {
 	}
 }
 
-func writeSanitizedString(sb *corpusFormatWriter, text string) {
+// writeSanitizedString is writeSanitized for a string.
+func writeSanitizedString(sb corpusFormatWriter, text string) {
 	clean := true
 	for _, char := range text {
 		if stripRune(char) {
@@ -742,20 +613,9 @@ func writeSanitizedString(sb *corpusFormatWriter, text string) {
 	}
 }
 
-func writeColoredSanitizedString(
-	sb *corpusFormatWriter,
-	color string,
-	reset string,
-	text string,
-) {
-	sb.writeString(color)
-	writeSanitizedString(sb, text)
-	sb.writeString(reset)
-}
-
-// containsVisible reports whether b has any rune that survives sanitization
-// (i.e. a non-control rune, or tab). Used to avoid emitting an empty color pair
-// around an all-control match span.
+// containsVisible reports whether b has a rune that stripRune keeps. It
+// prevents an empty color pair around a match span that holds only stripped
+// runes.
 func containsVisible(b []byte) bool {
 	for _, r := range string(b) {
 		if !stripRune(r) {
@@ -765,9 +625,9 @@ func containsVisible(b []byte) bool {
 	return false
 }
 
-// backupToRuneBoundary returns the largest index <= pos at which a rune starts,
-// i.e. it backs up off any UTF-8 continuation byte. Used to keep window/cap
-// cuts on rune boundaries.
+// backupToRuneBoundary returns the largest index <= pos at which a rune
+// starts: it moves back over UTF-8 continuation bytes. The window and cap cuts
+// use it to stay on rune boundaries.
 func backupToRuneBoundary(b []byte, pos int) int {
 	for pos > 0 && pos < len(b) && b[pos]&0xC0 == 0x80 {
 		pos--
@@ -775,9 +635,19 @@ func backupToRuneBoundary(b []byte, pos int) int {
 	return pos
 }
 
+// utf8Prefix returns the longest start of text of at most limit bytes that
+// does not cut a rune (backupToRuneBoundary).
+func utf8Prefix(text string, limit int) string {
+	if len(text) <= limit {
+		return text
+	}
+	end := backupToRuneBoundary([]byte(text), limit)
+	return text[:end]
+}
+
 // splitContextBytes splits raw context bytes (from LineMatch.Before or .After)
-// into sub-slices sharing the original data. A trailing newline is treated as
-// a terminator, not an empty line.
+// into slices of the original data. A trailing newline ends the last line; it
+// is not an empty line.
 func splitContextBytes(data []byte) [][]byte {
 	if len(data) == 0 {
 		return nil
@@ -785,13 +655,21 @@ func splitContextBytes(data []byte) [][]byte {
 	return bytes.Split(bytes.TrimSuffix(data, []byte("\n")), []byte("\n"))
 }
 
-// countContextLines counts how many context lines are in the raw bytes
-// without allocating. It mirrors splitContextBytes' trimming logic:
-// a trailing newline is ignored (it's a terminator, not an empty line).
+// countContextLines counts the context lines in the raw bytes, with no
+// allocation. It trims as splitContextBytes does: a trailing newline ends the
+// last line and is not an empty line.
 func countContextLines(data []byte) int {
 	if len(data) == 0 {
 		return 0
 	}
 	data = bytes.TrimSuffix(data, []byte("\n"))
 	return bytes.Count(data, []byte("\n")) + 1
+}
+
+// plural gives one for a count of 1 and many otherwise.
+func plural(count int, one, many string) string {
+	if count == 1 {
+		return one
+	}
+	return many
 }

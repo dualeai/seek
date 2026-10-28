@@ -4,15 +4,16 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"strings"
+	"syscall"
 	"testing"
 )
 
 func TestFormatCLIError(t *testing.T) {
-	const gib = int64(1024 * 1024 * 1024)
-	plan := corpusPlan{
+	plan := node{
 		root:     "/work/src",
 		cacheDir: "/cache/corpus",
 		indexDir: "/cache/corpus/index",
@@ -24,61 +25,6 @@ func TestFormatCLIError(t *testing.T) {
 		want string
 	}{
 		{
-			name: "folder indexed bytes",
-			err: folderCorpusError(plan, folderCapError(
-				"opaque folder byte cause",
-				indexCapIndexedBytes,
-				3*gib+1,
-				3*gib,
-			)),
-			want: "seek: cannot index \"/work/src\": the total size of indexable files exceeds the 3 GiB folder limit\n" +
-				"hint: pass smaller paths after the query; file: and -file: filters apply after indexing",
-		},
-		{
-			name: "folder candidate files",
-			err: folderCorpusError(plan, folderCapError(
-				"opaque folder file cause",
-				indexCapCandidateFiles,
-				8,
-				7,
-			)),
-			want: "seek: cannot index \"/work/src\": more than 7 files are candidates for indexing\n" +
-				"hint: pass smaller paths after the query; file: and -file: filters apply after indexing",
-		},
-		{
-			name: "git indexed bytes",
-			err: gitCorpusError("/work/repo", "/cache/index", gitCapError(
-				"opaque Git byte cause",
-				indexCapIndexedBytes,
-				4*gib+1,
-				4*gib,
-			)),
-			want: "seek: cannot index Git repository \"/work/repo\": the total size of working-tree indexable files exceeds the 4 GiB Git index-family limit\n" +
-				"hint: pass smaller paths after the query; file: and -file: filters apply after indexing",
-		},
-		{
-			name: "git committed candidates",
-			err: gitCorpusError("/work/repo", "/cache/index", gitCommittedCapError(
-				"opaque Git committed cause",
-				indexCapCandidateFiles,
-				8,
-				7,
-			)),
-			want: "seek: cannot index Git repository \"/work/repo\": more than 7 committed-tree entries are candidates for indexing\n" +
-				"hint: pass smaller paths after the query; file: and -file: filters apply after indexing",
-		},
-		{
-			name: "git committed candidate blob bytes",
-			err: gitCorpusError("/work/repo", "/cache/index", gitCommittedCapError(
-				"opaque Git committed byte cause",
-				indexCapIndexedBytes,
-				4*gib+1,
-				4*gib,
-			)),
-			want: "seek: cannot index Git repository \"/work/repo\": the total size of committed-tree candidate blobs exceeds the 4 GiB Git index-family limit\n" +
-				"hint: pass smaller paths after the query; file: and -file: filters apply after indexing",
-		},
-		{
 			name: "query syntax",
 			err:  &querySyntaxError{query: "foo or", cause: parseCause},
 			want: "seek: invalid query \"foo or\": parser detail",
@@ -89,15 +35,19 @@ func TestFormatCLIError(t *testing.T) {
 			want: "seek: path does not exist: \"missing\"",
 		},
 		{
+			name: "folder root removed during the search",
+			err:  folderCorpusError(plan, fmt.Errorf("read folder root: %w", fs.ErrNotExist)),
+			want: "seek: path does not exist: \"/work/src\"",
+		},
+		{
+			name: "Git directory",
+			err:  newPathOperandError(pathOperandResolve, "repo/.git", errGitDirectoryOperand),
+			want: "seek: cannot search a Git directory: \"repo/.git\"",
+		},
+		{
 			name: "unreadable path",
 			err:  newPathOperandError(pathOperandRead, "private", fs.ErrPermission),
 			want: "seek: cannot read path \"private\": permission denied",
-		},
-		{
-			name: "search root",
-			err:  &searchRootError{cause: errors.New("exit status 128")},
-			want: "seek: cannot determine a default Git search root\n" +
-				"hint: run seek in a Git worktree or pass a path after the query, for example: seek 'query' .",
 		},
 		{
 			name: "git not found",
@@ -219,8 +169,7 @@ func TestReportStaleIndexWarning_CtagsHidesTechnicalContextAtWarn(t *testing.T) 
 	if !ok {
 		t.Fatalf("debug error=%T, want error", testLogAttrs(debugRecord)["error"])
 	}
-	corpusErr, ok := errors.AsType[*gitCorpusContextError](debugErr)
-	if !ok || corpusErr.root != "/secret/repo" || corpusErr.indexDir != "/secret/cache/index" {
+	if !strings.Contains(debugErr.Error(), `git corpus root="/secret/repo" index="/secret/cache/index": `) {
 		t.Errorf("debug error=%v, want Git corpus context", debugErr)
 	}
 	ctagsErr, ok := errors.AsType[*ctagsUnavailableError](debugErr)
@@ -268,5 +217,25 @@ func TestReportStaleIndexWarning_CancellationDoesNotWarn(t *testing.T) {
 				t.Fatalf("cancellation records=%+v, want none", records)
 			}
 		})
+	}
+}
+
+// TestKeptFilesWarningNamesTheFile checks the warning for dirty files kept by
+// name: one record with their count, the first path, and the cause without
+// the path.
+func TestKeptFilesWarningNamesTheFile(t *testing.T) {
+	recorder := captureTestLogs(t, slog.LevelWarn)
+	reportStaleIndexWarning(gitCorpusError("/repo", "/index", &dirtyFilesKept{files: []string{"b.txt", "c.txt"}, cause: fmt.Errorf("read /repo/b.txt: %w", &fs.PathError{Op: "open", Path: "/repo/b.txt", Err: syscall.EIO})}))
+	records := recorder.Records()
+	if len(records) != 1 || !strings.Contains(records[0].Message, "by name only") {
+		t.Fatalf("records=%v", records)
+	}
+	attrs := map[string]string{}
+	records[0].Attrs(func(attr slog.Attr) bool {
+		attrs[attr.Key] = attr.Value.String()
+		return true
+	})
+	if attrs["files"] != "2" || attrs["first"] != "b.txt" || attrs["cause"] != syscall.EIO.Error() {
+		t.Fatalf("attrs=%v", attrs)
 	}
 }

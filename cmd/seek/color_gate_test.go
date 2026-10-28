@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-// withCleanColorEnv unsets the color-related env vars for the duration of the
-// test and restores their originals afterward, so each case starts from a known
-// state (t.Setenv can't unset, which these branches require).
+// withCleanColorEnv unsets NO_COLOR, CLICOLOR_FORCE and TERM, and puts their
+// values back at cleanup, so each case starts from a known state. t.Setenv
+// cannot unset a variable, and the unset branches need that.
 func withCleanColorEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{"NO_COLOR", "CLICOLOR_FORCE", "TERM"} {
@@ -20,10 +20,12 @@ func withCleanColorEnv(t *testing.T) {
 	}
 }
 
+// TestUseColor_GatePrecedence checks the order of the color rules of useColor
+// on a pipe: NO_COLOR, then CLICOLOR_FORCE, then TERM.
 func TestUseColor_GatePrecedence(t *testing.T) {
-	// A pipe is never a terminal, so term.IsTerminal is false here — letting us
-	// exercise every env branch deterministically (the isatty=true branch needs
-	// a real PTY and is intentionally out of scope for this unit test).
+	// A pipe is never a terminal, so term.IsTerminal is false, and each
+	// environment branch gives the same result on every host. The terminal
+	// branch needs a real PTY, so this unit test does not check it.
 	pr, pw, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)

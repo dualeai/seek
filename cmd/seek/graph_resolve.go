@@ -1,0 +1,262 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"maps"
+	"os"
+	"path/filepath"
+
+	"golang.org/x/sys/unix"
+)
+
+// errGitDirectoryOperand rejects a path operand at or below a Git directory: a
+// .git directory, a bare repository, or anything inside one. Its files are Git
+// internals, not content.
+var errGitDirectoryOperand = errors.New("path is inside a Git directory")
+
+// plannedExternalOperands are the seed nodes of the graph expansion.
+type plannedExternalOperands struct {
+	gitRoots []externalGitRoot
+	roots    []externalRoot
+}
+
+// externalGitRoot is a Git node of the graph expansion.
+type externalGitRoot struct {
+	paths gitPaths
+	// operands are the canonical paths that the search covers.
+	operands []gitScopeOperand
+	// state and children are the node capture: its git status, and the
+	// nested repositories that git status and git ls-files listed. They hold
+	// data only when captured is true. A node that the expansion did not
+	// capture failed, and has no plan.
+	state    repoState
+	children []string
+	// emitted holds the children that childrenInScope already returned.
+	emitted  map[string]struct{}
+	captured bool
+}
+
+// externalRoot is a folder seed: a directory or a single file.
+type externalRoot struct {
+	path string
+	info os.FileInfo
+}
+
+// resolvedOperand is an operand with its canonical path and its owning Git
+// worktree (if any). Git visibility then routes it to a Git or a folder seed.
+type resolvedOperand struct {
+	canonical string
+	info      os.FileInfo
+	repo      *gitPaths // owning worktree, or nil when outside any repo
+}
+
+type pathOperandOperation string
+
+const (
+	pathOperandResolve pathOperandOperation = "resolve"
+	pathOperandRead    pathOperandOperation = "read"
+)
+
+// pathOperandError preserves the exact operand and operation while wrapping
+// the file-system cause for errors.Is and verbose logs.
+type pathOperandError struct {
+	operation pathOperandOperation
+	operand   string
+	cause     error
+}
+
+func (e *pathOperandError) Error() string {
+	return fmt.Sprintf("%s path %q: %v", e.operation, e.operand, e.cause)
+}
+
+func (e *pathOperandError) Unwrap() error {
+	return e.cause
+}
+
+func newPathOperandError(operation pathOperandOperation, operand string, cause error) error {
+	return &pathOperandError{operation: operation, operand: operand, cause: cause}
+}
+
+// statOperand resolves one path operand and reads its type. It opens a file
+// operand once, so a file that exists but that Seek cannot read is a node
+// failure, as an unreadable folder is. It returns the absolute path whenever
+// the path resolves, also with an error.
+func statOperand(operand string) (string, os.FileInfo, error) {
+	abs, err := filepath.Abs(operand)
+	if err != nil {
+		return "", nil, newPathOperandError(pathOperandResolve, operand, err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return abs, nil, newPathOperandError(pathOperandRead, operand, err)
+	}
+	if !info.IsDir() && !info.Mode().IsRegular() {
+		return abs, nil, fmt.Errorf("unsupported path operand: %s", operand)
+	}
+	// The open proves read access. Seek does not open a cloud-only file: the
+	// open would download it, and the build never reads its bytes.
+	var st unix.Stat_t
+	if info.Mode().IsRegular() && (unix.Stat(abs, &st) != nil || !fileIsDataless(abs, &st)) {
+		file, err := os.Open(abs)
+		if err != nil {
+			return abs, nil, newPathOperandError(pathOperandRead, operand, err)
+		}
+		_ = file.Close()
+	}
+	return abs, info, nil
+}
+
+// resolveOperands resolves each explicit operand to its canonical path, its
+// owning Git worktree, and its Git visibility. Then it groups the operands into
+// the seeds of the graph expansion: Git roots and folder roots. An operand that
+// exists but that Seek cannot read, or whose repository Git cannot use or
+// classify, is a node failure with one warning. Any other stat error, and an
+// operand inside a Git directory, is an error.
+func resolveOperands(ctx context.Context, operands []string) (plannedExternalOperands, error) {
+	var result plannedExternalOperands
+
+	// Resolve each operand to its canonical path and owning Git worktree.
+	// Resolve a file operand through its parent directory. Group in-repo
+	// operands by repository so visibility needs one Git check per root.
+	resolved := make([]resolvedOperand, 0, len(operands))
+	pathsByRepo := make(map[string][]string)
+	listings := make(dirListings)
+	for _, operand := range operands {
+		abs, info, err := statOperand(operand)
+		if errors.Is(err, fs.ErrPermission) {
+			// The operand exists, but Seek cannot read it: a node failure,
+			// not an operand error.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return result, ctxErr
+			}
+			root := operand
+			if abs != "" {
+				root = canonicalCorpusPath(abs)
+			}
+			warnSkippedNode(ctx, root, err)
+			continue
+		}
+		if err != nil {
+			return result, err
+		}
+		// The on-disk case gives one root form for headers and nodes.
+		canonical := onDiskPath(canonicalCorpusPath(abs))
+		probe := canonical
+		if !info.IsDir() {
+			probe = filepath.Dir(canonical)
+		}
+		if gitDirectoryOperand(probe) {
+			return result, newPathOperandError(pathOperandResolve, operand, errGitDirectoryOperand)
+		}
+		ro := resolvedOperand{canonical: canonical, info: info}
+		paths, ok, err := operandRepo(ctx, probe)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return result, ctxErr
+			}
+			warnSkippedNode(ctx, canonical, err)
+			continue
+		}
+		if ok {
+			repo := paths
+			ro.repo = &repo
+			repoRoot := canonicalCorpusPath(paths.RepoDir)
+			// Give the operand the stored names where onDiskPath could not
+			// (realCaseWithin).
+			ro.canonical = realCaseWithin(repoRoot, canonical, listings)
+			pathsByRepo[repoRoot] = append(pathsByRepo[repoRoot], ro.canonical)
+		}
+		resolved = append(resolved, ro)
+	}
+
+	// Classify each in-repo operand. Visible paths use the scoped Git corpus;
+	// ignored paths use a folder or file corpus so their content stays visible.
+	inGit := make(map[string]bool)
+	failedRepos := make(map[string]bool)
+	for repoRoot, paths := range pathsByRepo {
+		decided, err := classifyVisibility(ctx, repoRoot, paths)
+		if err != nil {
+			// Git cannot decide the operands of this repository: the node
+			// fails with one warning, and its operands are never searched as
+			// folders.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return result, ctxErr
+			}
+			warnSkippedNode(ctx, repoRoot, err)
+			failedRepos[repoRoot] = true
+			continue
+		}
+		maps.Copy(inGit, decided)
+	}
+
+	// Group the seeds. Files and directories use the same visibility rule.
+	gitIndex := make(map[string]int)
+	for _, ro := range resolved {
+		if ro.repo != nil && failedRepos[canonicalCorpusPath(ro.repo.RepoDir)] {
+			continue
+		}
+		if ro.repo != nil && inGit[ro.canonical] {
+			repoRoot := canonicalCorpusPath(ro.repo.RepoDir)
+			i, found := gitIndex[repoRoot]
+			if !found {
+				i = len(result.gitRoots)
+				gitIndex[repoRoot] = i
+				result.gitRoots = append(result.gitRoots, externalGitRoot{paths: *ro.repo})
+			}
+			result.gitRoots[i].operands = append(result.gitRoots[i].operands,
+				gitScopeOperand{path: ro.canonical, dir: ro.info.IsDir()})
+			continue
+		}
+		// ro.canonical holds the on-disk letter case, so a folder seed compares
+		// with the other seeds by path (nested seeds).
+		result.roots = append(result.roots, externalRoot{path: ro.canonical, info: ro.info})
+	}
+	return result, nil
+}
+
+// operandRepo returns the Git node that holds probe. It walks up and decides
+// each `.git` entry by the expansion's rule (classifyGitDir):
+//   - A confirmed boundary needs no Git process.
+//   - A stray entry names no repository, so the walk goes on to the parent.
+//   - An entry that points to another work tree's Git directory, or that Git
+//     refuses, is a node failure and never a folder.
+//
+// Git runs in the boundary directory, so all operands of one repository share
+// one read of its filter drivers (readRepoGitConfig).
+func operandRepo(ctx context.Context, probe string) (gitPaths, bool, error) {
+	for dir := probe; ; {
+		if paths, ok, err := classifyGitDir(ctx, dir); ok || err != nil {
+			return paths, ok, err
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return gitPaths{}, false, nil
+		}
+		dir = parent
+	}
+}
+
+// gitDirectoryOperand reports a path at or below a Git directory. That is a
+// .git directory, a bare repository (HEAD that Git accepts, objects, and refs),
+// or anything inside one. The walk up stops at the first directory that holds a
+// `.git` entry: below it lies a work tree, even inside a bare repository. The
+// rule is the folder walk's file-system rule, with no Git process: a Git
+// directory that Git refuses or cannot read stays a Git directory.
+func gitDirectoryOperand(dir string) bool {
+	for current := dir; ; {
+		if isGitEntry(filepath.Dir(current), filepath.Base(current)) || detectBareRepoAt(current) {
+			return true
+		}
+		if _, err := os.Lstat(filepath.Join(current, gitEntryName)); err == nil {
+			return false
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return false
+		}
+		current = parent
+	}
+}

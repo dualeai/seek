@@ -2,67 +2,62 @@ package main
 
 import (
 	"fmt"
-	"os"
+	"maps"
 	"path/filepath"
 	"regexp"
-	"sort"
-	"strings"
+	"slices"
 
 	"github.com/sourcegraph/zoekt/query"
 )
 
-// This file builds the scope that restricts a Git corpus search to selected
-// paths. gitScopeSpec holds the parsed paths and builds the committed query.
-// gitDirtyScope separately supplies Git pathspecs and filters to the native
-// committed full reader and the dirty reader. The remaining helpers collapse
-// and deduplicate the selection.
+// maxRegexpFileOperands is the largest number of file operands that become
+// anchored file-name regexps. Zoekt finds each such regexp through the
+// file-name trigram index. A FileNameSet tests the name of every document of
+// each shard of the whole-repository index. Above this count, the Or of that
+// many regexp match trees costs more than one FileNameSet map, so the scope
+// uses the set.
+const maxRegexpFileOperands = 64
 
-type gitDirtyScope struct {
-	includeDirs  []string
-	includeFiles []string
-	excludeDirs  []string
-	excludeFiles []string
-	key          string
+// gitScopeOperand is one path that the search of a Git node covers: an
+// absolute path, and whether it is a directory. Any other operand is a regular
+// file. statOperand read the type and rejected every other type, so the scope
+// does not read the path again.
+type gitScopeOperand struct {
+	path string
+	dir  bool
 }
 
-type gitScopeSpec struct {
-	dirs         []string
-	files        []string
-	rootIncluded bool
-}
-
-func combineGitScope(includeScope, excludeScope query.Q) query.Q {
-	if excludeScope == nil {
-		return includeScope
+// gitScopeQuery gives the search-time filter that restricts a Git corpus
+// search to the path operands below the work-tree root. An operand at the root
+// selects the whole work tree: the filter is nil. A directory that another
+// directory holds, and a file that a directory holds, add nothing.
+func gitScopeQuery(root string, operands []gitScopeOperand) (query.Q, error) {
+	root = canonicalCorpusPath(root)
+	fileSet := make(map[string]struct{})
+	dirSet := make(map[string]struct{})
+	for _, operand := range operands {
+		rel, ok := relWithin(root, canonicalCorpusPath(operand.path))
+		if !ok {
+			return nil, fmt.Errorf("path outside current git worktree: %s", operand.path)
+		}
+		if rel == "." {
+			return nil, nil
+		}
+		name := filepath.ToSlash(rel)
+		if operand.dir {
+			dirSet[name] = struct{}{}
+		} else {
+			fileSet[name] = struct{}{}
+		}
 	}
-	notExcluded := &query.Not{Child: excludeScope}
-	if includeScope == nil {
-		return notExcluded
-	}
-	return query.Simplify(query.NewAnd(includeScope, notExcluded))
-}
+	dirs := collapseDirectoryScopes(slices.Sorted(maps.Keys(dirSet)))
+	files := dropFilesCoveredByDirs(slices.Sorted(maps.Keys(fileSet)), dirs)
 
-// maxRegexpFileOperands bounds how many individual file operands are expanded
-// into anchored filename regexps. Each anchored regexp distills to a filename
-// trigram lookup (index-assisted), far cheaper than FileNameSet's O(numDocs)
-// per-shard scan over a whole-repo combined index. Above this many operands the
-// Or of that many regexp match-trees costs more than one FileNameSet map, so we
-// fall back to the set. A var (not const) so tests can force either path.
-var maxRegexpFileOperands = 64
-
-func buildCurrentGitScope(root string, operands []string) (query.Q, error) {
-	spec, err := buildGitScopeSpec(root, operands)
-	if err != nil || spec.rootIncluded {
-		return nil, err
-	}
-
-	queries := make([]query.Q, 0, len(spec.files)+len(spec.dirs))
-	if n := len(spec.files); n > maxRegexpFileOperands {
-		queries = append(queries, query.NewFileNameSet(spec.files...))
+	queries := make([]query.Q, 0, len(files)+len(dirs))
+	if n := len(files); n > maxRegexpFileOperands {
+		queries = append(queries, query.NewFileNameSet(files...))
 	} else if n > 0 {
-		// Anchored exact-path filename regexps are trigram-assisted on the
-		// combined whole-repo index; FileNameSet would scan every doc.
-		for _, file := range spec.files {
+		for _, file := range files {
 			fileQ, err := query.RegexpQuery("^"+regexp.QuoteMeta(file)+"$", false, true)
 			if err != nil {
 				return nil, fmt.Errorf("build file scope %q: %w", file, err)
@@ -70,7 +65,7 @@ func buildCurrentGitScope(root string, operands []string) (query.Q, error) {
 			queries = append(queries, fileQ)
 		}
 	}
-	for _, dir := range spec.dirs {
+	for _, dir := range dirs {
 		dirQ, err := query.RegexpQuery("^"+regexp.QuoteMeta(dir)+"/", false, true)
 		if err != nil {
 			return nil, fmt.Errorf("build directory scope %q: %w", dir, err)
@@ -78,100 +73,14 @@ func buildCurrentGitScope(root string, operands []string) (query.Q, error) {
 		queries = append(queries, dirQ)
 	}
 
-	switch len(queries) {
-	case 0:
-		return nil, nil
-	case 1:
+	if len(queries) == 1 {
 		return queries[0], nil
-	default:
-		return query.NewOr(queries...), nil
 	}
+	return query.NewOr(queries...), nil
 }
 
-func buildGitDirtyScope(root string, operands, excludes []string) (*gitDirtyScope, error) {
-	include, err := buildGitScopeSpec(root, operands)
-	if err != nil || include.rootIncluded {
-		return nil, err
-	}
-	if len(include.dirs) == 0 && len(include.files) == 0 {
-		return nil, nil
-	}
-	exclude, err := buildGitScopeSpec(root, excludes)
-	if err != nil {
-		return nil, err
-	}
-	scope := &gitDirtyScope{
-		includeDirs:  include.dirs,
-		includeFiles: include.files,
-		excludeDirs:  exclude.dirs,
-		excludeFiles: exclude.files,
-	}
-	scope.key = hashParts(
-		"git_dirty_scope_v1",
-		"include_dirs", strings.Join(scope.includeDirs, "\x00"),
-		"include_files", strings.Join(scope.includeFiles, "\x00"),
-		"exclude_dirs", strings.Join(scope.excludeDirs, "\x00"),
-		"exclude_files", strings.Join(scope.excludeFiles, "\x00"),
-	)
-	return scope, nil
-}
-
-func buildGitScopeSpec(root string, operands []string) (gitScopeSpec, error) {
-	root = canonicalCorpusPath(root)
-	fileSet := make(map[string]struct{})
-	dirSet := make(map[string]struct{})
-	for _, operand := range operands {
-		abs, err := filepath.Abs(operand)
-		if err != nil {
-			return gitScopeSpec{}, newPathOperandError(pathOperandResolve, operand, err)
-		}
-		info, err := os.Stat(abs)
-		if err != nil {
-			return gitScopeSpec{}, newPathOperandError(pathOperandRead, operand, err)
-		}
-		canonical := canonicalCorpusPath(abs)
-		rel, ok := relWithin(root, canonical)
-		if !ok {
-			return gitScopeSpec{}, fmt.Errorf("path outside current git worktree: %s", operand)
-		}
-		if rel == "." {
-			return gitScopeSpec{rootIncluded: true}, nil
-		}
-		name := filepath.ToSlash(rel)
-		if info.IsDir() {
-			dirSet[name] = struct{}{}
-			continue
-		}
-		if !info.Mode().IsRegular() {
-			return gitScopeSpec{}, fmt.Errorf("unsupported path operand: %s", operand)
-		}
-		fileSet[name] = struct{}{}
-	}
-	dirs := collapseDirectoryScopes(sortedKeys(dirSet))
-	files := dropFilesCoveredByDirs(sortedKeys(fileSet), dirs)
-	return gitScopeSpec{dirs: dirs, files: files}, nil
-}
-
-func (s *gitDirtyScope) contains(name string) bool {
-	name = filepath.ToSlash(name)
-	if coveredByAnyDir(name, s.excludeDirs) || containsString(s.excludeFiles, name) {
-		return false
-	}
-	return coveredByAnyDir(name, s.includeDirs) || containsString(s.includeFiles, name)
-}
-
-func gitLiteralPathspec(name string) string {
-	if name == "." {
-		return "."
-	}
-	return ":(top,literal)" + name
-}
-
-func containsString(values []string, value string) bool {
-	i := sort.SearchStrings(values, value)
-	return i < len(values) && values[i] == value
-}
-
+// collapseDirectoryScopes drops each directory of dirs that another one holds.
+// dirs must be sorted, so a directory comes before the directories below it.
 func collapseDirectoryScopes(dirs []string) []string {
 	if len(dirs) < 2 {
 		return dirs
@@ -198,11 +107,8 @@ func dropFilesCoveredByDirs(files, dirs []string) []string {
 	return out
 }
 
+// coveredByAnyDir reports whether one of dirs is name or holds it
+// (pathWithin). Both are slash paths below the work-tree root.
 func coveredByAnyDir(name string, dirs []string) bool {
-	for _, dir := range dirs {
-		if name == dir || strings.HasPrefix(name, dir+"/") {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(dirs, func(dir string) bool { return pathWithin(dir, name) })
 }

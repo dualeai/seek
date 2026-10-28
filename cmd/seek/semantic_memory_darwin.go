@@ -10,6 +10,10 @@ import (
 	"strings"
 )
 
+// semanticHostAvailableMemory returns the bytes of memory that the host can
+// give now, for the concurrency of the semantic build. It adds the free,
+// inactive, speculative, and purgeable pages that vm_stat reports. It returns
+// 0 when vm_stat gives no value.
 func semanticHostAvailableMemory() int64 {
 	output, err := exec.Command("/usr/bin/vm_stat").Output()
 	if err != nil {
@@ -47,7 +51,7 @@ func semanticHostAvailableMemory() int64 {
 			}
 		}
 	}
-	if pages <= 0 || pageBytes <= 0 || pages > (1<<63-1)/pageBytes {
+	if pages <= 0 || pages > (1<<63-1)/pageBytes {
 		return 0
 	}
 	return pages * pageBytes

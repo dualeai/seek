@@ -5,6 +5,9 @@ import (
 	"testing"
 )
 
+// TestLargeDocumentKeepsContentAndSymbolSearch indexes one document larger
+// than shardMax and searches the index: its content and its symbol stay
+// searchable.
 func TestLargeDocumentKeepsContentAndSymbolSearch(t *testing.T) {
 	requireTools(t)
 	content := []byte("package large\n\nfunc LargeFileSymbol() {}\n// LARGE_FILE_CONTENT_MARKER\n")
@@ -21,8 +24,13 @@ func TestLargeDocumentKeepsContentAndSymbolSearch(t *testing.T) {
 	if err != nil || !indexed {
 		t.Fatalf("index large document: indexed=%t error=%v", indexed, err)
 	}
+	plan := node{cacheDir: t.TempDir(), indexDir: indexDir}
 	for _, queryText := range []string{"LARGE_FILE_CONTENT_MARKER", "sym:LargeFileSymbol"} {
-		matches, err := executeUnscopedShardSearchForTest(t.Context(), indexDir, queryText)
+		q, err := parseSearchQuery(queryText)
+		if err != nil {
+			t.Fatal(err)
+		}
+		matches, err := searchPlannedCorpusParsed(t.Context(), plan, nil, q, defaultSearchConfig())
 		if err != nil {
 			t.Fatalf("search %q: %v", queryText, err)
 		}

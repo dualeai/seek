@@ -35,6 +35,8 @@ jobs:
             name: macos-15-arm64
           - os: macos-15-intel                      # macOS x86_64 (Sequoia)
             name: macos-15-amd64
+          - os: xcode-27                            # macOS arm64 (27, preview image)
+            name: macos-27-arm64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -80,9 +82,10 @@ jobs:
           export PATH="$gobin:$PATH"
           go install golang.org/x/vuln/cmd/govulncheck@"${GOVULNCHECK_VERSION}"
           govulncheck -format sarif ./... > vuln.raw.sarif || true
-          # govulncheck emits duplicate items in rule tags and result stacks;
-          # GitHub's SARIF validator rejects dups, so dedupe both arrays.
-          # TODO: remove once these are fixed:
+          # govulncheck writes duplicate items in rule tags and in result
+          # stacks. GitHub's SARIF validator rejects duplicates, so jq removes
+          # them from both arrays.
+          # TODO: remove the jq filter when these issues are fixed:
           # https://github.com/golang/go/issues/75890 (tags)
           # https://github.com/golang/go/issues/81953 (stacks)
           # https://github.com/golang/go/issues/82319 (stacks)
@@ -136,10 +139,11 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           go install gotest.tools/gotestsum@"${GOTESTSUM_VERSION}"
       - name: Run unit tests
-        # Step backstop sits above the router plugin tests, the -race build, and
-        # the Go test -timeout (25m, which counts only the test run and fires with
-        # a goroutine dump), and below the job timeout. On macOS Intel the plugin
-        # tests took up to 2 min and the build up to 2 min.
+        # The step timeout is above the sum of the router plugin tests, the
+        # -race build, and the Go test -timeout, and below the job timeout. The
+        # Go test -timeout (25m) counts only the test run, and it stops the run
+        # with a goroutine dump. On macOS Intel, the plugin tests took up to
+        # 2 min, and the build took up to 2 min.
         timeout-minutes: 30
         run: make test-unit USE_PREBUILT=1 OUTPUT=seek
       - name: Coverage summary
@@ -173,9 +177,9 @@ jobs:
     needs: [build]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-26.04-arm
-    # The benchmarks take at least 20 min here (BenchmarkSemanticModelPass100k
-    # alone takes 13 min), and CodSpeed runner v5.2.1 then took at least 16 min
-    # after the run.
+    # The benchmarks take at least 20 min here: BenchmarkSemanticModelPass100k
+    # alone takes 13 min. After the run, CodSpeed runner v5.2.1 took at least
+    # 16 min more.
     timeout-minutes: 90
     permissions:
       actions: read
@@ -206,8 +210,9 @@ jobs:
           SEEK_BENCH_BINARY: ${{ runner.temp }}/seek-bench/seek
           SEEK_BENCH_REPO: ${{ github.workspace }}
 
-  # Submit the Go module graph to GitHub's dependency graph so Dependabot
-  # alerts work. Push-only: forked-PR runs lack write permission.
+  # Send the Go module graph to GitHub's dependency graph, so that Dependabot
+  # alerts work. The job runs on push only, because a run for a pull request
+  # from a fork has no write permission.
   dependency-submission:
     if: github.event_name == 'push'
     runs-on: ubuntu-26.04-arm

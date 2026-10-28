@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -10,14 +9,15 @@ import (
 	"github.com/sourcegraph/zoekt"
 )
 
-// ansiCodeRE matches any SGR escape, for proving color is presentation-only.
+// ansiCodeRE matches any SGR escape. The tests remove these escapes to show
+// that color changes the presentation only.
 var ansiCodeRE = regexp.MustCompile("\x1b\\[[0-9;]*m")
 
 // fmtOneFile formats a single git-corpus file match with the given palette and
 // hideCorpusContext (relative paths), the common shape for these unit tests.
 func fmtOneFile(fm zoekt.FileMatch, pal palette) string {
-	res := []corpusSearchResult{{corpusID: corpusID("c"), kind: corpusKindGit, file: fm}}
-	return formatCorpusResultsWithContext(res, nil, 0, 0, hideCorpusContext, pal)
+	res := withHeaders([]corpusSearchResult{{corpusID: corpusID("c"), kind: corpusKindGit, file: fm}})
+	return formatCorpusResultsWithContext(res, 0, 0, hideCorpusContext, pal)
 }
 
 func lineMatch(line string, lineNum uint32, frags ...zoekt.LineFragmentMatch) zoekt.LineMatch {
@@ -55,7 +55,7 @@ func TestColor_MatchSpanWrapped(t *testing.T) {
 }
 
 func TestColor_AdjacentFragmentsCoalesce(t *testing.T) {
-	// "foo" [0,3) and "bar" [3,6) are touching → one color pair, not two.
+	// "foo" [0,3) and "bar" [3,6) touch, so they get one color pair, not two.
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("foobar baz\n", 1, frag(0, 3), frag(3, 3))}}
 	out := fmtOneFile(fm, ansiPalette)
@@ -80,9 +80,9 @@ func TestColor_MultibyteAroundMatchNotSplit(t *testing.T) {
 	}
 }
 
-// TestColor_AnsiPaletteCodes pins the literal escape sequences. Without this,
-// the behavioral color tests (which reference ansiPalette.* by name) would still
-// pass if the palette were set to wrong/empty codes — this is their oracle.
+// TestColor_AnsiPaletteCodes checks the literal escape sequences. The other
+// color tests read ansiPalette by name, so they pass with wrong or empty
+// codes; this test holds the codes for them.
 func TestColor_AnsiPaletteCodes(t *testing.T) {
 	want := palette{file: "\x1b[36m", lineNo: "\x1b[2m", match: "\x1b[1;31m", reset: "\x1b[0m"}
 	if ansiPalette != want {
@@ -109,7 +109,8 @@ func TestColor_AnsiStrippedEqualsPlain(t *testing.T) {
 }
 
 func TestColor_NonAdjacentMatchesBothColored(t *testing.T) {
-	// "x ONE y TWO z": ONE@2, TWO@8 — separated, both must be colored.
+	// "x ONE y TWO z": ONE@2 and TWO@8 are apart, and the output must color
+	// both.
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("x ONE y TWO z\n", 1, frag(2, 3), frag(8, 3))}}
 	out := fmtOneFile(fm, ansiPalette)
@@ -129,17 +130,12 @@ func TestLongLine_MatchDeepStaysVisible(t *testing.T) {
 	fm := zoekt.FileMatch{FileName: "min.js", Language: "JavaScript", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch(line, 1, frag(2000, 6))}}
 	out := fmtOneFile(fm, plainPalette)
-	if !strings.Contains(out, "NEEDLE") {
-		t.Fatalf("match dropped by windowing, got:\n%q", out)
-	}
-	if !strings.Contains(out, "…+") {
-		t.Fatalf("expected truncation markers, got:\n%q", out)
-	}
-	// Window keeps ~matchCtxBytes on each side of a 6-byte match; the bound is
-	// tied to the const so it actually catches a too-wide window (a loose
-	// `> 2000` would pass for any window ≥ 512 and test nothing).
-	if maxBody := 2*matchCtxBytes + 256; len(out) > maxBody {
-		t.Fatalf("windowed output should be ≤ %d bytes, got %d", maxBody, len(out))
+	// Worked out by hand: the window keeps 512 source bytes on each side of the
+	// match. So 2000-512 bytes drop at each end of the 4006-byte line.
+	want := "## min.js (JavaScript)\n1 …+1488 bytes " + strings.Repeat("x", 512) + "NEEDLE" +
+		strings.Repeat("y", 512) + " …+1488 bytes\n"
+	if out != want {
+		t.Fatalf("windowed output=%q, want %q", out, want)
 	}
 }
 
@@ -160,7 +156,8 @@ func TestLongLine_MatchAtStartNoHeadMarker(t *testing.T) {
 	fm := zoekt.FileMatch{FileName: "min.js", Language: "JavaScript", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch(line, 1, frag(0, 4))}}
 	out := fmtOneFile(fm, plainPalette)
-	// Match at offset 0 → windowStart clamps to 0 → no leading "…+N bytes ".
+	// A match at offset 0 sets winStart to 0, so the line has no leading
+	// "…+N bytes " marker.
 	body := strings.SplitN(out, "\n", 2)[1]
 	if strings.HasPrefix(strings.TrimPrefix(body, "1 "), "…+") {
 		t.Fatalf("unexpected head marker for start-anchored match, got:\n%q", out)
@@ -184,7 +181,8 @@ func TestLongLine_ZeroLengthAndEOLFragmentsSkipped(t *testing.T) {
 }
 
 func TestLongLine_ContextLineCapped(t *testing.T) {
-	// A long before-context line is tail-trimmed (no match logic).
+	// The formatter cuts the tail of a long before-context line: a context
+	// line has no match to keep.
 	big := strings.Repeat("z", 2000)
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{{
@@ -196,11 +194,11 @@ func TestLongLine_ContextLineCapped(t *testing.T) {
 	if strings.Contains(out, big) {
 		t.Fatalf("long context line should be capped, got %d bytes", len(out))
 	}
-	// 2000 source bytes, all ASCII → cut at maxLineBytes (no rune backup), so the
-	// marker reports exactly 2000-maxLineBytes dropped. Tied to the const.
-	wantMarker := fmt.Sprintf("…+%d bytes", 2000-maxLineBytes)
-	if !strings.Contains(out, wantMarker) {
-		t.Fatalf("expected context cap marker %q, got:\n%q", wantMarker, out)
+	// 2000 source bytes, all ASCII: the cut is at the 1024-byte line cap (no
+	// rune backup), so the marker reports exactly 976 bytes dropped.
+	wantLine := "\n4 " + strings.Repeat("z", 1024) + " …+976 bytes\n"
+	if !strings.Contains(out, wantLine) {
+		t.Fatalf("expected the capped context line %q, got:\n%q", wantLine, out)
 	}
 }
 
@@ -225,13 +223,11 @@ func TestSanitize_ControlBytesStrippedTabKept(t *testing.T) {
 }
 
 func TestSanitize_ControlInsideMatchColorStillValid(t *testing.T) {
-	// ESC embedded inside the matched span is dropped; color codes stay paired
-	// and the only escapes present are our palette codes.
+	// The output drops an ESC inside the matched span. It holds one match
+	// code only, and that code and a reset enclose "needle".
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("x ne\x1bedle y\n", 1, frag(2, 7))}}
 	out := fmtOneFile(fm, ansiPalette)
-	// The embedded ESC is dropped; the only ESC bytes left are our palette
-	// codes, and every match-start is paired with a reset.
 	if strings.Contains(out, "ne\x1bedle") {
 		t.Fatalf("embedded ESC must be stripped, got:\n%q", out)
 	}
@@ -251,8 +247,8 @@ func TestNotices_FileLimit(t *testing.T) {
 		files = append(files, zoekt.FileMatch{FileName: name, Language: "Go", Score: 1,
 			LineMatches: []zoekt.LineMatch{lineMatch("x\n", 1)}})
 	}
-	out := formatGitCorpusResultsForTest(files, nil, 2, 0)
-	if !strings.Contains(out, "… 1 more files (showing 2 of 3)") {
+	out := formatGitCorpusResultsForTest(files, 2, 0)
+	if !strings.Contains(out, "… 1 more file (showing 2 of 3)") {
 		t.Fatalf("expected file-limit notice, got:\n%q", out)
 	}
 }
@@ -260,8 +256,8 @@ func TestNotices_FileLimit(t *testing.T) {
 func TestNotices_PerFileMatchLimit(t *testing.T) {
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("m1\n", 1), lineMatch("m2\n", 2), lineMatch("m3\n", 3)}}
-	out := formatGitCorpusResultsForTest([]zoekt.FileMatch{fm}, nil, 0, 2)
-	if !strings.Contains(out, "… 1 more matches in this file") {
+	out := formatGitCorpusResultsForTest([]zoekt.FileMatch{fm}, 0, 2)
+	if !strings.Contains(out, "… 1 more match in this file") {
 		t.Fatalf("expected per-file match notice, got:\n%q", out)
 	}
 }
@@ -269,19 +265,23 @@ func TestNotices_PerFileMatchLimit(t *testing.T) {
 func TestNotices_NoneWhenNothingDropped(t *testing.T) {
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("only\n", 1)}}
-	out := formatGitCorpusResultsForTest([]zoekt.FileMatch{fm}, nil, 5, 5)
-	if strings.Contains(out, "more files") || strings.Contains(out, "more matches") {
+	out := formatGitCorpusResultsForTest([]zoekt.FileMatch{fm}, 5, 5)
+	// "more file" and "more match" also find the singular notices of one
+	// dropped file or match.
+	if strings.Contains(out, "more file") || strings.Contains(out, "more match") {
 		t.Fatalf("no notice expected when nothing dropped, got:\n%q", out)
 	}
 }
 
 func TestLongLine_WindowCutLandsOnRuneBoundary(t *testing.T) {
-	// Place a 4-byte emoji so the computed window start (matchStart-matchCtxBytes)
-	// lands MID-rune. Without backupToRuneBoundary the window would slice the
-	// emoji and emit broken UTF-8.
+	// The computed window start (matchStart-matchCtxBytes) falls inside a
+	// 4-byte emoji. Without backupToRuneBoundary, the window would cut the
+	// emoji and write broken UTF-8.
 	const emoji = "🎉" // U+1F389, 4 bytes
 	matchStart := matchCtxBytes + 100
-	pre := strings.Repeat("a", matchCtxBytes-2) // emoji begins 2 bytes before winStart
+	winStart := matchStart - matchCtxBytes
+	// The emoji begins 2 bytes before winStart.
+	pre := strings.Repeat("a", winStart-2)
 	gap := strings.Repeat("b", matchStart-len(pre)-len(emoji))
 	line := pre + emoji + gap + "MATCH" + strings.Repeat("c", matchCtxBytes+200) + "\n"
 	if len(line) <= maxLineBytes {
@@ -302,13 +302,14 @@ func TestLongLine_WindowCutLandsOnRuneBoundary(t *testing.T) {
 }
 
 func TestSanitize_DisplayRootControlBytesStripped(t *testing.T) {
-	// A control byte in the corpus root must not leak through the absolute path.
+	// A control byte in the corpus root must not leak through the absolute
+	// path.
 	results := []corpusSearchResult{{
 		corpusID: corpusID("c"), kind: corpusKindFolder, displayRoot: "/tmp/ev\x1bil",
 		file: zoekt.FileMatch{FileName: "f.txt", Language: "Text", Score: 1,
 			LineMatches: []zoekt.LineMatch{{Line: []byte("x\n"), LineNumber: 1}}},
 	}}
-	out := formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext, plainPalette)
+	out := formatCorpusResultsWithContext(withHeaders(results), 0, 0, showCorpusContext, plainPalette)
 	if strings.Contains(out, "\x1b") {
 		t.Fatalf("control byte in displayRoot leaked, got:\n%q", out)
 	}
@@ -320,10 +321,11 @@ func TestSanitize_DisplayRootControlBytesStripped(t *testing.T) {
 // --- Trojan Source / BiDi -------------------------------------------------
 
 func TestSanitize_BidiOverridesStripped(t *testing.T) {
-	// U+202E (RLO) + U+202C (PDF): the Trojan-Source visual-spoofing pair must
-	// be removed; the surrounding text stays intact.
+	// The line holds U+202E (RLO), U+202C (PDF), U+2066 (LRI), and U+2028
+	// (line separator). Each can change how the line looks, so the output
+	// must drop each one. The text around them stays.
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
-		LineMatches: []zoekt.LineMatch{lineMatch("access = \u202Euser\u202C x\n", 1)}}
+		LineMatches: []zoekt.LineMatch{lineMatch("access = \u202Euser\u202C \u2066x\u2028\n", 1)}}
 	out := fmtOneFile(fm, plainPalette)
 	for _, r := range []rune{'\u202E', '\u202C', '\u2066', '\u2028'} {
 		if strings.ContainsRune(out, r) {
@@ -336,7 +338,7 @@ func TestSanitize_BidiOverridesStripped(t *testing.T) {
 }
 
 func TestSanitize_ZeroWidthJoinerKept(t *testing.T) {
-	// ZWJ (U+200D) is NOT stripped — legitimate in emoji/script sequences.
+	// The sanitizer keeps ZWJ (U+200D): emoji and script sequences use it.
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("x = \"a\u200Db\"\n", 1)}}
 	out := fmtOneFile(fm, plainPalette)
@@ -348,8 +350,9 @@ func TestSanitize_ZeroWidthJoinerKept(t *testing.T) {
 // --- Defensive: unsorted fragments ----------------------------------------
 
 func TestColor_UnsortedFragmentsNoSpanLoss(t *testing.T) {
-	// "aXbbbY c": X@1, Y@5. Deliver fragments OUT OF ORDER (Y then X). Without
-	// the defensive sort the second span would be silently coalesced away.
+	// "aXbbbY c": X@1, Y@5. The fragments come out of order (Y, then X).
+	// Without the sort, the merge of the spans would drop the second span
+	// with no error.
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("aXbbbY c\n", 1, frag(5, 1), frag(1, 1))}}
 	out := fmtOneFile(fm, ansiPalette)
@@ -362,15 +365,15 @@ func TestColor_UnsortedFragmentsNoSpanLoss(t *testing.T) {
 	}
 }
 
-func TestColor_UnsortedFragmentsMultipleSwaps(t *testing.T) {
-	// Three fragments delivered fully reversed (offsets 8,3,1) so the inline
-	// insertion sort must back up more than one position — a single-swap-only
-	// sort would leave them out of order and drop/merge a span.
+func TestColor_UnsortedFragmentsManyOutOfOrder(t *testing.T) {
+	// Three fragments arrive fully reversed (offsets 8, 3, 1), so the sort
+	// must move a span by more than one position. A sort that swaps only once
+	// would leave them out of order and drop or merge a span.
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("ABCDEFGHIJ\n", 1, frag(8, 1), frag(3, 1), frag(1, 1))}}
 	out := fmtOneFile(fm, ansiPalette)
 	if n := strings.Count(out, ansiPalette.match); n != 3 {
-		t.Fatalf("expected 3 spans after multi-swap sort, got %d in:\n%q", n, out)
+		t.Fatalf("expected 3 spans from out-of-order fragments, got %d in:\n%q", n, out)
 	}
 	for _, ch := range []string{"B", "D", "I"} { // offsets 1, 3, 8
 		if !strings.Contains(out, ansiPalette.match+ch+ansiPalette.reset) {
@@ -380,8 +383,8 @@ func TestColor_UnsortedFragmentsMultipleSwaps(t *testing.T) {
 }
 
 func TestColor_OverlappingFragmentsCoalesce(t *testing.T) {
-	// Overlapping (not merely adjacent) spans [0,5) and [2,7) must merge into a
-	// single [0,7) run — catches a merge that uses sp.start instead of max(end).
+	// The overlapping spans [0,5) and [2,7) must merge into one [0,7) run. A
+	// merge that keeps the end of the first span fails here.
 	fm := zoekt.FileMatch{FileName: "a.go", Language: "Go", Score: 1,
 		LineMatches: []zoekt.LineMatch{lineMatch("0123456789\n", 1, frag(0, 5), frag(2, 5))}}
 	out := fmtOneFile(fm, ansiPalette)
@@ -394,11 +397,12 @@ func TestColor_OverlappingFragmentsCoalesce(t *testing.T) {
 }
 
 func TestColor_ManyFragmentsSpillToHeap(t *testing.T) {
-	// >16 fragments on one line forces the stack-backed [16]span buffer to spill
-	// to a heap-grown slice; all spans must still render. Exercises the spill
-	// path that the [16] capacity bound otherwise leaves untested.
+	// More than 16 fragments on one line make the [16]span array on the
+	// stack grow into a slice on the heap. All spans must still render. No
+	// other test reaches that path.
 	const count = 20
-	line := strings.Repeat("x ", count) + "\n" // "x" at every even offset 0,2,4,…
+	// "x" is at each even offset: 0, 2, 4, and so on.
+	line := strings.Repeat("x ", count) + "\n"
 	frags := make([]zoekt.LineFragmentMatch, count)
 	for i := range count {
 		frags[i] = frag(i*2, 1)
@@ -411,7 +415,7 @@ func TestColor_ManyFragmentsSpillToHeap(t *testing.T) {
 	}
 }
 
-// --- stripRune: direct unit oracle for the security predicate -------------
+// --- stripRune: runes that it drops and keeps, with class edges -----------
 
 func TestStripRune(t *testing.T) {
 	cases := []struct {
@@ -450,12 +454,11 @@ func TestStripRune(t *testing.T) {
 	}
 }
 
-// --- Companion to BenchmarkCorpusFormatting_Palettes: the benchmark only
-// MEASURES the realistic fixture; this VERIFIES its output is correct.
-
+// TestCorpusFormatting_Realistic checks the output of the fixture that
+// BenchmarkCorpusFormatting_Palettes times: the benchmark does not check it.
 func TestCorpusFormatting_Realistic(t *testing.T) {
 	results := benchmarkGitResults(benchmarkRealisticFiles(2))
-	plain := formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
+	plain := formatCorpusResultsWithContext(results, 0, 0, hideCorpusContext, plainPalette)
 	for _, pc := range []struct {
 		name string
 		pal  palette
@@ -464,7 +467,7 @@ func TestCorpusFormatting_Realistic(t *testing.T) {
 		{"ansi", ansiPalette},
 	} {
 		t.Run(pc.name, func(t *testing.T) {
-			out := formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, pc.pal)
+			out := formatCorpusResultsWithContext(results, 0, 0, hideCorpusContext, pc.pal)
 			if !utf8.ValidString(out) {
 				t.Fatalf("output is not valid UTF-8")
 			}

@@ -1,8 +1,8 @@
 package main
 
 import (
+	"context"
 	"errors"
-	"fmt"
 	"math"
 )
 
@@ -10,70 +10,100 @@ const (
 	// zoektShardFormatBytes is the most content and the largest shard file that
 	// Zoekt can address: its offsets are uint32 (zoekt/index/section.go and
 	// zoekt/index/shard_builder.go). It is a format limit of the index, not a
-	// file-size policy. Seek sets no other per-document size limit: readers send
-	// larger content by name only, and guardWrappedShards keeps each shard file
-	// within this limit.
+	// file-size policy. Seek sets no other per-document size limit: readers
+	// send larger content by name only, and guardWrappedShards keeps each shard
+	// file within this limit.
 	zoektShardFormatBytes = math.MaxUint32
-
-	// maxCorpusIndexedBytes limits content work for one folder corpus or one
-	// Git index family. Before ignore filtering, the committed reader counts the
-	// sizes of candidate blobs whose content fits the index
-	// (documentContentFits). The folder and dirty readers count selected
-	// content.
-	// Git applies the limit separately to its committed and working-tree
-	// families. This is a work limit, not a process-memory bound.
-	maxCorpusIndexedBytes = 10 * 1024 * 1024 * 1024 // 10 GiB
-
-	// Git has a higher file-count budget than raw folders because Git
-	// provides the file universe and ignore semantics. Standard folders
-	// stay lower because they intentionally do not apply
-	// .gitignore/vendor/cache rules.
-	maxGitCandidateFiles    = 10_000_000
-	maxFolderCandidateFiles = 1_000_000
-
-	// maxFolderIndexedBytes keeps the folder reader on the shared aggregate
-	// corpus limit.
-	maxFolderIndexedBytes = maxCorpusIndexedBytes
 
 	// maxReadWeightBytes is the largest readSemaphore weight one document
 	// takes (readWeight). The smallest read budget, maxInFlightBytes, is sized
 	// in these units, not by the document size limit.
 	maxReadWeightBytes = 100 * 1024 * 1024 // 100 MiB
 
-	// corpusWorkerCap limits active corpus indexers. Each corpus indexer can
-	// also use the internal parallelism returned by indexParallelism.
-	corpusWorkerCap = 4
-
 	// maxInFlightBytes is the smallest readSemaphore capacity: six
-	// maximum-weight documents per corpus slot. readBudgetBytes grows the
-	// capacity with the host's memory.
-	maxInFlightBytes = 6 * maxReadWeightBytes * corpusWorkerCap
+	// maximum-weight documents, room for two build slots (buildSlotLimit).
+	// readBudgetBytes grows the capacity with the host's memory.
+	maxInFlightBytes = 6 * maxReadWeightBytes
 
-	// defaultIndexWindowBytes is the rotation point for the smallest budget,
-	// maxInFlightBytes. The compile-time checks below prove the window rules
-	// with it; indexWindowBytes applies the same formula to the real budget.
-	defaultIndexWindowBytes = (maxInFlightBytes - 2*maxReadWeightBytes) / (2 * corpusWorkerCap)
+	// minBudgetBuildSlots is buildSlotLimit of the smallest budget.
+	minBudgetBuildSlots = (maxInFlightBytes - 2*maxReadWeightBytes) / (2 * maxReadWeightBytes)
+
+	// defaultIndexWindowBytes is the rotation point of the smallest budget
+	// when all its build slots run. The compile-time checks below prove the
+	// window rules with it; indexWindowFor applies the same formula to the
+	// real budget and the builds of a command.
+	defaultIndexWindowBytes = (maxInFlightBytes - 2*maxReadWeightBytes) / (2 * minBudgetBuildSlots)
 )
 
 // readBudgetBytes is the global readSemaphore capacity for accounted document
 // content across all corpus readers and builders; workers do not own separate
-// quotas. Readers acquire weight, and consumers release it after the
-// Builder.Finish that stops retaining the document. Seek's objective is the
-// shortest time, so the budget grows with the host: a quarter of its physical
-// memory, and at least maxInFlightBytes. Zoekt needs several times the content
-// it builds, so the rest of memory is left for the builds. Other allocations
-// are not covered, so this value does not bound process RSS.
+// quotas. Readers acquire weight. A consumer releases it when it no longer
+// needs the document:
+//   - A Zoekt build releases a document after Finish. A full build releases
+//     a normal document earlier, after Builder.Add.
+//   - A vector build releases a file after the last model batch that reads it
+//     (semanticBuildOwner).
+//
+// Seek's objective is the shortest time, so the budget grows with the host: a
+// quarter of its physical memory, and at least maxInFlightBytes. Zoekt needs
+// several times the content it builds, so Seek leaves the rest of memory to
+// the builds. The budget does not cover other allocations, so this value does
+// not bound process RSS.
 var readBudgetBytes = max(int64(maxInFlightBytes), hostPhysicalMemory()/4)
 
-// indexWindowBytes is the live document-weight rotation point for
-// indexDocumentsWithRepository and the payload limit for native Git delta
-// admission. A consumer rotates when its pending weight reaches or passes this
-// point, so one document can take it past the point. The formula keeps headroom
-// beyond N rotation points: N*window + 2*doc is within readBudgetBytes. This is
-// not an exact bound on pending weight or process memory. It is a variable so
+// indexWindowBytes is the window when no command set one (indexWindow). It is
+// the content rotation point of a large-document window in
+// indexDocumentsWithRepository, and the payload limit of a delta. A consumer
+// rotates when its pending content reaches or passes this point, so one
+// document can take it past the point. The formula keeps two maximum-weight
+// documents free beside the two windows of each build slot:
+// 2*slots*window + 2*maxReadWeightBytes is within readBudgetBytes. This is not
+// an exact bound on pending weight or process memory. It is a variable so
 // tests can shrink it through swapIndexWindowBytesForTest; production callers
 // treat it as read-only.
-var indexWindowBytes = (readBudgetBytes - 2*maxReadWeightBytes) / (2 * corpusWorkerCap)
+var indexWindowBytes = indexWindowFor(readBudgetBytes, buildSlotLimit(readBudgetBytes))
+
+// buildSlotLimit is the most node builds that run at the same time. It is the
+// most builds whose windows keep the deadlock proof, with a window of at least
+// one maximum-weight document. The limit protects correctness, not CPU: every
+// build's readers and consumers stay within the read budget, so no read
+// Acquire waits forever (golang/go#59002). A host with more memory runs more
+// builds at once.
+func buildSlotLimit(readBudget int64) int {
+	return max(1, int((readBudget-2*maxReadWeightBytes)/(2*maxReadWeightBytes)))
+}
+
+// indexWindowFor is the rotation point when builds run at once. Each build
+// holds two windows (the lexical and the semantic consumer), and two
+// maximum-weight documents stay free.
+func indexWindowFor(readBudget int64, builds int) int64 {
+	builds = min(max(builds, 1), buildSlotLimit(readBudget))
+	return (readBudget - 2*maxReadWeightBytes) / (2 * int64(builds))
+}
+
+type indexWindowKey struct{}
+
+// withIndexWindow sets the window of a command whose graph has nodes nodes,
+// before its first build. At most that many builds run. So the two windows of
+// the one build of a one-node search take the whole build budget
+// (buildWindowBytes). A search of many nodes splits the budget among its build
+// slots. Each build takes its two windows from buildWindows, so commands that
+// run at the same time share the budget.
+func withIndexWindow(ctx context.Context, nodes int) context.Context {
+	return context.WithValue(ctx, indexWindowKey{}, indexWindowFor(readBudgetBytes, nodes))
+}
+
+// indexWindow is the window of a build under ctx: the window of its command,
+// or indexWindowBytes outside a command. A large-document window rotates at
+// it, a delta payload must stay below it, and a build slot takes two of it.
+// Every production build runs under runSearchCommand, so only tests that call
+// a build directly use indexWindowBytes.
+func indexWindow(ctx context.Context) int64 {
+	if window, ok := ctx.Value(indexWindowKey{}).(int64); ok {
+		return window
+	}
+	return indexWindowBytes
+}
 
 // documentContentLimit is the most content seek gives Zoekt for one document:
 // zoektShardFormatBytes, because one shard cannot hold more. Every reader sends
@@ -93,82 +123,26 @@ func documentContentFits(size int64) bool {
 	return size <= documentContentLimit
 }
 
-var (
-	gitCandidateFileLimit     int64 = maxGitCandidateFiles
-	gitCorpusIndexedByteLimit int64 = maxCorpusIndexedBytes
-)
-
-// These casts underflow at compile time if an invariant is false. One worker
-// and one document window are the minimum values that keep indexing useful. A
-// maximum-weight document must fit in the in-flight budget to prevent a
-// permanent Acquire wait on a non-cancellable context (golang/go#59002). The
-// final check keeps N rotation points and two maximum-weight documents within
-// that budget.
+// These casts underflow at compile time if an invariant is false, for the
+// smallest budget with all its build slots. That budget must have at least one
+// build slot. One document window is the minimum that keeps indexing useful. A
+// maximum-weight document must fit in the smallest read budget
+// (maxInFlightBytes) to prevent a permanent Acquire wait on a non-cancellable
+// context (golang/go#59002). The final check keeps two rotation points per slot
+// and two maximum-weight documents within that budget. A larger budget or fewer
+// builds give a larger window by the same rule, so the proof holds
+// (TestBuildSlotsFromReadBudget).
 const (
-	_ = uint(corpusWorkerCap - 1)
+	_ = uint(minBudgetBuildSlots - 1)
 	_ = uint(defaultIndexWindowBytes - maxReadWeightBytes)
 	_ = uint(maxInFlightBytes - maxReadWeightBytes)
-	_ = uint(maxInFlightBytes - (corpusWorkerCap*defaultIndexWindowBytes + 2*maxReadWeightBytes))
+	_ = uint(maxInFlightBytes - (2*minBudgetBuildSlots*defaultIndexWindowBytes + 2*maxReadWeightBytes))
 )
 
-var (
-	errGitCapExceeded = errors.New("git cap exceeded")
-
-	// errGitCommittedCapExceeded marks a stable cap result from the immutable
-	// committed-tree scan. Only this subtype can be cached by committed HEAD.
-	// Working-tree checks return the broader errGitCapExceeded sentinel.
-	errGitCommittedCapExceeded = fmt.Errorf("git committed cap exceeded: %w", errGitCapExceeded)
-	errFolderCapExceeded       = errors.New("folder cap exceeded")
-
-	// errDeltaPayloadExceedsWindow fires when a delta (working-tree
-	// dirty set OR folder-manifest changed set) would exceed
-	// indexWindowBytes. Both sites route through a windowed full
-	// rebuild via indexDocuments rather than holding the whole payload
-	// in indexDeltaDocuments's single terminal Finish.
-	errDeltaPayloadExceedsWindow = errors.New("delta payload exceeds window threshold")
-)
-
-type indexCapExceededError struct {
-	cause   error
-	message string
-	metric  indexCapMetric
-	current int64
-	limit   int64
-}
-
-type indexCapMetric string
-
-const (
-	indexCapCandidateFiles indexCapMetric = "candidate_files"
-	indexCapIndexedBytes   indexCapMetric = "indexed_bytes"
-)
-
-func (e indexCapExceededError) Error() string {
-	return fmt.Sprintf("%s: %s=%d limit=%d", e.message, e.metric, e.current, e.limit)
-}
-
-func (e indexCapExceededError) Unwrap() error {
-	return e.cause
-}
-
-func indexCapError(cause error, message string, metric indexCapMetric, current, limit int64) error {
-	return indexCapExceededError{
-		cause:   cause,
-		message: message,
-		metric:  metric,
-		current: current,
-		limit:   limit,
-	}
-}
-
-func gitCapError(message string, metric indexCapMetric, current, limit int64) error {
-	return indexCapError(errGitCapExceeded, message, metric, current, limit)
-}
-
-func gitCommittedCapError(message string, metric indexCapMetric, current, limit int64) error {
-	return indexCapError(errGitCommittedCapExceeded, message, metric, current, limit)
-}
-
-func folderCapError(message string, metric indexCapMetric, current, limit int64) error {
-	return indexCapError(errFolderCapExceeded, message, metric, current, limit)
-}
+// errDeltaPayloadExceedsWindow reports that the files to read of a delta reach
+// the build's window (indexWindow). These are the changed dirty files of a Git
+// node, or the changed files of a folder. Both callers then build in full with
+// indexDocuments, which releases the weight of a normal document after
+// Builder.Add. indexDeltaDocuments holds the whole payload until its one
+// Finish.
+var errDeltaPayloadExceedsWindow = errors.New("delta payload exceeds window threshold")

@@ -1,24 +1,30 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/sourcegraph/zoekt/index"
 )
 
-// dirtyAndIndex rewrites the working-tree file at relPath with content and
-// runs one indexing cycle. Returns the post-cycle shard count for
-// repoUncommitted so tests can assert on shard accumulation under successive
-// edits. The mtime is forced into the future to defeat filesystems that
-// collapse two writes within the same nanosecond, which would otherwise hide
-// the modification from statUncommittedCandidates.
-func dirtyAndIndex(t *testing.T, ctx context.Context, paths gitPaths, plan corpusPlan, relPath, content string) int {
+// dirtyAndIndex rewrites the working-tree file at relPath with content, runs
+// one indexing cycle, and returns the shard count of repoUncommitted after
+// it. It sets the mtime from the Go clock, 1 to 5 µs after the current time.
+// A file-system clock can give two quick writes of the same size one mtime,
+// and statUncommittedCandidates would then see no change.
+func dirtyAndIndex(t *testing.T, ctx context.Context, paths gitPaths, plan node, relPath, content string) int {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(paths.RepoDir, relPath), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -39,9 +45,8 @@ func TestDeltaUncommitted_RapidEditsKeepLatestOnly(t *testing.T) {
 	reindexGit(t, ctx, paths, plan)
 
 	const cycles = 10
-	// Shard count snapshots after each cycle. Used to distinguish delta-path
-	// behaviour (monotonic growth +1 per cycle, modulo empty-shard cleanup)
-	// from a hypothetical silent fallback to full rebuild (would stay at 1).
+	// The shard count after each cycle. A delta adds one shard per cycle; a
+	// full rebuild in its place keeps one shard.
 	shardSeries := make([]int, 0, cycles)
 	for i := range cycles {
 		marker := fmt.Sprintf("dirty_edit_%d", i)
@@ -71,8 +76,8 @@ func TestDeltaUncommitted_RapidEditsKeepLatestOnly(t *testing.T) {
 	if finalShards > cycles+1 {
 		t.Fatalf("shard count %d exceeds delta budget %d", finalShards, cycles+1)
 	}
-	// Delta-path proof: the shard count must grow over the run. A silently
-	// degraded full-rebuild path would stay at 1 shard throughout because
+	// Delta-path proof: the shard count must grow over the run. An unseen
+	// fallback to full rebuilds would stay at 1 shard throughout, because
 	// each rebuild replaces the prior shard set.
 	if finalShards <= 1 {
 		t.Fatalf("expected uncommitted shard accumulation under delta, got series %v — delta path may have silently fallen back to full rebuild", shardSeries)
@@ -82,7 +87,10 @@ func TestDeltaUncommitted_RapidEditsKeepLatestOnly(t *testing.T) {
 	}
 }
 
-func TestDeltaUncommitted_DirtyToCommittedTombstonesUncommittedShard(t *testing.T) {
+// TestDeltaUncommitted_DirtyToCommittedLeavesOneCopy commits the one dirty
+// file and indexes again: the search finds one copy of the file, not a
+// committed and an uncommitted copy.
+func TestDeltaUncommitted_DirtyToCommittedLeavesOneCopy(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// initial_clean\n")
@@ -99,10 +107,9 @@ func TestDeltaUncommitted_DirtyToCommittedTombstonesUncommittedShard(t *testing.
 		t.Fatal("dirty marker must be findable")
 	}
 
-	// Commit it and index. The uncommitted shard must tombstone the file so
-	// the committed shard's content wins and we never get duplicate hits.
-	gitRun(t, dir, "add", ".")
-	gitRun(t, dir, "commit", "-m", "promote dirty to committed")
+	// Commit it and index. The dirty set is now empty.
+	gitRunIn(t, dir, "add", ".")
+	gitRunIn(t, dir, "commit", "-m", "promote dirty to committed")
 	reindexGit(t, ctx, paths, plan)
 
 	results, err := searchPlannedCorpusForTest(ctx, plan, "dirty_then_committed")
@@ -117,8 +124,9 @@ func TestDeltaUncommitted_DirtyToCommittedTombstonesUncommittedShard(t *testing.
 func TestDeltaUncommitted_CommittedToDirtyHidesCommittedContent(t *testing.T) {
 	requireTools(t)
 
-	// deduplicateCorpusResults makes dirty content replace committed content for
-	// the same path. Use runSeekInRepo to exercise the public search path.
+	// The node read hides the committed copy of a dirty file, so dirty content
+	// replaces committed content. Use runSeekInRepo to exercise the public
+	// search path.
 	dir := initGitRepo(t, "app.go", "package main\n// committed_only_marker\n")
 
 	files, err := runSeekInRepo(t, dir, "committed_only_marker")
@@ -135,7 +143,7 @@ func TestDeltaUncommitted_CommittedToDirtyHidesCommittedContent(t *testing.T) {
 
 	committedAfter, _ := runSeekInRepo(t, dir, "committed_only_marker")
 	if len(committedAfter) != 0 {
-		t.Fatalf("committed content must be shadowed by dirty edit at the formatter, got %v", committedAfter)
+		t.Fatalf("the committed copy of a dirty file still matches: %v", committedAfter)
 	}
 	dirtyAfter, err := runSeekInRepo(t, dir, "dirty_replaces_committed")
 	if err != nil {
@@ -154,7 +162,7 @@ func TestDeltaUncommitted_EmptyDirtySetCleansShards(t *testing.T) {
 	paths, plan := planGitTestCorpus(t, dir)
 	reindexGit(t, ctx, paths, plan)
 
-	// Dirty the file, index → uncommitted shards exist.
+	// Dirty the file and index it, so uncommitted shards exist.
 	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// dirty_phase\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -163,9 +171,9 @@ func TestDeltaUncommitted_EmptyDirtySetCleansShards(t *testing.T) {
 		t.Fatal("expected at least one uncommitted shard after dirty cycle")
 	}
 
-	// Revert the file to its committed content. The next cycle's dirty set
-	// is empty → shards must be cleaned and the manifest dropped.
-	gitRun(t, dir, "checkout", "--", "app.go")
+	// Revert the file to its committed content. The dirty set of the next
+	// cycle is empty, so the build must remove the shards and the manifest.
+	gitRunIn(t, dir, "checkout", "--", "app.go")
 	reindexGit(t, ctx, paths, plan)
 
 	if got := repositoryShardCount(plan.indexDir, repoUncommitted); got != 0 {
@@ -184,9 +192,9 @@ func TestDeltaUncommitted_CorruptManifestFallsBackToFullRebuild(t *testing.T) {
 	paths, plan := planGitTestCorpus(t, dir)
 	reindexGit(t, ctx, paths, plan)
 
-	// Establish a manifest + a few delta shards by chaining several dirty
-	// cycles. We need shardsBefore > 1 so the fallback's "single fresh
-	// shard" outcome is unambiguously distinguishable from the prior state.
+	// Three dirty cycles write a manifest and delta shards. With more than one
+	// shard before the corruption, the one shard of a full rebuild differs
+	// from the prior state.
 	for i := range 3 {
 		body := fmt.Sprintf("package main\n// pre_corruption_marker_%d\n", i)
 		if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte(body), 0o644); err != nil {
@@ -205,9 +213,8 @@ func TestDeltaUncommitted_CorruptManifestFallsBackToFullRebuild(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Next cycle should detect the corruption (readUncommittedManifest
-	// returns ok=false), fall back to the full rebuild, and produce a fresh
-	// single base shard plus a regenerated manifest.
+	// readUncommittedManifest returns ok=false for the corrupt manifest, so
+	// the next cycle builds the family in full: one shard and a new manifest.
 	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// post_corruption_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -220,11 +227,10 @@ func TestDeltaUncommitted_CorruptManifestFallsBackToFullRebuild(t *testing.T) {
 		t.Fatal("pre-corruption marker should not survive a full rebuild")
 	}
 
-	// Direct proof the fallback path ran:
-	//   1. full rebuild via indexDocuments emits exactly one shard for the
-	//      uncommitted repo, so shard count must collapse.
-	//   2. the fallback writes a fresh manifest with valid JSON whose state
-	//      field is non-empty (was overwritten from the truncated payload).
+	// Proof that the full rebuild ran:
+	//   1. A full rebuild of one small file writes one uncommitted shard.
+	//   2. It writes a valid manifest, whose state replaces the "x" of the
+	//      truncated one.
 	shardsAfter := repositoryShardCount(plan.indexDir, repoUncommitted)
 	if shardsAfter != 1 {
 		t.Fatalf("fallback rebuild should leave a single uncommitted shard, got %d (was %d)", shardsAfter, shardsBefore)
@@ -244,16 +250,17 @@ func TestDeltaUncommitted_CorruptManifestFallsBackToFullRebuild(t *testing.T) {
 
 func TestDeltaUncommitted_ShardThresholdTriggersFullRebuild(t *testing.T) {
 	requireTools(t)
-	if testing.Short() {
-		t.Skip("threshold test does maxUncommittedDeltaShards+2 cycles; skipped under -short")
-	}
 
 	dir := initGitRepo(t, "app.go", "package main\n// uthreshold_baseline\n")
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
 	reindexGit(t, ctx, paths, plan)
 
-	cycles := maxUncommittedDeltaShards + 2
+	// The full build of cycle 0 writes one shard, and each later cycle adds
+	// one delta shard. A delta can take the family to
+	// maxUncommittedDeltaShards+1 delta shards, so the cycle after that one
+	// rebuilds the family in full.
+	cycles := maxUncommittedDeltaShards + 3
 	shardSeries := make([]int, 0, cycles)
 	for i := range cycles {
 		shards := dirtyAndIndex(t, ctx, paths, plan, "app.go", fmt.Sprintf("package main\n// uthreshold_cycle_%d\n", i))
@@ -287,6 +294,126 @@ func TestDeltaUncommitted_ShardThresholdTriggersFullRebuild(t *testing.T) {
 	latest := fmt.Sprintf("uthreshold_cycle_%d", cycles-1)
 	if r, _ := searchPlannedCorpusForTest(ctx, plan, latest); len(r) == 0 {
 		t.Fatalf("latest dirty marker %s must remain findable post-rebuild", latest)
+	}
+}
+
+// TestDeltaUncommitted_DeltaAboveLargeFullBase gives a work tree whose full
+// uncommitted build writes more shards than maxUncommittedDeltaShards. The cap
+// counts only the shards that deltas add since the full build. So each edit
+// of one dirty file takes a delta, which keeps uncommitted shard 0. The second
+// edit checks that the delta keeps the base count in the manifest.
+func TestDeltaUncommitted_DeltaAboveLargeFullBase(t *testing.T) {
+	requireTools(t)
+	// Zoekt ends a shard when its content passes shardMax. Each file holds
+	// more than half of it, so each shard holds two files.
+	const fileBytes = 3000
+	swapForTest(t, &shardMax, 4096)
+	dir := initGitRepo(t, "app.go", "package main\n// large_base_baseline\n")
+	const fileCount = 2 * (maxUncommittedDeltaShards + 4)
+	for i := range fileCount {
+		content := bytes.Repeat([]byte{byte('a' + i%26)}, fileBytes)
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("dirty_%d.txt", i)), content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx := t.Context()
+	paths, plan := planGitTestCorpus(t, dir)
+	reindexGit(t, ctx, paths, plan)
+	base := repositoryShardCount(plan.indexDir, repoUncommitted)
+	if base <= maxUncommittedDeltaShards {
+		t.Fatalf("the full build wrote %d uncommitted shards, want more than %d", base, maxUncommittedDeltaShards)
+	}
+	// firstShard returns uncommitted shard 0, which a delta keeps and a full
+	// build replaces.
+	firstShard := func() os.FileInfo {
+		t.Helper()
+		scan, err := scanFamily(plan.indexDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, member := range scan.members {
+			if member.uncommitted && member.shard && member.numbered && member.num == 0 {
+				info, err := os.Stat(filepath.Join(plan.indexDir, member.name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return info
+			}
+		}
+		t.Fatalf("no uncommitted shard 0 in %s", plan.indexDir)
+		return nil
+	}
+	baseBefore := firstShard()
+
+	for edit := 1; edit <= 2; edit++ {
+		marker := fmt.Sprintf("large_base_delta_beacon_%d", edit)
+		shards := dirtyAndIndex(t, ctx, paths, plan, fmt.Sprintf("dirty_%d.txt", edit), marker+"\n")
+		if !os.SameFile(baseBefore, firstShard()) {
+			t.Fatalf("edit %d: the build replaced uncommitted shard 0: a full rebuild ran, not a delta", edit)
+		}
+		if shards != base+edit {
+			t.Fatalf("edit %d: shards=%d, want the %d base shards and %d delta shards", edit, shards, base, edit)
+		}
+		results, err := searchPlannedCorpusForTest(ctx, plan, marker)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 1 {
+			t.Fatalf("edit %d: got %d files for the edited content, want 1", edit, len(results))
+		}
+		if edit == 1 {
+			// A commit of a new file changes HEAD and no dirty file, so the
+			// build only refreshes the uncommitted manifest. The refresh must
+			// keep the base count, or the next edit rebuilds in full.
+			writeFixtureFile(t, filepath.Join(dir, "committed.txt"), "large_base_commit\n")
+			gitRunIn(t, dir, "add", "committed.txt")
+			gitRunIn(t, dir, "commit", "-q", "-m", "unrelated")
+			reindexGit(t, ctx, paths, plan)
+		}
+	}
+}
+
+// TestUncommittedDeltaPossible_ShardCapCountsShardsAboveTheFullBase checks the
+// bounds of the uncommitted cap on a live family of empty shard files. The cap
+// counts only the shards above the full-build count of the manifest. With base
+// 0, the manifest has no base_shards field, as the manifest of an older build.
+// The cap then counts every shard.
+func TestUncommittedDeltaPossible_ShardCapCountsShardsAboveTheFullBase(t *testing.T) {
+	repoDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repoDir, "a.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const base = maxUncommittedDeltaShards + 8
+	for _, tc := range []struct {
+		name   string
+		shards int
+		base   int
+		delta  bool
+	}{
+		{name: "large-full-base", shards: base, base: base, delta: true},
+		{name: "cap-above-base", shards: base + maxUncommittedDeltaShards, base: base, delta: true},
+		{name: "above-cap-above-base", shards: base + maxUncommittedDeltaShards + 1, base: base},
+		{name: "no-base-at-cap", shards: maxUncommittedDeltaShards, delta: true},
+		{name: "no-base-above-cap", shards: maxUncommittedDeltaShards + 1},
+		{name: "base-ahead-of-family", shards: 10, base: 11},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cacheDir, indexDir := t.TempDir(), t.TempDir()
+			for i := range tc.shards {
+				name := fmt.Sprintf("%s_v16.%05d.zoekt", repoUncommitted, i)
+				if err := os.WriteFile(filepath.Join(indexDir, name), nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := writeUncommittedManifest(cacheDir, "cached", nil, 0, tc.base); err != nil {
+				t.Fatal(err)
+			}
+			store := corpusStore{cacheDir: cacheDir, indexDir: indexDir}
+			got := uncommittedDeltaPossible(t.Context(), repoDir, store, "cached", true, []string{"a.go"})
+			if (got != nil) != tc.delta {
+				t.Fatalf("delta=%t, want %t (shards=%d base=%d)", got != nil, tc.delta, tc.shards, tc.base)
+			}
+		})
 	}
 }
 
@@ -346,8 +473,8 @@ func TestDeltaUncommitted_ManifestRecordsEveryDirtyFile(t *testing.T) {
 		}
 	}
 
-	// Manifest must be sorted by name so the sorted-merge diff in
-	// diffUncommittedAgainstManifest works against future candidate lists.
+	// The manifest must sort its entries by name, each name once: the next
+	// build merges it with sorted candidates (diffUncommittedAgainstManifest).
 	for i := 1; i < len(manifest.Files); i++ {
 		if manifest.Files[i-1].Name >= manifest.Files[i].Name {
 			t.Fatalf("manifest entries not sorted: %q then %q", manifest.Files[i-1].Name, manifest.Files[i].Name)
@@ -369,7 +496,7 @@ func TestDeltaUncommitted_NewFileAppearsInDelta(t *testing.T) {
 	}
 	reindexGit(t, ctx, paths, plan)
 
-	// Second cycle adds a brand-new untracked file — the delta must pick it up.
+	// The second cycle adds a new untracked file: the delta must read it.
 	if err := os.WriteFile(filepath.Join(dir, "new.go"), []byte("package main\n// brand_new_dirty_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +530,7 @@ func TestDeltaUncommitted_DeletedDirtyFileTombstoned(t *testing.T) {
 		t.Fatal("first marker must be findable before deletion")
 	}
 
-	// Delete the first untracked file and edit the second to drift the state.
+	// Delete the first untracked file and edit the second to change the state.
 	if err := os.Remove(filepath.Join(dir, "first.go")); err != nil {
 		t.Fatal(err)
 	}
@@ -420,6 +547,387 @@ func TestDeltaUncommitted_DeletedDirtyFileTombstoned(t *testing.T) {
 	}
 }
 
+// TestDeltaUncommitted_RemovalOnlyHidesTheRemovedFile edits one dirty file, so
+// a delta shard holds it alone, then removes that file with no other change.
+// The removed file must leave the results, and every other file must stay. The
+// next delta and a full rebuild must keep these results.
+func TestDeltaUncommitted_RemovalOnlyHidesTheRemovedFile(t *testing.T) {
+	requireTools(t)
+
+	dir := initGitRepo(t, "app.go", "package main\n// committed_base\n")
+	ctx := context.Background()
+	paths, plan := planGitTestCorpus(t, dir)
+	reindexGit(t, ctx, paths, plan)
+
+	if err := os.WriteFile(filepath.Join(dir, "keep.go"), []byte("package main\n// keep_first_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "gone.go"), []byte("package main\n// gone_first_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	if shards := dirtyAndIndex(t, ctx, paths, plan, "gone.go", "package main\n// gone_second_marker\n"); shards < 2 {
+		t.Fatalf("uncommitted shards=%d, want a delta shard for the edit", shards)
+	}
+
+	matches := func(step string, absent, present []string) {
+		t.Helper()
+		for _, marker := range absent {
+			results, err := searchPlannedCorpusForTest(ctx, plan, marker)
+			if err != nil {
+				t.Fatalf("%s: search %s: %v", step, marker, err)
+			}
+			if len(results) != 0 {
+				t.Fatalf("%s: %s matches %d files, want none", step, marker, len(results))
+			}
+		}
+		for _, marker := range present {
+			results, err := searchPlannedCorpusForTest(ctx, plan, marker)
+			if err != nil {
+				t.Fatalf("%s: search %s: %v", step, marker, err)
+			}
+			if len(results) != 1 {
+				t.Fatalf("%s: %s matches %d files, want one", step, marker, len(results))
+			}
+		}
+	}
+
+	if err := os.Remove(filepath.Join(dir, "gone.go")); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	matches("removal",
+		[]string{"gone_first_marker", "gone_second_marker"},
+		[]string{"keep_first_marker", "committed_base"})
+
+	dirtyAndIndex(t, ctx, paths, plan, "keep.go", "package main\n// keep_second_marker\n")
+	matches("next delta",
+		[]string{"gone_first_marker", "gone_second_marker", "keep_first_marker"},
+		[]string{"keep_second_marker", "committed_base"})
+
+	// With no manifest, the next build reads every dirty file again.
+	deleteUncommittedManifest(plan.cacheDir)
+	if err := os.WriteFile(filepath.Join(dir, "added.go"), []byte("package main\n// added_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	matches("full rebuild",
+		[]string{"gone_first_marker", "gone_second_marker", "keep_first_marker"},
+		[]string{"keep_second_marker", "added_marker", "committed_base"})
+}
+
+// shardFileState identifies a shard family on disk by file name: the inode of
+// each .zoekt file and the content of each .meta sidecar.
+type shardFileState struct {
+	shards map[string]uint64
+	metas  map[string]string
+}
+
+// readShardFileState reads the shard files of repoName in indexDir.
+func readShardFileState(t *testing.T, indexDir, repoName string) shardFileState {
+	t.Helper()
+	state := shardFileState{shards: map[string]uint64{}, metas: map[string]string{}}
+	for _, shard := range repositoryShardFiles(indexDir, repoName) {
+		info, err := os.Stat(shard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state.shards[filepath.Base(shard)] = info.Sys().(*syscall.Stat_t).Ino
+		if meta, err := os.ReadFile(shard + ".meta"); err == nil {
+			state.metas[filepath.Base(shard)] = string(meta)
+		}
+	}
+	return state
+}
+
+// requireTombstoneOnlyDelta fails unless after has the shard files of before,
+// each with its inode, and at least one changed .meta sidecar. Then a delta
+// wrote only tombstones and rebuilt no shard.
+func requireTombstoneOnlyDelta(t *testing.T, before, after shardFileState) {
+	t.Helper()
+	if !maps.Equal(before.shards, after.shards) {
+		t.Fatalf("shard files changed: before=%v after=%v", before.shards, after.shards)
+	}
+	if maps.Equal(before.metas, after.metas) {
+		t.Fatal("no .meta sidecar changed: the delta wrote no tombstone")
+	}
+}
+
+// TestDeltaUncommitted_RemovalOnlyKeepsShards removes one of two dirty files.
+// The delta writes tombstones only: every prior uncommitted shard keeps its
+// inode, the shard count stays, and only the .meta sidecars change.
+func TestDeltaUncommitted_RemovalOnlyKeepsShards(t *testing.T) {
+	requireTools(t)
+	dir := initGitRepo(t, "app.go", "package main\n// committed_base\n")
+	ctx := context.Background()
+	paths, plan := planGitTestCorpus(t, dir)
+	reindexGit(t, ctx, paths, plan)
+	keep := "package main\n// keep_marker\n" + strings.Repeat("// filler line\n", 40)
+	if err := os.WriteFile(filepath.Join(dir, "keep.go"), []byte(keep), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "gone.go"), []byte("package main\n// gone_marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	before := readShardFileState(t, plan.indexDir, repoUncommitted)
+	if len(before.shards) == 0 {
+		t.Fatal("no uncommitted shard")
+	}
+
+	if err := os.Remove(filepath.Join(dir, "gone.go")); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	requireTombstoneOnlyDelta(t, before, readShardFileState(t, plan.indexDir, repoUncommitted))
+	if results, err := searchPlannedCorpusForTest(ctx, plan, "gone_marker"); err != nil || len(results) != 0 {
+		t.Fatalf("gone_marker matches %d files, want none; error=%v", len(results), err)
+	}
+}
+
+// requireFullRebuild fails unless after shares no shard file with before: the
+// build replaced the family.
+func requireFullRebuild(t *testing.T, before, after shardFileState) {
+	t.Helper()
+	for name, inode := range before.shards {
+		if after.shards[name] == inode {
+			t.Fatalf("shard %s kept inode %d: the build was a delta", name, inode)
+		}
+	}
+	if len(after.shards) == 0 {
+		t.Fatal("no shard after the full rebuild")
+	}
+}
+
+// requireTombstoneOnlyDeltaOrNewShard fails unless every shard of before keeps
+// its inode in after: the build was a delta, which can add shards.
+func requireTombstoneOnlyDeltaOrNewShard(t *testing.T, before, after shardFileState) {
+	t.Helper()
+	for name, inode := range before.shards {
+		if after.shards[name] != inode {
+			t.Fatalf("shard %s changed inode %d -> %d: the build was not a delta", name, inode, after.shards[name])
+		}
+	}
+}
+
+// compactionFixtureFile is the content of file i of the compaction tests:
+// files of one size, so a count of files is a count of bytes.
+func compactionFixtureFile(i int) string {
+	return fmt.Sprintf("package main\n// compact_marker_%02d\n", i) + strings.Repeat("// filler line\n", 40)
+}
+
+// TestDeltaUncommitted_TombstonedBytesCompactTheFamily removes 3 of 10 dirty
+// files of one size, then 2 more. The first delta tombstones 3 files against 7
+// live ones and stays a delta. With the second, deltas tombstoned 5 files
+// against 5 live ones, so the build replaces the family
+// (deltaNeedsCompaction).
+func TestDeltaUncommitted_TombstonedBytesCompactTheFamily(t *testing.T) {
+	requireTools(t)
+	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
+	// shard) below the bytes of two of these files of 634 bytes.
+	swapForTest(t, &shardMax, 1024)
+	dir := initGitRepo(t, "app.go", "package main\n// committed_base\n")
+	ctx := context.Background()
+	paths, plan := planGitTestCorpus(t, dir)
+	reindexGit(t, ctx, paths, plan)
+	for i := range 10 {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("d%02d.go", i)), []byte(compactionFixtureFile(i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reindexGit(t, ctx, paths, plan)
+	remove := func(files ...int) {
+		t.Helper()
+		for _, i := range files {
+			if err := os.Remove(filepath.Join(dir, fmt.Sprintf("d%02d.go", i))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		reindexGit(t, ctx, paths, plan)
+	}
+
+	before := readShardFileState(t, plan.indexDir, repoUncommitted)
+	remove(0, 1, 2)
+	requireTombstoneOnlyDelta(t, before, readShardFileState(t, plan.indexDir, repoUncommitted))
+
+	before = readShardFileState(t, plan.indexDir, repoUncommitted)
+	remove(3, 4)
+	requireFullRebuild(t, before, readShardFileState(t, plan.indexDir, repoUncommitted))
+	for i := range 10 {
+		results, err := searchPlannedCorpusForTest(ctx, plan, fmt.Sprintf("compact_marker_%02d", i))
+		if want := min(max(i-4, 0), 1); err != nil || len(results) != want {
+			t.Fatalf("compact_marker_%02d matches %d files, want %d; error=%v", i, len(results), want, err)
+		}
+	}
+}
+
+// TestNameOnlyMarkerBytes checks the bytes that a shard document holds for
+// each kind of document (heldContentBytes). A document kept by name only, by
+// the reader or by Zoekt's own check, holds Zoekt's NOT-INDEXED marker. Any
+// other document holds its content.
+func TestNameOnlyMarkerBytes(t *testing.T) {
+	late := append(bytes.Repeat([]byte("a"), 9000), 0)
+	for _, test := range []struct {
+		name string
+		doc  fileContent
+		held int64
+	}{
+		{"text", fileContent{content: []byte("package main\n")}, 13},
+		{"empty", fileContent{}, 0},
+		{"two bytes", fileContent{content: []byte("ab")}, int64(len("NOT-INDEXED: contains too few trigrams"))},
+		{"NUL after the reader's probe", fileContent{content: late}, int64(len("NOT-INDEXED: contains binary content"))},
+		{"binary by the reader", fileContent{skipReason: index.SkipReasonBinary}, int64(len("NOT-INDEXED: contains binary content"))},
+		{"too large", fileContent{skipReason: index.SkipReasonTooLarge}, int64(len("NOT-INDEXED: exceeds the maximum size limit"))},
+		{"no bytes", fileContent{skipReason: seekNoBytesReason}, int64(len("NOT-INDEXED: contains too many trigrams"))},
+	} {
+		if got := heldContentBytes(test.doc); got != test.held {
+			t.Errorf("%s: held=%d, want %d", test.name, got, test.held)
+		}
+	}
+}
+
+// binaryFixtureFile is a file of 8,000 bytes with NUL bytes: its shard holds
+// a marker of 36 bytes.
+var binaryFixtureFile = bytes.Repeat([]byte{0, 1, 2, 3}, 2000)
+
+// textFixture8000 is a text file of 8,000 bytes.
+var textFixture8000 = bytes.Repeat([]byte("// text line of about eighty bytes for the large text file of the fixture\n"), 110)[:8000]
+
+// TestDeltaUncommitted_TextFileThatBecomesBinaryCompacts removes 2 of 10 dirty
+// text files beside a text file of 8,000 bytes, then makes that file binary.
+// Before the reads, the file counts at its size, so the rule keeps a delta.
+// After the reads, it counts as its 36-byte marker. The 2 dead text files and
+// its old 8,000 bytes then reach the bytes of the 8 live text files and the
+// marker. So the family builds in full (deltaNeedsCompaction).
+func TestDeltaUncommitted_TextFileThatBecomesBinaryCompacts(t *testing.T) {
+	requireTools(t)
+	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
+	// shard) below the bytes of two of these files of 634 bytes.
+	swapForTest(t, &shardMax, 1024)
+	dir := initGitRepo(t, "app.go", "package main\n// committed_base\n")
+	ctx := context.Background()
+	paths, plan := planGitTestCorpus(t, dir)
+	reindexGit(t, ctx, paths, plan)
+	for i := range 10 {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("d%02d.go", i)), []byte(compactionFixtureFile(i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "big.txt"), textFixture8000, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	for i := range 2 {
+		if err := os.Remove(filepath.Join(dir, fmt.Sprintf("d%02d.go", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reindexGit(t, ctx, paths, plan)
+	before := readShardFileState(t, plan.indexDir, repoUncommitted)
+	if err := os.WriteFile(filepath.Join(dir, "big.txt"), binaryFixtureFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	requireFullRebuild(t, before, readShardFileState(t, plan.indexDir, repoUncommitted))
+}
+
+// TestDeltaUncommitted_BinaryFileThatBecomesTextStaysADelta removes 4 of 10
+// dirty text files beside a binary file, then 2 more while the binary file
+// becomes 20,280 bytes of text. Before the reads, the changed file counts at
+// an upper bound of its shard bytes, not at its old marker. So the rule keeps
+// the delta that the read bytes keep. The 6 dead text files and the old marker
+// stay below the live bytes (deltaNeedsCompaction).
+func TestDeltaUncommitted_BinaryFileThatBecomesTextStaysADelta(t *testing.T) {
+	requireTools(t)
+	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
+	// shard) below the bytes of two of these files of 634 bytes.
+	swapForTest(t, &shardMax, 1024)
+	dir := initGitRepo(t, "app.go", "package main\n// committed_base\n")
+	ctx := context.Background()
+	paths, plan := planGitTestCorpus(t, dir)
+	reindexGit(t, ctx, paths, plan)
+	for i := range 10 {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("d%02d.go", i)), []byte(compactionFixtureFile(i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "blob.bin"), binaryFixtureFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	remove := func(files ...int) {
+		t.Helper()
+		for _, i := range files {
+			if err := os.Remove(filepath.Join(dir, fmt.Sprintf("d%02d.go", i))); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	remove(0, 1, 2, 3)
+	reindexGit(t, ctx, paths, plan)
+	before := readShardFileState(t, plan.indexDir, repoUncommitted)
+	remove(4, 5)
+	text := bytes.Repeat([]byte("// text line of the former binary file\n"), 520)
+	if err := os.WriteFile(filepath.Join(dir, "blob.bin"), text, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	requireTombstoneOnlyDeltaOrNewShard(t, before, readShardFileState(t, plan.indexDir, repoUncommitted))
+}
+
+// TestDeltaUncommitted_BinaryFilesCountTheirMarker removes 8 of 10 dirty text
+// files beside a dirty binary file of 8,000 bytes. The binary file counts as
+// its marker, so 8 dead text files against 2 live ones and the marker rebuild
+// the family (deltaNeedsCompaction).
+func TestDeltaUncommitted_BinaryFilesCountTheirMarker(t *testing.T) {
+	requireTools(t)
+	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
+	// shard) below the bytes of two of these files of 634 bytes.
+	swapForTest(t, &shardMax, 1024)
+	dir := initGitRepo(t, "app.go", "package main\n// committed_base\n")
+	ctx := context.Background()
+	paths, plan := planGitTestCorpus(t, dir)
+	reindexGit(t, ctx, paths, plan)
+	for i := range 10 {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("d%02d.go", i)), []byte(compactionFixtureFile(i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "blob.bin"), binaryFixtureFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reindexGit(t, ctx, paths, plan)
+	before := readShardFileState(t, plan.indexDir, repoUncommitted)
+	for i := range 8 {
+		if err := os.Remove(filepath.Join(dir, fmt.Sprintf("d%02d.go", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reindexGit(t, ctx, paths, plan)
+	requireFullRebuild(t, before, readShardFileState(t, plan.indexDir, repoUncommitted))
+}
+
+// TestDeltaUncommitted_OnlyAMissingFileIsGone stats a deleted file and a file
+// at the root whose name is longer than 255 bytes. Lstat of the long name fails
+// with ENAMETOOLONG on Linux and macOS. The file is at the root: below a
+// missing folder, Lstat would fail with ENOENT first. Only the deleted file is
+// gone, and the delta reads the other one. A gone file gets no manifest entry,
+// so when it comes back, the delta tombstones nothing.
+func TestDeltaUncommitted_OnlyAMissingFileIsGone(t *testing.T) {
+	long := strings.Repeat("z", 300) + ".txt"
+	candidates := statUncommittedCandidates(t.TempDir(), []string{"deleted.txt", long})
+	if len(candidates) != 2 || !candidates[0].gone || candidates[1].gone {
+		t.Fatalf("candidates=%+v, want deleted.txt gone and the long path not", candidates)
+	}
+	if entries := uncommittedManifestEntries(candidates); len(entries) != 1 || entries[0].Name != long {
+		t.Fatalf("entries=%+v, want the long path only", entries)
+	}
+	toRead, changed, _ := diffUncommittedAgainstManifest(candidates, uncommittedManifest{})
+	if len(toRead) != 1 || toRead[0].Name != long || !slices.Equal(changed, []string{long}) {
+		t.Fatalf("toRead=%+v changed=%v, want the long path only", toRead, changed)
+	}
+}
+
 func TestDeltaUncommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 	requireTools(t)
 
@@ -432,12 +940,22 @@ func TestDeltaUncommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 	var missed atomic.Int64
 	var searchErr atomic.Int64
 	var wg sync.WaitGroup
-	start := make(chan struct{})
+	// The writer closes reindexing[i] when cycle i starts its reindex, and
+	// search i starts then. So search i runs beside cycle i, after the
+	// publish of each cycle before it.
+	reindexing := make([]chan struct{}, iterations)
+	for i := range reindexing {
+		reindexing[i] = make(chan struct{})
+	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		<-start
+	wg.Go(func() {
+		started := 0
+		// A writer that stops early starts the remaining searches.
+		defer func() {
+			for _, ch := range reindexing[started:] {
+				close(ch)
+			}
+		}()
 		for i := range iterations {
 			if err := os.WriteFile(filepath.Join(dir, "app.go"), fmt.Appendf(nil, "package main\n// concurrent_uncommitted_%d\n", i), 0o644); err != nil {
 				t.Errorf("write: %v", err)
@@ -449,19 +967,18 @@ func TestDeltaUncommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 				return
 			}
 			hash := gitCorpusStateHash(paths, state)
-			if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, hash); err != nil {
+			close(reindexing[i])
+			started++
+			if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, hash); err != nil {
 				t.Errorf("reindex: %v", err)
 				return
 			}
 		}
-	}()
+	})
 
 	for i := range iterations {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			<-start
-			time.Sleep(time.Duration(1+idx%4) * time.Millisecond)
+		wg.Go(func() {
+			<-reindexing[i]
 			res, err := searchPlannedCorpusForTest(ctx, plan, "uncommitted_concurrent_stable")
 			if err != nil {
 				searchErr.Add(1)
@@ -470,9 +987,8 @@ func TestDeltaUncommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 			if len(res) == 0 {
 				missed.Add(1)
 			}
-		}(i)
+		})
 	}
-	close(start)
 	wg.Wait()
 
 	if missed.Load() > 0 {

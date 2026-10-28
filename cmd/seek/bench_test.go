@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -17,29 +19,24 @@ import (
 	"github.com/sourcegraph/zoekt/index"
 )
 
-var benchmarkStringSink string
-var benchmarkPlansSink []corpusPlan
-
-func benchmarkRefreshGit(ctx context.Context, paths gitPaths, plan corpusPlan) error {
-	state, err := gitRepoStateIn(ctx, paths.RepoDir)
-	if err != nil {
-		return err
+// benchmarkRefreshGit runs the node refresh that a search runs
+// (gitNode.prepare): git status, the index checks, and the build when the
+// state changed. A stale index is an error: the benchmark must time a build
+// that publishes.
+func benchmarkRefreshGit(ctx context.Context, paths gitPaths, plan node) error {
+	indexState, err := ensureGitCorpusFresh(ctx, plan, paths)
+	if err == nil && indexState == corpusStale {
+		// A failed build serves the last index with no error.
+		return errors.New("the refresh left the index stale")
 	}
-	return runIndexingWithCache(
-		ctx,
-		paths,
-		plan.cacheDir,
-		plan.indexDir,
-		state,
-		gitCorpusStateHash(paths, state),
-	)
+	return err
 }
 
-// --- Hot-path microbenchmarks ---
-// These cover every function called on each search invocation.
+// --- Microbenchmarks of search-time functions ---
+// These cover functions that run on each search.
 
 func BenchmarkComputeStateHash_Small(b *testing.B) {
-	// Typical clean repo: headers only (~80 bytes)
+	// A clean repository: the two header records only, about 70 bytes.
 	input := "# branch.oid abc123def456789012345678901234567890\x00# branch.head main\x00"
 	b.SetBytes(int64(len(input)))
 	b.ReportAllocs()
@@ -49,13 +46,14 @@ func BenchmarkComputeStateHash_Small(b *testing.B) {
 }
 
 func BenchmarkComputeStateHash_Dirty(b *testing.B) {
-	// Repo with 50 dirty files — fingerprinted output (~5 KB)
+	// A repository with 50 dirty files and their stat fields: about 5 KB.
 	var sb strings.Builder
 	sb.WriteString("# branch.oid abc123def456789012345678901234567890\x00# branch.head main\x00")
 	for i := range 50 {
 		fmt.Fprintf(&sb, "1 .M N... 100644 100644 100644 abc123 def456 src/pkg%d/file%d.go\x00", i, i)
 	}
-	// Simulate fingerprint appendix
+	// The stat fields of each dirty file, as repoStateFingerprint appends
+	// them, with fewer fields.
 	for i := range 50 {
 		fmt.Fprintf(&sb, "\x00src/pkg%d/file%d.go\x001709312345678901234\x0012345\x00", i, i)
 	}
@@ -163,7 +161,8 @@ func BenchmarkRepoStateFingerprint_50Files(b *testing.B) {
 }
 
 func BenchmarkRepoStateFingerprint_DeletedFiles(b *testing.B) {
-	// All files are "deleted" (don't exist on disk) — exercises error path
+	// No file is on disk, so each Lstat fails and the fingerprint records
+	// each file as deleted.
 	state := repoState{
 		HeadSHA:   "abc123",
 		RawOutput: "# branch.oid abc123\x00",
@@ -204,45 +203,14 @@ func BenchmarkExtractV2Path(b *testing.B) {
 	}
 }
 
-func BenchmarkFastResolveGitPaths(b *testing.B) {
-	dir := b.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, ".git", "info"), 0o755); err != nil {
-		b.Fatal(err)
-	}
-
-	// Change to the temp dir so fastResolveGitPaths can find .git
-	origDir, err := os.Getwd()
-	if err != nil {
-		b.Fatal(err)
-	}
-	if err := os.Chdir(dir); err != nil {
-		b.Fatal(err)
-	}
-	b.Cleanup(func() { _ = os.Chdir(origDir) })
-
-	b.ReportAllocs()
-	for b.Loop() {
-		fastResolveGitPaths()
-	}
-}
-
 func BenchmarkResolveGitPaths_Subprocess(b *testing.B) {
-	dir := initGitRepo(b, "dummy.go", "package dummy\n")
-	origDir, err := os.Getwd()
-	if err != nil {
-		b.Fatal(err)
-	}
-	if err := os.Chdir(dir); err != nil {
-		b.Fatal(err)
-	}
-	b.Cleanup(func() { _ = os.Chdir(origDir) })
-	ctx := context.Background()
+	b.Chdir(initGitRepo(b, "dummy.go", "package dummy\n"))
+	ctx := b.Context()
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
-		// Call resolveGitPaths directly to bypass the fast path
-		// and measure pure subprocess cost.
+		// resolveGitPaths has no detectGitBoundary fast path (classifyGitDir
+		// has it), so the loop times the Git process alone.
 		if _, err := resolveGitPaths(ctx, ""); err != nil {
 			b.Fatal(err)
 		}
@@ -253,18 +221,13 @@ func BenchmarkResolveGitPaths_Subprocess(b *testing.B) {
 
 const benchmarkFormatterCorpusID corpusID = "benchmark"
 
+// benchmarkGitResults wraps files as the results of one Git node and sets
+// their headers (withHeaders).
 func benchmarkGitResults(files []zoekt.FileMatch) []corpusSearchResult {
-	return wrapCorpusResults(corpusPlan{
+	return withHeaders(wrapCorpusResults(node{
 		id:   benchmarkFormatterCorpusID,
 		kind: corpusKindGit,
-	}, files)
-}
-
-func benchmarkDirtyFilesByCorpus(dirtyFiles dirtyFileSet) dirtyFilesByCorpus {
-	if dirtyFiles == nil {
-		return nil
-	}
-	return dirtyFilesByCorpus{benchmarkFormatterCorpusID: dirtyFiles}
+	}, files))
 }
 
 func BenchmarkCorpusFormatting_1File_1Match(b *testing.B) {
@@ -279,12 +242,13 @@ func BenchmarkCorpusFormatting_1File_1Match(b *testing.B) {
 	results := benchmarkGitResults(files)
 	b.ReportAllocs()
 	for b.Loop() {
-		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
+		formatCorpusResultsWithContext(results, 0, 0, hideCorpusContext, plainPalette)
 	}
 }
 
-// BenchmarkCorpusFormatting_LongLineWindowed exercises the match-aware
-// windowing path (line >> maxLineBytes with a deep match + truncation markers).
+// BenchmarkCorpusFormatting_LongLineWindowed times the window that the
+// formatter cuts around a match. The line is about 4 times maxLineBytes, the
+// match is deep in it, and both ends of the window get a cut marker.
 func BenchmarkCorpusFormatting_LongLineWindowed(b *testing.B) {
 	line := strings.Repeat("x", 2000) + "NEEDLE" + strings.Repeat("y", 2000) + "\n"
 	files := []zoekt.FileMatch{{
@@ -296,12 +260,13 @@ func BenchmarkCorpusFormatting_LongLineWindowed(b *testing.B) {
 	results := benchmarkGitResults(files)
 	b.ReportAllocs()
 	for b.Loop() {
-		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
+		formatCorpusResultsWithContext(results, 0, 0, hideCorpusContext, plainPalette)
 	}
 }
 
-// BenchmarkCorpusFormatting_SanitizedControlChars exercises the rune-by-rune
-// sanitize slow path (C0 ESC + C1 control bytes interleaved with text).
+// BenchmarkCorpusFormatting_SanitizedControlChars times the slow path of
+// writeSanitized, which drops control characters one rune at a time. The line
+// mixes ESC (a C0 control) and U+009C (a C1 control) with text.
 func BenchmarkCorpusFormatting_SanitizedControlChars(b *testing.B) {
 	line := "func x() { " + strings.Repeat("a\x1bb\u009c", 50) + " }\n"
 	files := []zoekt.FileMatch{{
@@ -311,7 +276,7 @@ func BenchmarkCorpusFormatting_SanitizedControlChars(b *testing.B) {
 	results := benchmarkGitResults(files)
 	b.ReportAllocs()
 	for b.Loop() {
-		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
+		formatCorpusResultsWithContext(results, 0, 0, hideCorpusContext, plainPalette)
 	}
 }
 
@@ -331,16 +296,7 @@ func BenchmarkCorpusFormatting_10Files_3Matches(b *testing.B) {
 	results := benchmarkGitResults(files)
 	b.ReportAllocs()
 	for b.Loop() {
-		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
-	}
-}
-
-func BenchmarkCorpusFormatting_100Files_WithDedup(b *testing.B) {
-	files := dedupFixtureFiles(100, "file_%03d.go", "match\n", "updated match\n")
-	results := benchmarkGitResults(files)
-	b.ReportAllocs()
-	for b.Loop() {
-		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
+		formatCorpusResultsWithContext(results, 0, 0, hideCorpusContext, plainPalette)
 	}
 }
 
@@ -365,12 +321,12 @@ func BenchmarkCorpusFormatting_WithSymbols(b *testing.B) {
 	results := benchmarkGitResults(files)
 	b.ReportAllocs()
 	for b.Loop() {
-		formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, plainPalette)
+		formatCorpusResultsWithContext(results, 0, 0, hideCorpusContext, plainPalette)
 	}
 }
 
-// buildLargeFixture creates nFiles FileMatches, each with matchesPerFile
-// LineMatches including Before/After context and symbol annotations.
+// buildLargeFixture makes nFiles FileMatches, each with matchesPerFile
+// LineMatches. Each line match has Before and After context and a symbol.
 func buildLargeFixture(nFiles, matchesPerFile int) []zoekt.FileMatch {
 	files := make([]zoekt.FileMatch, nFiles)
 	for i := range nFiles {
@@ -408,7 +364,7 @@ func BenchmarkCorpusFormatting_FileLimit(b *testing.B) {
 		b.Run(name, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				formatCorpusResultsWithContext(results, nil, limit, 0, hideCorpusContext, plainPalette)
+				formatCorpusResultsWithContext(results, limit, 0, hideCorpusContext, plainPalette)
 			}
 		})
 	}
@@ -425,7 +381,7 @@ func BenchmarkCorpusFormatting_MatchLimit(b *testing.B) {
 		b.Run(name, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				formatCorpusResultsWithContext(results, nil, 0, maxMatches, hideCorpusContext, plainPalette)
+				formatCorpusResultsWithContext(results, 0, maxMatches, hideCorpusContext, plainPalette)
 			}
 		})
 	}
@@ -445,29 +401,9 @@ func BenchmarkCorpusFormatting_Combined(b *testing.B) {
 		b.Run(tc.name, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
-				formatCorpusResultsWithContext(results, nil, tc.limit, tc.maxMatches, hideCorpusContext, plainPalette)
+				formatCorpusResultsWithContext(results, tc.limit, tc.maxMatches, hideCorpusContext, plainPalette)
 			}
 		})
-	}
-}
-
-func BenchmarkDeduplicateCorpusResults_100(b *testing.B) {
-	results := make([]corpusSearchResult, 200)
-	for i := range 100 {
-		results[i] = corpusSearchResult{
-			corpusID: corpusID("repo"),
-			kind:     corpusKindGit,
-			file:     zoekt.FileMatch{FileName: fmt.Sprintf("f%d.go", i), Repository: "repo"},
-		}
-		results[100+i] = corpusSearchResult{
-			corpusID: corpusID("repo"),
-			kind:     corpusKindGit,
-			file:     zoekt.FileMatch{FileName: fmt.Sprintf("f%d.go", i), Repository: repoUncommitted},
-		}
-	}
-	b.ReportAllocs()
-	for b.Loop() {
-		deduplicateCorpusResults(results, nil)
 	}
 }
 
@@ -497,6 +433,8 @@ func BenchmarkStreamFiles_200Files(b *testing.B) {
 	benchmarkStreamFiles(b, 200)
 }
 
+// benchmarkStreamFiles times streamDirtyFiles over numFiles small files. The
+// benchmark names keep streamFiles for the CodSpeed history.
 func benchmarkStreamFiles(b *testing.B, numFiles int) {
 	b.Helper()
 
@@ -508,27 +446,39 @@ func benchmarkStreamFiles(b *testing.B, numFiles int) {
 		_ = os.WriteFile(filepath.Join(dir, name), []byte(fmt.Sprintf("package f%d\n// content_%d\n", i, i)), 0o644)
 	}
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
-		for fc := range streamFiles(b.Context(), dir, files, 4) {
+		// The failure rule of the text index build (buildUncommittedStage).
+		readCtx, cancel := context.WithCancelCause(b.Context())
+		failure := &dirtyFailure{keep: true, stop: cancel}
+		for fc := range streamDirtyFiles(readCtx, dir, files, 4, failure) {
 			readSemaphore.Release(fc.weight)
+		}
+		if readErr, ok := errors.AsType[*folderReadError](context.Cause(readCtx)); ok {
+			b.Fatal(readErr)
+		}
+		cancel(nil)
+		if err := failure.noted(); err != nil {
+			b.Fatal(err)
 		}
 	}
 }
 
-// --- End-to-end benchmark (requires git + ctags) ---
+// --- End-to-end benchmarks: they need Git and ctags ---
 
+// BenchmarkPlannedGitCorpus_ColdIndex times the first build and search of a
+// new repository (runSeekInPlannedGitCorpus). The timer stops while the round
+// makes the repository and plans its node (planGitTestCorpus).
 func BenchmarkPlannedGitCorpus_ColdIndex(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
+	ctx := b.Context()
 
 	for b.Loop() {
+		b.StopTimer()
 		dir := initGitRepo(b, "app.go", "package main\n\nfunc main() {\n\t// benchmark_marker_cold\n}\n")
-		ctx := context.Background()
-		paths, plan := planGitTestCorpus(b, dir)
-		results, err := runSeekInPlannedGitCorpus(ctx, "benchmark_marker_cold", paths, plan)
+		_, plan := planGitTestCorpus(b, dir)
+		b.StartTimer()
+
+		results, err := runSeekInPlannedGitCorpus(ctx, "benchmark_marker_cold", plan)
 		if err != nil {
 			b.Fatalf("cold search: %v", err)
 		}
@@ -539,23 +489,19 @@ func BenchmarkPlannedGitCorpus_ColdIndex(b *testing.B) {
 }
 
 func BenchmarkPlannedGitCorpus_WarmSearch(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
 
 	dir := initGitRepo(b, "app.go", "package main\n\nfunc main() {\n\t// benchmark_marker_warm\n}\n")
-	ctx := context.Background()
-	paths, plan := planGitTestCorpus(b, dir)
-	if results, err := runSeekInPlannedGitCorpus(ctx, "benchmark_marker_warm", paths, plan); err != nil {
+	ctx := b.Context()
+	_, plan := planGitTestCorpus(b, dir)
+	if results, err := runSeekInPlannedGitCorpus(ctx, "benchmark_marker_warm", plan); err != nil {
 		b.Fatalf("warm setup: %v", err)
 	} else if len(results) == 0 {
 		b.Fatal("expected warm setup result")
 	}
 
-	b.ResetTimer()
 	for b.Loop() {
-		results, err := runSeekInPlannedGitCorpus(ctx, "benchmark_marker_warm", paths, plan)
+		results, err := runSeekInPlannedGitCorpus(ctx, "benchmark_marker_warm", plan)
 		if err != nil {
 			b.Fatalf("warm search: %v", err)
 		}
@@ -566,51 +512,29 @@ func BenchmarkPlannedGitCorpus_WarmSearch(b *testing.B) {
 }
 
 func BenchmarkGitPathScoped_WarmSearch(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
 
 	dir := initGitRepo(b, "seed.go", "package seed\n")
-	if err := os.MkdirAll(filepath.Join(dir, "a"), 0o755); err != nil {
-		b.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(dir, "b"), 0o755); err != nil {
-		b.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "a", "app.go"), []byte("package a\n// path_scoped_bench_marker\n"), 0o644); err != nil {
-		b.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "b", "app.go"), []byte("package b\n// path_scoped_bench_marker\n"), 0o644); err != nil {
-		b.Fatal(err)
-	}
-	for _, args := range [][]string{
-		{"add", "."},
-		{"commit", "-m", "add path scoped benchmark files"},
-	} {
-		cmd := exec.Command("git", args...)
-		cmd.Dir = dir
-		if out, err := cmd.CombinedOutput(); err != nil {
-			b.Fatalf("git %v failed: %v\n%s", args, err, out)
-		}
-	}
+	writeFileAt(b, dir, "a/app.go", "package a\n// path_scoped_bench_marker\n")
+	writeFileAt(b, dir, "b/app.go", "package b\n// path_scoped_bench_marker\n")
+	gitRunIn(b, dir, "add", ".")
+	gitRunIn(b, dir, "commit", "-m", "add path scoped benchmark files")
 
-	ctx := context.Background()
+	ctx := b.Context()
 	paths, _ := planGitTestCorpus(b, dir)
-	scopedPlan, err := planCurrentGitCorpusWithOperands(paths, []string{filepath.Join(dir, "a")})
+	scopedPlan, err := planGitCorpus(paths, []gitScopeOperand{{path: filepath.Join(dir, "a"), dir: true}})
 	if err != nil {
 		b.Fatalf("plan scoped corpus: %v", err)
 	}
 
-	if results, err := runSeekInPlannedGitCorpus(ctx, "path_scoped_bench_marker", paths, scopedPlan); err != nil {
+	if results, err := runSeekInPlannedGitCorpus(ctx, "path_scoped_bench_marker", scopedPlan); err != nil {
 		b.Fatalf("scoped setup: %v", err)
 	} else {
-		assertBenchmarkResultsOnly(b, results, "a/app.go")
+		assertScopedBenchmarkResult(b, results)
 	}
 
-	b.ResetTimer()
 	for b.Loop() {
-		if _, err := runSeekInPlannedGitCorpus(ctx, "path_scoped_bench_marker", paths, scopedPlan); err != nil {
+		if _, err := runSeekInPlannedGitCorpus(ctx, "path_scoped_bench_marker", scopedPlan); err != nil {
 			b.Fatalf("search scoped corpus: %v", err)
 		}
 	}
@@ -630,50 +554,42 @@ func BenchmarkGitPathScoped_PlanCorpora(b *testing.B) {
 	gitRunIn(b, dir, "add", ".")
 	gitRunIn(b, dir, "commit", "-m", "add scoped planning files")
 
-	ctx := context.Background()
-	paths, _ := planGitTestCorpus(b, dir)
+	ctx := b.Context()
 	operands := []string{scope}
-	if plans, err := planCorpora(ctx, &paths, operands); err != nil {
+	if plans, err := planCorpora(ctx, operands); err != nil {
 		b.Fatalf("plan setup: %v", err)
 	} else if len(plans) != 1 {
 		b.Fatalf("plans=%d, want 1", len(plans))
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
-		plans, err := planCorpora(ctx, &paths, operands)
-		if err != nil {
+		if _, err := planCorpora(ctx, operands); err != nil {
 			b.Fatalf("plan scoped corpus: %v", err)
 		}
-		benchmarkPlansSink = plans
 	}
 }
 
 func BenchmarkGitPathScoped_ColdIndexWithTrackedSibling(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
 
 	dir, scope := writeScopedGitBenchmarkRepo(b)
-	ctx := context.Background()
+	ctx := b.Context()
 	paths, _ := planGitTestCorpus(b, dir)
-	scopedPlan, err := planCurrentGitCorpusWithOperands(paths, []string{scope})
+	scopedPlan, err := planGitCorpus(paths, []gitScopeOperand{{path: scope, dir: true}})
 	if err != nil {
 		b.Fatalf("plan scoped corpus: %v", err)
 	}
 	if err := os.RemoveAll(scopedPlan.cacheDir); err != nil {
 		b.Fatal(err)
 	}
-	if results, err := runSeekInPlannedGitCorpus(ctx, "scoped_cold_marker", paths, scopedPlan); err != nil {
+	if results, err := runSeekInPlannedGitCorpus(ctx, "scoped_cold_marker", scopedPlan); err != nil {
 		b.Fatalf("cold scoped setup: %v", err)
 	} else {
-		assertBenchmarkResultsOnly(b, results, "a/app.go")
+		assertScopedBenchmarkResult(b, results)
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
 		b.StopTimer()
 		if err := os.RemoveAll(scopedPlan.cacheDir); err != nil {
@@ -681,29 +597,26 @@ func BenchmarkGitPathScoped_ColdIndexWithTrackedSibling(b *testing.B) {
 		}
 		b.StartTimer()
 
-		if _, err := runSeekInPlannedGitCorpus(ctx, "scoped_cold_marker", paths, scopedPlan); err != nil {
+		if _, err := runSeekInPlannedGitCorpus(ctx, "scoped_cold_marker", scopedPlan); err != nil {
 			b.Fatalf("cold scoped corpus: %v", err)
 		}
 	}
 }
 
 func BenchmarkGitPathScoped_DirtyReindexWithTrackedSibling(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
 
 	dir, scope := writeScopedGitBenchmarkRepo(b)
-	ctx := context.Background()
+	ctx := b.Context()
 	paths, _ := planGitTestCorpus(b, dir)
-	scopedPlan, err := planCurrentGitCorpusWithOperands(paths, []string{scope})
+	scopedPlan, err := planGitCorpus(paths, []gitScopeOperand{{path: scope, dir: true}})
 	if err != nil {
 		b.Fatalf("plan scoped corpus: %v", err)
 	}
-	if results, err := runSeekInPlannedGitCorpus(ctx, "scoped_cold_marker", paths, scopedPlan); err != nil {
+	if results, err := runSeekInPlannedGitCorpus(ctx, "scoped_cold_marker", scopedPlan); err != nil {
 		b.Fatalf("warm scoped setup: %v", err)
 	} else {
-		assertBenchmarkResultsOnly(b, results, "a/app.go")
+		assertScopedBenchmarkResult(b, results)
 	}
 
 	target := filepath.Join(scope, "app.go")
@@ -711,14 +624,13 @@ func BenchmarkGitPathScoped_DirtyReindexWithTrackedSibling(b *testing.B) {
 	if err := os.WriteFile(target, []byte("package a\n// scoped_cold_marker\n// "+setupMarker+"\n"), 0o644); err != nil {
 		b.Fatal(err)
 	}
-	if results, err := runSeekInPlannedGitCorpus(ctx, setupMarker, paths, scopedPlan); err != nil {
+	if results, err := runSeekInPlannedGitCorpus(ctx, setupMarker, scopedPlan); err != nil {
 		b.Fatalf("dirty scoped setup: %v", err)
 	} else {
-		assertBenchmarkResultsOnly(b, results, "a/app.go")
+		assertScopedBenchmarkResult(b, results)
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		b.StopTimer()
 		marker := fmt.Sprintf("scoped_dirty_marker_%d", i)
@@ -727,36 +639,32 @@ func BenchmarkGitPathScoped_DirtyReindexWithTrackedSibling(b *testing.B) {
 			b.Fatal(err)
 		}
 		b.StartTimer()
-		// Measure seek's post-mutation reindex/search path, not filesystem
-		// write setup. Compare against baselines collected with this harness.
-		if _, err := runSeekInPlannedGitCorpus(ctx, marker, paths, scopedPlan); err != nil {
+		// The timer covers the refresh and the search, not the file write.
+		// Compare only with earlier results of this benchmark.
+		if _, err := runSeekInPlannedGitCorpus(ctx, marker, scopedPlan); err != nil {
 			b.Fatalf("dirty scoped corpus: %v", err)
 		}
 	}
 }
 
 func BenchmarkGitPathScoped_OutOfScopeCommitReusesCommittedLayer(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
 
 	dir, scope := writeScopedGitBenchmarkRepo(b)
-	ctx := context.Background()
+	ctx := b.Context()
 	paths, _ := planGitTestCorpus(b, dir)
-	scopedPlan, err := planCurrentGitCorpusWithOperands(paths, []string{scope})
+	scopedPlan, err := planGitCorpus(paths, []gitScopeOperand{{path: scope, dir: true}})
 	if err != nil {
 		b.Fatalf("plan scoped corpus: %v", err)
 	}
-	if results, err := runSeekInPlannedGitCorpus(ctx, "scoped_cold_marker", paths, scopedPlan); err != nil {
+	if results, err := runSeekInPlannedGitCorpus(ctx, "scoped_cold_marker", scopedPlan); err != nil {
 		b.Fatalf("warm scoped setup: %v", err)
 	} else {
-		assertBenchmarkResultsOnly(b, results, "a/app.go")
+		assertScopedBenchmarkResult(b, results)
 	}
 
 	sibling := filepath.Join(dir, "b")
 	b.ReportAllocs()
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		b.StopTimer()
 		name := filepath.Join(sibling, fmt.Sprintf("outside_%03d.go", i))
@@ -768,12 +676,15 @@ func BenchmarkGitPathScoped_OutOfScopeCommitReusesCommittedLayer(b *testing.B) {
 		gitRunIn(b, dir, "commit", "-m", "out of scope benchmark commit")
 		b.StartTimer()
 
-		if _, err := runSeekInPlannedGitCorpus(ctx, "scoped_cold_marker", paths, scopedPlan); err != nil {
+		if _, err := runSeekInPlannedGitCorpus(ctx, "scoped_cold_marker", scopedPlan); err != nil {
 			b.Fatalf("search after out-of-scope commit: %v", err)
 		}
 	}
 }
 
+// writeScopedGitBenchmarkRepo commits a repository whose folder a is the
+// scope and whose folder b is a tracked sibling. b/app.go holds the marker of
+// a/app.go, beside 200 more files. It returns the repository and the scope.
 func writeScopedGitBenchmarkRepo(b *testing.B) (repoDir, scope string) {
 	b.Helper()
 	dir := initGitRepo(b, "seed.go", "package seed\n")
@@ -802,44 +713,30 @@ func writeScopedGitBenchmarkRepo(b *testing.B) (repoDir, scope string) {
 	return dir, scope
 }
 
-func assertBenchmarkResultsOnly(b *testing.B, results []string, want ...string) {
+// assertScopedBenchmarkResult requires a/app.go as the one result. Each
+// scoped benchmark searches the folder a, which holds only that file.
+func assertScopedBenchmarkResult(b *testing.B, results []string) {
 	b.Helper()
-	if len(results) != len(want) {
-		b.Fatalf("results=%v, want exactly %v", results, want)
-	}
-	for _, expected := range want {
-		found := false
-		for _, got := range results {
-			if got == expected {
-				found = true
-				break
-			}
-		}
-		if !found {
-			b.Fatalf("results=%v, want exactly %v", results, want)
-		}
+	if !slices.Equal(results, []string{"a/app.go"}) {
+		b.Fatalf("results=%v, want exactly [a/app.go]", results)
 	}
 }
 
 func BenchmarkPlannedGitCorpus_DirtyReindex(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
 
 	dir := initGitRepo(b, "app.go", "package main\n\nfunc main() {\n\t// dirty_bench\n}\n")
-	ctx := context.Background()
-	paths, plan := planGitTestCorpus(b, dir)
-	if results, err := runSeekInPlannedGitCorpus(ctx, "dirty_bench", paths, plan); err != nil {
+	ctx := b.Context()
+	_, plan := planGitTestCorpus(b, dir)
+	if results, err := runSeekInPlannedGitCorpus(ctx, "dirty_bench", plan); err != nil {
 		b.Fatalf("dirty setup: %v", err)
 	} else if len(results) == 0 {
 		b.Fatal("expected dirty setup result")
 	}
 
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		b.StopTimer()
-		// Simulate edit on each iteration
+		// Each round edits app.go with a new marker.
 		marker := fmt.Sprintf("dirty_bench_iter_%d", i)
 		content := fmt.Sprintf("package main\n\nfunc main() {\n\t// %s\n}\n", marker)
 		if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte(content), 0o644); err != nil {
@@ -847,7 +744,7 @@ func BenchmarkPlannedGitCorpus_DirtyReindex(b *testing.B) {
 		}
 		b.StartTimer()
 
-		results, err := runSeekInPlannedGitCorpus(ctx, marker, paths, plan)
+		results, err := runSeekInPlannedGitCorpus(ctx, marker, plan)
 		if err != nil {
 			b.Fatalf("dirty search: %v", err)
 		}
@@ -857,23 +754,21 @@ func BenchmarkPlannedGitCorpus_DirtyReindex(b *testing.B) {
 	}
 }
 
-// BenchmarkSmallRepo_Phases breaks down the dirty-reindex path into
-// individual phases on a tiny repo (no SEEK_BENCH_REPO needed).
+// BenchmarkSmallRepo_Phases times each phase of the dirty refresh and of the
+// search on a small repository. It needs no SEEK_BENCH_REPO.
 func BenchmarkSmallRepo_Phases(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping in short mode")
-	}
 	requireTools(b)
 
 	dir := initGitRepo(b, "app.go", "package main\n\nfunc main() {\n\t// phase_bench\n}\n")
-	ctx := context.Background()
+	ctx := b.Context()
 	paths, plan := planGitTestCorpus(b, dir)
 
-	if _, _, err := ensureGitCorpusFresh(ctx, &plan, paths); err != nil {
+	if _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
 		b.Fatalf("initial indexing: %v", err)
 	}
 
-	// Dirty the file for uncommitted phases
+	// original is the committed app.go. The uncommitted phases append to it
+	// to make the file dirty.
 	original := []byte("package main\n\nfunc main() {\n\t// phase_bench\n}\n")
 
 	b.Run("gitRepoStateIn", func(b *testing.B) {
@@ -907,17 +802,10 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 		}
 	})
 
-	b.Run("planCurrentGitCorpus", func(b *testing.B) {
+	b.Run("planGitCorpus", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			_, _ = planCurrentGitCorpus(paths)
-		}
-	})
-
-	b.Run("ensureUntrackedCache", func(b *testing.B) {
-		b.ReportAllocs()
-		for b.Loop() {
-			ensureUntrackedCache(ctx, paths)
+			_, _ = planGitCorpus(paths, nil)
 		}
 	})
 
@@ -941,18 +829,20 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 		cachedState := readStateFile(plan.cacheDir)
 		preState := gitCorpusStateHash(paths, state)
 		b.ReportAllocs()
-		b.ResetTimer()
 		for i := 0; b.Loop(); i++ {
-			content := fmt.Appendf(original[:len(original):len(original)], "\n// p_%d\n", i)
+			content := fmt.Appendf(slices.Clip(original), "\n// p_%d\n", i)
 			if err := os.WriteFile(filepath.Join(dir, "app.go"), content, 0o644); err != nil {
 				b.Fatal(err)
 			}
-			// Reuse the captured state (paths only). statUncommittedCandidates
-			// re-stats each file during indexUncommitted, so the delta path
-			// still sees fresh mtime/size/ino for every iteration.
-			if err := indexUncommitted(ctx, dir, plan.indexDir, plan.cacheDir, state, cachedState, preState, indexParallelism()); err != nil {
+			// The rounds use the first capture for its paths only.
+			// indexUncommittedForBench stats each file again in each round
+			// (statUncommittedCandidates), so it sees the new size and mtime.
+			if err := indexUncommittedForBench(ctx, dir, plan.corpusStore, state, cachedState, preState); err != nil {
 				b.Fatalf("index uncommitted: %v", err)
 			}
+			// A build records the state it published: the next round reads
+			// a delta of the one changed file, as a real refresh does.
+			cachedState = preState
 		}
 	})
 
@@ -965,46 +855,33 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 			b.Fatal("expected dirty files")
 		}
 		b.ReportAllocs()
-		b.ResetTimer()
 		for b.Loop() {
 			gitCorpusStateHash(paths, dirtyState)
 		}
 	})
 
+	// The names of the next two sub-benchmarks stay for the CodSpeed history:
+	// both time the node read (searchPlannedCorpusParsed).
 	b.Run("executeParsedSearchScoped", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			if _, err := executeUnscopedShardSearchForTest(ctx, plan.indexDir, "phase_bench"); err != nil {
+			if _, err := searchPlannedCorpusForTest(ctx, plan, "phase_bench"); err != nil {
 				b.Fatalf("execute search: %v", err)
 			}
 		}
 	})
 
 	b.Run("executeParsedSearchScopedDirs_withEmptyOptionalDir", func(b *testing.B) {
-		emptyIndexDir := b.TempDir()
 		userQ, err := parseSearchQuery("phase_bench")
 		if err != nil {
 			b.Fatal(err)
 		}
 
 		b.Run("singleDir", func(b *testing.B) {
-			indexDirs := []string{plan.indexDir}
 			b.ReportAllocs()
-			b.ResetTimer()
 			for b.Loop() {
-				if _, err := executeParsedSearchScopedDirs(ctx, indexDirs, userQ, nil, defaultSearchConfig()); err != nil {
+				if _, err := searchPlannedCorpusParsed(ctx, plan, nil, userQ, defaultSearchConfig()); err != nil {
 					b.Fatalf("execute search with one dir: %v", err)
-				}
-			}
-		})
-
-		b.Run("oneShardDirOneEmptyDir", func(b *testing.B) {
-			indexDirs := []string{plan.indexDir, emptyIndexDir}
-			b.ReportAllocs()
-			b.ResetTimer()
-			for b.Loop() {
-				if _, err := executeParsedSearchScopedDirs(ctx, indexDirs, userQ, nil, defaultSearchConfig()); err != nil {
-					b.Fatalf("execute search with empty optional dir: %v", err)
 				}
 			}
 		})
@@ -1012,11 +889,8 @@ func BenchmarkSmallRepo_Phases(b *testing.B) {
 }
 
 func BenchmarkFolderCorpus_ColdIndex(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
-	ctx := context.Background()
+	ctx := b.Context()
 
 	for b.Loop() {
 		b.StopTimer()
@@ -1040,11 +914,8 @@ func BenchmarkFolderCorpus_ColdIndex(b *testing.B) {
 }
 
 func BenchmarkFolderCorpus_WarmSearch(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
-	ctx := context.Background()
+	ctx := b.Context()
 	root := writeBenchmarkFolder(b, 200, "folder_marker_warm")
 	plan := planFolderTestCorpus(b, root)
 	if indexState, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
@@ -1053,7 +924,6 @@ func BenchmarkFolderCorpus_WarmSearch(b *testing.B) {
 		b.Fatal("folder corpus should not be empty")
 	}
 
-	b.ResetTimer()
 	for b.Loop() {
 		if indexState, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 			b.Fatalf("ensure warm folder corpus: %v", err)
@@ -1071,11 +941,8 @@ func BenchmarkFolderCorpus_WarmSearch(b *testing.B) {
 }
 
 func BenchmarkFolderCorpus_WarmSearchAfterDeltas(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
-	ctx := context.Background()
+	ctx := b.Context()
 	root := writeBenchmarkFolder(b, 200, "folder_marker_delta_warm")
 	plan := planFolderTestCorpus(b, root)
 	if indexState, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
@@ -1096,7 +963,6 @@ func BenchmarkFolderCorpus_WarmSearchAfterDeltas(b *testing.B) {
 		}
 	}
 
-	b.ResetTimer()
 	for b.Loop() {
 		if indexState, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 			b.Fatalf("ensure warm folder corpus: %v", err)
@@ -1114,11 +980,8 @@ func BenchmarkFolderCorpus_WarmSearchAfterDeltas(b *testing.B) {
 }
 
 func BenchmarkExternalExactFile_ColdIndex(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
-	ctx := context.Background()
+	ctx := b.Context()
 
 	for b.Loop() {
 		b.StopTimer()
@@ -1146,11 +1009,8 @@ func BenchmarkExternalExactFile_ColdIndex(b *testing.B) {
 }
 
 func BenchmarkExternalExactFile_WarmSearch(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
-	ctx := context.Background()
+	ctx := b.Context()
 	root := b.TempDir()
 	path := filepath.Join(root, "single.go")
 	if err := os.WriteFile(path, []byte("package single\n// exact_file_marker_warm\n"), 0o644); err != nil {
@@ -1163,7 +1023,6 @@ func BenchmarkExternalExactFile_WarmSearch(b *testing.B) {
 		b.Fatal("exact file corpus should not be empty")
 	}
 
-	b.ResetTimer()
 	for b.Loop() {
 		if indexState, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 			b.Fatalf("ensure warm exact file corpus: %v", err)
@@ -1180,17 +1039,18 @@ func BenchmarkExternalExactFile_WarmSearch(b *testing.B) {
 	}
 }
 
+// BenchmarkMultiCorpus_WarmSearchAndFormat searches two warm folder nodes one
+// after the other, sets the headers with no path operand (withHeaders), and
+// formats the results. It skips searchNodes and the BM25 rescore of the
+// command route; BenchmarkMultiNode_WarmSearch times that route.
 func BenchmarkMultiCorpus_WarmSearchAndFormat(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
-	ctx := context.Background()
+	ctx := b.Context()
 	rootA := writeBenchmarkFolder(b, 100, "multi_corpus_marker")
 	rootB := writeBenchmarkFolder(b, 100, "multi_corpus_marker")
 	planA := planFolderTestCorpus(b, rootA)
 	planB := planFolderTestCorpus(b, rootB)
-	for _, plan := range []corpusPlan{planA, planB} {
+	for _, plan := range []node{planA, planB} {
 		if indexState, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 			b.Fatalf("ensure corpus: %v", err)
 		} else if indexState == corpusKnownEmpty {
@@ -1202,40 +1062,37 @@ func BenchmarkMultiCorpus_WarmSearchAndFormat(b *testing.B) {
 		b.Fatalf("parse query: %v", err)
 	}
 
-	b.ResetTimer()
 	for b.Loop() {
-		resultsA, _, err := prepareAndSearchCorpus(ctx, planA, nil, userQ, defaultSearchConfig())
+		resultsA, _, err := prepareAndSearchCorpus(ctx, planA, userQ, defaultSearchConfig())
 		if err != nil {
 			b.Fatalf("search corpus A: %v", err)
 		}
-		resultsB, _, err := prepareAndSearchCorpus(ctx, planB, nil, userQ, defaultSearchConfig())
+		resultsB, _, err := prepareAndSearchCorpus(ctx, planB, userQ, defaultSearchConfig())
 		if err != nil {
 			b.Fatalf("search corpus B: %v", err)
 		}
-		results := append(resultsA, resultsB...)
-		benchmarkStringSink = formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext, plainPalette)
+		formatCorpusResultsWithContext(withHeaders(append(resultsA, resultsB...)), 0, 0, showCorpusContext, plainPalette)
 	}
 }
 
-func BenchmarkFormatCorpusResults_Dedupe(b *testing.B) {
+func BenchmarkFormatCorpusResults_TwoCorpora(b *testing.B) {
 	results := benchmarkCorpusResultsForFormatting()
 
 	b.ReportAllocs()
 	for b.Loop() {
-		benchmarkStringSink = formatCorpusResultsWithContext(results, nil, 0, 0, showCorpusContext, plainPalette)
+		formatCorpusResultsWithContext(results, 0, 0, showCorpusContext, plainPalette)
 	}
 }
 
-func BenchmarkWriteCorpusResults_Dedupe(b *testing.B) {
+func BenchmarkWriteCorpusResults_TwoCorpora(b *testing.B) {
 	results := benchmarkCorpusResultsForFormatting()
 
 	b.ReportAllocs()
 	for b.Loop() {
 		output := bufio.NewWriter(io.Discard)
-		wrote, err := writeCorpusResultsWithContext(
+		err := writeCorpusResultsWithContext(
 			output,
 			results,
-			nil,
 			0,
 			0,
 			showCorpusContext,
@@ -1244,12 +1101,14 @@ func BenchmarkWriteCorpusResults_Dedupe(b *testing.B) {
 		if err == nil {
 			err = output.Flush()
 		}
-		if err != nil || !wrote {
-			b.Fatalf("write results: wrote=%t error=%v", wrote, err)
+		if err != nil {
+			b.Fatalf("write results: %v", err)
 		}
 	}
 }
 
+// benchmarkCorpusResultsForFormatting returns 200 results with headers: the
+// same 100 file names in two folder nodes.
 func benchmarkCorpusResultsForFormatting() []corpusSearchResult {
 	results := make([]corpusSearchResult, 0, 200)
 	for i := range 100 {
@@ -1269,7 +1128,7 @@ func benchmarkCorpusResultsForFormatting() []corpusSearchResult {
 			},
 		)
 	}
-	return results
+	return withHeaders(results)
 }
 
 func BenchmarkFolderCorpusState_200Files(b *testing.B) {
@@ -1291,13 +1150,13 @@ func BenchmarkFolderCorpusFingerprint_1000Files(b *testing.B) {
 func BenchmarkChangedFolderDocumentsFromManifest_1000Files_1Changed(b *testing.B) {
 	root := writeBenchmarkFolder(b, 1000, "folder_manifest_marker")
 	plan := planFolderTestCorpus(b, root)
-	ctx := context.Background()
+	ctx := b.Context()
 
 	_, oldSelected, err := folderCorpusState(ctx, plan)
 	if err != nil {
 		b.Fatalf("old folder state: %v", err)
 	}
-	if err := writeFolderManifest(plan.cacheDir, "old-state", oldSelected); err != nil {
+	if err := writeFolderManifest(plan.cacheDir, "old-state", oldSelected, 0, make([]int64, len(oldSelected)), 0); err != nil {
 		b.Fatalf("write folder manifest: %v", err)
 	}
 	manifest, ok := readFolderManifest(plan.cacheDir, "old-state")
@@ -1316,9 +1175,8 @@ func BenchmarkChangedFolderDocumentsFromManifest_1000Files_1Changed(b *testing.B
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
-		changedDocs, changedPaths, _ := changedFolderDocumentsFromManifest(selected, manifest)
+		changedDocs, changedPaths, _ := changedFolderDocumentsFromManifest(selected, manifest, indexWindowBytes)
 		if len(changedDocs) != 1 || len(changedPaths) != 1 {
 			b.Fatalf("changed docs=%d paths=%d, want 1 each", len(changedDocs), len(changedPaths))
 		}
@@ -1331,10 +1189,9 @@ func BenchmarkChangedFolderDocumentsFromManifest_1000Files_1Changed(b *testing.B
 func benchmarkFolderCorpusState(b *testing.B, files int) {
 	root := writeBenchmarkFolder(b, files, "folder_state_marker")
 	plan := planFolderTestCorpus(b, root)
-	ctx := context.Background()
+	ctx := b.Context()
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
 		state, selected, err := folderCorpusState(ctx, plan)
 		if err != nil {
@@ -1349,10 +1206,9 @@ func benchmarkFolderCorpusState(b *testing.B, files int) {
 func benchmarkFolderCorpusFingerprint(b *testing.B, files int) {
 	root := writeBenchmarkFolder(b, files, "folder_fingerprint_marker")
 	plan := planFolderTestCorpus(b, root)
-	ctx := context.Background()
+	ctx := b.Context()
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
 		state, selectedCount, err := folderCorpusFingerprint(ctx, plan)
 		if err != nil {
@@ -1372,13 +1228,13 @@ func BenchmarkFolderCorpus_DirtyReindexAndSearch_1File(b *testing.B) {
 	benchmarkFolderCorpusDirtyReindex(b, true)
 }
 
+// benchmarkFolderCorpusDirtyReindex edits one file of a warm folder node of
+// 200 files in each round, outside the timer. It times the refresh, and with
+// searchAfterRefresh also the search of the new marker.
 func benchmarkFolderCorpusDirtyReindex(b *testing.B, searchAfterRefresh bool) {
 	b.Helper()
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
-	ctx := context.Background()
+	ctx := b.Context()
 	root := writeBenchmarkFolder(b, 200, "folder_dirty_marker")
 	plan := planFolderTestCorpus(b, root)
 	if indexState, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
@@ -1390,8 +1246,7 @@ func benchmarkFolderCorpusDirtyReindex(b *testing.B, searchAfterRefresh bool) {
 
 	b.ReportAllocs()
 	var lastMarker string
-	b.ResetTimer()
-	for i := range b.N {
+	for i := 0; b.Loop(); i++ {
 		b.StopTimer()
 		marker := fmt.Sprintf("folder_dirty_marker_%03d", i)
 		lastMarker = marker
@@ -1416,7 +1271,7 @@ func benchmarkFolderCorpusDirtyReindex(b *testing.B, searchAfterRefresh bool) {
 			}
 		}
 	}
-	if !searchAfterRefresh && lastMarker != "" {
+	if !searchAfterRefresh {
 		b.StopTimer()
 		results, err := searchPlannedCorpusForTest(ctx, plan, lastMarker)
 		if err != nil {
@@ -1428,15 +1283,12 @@ func benchmarkFolderCorpusDirtyReindex(b *testing.B, searchAfterRefresh bool) {
 	}
 }
 
-// BenchmarkFolderCorpus_DirtyReindexPhases_1File measures coarse production
-// functions used by dirty folder refresh. The full refresh contract is measured
-// by BenchmarkFolderCorpus_DirtyReindex_1File.
+// BenchmarkFolderCorpus_DirtyReindexPhases_1File times the main production
+// steps of a dirty folder refresh, one at a time.
+// BenchmarkFolderCorpus_DirtyReindex_1File times the whole refresh.
 func BenchmarkFolderCorpus_DirtyReindexPhases_1File(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
-	ctx := context.Background()
+	ctx := b.Context()
 	root := writeBenchmarkFolder(b, 200, "folder_dirty_phase_marker")
 	plan := planFolderTestCorpus(b, root)
 	if indexState, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
@@ -1458,7 +1310,7 @@ func BenchmarkFolderCorpus_DirtyReindexPhases_1File(b *testing.B) {
 	if err != nil {
 		b.Fatalf("folder state: %v", err)
 	}
-	changedDocs, changedPaths, _ := changedFolderDocumentsFromManifest(selected, manifest)
+	changedDocs, changedPaths, _ := changedFolderDocumentsFromManifest(selected, manifest, indexWindowBytes)
 	if len(changedDocs) != 1 || len(changedPaths) != 1 {
 		b.Fatalf("changed docs=%d paths=%d, want 1 each", len(changedDocs), len(changedPaths))
 	}
@@ -1493,7 +1345,7 @@ func BenchmarkFolderCorpus_DirtyReindexPhases_1File(b *testing.B) {
 	b.Run("changedDocumentsFromManifest", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			docs, paths, _ := changedFolderDocumentsFromManifest(selected, manifest)
+			docs, paths, _ := changedFolderDocumentsFromManifest(selected, manifest, indexWindowBytes)
 			if len(docs) != 1 || len(paths) != 1 {
 				b.Fatalf("changed docs=%d paths=%d, want 1 each", len(docs), len(paths))
 			}
@@ -1512,7 +1364,7 @@ func BenchmarkFolderCorpus_DirtyReindexPhases_1File(b *testing.B) {
 			}
 			copyBenchmarkIndexFiles(b, templatePaths, indexDir)
 			b.StartTimer()
-			if _, err := indexDeltaDocuments(indexDir, repoName, plan.root, changedDocs, folderDeltaShardMax, changedPaths); err != nil {
+			if _, err := indexDeltaDocuments(indexDir, repoName, plan.root, changedDocs, indexParallelism(), changedPaths); err != nil {
 				b.Fatalf("index delta documents with base shard: %v", err)
 			}
 			b.StopTimer()
@@ -1522,17 +1374,14 @@ func BenchmarkFolderCorpus_DirtyReindexPhases_1File(b *testing.B) {
 	})
 }
 
-// BenchmarkFolderCorpus_OneFileZoektShardLowerBound measures the raw lower
-// bound for a bucket-style dirty refresh: build a fresh one-file Zoekt shard
-// with seek's normal indexing options, then search it through Zoekt. It does
-// not represent the product dirty-reindex contract; that remains
-// BenchmarkFolderCorpus_DirtyReindex_1File.
+// BenchmarkFolderCorpus_OneFileZoektShardLowerBound times the least work of a
+// dirty refresh that writes one new shard. It builds a one-file Zoekt shard
+// with Seek's index options (indexDocuments), then searches it as a node read
+// does (searchPlannedCorpusParsed). BenchmarkFolderCorpus_DirtyReindex_1File
+// times the real refresh.
 func BenchmarkFolderCorpus_OneFileZoektShardLowerBound(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
-	ctx := context.Background()
+	ctx := b.Context()
 	baseDir := b.TempDir()
 	repoName := "folder_bucket_lower_bound"
 	source := baseDir
@@ -1556,7 +1405,8 @@ func BenchmarkFolderCorpus_OneFileZoektShardLowerBound(b *testing.B) {
 		} else if !indexedAny {
 			b.Fatal("expected one-file shard to be indexed")
 		}
-		results, err := executeParsedShardSearchForTest(ctx, indexDir, userQ, defaultSearchConfig())
+		plan := node{cacheDir: baseDir, indexDir: indexDir}
+		results, err := searchPlannedCorpusParsed(ctx, plan, nil, userQ, defaultSearchConfig())
 		if err != nil {
 			b.Fatalf("search one-file shard: %v", err)
 		}
@@ -1569,6 +1419,8 @@ func BenchmarkFolderCorpus_OneFileZoektShardLowerBound(b *testing.B) {
 	}
 }
 
+// benchmarkIndexFilePaths returns the shard files of repoName in indexDir,
+// with the sidecar files of each (index.IndexFilePaths).
 func benchmarkIndexFilePaths(b *testing.B, indexDir, repoName string) []string {
 	b.Helper()
 	var paths []string
@@ -1599,6 +1451,9 @@ func copyBenchmarkIndexFiles(b *testing.B, paths []string, dstDir string) {
 	}
 }
 
+// writeBenchmarkFolder writes files Go files in ten folders, pkg00 to pkg09,
+// below a new temporary root, and returns the root. File i holds marker and
+// the word marker_i, with i in three digits.
 func writeBenchmarkFolder(b *testing.B, files int, marker string) string {
 	b.Helper()
 	root := b.TempDir()
@@ -1628,11 +1483,11 @@ func benchmarkFileMatch(name string, score float64) zoekt.FileMatch {
 	}
 }
 
-// benchmarkRealisticFiles builds n files with representative content rather than
-// the trivial fixtures above: tab-indented source, a symbol match with a
-// multibyte comment in its context, and a long minified line whose match sits
-// deep enough to trigger windowing. Exercises the sanitize, windowing, symbol
-// and (with ansiPalette) coloring paths together.
+// benchmarkRealisticFiles builds n files with more realistic content than the
+// fixtures above. Each file has a tab-indented symbol match with a multibyte
+// comment in its context. It also has a long minified line whose match is deep
+// enough to start the window. A benchmark of these files times the sanitize,
+// window, symbol and (with ansiPalette) color paths together.
 func benchmarkRealisticFiles(n int) []zoekt.FileMatch {
 	long := "const blob = \"" + strings.Repeat("x", 3000) + "needle" + strings.Repeat("y", 1500) + "\"\n"
 	files := make([]zoekt.FileMatch, n)
@@ -1647,7 +1502,8 @@ func benchmarkRealisticFiles(n int) []zoekt.FileMatch {
 					Before:     []byte("\t// HandleRequest validates the café ☕ then dispatches.\n"),
 					After:      []byte("\t\treturn s.dispatch(ctx)\n"),
 					LineFragments: []zoekt.LineFragmentMatch{
-						// "HandleRequest" begins at byte 19 of "\tfunc (s *Service) ".
+						// "HandleRequest" begins at byte 19 of
+						// "\tfunc (s *Service) ".
 						{LineOffset: 19, MatchLength: 13, SymbolInfo: &zoekt.Symbol{Kind: "method"}},
 					},
 				},
@@ -1662,11 +1518,11 @@ func benchmarkRealisticFiles(n int) []zoekt.FileMatch {
 	return files
 }
 
-// BenchmarkCorpusFormatting_Palettes covers BOTH the plain and the colored emit
-// paths (the rest of the suite only measures plainPalette, leaving the color
-// wrapping + visibility scan unbenchmarked) and reports out_B — the size of the
-// produced output, the agent-facing quality metric the formatter optimizes for.
-// Track out_B across changes to catch token/byte regressions in Go bench too.
+// BenchmarkCorpusFormatting_Palettes times both the plain and the colored
+// output paths. The other benchmarks use only plainPalette, so they do not time
+// the color codes and the containsVisible scan. It reports out_B, the size of
+// the output in bytes. The formatter keeps the output small for the agent that
+// reads it, so out_B shows each change in the bytes that it writes.
 func BenchmarkCorpusFormatting_Palettes(b *testing.B) {
 	results := benchmarkGitResults(benchmarkRealisticFiles(20))
 	for _, pc := range []struct {
@@ -1678,24 +1534,28 @@ func BenchmarkCorpusFormatting_Palettes(b *testing.B) {
 	} {
 		b.Run(pc.name, func(b *testing.B) {
 			b.ReportAllocs()
+			var out string
 			for b.Loop() {
-				benchmarkStringSink = formatCorpusResultsWithContext(results, nil, 0, 0, hideCorpusContext, pc.pal)
+				out = formatCorpusResultsWithContext(results, 0, 0, hideCorpusContext, pc.pal)
 			}
-			b.ReportMetric(float64(len(benchmarkStringSink)), "out_B")
+			b.ReportMetric(float64(len(out)), "out_B")
 		})
 	}
 }
 
 // --- Large-repo benchmarks ---
-// Set SEEK_BENCH_REPO to a git repo path (e.g. a kubernetes checkout) to
-// enable these. They measure real-world indexing and search latency on a
-// large codebase where the overhead is actually visible.
-// SEEK_BENCH_REPO is treated as read-only; benchmarks that need writes use
-// scratch clones.
+// Set SEEK_BENCH_REPO to the path of a Git repository, for example a
+// Kubernetes checkout, to run them. They time the index build and the search
+// on a large code base, where each cost shows. They do not write to
+// SEEK_BENCH_REPO: a benchmark that writes uses a scratch clone
+// (cloneBenchRepoAt).
 //
 //   git clone --depth=20 https://github.com/kubernetes/kubernetes /tmp/k8s
-//   SEEK_BENCH_REPO=/tmp/k8s go test ./cmd/seek/ -run='^$' -bench=BenchmarkLargeRepo -benchmem -count=3
+//   SEEK_BENCH_REPO=/tmp/k8s go test ./cmd/seek/ -run='^$' \
+//     -bench=BenchmarkLargeRepo -benchmem -count=3
 
+// requireBenchRepo returns SEEK_BENCH_REPO. With no value, it skips the
+// benchmark: only a run that names a checkout runs the large-repo benchmarks.
 func requireBenchRepo(b *testing.B) string {
 	b.Helper()
 	dir := os.Getenv("SEEK_BENCH_REPO")
@@ -1706,33 +1566,20 @@ func requireBenchRepo(b *testing.B) string {
 	return dir
 }
 
-// setupLargeRepoBench ensures the index is warm and returns the planned corpus.
-func setupLargeRepoBench(b *testing.B) (repoDir string, paths gitPaths, plan corpusPlan) {
+// setupLargeRepoBench builds the index of repoDir, SEEK_BENCH_REPO or a
+// scratch clone of it (cloneBenchRepoAt), and returns its Git paths and its
+// node.
+func setupLargeRepoBench(b *testing.B, repoDir string) (gitPaths, node) {
 	b.Helper()
-	repoDir = requireBenchRepo(b)
-	paths, plan = planGitTestCorpus(b, repoDir)
-
-	ctx := context.Background()
-	if _, _, err := ensureGitCorpusFresh(ctx, &plan, paths); err != nil {
+	paths, plan := planGitTestCorpus(b, repoDir)
+	if _, err := ensureGitCorpusFresh(b.Context(), plan, paths); err != nil {
 		b.Fatalf("initial indexing failed: %v", err)
 	}
-	return repoDir, paths, plan
+	return paths, plan
 }
 
-func setupScratchLargeRepoBench(b *testing.B) (repoDir string, paths gitPaths, plan corpusPlan) {
-	b.Helper()
-	repoDir = cloneBenchRepoAt(b, requireBenchRepo(b), "HEAD")
-	paths, plan = planGitTestCorpus(b, repoDir)
-
-	ctx := context.Background()
-	if _, _, err := ensureGitCorpusFresh(ctx, &plan, paths); err != nil {
-		b.Fatalf("initial indexing failed: %v", err)
-	}
-	return repoDir, paths, plan
-}
-
-// cloneBenchRepoAt creates a scratch clone so benchmarks can move HEAD or edit
-// files without mutating SEEK_BENCH_REPO.
+// cloneBenchRepoAt clones sourceRepo at ref into a temporary folder, so a
+// benchmark can move HEAD or edit files with no change to SEEK_BENCH_REPO.
 func cloneBenchRepoAt(b *testing.B, sourceRepo, ref string) string {
 	b.Helper()
 	sourceAbs, err := filepath.Abs(sourceRepo)
@@ -1743,8 +1590,8 @@ func cloneBenchRepoAt(b *testing.B, sourceRepo, ref string) string {
 	repoDir := filepath.Join(b.TempDir(), "repo")
 	gitRunIn(b, filepath.Dir(repoDir), "clone", "--no-checkout", sourceAbs, repoDir)
 	// A local clone can copy core.fsmonitor=true while its daemon socket still
-	// points at the source worktree. Disable it so the benchmark measures Seek
-	// instead of a failed fsmonitor IPC request.
+	// points at the source worktree. The clone turns it off, so the benchmark
+	// times Seek and not a failed fsmonitor request.
 	gitRunIn(b, repoDir, "config", "core.fsmonitor", "false")
 	gitRunIn(b, repoDir, "checkout", "-B", "seek-bench", want)
 	if got := gitOutputIn(b, repoDir, "rev-parse", "HEAD"); got != want {
@@ -1755,12 +1602,11 @@ func cloneBenchRepoAt(b *testing.B, sourceRepo, ref string) string {
 
 func BenchmarkLargeRepo_ColdIndex(b *testing.B) {
 	repoDir := requireBenchRepo(b)
-	ctx := context.Background()
+	ctx := b.Context()
 
-	b.ResetTimer()
 	for b.Loop() {
 		b.StopTimer()
-		paths, plan := planGitTestCorpus(b, repoDir)
+		_, plan := planGitTestCorpus(b, repoDir)
 		if err := os.RemoveAll(plan.cacheDir); err != nil {
 			b.Fatal(err)
 		}
@@ -1772,7 +1618,7 @@ func BenchmarkLargeRepo_ColdIndex(b *testing.B) {
 		}
 		b.StartTimer()
 
-		if results, err := runSeekInPlannedGitCorpus(ctx, "type:file", paths, plan); err != nil {
+		if results, err := runSeekInPlannedGitCorpus(ctx, "type:file", plan); err != nil {
 			b.Fatalf("cold large-repo search: %v", err)
 		} else if len(results) == 0 {
 			b.Fatal("expected cold large-repo result")
@@ -1781,11 +1627,10 @@ func BenchmarkLargeRepo_ColdIndex(b *testing.B) {
 }
 
 func BenchmarkLargeRepo_WarmSearch(b *testing.B) {
-	_, paths, plan := setupLargeRepoBench(b)
-	ctx := context.Background()
-	b.ResetTimer()
+	_, plan := setupLargeRepoBench(b, requireBenchRepo(b))
+	ctx := b.Context()
 	for b.Loop() {
-		if results, err := runSeekInPlannedGitCorpus(ctx, "type:file", paths, plan); err != nil {
+		if results, err := runSeekInPlannedGitCorpus(ctx, "type:file", plan); err != nil {
 			b.Fatalf("warm large-repo search: %v", err)
 		} else if len(results) == 0 {
 			b.Fatal("expected warm large-repo result")
@@ -1805,10 +1650,14 @@ func BenchmarkLargeRepo_DirtyReindex_50Files(b *testing.B) {
 	benchmarkLargeRepoDirtyN(b, 50)
 }
 
+// benchmarkLargeRepoDirtyN edits n source files of a clone of SEEK_BENCH_REPO
+// in each round, outside the timer. It times the refresh and the search of the
+// new marker.
 func benchmarkLargeRepoDirtyN(b *testing.B, n int) {
 	b.Helper()
-	repoDir, paths, plan := setupScratchLargeRepoBench(b)
-	ctx := context.Background()
+	repoDir := cloneBenchRepoAt(b, requireBenchRepo(b), "HEAD")
+	_, plan := setupLargeRepoBench(b, repoDir)
+	ctx := b.Context()
 
 	targets := findSourceFiles(b, repoDir, n)
 	originals := make([][]byte, len(targets))
@@ -1820,18 +1669,17 @@ func benchmarkLargeRepoDirtyN(b *testing.B, n int) {
 		originals[i] = data
 	}
 
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		b.StopTimer()
 		marker := fmt.Sprintf("large_repo_dirty_bench_%d", i)
 		for j, t := range targets {
-			content := fmt.Appendf(originals[j][:len(originals[j]):len(originals[j])], "\n// %s\n", marker)
+			content := fmt.Appendf(slices.Clip(originals[j]), "\n// %s\n", marker)
 			if err := os.WriteFile(t, content, 0o644); err != nil {
 				b.Fatal(err)
 			}
 		}
 		b.StartTimer()
-		if results, err := runSeekInPlannedGitCorpus(ctx, marker, paths, plan); err != nil {
+		if results, err := runSeekInPlannedGitCorpus(ctx, marker, plan); err != nil {
 			b.Fatalf("dirty large-repo search: %v", err)
 		} else {
 			assertBenchmarkResultsContainPaths(b, repoDir, targets, results)
@@ -1839,13 +1687,14 @@ func benchmarkLargeRepoDirtyN(b *testing.B, n int) {
 	}
 }
 
-// BenchmarkLargeRepo_Phases breaks down the dirty-reindex path into
-// individual phases so we can see where time is actually spent.
+// BenchmarkLargeRepo_Phases breaks down the dirty-reindex path and the search
+// that follows it into individual phases, to show the time of each phase.
 func BenchmarkLargeRepo_Phases(b *testing.B) {
-	repoDir, paths, plan := setupScratchLargeRepoBench(b)
-	ctx := context.Background()
+	repoDir := cloneBenchRepoAt(b, requireBenchRepo(b), "HEAD")
+	paths, plan := setupLargeRepoBench(b, repoDir)
+	ctx := b.Context()
 
-	target := findSourceFile(b, repoDir)
+	target := findSourceFiles(b, repoDir, 1)[0]
 	original, err := os.ReadFile(target)
 	if err != nil {
 		b.Fatal(err)
@@ -1873,17 +1722,10 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		}
 	})
 
-	b.Run("planCurrentGitCorpus", func(b *testing.B) {
+	b.Run("planGitCorpus", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			_, _ = planCurrentGitCorpus(paths)
-		}
-	})
-
-	b.Run("ensureUntrackedCache", func(b *testing.B) {
-		b.ReportAllocs()
-		for b.Loop() {
-			ensureUntrackedCache(ctx, paths)
+			_, _ = planGitCorpus(paths, nil)
 		}
 	})
 
@@ -1897,8 +1739,9 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 	})
 
 	b.Run("indexUncommitted_1file", func(b *testing.B) {
-		// Dirty the file once, capture the file list, then benchmark just
-		// the indexing loop without re-running git status each iteration.
+		// Dirty the file once and check that git status lists it. Each round
+		// edits the file, runs git status, and builds the uncommitted family
+		// (indexUncommittedForBench).
 		if err := os.WriteFile(target, append(original, []byte("\n// dirty\n")...), 0o644); err != nil {
 			b.Fatal(err)
 		}
@@ -1909,17 +1752,19 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		cachedState := readStateFile(plan.cacheDir)
 
 		b.ReportAllocs()
-		b.ResetTimer()
 		for i := 0; b.Loop(); i++ {
-			content := fmt.Appendf(original[:len(original):len(original)], "\n// p_%d\n", i)
+			content := fmt.Appendf(slices.Clip(original), "\n// p_%d\n", i)
 			if err := os.WriteFile(target, content, 0o644); err != nil {
 				b.Fatal(err)
 			}
 			loopState := mustGitRepoStateIn(b, ctx, repoDir)
 			preState := gitCorpusStateHash(paths, loopState)
-			if err := indexUncommitted(ctx, repoDir, plan.indexDir, plan.cacheDir, loopState, cachedState, preState, indexParallelism()); err != nil {
+			if err := indexUncommittedForBench(ctx, repoDir, plan.corpusStore, loopState, cachedState, preState); err != nil {
 				b.Fatalf("index uncommitted: %v", err)
 			}
+			// A build records the state it published: the next round reads
+			// a delta of the one changed file, as a real refresh does.
+			cachedState = preState
 		}
 	})
 
@@ -1932,9 +1777,9 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 	})
 
 	b.Run("postVerify_restat", func(b *testing.B) {
-		// Lightweight alternative: re-stat only the known dirty files
-		// instead of running a full git status. Uses the same state struct
-		// (same RawOutput), but repoStateFingerprint re-Lstats each file.
+		// A check with no git status: gitCorpusStateHash reads the same
+		// state, and repoStateFingerprint calls Lstat on each dirty file
+		// again.
 		if err := os.WriteFile(target, append(original, []byte("\n// dirty_for_restat\n")...), 0o644); err != nil {
 			b.Fatal(err)
 		}
@@ -1943,22 +1788,23 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 			b.Fatal("expected dirty files")
 		}
 		b.ReportAllocs()
-		b.ResetTimer()
 		for b.Loop() {
 			gitCorpusStateHash(paths, dirtyState)
 		}
 	})
 
+	// The name stays for the CodSpeed history: it times the node read
+	// (searchPlannedCorpusParsed).
 	b.Run("executeParsedSearchScoped", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			if _, err := executeUnscopedShardSearchForTest(ctx, plan.indexDir, "func main"); err != nil {
+			if _, err := searchPlannedCorpusForTest(ctx, plan, "func main"); err != nil {
 				b.Fatalf("execute search: %v", err)
 			}
 		}
 	})
 
-	// --- Post-indexation phase breakdown ---
+	// --- The phases after the index build ---
 
 	b.Run("loadShards", func(b *testing.B) {
 		b.ReportAllocs()
@@ -1982,17 +1828,16 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		}
 	})
 
+	// It times the read lock that each node search takes and releases: a
+	// node read that loads no shard.
 	b.Run("acquireSearchLock_uncontended", func(b *testing.B) {
-		lockPath := filepath.Join(plan.cacheDir, lockFile)
 		b.ReportAllocs()
 		for b.Loop() {
-			f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+			read, _, err := openNodeRead(ctx, plan, nil)
 			if err != nil {
 				b.Fatal(err)
 			}
-			_ = acquireReadLock(ctx, filepath.Dir(f.Name()), f)
-			unlockFile(f)
-			_ = f.Close()
+			read.close()
 		}
 	})
 
@@ -2002,62 +1847,30 @@ func BenchmarkLargeRepo_Phases(b *testing.B) {
 		}
 		dirtyState := mustGitRepoStateIn(b, ctx, repoDir)
 		b.ReportAllocs()
-		b.ResetTimer()
 		for b.Loop() {
 			_ = dirtyFileSetFromState(dirtyState)
 		}
 	})
 
 	b.Run("formatCorpusResultsWithContext", func(b *testing.B) {
-		results, err := executeUnscopedShardSearchForTest(ctx, plan.indexDir, "func main")
+		results, err := searchPlannedCorpusForTest(ctx, plan, "func main")
 		if err != nil {
 			b.Fatal(err)
 		}
 		if len(results) == 0 {
-			b.Skip("no results to format")
+			b.Fatal("the search found no results to format")
 		}
 		corpusResults := benchmarkGitResults(results)
 		b.ReportAllocs()
-		b.ResetTimer()
 		for b.Loop() {
-			formatCorpusResultsWithContext(corpusResults, nil, 0, 0, hideCorpusContext, plainPalette)
+			formatCorpusResultsWithContext(corpusResults, 0, 0, hideCorpusContext, plainPalette)
 		}
 	})
 
-	b.Run("formatCorpusResultsWithContext_dirtyFiles", func(b *testing.B) {
-		if err := os.WriteFile(target, append(original, []byte("\n// dirty_fmt\n")...), 0o644); err != nil {
-			b.Fatal(err)
-		}
-		dirtyState := mustGitRepoStateIn(b, ctx, repoDir)
-		results, err := executeUnscopedShardSearchForTest(ctx, plan.indexDir, "func main")
-		if err != nil {
-			b.Fatal(err)
-		}
-		if len(results) == 0 {
-			b.Skip("no results to format")
-		}
-		dirtyFiles := make(dirtyFileSet, len(dirtyState.Files))
-		for _, f := range dirtyState.Files {
-			dirtyFiles[f] = struct{}{}
-		}
-		corpusResults := benchmarkGitResults(results)
-		dirtyByCorpus := benchmarkDirtyFilesByCorpus(dirtyFiles)
-		b.ReportAllocs()
-		b.ResetTimer()
-		for b.Loop() {
-			formatCorpusResultsWithContext(corpusResults, dirtyByCorpus, 0, 0, hideCorpusContext, plainPalette)
-		}
-	})
 }
 
-// findSourceFile returns the absolute path of a source file suitable for editing.
-func findSourceFile(b *testing.B, repoDir string) string {
-	b.Helper()
-	targets := findSourceFiles(b, repoDir, 1)
-	return targets[0]
-}
-
-// findSourceFiles returns absolute paths of n source files suitable for editing.
+// findSourceFiles returns absolute paths of n source files suitable for
+// editing.
 func findSourceFiles(b *testing.B, repoDir string, n int) []string {
 	b.Helper()
 	var result []string
@@ -2081,11 +1894,14 @@ func findSourceFiles(b *testing.B, repoDir string, n int) []string {
 		b.Fatal(err)
 	}
 	if len(result) < n {
-		b.Skipf("repo has fewer than %d source files", n)
+		b.Fatalf("SEEK_BENCH_REPO has fewer than %d source files", n)
 	}
 	return result
 }
 
+// isBenchmarkSourceFile reports a regular, non-empty file whose content fits
+// one document (documentContentFits) and whose extension names a source
+// language.
 func isBenchmarkSourceFile(d os.DirEntry) bool {
 	if d.Type()&os.ModeSymlink != 0 {
 		return false
@@ -2125,25 +1941,21 @@ func assertBenchmarkResultsContainPaths(b *testing.B, repoDir string, targets []
 
 // --- Delta-indexing benchmarks ---
 
-// BenchmarkGitCommitted_1CommitAhead measures the steady-state cost of
-// indexing a single committed change. Each iteration prepares a new commit
-// outside the timed section, then runs the production native refresh. The
-// refresh uses a native delta when the new commit passes admission.
+// BenchmarkGitCommitted_1CommitAhead times the index update for one new
+// commit. Each round makes the commit outside the timer, then runs the node
+// refresh that a search runs (benchmarkRefreshGit). The refresh uses a native
+// delta when the new commit is eligible (prepareNativeGitDelta).
 func BenchmarkGitCommitted_1CommitAhead(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
 
 	dir := initGitRepo(b, "seed.go", "package main\n// commit_ahead_seed\n")
-	ctx := context.Background()
+	ctx := b.Context()
 	paths, plan := planGitTestCorpus(b, dir)
 	if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
 		b.Fatalf("initial commit index: %v", err)
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		b.StopTimer()
 		name := fmt.Sprintf("step%d.go", i)
@@ -2160,52 +1972,41 @@ func BenchmarkGitCommitted_1CommitAhead(b *testing.B) {
 	}
 }
 
-// BenchmarkGitUncommitted_RapidEdits_N16 simulates editor-driven saves:
-// rewrite the same file 16 times and measure the cumulative per-iteration
-// indexing cost. With delta on, each cycle should write one tiny shard and
-// tombstone the prior one. Empty-shard cleanup keeps the count bounded.
+// BenchmarkGitUncommitted_RapidEdits_N16 saves one file 16 times in each
+// round, as an editor does. It times the write, git status and the build of
+// each save.
+// Each save after the first writes one small delta shard and tombstones the
+// earlier copy of the file. When deltas added more than
+// maxUncommittedDeltaShards shards since the last full build, the next save
+// rebuilds the family in full. So the shard count stays bounded.
 func BenchmarkGitUncommitted_RapidEdits_N16(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
 
 	dir := initGitRepo(b, "app.go", "package main\n// rapid_edits_baseline\n")
-	ctx := context.Background()
+	ctx := b.Context()
 	paths, plan := planGitTestCorpus(b, dir)
-	// Establish the cachedState baseline by indexing once with no dirty files.
-	state := mustGitRepoStateIn(b, ctx, dir)
-	preState := gitCorpusStateHash(paths, state)
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, preState); err != nil {
-		b.Fatalf("baseline index: %v", err)
-	}
+	// One build with no dirty file publishes the first state.
+	reindexGit(b, ctx, paths, plan)
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		for j := range 16 {
 			body := fmt.Appendf(nil, "package main\n// rapid_edits_%d_%d\n", i, j)
 			if err := os.WriteFile(filepath.Join(dir, "app.go"), body, 0o644); err != nil {
 				b.Fatal(err)
 			}
-			state := mustGitRepoStateIn(b, ctx, dir)
-			preState := gitCorpusStateHash(paths, state)
-			if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, preState); err != nil {
-				b.Fatalf("delta cycle %d.%d: %v", i, j, err)
-			}
+			reindexGit(b, ctx, paths, plan)
 		}
 	}
 }
 
-// BenchmarkGitBranch_Switch_Unrelated measures the pathological case: a
-// branch switch that rewrites most of the indexed tree. Delta builds keep
-// emitting tombstones until the shard threshold trips and Zoekt falls back
-// to a full rebuild — the bench reports the combined cost so we can confirm
-// the worst case does not regress vs a hypothetical IsDelta=false build.
+// BenchmarkGitBranch_Switch_Unrelated measures the worst case: each round
+// switches between two branches that differ in 16 of the 21 indexed files.
+// Delta builds add tombstones until the delta shard count passes
+// maxCommittedDeltaShards; the next update then does a full build. Each round
+// times the git checkout and the node refresh. So the time per round includes
+// the cost of the delta builds and of the full builds.
 func BenchmarkGitBranch_Switch_Unrelated(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
 
 	dir := initGitRepo(b, "main.go", "package main\n// branch_switch_main\n")
@@ -2218,9 +2019,9 @@ func BenchmarkGitBranch_Switch_Unrelated(b *testing.B) {
 	}
 	gitRunIn(b, dir, "add", ".")
 	gitRunIn(b, dir, "commit", "-m", "main fleet")
-	mainBranch := gitCurrentBranch(&testing.T{}, dir)
+	mainBranch := gitOutputIn(b, dir, "symbolic-ref", "--short", "HEAD")
 
-	// Create a feature branch that overwrites 80% of the files.
+	// The feature branch changes 16 of the 20 numbered files.
 	gitRunIn(b, dir, "checkout", "-b", "feature")
 	for i := range 16 {
 		name := fmt.Sprintf("file%d.go", i)
@@ -2232,13 +2033,12 @@ func BenchmarkGitBranch_Switch_Unrelated(b *testing.B) {
 	gitRunIn(b, dir, "commit", "-am", "feature churn")
 
 	paths, plan := planGitTestCorpus(b, dir)
-	ctx := context.Background()
+	ctx := b.Context()
 	if err := benchmarkRefreshGit(ctx, paths, plan); err != nil {
 		b.Fatalf("initial index: %v", err)
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		target := mainBranch
 		if i%2 == 1 {
@@ -2251,39 +2051,27 @@ func BenchmarkGitBranch_Switch_Unrelated(b *testing.B) {
 	}
 }
 
-// BenchmarkSearchTombstoneCost measures the search-time penalty of an
-// accumulated delta shard set. After N edit cycles, only the latest content
-// is live; older shards have all docs tombstoned. The bench asserts that
-// search over the multi-shard index returns the expected hit and reports
-// wall time + allocs so regressions in eval.go's tombstone filter show up
-// in CodSpeed walltime mode.
+// BenchmarkSearchTombstoneCost times a search of an uncommitted family after
+// 16 edits of one file. Only the newest copy is live, and each older shard
+// holds a tombstoned copy. Each search must find the live marker. The time
+// and the allocations show a change in Zoekt's tombstone filter
+// (index/eval.go) on CodSpeed.
 func BenchmarkSearchTombstoneCost(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping end-to-end benchmark in short mode")
-	}
 	requireTools(b)
 
 	dir := initGitRepo(b, "app.go", "package main\n// tombstone_cost_baseline\n")
-	ctx := context.Background()
+	ctx := b.Context()
 	paths, plan := planGitTestCorpus(b, dir)
-	state := mustGitRepoStateIn(b, ctx, dir)
-	preState := gitCorpusStateHash(paths, state)
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, preState); err != nil {
-		b.Fatalf("baseline index: %v", err)
-	}
+	reindexGit(b, ctx, paths, plan)
 
-	// Generate 16 delta cycles on the same file. After cleanup, the live
-	// content lives in one shard and the rest hold tombstones.
+	// 16 edits of one file: one full build, then 15 deltas. The newest shard
+	// holds the live content; the older shards hold only tombstoned copies.
 	for i := range 16 {
 		body := fmt.Appendf(nil, "package main\n// tombstone_cost_iter_%d\n", i)
 		if err := os.WriteFile(filepath.Join(dir, "app.go"), body, 0o644); err != nil {
 			b.Fatal(err)
 		}
-		state := mustGitRepoStateIn(b, ctx, dir)
-		preState := gitCorpusStateHash(paths, state)
-		if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, preState); err != nil {
-			b.Fatalf("delta cycle %d: %v", i, err)
-		}
+		reindexGit(b, ctx, paths, plan)
 	}
 
 	target := "tombstone_cost_iter_15"
@@ -2294,7 +2082,6 @@ func BenchmarkSearchTombstoneCost(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
 		results, err := searchPlannedCorpusForTest(ctx, plan, target)
 		if err != nil {
@@ -2306,19 +2093,20 @@ func BenchmarkSearchTombstoneCost(b *testing.B) {
 	}
 }
 
-// =============================================================================
-// GC benchmarks
+// --- GC benchmarks ---
 //
-// Cover the GC integration end-to-end. Pinned scenarios:
-//   - hot path (after every search): touchUsed + opportunistic GC throttled
-//   - cold path (eviction): enumerate + per-corpus evict + full cycle
-//   - dry-run rendering: reportGCPlan with real + seeded corpora
+// They time the GC work of a command:
+//   - the warm path after each search: touchUsed, and runOpportunisticGC when
+//     the throttle stops it;
+//   - the eviction path: enumerateCorpusDirs, and full runGC passes;
+//   - the dry-run table: reportGCPlan with one real corpus and seeded ones.
 //
-// Defends audit findings against silent regressions on CodSpeed:
-//   - throttle gate before MkdirAll+isOnNFS (warm path 3→1 syscall)
-//   - touchStamp / touchUsed Chtimes fast path
-//   - shard picker HasPrefix (not substring)
-// =============================================================================
+// On CodSpeed they show the loss of these fast paths:
+//   - the throttle gate runs before MkdirAll and isOnNFS, so the warm path
+//     makes one system call, not three;
+//   - touchStamp and touchUsed try Chtimes first;
+//   - pickDisplayShard matches a name prefix (isUncommittedShard), not a
+//     substring.
 
 func BenchmarkGC_TouchUsed_WarmPath(b *testing.B) {
 	resetNFSCheck(b)
@@ -2327,7 +2115,8 @@ func BenchmarkGC_TouchUsed_WarmPath(b *testing.B) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		b.Fatal(err)
 	}
-	touchUsed(dir) // prime .used + nfsCheckOnce
+	// The first call makes .used and runs the NFS check once.
+	touchUsed(dir)
 
 	b.ReportAllocs()
 	for b.Loop() {
@@ -2343,7 +2132,7 @@ func BenchmarkGC_TouchUsed_ColdCreate(b *testing.B) {
 		b.Fatal(err)
 	}
 	usedPath := filepath.Join(dir, usedFile)
-	// Prime nfsCheckOnce so subsequent loop iters don't pay Statfs.
+	// The first call runs the NFS check once, so the loop makes no Statfs.
 	touchUsed(dir)
 
 	b.ReportAllocs()
@@ -2358,11 +2147,11 @@ func BenchmarkGC_TouchUsed_ColdCreate(b *testing.B) {
 func BenchmarkGC_RunOpportunisticGC_Throttled(b *testing.B) {
 	resetNFSCheck(b)
 	root := cacheRootForTest(b)
-	// Fresh stamp → throttle gate must short-circuit after 1 stat.
+	// A new .last-gc stamp: the throttle gate returns after one stat.
 	if err := os.WriteFile(filepath.Join(root, gcStampFile), nil, 0o644); err != nil {
 		b.Fatal(err)
 	}
-	ctx := context.Background()
+	ctx := b.Context()
 
 	b.ReportAllocs()
 	for b.Loop() {
@@ -2373,7 +2162,7 @@ func BenchmarkGC_RunOpportunisticGC_Throttled(b *testing.B) {
 func BenchmarkGC_Enumerate_N100(b *testing.B) {
 	root := cacheRootForTest(b)
 	now := time.Now()
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		seedCorpus(b, root, fakeCorpusHash(i), now)
 	}
 	corporaPath := filepath.Join(root, corporaDir)
@@ -2393,81 +2182,84 @@ func BenchmarkGC_Enumerate_N100(b *testing.B) {
 func BenchmarkGC_RunGC_NoEvictions_N100(b *testing.B) {
 	resetNFSCheck(b)
 	root := cacheRootForTest(b)
-	ctx := context.Background()
+	ctx := b.Context()
 
 	b.ReportAllocs()
 	for b.Loop() {
 		b.StopTimer()
-		// Re-seed every iter to lock in the "no evictions" invariant. If
-		// runGC ever regresses to wrongly evict fresh corpora, a one-shot
-		// setup would let the first iter evict everything and subsequent
-		// iters fast-path through an empty cache — masking the regression
-		// in the average. Per-iter reseed forces every measured cycle to
-		// face the same 100-corpus enumeration + skip path.
+		// Seed the corpora again in each round. If runGC evicted fresh
+		// corpora by mistake, one setup would leave an empty cache after the
+		// first round. The fast later rounds would then hide the defect in
+		// the average. So each timed round lists and keeps the same 100
+		// corpora.
 		now := time.Now()
-		for i := 0; i < 100; i++ {
+		for i := range 100 {
 			seedCorpus(b, root, fakeCorpusHash(i), now)
 		}
 		b.StartTimer()
 
-		runGC(ctx, gcOptions{maxAge: defaultGCMaxAge, skipThrottle: true}, defaultGCInterval)
+		runGC(ctx, gcOptions{skipThrottle: true})
 	}
 }
 
 func BenchmarkGC_RunGC_FullEvict_N100(b *testing.B) {
 	resetNFSCheck(b)
 	root := cacheRootForTest(b)
+	// A 1-byte budget puts every corpus over the budget, so each pass evicts
+	// all 100.
+	b.Setenv(envCacheBudget, "1")
 	stale := time.Now().Add(-30 * 24 * time.Hour)
-	ctx := context.Background()
+	ctx := b.Context()
 
 	b.ReportAllocs()
 	for b.Loop() {
 		b.StopTimer()
-		// Recreate the 100 stale corpora each iter — runGC's prior pass
-		// just evicted them.
-		for i := 0; i < 100; i++ {
+		// The last pass evicted the 100 stale corpora, so seed them again.
+		for i := range 100 {
 			seedCorpus(b, root, fakeCorpusHash(i), stale)
 		}
 		b.StartTimer()
 
-		runGC(ctx, gcOptions{maxAge: defaultGCMaxAge, skipThrottle: true}, defaultGCInterval)
+		runGC(ctx, gcOptions{skipThrottle: true})
 	}
 }
 
-// BenchmarkGC_RunGC_StreamingSorted_N100 pins the manual `seek gc --force
-// --sort=size` shape: the materialize-all + sortGCRows + evict-in-table-order
-// path, including the per-corpus corpusDirSize walk and display-info read
-// that the silent benches above never touch.
+// BenchmarkGC_RunGC_StreamingSorted_N100 times the path of
+// `seek gc --force --sort=size`. It measures each row (corpusDirSize and the
+// display information), sorts the rows (sortGCRows), and renders them in table
+// order, each after its eviction check. The 1P budget plans no eviction, so
+// the pass evicts no corpus. The silent benchmarks above do not run these
+// steps.
 func BenchmarkGC_RunGC_StreamingSorted_N100(b *testing.B) {
 	resetNFSCheck(b)
 	root := cacheRootForTest(b)
 	stale := time.Now().Add(-30 * 24 * time.Hour)
-	ctx := context.Background()
+	ctx := b.Context()
 
 	b.ReportAllocs()
 	for b.Loop() {
 		b.StopTimer()
-		// Recreate the 100 stale corpora each iter — runGC's prior pass
-		// just evicted them.
-		for i := 0; i < 100; i++ {
+		// Seed the 100 corpora again each iteration. The 1P cache budget
+		// that setTestUserCache sets keeps them all, so the pass evicts
+		// nothing.
+		for i := range 100 {
 			seedCorpus(b, root, fakeCorpusHash(i), stale)
 		}
 		b.StartTimer()
 
 		runGC(ctx, gcOptions{
-			maxAge:       defaultGCMaxAge,
 			skipThrottle: true,
 			writer:       io.Discard,
 			sortKey:      sortBySize,
-		}, defaultGCInterval)
+		})
 	}
 }
 
 func BenchmarkGC_PickDisplayShard(b *testing.B) {
 	cases := [][]string{
-		{"/c/index/github.com%2Ffoo%2Fbar_v17.00000.zoekt"},
-		{"/c/index/uncommitted_v17.00000.zoekt", "/c/index/github.com%2Ffoo%2Fbar_v17.00000.zoekt"},
-		{"/c/index/uncommitted_v17.00000.zoekt", "/c/index/github.com%2Ffoo%2Funcommitted-tool_v17.00000.zoekt"},
+		{"/c/index/github.com%2Ffoo%2Fbar_v16.00000.zoekt"},
+		{"/c/index/uncommitted_v16.00000.zoekt", "/c/index/github.com%2Ffoo%2Fbar_v16.00000.zoekt"},
+		{"/c/index/uncommitted_v16.00000.zoekt", "/c/index/github.com%2Ffoo%2Funcommitted-tool_v16.00000.zoekt"},
 	}
 	b.ReportAllocs()
 	for b.Loop() {
@@ -2478,19 +2270,16 @@ func BenchmarkGC_PickDisplayShard(b *testing.B) {
 }
 
 func BenchmarkGC_DryRun_Render_N20(b *testing.B) {
-	if testing.Short() {
-		b.Skip("builds a real git repo")
-	}
 	requireTools(b)
 	resetNFSCheck(b)
 
-	// One real corpus so readCorpusDisplayInfo has actual shard metadata to
-	// read on at least one row — exercises ReadMetadataPath + [gone]/
-	// [empty] branches together.
+	// One real corpus gives readCorpusDisplayInfo shard metadata to read
+	// (Zoekt's ReadMetadataPath) on one row. The other rows take the
+	// [empty] branch.
 	repo := initGitRepo(b, "app.go", "package main\n// bench_dry_run\n")
-	ctx := context.Background()
-	paths, realPlan := planGitTestCorpus(b, repo)
-	if _, err := runSeekInPlannedGitCorpus(ctx, "bench_dry_run", paths, realPlan); err != nil {
+	ctx := b.Context()
+	_, realPlan := planGitTestCorpus(b, repo)
+	if _, err := runSeekInPlannedGitCorpus(ctx, "bench_dry_run", realPlan); err != nil {
 		b.Fatalf("real corpus build: %v", err)
 	}
 
@@ -2498,10 +2287,10 @@ func BenchmarkGC_DryRun_Render_N20(b *testing.B) {
 	if err != nil {
 		b.Fatalf("seekUserCacheRoot: %v", err)
 	}
-	// 19 shardless corpora alongside the real one. Their displayName will
-	// be [empty]; rendering cost is what we measure.
+	// 19 corpora with no shard beside the real one. Their rows show
+	// [empty]; the benchmark times the rendering of the table.
 	now := time.Now()
-	for i := 0; i < 19; i++ {
+	for i := range 19 {
 		seedCorpus(b, root, fakeCorpusHash(i+1), now)
 	}
 
@@ -2510,30 +2299,27 @@ func BenchmarkGC_DryRun_Render_N20(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	cutoff := time.Now().Add(-defaultGCMaxAge)
+	// A dry run records no size (runGCCommandCmd).
+	evict, err := planCorpusEviction(root, entries, false, nil, false)
+	if err != nil {
+		b.Fatal(err)
+	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
-		if err := reportGCPlan(ctx, io.Discard, root, entries, cutoff, sortByName); err != nil {
-			b.Fatal(err)
-		}
+		reportGCPlan(ctx, io.Discard, root, entries, evict, sortByName)
 	}
 }
 
-// Windowed-indexer-fix benchmarks: rotation cost + manifest streaming.
+// Indexer benchmarks beyond the read budget, and the folder manifest write.
 
-// BenchmarkFolderCorpus_ColdIndex_LargeRotation forces multi-window
-// rotation by shrinking the test-local readSemaphore budget so the
-// window threshold drops to ~2 MiB. Synthesised payload spans many
-// windows; ns/op surfaces the rotation overhead the production fix
-// trades for bounded peak memory.
+// BenchmarkFolderCorpus_ColdIndex_LargeRotation sets a readSemaphore of 4 MiB
+// and builds 12 MiB of content. Its ns/op shows the cost of a build past the
+// read budget. Each 512 KiB file is a normal document, so one Builder takes all
+// of them and no window rotates. The name stays for the CodSpeed history.
 func BenchmarkFolderCorpus_ColdIndex_LargeRotation(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping rotation benchmark in -short")
-	}
 	requireTools(b)
-	ctx := context.Background()
+	ctx := b.Context()
 
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
@@ -2545,12 +2331,12 @@ func BenchmarkFolderCorpus_ColdIndex_LargeRotation(b *testing.B) {
 		b.StopTimer()
 		root := b.TempDir()
 		const fileCount = 24
-		const fileSize = 512 * 1024 // 12 MiB → ~6 windows
+		const fileSize = 512 * 1024 // 12 MiB in all
 		payload := make([]byte, fileSize-len("package x\n"))
 		for i := range payload {
 			payload[i] = byte('a' + i%26)
 		}
-		for i := 0; i < fileCount; i++ {
+		for i := range fileCount {
 			name := filepath.Join(root, fmt.Sprintf("f%03d.go", i))
 			if err := os.WriteFile(name, append([]byte("package x\n"), payload...), 0o644); err != nil {
 				b.Fatal(err)
@@ -2564,15 +2350,11 @@ func BenchmarkFolderCorpus_ColdIndex_LargeRotation(b *testing.B) {
 	}
 }
 
-// BenchmarkWriteFolderManifest_100k surfaces the streaming-JSON
-// encoder peak-allocation claim: bufio working set (~32 KiB) instead
-// of json.Marshal's ~2× payload buffer. ReportAllocs makes regressions
-// one-glance visible. 100k entries chosen as the largest realistic
-// folder-manifest size.
+// BenchmarkWriteFolderManifest_100k times writeFolderManifest with 100k
+// entries, the largest realistic folder manifest. The encoder builds the whole
+// JSON text in memory and writes it in one write. ReportAllocs shows a change
+// in allocation.
 func BenchmarkWriteFolderManifest_100k(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping manifest benchmark in -short")
-	}
 	const count = 100_000
 	selected := make([]folderCandidate, count)
 	for i := range selected {
@@ -2584,75 +2366,56 @@ func BenchmarkWriteFolderManifest_100k(b *testing.B) {
 			ino:   uint64(i),
 		}
 	}
+	markers := make([]int64, count)
 	b.ReportAllocs()
 	dir := b.TempDir()
-	b.ResetTimer()
 	for b.Loop() {
-		if err := writeFolderManifest(dir, "state-x", selected); err != nil {
+		if err := writeFolderManifest(dir, "state-x", selected, 0, markers, 0); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-// --- Detector hot-path benchmarks ---
+// --- Detector benchmarks ---
 
-func benchSetupValidGitDir(b *testing.B, root string) {
-	b.Helper()
-	gitDir := filepath.Join(root, ".git")
-	for _, sub := range []string{"objects", "refs"} {
-		if err := os.MkdirAll(filepath.Join(gitDir, sub), 0o755); err != nil {
-			b.Fatal(err)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
-		b.Fatal(err)
-	}
-}
-
-// BenchmarkDetectGitBoundary_NotBoundary measures the walker hot path:
-// detection on a directory that contains no `.git` entry. Most subdirectories
-// use this path, so the benchmark reports allocation changes.
+// BenchmarkDetectGitBoundary_NotBoundary measures the most common case of the
+// walker: detection on a directory that contains no `.git` entry. Most
+// subdirectories use this path, so the benchmark reports allocation changes.
 func BenchmarkDetectGitBoundary_NotBoundary(b *testing.B) {
 	root := b.TempDir()
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, status := detectGitBoundary(root, root)
+	for b.Loop() {
+		_, status := detectGitBoundary(root)
 		if status != notBoundary {
 			b.Fatalf("status=%v", status)
 		}
 	}
 }
 
-// BenchmarkDetectGitBoundary_DirForm measures L1+L2a confirmed path:
-// dir-form `.git/` with valid HEAD+objects+refs triad.
+// BenchmarkDetectGitBoundary_DirForm times the confirmed path of a `.git`
+// directory with HEAD, objects and refs (steps L1 and L2a of
+// detectGitBoundary).
 func BenchmarkDetectGitBoundary_DirForm(b *testing.B) {
 	root := b.TempDir()
-	benchSetupValidGitDir(b, root)
+	writeGitTriadAt(b, filepath.Join(root, ".git"))
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, status := detectGitBoundary(root, root)
+	for b.Loop() {
+		_, status := detectGitBoundary(root)
 		if status != boundaryConfirmed {
 			b.Fatalf("status=%v", status)
 		}
 	}
 }
 
-// BenchmarkDetectGitBoundary_WorktreeFile measures L2b path: streaming
-// `.git` file parse + commondir lookup.
+// BenchmarkDetectGitBoundary_WorktreeFile times the parse of a `.git` file
+// that names a Git directory outside the worktree (the layout of
+// git init --separate-git-dir). With no core.worktree and no linked-worktree
+// back-reference, the detector returns ambiguous and Git decides
+// (TestDetectGitBoundary_SeparateGitDirOutsideTreeAsksGit).
 func BenchmarkDetectGitBoundary_WorktreeFile(b *testing.B) {
 	root := b.TempDir()
 	realGitDir := filepath.Join(root, "real-git")
-	gitDir := realGitDir
-	for _, sub := range []string{"objects", "refs"} {
-		if err := os.MkdirAll(filepath.Join(gitDir, sub), 0o755); err != nil {
-			b.Fatal(err)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
-		b.Fatal(err)
-	}
+	writeGitTriadAt(b, realGitDir)
 	worktree := filepath.Join(root, "wt")
 	if err := os.MkdirAll(worktree, 0o755); err != nil {
 		b.Fatal(err)
@@ -2661,15 +2424,17 @@ func BenchmarkDetectGitBoundary_WorktreeFile(b *testing.B) {
 		b.Fatal(err)
 	}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, status := detectGitBoundary(worktree, root)
-		if status != boundaryConfirmed {
-			b.Fatalf("status=%v", status)
+	for b.Loop() {
+		_, status := detectGitBoundary(worktree)
+		if status != ambiguous {
+			b.Fatalf("status=%v, want ambiguous", status)
 		}
 	}
 }
 
+// BenchmarkDetectGitBoundary_LinkedWorktreeBackref times the confirmed path
+// of a linked worktree: its `.git` file names an admin directory whose gitdir
+// file names the worktree back.
 func BenchmarkDetectGitBoundary_LinkedWorktreeBackref(b *testing.B) {
 	root := b.TempDir()
 	parentGit := filepath.Join(root, "parent.git")
@@ -2685,11 +2450,176 @@ func BenchmarkDetectGitBoundary_LinkedWorktreeBackref(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, status := detectGitBoundary(worktree, root)
+	for b.Loop() {
+		_, status := detectGitBoundary(worktree)
 		if status != boundaryConfirmed {
 			b.Fatalf("status=%v", status)
 		}
 	}
+}
+
+// BenchmarkManyShardGit_WarmSearch times warm searches of one Git node with
+// at least 8 shards through runSearchCommand, the entry point of a command.
+// It times Seek's stages with a model that runs no inference
+// (benchmarkNodeModel). Each case query gives the model text, so each case
+// runs the model stages, also the cases named Strict. Each search loads every
+// shard of the node, so the time of a case grows with the number of shard
+// loads per node read. The body calls only runSearchCommand, so a change
+// inside the node read needs no change to the benchmark code.
+func BenchmarkManyShardGit_WarmSearch(b *testing.B) {
+	requireTools(b)
+	setTestUserCache(b)
+	swapForTest(b, &shardMax, 128<<10)
+	repo := initEmptyGitRepoNoRemote(b)
+	writeBenchmarkNodeFiles(b, repo, "pkg", 1024)
+	writeFileAt(b, repo, "pkg/f0517_marker.go", "package pkg\n\n// zqselectivebenchmarker\n")
+	// The benchmark model puts these files near the query by their names.
+	// They hold no query word, so a case that finds them also runs the
+	// relaxed query. Their names match the file:pkg/f00 filter of the last
+	// case.
+	for i := range 64 {
+		writeFileAt(b, repo, fmt.Sprintf("pkg/f00s%02d.go", i), fmt.Sprintf("package pkg\n\n// vector-only file %d\n", i))
+	}
+	gitRunIn(b, repo, "add", ".")
+	gitRunIn(b, repo, "commit", "-q", "-m", "fixture")
+	operands := []string{repo}
+	// The Description case must find files by vector, so it runs the
+	// relaxed query.
+	if out := captureStdoutGC(b, func() { mustRunBenchmarkSearch(b, "parse handler", operands) }); !strings.Contains(out, "f00s") {
+		b.Fatal("the description case found no vector-only file, so the relaxed query does not run")
+	}
+	discardStdout(b)
+	cases := []struct{ name, query string }{
+		{"SelectiveStrict", "zqselectivebenchmarker"},
+		{"CommonStrict", "handler"},
+		{"Description", "parse handler"},
+	}
+	for _, c := range cases {
+		mustRunBenchmarkSearch(b, c.query, operands)
+	}
+	plans, err := planCorpora(b.Context(), operands)
+	if err != nil || len(plans) != 1 {
+		b.Fatalf("plans=%d err=%v", len(plans), err)
+	}
+	if shards, _ := filepath.Glob(filepath.Join(plans[0].indexDir, "*.zoekt")); len(shards) < 8 {
+		b.Fatalf("the fixture has %d shards, want 8 or more", len(shards))
+	}
+	for _, c := range cases {
+		b.Run(c.name, func(b *testing.B) {
+			for b.Loop() {
+				mustRunBenchmarkSearch(b, c.query, operands)
+			}
+		})
+	}
+	// The last case reads the dirty overlay and the file: mask too.
+	writeFileAt(b, repo, "pkg/f0001.go", "package pkg\n\n// handler parses the dirty request\n")
+	const dirtyQuery = "file:pkg/f00 parse handler"
+	mustRunBenchmarkSearch(b, dirtyQuery, operands)
+	b.Run("DescriptionFileFilterDirtyGit", func(b *testing.B) {
+		for b.Loop() {
+			mustRunBenchmarkSearch(b, dirtyQuery, operands)
+		}
+	})
+}
+
+// BenchmarkMultiNode_WarmSearch times warm searches with no path operand in a
+// folder that holds two Git repositories. The search has three nodes, the
+// folder and the two repositories, and searchNodes reads them at the same
+// time. It times Seek's stages with a model that runs no inference
+// (benchmarkNodeModel). Both case queries give the model text, so both cases
+// run the model stages. Each case, not the parent benchmark, changes the
+// current folder to the fixture. CodSpeed's version of the testing package
+// saves the result of a case after the case ends, and it finds the Git root
+// from the current folder at that time. The fixture folder is in no Git
+// repository, so a folder change in the parent makes that save panic. The
+// cleanup of the case restores the folder before the save.
+func BenchmarkMultiNode_WarmSearch(b *testing.B) {
+	requireTools(b)
+	setTestUserCache(b)
+	root := b.TempDir()
+	writeBenchmarkNodeFiles(b, root, "docs", 200)
+	for _, name := range []string{"repo-a", "repo-b"} {
+		repo := initEmptyGitRepoNoRemoteAt(b, filepath.Join(root, name))
+		writeBenchmarkNodeFiles(b, repo, "pkg", 200)
+		gitRunIn(b, repo, "add", ".")
+		gitRunIn(b, repo, "commit", "-q", "-m", "fixture")
+	}
+	discardStdout(b)
+	if plans, err := planCorpora(b.Context(), []string{root}); err != nil || len(plans) != 3 {
+		b.Fatalf("plans=%d err=%v, want 3 nodes", len(plans), err)
+	}
+	for _, c := range []struct{ name, query string }{
+		{"Strict", "handler"},
+		{"Description", "parse handler"},
+	} {
+		b.Run(c.name, func(b *testing.B) {
+			b.Chdir(root)
+			mustRunBenchmarkSearch(b, c.query, nil)
+			for b.Loop() {
+				mustRunBenchmarkSearch(b, c.query, nil)
+			}
+		})
+	}
+}
+
+// writeBenchmarkNodeFiles writes count Go files of about 2 KiB below
+// dir/sub. Each file holds the text "handler" in a name and the word "parses".
+func writeBenchmarkNodeFiles(b *testing.B, dir, sub string, count int) {
+	b.Helper()
+	for i := range count {
+		writeFileAt(b, dir, fmt.Sprintf("%s/f%04d.go", sub, i), fmt.Sprintf(
+			"package pkg\n\n// handler%04d parses the request of case %d.\nfunc handler%04d() {}\n%s",
+			i, i, i, strings.Repeat(fmt.Sprintf("// note %d of the benchmark fixture text\n", i), 48),
+		))
+	}
+}
+
+// mustRunBenchmarkSearch runs one search command as the CLI does, with the
+// benchmark model (benchmarkNodeModel) for the model stages.
+func mustRunBenchmarkSearch(b *testing.B, query string, operands []string) {
+	b.Helper()
+	runConfig := searchRunConfig{policy: semanticSearch, newModel: benchmarkNodeModel}
+	if err := runSearchCommand(b.Context(), query, operands, defaultSearchConfig(), runConfig); err != nil {
+		b.Fatalf("search %q: %v", query, err)
+	}
+}
+
+// benchmarkNodeModel is the test model with one vector per file, so USearch's
+// graph has distinct points: equal vectors give a degenerate graph that finds
+// nothing. It runs no inference, so a benchmark with it times Seek's stages;
+// BenchmarkCLIProcess times a warm description search with the bundled model.
+// The files whose path starts with pkg/f00s lie near the query, and the
+// others lie far from it. The model accepts every document that it scores.
+func benchmarkNodeModel(context.Context) (semanticModel, error) {
+	return &hybridTestScorer{mode: payloadAccept, vectorForUnit: func(unit semanticUnit) semanticVector {
+		var vector semanticVector
+		if strings.HasPrefix(unit.path, "pkg/f00s") {
+			vector[0] = 1
+		} else {
+			vector[1] = 1
+		}
+		hash := fnv.New32a()
+		_, _ = hash.Write([]byte(unit.path))
+		vector[2+int(hash.Sum32()%uint32(semanticEmbeddingDimensions-2))] = 0.05
+		_ = normalizeSemanticVector(&vector)
+		return vector
+	}}, nil
+}
+
+// indexUncommittedForBench runs the uncommitted part of a Git build as
+// gitNode.buildLocked does: a delta when the live family takes one, else a
+// full stage. It takes no build lock or publish lock, so it times that part
+// alone.
+func indexUncommittedForBench(ctx context.Context, repoDir string, store corpusStore, state repoState, cachedState, preState string) error {
+	// The bench does not write the family manifest (.family-v1) between
+	// rounds, and no other process changes the family, so it passes
+	// familyIntact as true.
+	delta, stage, prebuildErr, err := prepareUncommitted(ctx, repoDir, store, cachedState, true, state, indexParallelism())
+	if err := errors.Join(prebuildErr, err); err != nil {
+		return err
+	}
+	if stage != nil {
+		defer stage.discard()
+	}
+	return indexUncommitted(ctx, repoDir, store, state, preState, indexParallelism(), stage, delta)
 }

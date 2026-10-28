@@ -1,29 +1,35 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"flag"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 )
 
+// cliProcessHelperEnv set to cliProcessTestMarker makes the test binary run
+// as the CLI (TestCLIProcessHelper).
 const (
 	cliProcessHelperEnv  = "SEEK_TEST_CLI_PROCESS_HELPER"
 	cliProcessTestMarker = "1"
 )
 
+// cliProcessResult is the output and the exit code of one CLI process.
 type cliProcessResult struct {
 	stdout string
 	stderr string
 	code   int
 }
 
+// TestCLIProcessHelper is the CLI process that cliProcessCommand starts. With
+// cliProcessHelperEnv set to cliProcessTestMarker, it runs main with the
+// arguments after "--". In a normal test run it returns at once.
 func TestCLIProcessHelper(t *testing.T) {
 	if os.Getenv(cliProcessHelperEnv) != cliProcessTestMarker {
 		return
@@ -52,15 +58,8 @@ func TestCLIProcessErrorsAndExitCodes(t *testing.T) {
 			code:         2,
 		},
 		{
+			// Seek removed --rerank, so it must stay an unknown flag.
 			name:           "unknown flag fallback",
-			args:           []string{"--unknown", "needle"},
-			dir:            empty,
-			stderrPrefix:   "seek: ",
-			stderrContains: []string{"--unknown"},
-			code:           2,
-		},
-		{
-			name:           "removed rerank flag",
 			args:           []string{"--rerank", "needle"},
 			dir:            empty,
 			stderrPrefix:   "seek: ",
@@ -124,55 +123,22 @@ func TestCLIProcessErrorsAndExitCodes(t *testing.T) {
 	}
 }
 
-func TestCLIProcess_MissingGitDoesNotReturnNoMatch(t *testing.T) {
+// TestCLIProcess_MissingGitSkipsTheNode runs with no Git on PATH: the Git
+// node fails and the search skips it, as it does any failed node. One warning
+// names the root and gives the hint; no folder content shows; the exit is 1.
+func TestCLIProcess_MissingGitSkipsTheNode(t *testing.T) {
 	repo := initGitRepo(t, "note.txt", "missing_git_process_marker\n")
 	result := runCLIProcess(t, repo, []string{"missing_git_process_marker"}, []string{
 		"PATH=" + t.TempDir(),
 	})
-	want := "seek: Git is required but was not found\n" +
-		"hint: install Git and ensure git is on PATH\n"
-	if result.stdout != "" || result.stderr != want || result.code != 2 {
-		t.Fatalf("stdout=%q stderr=%q code=%d, want empty stdout, stderr=%q, code=2", result.stdout, result.stderr, result.code, want)
+	if result.stdout != "" || result.code != 1 || strings.Count(result.stderr, "\n") != 1 {
+		t.Fatalf("stdout=%q stderr=%q code=%d, want one warning and code 1", result.stdout, result.stderr, result.code)
 	}
-}
-
-func TestCLIProcess_VerboseMissingGitKeepsHintAndDetail(t *testing.T) {
-	repo := initGitRepo(t, "note.txt", "missing_git_verbose_process_marker\n")
-	result := runCLIProcess(t, repo, []string{"--verbose", "missing_git_verbose_process_marker"}, []string{
-		"PATH=" + t.TempDir(),
-	})
-	wantPrefix := "seek: Git is required but was not found\n" +
-		"hint: install Git and ensure git is on PATH\n"
-	if result.stdout != "" || result.code != 2 || !strings.HasPrefix(result.stderr, wantPrefix) {
-		t.Fatalf("stdout=%q stderr=%q code=%d, want empty stdout, stderr prefix=%q, code=2", result.stdout, result.stderr, result.code, wantPrefix)
-	}
-	for _, want := range []string{"level=ERROR", `msg="Command failed"`, `error="git corpus root=`} {
+	// No path is the same as ".", so the warning names the resolved root.
+	for _, want := range []string{"level=WARN", "root=" + resolvedPath(t, repo), "Git is required but was not found", "install Git and ensure git is on PATH"} {
 		if !strings.Contains(result.stderr, want) {
-			t.Fatalf("stderr=%q, want structured detail %q", result.stderr, want)
+			t.Fatalf("stderr=%q, want %q", result.stderr, want)
 		}
-	}
-}
-
-func TestCLIProcess_FolderCapExplainsLimitAndRemedy(t *testing.T) {
-	folder := t.TempDir()
-	// The file size is only a unit for the folder byte cap. Any size that fits
-	// the index works; 100 MiB keeps the file count low.
-	const fileSize = 100 << 20
-	const fileCount = maxFolderIndexedBytes/fileSize + 1
-	for i := int64(0); i < fileCount; i++ {
-		writeSparseFile(t, filepath.Join(folder, fmt.Sprintf("f%03d.bin", i)), fileSize)
-	}
-
-	resolvedFolder, err := filepath.EvalSymlinks(folder)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result := runCLIProcess(t, t.TempDir(), []string{"needle", folder}, nil)
-	want := "seek: cannot index " + strconv.Quote(filepath.Clean(resolvedFolder)) +
-		": the total size of indexable files exceeds the 10 GiB folder limit\n" +
-		"hint: pass smaller paths after the query; file: and -file: filters apply after indexing\n"
-	if result.stdout != "" || result.stderr != want || result.code != 2 {
-		t.Fatalf("stdout=%q stderr=%q code=%d, want empty stdout, stderr=%q, code=2", result.stdout, result.stderr, result.code, want)
 	}
 }
 
@@ -275,7 +241,7 @@ func TestCLIProcess_GCRemainsSubcommand(t *testing.T) {
 		t.Run(command, func(t *testing.T) {
 			result := runCLIProcess(t, t.TempDir(), []string{command, "--help"}, nil)
 			if result.code != 0 || result.stderr != "" ||
-				!strings.Contains(result.stdout, "Delete search indexes that have not been used") ||
+				!strings.Contains(result.stdout, "Delete the least recently used search indexes") ||
 				!strings.Contains(result.stdout, "run cleanup even if it ran recently") ||
 				strings.Contains(result.stdout, ".last-gc") ||
 				!strings.Contains(result.stdout, "--dry-run") {
@@ -315,7 +281,7 @@ func TestCLIProcess_LexicalOnlySkipsSemanticCacheAndModel(t *testing.T) {
 		[]string{"--verbose", "--lexical-only", "alpha beta", folder},
 		nil,
 	)
-	if result.code != 0 || !strings.Contains(result.stdout, "## app.go") {
+	if result.code != 0 || !strings.Contains(result.stdout, "## "+filepath.Join(folder, "app.go")) {
 		t.Fatalf(
 			"lexical-only stdout=%q stderr=%q code=%d",
 			result.stdout,
@@ -343,22 +309,25 @@ func TestCLIProcess_LexicalOnlySkipsSemanticCacheAndModel(t *testing.T) {
 	}
 }
 
-// TestCLIProcess_QueryShapeDecidesSemanticCache checks the user-visible rule
-// the README states: Seek builds meaning-based data only for a search that can
-// read it. An exact word cannot reach it, a description can.
+// TestCLIProcess_QueryShapeDecidesSemanticCache checks the user-visible rule:
+// Seek builds meaning-based data for every search that can read it. One word,
+// a symbol filter and a description reach it; a query of negations only gives
+// the model no text, so it builds none.
 //
-// This sits at process level beside the --lexical-only test because it makes
-// the same kind of claim: a command either leaves semantic data in the cache or
-// it does not. The in-process tests cover why; this covers what a user sees.
+// The test runs the real process, as the --lexical-only test does. Both check
+// whether a command leaves semantic data in the cache. The in-process tests
+// check why; this test checks what a user sees. The symbol lookup expects the
+// model to add no file. So the folder has a fixed model path
+// (stableModelRoot), and the score is the same in each run.
 func TestCLIProcess_QueryShapeDecidesSemanticCache(t *testing.T) {
 	requireTools(t)
-	folder := t.TempDir()
+	folder := stableModelRoot(t)
 	writeFileAt(t, folder, "app.go", "package sample\n// alpha beta gamma describes the sample\n")
 
-	// wantCode guards this table against a vacuous pass: a case that expects no
-	// results and no vectors would also hold if the command crashed, so every
-	// case pins the documented exit code. 0 is a match, 1 is no match, and 2 is
-	// an error that must never appear here.
+	// wantCode keeps a case from a false pass. A case with no results and no
+	// vectors would also pass if the command crashed, so each case sets the
+	// exit code. 0 is a match, 1 is no match, and 2 is an error that must not
+	// occur here.
 	for _, testCase := range []struct {
 		name        string
 		query       string
@@ -366,9 +335,10 @@ func TestCLIProcess_QueryShapeDecidesSemanticCache(t *testing.T) {
 		wantResults bool
 		wantVectors bool
 	}{
-		{name: "exact word", query: "alpha", wantCode: 0, wantResults: true, wantVectors: false},
-		{name: "symbol lookup", query: "sym:Missing", wantCode: 1, wantResults: false, wantVectors: false},
+		{name: "exact word", query: "alpha", wantCode: 0, wantResults: true, wantVectors: true},
+		{name: "symbol lookup", query: "sym:Missing", wantCode: 1, wantResults: false, wantVectors: true},
 		{name: "description", query: "describes the sample", wantCode: 0, wantResults: true, wantVectors: true},
+		{name: "negations only", query: "-file:missing", wantCode: 0, wantResults: true, wantVectors: false},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			cacheDir := t.TempDir()
@@ -388,7 +358,7 @@ func TestCLIProcess_QueryShapeDecidesSemanticCache(t *testing.T) {
 					result.stderr,
 				)
 			}
-			if testCase.wantResults != strings.Contains(result.stdout, "## app.go") {
+			if testCase.wantResults != strings.Contains(result.stdout, "## "+filepath.Join(folder, "app.go")) {
 				t.Fatalf(
 					"results=%t, want %t: stdout=%q stderr=%q",
 					!testCase.wantResults,
@@ -436,19 +406,71 @@ func cachePathsMatching(tb testing.TB, cacheDir string, match func(name string) 
 	return found
 }
 
+// runCLIProcess runs args in dir as a CLI process with a new empty cache.
 func runCLIProcess(t *testing.T, dir string, args, extraEnv []string) cliProcessResult {
 	t.Helper()
 	return runCLIProcessWithCache(t, t.TempDir(), dir, args, extraEnv)
 }
 
+// runCLIProcessWithCache runs args in dir as a CLI process with cacheDir as
+// its cache and extraEnv last in its environment.
 func runCLIProcessWithCache(t *testing.T, cacheDir, dir string, args, extraEnv []string) cliProcessResult {
 	t.Helper()
-	commandArgs := append([]string{"-test.run=^TestCLIProcessHelper$", "--"}, args...)
-	cmd := exec.Command(os.Args[0], commandArgs...)
-	cmd.Dir = dir
+	cmd := cliProcessCommand(t.Context(), cacheDir, dir, args, extraEnv)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+	return cliProcessResult{stdout: stdout.String(), stderr: stderr.String(), code: cliProcessExitCode(t, runErr)}
+}
+
+// runCLIProcessOnLine runs the CLI process as runCLIProcessWithCache does and
+// reads its stderr line by line. At the first line that match accepts, it
+// calls act with the process, once. The second result reports whether that
+// line came. The process writes the debug line of a lock wait (pollLock) only
+// with --verbose; lockWaitLine matches it.
+func runCLIProcessOnLine(t *testing.T, cacheDir, dir string, args []string, match func(line string) bool, act func(*os.Process)) (cliProcessResult, bool) {
+	t.Helper()
+	cmd := cliProcessCommand(t.Context(), cacheDir, dir, args, nil)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	seen := false
+	scanner := bufio.NewScanner(stderrPipe)
+	for scanner.Scan() {
+		stderr.WriteString(scanner.Text() + "\n")
+		if !seen && match(scanner.Text()) {
+			seen = true
+			act(cmd.Process)
+		}
+	}
+	waitErr := cmd.Wait()
+	return cliProcessResult{stdout: stdout.String(), stderr: stderr.String(), code: cliProcessExitCode(t, waitErr)}, seen
+}
+
+// lockWaitLine matches the stderr line of a lock wait of a CLI process. The
+// line holds reason (lockWaitBuild, lockWaitReaders, or lockWaitPublish) and
+// the path of the lock, so a wait on another lock does not match.
+func lockWaitLine(reason, lock string) func(line string) bool {
+	return func(line string) bool {
+		return strings.Contains(line, reason) && strings.Contains(line, lock)
+	}
+}
+
+// cliProcessCommand returns the command of the CLI helper process: it runs
+// args in dir, with cacheDir as its cache and extraEnv last in its
+// environment.
+func cliProcessCommand(ctx context.Context, cacheDir, dir string, args, extraEnv []string) *exec.Cmd {
+	commandArgs := append([]string{"-test.run=^TestCLIProcessHelper$", "--"}, args...)
+	cmd := exec.CommandContext(ctx, os.Args[0], commandArgs...)
+	cmd.Dir = dir
 	overrides := []string{
 		cliProcessHelperEnv + "=" + cliProcessTestMarker,
 		"SEEK_CACHE_DIR=" + cacheDir,
@@ -456,24 +478,28 @@ func runCLIProcessWithCache(t *testing.T, cacheDir, dir string, args, extraEnv [
 	}
 	overrides = append(overrides, extraEnv...)
 	cmd.Env = append(cmd.Environ(), overrides...)
-	runErr := cmd.Run()
-	result := cliProcessResult{stdout: stdout.String(), stderr: stderr.String()}
-	if runErr == nil {
-		return result
-	}
-	var exitErr *exec.ExitError
-	if !errors.As(runErr, &exitErr) {
-		t.Fatalf("run CLI helper: %v", runErr)
-	}
-	result.code = exitErr.ExitCode()
-	return result
+	return cmd
 }
 
-// TestCLIProcess_ContentRulesOnStdoutAndStderr checks the user-facing contract
-// on the real process: content past Zoekt's default trigram cap matches and
-// stdout ends with one newline; a file whose content is not in the index gets
-// one warning on stderr with Zoekt's reason and exit status 1. The in-process
-// tests cover which operands get a warning.
+// cliProcessExitCode returns the exit code of a CLI process from the error of
+// its Run or Wait. Any error other than an exit status fails the test.
+func cliProcessExitCode(t *testing.T, err error) int {
+	t.Helper()
+	if err == nil {
+		return 0
+	}
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	if !ok {
+		t.Fatalf("run CLI helper: %v", err)
+	}
+	return exitErr.ExitCode()
+}
+
+// TestCLIProcess_ContentRulesOnStdoutAndStderr checks the output rules on the
+// real process. Content past Zoekt's default trigram cap matches, and stdout
+// ends with one newline. A file whose content is not in the index gets one
+// warning on stderr with Zoekt's reason, and the exit status is 1. The
+// in-process tests check which operands get a warning.
 func TestCLIProcess_ContentRulesOnStdoutAndStderr(t *testing.T) {
 	requireTools(t)
 	const warning = "File content is not searchable"

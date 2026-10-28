@@ -4,28 +4,29 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
-	"time"
 )
 
 // ===========================================================================
-// NORMAL CASES — expected workflows not yet covered
+// NORMAL CASES: common workflows
 // ===========================================================================
 
 // TestIntegration_DetachedHEAD verifies seek works in detached HEAD state,
-// which changes the branch.oid header format.
+// where git status prints "# branch.head (detached)".
 func TestIntegration_DetachedHEAD(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// detached_marker\n")
 
 	// Detach HEAD
-	gitRun(t, dir, "checkout", "--detach", "HEAD")
+	gitRunIn(t, dir, "checkout", "--detach", "HEAD")
 
 	files, err := runSeekInRepo(t, dir, "detached_marker")
 	if err != nil {
@@ -36,8 +37,9 @@ func TestIntegration_DetachedHEAD(t *testing.T) {
 	}
 }
 
-// TestIntegration_InitialCommitEmpty verifies seek handles a repo with only
-// an initial commit containing a single empty tree (e.g. git commit --allow-empty).
+// TestIntegration_InitialCommitEmpty searches a repository whose one commit
+// has an empty tree (git commit --allow-empty). The search finds its
+// untracked file.
 func TestIntegration_InitialCommitEmpty(t *testing.T) {
 	requireTools(t)
 
@@ -55,7 +57,7 @@ func TestIntegration_InitialCommitEmpty(t *testing.T) {
 			t.Fatalf("%v failed: %v\n%s", args, err, out)
 		}
 	}
-	// Add an untracked file — should be findable even with empty initial commit
+	// An untracked file beside the empty commit.
 	if err := os.WriteFile(filepath.Join(dir, "new.go"), []byte("package main\n// empty_initial_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -89,16 +91,14 @@ func TestRun_EmptyGitRepoReturnsNoMatch(t *testing.T) {
 	setTestUserCache(t)
 	t.Chdir(dir)
 
-	_, err := captureStdout(t, func() error {
-		return run(context.Background(), "absent_empty_repo_marker", nil)
-	})
+	_, err := seek(t, "--lexical-only", "absent_empty_repo_marker")
 	if !errors.Is(err, errNoMatch) {
 		t.Fatalf("expected no match for empty git repo, got %v", err)
 	}
 }
 
-// TestIntegration_StagedButNotCommitted verifies that staged (git add) but
-// not yet committed files are detected by git status and searchable.
+// TestIntegration_StagedButNotCommitted verifies that git status lists a file
+// that is staged (git add) but not committed, and that the search finds it.
 func TestIntegration_StagedButNotCommitted(t *testing.T) {
 	requireTools(t)
 
@@ -108,7 +108,7 @@ func TestIntegration_StagedButNotCommitted(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "staged.go"), []byte("package main\n// staged_only_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, dir, "add", "staged.go")
+	gitRunIn(t, dir, "add", "staged.go")
 
 	files, err := runSeekInRepo(t, dir, "staged_only_marker")
 	if err != nil {
@@ -125,15 +125,15 @@ func TestIntegration_MultipleBranches(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// main_branch_marker\n")
-	defaultBranch := gitCurrentBranch(t, dir)
+	defaultBranch := gitOutputIn(t, dir, "symbolic-ref", "--quiet", "--short", "HEAD")
 
 	// Create and switch to a new branch with different content
-	gitRun(t, dir, "checkout", "-b", "feature")
+	gitRunIn(t, dir, "checkout", "-b", "feature")
 	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// feature_branch_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, dir, "add", "app.go")
-	gitRun(t, dir, "commit", "-m", "feature change")
+	gitRunIn(t, dir, "add", "app.go")
+	gitRunIn(t, dir, "commit", "-m", "feature change")
 
 	// Search should find feature branch content
 	files, err := runSeekInRepo(t, dir, "feature_branch_marker")
@@ -144,8 +144,8 @@ func TestIntegration_MultipleBranches(t *testing.T) {
 		t.Fatal("expected match for feature branch content")
 	}
 
-	// Switch back to main — search should find main content
-	gitRun(t, dir, "checkout", defaultBranch)
+	// Switch back to the default branch: the search finds its content.
+	gitRunIn(t, dir, "checkout", defaultBranch)
 
 	files, err = runSeekInRepo(t, dir, "main_branch_marker")
 	if err != nil {
@@ -171,8 +171,8 @@ func TestIntegration_NestedDirectoryStructure(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(nested, "deep.go"), []byte("package main\n// deep_nested_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, dir, "add", ".")
-	gitRun(t, dir, "commit", "-m", "add nested file")
+	gitRunIn(t, dir, "add", ".")
+	gitRunIn(t, dir, "commit", "-m", "add nested file")
 
 	files, err := runSeekInRepo(t, dir, "deep_nested_marker")
 	if err != nil {
@@ -205,11 +205,11 @@ func TestIntegration_NestedUntrackedFileSearchable(t *testing.T) {
 }
 
 // ===========================================================================
-// EDGE CASES — boundary conditions and unusual-but-valid states
+// EDGE CASES: boundary conditions and unusual but valid states
 // ===========================================================================
 
-// TestParseGitStatusV2_TrailingGarbageAfterLastNul verifies that content
-// after the last NUL byte (no final NUL terminator) is safely ignored.
+// TestParseGitStatusV2_TrailingGarbageAfterLastNul verifies that the parser
+// ignores the content after the last NUL byte (no final NUL terminator).
 func TestParseGitStatusV2_TrailingGarbageAfterLastNul(t *testing.T) {
 	raw := "# branch.oid abc123\x00? file.go\x00trailing garbage without nul"
 	state := parseGitStatusV2(raw)
@@ -223,8 +223,8 @@ func TestParseGitStatusV2_TrailingGarbageAfterLastNul(t *testing.T) {
 	}
 }
 
-// TestParseGitStatusV2_ConsecutiveNulBytes verifies empty records between
-// NUL bytes are skipped (len < 2).
+// TestParseGitStatusV2_ConsecutiveNulBytes verifies that an empty record
+// between NUL bytes (len < 2) adds no file.
 func TestParseGitStatusV2_ConsecutiveNulBytes(t *testing.T) {
 	raw := "# branch.oid abc\x00\x00\x00? file.go\x00\x00"
 	state := parseGitStatusV2(raw)
@@ -237,8 +237,8 @@ func TestParseGitStatusV2_ConsecutiveNulBytes(t *testing.T) {
 	}
 }
 
-// TestParseGitStatusV2_PathWithSpacesAndUnicode verifies real-world
-// Unicode filenames are preserved through parsing.
+// TestParseGitStatusV2_PathWithSpacesAndUnicode verifies that the parser
+// keeps paths with spaces and Unicode characters unchanged.
 func TestParseGitStatusV2_PathWithSpacesAndUnicode(t *testing.T) {
 	paths := []string{
 		"dir with spaces/file name.go",
@@ -257,8 +257,8 @@ func TestParseGitStatusV2_PathWithSpacesAndUnicode(t *testing.T) {
 	}
 }
 
-// TestExtractV2Path_TooFewFields verifies that when entry has fewer fields
-// than skipFields, empty string is returned (not a panic).
+// TestExtractV2Path_TooFewFields verifies that extractV2Path returns "", with
+// no panic, when entry has fewer fields than skipFields.
 func TestExtractV2Path_TooFewFields(t *testing.T) {
 	cases := []struct {
 		entry      string
@@ -315,22 +315,28 @@ func TestRepoStateFingerprint_AllFilesDeleted(t *testing.T) {
 	}
 }
 
-// TestStateFile_CorruptContent verifies that a corrupted state file
-// (non-hex content) is treated as a cache miss (different from any valid hash).
+// TestStateFile_CorruptContent verifies that a corrupt state file (not hex)
+// is a cache miss. The next freshness check builds again and writes the valid
+// state back.
 func TestStateFile_CorruptContent(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, stateFile), []byte("CORRUPT!@#$%"), 0o644); err != nil {
+	requireTools(t)
+	dir := initGitRepo(t, "app.go", "package main\n// corrupt_state_marker\n")
+	paths, plan := planGitTestCorpus(t, dir)
+	if _, err := ensureGitCorpusFresh(t.Context(), plan, paths); err != nil {
 		t.Fatal(err)
 	}
-	cached := readStateFile(dir)
-	// Corrupt content is read as-is (trimmed); it simply won't match any valid hash
-	if cached == "" {
-		t.Error("expected non-empty read of corrupt state file")
+	valid := readStateFile(plan.cacheDir)
+	if valid == "" {
+		t.Fatal("the first build wrote no state")
 	}
-	// Verify it doesn't match a real hash
-	realHash := computeStateHash("anything")
-	if cached == realHash {
-		t.Error("corrupt state file should not match a valid hash")
+	if err := os.WriteFile(filepath.Join(plan.cacheDir, stateFile), []byte("CORRUPT!@#$%"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureGitCorpusFresh(t.Context(), plan, paths); err != nil {
+		t.Fatal(err)
+	}
+	if got := readStateFile(plan.cacheDir); got != valid {
+		t.Fatalf("state after a corrupt record=%q, want the rebuilt state %q", got, valid)
 	}
 }
 
@@ -340,7 +346,7 @@ func TestStateFile_PartialWrite(t *testing.T) {
 	dir := t.TempDir()
 
 	// Write only the tmp file (simulating crash before rename)
-	if err := os.WriteFile(filepath.Join(dir, stateTmpFile), []byte("partial"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, ".state.tmp"), []byte("partial"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -352,57 +358,38 @@ func TestStateFile_PartialWrite(t *testing.T) {
 
 	// deleteStateFiles should clean up the orphan
 	deleteStateFiles(dir)
-	if _, err := os.Stat(filepath.Join(dir, stateTmpFile)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dir, ".state.tmp")); !os.IsNotExist(err) {
 		t.Error("expected .state.tmp to be deleted")
 	}
 }
 
-// TestStreamFiles_FIFOSkipped verifies that FIFO (named pipe) files
-// are skipped without blocking or error.
-func TestStreamFiles_FIFOSkipped(t *testing.T) {
+// TestStreamDirtyFiles_FIFOSkipped verifies that the reader skips a FIFO
+// (named pipe) with no block and no error. It sends no document for the FIFO,
+// not even its name. It reads the regular file beside it.
+func TestStreamDirtyFiles_FIFOSkipped(t *testing.T) {
 	dir := t.TempDir()
-
-	// Create a regular file alongside
 	if err := os.WriteFile(filepath.Join(dir, "regular.go"), []byte("package main\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	// Create a FIFO — collectStreamFilesForTest should not block on it.
-	// Lstat returns ModeNamedPipe which is not ModeDir or ModeSymlink,
-	// so it passes the type check. But ReadFile on a FIFO blocks.
-	// This test documents whether the current code handles this.
+	// The lstat of the reader (dirtyLstat) gives the FIFO type, so the reader
+	// skips the FIFO before any open: only a regular file passes. A plain open
+	// of a FIFO with no writer blocks, so a reader that opens it stops the test
+	// at the go test timeout.
 	fifoPath := filepath.Join(dir, "fifo")
-	cmd := exec.Command("mkfifo", fifoPath)
-	if err := cmd.Run(); err != nil {
-		t.Skipf("mkfifo not available: %v", err)
+	if err := syscall.Mkfifo(fifoPath, 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	// Use a timeout to detect if collectStreamFilesForTest blocks on FIFO
-	done := make(chan []fileContent, 1)
-	go func() {
-		done <- collectStreamFilesForTest(t.Context(), dir, []string{"regular.go", "fifo"}, 2)
-	}()
-
-	select {
-	case results := <-done:
-		// Should have at least the regular file
-		found := false
-		for _, r := range results {
-			if r.name == "regular.go" {
-				found = true
-			}
-		}
-		if !found {
-			t.Error("expected regular.go in results")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("collectStreamFilesForTest blocked — likely stuck reading FIFO")
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"regular.go", "fifo"}, 2)
+	if len(results) != 1 || results[0].name != "regular.go" || string(results[0].content) != "package main\n" {
+		t.Fatalf("results=%+v, want regular.go with its content only", results)
 	}
 }
 
-// TestStreamFiles_HardlinkContent verifies hardlinked files
+// TestStreamDirtyFiles_HardlinkContent verifies hardlinked files
 // are read correctly (content matches, different paths).
-func TestStreamFiles_HardlinkContent(t *testing.T) {
+func TestStreamDirtyFiles_HardlinkContent(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "source.go")
 	link := filepath.Join(dir, "hardlink.go")
@@ -411,10 +398,10 @@ func TestStreamFiles_HardlinkContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Link(src, link); err != nil {
-		t.Skipf("hardlinks not supported: %v", err)
+		t.Fatal(err)
 	}
 
-	results := collectStreamFilesForTest(t.Context(), dir, []string{"source.go", "hardlink.go"}, 2)
+	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"source.go", "hardlink.go"}, 2)
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results for hardlinked files, got %d", len(results))
 	}
@@ -425,9 +412,10 @@ func TestStreamFiles_HardlinkContent(t *testing.T) {
 	}
 }
 
-// TestRepoStateFingerprint_HardlinkSameInode verifies that hardlinked files
-// have the same inode in the fingerprint (expected behavior — they ARE the
-// same file at the filesystem level).
+// TestRepoStateFingerprint_HardlinkSameInode fingerprints two hard links to
+// one file. The links share an inode, but each path name goes into the
+// fingerprint. Each link alone gives its own fingerprint, and the two links
+// together give a third.
 func TestRepoStateFingerprint_HardlinkSameInode(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "a.go")
@@ -437,7 +425,7 @@ func TestRepoStateFingerprint_HardlinkSameInode(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Link(src, link); err != nil {
-		t.Skipf("hardlinks not supported: %v", err)
+		t.Fatal(err)
 	}
 
 	state := repoState{
@@ -456,7 +444,7 @@ func TestRepoStateFingerprint_HardlinkSameInode(t *testing.T) {
 }
 
 // ===========================================================================
-// WEIRD CASES — unusual but possible states
+// WEIRD CASES: unusual but possible states
 // ===========================================================================
 
 // TestIntegration_GitignoredFileNotIndexed verifies that .gitignore'd files
@@ -470,8 +458,8 @@ func TestIntegration_GitignoredFileNotIndexed(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("ignored/\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, dir, "add", ".gitignore")
-	gitRun(t, dir, "commit", "-m", "add gitignore")
+	gitRunIn(t, dir, "add", ".gitignore")
+	gitRunIn(t, dir, "commit", "-m", "add gitignore")
 
 	// Create ignored file
 	if err := os.MkdirAll(filepath.Join(dir, "ignored"), 0o755); err != nil {
@@ -501,8 +489,8 @@ func TestIntegration_EmptyFileCommittedAndUncommitted(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "empty.go"), []byte(""), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, dir, "add", "empty.go")
-	gitRun(t, dir, "commit", "-m", "add empty file")
+	gitRunIn(t, dir, "add", "empty.go")
+	gitRunIn(t, dir, "commit", "-m", "add empty file")
 
 	// Create empty untracked file
 	if err := os.WriteFile(filepath.Join(dir, "empty_new.go"), []byte(""), 0o644); err != nil {
@@ -519,14 +507,15 @@ func TestIntegration_EmptyFileCommittedAndUncommitted(t *testing.T) {
 	}
 }
 
-// TestIntegration_BinaryFileDoesNotCorruptIndex verifies that binary files
-// (with NUL bytes, random data) don't corrupt the index or cause panics.
+// TestIntegration_BinaryFileDoesNotCorruptIndex verifies that an untracked
+// binary file (every byte value, NUL included) does not stop the search of a
+// text file.
 func TestIntegration_BinaryFileDoesNotCorruptIndex(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// binary_test_marker\n")
 
-	// Create a binary file with NUL bytes and random-ish data
+	// 4 KiB that hold each byte value 16 times.
 	binary := make([]byte, 4096)
 	for i := range binary {
 		binary[i] = byte(i % 256)
@@ -535,7 +524,6 @@ func TestIntegration_BinaryFileDoesNotCorruptIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Should not crash or corrupt
 	files, err := runSeekInRepo(t, dir, "binary_test_marker")
 	if err != nil {
 		t.Fatalf("search failed with binary file present: %v", err)
@@ -551,39 +539,49 @@ func TestIntegration_MergeConflictState(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// base_content\n")
-	defaultBranch := gitCurrentBranch(t, dir)
+	defaultBranch := gitOutputIn(t, dir, "symbolic-ref", "--quiet", "--short", "HEAD")
 
 	// Create a branch with a conflicting change
-	gitRun(t, dir, "checkout", "-b", "conflict-branch")
+	gitRunIn(t, dir, "checkout", "-b", "conflict-branch")
 	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// conflict_branch_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, dir, "add", "app.go")
-	gitRun(t, dir, "commit", "-m", "branch change")
+	gitRunIn(t, dir, "add", "app.go")
+	gitRunIn(t, dir, "commit", "-m", "branch change")
 
 	// Go back and make a conflicting change on the default branch
-	gitRun(t, dir, "checkout", defaultBranch)
+	gitRunIn(t, dir, "checkout", defaultBranch)
 	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// master_conflict_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, dir, "add", "app.go")
-	gitRun(t, dir, "commit", "-m", "default branch change")
+	gitRunIn(t, dir, "add", "app.go")
+	gitRunIn(t, dir, "commit", "-m", "default branch change")
 
-	// Attempt merge — will conflict
+	// Try a merge. It conflicts.
 	cmd := exec.Command("git", "merge", "conflict-branch")
 	cmd.Dir = dir
 	_ = cmd.Run() // ignore error, conflict is expected
+	// Real Git output is the oracle: app.go is an unmerged ("u") entry.
+	if status := gitOutputIn(t, dir, "status", "--porcelain=v2", "-z"); !strings.HasPrefix(status, "u UU ") {
+		t.Fatalf("merge left no unmerged entry: %q", status)
+	}
 
-	// Seek should still work during merge conflict — should not crash
-	_, err := runSeekInRepo(t, dir, "conflict")
+	// The work-tree app.go holds both sides between conflict markers. Only
+	// the work-tree copy holds the branch side: HEAD holds the default
+	// branch side.
+	files, err := runSeekInRepo(t, dir, "conflict_branch_marker")
 	if err != nil {
 		t.Fatalf("search during merge conflict should not error: %v", err)
 	}
+	if len(files) != 1 || files[0] != "app.go" {
+		t.Fatalf("files=%q, want the unmerged work-tree app.go", files)
+	}
 }
 
-// TestIntegration_SubmoduleDirtySkipped verifies that a dirty submodule
-// (which appears as a directory in git status) is skipped by
-// collectStreamFilesForTest without error.
+// TestIntegration_SubmoduleDirtySkipped verifies that a submodule with an
+// untracked file does not stop a search of the host repository. Git status
+// (--ignore-submodules=dirty) does not list the submodule, so the host's
+// dirty-file reader never meets it.
 func TestIntegration_SubmoduleDirtySkipped(t *testing.T) {
 	requireTools(t)
 
@@ -609,15 +607,15 @@ func TestIntegration_SubmoduleDirtySkipped(t *testing.T) {
 	gitRunIn(t, subSrc, "commit", "-m", "sub initial")
 
 	// Allow local file transport and add submodule
-	gitRun(t, dir, "-c", "protocol.file.allow=always", "submodule", "add", subSrc, "mysub")
-	gitRun(t, dir, "commit", "-m", "add submodule")
+	gitRunIn(t, dir, "-c", "protocol.file.allow=always", "submodule", "add", subSrc, "mysub")
+	gitRunIn(t, dir, "commit", "-m", "add submodule")
 
 	// Make the submodule dirty
 	if err := os.WriteFile(filepath.Join(dir, "mysub", "dirty.go"), []byte("package sub\n// dirty\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	// Seek should work — dirty submodule directory should be skipped
+	// The dirty submodule is its own node: the host search must not fail on it.
 	files, err := runSeekInRepo(t, dir, "submodule_host_marker")
 	if err != nil {
 		t.Fatalf("search with dirty submodule failed: %v", err)
@@ -627,8 +625,8 @@ func TestIntegration_SubmoduleDirtySkipped(t *testing.T) {
 	}
 }
 
-// TestGitRepoState_CancelledContext verifies that cancellation is not hidden as
-// an empty repository state.
+// TestGitRepoState_CancelledContext verifies that gitRepoStateIn returns the
+// cancellation, not an empty repository state.
 func TestGitRepoState_CancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -640,11 +638,11 @@ func TestGitRepoState_CancelledContext(t *testing.T) {
 }
 
 // ===========================================================================
-// OUT OF BOUNDS — stress, limits, and adversarial inputs
+// OUT OF BOUNDS: stress, limits, and adversarial inputs
 // ===========================================================================
 
-// TestParseGitStatusV2_MassiveFileList verifies parsing with thousands
-// of entries doesn't degrade or panic.
+// TestParseGitStatusV2_MassiveFileList verifies that the parser keeps each of
+// 10,000 changed entries.
 func TestParseGitStatusV2_MassiveFileList(t *testing.T) {
 	var raw strings.Builder
 	raw.WriteString("# branch.oid abc123\x00")
@@ -661,9 +659,9 @@ func TestParseGitStatusV2_MassiveFileList(t *testing.T) {
 	}
 }
 
-// TestRepoStateFingerprint_ManyDeletedFiles verifies fingerprinting with
-// a large number of deleted files (all hitting the error path) is fast
-// and correct.
+// TestRepoStateFingerprint_ManyDeletedFiles fingerprints 1,000 deleted files,
+// so each Lstat fails: the files change the fingerprint, and two calls give
+// the same fingerprint.
 func TestRepoStateFingerprint_ManyDeletedFiles(t *testing.T) {
 	dir := t.TempDir()
 	files := make([]string, 1000)
@@ -675,24 +673,18 @@ func TestRepoStateFingerprint_ManyDeletedFiles(t *testing.T) {
 		Files:     files,
 	}
 
-	start := time.Now()
 	fp := repoStateFingerprint(dir, state)
-	elapsed := time.Since(start)
-
 	if fp == state.RawOutput {
 		t.Fatal("expected deleted files to affect fingerprint")
 	}
 	if fp != repoStateFingerprint(dir, state) {
 		t.Fatal("expected many-deleted-files fingerprint to be deterministic")
 	}
-	// Should be fast (< 100ms for 1000 Lstats on non-existent files)
-	if elapsed > 500*time.Millisecond {
-		t.Errorf("fingerprinting 1000 deleted files took %v (expected < 500ms)", elapsed)
-	}
 }
 
-// TestComputeStateHash_CollisionResistance verifies that similar inputs
-// produce different hashes (not a crypto guarantee, but a sanity check).
+// TestComputeStateHash_CollisionResistance verifies that 10,000 similar inputs
+// give 10,000 different hashes. This is a basic check, not a cryptographic
+// guarantee.
 func TestComputeStateHash_CollisionResistance(t *testing.T) {
 	hashes := make(map[string]string)
 	for i := range 10_000 {
@@ -705,9 +697,9 @@ func TestComputeStateHash_CollisionResistance(t *testing.T) {
 	}
 }
 
-// TestStreamFiles_HighConcurrency verifies that reading many
+// TestStreamDirtyFiles_HighConcurrency verifies that reading many
 // files with high parallelism doesn't miss or duplicate results.
-func TestStreamFiles_HighConcurrency(t *testing.T) {
+func TestStreamDirtyFiles_HighConcurrency(t *testing.T) {
 	dir := t.TempDir()
 	const numFiles = 500
 	for i := range numFiles {
@@ -722,7 +714,7 @@ func TestStreamFiles_HighConcurrency(t *testing.T) {
 		files[i] = fmt.Sprintf("file_%03d.go", i)
 	}
 
-	results := collectStreamFilesForTest(t.Context(), dir, files, 16)
+	results := collectStreamFilesForTest(t, t.Context(), dir, files, 16)
 	if len(results) != numFiles {
 		t.Errorf("expected %d results, got %d", numFiles, len(results))
 	}
@@ -737,10 +729,13 @@ func TestStreamFiles_HighConcurrency(t *testing.T) {
 	}
 }
 
-// TestStreamFiles_RacyDeletion simulates files being deleted
-// between git status and collectStreamFilesForTest (TOCTOU). Some files
-// should be read, deleted ones should be silently skipped.
-func TestStreamFiles_RacyDeletion(t *testing.T) {
+// TestStreamDirtyFiles_RacyDeletion deletes the 50 even-numbered files of 100
+// while the reader reads them, as a file can go between git status and the
+// read. The reader reads each of the 50 files that stay. A deleted file gives
+// no document, or its content when the read came first, and no error.
+// TestStreamDirtyFiles_MixedValidAndInvalid checks a file that is gone before
+// the read starts.
+func TestStreamDirtyFiles_RacyDeletion(t *testing.T) {
 	dir := t.TempDir()
 	const numFiles = 100
 	fileNames := make([]string, numFiles)
@@ -754,70 +749,62 @@ func TestStreamFiles_RacyDeletion(t *testing.T) {
 
 	// Delete half the files concurrently while reading
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for i := 0; i < numFiles; i += 2 {
 			_ = os.Remove(filepath.Join(dir, fileNames[i]))
 		}
-	}()
+	})
 
-	results := collectStreamFilesForTest(t.Context(), dir, fileNames, 4)
+	results := collectStreamFilesForTest(t, t.Context(), dir, fileNames, 4)
 	wg.Wait()
 
-	// Should not panic; should have between 50 and 100 results depending on timing
-	if len(results) == 0 {
-		t.Error("expected at least some results despite concurrent deletion")
+	// collectStreamFilesForTest fails the test on a read error.
+	read := make(map[string]bool, len(results))
+	for _, r := range results {
+		if read[r.name] || string(r.content) != "content" {
+			t.Fatalf("result %s: duplicate=%t content=%q skip=%v, want one result with the file content", r.name, read[r.name], r.content, r.skipReason)
+		}
+		read[r.name] = true
 	}
-	if len(results) > numFiles {
-		t.Errorf("more results than files: %d > %d", len(results), numFiles)
+	for i := 1; i < numFiles; i += 2 {
+		if !read[fileNames[i]] {
+			t.Errorf("%s was never deleted but has no result", fileNames[i])
+		}
 	}
 }
 
 // TestAcquireBuildLock_ContextCancellation verifies that build-lock acquisition
 // respects context cancellation during the polling loop (cold path, no shards).
+// At the debug line of the wait, the test cancels the context. The test keeps
+// the lock until it ends, so the wait can end only through the context.
 func TestAcquireBuildLock_ContextCancellation(t *testing.T) {
 	dir := t.TempDir()
 	indexDir := filepath.Join(dir, "index")
 
 	// Hold the build lock so a second acquire must poll.
-	holder, err := os.OpenFile(filepath.Join(dir, buildLockFile), os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		unlockFile(holder)
-		_ = holder.Close()
-	}()
-	if err := lockFileExclusive(holder); err != nil {
-		t.Fatal(err)
-	}
+	holdBuildLock(t, dir)
 
-	// No shards — acquireBuildLock will poll (not skip).
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	// No shards exist, so acquireBuildLock polls (it does not skip).
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
+	_, waiting := captureTestLogsWithSignal(t, slog.LevelWarn, lockWaitBuild, filepath.Join(dir, buildLockFile))
+	acted := onLockWait(t, waiting, func() error { return nil }, cancel)
 
-	start := time.Now()
-	_, acquired, err := acquireBuildLock(ctx, dir, indexDir)
-	elapsed := time.Since(start)
-
+	_, acquired, err := corpusStore{cacheDir: dir, indexDir: indexDir}.acquireBuildLock(ctx)
+	lockWaitActed(t, acted)
 	if acquired {
 		t.Error("should not have acquired build lock while held")
 	}
-	if err == nil {
-		t.Error("expected error on timeout")
-	}
-	// Should respect the 200ms context timeout, not wait the full 60s
-	if elapsed > 2*time.Second {
-		t.Errorf("took %v to timeout, expected ~200ms", elapsed)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err=%v, want context.Canceled", err)
 	}
 }
 
-// TestIntegration_VeryLargeUncommittedFile verifies that other files are still
-// indexed when an uncommitted file exceeds testDocumentContentLimit; that file
-// is indexed by name only.
+// TestIntegration_VeryLargeUncommittedFile verifies that Seek still indexes
+// the other files when an uncommitted file exceeds testDocumentContentLimit.
+// It indexes that file by name only.
 func TestIntegration_VeryLargeUncommittedFile(t *testing.T) {
-	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
+	swapForTest(t, &documentContentLimit, testDocumentContentLimit)
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// normal_content_marker\n")
@@ -844,40 +831,47 @@ func TestIntegration_VeryLargeUncommittedFile(t *testing.T) {
 	if len(files) == 0 {
 		t.Fatal("expected match for small file when large file is present")
 	}
+	// The search finds the large file by its name and not by its content.
+	named, err := seek(t, "--lexical-only", "file:huge.dat", dir)
+	if err != nil || !strings.Contains(named, "huge.dat") {
+		t.Fatalf("the large file is not found by name: err=%v\n%s", err, named)
+	}
+	content, err := seek(t, "--lexical-only", strings.Repeat("x", 32), dir)
+	if err != nil && !errors.Is(err, errNoMatch) || strings.Contains(content, "huge.dat") {
+		t.Fatalf("the content of the large file is indexed: err=%v\n%s", err, content)
+	}
 }
 
-// TestPlannedGitCorpus_ConcurrentSearches exercises concurrent planned-corpus
-// searches against the same cache/index. It intentionally stays below the CLI
-// boundary because run/captureStdout/cwd changes are process-global.
-func TestPlannedGitCorpus_ConcurrentSearches(t *testing.T) {
+// TestCLIProcess_ConcurrentColdGitSearches starts eight search processes of one
+// cold repository with one cache at the same time. One process builds, each
+// other one waits for that build (acquireBuildLock), and each one prints the
+// match. In one process, the build slots order the builds before the build
+// lock does, so the test uses processes.
+func TestCLIProcess_ConcurrentColdGitSearches(t *testing.T) {
 	requireTools(t)
-
 	dir := initGitRepo(t, "app.go", "package main\n// concurrent_seek_marker\n")
-	paths, plan := planGitTestCorpus(t, dir)
+	cacheDir := t.TempDir()
 
-	const goroutines = 8
-	var wg sync.WaitGroup
-	errors := make(chan error, goroutines)
-
-	for range goroutines {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			files, err := runSeekInPlannedGitCorpus(context.Background(), "concurrent_seek_marker", paths, plan)
-			if err != nil {
-				errors <- err
-				return
-			}
-			if len(files) == 0 {
-				errors <- fmt.Errorf("no results found")
-			}
-		}()
+	type run struct {
+		stdout, stderr string
+		err            error
 	}
-
+	runs := make([]run, 8)
+	var wg sync.WaitGroup
+	for i := range runs {
+		wg.Go(func() {
+			cmd := cliProcessCommand(t.Context(), cacheDir, dir, []string{"--lexical-only", "concurrent_seek_marker"}, nil)
+			var stdout, stderr strings.Builder
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			err := cmd.Run()
+			runs[i] = run{stdout: stdout.String(), stderr: stderr.String(), err: err}
+		})
+	}
 	wg.Wait()
-	close(errors)
-	for err := range errors {
-		t.Errorf("concurrent seek failed: %v", err)
+	for i, r := range runs {
+		if code := cliProcessExitCode(t, r.err); code != 0 || !strings.Contains(r.stdout, "## app.go") {
+			t.Errorf("process %d: exit=%d stdout=%q stderr=%q, want exit 0 and app.go", i, code, r.stdout, r.stderr)
+		}
 	}
 }
 
@@ -913,7 +907,7 @@ func TestParseGitStatusV2_PathWithNewlineInName(t *testing.T) {
 }
 
 // ===========================================================================
-// GIT CONFIG INFLUENCE — user config that changes git status output
+// GIT CONFIG INFLUENCE: user config that changes git status output
 // ===========================================================================
 
 // TestIntegration_CoreQuotePath verifies that core.quotePath=true doesn't
@@ -924,7 +918,7 @@ func TestIntegration_CoreQuotePath(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// base\n")
-	gitRun(t, dir, "config", "core.quotePath", "true")
+	gitRunIn(t, dir, "config", "core.quotePath", "true")
 
 	// Create file with non-ASCII name
 	if err := os.WriteFile(filepath.Join(dir, "données.go"), []byte("package main\n// quotepath_marker\n"), 0o644); err != nil {
@@ -940,13 +934,13 @@ func TestIntegration_CoreQuotePath(t *testing.T) {
 	}
 }
 
-// TestIntegration_StatusShowUntrackedFilesNo verifies seek's explicit
-// untracked-file mode is not weakened by user Git status configuration.
+// TestIntegration_StatusShowUntrackedFilesNo verifies that a user Git status
+// setting does not weaken the explicit untracked-file mode of seek.
 func TestIntegration_StatusShowUntrackedFilesNo(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// committed_marker\n")
-	gitRun(t, dir, "config", "status.showUntrackedFiles", "no")
+	gitRunIn(t, dir, "config", "status.showUntrackedFiles", "no")
 
 	// Create untracked file
 	if err := os.WriteFile(filepath.Join(dir, "untracked.go"), []byte("package main\n// invisible_untracked_marker\n"), 0o644); err != nil {
@@ -966,7 +960,7 @@ func TestIntegration_StatusShowUntrackedFilesNoNestedFileSearchable(t *testing.T
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// committed_marker\n")
-	gitRun(t, dir, "config", "status.showUntrackedFiles", "no")
+	gitRunIn(t, dir, "config", "status.showUntrackedFiles", "no")
 
 	nested := filepath.Join(dir, "a", "b", "c")
 	if err := os.MkdirAll(nested, 0o755); err != nil {

@@ -7,29 +7,36 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
+	"testing/synctest"
 
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/query"
 )
 
+// cancellationTestModel is the test model that fails at one stage. Its test
+// also fails the build (embedErr errRerankUnavailable), so no vector exists
+// and only strict hits can print. With failureStage "prepare", each query
+// preparation returns the error of fail. Else the preparation succeeds, and
+// each score call returns that error. fail can cancel the command, so a test
+// can cancel inside the model call.
+// A test with it proves the route after a model failure. An ordinary error
+// gives the strict fallback. A cancelled command gives no output and the
+// cancellation. It cannot prove that a cancellation stops a real model call in
+// time, or anything about vectors, meaning or rank.
 type cancellationTestModel struct {
-	fixedRerankScorer
+	hybridTestScorer
 	failureStage string
 	fail         func() error
-	prepareCalls atomic.Int32
-	closeCalls   atomic.Int32
 }
 
 func (model *cancellationTestModel) PrepareSemanticQuery(
 	ctx context.Context,
 	text string,
 ) (*semanticQueryEmbedding, error) {
-	model.prepareCalls.Add(1)
 	if model.failureStage == "prepare" {
 		return nil, model.fail()
 	}
-	return model.fixedRerankScorer.PrepareSemanticQuery(ctx, text)
+	return model.hybridTestScorer.PrepareSemanticQuery(ctx, text)
 }
 
 func (model *cancellationTestModel) ScoresWithSemanticQuery(
@@ -37,15 +44,13 @@ func (model *cancellationTestModel) ScoresWithSemanticQuery(
 	*semanticQueryEmbedding,
 	[]rerankDocument,
 ) ([]float32, error) {
-	model.scoreCalls.Add(1)
 	return nil, model.fail()
 }
 
-func (model *cancellationTestModel) Close() error {
-	model.closeCalls.Add(1)
-	return nil
-}
-
+// TestRunSearchCommandLexicalModelCancellation fails the model in query
+// preparation or in scoring, with an ordinary error or with a cancellation of
+// the command. An ordinary error prints the strict lexical result. A
+// cancellation prints nothing and returns context.Canceled.
 func TestRunSearchCommandLexicalModelCancellation(t *testing.T) {
 	for _, stage := range []string{"prepare", "score"} {
 		for _, cancelled := range []bool{false, true} {
@@ -60,20 +65,15 @@ func TestRunSearchCommandLexicalModelCancellation(t *testing.T) {
 				strict, relaxed := t.TempDir(), t.TempDir()
 				writeFileAt(t, strict, "strict.go", "package sample\n// alpha beta\n")
 				writeFileAt(t, relaxed, "relaxed.go", "package sample\n// alpha only\n")
-				paths := []string{strict, relaxed}
-				run := func(ctx context.Context, config searchRunConfig) (string, error) {
-					return captureStdout(t, func() error {
-						return runSearchCommand(ctx, "alpha beta", paths, 0, 0, defaultSearchConfig(), config)
-					})
-				}
-				baseline, err := run(t.Context(), searchRunConfig{})
+				baseline, err := seek(t, "--lexical-only", "alpha beta", strict, relaxed)
 				if err != nil || !strings.Contains(baseline, "strict.go") || strings.Contains(baseline, "relaxed.go") {
 					t.Fatalf("strict baseline: output=%q error=%v", baseline, err)
 				}
 
 				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
-				model := &cancellationTestModel{
+				model := observeModel(&cancellationTestModel{
+					embedErr:     errRerankUnavailable,
 					failureStage: stage,
 					fail: func() error {
 						if cancelled {
@@ -81,16 +81,13 @@ func TestRunSearchCommandLexicalModelCancellation(t *testing.T) {
 						}
 						return errors.New("fake model failure")
 					},
-				}
-				output, err := run(ctx, searchRunConfig{
-					policy: defaultSearchPolicy(),
-					newModel: func(context.Context) (semanticModel, error) {
-						return model, nil
-					},
 				})
-				// The output shows the route: a cancelled command prints nothing and
-				// returns the cancellation; an ordinary model failure falls back to
-				// the strict lexical result.
+				output, err := captureStdout(t, func() error {
+					return seekRoot(ctx, t, model.factory(), "alpha beta", strict, relaxed)
+				})
+				// The output shows the route: a cancelled command prints
+				// nothing and returns the cancellation; an ordinary model
+				// failure falls back to the strict lexical result.
 				if cancelled {
 					if !errors.Is(err, context.Canceled) || output != "" {
 						t.Errorf("cancelled command: output=%q error=%v, want no output and cancellation", output, err)
@@ -102,15 +99,17 @@ func TestRunSearchCommandLexicalModelCancellation(t *testing.T) {
 				if stage == "score" {
 					wantScores = 1
 				}
-				if model.prepareCalls.Load() != 1 || model.scoreCalls.Load() != wantScores || model.closeCalls.Load() != 1 {
+				if model.prepares.Load() != 1 || model.scores.Load() != wantScores || model.closes.Load() != 1 {
 					t.Errorf("model calls: prepare=%d score=%d close=%d, want 1/%d/1",
-						model.prepareCalls.Load(), model.scoreCalls.Load(), model.closeCalls.Load(), wantScores)
+						model.prepares.Load(), model.scores.Load(), model.closes.Load(), wantScores)
 				}
 			})
 		}
 	}
 }
 
+// cancellationTestShard is a Zoekt shard whose Search runs search and that
+// counts its Close calls.
 type cancellationTestShard struct {
 	zoekt.Searcher
 	search     func(context.Context) (*zoekt.SearchResult, error)
@@ -136,68 +135,63 @@ func TestSearchLoadedShardsRejectsCancelledPartialResult(t *testing.T) {
 		cancel()
 		return &zoekt.SearchResult{Files: []zoekt.FileMatch{{FileName: "partial.go"}}}, nil
 	}}
-	files, err := searchLoadedShards(ctx, []zoekt.Searcher{shard}, &query.Const{Value: true}, defaultSearchConfig())
+	files, err := searchLoadedShards(ctx, []zoekt.Searcher{shard}, &query.Const{Value: true}, defaultSearchConfig(), nil)
 	if !errors.Is(err, context.Canceled) || len(files) != 0 {
 		t.Errorf("cancelled shard: files=%v error=%v, want no files and cancellation", files, err)
 	}
-	if shard.closeCalls.Load() != 1 {
-		t.Errorf("close calls=%d, want 1", shard.closeCalls.Load())
+	if shard.closeCalls.Load() != 0 {
+		t.Errorf("close calls=%d, want 0: the caller closes the shards", shard.closeCalls.Load())
 	}
 }
 
+// TestSearchLoadedShardsJoinsWorkersBeforeCancellation cancels the search in
+// one shard while another shard still runs. The test runs in a synctest
+// bubble, where synctest.Wait returns only when every other goroutine is
+// blocked. So when synctest.Wait returns, a search that does not wait for its
+// last worker has already returned.
 func TestSearchLoadedShardsJoinsWorkersBeforeCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	first := &cancellationTestShard{search: func(context.Context) (*zoekt.SearchResult, error) {
-		cancel()
-		return &zoekt.SearchResult{Files: []zoekt.FileMatch{{FileName: "first.go"}}}, nil
-	}}
-	started, release := make(chan struct{}), make(chan struct{})
-	var releaseOnce sync.Once
-	releaseWorker := func() { releaseOnce.Do(func() { close(release) }) }
-	t.Cleanup(releaseWorker)
-	second := &cancellationTestShard{search: func(context.Context) (*zoekt.SearchResult, error) {
-		close(started)
-		<-release
-		return &zoekt.SearchResult{Files: []zoekt.FileMatch{{FileName: "second.go"}}}, nil
-	}}
-	type result struct {
-		files []zoekt.FileMatch
-		err   error
-	}
-	done := make(chan result, 1)
-	go func() {
-		files, err := searchLoadedShards(ctx, []zoekt.Searcher{first, second}, &query.Const{Value: true}, defaultSearchConfig())
-		done <- result{files: files, err: err}
-	}()
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("second shard did not start")
-	}
-	select {
-	case <-ctx.Done():
-	case <-time.After(5 * time.Second):
-		t.Fatal("first shard did not cancel the search")
-	}
-	select {
-	case got := <-done:
-		t.Fatalf("search returned before the worker finished: %+v", got)
-	default:
-	}
-	if first.closeCalls.Load() != 0 || second.closeCalls.Load() != 0 {
-		t.Error("searchers closed before all workers finished")
-	}
-	releaseWorker()
-	select {
-	case got := <-done:
-		if !errors.Is(got.err, context.Canceled) || len(got.files) != 0 {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		first := &cancellationTestShard{search: func(context.Context) (*zoekt.SearchResult, error) {
+			cancel()
+			return &zoekt.SearchResult{Files: []zoekt.FileMatch{{FileName: "first.go"}}}, nil
+		}}
+		started, release := make(chan struct{}), make(chan struct{})
+		var releaseOnce sync.Once
+		releaseWorker := func() { releaseOnce.Do(func() { close(release) }) }
+		t.Cleanup(releaseWorker)
+		second := &cancellationTestShard{search: func(context.Context) (*zoekt.SearchResult, error) {
+			close(started)
+			<-release
+			return &zoekt.SearchResult{Files: []zoekt.FileMatch{{FileName: "second.go"}}}, nil
+		}}
+		type result struct {
+			files []zoekt.FileMatch
+			err   error
+		}
+		done := make(chan result, 1)
+		go func() {
+			files, err := searchLoadedShards(ctx, []zoekt.Searcher{first, second}, &query.Const{Value: true}, defaultSearchConfig(), nil)
+			done <- result{files: files, err: err}
+		}()
+		<-started
+		<-ctx.Done()
+		synctest.Wait()
+		select {
+		case got := <-done:
+			t.Fatalf("search returned before the worker finished: %+v", got)
+		default:
+		}
+		if first.closeCalls.Load() != 0 || second.closeCalls.Load() != 0 {
+			t.Error("searchers closed before all workers finished")
+		}
+		releaseWorker()
+		if got := <-done; !errors.Is(got.err, context.Canceled) || len(got.files) != 0 {
 			t.Errorf("cancelled shards: files=%v error=%v, want no files and cancellation", got.files, got.err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("search did not return after all workers finished")
-	}
-	if first.closeCalls.Load() != 1 || second.closeCalls.Load() != 1 {
-		t.Errorf("close calls=%d/%d, want 1/1", first.closeCalls.Load(), second.closeCalls.Load())
-	}
+		if first.closeCalls.Load() != 0 || second.closeCalls.Load() != 0 {
+			t.Errorf("close calls=%d/%d, want 0/0: the caller closes the shards", first.closeCalls.Load(), second.closeCalls.Load())
+		}
+	})
 }

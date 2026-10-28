@@ -9,10 +9,3 @@ var lateOnCompressedRuntime []byte
 
 //go:embed rerank_assets_linux_arm64/runtime.json
 var lateOnRuntimeManifestJSON []byte
-
-func lateOnRuntimeForPlatform() (lateOnRuntimeBundle, error) {
-	return lateOnRuntimeBundleFromManifest(
-		lateOnRuntimeManifestJSON,
-		lateOnCompressedRuntime,
-	)
-}

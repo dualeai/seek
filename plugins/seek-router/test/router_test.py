@@ -289,7 +289,7 @@ class RouterContractTest(unittest.TestCase):
         cls.temp_dir = tempfile.TemporaryDirectory()
         cls.bin_dir = pathlib.Path(cls.temp_dir.name)
         cls.seek_stub = cls.bin_dir / "seek"
-        cls._write_seek_stub("-A, --after-context\n-C, --context\n")
+        cls._write_seek_stub()
         cls.env = os.environ.copy()
         cls.env["PATH"] = f"{cls.bin_dir}{os.pathsep}{cls.env['PATH']}"
 
@@ -298,16 +298,9 @@ class RouterContractTest(unittest.TestCase):
         cls.temp_dir.cleanup()
 
     @classmethod
-    def _write_seek_stub(cls, help_text: str) -> None:
+    def _write_seek_stub(cls) -> None:
         cls.seek_stub.write_text(
             "#!/bin/sh\n"
-            'if [ -n "${SEEK_TEST_REQUIRED_CACHE:-}" ] '
-            '&& [ "${SEEK_CACHE_DIR:-}" != "$SEEK_TEST_REQUIRED_CACHE" ]; then\n'
-            "  exit 1\n"
-            "fi\n"
-            'if [ "${1:-}" = "--help" ]; then\n'
-            f"  printf '%s' {shlex.quote(help_text)}\n"
-            "fi\n"
             "exit 0\n",
             encoding="utf-8",
         )
@@ -397,17 +390,19 @@ class RouterContractTest(unittest.TestCase):
                     "20",
                     "-m",
                     "3",
-                    'case:yes type:file file:"Router"',
+                    'case:yes type:file file:"(^|/)[^/]*Router[^/]*$"',
                     "./cmd",
                 ],
             ),
             (
                 "fd 'Étage' .",
-                ["seek", "-n", "20", "-m", "3", 'case:no type:file file:"Étage"', "."],
+                ["seek", "-n", "20", "-m", "3", 'case:no type:file file:"(^|/)[^/]*Étage[^/]*$"', "."],
             ),
             (
-                "fd '\\Acargo' .",
-                ["seek", "-n", "20", "-m", "3", 'case:yes type:file file:"\\\\Acargo"', "."],
+                # A literal name stays inside the file name: the root text
+                # that the header holds does not match it.
+                "fd sub ./sub",
+                ["seek", "-n", "20", "-m", "3", 'case:no type:file file:"(^|/)[^/]*sub[^/]*$"', "./sub"],
             ),
             (
                 "grep -rl needle ./cmd | head -5",
@@ -518,16 +513,33 @@ class RouterContractTest(unittest.TestCase):
             ],
         )
 
-    def test_safe_pathless_forms_stay_in_current_directory(self) -> None:
+    def test_context_has_no_router_cap(self) -> None:
+        # Seek has no context cap, so the router keeps every context size that
+        # Seek reads (an int64), as decimal text.
         cases = {
-            "rg needle": ["."],
-            "git grep needle": ["."],
-            "fd needle": ["."],
+            "rg -C 513 needle file.go": "513",
+            "rg -C 007 needle file.go": "7",
+            "rg -A 9223372036854775807 needle file.go": "9223372036854775807",
         }
-        for command, suffix in cases.items():
+        for command, lines in cases.items():
             with self.subTest(command=command):
                 actual, _ = self.routed(command)
-                self.assertEqual(actual[-len(suffix) :], suffix)
+                self.assertEqual(actual[5:7], [command.split()[1], lines])
+        for command in [
+            "rg -C 9223372036854775808 needle file.go",
+            "rg -C 99999999999999999999 needle file.go",
+        ]:
+            with self.subTest(command=command):
+                self.assert_passthrough(command)
+
+    def test_safe_pathless_forms_stay_in_current_directory(self) -> None:
+        # Seek searches the current directory when it gets no path, so the
+        # rewrite adds none.
+        for command in ["rg needle", "git grep needle", "fd needle"]:
+            with self.subTest(command=command):
+                actual, _ = self.routed(command)
+                self.assertNotIn(".", actual)
+                self.assertIn("needle", actual[-1])
 
     def test_unsupported_shell_forms_pass_through(self) -> None:
         commands = [
@@ -562,13 +574,17 @@ class RouterContractTest(unittest.TestCase):
             "grep -rEF 'seek.router' README.md",
             "rg -P needle .",
             "rg --json needle .",
-            "rg -C 513 needle file.go",
             "rg -C 4 needle",
             "rg -l -C 4 needle file.go",
             "git grep 'foo|bar'",
             "git grep needle HEAD",
             "git grep needle -- ':*.go'",
             "fd -e go needle .",
+            # A regex pattern stays with fd: the router routes literal names.
+            "fd 'main.*go' ./mainpkg",
+            "fd '\\.go$' .",
+            "fd '^a|b$' ./sub",
+            "fd sub/x .",
             "find . ! -type f -name '*.go'",
             "find . -type f -name '*.go' -exec echo {} ';'",
         ]
@@ -598,33 +614,13 @@ class RouterContractTest(unittest.TestCase):
         )
         self.assertEqual(self.run_raw(payload, env), "")
 
-    def test_old_seek_only_blocks_context_routes(self) -> None:
-        self._write_seek_stub("seek help without context flags\n")
-        try:
-            self.assert_passthrough("rg -A 30 needle file.go")
-            commands = [
-                "rg -l needle .",
-                "rg -F 'foo -A bar' file.go",
-                "rg needle 'path -C segment'",
-            ]
-            for command in commands:
-                with self.subTest(command=command):
-                    actual, _ = self.routed(command)
-                    self.assertEqual(actual[0], "seek")
-        finally:
-            self._write_seek_stub("-A, --after-context\n-C, --context\n")
-
-    def test_context_probe_preserves_search_cache(self) -> None:
-        env = self.env.copy()
-        cache = str(self.bin_dir / "real-cache")
-        env["SEEK_CACHE_DIR"] = cache
-        env["SEEK_TEST_REQUIRED_CACHE"] = cache
-        actual, _ = self.routed("rg -A 5 needle file.go", env)
-        self.assertEqual(actual[0], "seek")
-
     def test_router_uses_its_documented_regex_and_case_contract(self) -> None:
+        # The router does not read a ripgrep configuration file. These flags
+        # would make each search case-insensitive and literal.
+        config = self.bin_dir / "rg-config"
+        config.write_text("--ignore-case\n--fixed-strings\n", encoding="utf-8")
         configured = self.env.copy()
-        configured["RIPGREP_CONFIG_PATH"] = str(self.bin_dir / "rg-config")
+        configured["RIPGREP_CONFIG_PATH"] = str(config)
         cases = {
             "rg '(?s)foo.*bar' .": 'case:yes content:"(?s)foo.*bar"',
             "rg 'caf\\w' .": 'case:yes content:"caf\\\\w"',

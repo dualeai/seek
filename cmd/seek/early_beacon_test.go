@@ -1,31 +1,25 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
-// TestEnsureFolderCorpusFresh_MultiWindowEarlyBeaconSurvives checks a windowed
-// index build. The first window is a full build and later windows are delta
-// builds. Each Zoekt Builder.Finish call can update prior sidecars.
-//
-// The first marker sorts into the first window. The last marker sorts into the
-// final window. Both must remain searchable after at least three windows.
-func TestEnsureFolderCorpusFresh_MultiWindowEarlyBeaconSurvives(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+// TestEnsureFolderCorpusFresh_MultiShardEarlyBeaconSurvives checks a build of
+// several shards whose content is larger than the read budget. The first
+// marker sorts into the first shard, and the last marker sorts into the final
+// shard. Both must remain searchable.
+func TestEnsureFolderCorpusFresh_MultiShardEarlyBeaconSurvives(t *testing.T) {
+	requireTools(t)
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
 	const testBudget int64 = 4 * 1024 * 1024 // 4 MiB
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
-	defer goroutineLeakGuard(t, 60*time.Second)()
+	defer goroutineLeakGuard(t)()
 
 	const earlyBeacon = "EARLY_BEACON_A_F00DCAFE"
 	const lateBeacon = "LATE_BEACON_Z_BAADBEEF"
@@ -35,8 +29,9 @@ func TestEnsureFolderCorpusFresh_MultiWindowEarlyBeaconSurvives(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "a_early.txt"), []byte(earlyBeacon+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Middle payload: force >= 3 windows. With testBudget=4 MiB →
-	// indexWindowBytes=2 MiB. ~12 MiB of payload across many files.
+	// The middle payload is 12 MiB in 256 KiB files. That is three times the
+	// test budget and more than the 10 MiB shardMax, so the build makes two or
+	// more shards.
 	const fileSize int64 = 256 * 1024
 	const totalPayload int64 = 12 * 1024 * 1024
 	written := int64(0)
@@ -57,22 +52,20 @@ func TestEnsureFolderCorpusFresh_MultiWindowEarlyBeaconSurvives(t *testing.T) {
 	}
 
 	plan := planSynthCorpus(t, root)
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
+	ctx := t.Context()
 
 	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 		t.Fatalf("ensureFolderCorpusFresh: %v", err)
 	}
-	// Sanity: fixture must produce multiple shards (windows). Single
-	// shard would mean the rotation path didn't fire and the test
-	// asserts nothing about cross-window survival.
+	// The fixture must make two or more shards. With one shard, the test
+	// proves nothing about the shards that follow the first.
 	if n := repositoryShardCount(plan.indexDir, folderRepoName(plan)); n < 2 {
-		t.Fatalf("expected >= 2 shards (rotation didn't fire), got %d", n)
+		t.Fatalf("expected >= 2 shards, got %d", n)
 	}
 
-	// Both beacons must be findable. The early beacon proves window 0's
-	// content was not corrupted by subsequent IsDelta=true Finish .meta
-	// rewrites; the late beacon proves the final window flushed.
+	// The search must find both beacons. The early beacon proves that the
+	// later shards left the first shard searchable, and the late beacon
+	// proves that the final shard flushed.
 	for _, b := range []struct{ name, marker string }{{"early", earlyBeacon}, {"late", lateBeacon}} {
 		results, err := searchPlannedCorpusForTest(ctx, plan, b.marker)
 		if err != nil {

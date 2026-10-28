@@ -3,23 +3,25 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"path/filepath"
 	"strconv"
+	"strings"
 )
 
-// corpusHashHexLen is the hex-encoded length of a corpus ID produced by
-// newCorpusID — sha256 truncated to corpusHashBytes bytes, then hex-encoded.
-// Used by the GC enumerator to filter unrelated entries in the corpora dir.
+// corpusHashBytes is the byte length of a corpus ID hash (hashParts), and
+// corpusHashHexLen is its length in hex. The GC enumerator keeps only the
+// entries of the corpora directory with that hex shape (isCorpusHashName).
 const (
 	corpusHashBytes  = 16
 	corpusHashHexLen = corpusHashBytes * 2
 )
 
-// hashParts terminates each part with a 0x00 byte before hashing, which makes
-// the serialization injective ONLY while every part is NUL-free and structural
-// labels are non-empty. All current inputs satisfy this (POSIX path components
-// cannot contain 0x00; labels are fixed literals), so distinct part lists
-// cannot collide. Do not feed parts that may contain 0x00 or be empty in a
-// label position, or collisions become constructible.
+// hashParts returns the hex of the first corpusHashBytes bytes of the SHA-256
+// of parts. It ends each part with a 0x00 byte. So two different part lists
+// give different input bytes only while no part holds 0x00; an empty part is
+// safe. No current input holds 0x00: a POSIX path cannot, a file identity is
+// "dev:ino" in digits, and labels, numbers and versions are fixed text. A part
+// that can hold 0x00 would let a caller make two part lists with one hash.
 func hashParts(parts ...string) string {
 	h := sha256.New()
 	for _, part := range parts {
@@ -34,12 +36,11 @@ func newCorpusID(parts ...string) corpusID {
 	return corpusID(hashParts(parts...))
 }
 
+// indexOptionsHash hashes the build options and the format versions that
+// decide the shard content. A change of one gives a new corpus ID and a new
+// Git state hash.
 func indexOptionsHash() string {
-	return hashParts(indexOptionsParts()...)
-}
-
-func indexOptionsParts() []string {
-	return []string{
+	return hashParts(
 		"ctags_must_succeed", "true",
 		// TrigramMax always equals SizeMax (indexBuildOptions), so size_max
 		// covers both.
@@ -47,46 +48,38 @@ func indexOptionsParts() []string {
 		"shard_max", strconv.Itoa(shardMax),
 		"document_naming", seekDocumentNamingVersion,
 		"zoekt_compatibility", zoektCompatibilityVersion,
-	}
+	)
 }
 
+// gitCorpusFingerprint is the input of a Git node's state hash. It joins its
+// parts with a 0x00 separator, with no 0x00 after the last part. hashParts
+// ends every part with 0x00. The two forms are not interchangeable: a change
+// of form changes every state key.
 func gitCorpusFingerprint(paths gitPaths, state repoState) string {
-	return stringsJoinNUL(
+	return strings.Join([]string{
 		"git-state-v2",
 		"index_generation", seekIndexGeneration,
 		"cache_layout", seekCacheLayoutVersion,
 		"document_naming", seekDocumentNamingVersion,
 		"zoekt_compatibility", zoektCompatibilityVersion,
 		"index_options", indexOptionsHash(),
-		"worktree", canonicalCorpusPath(paths.RepoDir),
-		"common_dir", canonicalCorpusPath(paths.CommonDir),
+		"worktree", pathIdentityOrClean(paths.RepoDir),
+		"common_dir", pathIdentityOrClean(paths.CommonDir),
 		"repo_state", repoStateFingerprint(paths.RepoDir, state),
-	)
+	}, "\x00")
 }
 
 func gitCorpusStateHash(paths gitPaths, state repoState) string {
 	return computeStateHash(gitCorpusFingerprint(paths, state))
 }
 
-// stringsJoinNUL joins parts with a single 0x00 SEPARATOR (n-1 NULs, no
-// trailing) — distinct from hashParts, which TERMINATES every part with 0x00.
-// The two framings are NOT interchangeable: both feed the cache-key path
-// (hashParts → corpus IDs, stringsJoinNUL → state fingerprints), so swapping
-// one for the other would silently rotate every key.
-func stringsJoinNUL(parts ...string) string {
-	if len(parts) == 0 {
-		return ""
+// pathIdentityOrClean returns the file identity (dev:ino) of path, so a state
+// hash does not depend on the spelling of the path. The path can come from
+// the operand, a .git file, a commondir file, or Git output. When stat fails,
+// it returns the clean path.
+func pathIdentityOrClean(path string) string {
+	if id, err := filesystemIdentity(path); err == nil {
+		return id
 	}
-	n := len(parts) - 1
-	for _, part := range parts {
-		n += len(part)
-	}
-	buf := make([]byte, 0, n)
-	for i, part := range parts {
-		if i > 0 {
-			buf = append(buf, 0)
-		}
-		buf = append(buf, part...)
-	}
-	return string(buf)
+	return filepath.Clean(path)
 }

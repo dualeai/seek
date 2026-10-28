@@ -18,13 +18,10 @@ upgrade:
 	go mod tidy
 
 # Maintainer-only: download fixed search sources, derive the model, and update
-# tracked model, tokenizer, ONNX Runtime, and USearch resources. No build or
-# release target invokes this.
+# the tracked model, tokenizer, ONNX Runtime, USearch, and NumKong resources. No
+# build or release target invokes this.
 search-assets-upgrade:
 	bash ./cicd/rerank-assets-upgrade.sh
-
-# Keep the old target as a compatibility alias for maintainer scripts.
-rerank-assets-upgrade: search-assets-upgrade
 
 VERSION ?= $(shell bash ./cicd/version.sh -g . -c -m)
 BUILD_VERSION = $(patsubst v%,%,$(VERSION))
@@ -136,4 +133,4 @@ lint: tokenizer-native
 release:
 	bash ./cicd/release.sh
 
-.PHONY: install upgrade search-assets-upgrade rerank-assets-upgrade tokenizer-native build package test test-static test-plugin test-unit test-bench test-bench-repo test-bench-semantic test-bench-compare lint release
+.PHONY: install upgrade search-assets-upgrade tokenizer-native build package test test-static test-plugin test-unit test-bench test-bench-repo test-bench-semantic test-bench-compare lint release

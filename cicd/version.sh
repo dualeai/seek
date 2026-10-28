@@ -14,7 +14,7 @@ while getopts "g:cm" opt; do
     esac
 done
 
-# Get version from git tag or default
+# Run in the Git directory
 cd "$GIT_DIR" || exit 1
 
 # Try to get version from git tag

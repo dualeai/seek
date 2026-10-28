@@ -2,19 +2,19 @@ package main
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"sync"
 	"testing"
 )
 
-// TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable checks that a built
-// corpus with a stored state remains searchable on a warm call.
+// TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable checks that a warm
+// call on a built corpus with a stored state gives corpusSearchable. The warm
+// call must return before it takes a build slot. A warm call that waits for
+// a slot runs until the go test timeout, which prints each goroutine.
 func TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable(t *testing.T) {
-	if testing.Short() {
-		t.Skip("invokes Zoekt indexer + ctags subprocess")
-	}
 	requireTools(t)
 
 	root := t.TempDir()
@@ -27,12 +27,16 @@ func TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable(t *testing.T) {
 	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 		t.Fatalf("first call: %v", err)
 	}
-	// After the first call the state file must be populated; the
-	// warm-path gate depends on this.
+	// The warm return compares the state file with the walk, so the first
+	// call must write it.
 	if cached := readStateFile(plan.cacheDir); cached == "" {
-		t.Fatal("cold call did not write the state file; cache-gate test would be invalid")
+		t.Fatal("the cold call did not write the state file")
 	}
+	// With every build slot held, only the warm return before the slot can
+	// answer.
+	release := holdEveryBuildSlot(t)
 	state, err := ensureFolderCorpusFresh(ctx, plan)
+	release()
 	if err != nil {
 		t.Fatalf("second call: %v", err)
 	}
@@ -41,10 +45,23 @@ func TestEnsureFolderCorpusFresh_WarmCallRemainsSearchable(t *testing.T) {
 	}
 }
 
-// TestFolderCorpusStateParallel_HighFanout_NoStallNoDrop checks that the
-// parallel dispatcher returns every file when there are more entries than
-// workers.
-func TestFolderCorpusStateParallel_HighFanout_NoStallNoDrop(t *testing.T) {
+// holdEveryBuildSlot takes all of buildWindowBytes from buildWindows, so a
+// build waits for a slot; release frees it. A slot that another test kept
+// makes it wait until the go test timeout, which prints each goroutine.
+func holdEveryBuildSlot(t *testing.T) (release func()) {
+	t.Helper()
+	if err := buildWindows.Acquire(t.Context(), buildWindowBytes); err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	release = func() { once.Do(func() { buildWindows.Release(buildWindowBytes) }) }
+	t.Cleanup(release)
+	return release
+}
+
+// TestFolderCorpusState_HighFanout_NoStallNoDrop checks that the parallel
+// walk returns every file when there are more directories than workers.
+func TestFolderCorpusState_HighFanout_NoStallNoDrop(t *testing.T) {
 	root := t.TempDir()
 	const N = 200
 	for i := 0; i < N; i++ {
@@ -57,21 +74,21 @@ func TestFolderCorpusStateParallel_HighFanout_NoStallNoDrop(t *testing.T) {
 		}
 	}
 	plan := planFolderTestCorpus(t, root)
-	state, selected, err := folderCorpusStateParallel(t.Context(), plan)
+	state, selected, err := folderCorpusState(t.Context(), plan)
 	if err != nil {
-		t.Fatalf("folderCorpusStateParallel: %v", err)
+		t.Fatalf("folderCorpusState: %v", err)
 	}
 	if state == "" {
 		t.Fatal("expected non-empty stateHash")
 	}
 	if got := len(selected); got != N {
-		t.Fatalf("selected count = %d, want %d (parallel dispatcher dropped entries)", got, N)
+		t.Fatalf("selected count = %d, want %d (the parallel walk dropped entries)", got, N)
 	}
 }
 
-// TestFolderCorpusStateParallel_IdempotentSelectedAndStateHash checks that two
+// TestFolderCorpusState_IdempotentSelectedAndStateHash checks that two
 // scans of an unchanged tree return the same state and selected file count.
-func TestFolderCorpusStateParallel_IdempotentSelectedAndStateHash(t *testing.T) {
+func TestFolderCorpusState_IdempotentSelectedAndStateHash(t *testing.T) {
 	root := t.TempDir()
 	for i := 0; i < 50; i++ {
 		if err := os.WriteFile(filepath.Join(root, "f"+strconv.Itoa(i)+".txt"), []byte("payload"), 0o644); err != nil {
@@ -80,11 +97,11 @@ func TestFolderCorpusStateParallel_IdempotentSelectedAndStateHash(t *testing.T) 
 	}
 	plan := planFolderTestCorpus(t, root)
 	ctx := t.Context()
-	hash1, sel1, err := folderCorpusStateParallel(ctx, plan)
+	hash1, sel1, err := folderCorpusState(ctx, plan)
 	if err != nil {
 		t.Fatalf("first call: %v", err)
 	}
-	hash2, sel2, err := folderCorpusStateParallel(ctx, plan)
+	hash2, sel2, err := folderCorpusState(ctx, plan)
 	if err != nil {
 		t.Fatalf("second call: %v", err)
 	}
@@ -96,98 +113,9 @@ func TestFolderCorpusStateParallel_IdempotentSelectedAndStateHash(t *testing.T) 
 	}
 }
 
-type fakeDirEntry struct {
-	name        string
-	isDir       bool
-	typ         os.FileMode
-	infoCalls   int
-	failOnInfo  bool
-	regInfoFile string
-}
-
-func (f *fakeDirEntry) Name() string      { return f.name }
-func (f *fakeDirEntry) IsDir() bool       { return f.isDir }
-func (f *fakeDirEntry) Type() os.FileMode { return f.typ }
-func (f *fakeDirEntry) Info() (os.FileInfo, error) {
-	f.infoCalls++
-	if f.failOnInfo {
-		return nil, errors.New("Info() must not be called for non-regular entries")
-	}
-	return os.Lstat(f.regInfoFile)
-}
-
-// Check each non-zero type bit from io/fs.FileMode. Modifier bits must also
-// return before Info because production checks Type() != 0.
-// ModeDir is omitted because fingerprintRootEntry checks IsDir first.
-func TestFingerprintRootEntry_NonRegular_SkipsEntryInfo(t *testing.T) {
-	plan := planFolderTestCorpus(t, t.TempDir())
-
-	cases := []struct {
-		name string
-		typ  os.FileMode
-	}{
-		{"symlink", os.ModeSymlink},
-		{"named-pipe", os.ModeNamedPipe},
-		{"socket", os.ModeSocket},
-		{"device", os.ModeDevice},
-		{"char-device", os.ModeDevice | os.ModeCharDevice},
-		{"irregular", os.ModeIrregular},
-		{"setuid-marker", os.ModeSetuid},
-		{"setgid-marker", os.ModeSetgid},
-		{"sticky-marker", os.ModeSticky},
-		{"temporary-marker", os.ModeTemporary},
-		{"append-marker", os.ModeAppend},
-		{"exclusive-marker", os.ModeExclusive},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			entry := &fakeDirEntry{
-				name:       "x",
-				typ:        tc.typ,
-				failOnInfo: true,
-			}
-			piece, err := fingerprintRootEntry(t.Context(), plan, entry, false, false)
-			if err != nil {
-				t.Fatalf("unexpected err: %v", err)
-			}
-			if piece.present {
-				t.Fatalf("expected piece.present=false for non-regular type %v", tc.typ)
-			}
-			if entry.infoCalls != 0 {
-				t.Fatalf("entry.Info() called %d times for non-regular; want 0", entry.infoCalls)
-			}
-		})
-	}
-}
-
-// TestFingerprintRootEntry_RegularFile_CallsInfo checks that a regular entry
-// loads its file information.
-func TestFingerprintRootEntry_RegularFile_CallsInfo(t *testing.T) {
-	plan := planFolderTestCorpus(t, t.TempDir())
-	regFile := filepath.Join(t.TempDir(), "real.txt")
-	if err := os.WriteFile(regFile, []byte("payload"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	entry := &fakeDirEntry{
-		name:        "real.txt",
-		typ:         0, // regular
-		regInfoFile: regFile,
-	}
-	piece, err := fingerprintRootEntry(t.Context(), plan, entry, false, false)
-	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
-	}
-	if !piece.present {
-		t.Fatalf("expected piece.present=true for regular file")
-	}
-	if entry.infoCalls != 1 {
-		t.Fatalf("entry.Info() called %d times for regular; want 1", entry.infoCalls)
-	}
-}
-
-// TestWalkDirectory_GitContentNotInStateHash checks that content in .git does
-// not change the parent folder state.
-func TestWalkDirectory_GitContentNotInStateHash(t *testing.T) {
+// TestFolderCorpusState_GitContentNotInStateHash checks that content in .git
+// does not change the parent folder state.
+func TestFolderCorpusState_GitContentNotInStateHash(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("payload"), 0o644); err != nil {
 		t.Fatal(err)
@@ -201,14 +129,14 @@ func TestWalkDirectory_GitContentNotInStateHash(t *testing.T) {
 	}
 	plan := planFolderTestCorpus(t, root)
 
-	preHash, _, err := folderCorpusStateParallel(t.Context(), plan)
+	preHash, _, err := folderCorpusState(t.Context(), plan)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(gitDir, "sentinel"), []byte("v2-mutated"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	postHash, _, err := folderCorpusStateParallel(t.Context(), plan)
+	postHash, _, err := folderCorpusState(t.Context(), plan)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,43 +145,11 @@ func TestWalkDirectory_GitContentNotInStateHash(t *testing.T) {
 	}
 }
 
-// TestWalkDirectory_GitPresenceAffectsBoundaryMarker checks that adding .git
-// changes the boundary marker even though its content is excluded.
-func TestWalkDirectory_GitPresenceAffectsBoundaryMarker(t *testing.T) {
-	noGit := t.TempDir()
-	if err := os.WriteFile(filepath.Join(noGit, "a.txt"), []byte("payload"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	withGit := t.TempDir()
-	if err := os.WriteFile(filepath.Join(withGit, "a.txt"), []byte("payload"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(withGit, ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	hashNoGit, _, err := folderCorpusStateParallel(t.Context(), planFolderTestCorpus(t, noGit))
-	if err != nil {
-		t.Fatal(err)
-	}
-	hashWithGit, _, err := folderCorpusStateParallel(t.Context(), planFolderTestCorpus(t, withGit))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if hashNoGit == hashWithGit {
-		t.Fatalf("boundary marker did not contribute: same hash for trees with/without .git (%q)", hashNoGit)
-	}
-}
-
-// ---------------------------------------------------------------------
-// End-to-end smoke: cumulative cold + warm path.
-// ---------------------------------------------------------------------
-
+// TestEnsureFolderCorpusFresh_ColdThenWarm_SearchableBoth builds a folder of
+// 25 files cold, then calls again warm. Both calls give corpusSearchable, and
+// the warm call returns before it takes a build slot. A warm call that waits
+// for a slot runs until the go test timeout, which prints each goroutine.
 func TestEnsureFolderCorpusFresh_ColdThenWarm_SearchableBoth(t *testing.T) {
-	if testing.Short() {
-		t.Skip("invokes Zoekt indexer + ctags subprocess")
-	}
 	requireTools(t)
 
 	root := t.TempDir()
@@ -276,11 +172,53 @@ func TestEnsureFolderCorpusFresh_ColdThenWarm_SearchableBoth(t *testing.T) {
 	if cold != corpusSearchable {
 		t.Fatalf("cold state = %v, want corpusSearchable", cold)
 	}
+	// With every build slot held, only the warm return before the slot can
+	// answer.
+	release := holdEveryBuildSlot(t)
 	warm, err := ensureFolderCorpusFresh(ctx, plan)
+	release()
 	if err != nil {
 		t.Fatalf("warm: %v", err)
 	}
 	if warm != corpusSearchable {
 		t.Fatalf("warm state = %v, want corpusSearchable", warm)
+	}
+}
+
+// TestWarmFolderVectorSearchTakesNoBuildSlot runs a warm folder search that
+// reads vectors while every build slot is held. The fast path finds the bound
+// generation of the folder's semantic source with no build slot, so the
+// search ends. b.go holds no word of the query, so only the vector read can
+// print it. The warm search embeds no unit and prints what the cold search
+// printed, b.go included. A search that waits for a slot never ends. Then go
+// test -timeout stops the process with a dump of each goroutine, which shows
+// the wait in acquireBuildSlot. The process ends there, so no later test
+// shares os.Stdout with the waiting search.
+func TestWarmFolderVectorSearchTakesNoBuildSlot(t *testing.T) {
+	requireTools(t)
+	setTestUserCache(t)
+	folder := t.TempDir()
+	writeFileAt(t, folder, "a.go", "package a\n// alpha beta handler\n")
+	writeFileAt(t, folder, "b.go", "package a\n// dispatches a request to its handler\n")
+	scorer := observeModel(&hybridTestScorer{mode: payloadAccept})
+	model := scorer.factory()
+	cold, err := seekWith(t, model, "alpha beta", folder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	embeds := scorer.embeds.Load()
+	if embeds == 0 || !slices.Contains(headerPaths(cold), filepath.Join(folder, "b.go")) {
+		t.Fatalf("the cold search embedded %d calls and printed %v, want b.go from the vectors:\n%s",
+			embeds, headerPaths(cold), cold)
+	}
+	release := holdEveryBuildSlot(t)
+	warm, err := seekWith(t, model, "alpha beta", folder)
+	release()
+	if err != nil {
+		t.Fatalf("the warm vector search failed while every build slot was held: %v", err)
+	}
+	if warm != cold || scorer.embeds.Load() != embeds {
+		t.Fatalf("the warm search embedded %d calls, want 0, and must print b.go from the vectors as the cold search did; cold:\n%s\nwarm:\n%s",
+			scorer.embeds.Load()-embeds, cold, warm)
 	}
 }

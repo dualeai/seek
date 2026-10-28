@@ -1,39 +1,26 @@
-//go:build soak
-
 package main
 
 import (
-	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"runtime"
-	"sync/atomic"
 	"testing"
-	"time"
 )
 
-// TestSoak_LargeFolderForFiveMinutes — long-running smoke test gated
-// behind the `soak` build tag and the SEEK_SOAK=1 env var. Synthesises
-// a 4 GiB sparse folder (1024 files × 4 MiB each) and runs
-// ensureFolderCorpusFresh in a loop for 5 minutes, sampling memory
-// stats every 5 seconds.
+// TestSoak_LargeFolderStaysFresh makes a 4 GiB sparse folder (1024 files of
+// 4 MiB) and runs ensureFolderCorpusFresh on it 1000 times. The first call
+// builds the index, and each later call finds it current. It reads the heap
+// after each call.
 //
-// Asserts:
-//   - HeapAlloc peak stays bounded (< 1.5 GiB worst case),
-//   - forward progress: loop iteration counter advances every 30s,
-//   - readSemaphore returns to its starting balance at the end.
-//
-// Run path:
-//
-//	SEEK_SOAK=1 go test -tags=soak ./cmd/seek -run TestSoak_LargeFolderForFiveMinutes -timeout=15m
-func TestSoak_LargeFolderForFiveMinutes(t *testing.T) {
-	if os.Getenv("SEEK_SOAK") != "1" {
-		t.Skip("set SEEK_SOAK=1 to run soak test")
-	}
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+// It asserts:
+//   - each call ends with no error;
+//   - at the end, the index has a shard;
+//   - the live heap after a GC grows by at most 8 MiB from call 100 to the
+//     end;
+//   - the HeapAlloc peak stays at or below 1500 MiB (a leak guard);
+//   - readSemaphore has its start weight again at the end.
+func TestSoak_LargeFolderStaysFresh(t *testing.T) {
+	requireTools(t)
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
@@ -41,77 +28,51 @@ func TestSoak_LargeFolderForFiveMinutes(t *testing.T) {
 
 	root := t.TempDir()
 	const totalFiles = 1024
-	const fileSize int64 = 4 * 1024 * 1024 // 4 MiB → 4 GiB total
-	for i := 0; i < totalFiles; i++ {
+	const fileSize int64 = 4 * 1024 * 1024 // 4 MiB, so 4 GiB in all
+	for i := range totalFiles {
 		writeSparseFile(t, filepath.Join(root, fmt.Sprintf("f%05d.bin", i)), fileSize)
 	}
 
 	plan := planSynthCorpus(t, root)
 
-	const soakDuration = 5 * time.Minute
-	const sampleInterval = 5 * time.Second
-	// First cold-index of 4 GiB sparse takes minutes (ctags subprocess
-	// per shard); subsequent iterations hit the cached fast path. 2 min
-	// deadline accommodates the cold pass without masking a real wedge.
-	const progressDeadline = 2 * time.Minute
-
-	ctx, cancel := context.WithTimeout(t.Context(), soakDuration+1*time.Minute)
-	defer cancel()
-
-	var iterations atomic.Int64
-	doneSoak := make(chan struct{})
-	go func() {
-		defer close(doneSoak)
-		deadline := time.Now().Add(soakDuration)
-		for time.Now().Before(deadline) {
-			if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
-				t.Errorf("ensureFolderCorpusFresh: %v", err)
-				return
-			}
-			iterations.Add(1)
-			if ctx.Err() != nil {
-				return
-			}
-		}
-	}()
-
+	const iterations = 1000
 	var peakHeap uint64
-	lastProgressIters := int64(0)
-	lastProgressTime := time.Now()
-	ticker := time.NewTicker(sampleInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-doneSoak:
-			goto end
-		case <-ctx.Done():
-			t.Fatal("soak context deadline exceeded")
-		case <-ticker.C:
-			var ms runtime.MemStats
-			runtime.ReadMemStats(&ms)
-			if ms.HeapAlloc > peakHeap {
-				peakHeap = ms.HeapAlloc
-			}
-			iter := iterations.Load()
-			if iter > lastProgressIters {
-				lastProgressIters = iter
-				lastProgressTime = time.Now()
-			} else if time.Since(lastProgressTime) > progressDeadline {
-				dumpGoroutines(t)
-				t.Fatalf("no forward progress in %v (iter stuck at %d)", progressDeadline, iter)
-			}
-			t.Logf("soak: iter=%d heap=%d MiB peak=%d MiB", iter, ms.HeapAlloc/1024/1024, peakHeap/1024/1024)
+	liveHeap := func() uint64 {
+		runtime.GC()
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		return ms.HeapAlloc
+	}
+	var warmHeap uint64
+	for i := range iterations {
+		if _, err := ensureFolderCorpusFresh(t.Context(), plan); err != nil {
+			t.Fatalf("ensureFolderCorpusFresh %d: %v", i, err)
 		}
+		if i == 99 {
+			warmHeap = liveHeap()
+		}
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		peakHeap = max(peakHeap, ms.HeapAlloc)
+	}
+	endHeap := liveHeap()
+	t.Logf("soak: %d calls, peak heap %d MiB, live heap after call 100 %d KiB, at the end %d KiB", iterations, peakHeap/1024/1024, warmHeap/1024, endHeap/1024)
+	// The live heap after a GC must not grow over the warm calls. A ceiling of
+	// 8 MiB over 900 calls finds a leak of about 9 KiB per call.
+	const liveGrowthCeiling = 8 << 20
+	if endHeap > warmHeap+liveGrowthCeiling {
+		t.Errorf("live heap grew from %d KiB to %d KiB over %d warm calls", warmHeap/1024, endHeap/1024, iterations-100)
+	}
+	if n := repositoryShardCount(plan.indexDir, folderRepoName(plan)); n == 0 {
+		t.Fatal("no shards produced")
 	}
 
-end:
+	// This ceiling is a leak guard, not a resource limit: low resource use is
+	// no goal of Seek. A leak grows the heap with each call and passes the
+	// ceiling. A large working set stays below it.
 	const heapCeiling = 1500 * 1024 * 1024
 	if peakHeap > heapCeiling {
 		t.Errorf("peak HeapAlloc %d MiB > ceiling %d MiB", peakHeap/1024/1024, heapCeiling/1024/1024)
-	}
-	if iterations.Load() == 0 {
-		t.Error("soak loop never completed a single iteration")
 	}
 	if got := availableWeight(readSemaphore); got != before {
 		t.Errorf("semaphore leak: before=%d after=%d", before, got)

@@ -1,38 +1,31 @@
 package main
 
 import (
-	"context"
 	"testing"
-	"time"
 )
 
-// TestSequentialCorpora_SemaphoreDrainsBetweenPlans — process plans
-// sequentially. Every plan must return the global semaphore to its
-// starting balance — otherwise plan N+1 starts with reduced budget
-// and may wedge once cumulative > remaining.
+// TestSequentialCorpora_SemaphoreDrainsBetweenPlans builds two folder plans,
+// one after the other, each with twice the read budget. Each build must give
+// back all its read weight. Else the next plan starts with less budget and
+// can block.
 func TestSequentialCorpora_SemaphoreDrainsBetweenPlans(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+	requireTools(t)
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
 	const testBudget int64 = 4 * 1024 * 1024
 	const fileSize int64 = 512 * 1024
-	const totalPerCorpus int64 = 8 * 1024 * 1024 // 2× budget per corpus
+	const totalPerCorpus int64 = 8 * 1024 * 1024 // twice the budget
 
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
-	defer goroutineLeakGuard(t, 90*time.Second)()
+	defer goroutineLeakGuard(t)()
 
 	for _, label := range []string{"A", "B"} {
 		root := writeRandomFolder(t, totalPerCorpus, fileSize)
 		plan := planSynthCorpus(t, root)
 
-		ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
-		_, err := ensureFolderCorpusFresh(ctx, plan)
-		cancel()
-		if err != nil {
+		if _, err := ensureFolderCorpusFresh(t.Context(), plan); err != nil {
 			t.Fatalf("corpus %s ensureFolderCorpusFresh: %v", label, err)
 		}
 		// A shard proves that this corpus reached the indexing path before the
@@ -50,16 +43,14 @@ func TestSequentialCorpora_SemaphoreDrainsBetweenPlans(t *testing.T) {
 // in sequence. It checks that the known-empty path does not leak weight and
 // that each plan releases its weight.
 func TestSequentialCorpora_ThreeWayMix(t *testing.T) {
-	if err := checkCtagsCached(); err != nil {
-		t.Skipf("ctags required: %v", err)
-	}
+	requireTools(t)
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
 	const testBudget int64 = 4 * 1024 * 1024
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
-	defer goroutineLeakGuard(t, 60*time.Second)()
+	defer goroutineLeakGuard(t)()
 
 	emptyRoot := t.TempDir()
 	roots := []struct {
@@ -72,14 +63,11 @@ func TestSequentialCorpora_ThreeWayMix(t *testing.T) {
 	}
 	for _, rc := range roots {
 		plan := planSynthCorpus(t, rc.path)
-		ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
-		_, err := ensureFolderCorpusFresh(ctx, plan)
-		cancel()
-		if err != nil {
+		if _, err := ensureFolderCorpusFresh(t.Context(), plan); err != nil {
 			t.Fatalf("corpus[%s]: %v", rc.label, err)
 		}
-		// Empty corpus produces 0 shards (zero-doc branch in
-		// indexDocuments); large/medium must produce >= 1.
+		// The empty folder gives no shard: no document reaches the build. The
+		// large and medium folders give one or more.
 		n := repositoryShardCount(plan.indexDir, folderRepoName(plan))
 		if rc.label == "empty" {
 			if n != 0 {

@@ -2,23 +2,25 @@ package main
 
 // Partial-loss regression matrix.
 //
-// Losing a subset of files in a corpus index directory must cause repair on the
-// next search. Each damage row checks the same contract:
+// When a corpus index directory loses some of its files, the next search must
+// repair it. Each damage row checks the same contract:
 //
-//   - each live marker is found in exactly its source file;
-//   - tombstoned markers do not return;
+//   - the search finds each live marker in exactly its source file;
+//   - no tombstoned marker comes back;
 //   - the first search repairs the damage; and
 //   - two later searches do not change the repaired shard family.
 //
-// Counting documents is not enough. A stale .meta keeps the document count
-// constant while serving content that exists nowhere in the tree, and a byte
-// flip keeps both count and size constant while hiding a live document. Only
-// a marker set proves what a user would actually get back.
+// A document count is not enough. A stale .meta keeps the document count and
+// serves content that exists nowhere in the tree. A byte flip keeps both the
+// count and the size and hides a live document. Only a marker set proves
+// what a user gets back.
 //
-// Isolation. Every test here calls planGitTestCorpus / planFolderTestCorpus,
-// which call setTestUserCache, which t.Setenv HOME, XDG_CACHE_HOME and an
-// empty SEEK_CACHE_DIR. Each test therefore owns a private cache root, and
-// t.Setenv forbids t.Parallel, so rows never race for a corpus.
+// Isolation. Every in-process test here calls planGitTestCorpus or
+// planFolderTestCorpus. These call setTestUserCache, which sets HOME,
+// XDG_CACHE_HOME and an empty SEEK_CACHE_DIR with t.Setenv. The process-level
+// test gives each CLI process its own SEEK_CACHE_DIR. So each test owns a
+// private cache root. t.Setenv forbids t.Parallel, so rows never race for a
+// corpus.
 
 import (
 	"bytes"
@@ -26,7 +28,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -44,12 +46,11 @@ type plMarker struct {
 // plCorpus is a delta-stacked committed family plus the marker ledger that
 // describes what a correct answer looks like.
 //
-// Each committed delta adds a shard and updates .meta sidecars. The fixture
-// therefore contains a real multi-shard family with tombstones.
+// Each committed delta adds a shard and updates .meta sidecars. So the fixture
+// holds a real multi-shard family with tombstones.
 type plCorpus struct {
 	repoDir string
-	paths   gitPaths
-	plan    corpusPlan
+	plan    node
 
 	live []plMarker // must be findable, exactly once, at their own path
 	dead []plMarker // tombstoned; must never come back
@@ -60,22 +61,24 @@ type plCorpus struct {
 
 // buildPartialLossCorpus produces a committed family with multiple delta shards
 // and two tombstones.
-func buildPartialLossCorpus(t *testing.T, ctx context.Context) *plCorpus {
+func buildPartialLossCorpus(t *testing.T) *plCorpus {
 	t.Helper()
 	requireTools(t)
+	ctx := t.Context()
 
 	repo := initGitRepo(t, "seed.go", "package main\n// PL_SEED\n")
 	paths, plan := planGitTestCorpus(t, repo)
-	c := &plCorpus{repoDir: repo, paths: paths, plan: plan}
+	c := &plCorpus{repoDir: repo, plan: plan}
 	reindexGit(t, ctx, paths, plan)
 	c.live = append(c.live, plMarker{"PL_SEED", "seed.go"})
 
-	// ghost.go is committed with one marker and later rewritten with another:
-	// the first becomes a tombstone, the second stays live.
+	// The fixture commits ghost.go with one marker and later rewrites it with
+	// another: the first marker becomes a tombstone, the second stays live.
 	writeTrackedFile(t, repo, "ghost.go", "package main\n// PL_GHOST\n")
 	reindexGit(t, ctx, paths, plan)
 
-	// gone.go is committed and later deleted: its marker becomes a tombstone.
+	// The fixture commits gone.go and later deletes it: its marker becomes a
+	// tombstone.
 	writeTrackedFile(t, repo, "gone.go", "package main\n// PL_GONE\n")
 	reindexGit(t, ctx, paths, plan)
 
@@ -103,7 +106,7 @@ func buildPartialLossCorpus(t *testing.T, ctx context.Context) *plCorpus {
 	if got := committedShardCount(t, plan.indexDir); got < 4 {
 		t.Fatalf("fixture must be multi-shard for partial loss to mean anything, got %d shards", got)
 	}
-	c.assertHealthy(t, ctx, "fixture baseline")
+	c.assertHealthy(t, "fixture baseline")
 
 	c.golden = filepath.Join(t.TempDir(), "golden")
 	plCopyTree(t, plan.cacheDir, c.golden)
@@ -129,7 +132,6 @@ func (c *plCorpus) assertRepoUntouched(t *testing.T) {
 // starts from the same family.
 func (c *plCorpus) restorePristine(t *testing.T) {
 	t.Helper()
-	plChmodTreeWritable(c.plan.indexDir)
 	if err := os.RemoveAll(c.plan.cacheDir); err != nil {
 		t.Fatalf("clear cache dir: %v", err)
 	}
@@ -142,7 +144,7 @@ func (c *plCorpus) restorePristine(t *testing.T) {
 
 // seekOnce runs the freshness check, any required rebuild, and the search.
 func (c *plCorpus) seekOnce(ctx context.Context, token string) ([]string, error) {
-	return runSeekInPlannedGitCorpus(ctx, token, c.paths, c.plan)
+	return runSeekInPlannedGitCorpus(ctx, token, c.plan)
 }
 
 // searchOnly reads the published family without another freshness check.
@@ -160,8 +162,9 @@ func (c *plCorpus) searchOnly(ctx context.Context, token string) ([]string, erro
 
 // assertHealthy runs one complete search, then checks all markers against the
 // shard family that the search published.
-func (c *plCorpus) assertHealthy(t *testing.T, ctx context.Context, label string) {
+func (c *plCorpus) assertHealthy(t *testing.T, label string) {
 	t.Helper()
+	ctx := t.Context()
 	check := func(kind string, m plMarker, files []string, err error) {
 		t.Helper()
 		if err != nil {
@@ -199,15 +202,15 @@ func (c *plCorpus) assertHealthy(t *testing.T, ctx context.Context, label string
 
 // assertConvergesAndIsStable checks that the first search repairs the family
 // and that two later searches do not change it.
-func (c *plCorpus) assertConvergesAndIsStable(t *testing.T, ctx context.Context) {
+func (c *plCorpus) assertConvergesAndIsStable(t *testing.T) {
 	t.Helper()
-	c.assertHealthy(t, ctx, "run 1 (must converge in one search)")
+	c.assertHealthy(t, "run 1 (must converge in one search)")
 	if t.Failed() {
 		return
 	}
 	after1 := plFamilySnapshot(t, c.plan.indexDir)
-	c.assertHealthy(t, ctx, "run 2")
-	c.assertHealthy(t, ctx, "run 3")
+	c.assertHealthy(t, "run 2")
+	c.assertHealthy(t, "run 3")
 	if after2 := plFamilySnapshot(t, c.plan.indexDir); after2 != after1 {
 		t.Errorf("family kept changing after it converged (rebuild loop?):\n run1 %s\n run3 %s",
 			after1, after2)
@@ -228,6 +231,8 @@ func committedMetaPaths(t *testing.T, indexDir string) []string {
 	return plFamilyGlob(t, indexDir, "*.zoekt.meta")
 }
 
+// plFamilyGlob returns the files of indexDir that match pattern, sorted, with
+// no file of the uncommitted family.
 func plFamilyGlob(t *testing.T, indexDir, pattern string) []string {
 	t.Helper()
 	all, err := filepath.Glob(filepath.Join(indexDir, pattern))
@@ -240,13 +245,13 @@ func plFamilyGlob(t *testing.T, indexDir, pattern string) []string {
 			out = append(out, p)
 		}
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }
 
-// shardCarrying returns the committed shard whose bytes contain token. Shard
-// numbering is a zoekt implementation detail, so rows address shards by the
-// marker they hold: "the shard that holds PL_MARK_1", never "shard 4".
+// shardCarrying returns the committed shard whose bytes contain token. Zoekt
+// owns the shard numbers, so rows name a shard by the marker that it holds:
+// "the shard that holds PL_MARK_1", never "shard 4".
 func shardCarrying(t *testing.T, indexDir, token string) string {
 	t.Helper()
 	for _, p := range committedShardPaths(t, indexDir) {
@@ -262,8 +267,8 @@ func shardCarrying(t *testing.T, indexDir, token string) string {
 	return ""
 }
 
-// plFamilySnapshot renders the family as a stable "name=size" list, used to
-// prove the build stopped moving once it converged.
+// plFamilySnapshot gives the family as a sorted "name=size" list, so a test
+// can show that the build no longer changes it after the repair.
 func plFamilySnapshot(t *testing.T, indexDir string) string {
 	t.Helper()
 	var parts []string
@@ -275,65 +280,21 @@ func plFamilySnapshot(t *testing.T, indexDir string) string {
 		}
 		parts = append(parts, fmt.Sprintf("%s=%d", filepath.Base(p), st.Size()))
 	}
-	sort.Strings(parts)
+	slices.Sort(parts)
 	return strings.Join(parts, " ")
 }
 
+// plUnique returns the distinct values of in, sorted.
 func plUnique(in []string) []string {
-	seen := map[string]struct{}{}
-	out := make([]string, 0, len(in))
-	for _, s := range in {
-		if _, ok := seen[s]; ok {
-			continue
-		}
-		seen[s] = struct{}{}
-		out = append(out, s)
-	}
-	sort.Strings(out)
-	return out
+	return slices.Compact(slices.Sorted(slices.Values(in)))
 }
 
+// plCopyTree copies the directory tree src to dst, which must not exist.
 func plCopyTree(t *testing.T, src, dst string) {
 	t.Helper()
-	err := filepath.Walk(src, func(p string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, rerr := filepath.Rel(src, p)
-		if rerr != nil {
-			return rerr
-		}
-		target := filepath.Join(dst, rel)
-		if info.IsDir() {
-			return os.MkdirAll(target, 0o755)
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return nil
-		}
-		b, rerr := os.ReadFile(p)
-		if rerr != nil {
-			return rerr
-		}
-		return os.WriteFile(target, b, info.Mode().Perm())
-	})
-	if err != nil {
+	if err := os.CopyFS(dst, os.DirFS(src)); err != nil {
 		t.Fatalf("copy tree %s -> %s: %v", src, dst, err)
 	}
-}
-
-// plChmodTreeWritable undoes a chmod-000 row so the restore can delete it.
-func plChmodTreeWritable(dir string) {
-	_ = filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		if info.IsDir() {
-			_ = os.Chmod(p, 0o755)
-			return nil
-		}
-		_ = os.Chmod(p, 0o644)
-		return nil
-	})
 }
 
 func plRemove(t *testing.T, paths ...string) {
@@ -353,40 +314,40 @@ func plRemove(t *testing.T, paths ...string) {
 type plRow struct {
 	// name is the subtest name; keep it -run selectable.
 	name string
-	// ownFixture marks a row that mutates the repository (a commit or an
-	// untracked file). restorePristine rewinds only the cache, so such a row
-	// gets a private repository and cache instead of the shared fixture.
+	// ownFixture marks a row that changes the repository (a commit or an
+	// untracked file). restorePristine puts back only the cache. So such a
+	// row gets a private repository and cache, not the shared fixture.
 	ownFixture bool
-	// slow marks a row that builds a second full family; skipped under -short.
-	slow bool
-	// damage mutates the corpus on disk between two seek invocations, exactly
-	// as an external process would.
-	damage func(t *testing.T, ctx context.Context, c *plCorpus)
+	// damage changes the corpus on disk between two searches, as an outside
+	// process would.
+	damage func(t *testing.T, c *plCorpus)
 }
 
+// partialLossRows returns the damage rows of
+// TestPartialLoss_GitCommittedFamily.
 func partialLossRows() []plRow {
 	return []plRow{
 		{
 			name: "shard_zero_deleted",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				plRemove(t, shardCarrying(t, c.plan.indexDir, "PL_SEED"))
 			},
 		},
 		{
 			name: "middle_shard_deleted",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				plRemove(t, shardCarrying(t, c.plan.indexDir, "PL_MARK_0"))
 			},
 		},
 		{
 			name: "trailing_shard_deleted",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				plRemove(t, shardCarrying(t, c.plan.indexDir, "PL_ALIVE"))
 			},
 		},
 		{
-			name: "incident_shape_all_but_shard_zero",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			name: "all_but_shard_zero_deleted",
+			damage: func(t *testing.T, c *plCorpus) {
 				keep := shardCarrying(t, c.plan.indexDir, "PL_SEED")
 				for _, p := range committedShardPaths(t, c.plan.indexDir) {
 					if p != keep {
@@ -397,13 +358,13 @@ func partialLossRows() []plRow {
 		},
 		{
 			name: "every_committed_shard_deleted",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				plRemove(t, committedShardPaths(t, c.plan.indexDir)...)
 			},
 		},
 		{
 			name: "index_dir_removed",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				if err := os.RemoveAll(c.plan.indexDir); err != nil {
 					t.Fatal(err)
 				}
@@ -411,7 +372,7 @@ func partialLossRows() []plRow {
 		},
 		{
 			name: "index_dir_replaced_by_file",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				if err := os.RemoveAll(c.plan.indexDir); err != nil {
 					t.Fatal(err)
 				}
@@ -422,7 +383,7 @@ func partialLossRows() []plRow {
 		},
 		{
 			name: "shard_truncated",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				p := shardCarrying(t, c.plan.indexDir, "PL_MARK_1")
 				st, err := os.Stat(p)
 				if err != nil {
@@ -435,7 +396,7 @@ func partialLossRows() []plRow {
 		},
 		{
 			name: "shard_unreadable",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				if err := os.Chmod(shardCarrying(t, c.plan.indexDir, "PL_MARK_1"), 0o000); err != nil {
 					t.Fatal(err)
 				}
@@ -443,7 +404,7 @@ func partialLossRows() []plRow {
 		},
 		{
 			name: "shard_replaced_by_directory",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				p := shardCarrying(t, c.plan.indexDir, "PL_MARK_1")
 				plRemove(t, p)
 				if err := os.MkdirAll(p, 0o755); err != nil {
@@ -453,7 +414,7 @@ func partialLossRows() []plRow {
 		},
 		{
 			name: "shard_symlinked_to_devnull",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				p := shardCarrying(t, c.plan.indexDir, "PL_MARK_1")
 				plRemove(t, p)
 				if err := os.Symlink(os.DevNull, p); err != nil {
@@ -463,9 +424,10 @@ func partialLossRows() []plRow {
 		},
 		{
 			// A shard replaced by a link to another shard can return only a
-			// subset of the documents. The manifest must reject the replacement.
+			// subset of the documents. The manifest must reject the
+			// replacement.
 			name: "shard_symlinked_to_sibling",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				victim := shardCarrying(t, c.plan.indexDir, "PL_MARK_1")
 				donor := shardCarrying(t, c.plan.indexDir, "PL_SEED")
 				plRemove(t, victim)
@@ -476,7 +438,7 @@ func partialLossRows() []plRow {
 		},
 		{
 			name: "meta_sidecar_deleted",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				// The tombstone for PL_GHOST lives in the .meta of the shard
 				// that still carries the superseded document.
 				plRemove(t, shardCarrying(t, c.plan.indexDir, "PL_GHOST")+".meta")
@@ -484,19 +446,19 @@ func partialLossRows() []plRow {
 		},
 		{
 			name: "every_meta_sidecar_deleted",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				plRemove(t, committedMetaPaths(t, c.plan.indexDir)...)
 			},
 		},
 		{
 			name: "orphan_meta_shard_deleted",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				plRemove(t, shardCarrying(t, c.plan.indexDir, "PL_MARK_1"))
 			},
 		},
 		{
 			name: "random_subset_deleted",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				shards := committedShardPaths(t, c.plan.indexDir)
 				for i, p := range shards {
 					if i%2 == 0 {
@@ -510,13 +472,12 @@ func partialLossRows() []plRow {
 			// damaged family or return superseded content.
 			name:       "gap_then_commit_serves_stale_content",
 			ownFixture: true,
-			slow:       true,
-			damage: func(t *testing.T, ctx context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				plRemove(t, shardCarrying(t, c.plan.indexDir, "PL_SEED"))
 				// A commit that supersedes a live marker. After the rebuild
 				// PL_MARK_2 must be gone and PL_SUPERSEDER must be the only
-				// hit. The new token deliberately shares no substring with the
-				// old one, so a hit on the old token can only be stale content.
+				// hit. The new content of f2.go does not hold the old token,
+				// so a hit on the old token can only be stale content.
 				writeTrackedFile(t, c.repoDir, "f2.go", "package main\n// PL_SUPERSEDER\n")
 				c.dead = append(c.dead, plMarker{"PL_MARK_2", "f2.go"})
 				for i := range c.live {
@@ -527,16 +488,16 @@ func partialLossRows() []plRow {
 			},
 		},
 		{
-			// An uncommitted shard must not make a missing committed family look
-			// complete.
+			// An uncommitted shard must not make a missing committed family
+			// look complete.
 			name:       "committed_family_lost_with_dirty_file_present",
 			ownFixture: true,
-			damage: func(t *testing.T, ctx context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				if err := os.WriteFile(filepath.Join(c.repoDir, "dirty.go"),
 					[]byte("package main\n// PL_DIRTY\n"), 0o644); err != nil {
 					t.Fatal(err)
 				}
-				if files, err := c.seekOnce(ctx, "PL_DIRTY"); err != nil || len(files) == 0 {
+				if files, err := c.seekOnce(t.Context(), "PL_DIRTY"); err != nil || len(files) == 0 {
 					t.Fatalf("dirty file must be indexed before the damage: %v %v", files, err)
 				}
 				c.live = append(c.live, plMarker{"PL_DIRTY", "dirty.go"})
@@ -548,12 +509,12 @@ func partialLossRows() []plRow {
 			// A manifest must not keep a missing uncommitted family current.
 			name:       "uncommitted_shard_lost_manifest_kept",
 			ownFixture: true,
-			damage: func(t *testing.T, ctx context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				if err := os.WriteFile(filepath.Join(c.repoDir, "dirty.go"),
 					[]byte("package main\n// PL_DIRTY\n"), 0o644); err != nil {
 					t.Fatal(err)
 				}
-				if files, err := c.seekOnce(ctx, "PL_DIRTY"); err != nil || len(files) == 0 {
+				if files, err := c.seekOnce(t.Context(), "PL_DIRTY"); err != nil || len(files) == 0 {
 					t.Fatalf("dirty file must be indexed before the damage: %v %v", files, err)
 				}
 				c.live = append(c.live, plMarker{"PL_DIRTY", "dirty.go"})
@@ -565,16 +526,53 @@ func partialLossRows() []plRow {
 			},
 		},
 		{
+			// A delta family that lost its last shard must not stay current.
+			// The first shard tombstones the edited file, so the rest of the
+			// family hides that file with no warning.
+			name:       "uncommitted_trailing_shard_deleted",
+			ownFixture: true,
+			damage: func(t *testing.T, c *plCorpus) {
+				write := func(name, body string) {
+					t.Helper()
+					if err := os.WriteFile(filepath.Join(c.repoDir, name), []byte(body), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				write("dirty_a.go", "package main\n// PL_UNC_A\n")
+				write("dirty_b.go", "package main\n// PL_UNC_OLD\n")
+				if files, err := c.seekOnce(t.Context(), "PL_UNC_A"); err != nil || len(files) == 0 {
+					t.Fatalf("dirty files must be indexed before the edit: %v %v", files, err)
+				}
+				// A second edit makes a delta: a new shard with dirty_b.go and
+				// a tombstone of dirty_b.go in the first shard.
+				write("dirty_b.go", "package main\n// PL_UNC_NEW_EDIT\n")
+				if files, err := c.seekOnce(t.Context(), "PL_UNC_NEW_EDIT"); err != nil || len(files) == 0 {
+					t.Fatalf("the edit must be indexed before the damage: %v %v", files, err)
+				}
+				shards := repositoryShardFiles(c.plan.indexDir, repoUncommitted)
+				if len(shards) < 2 {
+					t.Fatalf("two edits must make a delta family, got %v", shards)
+				}
+				last := shards[len(shards)-1]
+				if b, err := os.ReadFile(last); err != nil || !bytes.Contains(b, []byte("PL_UNC_NEW_EDIT")) {
+					t.Fatalf("the last uncommitted shard must hold the edit (err %v)", err)
+				}
+				c.live = append(c.live, plMarker{"PL_UNC_A", "dirty_a.go"}, plMarker{"PL_UNC_NEW_EDIT", "dirty_b.go"})
+				c.dead = append(c.dead, plMarker{"PL_UNC_OLD", "dirty_b.go"})
+				plRemove(t, last)
+			},
+		},
+		{
 			// Keep the existing state-file recovery path covered.
 			name: "sidecars_cleared_only",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				_ = os.Remove(filepath.Join(c.plan.cacheDir, stateFile))
 				_ = os.Remove(filepath.Join(c.plan.cacheDir, headFile))
 			},
 		},
 		{
 			name: "swapping_marker_present",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				// Add the marker that makes recoverIncompleteSwap clear the
 				// incomplete family before the rebuild.
 				keep := shardCarrying(t, c.plan.indexDir, "PL_SEED")
@@ -591,7 +589,7 @@ func partialLossRows() []plRow {
 		},
 		{
 			name: "extra_out_of_range_shard",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				donor := shardCarrying(t, c.plan.indexDir, "PL_SEED")
 				b, err := os.ReadFile(donor)
 				if err != nil {
@@ -605,7 +603,7 @@ func partialLossRows() []plRow {
 		},
 		{
 			name: "state_and_head_garbage",
-			damage: func(t *testing.T, _ context.Context, c *plCorpus) {
+			damage: func(t *testing.T, c *plCorpus) {
 				for _, f := range []string{stateFile, headFile} {
 					if err := os.WriteFile(filepath.Join(c.plan.cacheDir, f),
 						[]byte("\x00\x01garbage\n"), 0o644); err != nil {
@@ -620,10 +618,10 @@ func partialLossRows() []plRow {
 // plPrepareRow restores the shared cache for a cache-only row. It creates a
 // private repository and cache for a row that changes repository data. It also
 // returns a post-run check.
-func plPrepareRow(t *testing.T, ctx context.Context, shared *plCorpus, row plRow) (*plCorpus, func()) {
+func plPrepareRow(t *testing.T, shared *plCorpus, row plRow) (*plCorpus, func()) {
 	t.Helper()
 	if row.ownFixture {
-		return buildPartialLossCorpus(t, ctx), func() {}
+		return buildPartialLossCorpus(t), func() {}
 	}
 	local := *shared
 	local.live = append([]plMarker(nil), shared.live...)
@@ -632,21 +630,19 @@ func plPrepareRow(t *testing.T, ctx context.Context, shared *plCorpus, row plRow
 	return &local, func() { shared.assertRepoUntouched(t) }
 }
 
-// TestPartialLoss_GitCommittedFamily is the matrix. One shared fixture, one
-// pristine restore per row, one row per damage mode.
+// TestPartialLoss_GitCommittedFamily is the matrix: one row per damage mode.
+// A row that changes only the cache starts from the shared fixture, restored
+// to its pristine copy. A row that changes the repository (ownFixture) builds
+// its own fixture.
 func TestPartialLoss_GitCommittedFamily(t *testing.T) {
-	ctx := context.Background()
-	shared := buildPartialLossCorpus(t, ctx)
+	shared := buildPartialLossCorpus(t)
 
 	for _, row := range partialLossRows() {
 		t.Run(row.name, func(t *testing.T) {
-			if row.slow && testing.Short() {
-				t.Skip("slow row: builds a second family")
-			}
-			c, guard := plPrepareRow(t, ctx, shared, row)
+			c, guard := plPrepareRow(t, shared, row)
 			defer guard()
-			row.damage(t, ctx, c)
-			c.assertConvergesAndIsStable(t, ctx)
+			row.damage(t, c)
+			c.assertConvergesAndIsStable(t)
 		})
 	}
 }
@@ -655,19 +651,15 @@ func TestPartialLoss_GitCommittedFamily(t *testing.T) {
 // Folder corpus parity
 // ---------------------------------------------------------------------------
 
-// TestPartialLoss_FolderFamily applies the same check to a folder corpus.
-// Folder shards rotate on indexWindowBytes rather than commits. The test holds
-// testReadSemMu while it changes and restores that package state.
+// TestPartialLoss_FolderFamily deletes the last shard of a folder family. A
+// small shardMax gives the family several shards. The first refresh must
+// repair the family: the search then finds each marker in exactly its file,
+// also after a second refresh. Unlike the Git matrix, it checks one damage
+// mode, no tombstone and no family snapshot.
 func TestPartialLoss_FolderFamily(t *testing.T) {
 	requireTools(t)
-	ctx := context.Background()
-
-	testReadSemMu.Lock()
-	restoreWindow := swapIndexWindowBytesForTest(4 * 1024)
-	defer func() {
-		restoreWindow()
-		testReadSemMu.Unlock()
-	}()
+	ctx := t.Context()
+	swapForTest(t, &shardMax, 4*1024)
 
 	root := t.TempDir()
 	var markers []plMarker
@@ -684,8 +676,8 @@ func TestPartialLoss_FolderFamily(t *testing.T) {
 
 	assertAll := func(label string) {
 		t.Helper()
-		// One refresh — the healing invocation — then read the family it
-		// published, exactly as the git matrix does.
+		// Run one refresh: after a damage, it must repair the family. Then
+		// read the family that it published, exactly as the git matrix does.
 		if st, err := ensureFolderCorpusFresh(ctx, plan); err != nil || st != corpusSearchable {
 			t.Errorf("%s: folder refresh: st=%v err=%v", label, st, err)
 			return
@@ -712,9 +704,9 @@ func TestPartialLoss_FolderFamily(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(shards) < 2 {
-		t.Fatalf("fixture must be multi-shard, got %d (indexWindowBytes swap failed?)", len(shards))
+		t.Fatalf("fixture must be multi-shard, got %d (shardMax swap failed?)", len(shards))
 	}
-	sort.Strings(shards)
+	slices.Sort(shards)
 	plRemove(t, shards[len(shards)-1])
 	assertAll("run 1 (must converge in one search)")
 	assertAll("run 2")
@@ -725,18 +717,23 @@ func TestPartialLoss_FolderFamily(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestPartialLoss_ContentCorruptionIsNotDetected records one damage mode that
-// the manifest does not detect: a byte flipped inside a shard's
-// content with the header intact. Size, document count, and shard membership
-// stay unchanged, so the publish manifest cannot find it. Content hashes would
-// be needed to detect this case.
+// the manifest does not detect: a flipped byte inside the content of a shard,
+// with the header intact. Size, document count, and shard membership stay the
+// same, so the publish manifest cannot find it. Only content hashes could
+// detect this case.
 //
-// This test records the current limit. If content hashes are added, move this
-// case into partialLossRows.
+// This test records the current limit. If Seek adds content hashes, move this
+// case into partialLossRows. The manifest checks each shard alone, so one
+// commit and one shard show the limit.
 func TestPartialLoss_ContentCorruptionIsNotDetected(t *testing.T) {
-	ctx := context.Background()
-	c := buildPartialLossCorpus(t, ctx)
-
+	requireTools(t)
+	ctx := t.Context()
 	const token = "PL_MARK_1"
+	repo := initGitRepo(t, "f1.go", "package main\n// "+token+"\n")
+	paths, plan := planGitTestCorpus(t, repo)
+	reindexGit(t, ctx, paths, plan)
+	c := &plCorpus{repoDir: repo, plan: plan}
+
 	shard := shardCarrying(t, c.plan.indexDir, token)
 	before, err := os.Stat(shard)
 	if err != nil {
@@ -771,7 +768,7 @@ func TestPartialLoss_ContentCorruptionIsNotDetected(t *testing.T) {
 			"If per-shard content hashes landed, move this row into "+
 			"partialLossRows and delete this test.", files)
 	}
-	// Documented limit: a live document silently disappeared, exit 0, no
+	// Documented limit: a live document disappeared with exit 0 and no
 	// warning, stable across searches.
 	if files, err := c.seekOnce(ctx, token); err != nil || len(files) != 0 {
 		t.Fatalf("behavior changed on the second search: files=%v err=%v", files, err)
@@ -783,8 +780,8 @@ func TestPartialLoss_ContentCorruptionIsNotDetected(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // plSoleCorpusIndexDir finds the one populated corpus under an isolated cache
-// root. Used only by the process-level row, which cannot share the in-process
-// corpus plan.
+// root. Only the process-level test uses it, because that test cannot share
+// the in-process corpus plan.
 func plSoleCorpusIndexDir(t *testing.T, cacheRoot string) string {
 	t.Helper()
 	entries, err := filepath.Glob(filepath.Join(cacheRoot, corporaDir, "*", "index"))
@@ -803,8 +800,9 @@ func plSoleCorpusIndexDir(t *testing.T, cacheRoot string) string {
 	return populated[0]
 }
 
-// TestPartialLoss_RouterContractOnRealProcess checks the process-level result:
-// exit 1, empty stderr, no match, and the same result on the next run.
+// TestPartialLoss_RouterContractOnRealProcess checks the process-level result
+// after a shard loss. It wants exit 0, the restored match on stdout, no
+// repair notice on stdout, and the same result on the next run.
 //
 // runCLIProcessWithCache starts the test binary as the CLI with an isolated
 // SEEK_CACHE_DIR. This lets the test check the exit code and output streams.
@@ -812,7 +810,6 @@ func plSoleCorpusIndexDir(t *testing.T, cacheRoot string) string {
 // The CLI also calls runOpportunisticGC after the search. The isolated cache
 // and .last-gc throttle keep that call inside the test fixture.
 func TestPartialLoss_RouterContractOnRealProcess(t *testing.T) {
-
 	requireTools(t)
 	cacheDir := t.TempDir()
 	repo := initGitRepo(t, "app.go", "package main\n// PL_CLI_BASE\n")
@@ -845,7 +842,7 @@ func TestPartialLoss_RouterContractOnRealProcess(t *testing.T) {
 		if !strings.Contains(r.stdout, "PL_CLI_STACK") {
 			t.Fatalf("%s: stdout must carry the restored match, got %q", run, r.stdout)
 		}
-		if strings.Contains(r.stdout, "Index was incomplete") {
+		if strings.Contains(r.stdout, "Index damage detected") {
 			t.Fatalf("%s: the repair notice must never reach stdout — the router "+
 				"pipes it, stdout=%q", run, r.stdout)
 		}

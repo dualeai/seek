@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -8,14 +9,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
-	"time"
 
-	"github.com/sourcegraph/zoekt/ignore"
 	"github.com/sourcegraph/zoekt/index"
 )
 
@@ -50,13 +49,21 @@ func TestNativeGitRecordParserAllocations(t *testing.T) {
 	}
 }
 
+// installFakeGit puts a shell script named git alone on PATH. FAKE_GIT_MODE
+// selects its reply. A mode with a malformed reply exits 0 after it, unless its
+// name ends in _hang. So only a reply check of Seek can fail the call. An
+// unknown mode exits 64.
 func installFakeGit(t *testing.T) {
 	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("fake Git fixture requires a POSIX shell")
-	}
 	binDir := t.TempDir()
 	script := `#!/bin/sh
+# The filter-driver read (git config --get-regexp) finds no driver, as in a
+# repository with none: exit 1 and print nothing.
+for arg do
+  if [ "$arg" = config ]; then
+    exit 1
+  fi
+done
 read_object_command() {
   IFS=' ' read -r verb object
 }
@@ -71,6 +78,10 @@ case "$FAKE_GIT_MODE" in
 		;;
 	version_newer)
 		printf 'git version 3.0.1\n'
+		exit 0
+		;;
+	version_snapshot)
+		printf 'git version 2.47.GIT\n'
 		exit 0
 		;;
 	batch_session_valid)
@@ -104,28 +115,34 @@ case "$FAKE_GIT_MODE" in
     printf '%s\n' "$$" > "$FAKE_GIT_PID_FILE"
     printf 'bad\0'
     trap 'exit 130' INT TERM
-    while :; do :; done
+    # Each hang loop ends with the test process. So a test that fails at the
+    # go test timeout leaves no busy process.
+    while kill -0 "$PPID" 2>/dev/null; do :; done
     ;;
   hang)
     printf '%s\n' "$$" > "$FAKE_GIT_PID_FILE"
     trap 'exit 130' INT TERM
-    while :; do :; done
+    while kill -0 "$PPID" 2>/dev/null; do :; done
     ;;
   batch_check_wrong_id)
     read_object_command
     printf '1123456789abcdef0123456789abcdef01234567 blob 3\n'
+    exit 0
     ;;
   batch_check_wrong_type)
     read_object_command
     printf '%s tree 3\n' "$object"
+    exit 0
     ;;
   batch_check_invalid_size)
     read_object_command
     printf '%s blob -1\n' "$object"
+    exit 0
     ;;
   batch_check_overflow)
     read_object_command
     printf '%s blob 999999999999999999999999999999999999\n' "$object"
+    exit 0
     ;;
   batch_check_limits)
     read_object_command
@@ -136,20 +153,15 @@ case "$FAKE_GIT_MODE" in
     printf '%s blob 104857601\n' "$second"
     exit 0
     ;;
-	batch_check_oversize)
-		read_object_command
-		IFS= read -r flush
-		test "$flush" = flush || exit 70
-		printf '%s blob 104857601\n' "$object"
-		exit 0
-		;;
   batch_check_missing)
     read_object_command
     printf '%s missing\n' "$object"
+    exit 0
     ;;
   batch_check_extra)
     read_object_command
     printf '%s blob 3\nEXTRA\n' "$object"
+    exit 0
     ;;
   batch_check_nonzero)
     read_object_command
@@ -162,6 +174,7 @@ case "$FAKE_GIT_MODE" in
     i=0
     while [ "$i" -lt 600 ]; do printf x; i=$((i + 1)); done
     printf '\n'
+    exit 0
     ;;
   batch_check_blocked_pipes)
     i=0
@@ -175,14 +188,17 @@ case "$FAKE_GIT_MODE" in
   batch_content_truncated)
     read_object_command
     printf '%s blob 3\nab' "$object"
+    exit 0
     ;;
   batch_content_bad_delimiter)
     read_object_command
     printf '%s blob 3\nabcX' "$object"
+    exit 0
     ;;
   batch_content_extra)
     read_object_command
     printf '%s blob 3\nabc\nEXTRA' "$object"
+    exit 0
     ;;
   batch_content_nonzero)
     read_object_command
@@ -193,6 +209,7 @@ case "$FAKE_GIT_MODE" in
   batch_content_wrong_size)
     read_object_command
     printf '%s blob 4\nabcd\n' "$object"
+    exit 0
     ;;
   batch_content_blocked_pipes)
     i=0
@@ -212,10 +229,11 @@ case "$FAKE_GIT_MODE" in
     printf '%s\n' "$$" > "$FAKE_GIT_PID_FILE"
     printf ':000000 100644 0000000000000000000000000000000000000000 0123456789abcdef0123456789abcdef01234567 A\0added.go\0'
     trap 'exit 130' INT TERM
-    while :; do :; done
+    while kill -0 "$PPID" 2>/dev/null; do :; done
     ;;
   diff_malformed)
     printf ':bad\0path\0'
+    exit 0
     ;;
 esac
 exit 64
@@ -255,13 +273,12 @@ func TestNativeGitBatchSessionFramesInfoContentsAndFlush(t *testing.T) {
 	}
 }
 
-func requireProcessGone(t *testing.T, pidFile string) {
+// requireProcessGone fails the test when the fake Git process of pidLine
+// still exists. Call it when the call that must kill and join the child
+// returns. The join reaps the child, so a live or zombie child is a defect.
+func requireProcessGone(t *testing.T, pidLine string) {
 	t.Helper()
-	raw, err := os.ReadFile(pidFile)
-	if err != nil {
-		t.Fatalf("read fake Git PID: %v", err)
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	pid, err := strconv.Atoi(strings.TrimSpace(pidLine))
 	if err != nil {
 		t.Fatalf("parse fake Git PID: %v", err)
 	}
@@ -269,17 +286,19 @@ func requireProcessGone(t *testing.T, pidFile string) {
 	if err != nil {
 		return
 	}
-	deadline := time.Now().Add(time.Second)
-	for {
-		err = process.Signal(syscall.Signal(0))
-		if err != nil {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("fake Git process %d is still running", pid)
-		}
-		time.Sleep(10 * time.Millisecond)
+	if err := process.Signal(syscall.Signal(0)); err == nil {
+		t.Fatalf("fake Git process %d is still running", pid)
 	}
+}
+
+// readFakeGitPID returns the PID line that the fake Git wrote to pidFile.
+func readFakeGitPID(t *testing.T, pidFile string) string {
+	t.Helper()
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("read fake Git PID: %v", err)
+	}
+	return string(raw)
 }
 
 func TestParseGitObjectID(t *testing.T) {
@@ -311,11 +330,12 @@ func TestRequireNativeGitVersion(t *testing.T) {
 		{mode: "version_old", wantErr: true},
 		{mode: "version_minimum"},
 		{mode: "version_newer"},
+		{mode: "version_snapshot"},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
 			installFakeGit(t)
 			t.Setenv("FAKE_GIT_MODE", tc.mode)
-			err := requireNativeGitVersion(t.Context(), t.TempDir())
+			err := requireNativeGitVersion(t.Context())
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("error=%v, want error=%t", err, tc.wantErr)
 			}
@@ -326,11 +346,35 @@ func TestRequireNativeGitVersion(t *testing.T) {
 	}
 	t.Run("unavailable", func(t *testing.T) {
 		t.Setenv("PATH", t.TempDir())
-		err := requireNativeGitVersion(t.Context(), t.TempDir())
+		err := requireNativeGitVersion(t.Context())
 		if !errors.Is(err, exec.ErrNotFound) {
 			t.Fatalf("error=%v, want Git executable failure", err)
 		}
 	})
+}
+
+func TestGitHonorsNoLazyFetch(t *testing.T) {
+	for version, want := range map[string]bool{
+		"git version 2.36.0":           false,
+		"git version 2.39.3":           false,
+		"git version 2.39.4":           true,
+		"git version 2.40.1":           false,
+		"git version 2.40.2":           true,
+		"git version 2.43.0":           false,
+		"git version 2.43.4":           true,
+		"git version 2.44.1":           true,
+		"git version 2.45.0":           true,
+		"git version 2.56.0":           true,
+		"git version 2.43.4.windows.1": true,
+		"git version 2.43.GIT":         false,
+		"git version 2.47.GIT":         true,
+		"git version 3.0.0":            true,
+		"git version garbage":          false,
+	} {
+		if got := gitHonorsNoLazyFetch([]byte(version + "\n")); got != want {
+			t.Errorf("%s: got %t, want %t", version, got, want)
+		}
+	}
 }
 
 func TestParseNativeGitTreeRecordModesAndBytePaths(t *testing.T) {
@@ -379,14 +423,15 @@ func TestSanitizedGitEnvSetsStableNonInteractiveValues(t *testing.T) {
 		"GIT_TERMINAL_PROMPT=1",
 		"GIT_DIR=/wrong",
 		"GIT_LITERAL_PATHSPECS=0",
+		"GIT_NO_LAZY_FETCH=0",
 	})
 	joined := strings.Join(env, "\n")
-	for _, want := range []string{"PATH=/bin", "LC_ALL=C", "LANG=C", "GIT_TERMINAL_PROMPT=0"} {
+	for _, want := range []string{"PATH=/bin", "LC_ALL=C", "LANG=C", "GIT_TERMINAL_PROMPT=0", "GIT_NO_LAZY_FETCH=1"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("environment %q lacks %q", joined, want)
 		}
 	}
-	for _, unwanted := range []string{"fr_FR", "GIT_DIR=", "GIT_LITERAL_PATHSPECS="} {
+	for _, unwanted := range []string{"fr_FR", "GIT_DIR=", "GIT_LITERAL_PATHSPECS=", "GIT_NO_LAZY_FETCH=0"} {
 		if strings.Contains(joined, unwanted) {
 			t.Fatalf("environment %q contains %q", joined, unwanted)
 		}
@@ -410,7 +455,7 @@ func TestBoundedGitStderrKeepsStartAndEnd(t *testing.T) {
 
 func TestNativeGitTreeStartFailure(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
-	err := readNativeGitTreeRecords(t.Context(), t.TempDir(), []string{"ls-tree"}, func([]gitTreeEntry) error { return nil })
+	err := readNativeGitTree(t.Context(), t.TempDir(), nativeTestOID, func([]gitTreeEntry) error { return nil })
 	if err == nil || !errors.Is(err, exec.ErrNotFound) {
 		t.Fatalf("error=%v, want Git executable failure", err)
 	}
@@ -420,7 +465,7 @@ func TestNativeGitTreeChecksLateExitAndBoundedStderr(t *testing.T) {
 	installFakeGit(t)
 	t.Setenv("FAKE_GIT_MODE", "valid_then_fail")
 	seen := 0
-	err := readNativeGitTreeRecords(t.Context(), t.TempDir(), []string{"ls-tree"}, func(entries []gitTreeEntry) error {
+	err := readNativeGitTree(t.Context(), t.TempDir(), nativeTestOID, func(entries []gitTreeEntry) error {
 		seen += len(entries)
 		return nil
 	})
@@ -437,7 +482,7 @@ func TestNativeGitTreeChecksLateExitAndBoundedStderr(t *testing.T) {
 func TestNativeGitTreeRejectsEarlyEOF(t *testing.T) {
 	installFakeGit(t)
 	t.Setenv("FAKE_GIT_MODE", "truncated")
-	err := readNativeGitTreeRecords(t.Context(), t.TempDir(), []string{"ls-tree"}, func([]gitTreeEntry) error { return nil })
+	err := readNativeGitTree(t.Context(), t.TempDir(), nativeTestOID, func([]gitTreeEntry) error { return nil })
 	if err == nil || !strings.Contains(err.Error(), "truncated Git tree record") {
 		t.Fatalf("error=%v", err)
 	}
@@ -448,32 +493,33 @@ func TestNativeGitTreeParseFailureKillsAndJoinsChild(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "pid")
 	t.Setenv("FAKE_GIT_PID_FILE", pidFile)
 	t.Setenv("FAKE_GIT_MODE", "malformed_then_hang")
-	err := readNativeGitTreeRecords(t.Context(), t.TempDir(), []string{"ls-tree"}, func([]gitTreeEntry) error { return nil })
+	err := readNativeGitTree(t.Context(), t.TempDir(), nativeTestOID, func([]gitTreeEntry) error { return nil })
 	if err == nil {
 		t.Fatal("malformed tree succeeded")
 	}
-	requireProcessGone(t, pidFile)
+	requireProcessGone(t, readFakeGitPID(t, pidFile))
 }
 
 func TestNativeGitTreeCancellationAndDeadline(t *testing.T) {
 	for _, test := range []struct {
-		name    string
-		context func() (context.Context, context.CancelFunc)
+		name string
+		// context gives the context and the call that ends it.
+		context func() (context.Context, func())
 		want    error
 	}{
 		{
 			name: "cancellation",
-			context: func() (context.Context, context.CancelFunc) {
+			context: func() (context.Context, func()) {
 				ctx, cancel := context.WithCancel(context.Background())
-				time.AfterFunc(500*time.Millisecond, cancel)
 				return ctx, cancel
 			},
 			want: context.Canceled,
 		},
 		{
 			name: "deadline",
-			context: func() (context.Context, context.CancelFunc) {
-				return context.WithTimeout(context.Background(), 500*time.Millisecond)
+			context: func() (context.Context, func()) {
+				ctx := newExpiringContext()
+				return ctx, ctx.expire
 			},
 			want: context.DeadlineExceeded,
 		},
@@ -483,14 +529,78 @@ func TestNativeGitTreeCancellationAndDeadline(t *testing.T) {
 			pidFile := filepath.Join(t.TempDir(), fmt.Sprintf("%s.pid", test.name))
 			t.Setenv("FAKE_GIT_PID_FILE", pidFile)
 			t.Setenv("FAKE_GIT_MODE", "hang")
-			ctx, cancel := test.context()
-			defer cancel()
-			err := readNativeGitTreeRecords(ctx, t.TempDir(), []string{"ls-tree"}, func([]gitTreeEntry) error { return nil })
+			ctx, end := test.context()
+			defer end()
+			pidLine := stopWhenFakeGitStarts(t, pidFile, end)
+			err := readNativeGitTree(ctx, t.TempDir(), nativeTestOID, func([]gitTreeEntry) error { return nil })
 			if !errors.Is(err, test.want) {
 				t.Fatalf("error=%v, want %v", err, test.want)
 			}
-			requireProcessGone(t, pidFile)
+			requireProcessGone(t, pidLine())
 		})
+	}
+}
+
+// stopWhenFakeGitStarts makes pidFile a FIFO and calls stop when the fake Git
+// writes its PID line to it. So a test cancels the child only after it runs,
+// however slow the host is. The returned function gives that line. The test
+// holds the FIFO open for reading and writing. So the fake Git never waits for
+// a reader, and the cleanup ends a read that no fake Git ends.
+func stopWhenFakeGitStarts(t *testing.T, pidFile string, stop func()) (pidLine func() string) {
+	t.Helper()
+	if err := syscall.Mkfifo(pidFile, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Linux and macOS open a FIFO for reading and writing with no wait.
+	fifo, err := os.OpenFile(pidFile, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := make(chan string, 1)
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		line, _ := bufio.NewReader(fifo).ReadString('\n')
+		lines <- line
+		stop()
+	}()
+	t.Cleanup(func() {
+		_, _ = fifo.Write([]byte("\n"))
+		<-exited
+		_ = fifo.Close()
+	})
+	return func() string {
+		select {
+		case line := <-lines:
+			return line
+		default:
+			t.Fatal("the fake Git wrote no PID, so the test did not stop it")
+			return ""
+		}
+	}
+}
+
+// expiringContext expires with context.DeadlineExceeded when the test calls
+// expire, as a timeout does, but at a point that the test chooses.
+type expiringContext struct {
+	context.Context
+	done chan struct{}
+	once sync.Once
+}
+
+func newExpiringContext() *expiringContext {
+	return &expiringContext{Context: context.Background(), done: make(chan struct{})}
+}
+
+func (c *expiringContext) expire()               { c.once.Do(func() { close(c.done) }) }
+func (c *expiringContext) Done() <-chan struct{} { return c.done }
+
+func (c *expiringContext) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
 	}
 }
 
@@ -498,81 +608,112 @@ func fakeTreeEntry(oid string) gitTreeEntry {
 	return gitTreeEntry{mode: "100644", oid: gitObjectID(oid), path: "file.go"}
 }
 
-func TestCheckNativeGitBlobsUsesBoundedChunksAndAcceptsDuplicates(t *testing.T) {
+// TestScanNativeGitDeltaChangesSplitsChunksAndAcceptsDuplicates scans a diff
+// whose new and old blobs fill more than one batch chunk, all with one blob ID
+// on each side. Each new blob info keeps its own path across the chunk
+// boundary, and the old blobs count their held bytes.
+func TestScanNativeGitDeltaChangesSplitsChunksAndAcceptsDuplicates(t *testing.T) {
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
-	path := filepath.Join(repoDir, "blob")
-	if err := os.WriteFile(path, []byte("abc"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	oid := gitOutputIn(t, repoDir, "hash-object", "-w", "blob")
-	entries := make([]gitTreeEntry, gitObjectBatchSize+1)
-	for i := range entries {
-		entries[i] = fakeTreeEntry(oid)
-	}
-	var chunks []int
-	err := checkNativeGitBlobs(t.Context(), repoDir, entries, func(infos []gitBlobInfo) error {
-		chunks = append(chunks, len(infos))
-		for _, info := range infos {
-			if info.size != 3 || info.entry.oid.String() != oid {
-				t.Fatalf("blob info=%+v", info)
-			}
+	for name, content := range map[string]string{"old": "abc", "new": "abcde"} {
+		if err := os.WriteFile(filepath.Join(repoDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
 		}
-		return nil
-	})
+	}
+	oldOID := gitObjectID(gitOutputIn(t, repoDir, "hash-object", "-w", "old"))
+	newOID := gitObjectID(gitOutputIn(t, repoDir, "hash-object", "-w", "new"))
+	// One more path than half a chunk: the new and old blobs fill two chunks.
+	diff := make([]gitDiffEntry, gitObjectBatchSize/2+1)
+	for i := range diff {
+		diff[i] = gitDiffEntry{oldMode: "100644", newMode: "100644", oldOID: oldOID, newOID: newOID, path: fmt.Sprintf("f%05d.go", i)}
+	}
+	infos, oldBytes, err := scanNativeGitDeltaChanges(t.Context(), repoDir, diff)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fmt.Sprint(chunks) != "[8192 1]" {
-		t.Fatalf("batch chunks=%v", chunks)
+	if len(infos) != len(diff) {
+		t.Fatalf("new blob infos=%d, want %d", len(infos), len(diff))
+	}
+	for i, info := range infos {
+		if info.size != 5 || info.entry.oid != newOID || info.entry.path != diff[i].path {
+			t.Fatalf("new blob info %d=%+v", i, info)
+		}
+	}
+	if want := int64(3 * len(diff)); oldBytes != want {
+		t.Fatalf("old bytes=%d, want %d", oldBytes, want)
 	}
 }
 
-func TestCheckNativeGitBlobReplyFailures(t *testing.T) {
-	for _, mode := range []string{
-		"batch_check_wrong_id",
-		"batch_check_wrong_type",
-		"batch_check_invalid_size",
-		"batch_check_overflow",
-		"batch_check_missing",
-		"batch_check_extra",
-		"batch_check_nonzero",
-		"batch_check_long_header",
+// startFakeNativeGitBatch starts a batch session on the fake Git of mode.
+func startFakeNativeGitBatch(t *testing.T, ctx context.Context, mode string) *nativeGitBatch {
+	t.Helper()
+	installFakeGit(t)
+	t.Setenv("FAKE_GIT_MODE", mode)
+	batch, err := startNativeGitBatch(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { batch.abort(nil) })
+	return batch
+}
+
+// TestNativeGitBatchCheckReplyFailures gives the batch a malformed reply. A bad
+// info reply fails check; extra output or a failed exit fails close. Either
+// way the call joins the child.
+func TestNativeGitBatchCheckReplyFailures(t *testing.T) {
+	for _, test := range []struct {
+		mode    string
+		atClose bool
+		want    string
+	}{
+		{mode: "batch_check_wrong_id", want: "returned object 1123456789abcdef0123456789abcdef01234567"},
+		{mode: "batch_check_wrong_type", want: `returned type "tree"`},
+		{mode: "batch_check_invalid_size", want: `invalid Git blob size "-1"`},
+		{mode: "batch_check_overflow", want: "invalid Git blob size"},
+		{mode: "batch_check_missing", want: "missing locally"},
+		{mode: "batch_check_extra", atClose: true, want: "unexpected trailing Git output"},
+		{mode: "batch_check_nonzero", atClose: true, want: "exit status 9"},
+		{mode: "batch_check_long_header", want: "header exceeds 512 bytes"},
 	} {
-		t.Run(mode, func(t *testing.T) {
-			installFakeGit(t)
-			t.Setenv("FAKE_GIT_MODE", mode)
-			err := checkNativeGitBlobs(
-				t.Context(),
-				t.TempDir(),
-				[]gitTreeEntry{fakeTreeEntry(nativeTestOID)},
-				func([]gitBlobInfo) error { return nil },
-			)
-			if err == nil {
-				t.Fatal("malformed cat-file info reply succeeded")
+		t.Run(test.mode, func(t *testing.T) {
+			batch := startFakeNativeGitBatch(t, t.Context(), test.mode)
+			_, err := batch.check([]gitTreeEntry{fakeTreeEntry(nativeTestOID)})
+			if test.atClose {
+				if err != nil {
+					t.Fatalf("check=%v, want the failure at close", err)
+				}
+				err = batch.close()
+			}
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v, want %q", err, test.want)
+			}
+			// Wait sets ProcessState: a nil value is a child that no call
+			// joined.
+			if batch.execCmd.ProcessState == nil {
+				t.Fatal("the failed batch did not join its child")
+			}
+			// A missing blob in a repository that is not a partial clone is
+			// damage: the error names the object and its path.
+			if test.mode == "batch_check_missing" && (!errors.Is(err, errGitBlobMissing) ||
+				!strings.Contains(err.Error(), nativeTestOID) || !strings.Contains(err.Error(), fakeTreeEntry(nativeTestOID).path)) {
+				t.Fatalf("error=%q, want errGitBlobMissing with the object ID and path", err)
 			}
 		})
 	}
 }
 
-func TestCheckNativeGitBlobExactLimitAndOversize(t *testing.T) {
-	swapDocumentContentLimitForTest(t, 100<<20)
-	installFakeGit(t)
-	t.Setenv("FAKE_GIT_MODE", "batch_check_limits")
-	secondOID := strings.Repeat("a", 40)
-	var infos []gitBlobInfo
-	err := checkNativeGitBlobs(
-		t.Context(),
-		t.TempDir(),
-		[]gitTreeEntry{
-			fakeTreeEntry(nativeTestOID),
-			fakeTreeEntry(secondOID),
-		},
-		func(chunk []gitBlobInfo) error {
-			infos = append(infos, chunk...)
-			return nil
-		},
-	)
+// TestNativeGitBatchCheckExactLimitAndOversize checks blobs of exactly the
+// document limit and one byte more: only the second is oversize.
+func TestNativeGitBatchCheckExactLimitAndOversize(t *testing.T) {
+	swapForTest(t, &documentContentLimit, 100<<20)
+	batch := startFakeNativeGitBatch(t, t.Context(), "batch_check_limits")
+	infos, err := batch.check([]gitTreeEntry{
+		fakeTreeEntry(nativeTestOID),
+		fakeTreeEntry(strings.Repeat("a", 40)),
+	})
+	if err == nil {
+		err = batch.close()
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -582,69 +723,45 @@ func TestCheckNativeGitBlobExactLimitAndOversize(t *testing.T) {
 	}
 }
 
-func TestScanNativeGitDeltaChangesCountsOversizeWithoutBytes(t *testing.T) {
-	swapDocumentContentLimitForTest(t, 100<<20)
-	installFakeGit(t)
-	t.Setenv("FAKE_GIT_MODE", "batch_check_oversize")
-	base := gitIndexBudget{candidates: 7, indexedBytes: 99}
-	diff := []gitDiffEntry{{
-		newMode: "100644",
-		newOID:  gitObjectID(nativeTestOID),
-		newPath: "oversize.bin",
-	}}
-	infos, got, consistent, err := scanNativeGitDeltaChanges(t.Context(), t.TempDir(), &ignore.Matcher{}, diff, base)
-	if err != nil || !consistent {
-		t.Fatalf("scan oversize delta: consistent=%t error=%v", consistent, err)
-	}
-	want := gitIndexBudget{candidates: 8, indexedBytes: 99}
-	if got != want || len(infos) != 1 || !infos[0].oversize || infos[0].entry.path != "oversize.bin" {
-		t.Fatalf("budget=%+v infos=%+v, want budget=%+v and one oversize file", got, infos, want)
-	}
-}
-
-func TestCheckNativeGitBlobsReadsAndWritesConcurrently(t *testing.T) {
-	installFakeGit(t)
-	t.Setenv("FAKE_GIT_MODE", "batch_check_blocked_pipes")
+// TestNativeGitBatchCheckReadsAndWritesConcurrently checks a full chunk
+// against a fake Git that fills its output pipe before it reads all requests:
+// check must read while it writes.
+func TestNativeGitBatchCheckReadsAndWritesConcurrently(t *testing.T) {
+	batch := startFakeNativeGitBatch(t, t.Context(), "batch_check_blocked_pipes")
 	entries := make([]gitTreeEntry, gitObjectBatchSize)
 	for i := range entries {
 		entries[i] = fakeTreeEntry(nativeTestOID)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	count := 0
-	err := checkNativeGitBlobs(ctx, t.TempDir(), entries, func(infos []gitBlobInfo) error {
-		count += len(infos)
-		return nil
-	})
-	if err != nil || count != gitObjectBatchSize {
-		t.Fatalf("infos=%d error=%v", count, err)
+	infos, err := batch.check(entries)
+	if err == nil {
+		err = batch.close()
+	}
+	if err != nil || len(infos) != gitObjectBatchSize {
+		t.Fatalf("infos=%d error=%v", len(infos), err)
 	}
 }
 
-func TestCheckNativeGitBlobCancellationKillsChild(t *testing.T) {
-	installFakeGit(t)
+// TestNativeGitBatchCheckCancellationKillsChild expires the context while the
+// fake Git hangs: check returns the context error, and the child is gone.
+func TestNativeGitBatchCheckCancellationKillsChild(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "batch.pid")
 	t.Setenv("FAKE_GIT_PID_FILE", pidFile)
-	t.Setenv("FAKE_GIT_MODE", "hang")
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-	err := checkNativeGitBlobs(
-		ctx,
-		t.TempDir(),
-		[]gitTreeEntry{fakeTreeEntry(nativeTestOID)},
-		func([]gitBlobInfo) error { return nil },
-	)
+	ctx := newExpiringContext()
+	defer ctx.expire()
+	pidLine := stopWhenFakeGitStarts(t, pidFile, ctx.expire)
+	batch := startFakeNativeGitBatch(t, ctx, "hang")
+	_, err := batch.check([]gitTreeEntry{fakeTreeEntry(nativeTestOID)})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error=%v, want deadline", err)
 	}
-	requireProcessGone(t, pidFile)
+	requireProcessGone(t, pidLine())
 }
 
 func TestReadNativeGitBlobsReadsExactContent(t *testing.T) {
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
-	// A binary blob larger than the probe comes first: the reader must drop the
-	// rest of it and still read the text blob after it exactly.
+	// A binary blob larger than the probe comes first. The reader must drop
+	// the rest of it and still read the text blob after it exactly.
 	binary := append([]byte{0}, bytes.Repeat([]byte("b"), 3*binaryProbeBytes)...)
 	text := []byte("abc\nwith content\n")
 	var infos []gitBlobInfo
@@ -684,7 +801,7 @@ func TestReadNativeGitBlobsReadsExactContent(t *testing.T) {
 }
 
 func TestReadNativeGitBlobsDoesNotStartChildForOversize(t *testing.T) {
-	swapDocumentContentLimitForTest(t, 100<<20)
+	swapForTest(t, &documentContentLimit, 100<<20)
 	t.Setenv("PATH", t.TempDir())
 	info := gitBlobInfo{entry: fakeTreeEntry(nativeTestOID), size: documentContentLimit + 1, oversize: true}
 	called := false
@@ -700,17 +817,22 @@ func TestReadNativeGitBlobsDoesNotStartChildForOversize(t *testing.T) {
 	}
 }
 
+// TestReadNativeGitBlobReplyFailures reads a 3-byte blob from a malformed
+// contents reply. Each reply fails the read with the error of its check.
 func TestReadNativeGitBlobReplyFailures(t *testing.T) {
-	for _, mode := range []string{
-		"batch_content_truncated",
-		"batch_content_bad_delimiter",
-		"batch_content_extra",
-		"batch_content_nonzero",
-		"batch_content_wrong_size",
+	for _, test := range []struct {
+		mode string
+		want string
+	}{
+		{mode: "batch_content_truncated", want: "body: unexpected EOF"},
+		{mode: "batch_content_bad_delimiter", want: "delimiter: got byte 0x58"},
+		{mode: "batch_content_extra", want: "unexpected trailing Git output"},
+		{mode: "batch_content_nonzero", want: "exit status 11"},
+		{mode: "batch_content_wrong_size", want: "size changed from 3 to 4"},
 	} {
-		t.Run(mode, func(t *testing.T) {
+		t.Run(test.mode, func(t *testing.T) {
 			installFakeGit(t)
-			t.Setenv("FAKE_GIT_MODE", mode)
+			t.Setenv("FAKE_GIT_MODE", test.mode)
 			info := gitBlobInfo{entry: fakeTreeEntry(nativeTestOID), size: 3}
 			err := readNativeGitBlobs(t.Context(), t.TempDir(), []gitBlobInfo{info}, func(document fileContent) error {
 				if document.weight > 0 {
@@ -718,8 +840,8 @@ func TestReadNativeGitBlobReplyFailures(t *testing.T) {
 				}
 				return nil
 			})
-			if err == nil {
-				t.Fatal("malformed batch reply succeeded")
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v, want %q", err, test.want)
 			}
 		})
 	}
@@ -732,10 +854,8 @@ func TestReadNativeGitBlobsReadsAndWritesConcurrently(t *testing.T) {
 	for i := range infos {
 		infos[i] = gitBlobInfo{entry: fakeTreeEntry(nativeTestOID), size: 3}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	count := 0
-	err := readNativeGitBlobs(ctx, t.TempDir(), infos, func(document fileContent) error {
+	err := readNativeGitBlobs(t.Context(), t.TempDir(), infos, func(document fileContent) error {
 		count++
 		readSemaphore.Release(document.weight)
 		return nil
@@ -750,14 +870,15 @@ func TestReadNativeGitBlobCancellationKillsChild(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "content.pid")
 	t.Setenv("FAKE_GIT_PID_FILE", pidFile)
 	t.Setenv("FAKE_GIT_MODE", "hang")
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
+	ctx := newExpiringContext()
+	defer ctx.expire()
+	pidLine := stopWhenFakeGitStarts(t, pidFile, ctx.expire)
 	info := gitBlobInfo{entry: fakeTreeEntry(nativeTestOID), size: 3}
 	err := readNativeGitBlobs(ctx, t.TempDir(), []gitBlobInfo{info}, func(fileContent) error { return nil })
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error=%v, want deadline", err)
 	}
-	requireProcessGone(t, pidFile)
+	requireProcessGone(t, pidLine())
 }
 
 func TestParseNativeGitDiffHeader(t *testing.T) {
@@ -779,7 +900,7 @@ func TestParseNativeGitDiffHeader(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if entry.oldMode != test.oldMode || entry.newMode != test.newMode || entry.oldOID.String() != test.oldOID || entry.newOID.String() != test.newOID || entry.oldPath != "a\tpath\n.go" {
+		if entry.oldMode != test.oldMode || entry.newMode != test.newMode || entry.oldOID.String() != test.oldOID || entry.newOID.String() != test.newOID || entry.path != "a\tpath\n.go" {
 			t.Fatalf("entry=%+v", entry)
 		}
 	}
@@ -797,13 +918,19 @@ func TestParseNativeGitDiffHeader(t *testing.T) {
 }
 
 func TestReadNativeGitDiffChecksLateExitAndMalformedOutput(t *testing.T) {
-	for _, mode := range []string{"diff_valid_then_fail", "diff_malformed"} {
-		t.Run(mode, func(t *testing.T) {
+	for _, test := range []struct {
+		mode string
+		want string
+	}{
+		{mode: "diff_valid_then_fail", want: "exit status 12"},
+		{mode: "diff_malformed", want: "malformed Git raw diff header"},
+	} {
+		t.Run(test.mode, func(t *testing.T) {
 			installFakeGit(t)
-			t.Setenv("FAKE_GIT_MODE", mode)
+			t.Setenv("FAKE_GIT_MODE", test.mode)
 			_, err := readNativeGitDiff(t.Context(), t.TempDir(), gitObjectID(nativeTestOID), gitObjectID(strings.Repeat("a", 40)), 10)
-			if err == nil {
-				t.Fatal("invalid diff succeeded")
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v, want %q", err, test.want)
 			}
 		})
 	}
@@ -818,7 +945,7 @@ func TestReadNativeGitDiffCapKillsChild(t *testing.T) {
 	if !errors.Is(err, errNativeGitDeltaTooLarge) {
 		t.Fatalf("error=%v, want delta cap", err)
 	}
-	requireProcessGone(t, pidFile)
+	requireProcessGone(t, readFakeGitPID(t, pidFile))
 }
 
 func TestReadNativeGitDiffCancellationKillsChild(t *testing.T) {
@@ -826,11 +953,12 @@ func TestReadNativeGitDiffCancellationKillsChild(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "diff-cancel.pid")
 	t.Setenv("FAKE_GIT_PID_FILE", pidFile)
 	t.Setenv("FAKE_GIT_MODE", "hang")
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
+	ctx := newExpiringContext()
+	defer ctx.expire()
+	pidLine := stopWhenFakeGitStarts(t, pidFile, ctx.expire)
 	_, err := readNativeGitDiff(ctx, t.TempDir(), gitObjectID(nativeTestOID), gitObjectID(strings.Repeat("a", 40)), 10)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error=%v, want deadline", err)
 	}
-	requireProcessGone(t, pidFile)
+	requireProcessGone(t, pidLine())
 }

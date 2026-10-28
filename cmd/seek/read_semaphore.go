@@ -6,22 +6,18 @@ import "golang.org/x/sync/semaphore"
 // stops at maxReadWeightBytes. The semaphore grants waiters in order, and
 // consumers keep their window weight while they wait for more documents. A
 // request near the whole budget would therefore wait forever, and every later
-// reader would wait behind it. A larger document still gets indexed; its memory
-// above the clamp is not counted.
+// reader would wait behind it. Seek still indexes a larger document, but the
+// semaphore does not count its memory above the clamp.
 func readWeight(size int64) int64 {
 	return min(size, maxReadWeightBytes)
 }
 
-// readSemaphore bounds document weight in flight across reader entry points.
-// Budget is readBudgetBytes (caps.go); each document takes readWeight of its
-// size. Acquire on the reader side; the Release contract lives on
-// fileContent.weight (indexer.go).
+// readSemaphore bounds the weight of the documents that are read and not yet
+// released, across every reader entry point. Its budget is readBudgetBytes
+// (caps.go), and each document takes readWeight of its size. The readers
+// acquire the weight; the doc of fileContent.weight (indexer.go) gives the
+// release rules.
 var readSemaphore = semaphore.NewWeighted(readBudgetBytes)
-
-// largeDocumentSemaphore bounds large shard and ctags jobs across all active
-// corpora. It limits concurrency only; every document still gets normal
-// content and symbol analysis.
-var largeDocumentSemaphore = semaphore.NewWeighted(int64(largeDocumentParallelism))
 
 // releaseFileContentWeights releases readSemaphore weight for every document
 // that carries non-zero weight. It is safe on nil, empty, and all-zero slices.

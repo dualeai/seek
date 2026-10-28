@@ -20,14 +20,13 @@ type gcCmdOptions struct {
 	sort   string
 }
 
-// runGCCommandCmd implements `seek gc`. Flags are parsed by Cobra and
-// passed in via opts. Flag validation and setup failures (cache root,
-// enumeration) return an error and exit non-zero; failures inside the
-// live sweep itself are logged + swallowed by runGC.
+// runGCCommandCmd implements `seek gc` with the flags that Cobra parsed
+// (opts). Flag validation and setup failures (cache root, enumeration, the
+// dry-run plan) return an error and exit non-zero. runGC logs the failures
+// inside the live sweep and does not return them.
 func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
-	// Validate flags before the throttle / NFS / enumeration work so an
-	// invalid --sort errors loudly even on runs that would otherwise
-	// silently no-op.
+	// Validate flags before the throttle, NFS, and enumeration work, so an
+	// invalid --sort fails even on a run that would otherwise do nothing.
 	sortKey, err := parseGCSortKey(opts.sort)
 	if err != nil {
 		return err
@@ -37,24 +36,25 @@ func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 	if err != nil {
 		return fmt.Errorf("resolve cache root: %w", err)
 	}
-	cfg := gcConfigFromEnv()
-	maxAge := cfg.maxAge
-	if opts.all {
-		maxAge = 0
-	}
 
 	corporaPath := filepath.Join(cacheRoot, corporaDir)
 	if opts.dryRun {
-		// An absent cache is an empty plan. Do not create it only to report that
-		// it contains no corpora.
+		// An absent cache is an empty plan. Do not create it only to report
+		// that it contains no corpora.
 		entries, err := enumerateCorpusDirs(corporaPath)
 		if err != nil {
 			return fmt.Errorf("enumerate corpora: %w", err)
 		}
-		if err := reportGCPlan(ctx, os.Stdout, cacheRoot, entries, time.Now().Add(-maxAge), sortKey); err != nil {
-			return err
+		evict, err := planCorpusEviction(cacheRoot, entries, opts.all, nil, false)
+		if err != nil {
+			return fmt.Errorf("compute the cache budget: %w", err)
 		}
-		reportProviderArtifactPlan(ctx, os.Stdout, cacheRoot, time.Now().Add(-maxAge))
+		reportGCPlan(ctx, os.Stdout, cacheRoot, entries, evict, sortKey)
+		before := time.Now().Add(-providerArtifactAge(opts.all))
+		reportDirPlan(os.Stdout, "compiled model files", agedProviderArtifacts(ctx, cacheRoot, before),
+			"Seek compiles these again when it needs them.")
+		reportDirPlan(os.Stdout, "retired runtimes", retiredRuntimes(cacheRoot, before),
+			"Seek extracts these again when a version that needs them runs.")
 		return nil
 	}
 
@@ -72,27 +72,27 @@ func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 		return fmt.Errorf("enumerate corpora: %w", err)
 	}
 
-	// Live eviction: reuse runGC for trash drain + lock + per-corpus
-	// rename/RemoveAll. `--force` and `--all` both bypass the throttle
-	// gate — `--all` is an explicit user wipe, not subject to .last-gc.
-	// writer is non-nil → runGC streams the per-corpus table to stdout
-	// (same shape as `--dry-run`, ACTION column shows real outcome).
+	// Live eviction: runGC takes the lock, empties the trash, and renames and
+	// removes each corpus. `--force` and `--all` both skip the throttle gate:
+	// `--all` is an explicit request, and .last-gc does not apply. writer is
+	// not nil, so runGC streams the table of the corpora to stdout. It has the
+	// form of `--dry-run`, and the ACTION column shows the real outcome.
 	runGC(ctx, gcOptions{
-		maxAge:       maxAge,
+		evictAll:     opts.all,
 		skipThrottle: opts.force || opts.all,
 		writer:       os.Stdout,
 		sortKey:      sortKey,
-	}, cfg.interval)
+	})
 	return nil
 }
 
-// gcTableHeader is the column row shared by `seek gc --dry-run` and live
-// `seek gc --force`. Widths align with the format string in renderGCRow.
+// gcTableHeader is the column row of `seek gc --dry-run` and of a live
+// `seek gc`. Its widths match the format string in emitGCRow.
 const gcTableHeader = "  CORPUS      ROOT                                                  AGE     SIZE    ACTION"
 
-// gcTableStats accumulates the counters behind the table summary line,
-// shared by the dry-run and live paths so the two summaries cannot drift —
-// they deliberately differ only in the verb ("evictable" vs "evicted").
+// gcTableStats holds the counters of the table summary line. The dry-run and
+// live paths share it, so their summaries differ only in the verb
+// ("evictable" or "evicted").
 type gcTableStats struct {
 	totalBytes int64
 	evictBytes int64
@@ -106,19 +106,18 @@ func (s *gcTableStats) summary(w io.Writer, verb string) {
 }
 
 // gcSortKey selects the row order of the `seek gc` table. The zero value
-// (sortByName) preserves the historical hash order shared by the dry-run
-// and live paths — and is what the opportunistic path implicitly uses.
+// (sortByName) keeps the hash order of the dry-run and live paths. The
+// opportunistic path uses it too.
 type gcSortKey uint8
 
 const (
-	sortByName gcSortKey = iota // corpus hash — historical, deterministic
-	sortByAge                   // oldest .used first — matches eviction priority
-	sortBySize                  // largest first — "what is eating my disk"
+	sortByName gcSortKey = iota // corpus hash, a fixed order
+	sortByAge                   // oldest .used first, the eviction order
+	sortBySize                  // largest first
 )
 
-// gcSortValues is the single source for the --sort accepted values: the
-// parse error message and the shell-completion list both derive from it, so
-// adding a key can't leave completions or the error text stale.
+// gcSortValues lists the values that --sort accepts. The parse error and the
+// shell completion both read it, so a new key reaches both.
 var gcSortValues = []string{"name", "age", "size"}
 
 func parseGCSortKey(s string) (gcSortKey, error) {
@@ -133,20 +132,19 @@ func parseGCSortKey(s string) (gcSortKey, error) {
 	return 0, fmt.Errorf("--sort must be one of %s, got %q", strings.Join(gcSortValues, "|"), s)
 }
 
-// gcRow is one materialized table row: the corpus entry plus the size and
-// display info renderGCRow needs. Sorted views (--sort=age|size) build all
-// rows up front so they can be ordered before rendering; the default name
-// order builds one transient row per entry.
+// gcRow is one table row: the corpus entry, and the size and display info
+// that emitGCRow needs. A sorted view (--sort=age|size) builds all rows
+// first, so it can sort them before it renders them. The default name order
+// builds one short-lived row per entry.
 type gcRow struct {
 	entry corpusDirEntry
 	size  int64
 	info  corpusDisplayInfo
 }
 
-// measureGCRow captures a corpus's size + display info for one table row.
-// Both are read before eviction — once the dir is renamed to .trash the
-// original path is gone (corpusDirSize would return 0, readCorpusDisplayInfo
-// [empty]).
+// measureGCRow reads a corpus's size and display info for one table row. It
+// reads both before the eviction. After the rename to .trash, the old path is
+// gone: corpusDirSize would return 0, and readCorpusDisplayInfo [empty].
 func measureGCRow(e corpusDirEntry) gcRow {
 	return gcRow{
 		entry: e,
@@ -155,9 +153,9 @@ func measureGCRow(e corpusDirEntry) gcRow {
 	}
 }
 
-// buildGCRows materializes a row for every entry. ctx is honored between
-// entries only — corpusDirSize walks are uncancelable — and on cancellation
-// the rows built so far are returned.
+// buildGCRows builds a row for every entry. It checks ctx only between
+// entries, because a corpusDirSize walk cannot stop. On a cancel, it returns
+// the rows that it built.
 func buildGCRows(ctx context.Context, entries []corpusDirEntry) []gcRow {
 	rows := make([]gcRow, 0, len(entries))
 	for _, e := range entries {
@@ -169,9 +167,9 @@ func buildGCRows(ctx context.Context, entries []corpusDirEntry) []gcRow {
 	return rows
 }
 
-// sortGCRows orders rows for the table. Callers pass rows already in hash
-// order (enumeration output is hash-sorted), so the stable sort gives
-// equal-size / equal-age rows a deterministic hash tiebreak.
+// sortGCRows orders rows for the table. Callers give rows in hash order
+// (enumerateCorpusDirs). So the stable sort orders rows of equal size or
+// equal age by hash.
 func sortGCRows(rows []gcRow, key gcSortKey) {
 	switch key {
 	case sortBySize:
@@ -181,20 +179,6 @@ func sortGCRows(rows []gcRow, key gcSortKey) {
 	case sortByName:
 		// Input is already hash-sorted.
 	}
-}
-
-// renderGCRow prints one corpus row using the column layout in gcTableHeader.
-// Display info is passed in (not computed here) so live callers can capture
-// it before eviction.
-func renderGCRow(w io.Writer, e corpusDirEntry, info corpusDisplayInfo, size int64, now time.Time, action string) {
-	age := now.Sub(e.usedAt)
-	_, _ = fmt.Fprintf(w, "  %-10s  %-52s  %-6s  %-6s  %s\n",
-		truncateHash(e.name),
-		formatRoot(info, 52),
-		humanDuration(age),
-		humanBytes(size),
-		action,
-	)
 }
 
 // printGCTableBanner prints the banner shared by the dry-run and live tables,
@@ -208,22 +192,28 @@ func printGCTableBanner(w io.Writer, cacheRoot string, n int) {
 	_, _ = fmt.Fprintln(w, gcTableHeader)
 }
 
-// predictGCAction is the dry-run counterpart to evictIfExpired: it reports
-// what the TTL decision would be (kept | evicted) without taking a lock or
-// mutating anything. Sharing the gcRowResult vocabulary with the live path
-// keeps the two tables byte-aligned.
-func predictGCAction(e corpusDirEntry, cutoff time.Time) gcRowResult {
-	if e.usedAt.After(cutoff) {
+// predictGCAction is the dry-run form of evictIfPlanned. It reports what the
+// eviction plan would do (kept or evicted), with no lock and no change. It
+// uses the gcRowResult words of the live path, so the two tables align.
+func predictGCAction(e corpusDirEntry, evict map[corpusID]bool) gcRowResult {
+	if !evict[e.name] {
 		return gcRowResult{action: actionKept}
 	}
 	return gcRowResult{action: actionEvicted}
 }
 
-// emitGCRow renders one row and folds it into the running stats, using the
-// same gcRowResult on both paths so the "counts as evicted" predicate lives
-// in exactly one place.
+// emitGCRow prints one corpus row in the column layout of gcTableHeader and
+// adds it to stats. The row holds the display info, so a live caller reads it
+// before the eviction (measureGCRow). Both paths give it a gcRowResult, so the
+// rule of what counts as evicted is in one place.
 func emitGCRow(w io.Writer, stats *gcTableStats, r gcRow, now time.Time, res gcRowResult) {
-	renderGCRow(w, r.entry, r.info, r.size, now, res.String())
+	_, _ = fmt.Fprintf(w, "  %-10s  %-*s  %-6s  %-6s  %s\n",
+		truncateHash(r.entry.name),
+		gcRootWidth, formatRoot(r.info),
+		humanDuration(now.Sub(r.entry.usedAt)),
+		humanBytes(r.size),
+		res.String(),
+	)
 	stats.totalBytes += r.size
 	stats.rendered++
 	if res.action == actionEvicted || res.action == actionTrashed {
@@ -232,36 +222,35 @@ func emitGCRow(w io.Writer, stats *gcTableStats, r gcRow, now time.Time, res gcR
 	}
 }
 
-// reportGCPlan prints the dry-run table. No filesystem mutation. Display
-// path is recovered from each corpus's first zoekt shard
-// (Repository.Source) — see readCorpusDisplayInfo. Empty / crashed corpora
-// without shards display as "[empty]"; corpora whose source root has been
-// deleted on disk show as "[gone] <path>".
+// reportGCPlan prints the dry-run table and changes nothing on disk. The
+// displayed path is Repository.Source of a committed Zoekt shard of each
+// corpus, else of an uncommitted one (readCorpusDisplayInfo). A corpus with
+// no shard (empty or crashed) shows as "[empty]". A corpus whose source root
+// is gone from disk shows as "[gone] <path>".
 //
-// Vocab is past tense (`kept`/`evicted`) — same words as the live path
-// (`seek gc --force`), interpreted as "what would happen". The live path
-// (runGC streaming) uses the same renderGCRow + column layout, so dry-run
-// and live output stay byte-aligned across columns.
+// The rows use the words of the live path (`seek gc --force`), `kept` and
+// `evicted`, for what would happen. The live path (runGC) uses the same
+// emitGCRow and columns, so the dry-run and live output line up.
 //
-// Per-row cost is dominated by corpusDirSize (filepath.WalkDir subtree walk
-// per corpus) plus readCorpusDisplayInfo (one zoekt shard metadata read). At
-// ~700 corpora a cold sorted view takes ~1s; the default name order streams
-// rows, so latency is amortized. A bounded errgroup over the per-row work
-// remains the fix if sorted views grow too slow.
+// Most of the time of a row is corpusDirSize (a filepath.WalkDir walk of the
+// corpus) and readCorpusDisplayInfo (one read of Zoekt shard metadata). The
+// plan measures the rows one after another. At about 700 corpora, a cold
+// sorted view takes about 1 s. The default name order prints each row as
+// soon as it measures it.
 //
-// The summary counts the rows actually rendered — both branches stop early
-// on ctx cancellation, and the summary must describe what was measured.
-func reportGCPlan(ctx context.Context, w io.Writer, cacheRoot string, entries []corpusDirEntry, cutoff time.Time, sortKey gcSortKey) error {
+// The summary counts the rendered rows. Both branches stop early on a cancel
+// of ctx, and the summary tells what the plan measured.
+func reportGCPlan(ctx context.Context, w io.Writer, cacheRoot string, entries []corpusDirEntry, evict map[corpusID]bool, sortKey gcSortKey) {
 	printGCTableBanner(w, cacheRoot, len(entries))
 	if len(entries) == 0 {
-		return nil
+		return
 	}
 	now := time.Now()
 	stats := &gcTableStats{}
-	emit := func(r gcRow) { emitGCRow(w, stats, r, now, predictGCAction(r.entry, cutoff)) }
+	emit := func(r gcRow) { emitGCRow(w, stats, r, now, predictGCAction(r.entry, evict)) }
 	if sortKey == sortByName {
-		// Default order streams each row right after its own measurement —
-		// incremental output on large caches, no frozen header.
+		// The default order prints each row after its own measurement, so a
+		// large cache shows rows at once and not only the header.
 		for _, e := range entries {
 			if ctx.Err() != nil {
 				break
@@ -269,7 +258,7 @@ func reportGCPlan(ctx context.Context, w io.Writer, cacheRoot string, entries []
 			emit(measureGCRow(e))
 		}
 	} else {
-		// Sorted views must measure everything before rendering anything.
+		// A sorted view measures all rows before it renders one.
 		rows := buildGCRows(ctx, entries)
 		sortGCRows(rows, sortKey)
 		for _, r := range rows {
@@ -277,16 +266,18 @@ func reportGCPlan(ctx context.Context, w io.Writer, cacheRoot string, entries []
 		}
 	}
 	stats.summary(w, "evictable")
-	return nil
 }
 
-// formatRoot renders a corpusDisplayInfo for the table, marking missing
-// sources with [gone] and truncating overlong paths from the LEFT so the
-// recognizable basename always survives. Control characters are stripped
-// (an interior newline is legal in POSIX paths but would break the
-// one-row-per-corpus layout) and cuts land on rune boundaries so multibyte
-// paths never render orphan continuation bytes.
-func formatRoot(info corpusDisplayInfo, width int) string {
+// gcRootWidth is the byte width of the ROOT column of gcTableHeader.
+const gcRootWidth = 52
+
+// formatRoot renders a corpusDisplayInfo for the ROOT column. It marks a
+// missing source with [gone]. It cuts a path longer than gcRootWidth from the
+// left and keeps its end. So a base name that fits in the kept bytes stays
+// whole. It removes control characters: a newline is valid in a POSIX path,
+// but it would break the layout of one row per corpus. The cut is on a rune
+// boundary, so a multibyte path never shows a partial rune.
+func formatRoot(info corpusDisplayInfo) string {
 	if info.source == "" {
 		return "[empty]"
 	}
@@ -294,67 +285,54 @@ func formatRoot(info corpusDisplayInfo, width int) string {
 	if info.gone {
 		path = "[gone] " + path
 	}
-	if len(path) <= width {
+	if len(path) <= gcRootWidth {
 		return path
 	}
 	const ellipsis = "..."
-	keep := width - len(ellipsis)
-	if keep <= 0 {
-		return path[:backupToRuneBoundary([]byte(path), width)]
-	}
+	keep := gcRootWidth - len(ellipsis)
 	cut := len(path) - keep
-	// Advance to the next rune boundary so the cut never splits a rune
-	// (keeps at most `keep` bytes, never more).
+	// Move to the next rune boundary, so the cut never splits a rune. It
+	// keeps at most `keep` bytes.
 	for cut < len(path) && path[cut]&0xC0 == 0x80 {
 		cut++
 	}
 	return ellipsis + path[cut:]
 }
 
-// sanitizeCell strips control characters from a table cell — stripRune's
-// policy (C0 controls, DEL, bidi controls) plus tab, which would break
-// column alignment. Clean strings (the overwhelming common case) are
-// returned without allocation.
+// sanitizeCell removes control characters from a table cell. It removes what
+// stripRune removes (C0 and C1 controls, DEL, bidi controls, line and
+// paragraph separators), and also tab, which would break the column
+// alignment. A clean string (the usual case) returns with no allocation.
 func sanitizeCell(s string) string {
-	clean := true
-	for _, r := range s {
-		if r == '\t' || stripRune(r) {
-			clean = false
-			break
-		}
-	}
-	if clean {
+	drop := func(r rune) bool { return r == '\t' || stripRune(r) }
+	if !strings.ContainsFunc(s, drop) {
 		return s
 	}
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range s {
-		if r == '\t' || stripRune(r) {
-			continue
+		if !drop(r) {
+			b.WriteRune(r)
 		}
-		b.WriteRune(r)
 	}
 	return b.String()
 }
 
+// truncateHash fits a corpus hash in the 10-byte CORPUS column: a longer hash
+// keeps its first 5 and last 2 characters around "...".
 func truncateHash(h corpusID) string {
 	s := string(h)
 	if len(s) <= 10 {
 		return s
 	}
-	var b strings.Builder
-	b.Grow(10)
-	b.WriteString(s[:5])
-	b.WriteString("...")
-	b.WriteString(s[len(s)-2:])
-	return b.String()
+	return s[:5] + "..." + s[len(s)-2:]
 }
 
 func humanDuration(d time.Duration) string {
 	switch {
 	case d < 0:
-		// Future .used (clock skew, cp -p restore, NTP step): render as
-		// fresh, not as a negative raw-second blob.
+		// A .used time in the future (clock skew, a cp -p restore, an NTP
+		// step) shows as new, not as a negative number of seconds.
 		return "0s"
 	case d >= 24*time.Hour:
 		return fmt.Sprintf("%dd", int(d/(24*time.Hour)))
@@ -367,9 +345,9 @@ func humanDuration(d time.Duration) string {
 	}
 }
 
-// humanBytes keeps every value within the 6-char SIZE column (TB is the
-// top tier — good through 9999TB): one decimal while it fits ("1.5GB",
-// "99.9GB"), integer past that ("154GB", "1023GB").
+// humanBytes keeps every value within the 6-character SIZE column, up to
+// 9999TB. It shows one decimal while it fits ("1.5GB", "99.9GB"), and an
+// integer after that ("154GB", "1023GB").
 func humanBytes(n int64) string {
 	const (
 		kb = 1024
@@ -391,9 +369,9 @@ func humanBytes(n int64) string {
 	}
 }
 
-// humanBytesUnit formats with one decimal, dropping it when the result
-// would overflow the 6-char cell (covers both ≥100 units and the %.1f
-// rounding edge where 99.96 would render "100.0").
+// humanBytesUnit formats with one decimal. It drops the decimal when the
+// result would not fit the 6-character cell: at 100 units or more, and when
+// %.1f rounds 99.96 to "100.0".
 func humanBytesUnit(n, unit int64, suffix string) string {
 	s := fmt.Sprintf("%.1f%s", float64(n)/float64(unit), suffix)
 	if len(s) > 6 {
@@ -402,6 +380,8 @@ func humanBytesUnit(n, unit int64, suffix string) string {
 	return s
 }
 
+// corpusDirSize returns the bytes of the files under path. It skips temporary
+// build directories and the size ledger file.
 func corpusDirSize(path string) int64 {
 	var total int64
 	_ = filepath.WalkDir(path, func(_ string, d fs.DirEntry, err error) error {
@@ -410,10 +390,14 @@ func corpusDirSize(path string) int64 {
 		}
 		if d.IsDir() {
 			// Skip in-progress temp build dirs so the SIZE column reports the
-			// honest steady-state footprint, not a transient 2x during a build.
+			// size between builds, not the temporary extra size of a build.
 			if strings.HasPrefix(d.Name(), buildDirPrefix) {
 				return fs.SkipDir
 			}
+			return nil
+		}
+		if d.Name() == corpusSizeFile {
+			// The ledger entry describes the corpus; it is not part of it.
 			return nil
 		}
 		info, err := d.Info()
@@ -426,30 +410,26 @@ func corpusDirSize(path string) int64 {
 	return total
 }
 
-// reportProviderArtifactPlan lists the compiled model files a collection would
-// remove. Without it a plan under-reports the deletion, because those files live
-// outside the corpus table.
-func reportProviderArtifactPlan(ctx context.Context, w io.Writer, cacheRoot string, cutoff time.Time) {
-	due := agedProviderArtifacts(ctx, cacheRoot, cutoff)
+// reportDirPlan lists the directories outside the corpus table that a
+// collection would remove (sweepAgedProviderArtifacts, sweepRetiredRuntimes).
+// Without it, a plan would not show all that GC deletes. It prints nothing
+// when no directory is due.
+func reportDirPlan(w io.Writer, label string, due []string, footer string) {
 	if len(due) == 0 {
 		return
 	}
-	// Measure once per entry. corpusDirSize walks the whole subtree, and that walk
-	// dominates the cost of a plan, so the total and the rows must share it.
+	// Measure each entry once. corpusDirSize walks the whole subtree, and
+	// that walk is most of the cost of a plan, so the total and the rows share
+	// it.
 	sizes := make([]int64, len(due))
 	var total int64
-	for i, entry := range due {
-		sizes[i] = corpusDirSize(entry.path())
+	for i, path := range due {
+		sizes[i] = corpusDirSize(path)
 		total += sizes[i]
 	}
-	_, _ = fmt.Fprintf(
-		w,
-		"\ncompiled model files to remove: %d (%s)\n",
-		len(due),
-		humanBytes(total),
-	)
-	for i, entry := range due {
-		_, _ = fmt.Fprintf(w, "  %s  %s\n", humanBytes(sizes[i]), entry.path())
+	_, _ = fmt.Fprintf(w, "\n%s to remove: %d (%s)\n", label, len(due), humanBytes(total))
+	for i, path := range due {
+		_, _ = fmt.Fprintf(w, "  %s  %s\n", humanBytes(sizes[i]), path)
 	}
-	_, _ = fmt.Fprintf(w, "Seek compiles these again when it needs them.\n")
+	_, _ = fmt.Fprintln(w, footer)
 }

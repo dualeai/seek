@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -12,13 +14,13 @@ import (
 	"github.com/spf13/pflag"
 )
 
-// TestSplicePassthroughSeparator locks the contract that determines
-// when an unknown leading `-token` is a Zoekt query (must pass through
-// to pflag as positional via `--`) vs a typo in a known flag (must
-// surface pflag's "unknown flag" error). Every case is named so the
-// matrix doubles as documentation.
+// TestSplicePassthroughSeparator checks when splicePassthroughSeparator
+// reads an unknown leading `-token` as a Zoekt query. Such a token goes to
+// pflag as a positional argument after a new `--`. An unknown `--token` stays
+// a typo of a known flag, for which pflag gives its "unknown flag" error.
+// Each case has a name, so the table also documents the rule.
 func TestSplicePassthroughSeparator(t *testing.T) {
-	flags := newRootCmd().Flags()
+	flags := newRootCmd(newLateOnSemanticModel).Flags()
 	cases := []struct {
 		name string
 		in   []string
@@ -133,11 +135,10 @@ func TestSplicePassthroughSeparator(t *testing.T) {
 	}
 }
 
-// newQuietRootCmd builds the root command with stdout/stderr silenced
-// so test runs don't leak Cobra's auto-generated usage prints. Shared
-// boilerplate across the TestRootCmd_* + TestSuggestFlagError_* cases.
+// newQuietRootCmd builds the root command with its output and error output
+// discarded, so a test does not print Cobra's usage text.
 func newQuietRootCmd() *cobra.Command {
-	root := newRootCmd()
+	root := newRootCmd(newLateOnSemanticModel)
 	root.SetOut(io.Discard)
 	root.SetErr(io.Discard)
 	return root
@@ -167,70 +168,123 @@ func TestRootCmd_RejectsNegativeLimit(t *testing.T) {
 	}
 }
 
-func TestDefaultSearchRunConfigBindsAcceptancePolicies(t *testing.T) {
-	config := defaultSearchRunConfig(defaultSearchPolicy())
-	if config.newModel == nil || config.newAcceptancePolicies == nil {
-		t.Fatalf("default run config is incomplete: %+v", config)
-	}
-	if config.rerankAcceptance != nil || config.hybridAcceptance != nil {
-		t.Fatalf("default run config resolved acceptance eagerly: %+v", config)
-	}
-	policies := config.newAcceptancePolicies()
-	if policies.rerank == nil || policies.hybrid == nil {
-		t.Fatalf("default acceptance policies are incomplete: %+v", policies)
-	}
-	if policies.rerank.route != "lexical-rerank" ||
-		policies.hybrid.route != "joined" {
-		t.Fatalf(
-			"acceptance routes=%q and %q",
-			policies.rerank.route,
-			policies.hybrid.route,
-		)
-	}
-	if policies.rerank.minimumMeanMaxSim != 0.575 ||
-		policies.hybrid.minimumMeanMaxSim != 0.600 {
-		t.Fatalf(
-			"acceptance minimums=%g and %g",
-			policies.rerank.minimumMeanMaxSim,
-			policies.hybrid.minimumMeanMaxSim,
-		)
-	}
+// contextMarkerLine is the line of the marker in the file of
+// newContextLinesFolder. The file has contextMarkerLine-1 lines on each side
+// of the marker.
+const contextMarkerLine = 1051
 
-	lexical := defaultSearchRunConfig(lexicalOnlySearchPolicy())
-	if lexical.newModel != nil || lexical.rerankAcceptance != nil ||
-		lexical.hybridAcceptance != nil || lexical.newAcceptancePolicies != nil {
-		t.Fatalf("lexical-only run config started model policy: %+v", lexical)
+// newContextLinesFolder writes a folder with one text file of
+// 2*contextMarkerLine-1 lines. The marker is on contextMarkerLine, and each
+// other line holds its own word.
+func newContextLinesFolder(t *testing.T) string {
+	t.Helper()
+	requireTools(t)
+	setTestUserCache(t)
+	var content strings.Builder
+	for line := 1; line < 2*contextMarkerLine; line++ {
+		if line == contextMarkerLine {
+			content.WriteString("zqcontextmarker\n")
+			continue
+		}
+		fmt.Fprintf(&content, "zqline%04d\n", line)
+	}
+	folder := t.TempDir()
+	writeFileAt(t, folder, "lines.txt", content.String())
+	return folder
+}
+
+// printedLineNumbers runs the root command with flags and a text search for
+// the marker in folder. It returns the line numbers that the output prints.
+func printedLineNumbers(t *testing.T, folder string, flags ...string) ([]int, error) {
+	t.Helper()
+	root := newQuietRootCmd()
+	args := append([]string{"--lexical-only"}, flags...)
+	root.SetArgs(append(args, "zqcontextmarker", folder))
+	out, err := captureStdout(t, root.Execute)
+	if err != nil {
+		return nil, err
+	}
+	// printedResults skips text before the first header, so read that text
+	// here: each printed line must be a header or a numbered line.
+	if out != "" && !strings.HasPrefix(out, "## ") {
+		t.Fatalf("output starts with text before the first header:\n%s", out)
+	}
+	var numbers []int
+	for _, result := range printedResults(out) {
+		for _, line := range result.body {
+			field, _, _ := strings.Cut(line, " ")
+			number, convErr := strconv.Atoi(field)
+			if convErr != nil {
+				t.Fatalf("output line %q has no line number:\n%s", line, out)
+			}
+			numbers = append(numbers, number)
+		}
+	}
+	return numbers, nil
+}
+
+// assertLineSpan fails the test unless numbers holds each line from first to
+// last once, in order.
+func assertLineSpan(t *testing.T, args []string, numbers []int, first, last int) {
+	t.Helper()
+	want := make([]int, 0, last-first+1)
+	for number := first; number <= last; number++ {
+		want = append(want, number)
+	}
+	if slices.Equal(numbers, want) {
+		return
+	}
+	span := "no lines"
+	if len(numbers) > 0 {
+		span = fmt.Sprintf("%d lines from %d to %d", len(numbers), numbers[0], numbers[len(numbers)-1])
+	}
+	t.Fatalf("%v: printed %s, want lines %d to %d", args, span, first, last)
+}
+
+// TestContextLinesHaveNoUpperBound runs `seek -C 1000` and `seek -A 1000`:
+// the output prints 1000 lines on each side that the flag selects.
+func TestContextLinesHaveNoUpperBound(t *testing.T) {
+	folder := newContextLinesFolder(t)
+	for _, tc := range []struct {
+		args        []string
+		first, last int
+	}{
+		{args: []string{"-C", "1000"}, first: contextMarkerLine - 1000, last: contextMarkerLine + 1000},
+		{args: []string{"-A", "1000"}, first: contextMarkerLine, last: contextMarkerLine + 1000},
+	} {
+		got, err := printedLineNumbers(t, folder, tc.args...)
+		if err != nil {
+			t.Fatalf("%v: %v", tc.args, err)
+		}
+		assertLineSpan(t, tc.args, got, tc.first, tc.last)
 	}
 }
 
+// TestSelectSearchConfig runs the root command with the context flags. The
+// output prints the lines that each flag selects, and a bad flag value stops
+// the command before the search.
 func TestSelectSearchConfig(t *testing.T) {
+	folder := newContextLinesFolder(t)
 	cases := []struct {
-		name      string
-		args      []string
-		wantLines int
-		wantAfter bool
-		wantErr   string
+		name          string
+		args          []string
+		before, after int
+		wantErr       string
 	}{
-		{name: "default", wantLines: searchContextLines},
-		{name: "after", args: []string{"-A", "360"}, wantLines: 360, wantAfter: true},
-		{name: "context", args: []string{"--context=12"}, wantLines: 12},
-		{name: "zero context", args: []string{"-C", "0"}, wantLines: 0},
-		{name: "too much context", args: []string{"-C", "513"}, wantErr: "between 0 and 512"},
-		{name: "negative after", args: []string{"-A=-1"}, wantErr: "between 0 and 512"},
+		// The README gives up to 3 lines on each side by default.
+		{name: "default", before: 3, after: 3},
+		{name: "after", args: []string{"-A", "360"}, after: 360},
+		{name: "context", args: []string{"--context=12"}, before: 12, after: 12},
+		{name: "zero context", args: []string{"-C", "0"}},
+		{name: "large context", args: []string{"-C", "513"}, before: 513, after: 513},
+		{name: "negative after", args: []string{"-A=-1"}, wantErr: "must be 0 or more"},
+		{name: "negative context", args: []string{"--context=-1"}, wantErr: "must be 0 or more"},
 		{name: "mixed modes", args: []string{"-A", "2", "-C", "3"}, wantErr: "cannot be used together"},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			flags := &cliFlags{limit: 20, maxMatches: 1, search: defaultSearchConfig()}
-			cmd := &cobra.Command{}
-			cmd.Flags().IntVarP(&flags.afterContext, "after-context", "A", 0, "")
-			cmd.Flags().IntVarP(&flags.context, "context", "C", 0, "")
-			if err := cmd.Flags().Parse(tc.args); err != nil {
-				t.Fatalf("parse flags: %v", err)
-			}
-
-			err := selectSearchConfig(cmd, flags)
+			got, err := printedLineNumbers(t, folder, tc.args...)
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("err=%v, want substring %q", err, tc.wantErr)
@@ -238,26 +292,19 @@ func TestSelectSearchConfig(t *testing.T) {
 				return
 			}
 			if err != nil {
-				t.Fatalf("selectSearchConfig: %v", err)
+				t.Fatalf("search: %v", err)
 			}
-			if flags.search.opts.NumContextLines != tc.wantLines {
-				t.Fatalf("context lines=%d, want %d", flags.search.opts.NumContextLines, tc.wantLines)
-			}
-			if flags.search.afterOnly != tc.wantAfter {
-				t.Fatalf("afterOnly=%v, want %v", flags.search.afterOnly, tc.wantAfter)
-			}
+			assertLineSpan(t, tc.args, got, contextMarkerLine-tc.before, contextMarkerLine+tc.after)
 		})
 	}
 }
 
-// TestRootCmd_VersionOutputHasNoDoublePrefix — drive `seek --version`
-// end-to-end and capture stdout. Asserts the user-visible contract
-// (the printed line starts with exactly one "seek " prefix), not the
-// internal Version field layout — so renaming the field or switching
-// to SetVersionTemplate would not break the test as long as the
-// printed output stays sane.
+// TestRootCmd_VersionOutputHasNoDoublePrefix runs `seek --version` and
+// reads stdout: the printed line starts with exactly one "seek " prefix. It
+// checks the printed output, not the layout of the Version field. So a
+// rename of the field or a change to SetVersionTemplate does not break it.
 func TestRootCmd_VersionOutputHasNoDoublePrefix(t *testing.T) {
-	root := newRootCmd()
+	root := newRootCmd(newLateOnSemanticModel)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(io.Discard)
@@ -305,10 +352,10 @@ func TestSuggestFlagError_NoSuggestionWhenTooFar(t *testing.T) {
 	}
 }
 
-// TestSuggestFlagError_SubcommandInheritedFlag — a typo of an
-// inherited PersistentFlag on the gc subcommand should still surface a
-// suggestion. Covers the collectFlagNames → InheritedFlags branch
-// (the local Flags of `gc` don't include --verbose).
+// TestSuggestFlagError_SubcommandInheritedFlag checks that a typo of an
+// inherited persistent flag on the gc subcommand still gets a suggestion. gc
+// sets no flag error function and declares no --verbose. So the hint needs
+// the function of the root and the parsed flag set of gc.
 func TestSuggestFlagError_SubcommandInheritedFlag(t *testing.T) {
 	root := newQuietRootCmd()
 	root.SetArgs([]string{"gc", "--verbos"})
@@ -382,32 +429,25 @@ func TestShouldRunOpportunisticGC(t *testing.T) {
 }
 
 func TestBadProviderPinOnlyStopsCommandsThatUseTheModel(t *testing.T) {
-	// A typo in SEEK_PROVIDER must be loud for a search that would use the
-	// model, and must not stop commands that never read the setting.
+	// A typo in SEEK_PROVIDER stops a search that would use the model, and
+	// does not stop commands that never read the setting.
 	t.Setenv(lateOnProviderEnv, "gpu")
+	// Each command also has a bad argument that fails after the provider
+	// check, so the error tells which check stopped it first.
 	for _, test := range []struct {
-		name        string
-		lexicalOnly bool
-		subcommand  bool
-		wantErr     bool
+		name string
+		args []string
+		want string
 	}{
-		{name: "search", wantErr: true},
-		{name: "lexical only", lexicalOnly: true},
-		{name: "subcommand", subcommand: true},
+		{name: "search", args: []string{"-n", "-5", "needle"}, want: lateOnProviderEnv + ` is "gpu"`},
+		{name: "lexical only", args: []string{"--lexical-only", "-n", "-5", "needle"}, want: "--limit must be"},
+		{name: "subcommand", args: []string{"gc", "--sort=bogus"}, want: "--sort must be"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			root := &cobra.Command{Use: "seek"}
-			cmd := root
-			if test.subcommand {
-				cmd = &cobra.Command{Use: "gc"}
-				root.AddCommand(cmd)
-			}
-			var err error
-			if !test.lexicalOnly && commandUsesSemanticModel(cmd) {
-				_, err = lateOnForcedProvider()
-			}
-			if (err != nil) != test.wantErr {
-				t.Fatalf("error = %v, want an error: %t", err, test.wantErr)
+			root := newQuietRootCmd()
+			root.SetArgs(test.args)
+			if err := root.Execute(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
 			}
 		})
 	}

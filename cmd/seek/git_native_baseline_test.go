@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -17,9 +16,19 @@ import (
 	"github.com/sourcegraph/zoekt/query"
 )
 
+// zoektIndexedPaths returns the sorted paths of the documents in the shards of
+// indexDir.
 func zoektIndexedPaths(t testing.TB, indexDir string) []string {
 	t.Helper()
-	searchers, err := loadShardsOptional(indexDir)
+	// An empty repository writes no shard, so it indexes no path.
+	shards, err := familyShardNames(indexDir)
+	if err != nil {
+		t.Fatalf("list Zoekt shards: %v", err)
+	}
+	if len(shards) == 0 {
+		return nil
+	}
+	searchers, err := loadShardPaths(shards)
 	if err != nil {
 		t.Fatalf("load Zoekt shards: %v", err)
 	}
@@ -46,11 +55,16 @@ func zoektIndexedPaths(t testing.TB, indexDir string) []string {
 	return paths
 }
 
+// zoektRepositoryMetadata returns the first committed repository record in
+// indexDir.
 func zoektRepositoryMetadata(t testing.TB, indexDir string) *zoekt.Repository {
 	t.Helper()
 	return zoektCommittedRepositoryMetadata(t, indexDir)[0]
 }
 
+// zoektCommittedRepositoryMetadata returns the live repository records of the
+// committed shards in indexDir, in shard name order. It fails the test when
+// there is none.
 func zoektCommittedRepositoryMetadata(t testing.TB, indexDir string) []*zoekt.Repository {
 	t.Helper()
 	shards, err := filepath.Glob(filepath.Join(indexDir, "*.zoekt"))
@@ -76,11 +90,13 @@ func zoektCommittedRepositoryMetadata(t testing.TB, indexDir string) []*zoekt.Re
 	return committed
 }
 
+// requireCompleteNativeIndex builds a native full index of the HEAD of repoDir
+// and checks that it holds exactly the paths in want.
 func requireCompleteNativeIndex(t *testing.T, repoDir string, want []string) {
 	t.Helper()
 	indexDir := t.TempDir()
 	snapshot := captureHeadForTest(t, repoDir)
-	if err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, nil, 1); err != nil {
+	if _, err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, 1, nil); err != nil {
 		t.Fatalf("native committed index: %v", err)
 	}
 	got := zoektIndexedPaths(t, indexDir)
@@ -122,8 +138,8 @@ func TestNativeGitFullIndexesFixtureInventory(t *testing.T) {
 }
 
 // moveObjectToLoosePrefixedPack stores one object in a valid Git pack whose
-// name does not start with "pack-", then removes its loose copy. Git reads all
-// *.idx packs. The former go-git-backed reader read only pack-* packs.
+// name does not start with "pack-", then removes its loose copy. Git reads
+// every *.idx pack, so a reader that reads only pack-* packs misses the object.
 func moveObjectToLoosePrefixedPack(t *testing.T, repoDir, oid string) {
 	t.Helper()
 	prefix := filepath.Join(repoDir, ".git", "objects", "pack", "loose-native-fixture")
@@ -228,8 +244,13 @@ func TestNativeGitIndexer_AlternatesIsComplete(t *testing.T) {
 	requireCompleteNativeIndex(t, clone, want)
 }
 
+// TestNativeGitIndexer_VisibleContract checks what a native full build
+// writes. Each committed file has a document: also a binary, an empty, an
+// oversize and a symlink file, and a file that .sourcegraph/ignore names. A
+// gitlink has none. The one repository record has the Seek name and source,
+// one HEAD branch, and none of the zoekt.* config values.
 func TestNativeGitIndexer_VisibleContract(t *testing.T) {
-	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
+	swapForTest(t, &documentContentLimit, testDocumentContentLimit)
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
 
@@ -254,7 +275,7 @@ func TestNativeGitIndexer_VisibleContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink("regular.go", filepath.Join(repoDir, "link.go")); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
+		t.Fatal(err)
 	}
 	oversize := filepath.Join(repoDir, "oversize.dat")
 	if err := os.WriteFile(oversize, nil, 0o644); err != nil {
@@ -269,22 +290,22 @@ func TestNativeGitIndexer_VisibleContract(t *testing.T) {
 	gitlinkOID := gitOutputIn(t, repoDir, "rev-parse", "HEAD")
 	gitRunIn(t, repoDir, "update-index", "--add", "--cacheinfo", "160000,"+gitlinkOID+",submodule")
 	gitRunIn(t, repoDir, "commit", "-m", "golden gitlink")
+	// Seek reads no zoekt.* config: the shards get none of these values.
 	gitRunIn(t, repoDir, "config", "zoekt.name", "native-golden")
 	gitRunIn(t, repoDir, "config", "zoekt.web-url", "https://example.test/native-golden")
-	gitRunIn(t, repoDir, "config", "zoekt.web-url-type", "github")
 	gitRunIn(t, repoDir, "config", "zoekt.repoid", "42")
 	gitRunIn(t, repoDir, "config", "zoekt.tenantID", "7")
-	gitRunIn(t, repoDir, "config", "zoekt.github-stars", "100")
 
 	indexDir := t.TempDir()
 	snapshot := captureHeadForTest(t, repoDir)
-	if err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, nil, 1); err != nil {
+	if _, err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, 1, nil); err != nil {
 		t.Fatalf("native committed index: %v", err)
 	}
 	wantPaths := []string{
 		".sourcegraph/ignore",
 		"binary.bin",
 		"empty.txt",
+		"ignored.go",
 		"link.go",
 		"oversize.dat",
 		"regular.go",
@@ -295,18 +316,14 @@ func TestNativeGitIndexer_VisibleContract(t *testing.T) {
 	}
 
 	head := gitOutputIn(t, repoDir, "rev-parse", "HEAD")
-	commitUnix, err := strconv.ParseInt(gitOutputIn(t, repoDir, "show", "-s", "--format=%ct", "HEAD"), 10, 64)
-	if err != nil {
-		t.Fatalf("parse commit time: %v", err)
-	}
 	repository := zoektRepositoryMetadata(t, indexDir)
-	if repository.Name != "native-golden" || repository.Source != repoDir {
+	if repository.Name != fallbackGitRepositoryName(repoDir) || repository.Source != repoDir {
 		t.Fatalf("repository identity name=%q source=%q", repository.Name, repository.Source)
 	}
-	if repository.URL != "https://example.test/native-golden" {
+	if repository.URL != "" {
 		t.Fatalf("repository URL=%q", repository.URL)
 	}
-	if repository.ID != 42 || repository.TenantID != 7 || repository.Rank != 0 {
+	if repository.ID != 0 || repository.TenantID != 0 || repository.Rank != 0 {
 		t.Fatalf("repository numeric metadata ID=%d TenantID=%d Rank=%d", repository.ID, repository.TenantID, repository.Rank)
 	}
 	if repository.CommitURLTemplate != "" || repository.FileURLTemplate != "" || repository.LineFragmentTemplate != "" {
@@ -315,10 +332,7 @@ func TestNativeGitIndexer_VisibleContract(t *testing.T) {
 	if len(repository.Branches) != 1 || repository.Branches[0].Name != "HEAD" || repository.Branches[0].Version != head {
 		t.Fatalf("repository branches=%v, want HEAD@%s", repository.Branches, head)
 	}
-	if repository.LatestCommitDate.Unix() != commitUnix {
-		t.Fatalf("latest commit=%s, want unix %d", repository.LatestCommitDate, commitUnix)
-	}
-	if repository.RawConfig["name"] != "native-golden" {
+	if repository.RawConfig != nil {
 		t.Fatalf("raw config=%v", repository.RawConfig)
 	}
 	if repository.IndexOptions == "" || !repository.HasSymbols {

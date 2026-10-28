@@ -2,24 +2,23 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
+
+	"github.com/sourcegraph/zoekt/query"
 )
 
-// TestFolderDrift_KeepsStateWhenNothingWasPublished checks that a folder build
-// interrupted by drift keeps its .state file.
+// TestFolderDrift_NextBuildIndexesTheDrift adds a file while a folder build
+// runs. The build succeeds with the state of its walk. The file is a change
+// for the next build, which is a delta on the published family. A change
+// during a build is not an error.
 //
-// Nothing that drifted was published: the folder builder writes into a
-// temporary directory and publishes only at the end, so the family on disk
-// still matches the manifest and still matches .state. Deleting .state anyway
-// removes the delta base, and the next build then rebuilds in full a family
-// that was already correct.
-//
-// The drift is driven through the semantic scorer, which the builder calls
-// while the build runs. That needs no production test hook.
-func TestFolderDrift_KeepsStateWhenNothingWasPublished(t *testing.T) {
+// The builds are text builds. The test holds a read lock, so the build waits
+// to publish after its walk and its reads. The test adds the file during that
+// wait.
+func TestFolderDrift_NextBuildIndexesTheDrift(t *testing.T) {
 	requireTools(t)
 
 	folder := t.TempDir()
@@ -27,13 +26,7 @@ func TestFolderDrift_KeepsStateWhenNothingWasPublished(t *testing.T) {
 	plan := planFolderTestCorpus(t, folder)
 	ctx := context.Background()
 
-	newExecution := func(scorer *hybridTestScorer) searchExecution {
-		return testSemanticSearchExecution(t, func(context.Context) (semanticModel, error) {
-			return scorer, nil
-		})
-	}
-
-	if _, err := ensureFolderCorpusFreshWithExecution(ctx, plan, newExecution(&hybridTestScorer{})); err != nil {
+	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
 		t.Fatalf("first folder build: %v", err)
 	}
 	published := readStateFile(plan.cacheDir)
@@ -44,50 +37,51 @@ func TestFolderDrift_KeepsStateWhenNothingWasPublished(t *testing.T) {
 		t.Fatal("the first build left no usable family")
 	}
 
-	// Add a file while the build runs, so the post-build fingerprint disagrees
-	// with the one the build started from.
-	var once sync.Once
-	drifting := &hybridTestScorer{
-		vectorForUnit: func(unit semanticUnit) semanticVector {
-			once.Do(func() {
-				writeFileAt(t, folder, "late.go", "package sample\n// arrived during the build\n")
-			})
-			return semanticVector{}
-		},
-	}
+	// second.go makes the next build run, and late.go arrives while that
+	// build waits to publish.
 	writeFileAt(t, folder, "second.go", "package sample\n// forces a rebuild\n")
+	release := holdReadLock(t, plan.cacheDir)
+	_, waiting := captureTestLogsWithSignal(t, slog.LevelWarn, lockWaitReaders, filepath.Join(plan.cacheDir, lockFile))
+	acted := onLockWait(t, waiting, func() error {
+		return os.WriteFile(filepath.Join(folder, "late.go"), []byte("package sample\n// arrived during the build\n"), 0o644)
+	}, release)
 
-	if _, err := ensureFolderCorpusFreshWithExecution(ctx, plan, newExecution(drifting)); err == nil {
-		t.Fatal("the drifted build reported no error")
+	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
+		t.Fatalf("the drifted build failed: %v", err)
+	}
+	lockWaitActed(t, acted)
+	if got := readStateFile(plan.cacheDir); got == "" || got == published {
+		t.Fatalf("the drifted build published no new state: %q", got)
 	}
 
-	if got := readStateFile(plan.cacheDir); got == "" {
-		t.Fatal("the drifted build deleted .state although it published nothing")
-	}
-
-	// The point of keeping .state is the delta base, so assert that and not
-	// only the file. A delta seeds the prior shards with hard links, so the
-	// base shard stays the same file. A full rebuild writes a new one.
+	// The next build indexes the late file as a delta. A delta seeds the
+	// prior shards with hard links, so the base shard stays the same file. A
+	// full rebuild writes a new one.
 	baseBefore := firstShardInfo(t, plan.indexDir)
-	if _, err := ensureFolderCorpusFreshWithExecution(ctx, plan, newExecution(&hybridTestScorer{})); err != nil {
-		t.Fatalf("recovery build: %v", err)
+	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
+		t.Fatalf("next build: %v", err)
 	}
 	baseAfter := firstShardInfo(t, plan.indexDir)
 	if !os.SameFile(baseBefore, baseAfter) {
-		t.Fatal("the recovery build rewrote the base shard, so it lost the delta base")
+		t.Fatal("the next build rewrote the base shard, so it was not a delta")
 	}
 	if readStateFile(plan.cacheDir) == "" {
-		t.Fatal("the recovery build left no state")
+		t.Fatal("the next build left no state")
 	}
-	// The corpus must still answer for the file that arrived during the build.
-	if _, err := ensureFolderCorpusFreshWithExecution(ctx, plan, newExecution(&hybridTestScorer{})); err != nil {
-		t.Fatalf("second recovery build: %v", err)
+	// The corpus answers for the file that arrived during the build. The
+	// search reads the node under its read lock (searchPlannedCorpusParsed).
+	if _, err := ensureFolderCorpusFresh(ctx, plan); err != nil {
+		t.Fatalf("warm build: %v", err)
+	}
+	files, err := searchPlannedCorpusParsed(ctx, plan, nil, &query.Substring{Pattern: "arrived during the build"}, defaultSearchConfig())
+	if err != nil || len(files) != 1 || files[0].FileName != "late.go" {
+		t.Fatalf("files=%v err=%v, want late.go indexed by the next build", files, err)
 	}
 }
 
 // firstShardInfo returns the FileInfo of shard 0, which a delta build keeps and
 // a full build replaces. It asks the family scan for the shard number rather
-// than sorting names, so it does not restate how a shard name is formed.
+// than sorting names, so it does not restate the rule of shard names.
 func firstShardInfo(tb testing.TB, indexDir string) os.FileInfo {
 	tb.Helper()
 	scan, err := scanFamily(indexDir)

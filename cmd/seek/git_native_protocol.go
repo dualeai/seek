@@ -8,53 +8,89 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"slices"
 	"strings"
 
 	"github.com/sourcegraph/zoekt/index"
 )
 
-// This command protocol is the only reader for committed Git data. Normal
-// full, committed delta, and scoped full indexing all use it with captured
-// full object IDs. There is no go-git or zoekt/gitindex fallback. Git reads
-// the objects; index.Builder writes the resulting documents to staging.
+// This command protocol is the only reader of committed Git content for the
+// builds. The full and the delta committed builds and the semantic build use
+// it with captured full object IDs. There is no go-git or zoekt/gitindex
+// fallback. Git reads the objects, and index.Builder writes the text-index
+// documents to staging.
 //
-// Full scans use ls-tree, then one buffered batch-command session. `info`
-// gets blob sizes before `contents` asks for approved bodies. This keeps
-// oversize bodies out of the content stream. Each protocol window handles at
-// most gitObjectBatchSize objects. Delta work can use separate sessions for
-// ignore, size, and content phases. A malformed or short reply, a write error,
-// or a failed child rejects the staged build.
+// A full scan uses ls-tree, then one buffered batch-command session. `info`
+// gets the blob sizes before `contents` asks for the accepted bodies. So no
+// oversize body enters the content stream. Each protocol window handles at
+// most gitObjectBatchSize objects. A delta uses one session to size the new
+// blobs and read the old ones, and a second session to read the new bodies. A
+// malformed or short reply, a write error, or a failed child rejects the
+// staged build.
 const (
 	gitObjectBatchSize = 8192
 	gitBatchHeaderMax  = 512
 	gitStderrMax       = 32 * 1024
-	minNativeGitMajor  = 2
-	minNativeGitMinor  = 36
+	// cat-file --batch-command needs Git 2.36. A partial clone also needs a Git
+	// that honors GIT_NO_LAZY_FETCH (gitHonorsNoLazyFetch).
+	minNativeGitMajor = 2
+	minNativeGitMinor = 36
 )
 
+// errGitBlobMissing reports a blob that the repository does not hold locally.
+// In a partial clone, Seek never fetches it (GIT_NO_LAZY_FETCH) and indexes its
+// name only; in another repository, it is an error.
+var errGitBlobMissing = errors.New("git blob is missing locally")
+
+// errNativeGitDeltaTooLarge stops a diff with more entries than its limit
+// (readNativeGitDiff).
 var errNativeGitDeltaTooLarge = errors.New("native Git delta has too many changed paths")
 
+// gitObjectID is a full lowercase hexadecimal Git object ID: 40 characters
+// for SHA-1, 64 for SHA-256.
 type gitObjectID string
 
+// gitTreeEntry is one ls-tree record: the mode, the object ID, and the path.
+// A batch request uses only the object ID and the path, so a request that
+// does not come from ls-tree leaves the mode empty.
 type gitTreeEntry struct {
 	mode string
 	oid  gitObjectID
 	path string
 }
 
+// gitBlobInfo is the `info` reply of one blob. oversize marks a blob too large
+// for the index; missing marks a blob that a partial clone does not have.
 type gitBlobInfo struct {
 	entry    gitTreeEntry
 	size     int64
 	oversize bool
+	missing  bool
 }
 
+// nameOnly reports a blob whose content Seek does not read.
+func (info gitBlobInfo) nameOnly() bool {
+	return info.oversize || info.missing
+}
+
+// nameOnlyDocument is the index document of a blob whose content Seek does not
+// read. A missing blob gets Seek's no-bytes reason, and an oversize one gets
+// the too-large reason.
+func (info gitBlobInfo) nameOnlyDocument() fileContent {
+	if info.missing {
+		return fileContent{name: info.entry.path, skipReason: seekNoBytesReason}
+	}
+	return fileContent{name: info.entry.path, skipReason: index.SkipReasonTooLarge}
+}
+
+// gitDiffEntry is one raw diff record. Rename detection is off, so the old and
+// the new side have the same path.
 type gitDiffEntry struct {
 	oldMode string
 	newMode string
 	oldOID  gitObjectID
 	newOID  gitObjectID
-	oldPath string
-	newPath string
+	path    string
 }
 
 func parseGitObjectID(raw []byte) (gitObjectID, error) {
@@ -79,34 +115,9 @@ func validGitObjectID(raw []byte) bool {
 	return true
 }
 
-func gitObjectIDEqualBytes(id gitObjectID, raw []byte) bool {
-	if len(id) != len(raw) {
-		return false
-	}
-	for i := range raw {
-		if id[i] != raw[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func gitBytesEqualString(raw []byte, value string) bool {
-	if len(raw) != len(value) {
-		return false
-	}
-	for i := range raw {
-		if raw[i] != value[i] {
-			return false
-		}
-	}
-	return true
-}
-
+// parseGitDecimal parses a decimal count of Git output. The caller gives a
+// non-empty field (splitGitHeader).
 func parseGitDecimal(raw []byte) (int64, bool) {
-	if len(raw) == 0 {
-		return 0, false
-	}
 	const maxInt64 = int64(^uint64(0) >> 1)
 	var n int64
 	for _, c := range raw {
@@ -124,28 +135,17 @@ func parseGitDecimal(raw []byte) (int64, bool) {
 
 func (id gitObjectID) String() string { return string(id) }
 
-func nativeGitCmd(ctx context.Context, repoDir string, args ...string) *exec.Cmd {
-	base := []string{"--literal-pathspecs", "--no-pager", "--no-replace-objects"}
-	cmd := gitCmd(ctx, append(base, args...)...)
-	cmd.Dir = repoDir
-	return cmd
-}
-
-func requireNativeGitVersion(ctx context.Context, repoDir string) error {
-	cmd := gitCmd(ctx, "version")
-	cmd.Dir = repoDir
-	out, err := cmd.Output()
+func requireNativeGitVersion(ctx context.Context) error {
+	out, err := gitVersion(ctx)
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		return fmt.Errorf("check Git version: %w", err)
+		return err
 	}
-	if gitVersionOutputAtLeast(out, minNativeGitMajor, minNativeGitMinor) {
+	if major, minor, _, ok := gitVersionNumbers(out); ok &&
+		(major > minNativeGitMajor || major == minNativeGitMajor && minor >= minNativeGitMinor) {
 		return nil
 	}
 	return fmt.Errorf(
-		"direct Git indexing requires Git %d.%d or later for cat-file --batch-command",
+		"direct Git indexing requires Git %d.%d or later",
 		minNativeGitMajor,
 		minNativeGitMinor,
 	)
@@ -154,10 +154,9 @@ func requireNativeGitVersion(ctx context.Context, repoDir string) error {
 // boundedGitStderr keeps both ends of Git stderr. Git often puts the cause at
 // the start and cleanup details at the end.
 type boundedGitStderr struct {
-	head      []byte
-	tail      []byte
-	total     int
-	truncated bool
+	head  []byte
+	tail  []byte
+	total int
 }
 
 func (b *boundedGitStderr) Write(p []byte) (int, error) {
@@ -175,12 +174,11 @@ func (b *boundedGitStderr) Write(p []byte) (int, error) {
 			b.tail = append(b.tail[:0], b.tail[len(b.tail)-half:]...)
 		}
 	}
-	b.truncated = b.total > gitStderrMax
 	return n, nil
 }
 
 func (b *boundedGitStderr) String() string {
-	if !b.truncated {
+	if b.total <= gitStderrMax {
 		return strings.TrimSpace(string(append(append([]byte(nil), b.head...), b.tail...)))
 	}
 	var out bytes.Buffer
@@ -191,20 +189,8 @@ func (b *boundedGitStderr) String() string {
 	return strings.TrimSpace(out.String())
 }
 
-func nativeGitCommandError(ctx context.Context, operation string, err error, stderr *boundedGitStderr) error {
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return ctxErr
-	}
-	if err == nil {
-		return nil
-	}
-	message := stderr.String()
-	if message == "" {
-		return fmt.Errorf("%s: %w", operation, err)
-	}
-	return fmt.Errorf("%s: %w: %s", operation, err, message)
-}
-
+// nativeGitReadError wraps a read error of a Git child with operation. It
+// returns the context error when the search was canceled.
 func nativeGitReadError(ctx context.Context, operation string, err error) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
@@ -212,23 +198,18 @@ func nativeGitReadError(ctx context.Context, operation string, err error) error 
 	return fmt.Errorf("%s: %w", operation, err)
 }
 
-func waitNativeGitChild(ctx context.Context, cmd *exec.Cmd, operation string, stderr *boundedGitStderr) error {
-	return nativeGitCommandError(ctx, operation, cmd.Wait(), stderr)
-}
-
+// abortNativeGitChild closes stdin when it is set, kills the Git child, and
+// waits for it.
 func abortNativeGitChild(cmd *exec.Cmd, stdin io.Closer) {
 	if stdin != nil {
 		_ = stdin.Close()
 	}
-	if cmd == nil {
-		return
-	}
-	if cmd.Process != nil {
-		_ = cmd.Process.Kill()
-	}
+	_ = cmd.Process.Kill()
 	_ = cmd.Wait()
 }
 
+// readExactEOF reports an error unless reader is at its end, so trailing
+// output of Git fails the read.
 func readExactEOF(reader io.Reader) error {
 	var one [1]byte
 	n, err := reader.Read(one[:])
@@ -244,6 +225,9 @@ func readExactEOF(reader io.Reader) error {
 	}
 }
 
+// parseNativeGitTreeRecord parses one NUL-terminated `ls-tree -z` record. It
+// accepts the blob modes 100644, 100755, and 120000, and the submodule mode
+// 160000 with the type commit.
 func parseNativeGitTreeRecord(record []byte) (gitTreeEntry, error) {
 	if len(record) == 0 || record[len(record)-1] != 0 {
 		return gitTreeEntry{}, fmt.Errorf("git tree record has no final NUL")
@@ -255,37 +239,26 @@ func parseNativeGitTreeRecord(record []byte) (gitTreeEntry, error) {
 	}
 	header := record[:tab]
 	path := record[tab+1:]
-	firstSpace := bytes.IndexByte(header, ' ')
-	if firstSpace <= 0 {
+	modeRaw, typeRaw, oidRaw, ok := splitGitHeader(header)
+	if !ok {
 		return gitTreeEntry{}, fmt.Errorf("malformed Git tree header %q", header)
 	}
-	secondRelative := bytes.IndexByte(header[firstSpace+1:], ' ')
-	if secondRelative <= 0 {
-		return gitTreeEntry{}, fmt.Errorf("malformed Git tree header %q", header)
-	}
-	secondSpace := firstSpace + 1 + secondRelative
-	if secondSpace == len(header)-1 || bytes.IndexByte(header[secondSpace+1:], ' ') >= 0 {
-		return gitTreeEntry{}, fmt.Errorf("malformed Git tree header %q", header)
-	}
-	modeRaw := header[:firstSpace]
-	typeRaw := header[firstSpace+1 : secondSpace]
-	oidRaw := header[secondSpace+1:]
 	var mode string
 	wantType := "blob"
-	switch {
-	case gitBytesEqualString(modeRaw, "100644"):
+	switch string(modeRaw) {
+	case "100644":
 		mode = "100644"
-	case gitBytesEqualString(modeRaw, "100755"):
+	case "100755":
 		mode = "100755"
-	case gitBytesEqualString(modeRaw, "120000"):
+	case "120000":
 		mode = "120000"
-	case gitBytesEqualString(modeRaw, "160000"):
+	case "160000":
 		mode = "160000"
 		wantType = "commit"
 	default:
 		return gitTreeEntry{}, fmt.Errorf("unsupported Git tree mode %q", modeRaw)
 	}
-	if !gitBytesEqualString(typeRaw, wantType) {
+	if string(typeRaw) != wantType {
 		return gitTreeEntry{}, fmt.Errorf("git tree mode %s has type %q, want %q", modeRaw, typeRaw, wantType)
 	}
 	oid, err := parseGitObjectID(oidRaw)
@@ -295,13 +268,15 @@ func parseNativeGitTreeRecord(record []byte) (gitTreeEntry, error) {
 	return gitTreeEntry{mode: mode, oid: oid, path: string(path)}, nil
 }
 
-func readNativeGitTreeRecords(
+// readNativeGitTree runs `git ls-tree` on the captured commit and passes its
+// records to consume in groups of at most gitObjectBatchSize.
+func readNativeGitTree(
 	ctx context.Context,
 	repoDir string,
-	args []string,
+	snapshot gitObjectID,
 	consume func([]gitTreeEntry) error,
 ) error {
-	cmd := nativeGitCmd(ctx, repoDir, args...)
+	cmd := newGitCommand(ctx, repoDir, "ls-tree", "-r", "-z", "--full-tree", "--no-abbrev", snapshot.String())
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("open git ls-tree stdout: %w", err)
@@ -309,7 +284,7 @@ func readNativeGitTreeRecords(
 	var stderr boundedGitStderr
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
-		return nativeGitCommandError(ctx, "start git ls-tree", err, &stderr)
+		return gitCommandError(ctx, "start git ls-tree", err, &stderr)
 	}
 
 	reader := bufio.NewReaderSize(stdout, 64*1024)
@@ -355,7 +330,7 @@ func readNativeGitTreeRecords(
 					return err
 				}
 			}
-			return waitNativeGitChild(ctx, cmd, "git ls-tree", &stderr)
+			return gitCommandError(ctx, "git ls-tree", cmd.Wait(), &stderr)
 		default:
 			abortNativeGitChild(cmd, nil)
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -364,44 +339,6 @@ func readNativeGitTreeRecords(
 			return fmt.Errorf("read git ls-tree: %w", readErr)
 		}
 	}
-}
-
-func readNativeGitTree(
-	ctx context.Context,
-	repoDir string,
-	snapshot gitSnapshot,
-	scope *gitDirtyScope,
-	consume func([]gitTreeEntry) error,
-) error {
-	args := []string{"ls-tree", "-r", "-z", "--full-tree", "--no-abbrev", snapshot.commitOID.String()}
-	if scope != nil {
-		args = append(args, "--")
-		args = append(args, scope.includeDirs...)
-		args = append(args, scope.includeFiles...)
-	}
-	return readNativeGitTreeRecords(ctx, repoDir, args, consume)
-}
-
-func readNativeGitRootIgnoreEntry(ctx context.Context, repoDir string, snapshot gitSnapshot) (*gitTreeEntry, error) {
-	args := []string{"ls-tree", "-z", "--full-tree", "--no-abbrev", snapshot.commitOID.String(), "--", ".sourcegraph/ignore"}
-	var entries []gitTreeEntry
-	err := readNativeGitTreeRecords(ctx, repoDir, args, func(chunk []gitTreeEntry) error {
-		entries = append(entries, chunk...)
-		if len(entries) > 1 {
-			return fmt.Errorf("git tree returned more than one root ignore entry")
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	if len(entries) == 0 {
-		return nil, nil
-	}
-	if entries[0].path != ".sourcegraph/ignore" || entries[0].mode == "160000" {
-		return nil, fmt.Errorf("root .sourcegraph/ignore is not a blob")
-	}
-	return &entries[0], nil
 }
 
 func readNativeGitBatchHeader(reader *bufio.Reader) ([]byte, error) {
@@ -415,35 +352,37 @@ func readNativeGitBatchHeader(reader *bufio.Reader) ([]byte, error) {
 		}
 		return nil, err
 	}
-	if len(header) == 0 || header[len(header)-1] != '\n' {
-		return nil, io.ErrUnexpectedEOF
-	}
+	// With no error, ReadSlice gives a slice that ends in the newline.
 	return header[:len(header)-1], nil
 }
 
+// splitGitHeader splits a Git header "a b c" into its three fields. It reports
+// false when a field is empty or the header does not have exactly two spaces.
+func splitGitHeader(header []byte) (a, b, c []byte, ok bool) {
+	a, rest, first := bytes.Cut(header, []byte{' '})
+	b, c, second := bytes.Cut(rest, []byte{' '})
+	return a, b, c, first && second && len(a) > 0 && len(b) > 0 && len(c) > 0 && bytes.IndexByte(c, ' ') < 0
+}
+
+// parseNativeGitBatchHeader checks one cat-file reply header for the blob want
+// and returns its size. A "missing" reply gives errGitBlobMissing. A non-nil
+// wantSize is the size of the info reply: the contents reply must give it
+// again.
 func parseNativeGitBatchHeader(header []byte, want gitObjectID, wantSize *int64) (int64, error) {
-	firstSpace := bytes.IndexByte(header, ' ')
-	if firstSpace <= 0 {
+	if oid, ok := bytes.CutSuffix(header, []byte(" missing")); ok && string(want) == string(oid) {
+		return 0, errGitBlobMissing
+	}
+	oidRaw, typeRaw, sizeRaw, ok := splitGitHeader(header)
+	if !ok {
 		return 0, fmt.Errorf("malformed Git cat-file reply %q", header)
 	}
-	secondRelative := bytes.IndexByte(header[firstSpace+1:], ' ')
-	if secondRelative <= 0 {
-		return 0, fmt.Errorf("malformed Git cat-file reply %q", header)
-	}
-	secondSpace := firstSpace + 1 + secondRelative
-	if secondSpace == len(header)-1 || bytes.IndexByte(header[secondSpace+1:], ' ') >= 0 {
-		return 0, fmt.Errorf("malformed Git cat-file reply %q", header)
-	}
-	oidRaw := header[:firstSpace]
-	typeRaw := header[firstSpace+1 : secondSpace]
-	sizeRaw := header[secondSpace+1:]
 	if !validGitObjectID(oidRaw) {
 		return 0, fmt.Errorf("git cat-file reply object is not a full lowercase object ID: %q", oidRaw)
 	}
-	if !gitObjectIDEqualBytes(want, oidRaw) {
+	if string(want) != string(oidRaw) {
 		return 0, fmt.Errorf("git cat-file returned object %s, want %s", oidRaw, want)
 	}
-	if !gitBytesEqualString(typeRaw, "blob") {
+	if string(typeRaw) != "blob" {
 		return 0, fmt.Errorf("git cat-file returned type %q for %s, want blob", typeRaw, want)
 	}
 	size, ok := parseGitDecimal(sizeRaw)
@@ -456,42 +395,12 @@ func parseNativeGitBatchHeader(header []byte, want gitObjectID, wantSize *int64)
 	return size, nil
 }
 
-func checkNativeGitBlobs(
-	ctx context.Context,
-	repoDir string,
-	entries []gitTreeEntry,
-	consume func([]gitBlobInfo) error,
-) error {
-	if len(entries) == 0 {
-		return nil
-	}
-	batch, err := startNativeGitBatch(ctx, repoDir)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if !batch.finished {
-			batch.abort(nil)
-		}
-	}()
-	for start := 0; start < len(entries); start += gitObjectBatchSize {
-		end := min(start+gitObjectBatchSize, len(entries))
-		infos, err := batch.check(entries[start:end])
-		if err != nil {
-			return err
-		}
-		if err := consume(infos); err != nil {
-			return err
-		}
-	}
-	return batch.close()
-}
-
-// readNativeGitBlobs emits entries in input order and does not request oversize
-// bodies. For each other document, it acquires readSemaphore weight before it
-// calls consume. A successful call transfers release ownership to the
-// consumer. This function releases the current weight if reading or consuming
-// fails.
+// readNativeGitBlobs gives the entries to consume in input order. It does not
+// ask for the bodies of name-only blobs (oversize or missing). For each other
+// document, it takes readSemaphore weight before it calls consume. After a
+// successful call, the consumer releases the weight. A binary blob goes to
+// consume by name only, with its weight already released. This function
+// releases the current weight when the read or consume fails.
 func readNativeGitBlobs(
 	ctx context.Context,
 	repoDir string,
@@ -501,16 +410,9 @@ func readNativeGitBlobs(
 	if len(infos) == 0 {
 		return nil
 	}
-	allOversize := true
-	for _, info := range infos {
-		if !info.oversize {
-			allOversize = false
-			break
-		}
-	}
-	if allOversize {
+	if !slices.ContainsFunc(infos, func(info gitBlobInfo) bool { return !info.nameOnly() }) {
 		for _, info := range infos {
-			if err := consume(fileContent{name: info.entry.path, skipReason: index.SkipReasonTooLarge}); err != nil {
+			if err := consume(info.nameOnlyDocument()); err != nil {
 				return err
 			}
 		}
@@ -575,42 +477,35 @@ func parseNativeGitDiffHeader(header, path []byte, oidLength int) (gitDiffEntry,
 	default:
 		return gitDiffEntry{}, fmt.Errorf("unsupported Git raw diff status %q", fields[4])
 	}
-	name := string(path)
 	return gitDiffEntry{
 		oldMode: oldMode,
 		newMode: newMode,
 		oldOID:  oldOID,
 		newOID:  newOID,
-		oldPath: name,
-		newPath: name,
+		path:    string(path),
 	}, nil
 }
 
+// readNativeGitNULRecord reads one NUL-terminated record without its NUL. It
+// reports false at the end of the output, and io.ErrUnexpectedEOF for a last
+// record with no NUL.
 func readNativeGitNULRecord(reader *bufio.Reader) ([]byte, bool, error) {
-	var complete []byte
-	for {
-		part, err := reader.ReadSlice(0)
-		if errors.Is(err, bufio.ErrBufferFull) {
-			complete = append(complete, part...)
-			continue
-		}
-		complete = append(complete, part...)
-		switch {
-		case err == nil:
-			return complete[:len(complete)-1], true, nil
-		case errors.Is(err, io.EOF) && len(complete) == 0:
-			return nil, false, nil
-		case errors.Is(err, io.EOF):
-			return nil, false, io.ErrUnexpectedEOF
-		default:
-			return nil, false, err
-		}
+	record, err := reader.ReadBytes(0)
+	switch {
+	case err == nil:
+		return record[:len(record)-1], true, nil
+	case errors.Is(err, io.EOF) && len(record) == 0:
+		return nil, false, nil
+	case errors.Is(err, io.EOF):
+		return nil, false, io.ErrUnexpectedEOF
+	default:
+		return nil, false, err
 	}
 }
 
 // readNativeGitDiff returns raw changes from baseOID to targetOID. Rename
-// detection is off, so a rename is one delete and one add. If maxEntries is
-// nonnegative, one extra entry stops Git and returns errNativeGitDeltaTooLarge.
+// detection is off, so a rename is one delete and one add. One entry more than
+// maxEntries stops Git and returns errNativeGitDeltaTooLarge.
 func readNativeGitDiff(
 	ctx context.Context,
 	repoDir string,
@@ -618,10 +513,7 @@ func readNativeGitDiff(
 	targetOID gitObjectID,
 	maxEntries int,
 ) ([]gitDiffEntry, error) {
-	if len(baseOID) != len(targetOID) {
-		return nil, fmt.Errorf("git delta object formats differ")
-	}
-	cmd := nativeGitCmd(ctx, repoDir,
+	cmd := newGitCommand(ctx, repoDir,
 		"diff-tree",
 		"-r",
 		"--no-commit-id",
@@ -641,14 +533,10 @@ func readNativeGitDiff(
 	var stderr boundedGitStderr
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
-		return nil, nativeGitCommandError(ctx, "start git diff-tree", err, &stderr)
+		return nil, gitCommandError(ctx, "start git diff-tree", err, &stderr)
 	}
 	reader := bufio.NewReaderSize(stdout, 64*1024)
-	capacity := gitObjectBatchSize
-	if maxEntries >= 0 {
-		capacity = min(maxEntries, gitObjectBatchSize)
-	}
-	entries := make([]gitDiffEntry, 0, capacity)
+	entries := make([]gitDiffEntry, 0, min(maxEntries, gitObjectBatchSize))
 	for {
 		header, ok, err := readNativeGitNULRecord(reader)
 		if err != nil {
@@ -656,7 +544,7 @@ func readNativeGitDiff(
 			return nil, nativeGitReadError(ctx, "read Git raw diff header", err)
 		}
 		if !ok {
-			if err := waitNativeGitChild(ctx, cmd, "git diff-tree", &stderr); err != nil {
+			if err := gitCommandError(ctx, "git diff-tree", cmd.Wait(), &stderr); err != nil {
 				return nil, err
 			}
 			return entries, nil
@@ -675,7 +563,7 @@ func readNativeGitDiff(
 			return nil, err
 		}
 		entries = append(entries, entry)
-		if maxEntries >= 0 && len(entries) > maxEntries {
+		if len(entries) > maxEntries {
 			abortNativeGitChild(cmd, nil)
 			return nil, errNativeGitDeltaTooLarge
 		}

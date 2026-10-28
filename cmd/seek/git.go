@@ -1,218 +1,137 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
+	"slices"
 	"strings"
-	"time"
 )
+
+// gitNoHead is the HeadSHA of a work tree whose HEAD names no commit: a new
+// repository or an orphan branch.
+const gitNoHead = "no-head"
 
 // repoState holds the parsed result of a single git status call.
 type repoState struct {
-	HeadSHA   string   // commit SHA from # branch.oid, or "no-head"
-	RawOutput string   // full raw output for state hashing
+	HeadSHA   string   // commit SHA from # branch.oid, or gitNoHead
+	RawOutput string   // raw output for state hashing, without child records
 	Files     []string // paths of changed/untracked files
+	// Children are the paths of nested repositories in the work tree: an
+	// untracked repository (Git lists it as one "? dir/" entry) and a changed
+	// gitlink that is still a repository. Each child is its own graph node,
+	// and its records are not in Files or RawOutput. So a commit in a child
+	// does not change the parent state.
+	Children []string
 }
 
 type gitPaths struct {
-	RepoDir    string
-	CommonDir  string
-	ConfigPath string
+	RepoDir   string
+	CommonDir string
 }
 
-type gitUnavailableError struct {
-	cause error
-}
-
-func (e *gitUnavailableError) Error() string {
-	return fmt.Sprintf("Git executable is unavailable: %v", e.cause)
-}
-
-func (e *gitUnavailableError) Unwrap() error {
-	return e.cause
-}
-
-// gitCmd creates a Git command that uses a graceful signal on cancellation so
-// Git can release its locks. It does not set GIT_OPTIONAL_LOCKS=0 because Git
-// must refresh its stat cache to detect some same-second edits.
-func gitCmd(ctx context.Context, args ...string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	if errors.Is(cmd.Err, exec.ErrNotFound) {
-		cmd.Err = &gitUnavailableError{cause: cmd.Err}
-	}
-	cmd.Env = sanitizedGitEnv(os.Environ())
-	cmd.Cancel = func() error {
-		return cmd.Process.Signal(gitCancelSignal())
-	}
-	cmd.WaitDelay = 3 * time.Second
-	return cmd
-}
-
-// gitLocationEnv names the variables that redirect git at a different
-// repository than the one Seek resolved from the filesystem. Seek removes them
-// from all Git commands.
-var gitLocationEnv = [5]string{
-	"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
-}
-
-func sanitizedGitEnv(env []string) []string {
-	filtered := env[:0]
-	for _, kv := range env {
-		name, _, _ := strings.Cut(kv, "=")
-		switch name {
-		case "GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS",
-			"GIT_TERMINAL_PROMPT", "LC_ALL", "LANG":
-			continue
-		// Corpus identity comes from the filesystem. A location variable could
-		// make Git describe a different repository from the indexed corpus.
-		case gitLocationEnv[0], gitLocationEnv[1], gitLocationEnv[2], gitLocationEnv[3], gitLocationEnv[4]:
-			continue
-		default:
-			filtered = append(filtered, kv)
-		}
-	}
-	filtered = append(filtered,
-		"GIT_TERMINAL_PROMPT=0",
-		"LC_ALL=C",
-		"LANG=C",
-	)
-	return filtered
-}
-
-// resolveGitPathsFromCWD resolves Git paths from the current directory. It
-// first checks .git directories and worktree .git files without a subprocess.
-// It uses git rev-parse when that check cannot give a clear result.
-func resolveGitPathsFromCWD(ctx context.Context) (gitPaths, error) {
-	if paths, ok := fastResolveGitPaths(); ok {
-		return paths, nil
-	}
-	return resolveGitPaths(ctx, "")
-}
-
-// fastResolveGitPaths walks from the current directory to its ancestors and
-// checks each Git boundary without a subprocess. It returns false when the
-// current directory is unreadable, no boundary exists, or detection is unclear.
-func fastResolveGitPaths() (gitPaths, bool) {
-	dir, err := os.Getwd()
-	if err != nil {
-		return gitPaths{}, false
-	}
-	for {
-		b, status := detectGitBoundary(dir, "")
-		if status == boundaryConfirmed {
-			return b.toGitPaths(), true
-		}
-		if status == ambiguous {
-			return gitPaths{}, false
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return gitPaths{}, false
-		}
-		dir = parent
-	}
-}
-
+// resolveGitPaths asks Git for the work tree root and the common Git
+// directory of the repository that holds dir.
 func resolveGitPaths(ctx context.Context, dir string) (gitPaths, error) {
-	cmd := gitCmd(ctx,
+	cmd := newGitCommand(ctx, dir,
 		"rev-parse",
 		"--path-format=absolute",
 		"--show-toplevel",
 		"--git-common-dir",
-		"--git-path", "config",
 	)
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	out, err := cmd.Output()
+	out, err := gitOutput(ctx, cmd, "git rev-parse")
 	if err != nil {
 		return gitPaths{}, err
 	}
 
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) != 3 {
+	if len(lines) != 2 {
 		return gitPaths{}, fmt.Errorf("unexpected git rev-parse output: got %d lines", len(lines))
 	}
 
 	paths := gitPaths{
-		RepoDir:    strings.TrimSpace(lines[0]),
-		CommonDir:  strings.TrimSpace(lines[1]),
-		ConfigPath: strings.TrimSpace(lines[2]),
+		RepoDir:   strings.TrimSpace(lines[0]),
+		CommonDir: strings.TrimSpace(lines[1]),
 	}
 	return paths, nil
 }
 
-// gitRepoStateIn returns the repository state for a specific directory.
-// Used when the CWD may not be inside the target repository.
+// gitRepoStateIn runs one git status in dir and returns the repository state.
+// It drops the untracked files of an untracked bare repository.
 func gitRepoStateIn(ctx context.Context, dir string) (repoState, error) {
-	cmd := gitCmd(ctx, "status", "--porcelain=v2", "--branch", "--no-renames", "--no-ahead-behind", "--untracked-files=all", "-z")
-	cmd.Dir = dir
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	cmd := newGitCommand(ctx, dir, "status", "--porcelain=v2", "--branch", "--no-renames", "--no-ahead-behind",
+		"--untracked-files=all", "--ignore-submodules=dirty", "-z")
+	out, err := gitOutput(ctx, cmd, "git status")
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return repoState{}, ctxErr
-		}
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			return repoState{}, fmt.Errorf("git status: %w", err)
-		}
-		return repoState{}, fmt.Errorf("git status: %w: %s", err, msg)
+		return repoState{}, err
 	}
-	return parseGitStatusV2(string(out)), nil
+	raw := string(out)
+	return parseGitStatusV2Skipping(raw, untrackedBareRepos(dir, raw)), nil
 }
 
+// untrackedBareRepos returns the untracked directories of a work tree that are
+// bare repositories. Git lists their files one by one, but they hold Git
+// internals, not content. Only a "? <dir>/HEAD" entry can name one, so the
+// check costs a few stats per such entry.
+func untrackedBareRepos(repoDir, raw string) []string {
+	var roots []string
+	for record := range strings.SplitSeq(raw, "\x00") {
+		path, ok := strings.CutPrefix(record, "? ")
+		if !ok {
+			continue
+		}
+		dir, ok := strings.CutSuffix(path, "/HEAD")
+		if !ok {
+			continue
+		}
+		if !detectBareRepoAt(filepath.Join(repoDir, filepath.FromSlash(dir))) {
+			continue
+		}
+		roots = append(roots, dir)
+	}
+	return roots
+}
+
+// gitHeadTreeish returns the commit ID of HEAD in dir, or gitNoHead when HEAD
+// names no commit.
 func gitHeadTreeish(ctx context.Context, dir string) (string, error) {
-	cmd := gitCmd(ctx, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
-	cmd.Dir = dir
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	cmd := newGitCommand(ctx, dir, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+	out, err := gitOutput(ctx, cmd, "git rev-parse HEAD")
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return "", ctxErr
+		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok && exitErr.ExitCode() == 1 {
+			return gitNoHead, nil
 		}
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			return "no-head", nil
-		}
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			return "", fmt.Errorf("git rev-parse HEAD: %w", err)
-		}
-		return "", fmt.Errorf("git rev-parse HEAD: %w: %s", err, msg)
+		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
 }
 
-// parseGitStatusV2 parses git status --porcelain=v2 --branch --no-renames -z output.
-// With -z, ALL records (headers and entries) are NUL-terminated.
-func parseGitStatusV2(raw string) repoState {
-	state := repoState{
-		HeadSHA:   "no-head",
-		RawOutput: raw,
-	}
+// parseGitStatusV2Skipping parses git status --porcelain=v2 --branch
+// --no-renames -z output. With -z, a NUL byte ends each record, header or
+// entry. It puts the nested repositories in Children, not in Files or
+// RawOutput. It drops the untracked entries below the bareRepos directories
+// from Files and RawOutput.
+func parseGitStatusV2Skipping(raw string, bareRepos []string) repoState {
+	state := repoState{HeadSHA: gitNoHead}
 
+	var kept strings.Builder
+	kept.Grow(len(raw))
 	seen := make(map[string]struct{})
 	pos := 0
 
-	// Parse NUL-terminated records. With -z, both header lines (# ...)
-	// and entry records use NUL as the terminator.
 	for pos < len(raw) {
 		end := strings.IndexByte(raw[pos:], 0)
 		if end < 0 {
 			break
 		}
+		start := pos
 		entry := raw[pos : pos+end]
 		pos += end + 1
 
 		if len(entry) < 2 {
+			kept.WriteString(raw[start:pos])
 			continue
 		}
 
@@ -220,32 +139,49 @@ func parseGitStatusV2(raw string) repoState {
 		if entry[0] == '#' {
 			if strings.HasPrefix(entry, "# branch.oid ") {
 				state.HeadSHA = entry[len("# branch.oid "):]
-				if state.HeadSHA == "(initial)" {
-					state.HeadSHA = "no-head"
+				// Git writes "(initial)" before the first commit. An empty
+				// value names no object either, so it also means no HEAD.
+				if state.HeadSHA == "(initial)" || state.HeadSHA == "" {
+					state.HeadSHA = gitNoHead
 				}
 			}
+			kept.WriteString(raw[start:pos])
 			continue
 		}
 
 		var path string
+		child := false
 		switch entry[0] {
-		case '?': // untracked: "? <path>"
+		case '?': // untracked: "? <path>"; a nested repository ends in "/"
 			path = entry[2:]
+			if trimmed, ok := strings.CutSuffix(path, "/"); ok {
+				path, child = trimmed, true
+			} else if slices.ContainsFunc(bareRepos, func(dir string) bool { return strings.HasPrefix(path, dir+"/") }) {
+				continue
+			}
 		case '1': // changed: "1 XY sub mH mI mW hH hI <path>"
 			path = extractV2Path(entry, 8)
+			child = v2Field(entry, 5) == gitlinkMode
 		case '2': // renamed/copied: "2 XY sub mH mI mW hH hI Xscore <path>"
-			// With -z, rename entries emit an additional NUL-terminated
-			// record for the original path. Consume it so it's not
-			// misinterpreted as a separate entry. This should not occur
-			// with --no-renames but handles it defensively.
+			// With -z, a rename entry has one more NUL-terminated record
+			// for the original path. Skip it, so that the parser does not
+			// read it as a separate entry. --no-renames prevents rename
+			// entries, but the parser does not depend on that.
 			path = extractV2Path(entry, 9)
+			child = v2Field(entry, 5) == gitlinkMode
 			if nextEnd := strings.IndexByte(raw[pos:], 0); nextEnd >= 0 {
 				pos += nextEnd + 1
 			}
 		case 'u': // unmerged: "u XY sub m1 m2 m3 mW h1 h2 h3 <path>"
 			path = extractV2Path(entry, 10)
+			child = v2Field(entry, 6) == gitlinkMode
 		}
 
+		if child {
+			state.Children = append(state.Children, path)
+			continue
+		}
+		kept.WriteString(raw[start:pos])
 		if path != "" {
 			if _, ok := seen[path]; ok {
 				continue
@@ -255,93 +191,27 @@ func parseGitStatusV2(raw string) repoState {
 		}
 	}
 
+	state.RawOutput = kept.String()
 	return state
 }
 
-// ensureUntrackedCache enables core.untrackedCache if not already set.
-// The untracked cache stores directory mtimes in the git index so that
-// git status can skip unchanged directories. The setting is stored in the
-// repository's .git/config and can be disabled there. Read that file directly
-// before running `git config`.
-func ensureUntrackedCache(ctx context.Context, paths gitPaths) {
-	configPath := paths.ConfigPath
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return
-	}
-	if strings.Contains(string(data), "untrackedCache") {
-		return
-	}
-	cmd := gitCmd(ctx, "config", "core.untrackedCache", "true")
-	cmd.Dir = paths.RepoDir
-	_ = cmd.Run()
+// gitlinkMode is the Git file mode of a gitlink (a submodule commit).
+const gitlinkMode = "160000"
+
+// v2Field returns the space-separated field at index n of a porcelain v2
+// entry. The work-tree mode tells whether a changed gitlink is still a
+// repository: a gitlink replaced by a file is content of the parent.
+func v2Field(entry string, n int) string {
+	field, _, _ := strings.Cut(extractV2Path(entry, n), " ")
+	return field
 }
 
-// ensureFSMonitor enables the built-in filesystem monitor daemon if not
-// already configured. The fsmonitor daemon uses OS-level file watchers
-// (FSEvents on macOS, inotify on Linux) so git status can query a socket
-// instead of lstat'ing every tracked file. On large repos this reduces
-// git status from hundreds of milliseconds to single-digit ms. The
-// setting is safe, reversible, and stored in .git/config (per-repo only).
-//
-// Requires Git 2.36+ where core.fsmonitor=true means "use the built-in
-// daemon". On older versions this key expects a hook script path, and
-// setting it to "true" would be misinterpreted (on Unix, /usr/bin/true
-// exists and would silently disable change detection).
-//
-// Only called on first run (when no cached state exists), so the
-// subprocess cost of version detection is amortized.
-func ensureFSMonitor(ctx context.Context, paths gitPaths) {
-	configPath := paths.ConfigPath
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return
-	}
-	if strings.Contains(string(data), "fsmonitor") {
-		return
-	}
-	// Gate on Git 2.36+ to avoid misinterpretation of the boolean value.
-	if !gitVersionAtLeast(ctx, paths.RepoDir, 2, 36) {
-		return
-	}
-	cmd := gitCmd(ctx, "config", "core.fsmonitor", "true")
-	cmd.Dir = paths.RepoDir
-	_ = cmd.Run()
-}
-
-// gitVersionAtLeast returns true if the installed git version is at least
-// major.minor. Returns false on any parse error (conservative).
-func gitVersionAtLeast(ctx context.Context, dir string, major, minor int) bool {
-	cmd := gitCmd(ctx, "version")
-	cmd.Dir = dir
-	out, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-	return gitVersionOutputAtLeast(out, major, minor)
-}
-
-func gitVersionOutputAtLeast(out []byte, major, minor int) bool {
-	// Parse "git version 2.43.0" or "git version 2.43.0.windows.1"
-	s := strings.TrimSpace(string(out))
-	s = strings.TrimPrefix(s, "git version ")
-	parts := strings.SplitN(s, ".", 3)
-	if len(parts) < 2 {
-		return false
-	}
-	maj, err1 := strconv.Atoi(parts[0])
-	min, err2 := strconv.Atoi(parts[1])
-	if err1 != nil || err2 != nil {
-		return false
-	}
-	return maj > major || (maj == major && min >= minor)
-}
-
-// extractV2Path extracts the path from a porcelain v2 entry by skipping
-// the given number of space-separated fields.
+// extractV2Path returns the rest of a porcelain v2 entry after skipFields
+// space-separated fields, or "" when no field follows them. When skipFields
+// counts every field before the path, the rest is the path, spaces included.
 func extractV2Path(entry string, skipFields int) string {
 	idx := 0
-	for i := 0; i < skipFields; i++ {
+	for range skipFields {
 		space := strings.IndexByte(entry[idx:], ' ')
 		if space < 0 {
 			return ""

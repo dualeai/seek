@@ -6,7 +6,8 @@ BEGIN {
 	regex_meta = "\\.+*?()|[]{}^$"
 	file_limit = 20
 	match_limit = 3
-	max_context = 512
+	route_query_kind = "content"
+	route_match_limit = match_limit
 }
 
 {
@@ -15,18 +16,16 @@ BEGIN {
 }
 
 END {
-	if (multiline || command == "" || !tokenize(command)) exit
+	if (multiline || !tokenize(command)) exit
 
 	search_argc = pipe_at ? pipe_at - 1 : argc
-	if (search_argc < 1) exit
 	if (pipe_at && !parse_head(pipe_at + 1, argc)) exit
 	if (!route_search(search_argc)) exit
 	if (head_limit && !route_files_only) exit
 
 	limit = file_limit
 	if (head_limit && head_limit < limit) limit = head_limit
-	context_kind = route_context_flag == "" ? "none" : substr(route_context_flag, 2, 1)
-	print context_kind "|" render_seek(limit)
+	print render_seek(limit)
 }
 
 function push_token() {
@@ -35,8 +34,9 @@ function push_token() {
 	token_started = 0
 }
 
-# Accept literal POSIX-shell words, quotes, and backslash escapes. Reject every
-# form that can expand, redirect, start another command, or run in background.
+# Accept literal POSIX-shell words, quotes, backslash escapes, and one pipe.
+# Reject every other form that can expand, redirect, start another command, or
+# run in the background.
 function tokenize(source,    i, char, next_char, mode, length_source) {
 	argc = 0
 	pipe_at = 0
@@ -139,25 +139,12 @@ function set_head_limit(value) {
 }
 
 function route_search(last) {
-	reset_route()
 	if (args[1] == "grep") return route_grep(2, last)
 	if (args[1] == "rg") return route_rg(2, last)
 	if (args[1] == "git" && last >= 2 && args[2] == "grep") return route_git_grep(3, last)
 	if (args[1] == "fd") return route_fd(2, last)
 	if (args[1] == "find") return route_find(2, last)
 	return 0
-}
-
-function reset_route(    i) {
-	for (i = 1; i <= route_npaths; i++) delete route_paths[i]
-	route_npaths = 0
-	route_pattern = ""
-	route_insensitive = 0
-	route_files_only = 0
-	route_query_kind = "content"
-	route_context_flag = ""
-	route_context_lines = 0
-	route_match_limit = match_limit
 }
 
 function route_grep(first, last,    i, j, arg, flag, pattern_at, recursive, insensitive, fixed, extended, files_only) {
@@ -172,7 +159,7 @@ function route_grep(first, last,    i, j, arg, flag, pattern_at, recursive, inse
 			pattern_at = i
 			break
 		}
-		if (length(arg) < 2 || substr(arg, 1, 2) == "--") return 0
+		if (substr(arg, 1, 2) == "--") return 0
 		for (j = 2; j <= length(arg); j++) {
 			flag = substr(arg, j, 1)
 			if (flag == "r") recursive = 1
@@ -233,7 +220,6 @@ function route_rg(first, last,    i, j, arg, flag, value, pattern_at, path_at, p
 			} else return 0
 			continue
 		}
-		if (length(arg) < 2) return 0
 		if (arg == "-A" || arg == "-C") {
 			if (i == last || !set_rg_context(arg, args[++i])) return 0
 			continue
@@ -267,7 +253,7 @@ function route_rg(first, last,    i, j, arg, flag, value, pattern_at, path_at, p
 		}
 	}
 	if (pattern_at) {
-		if (pattern_set || pattern_at > last) return 0
+		if (pattern_at > last) return 0
 		route_pattern = args[pattern_at]
 		pattern_set = 1
 		path_at = pattern_at + 1
@@ -275,11 +261,8 @@ function route_rg(first, last,    i, j, arg, flag, value, pattern_at, path_at, p
 	if (!pattern_set || route_pattern == "") return 0
 	if (fixed) route_pattern = regexp_quote(route_pattern)
 
-	if (!path_at || path_at > last) {
-		route_paths[++route_npaths] = "."
-	} else if (!copy_paths(path_at, last) || has_dash_path()) {
-		return 0
-	}
+	# A pathless form sends no path: Seek searches the current directory.
+	if (path_at && path_at <= last && (!copy_paths(path_at, last) || has_dash_path())) return 0
 	if (route_context_flag != "" && ((!path_at || path_at > last) || files_only)) return 0
 
 	route_insensitive = insensitive
@@ -288,12 +271,15 @@ function route_rg(first, last,    i, j, arg, flag, value, pattern_at, path_at, p
 	return 1
 }
 
-function set_rg_context(flag, value,    number) {
+function set_rg_context(flag, value) {
 	if (route_context_flag != "" || !decimal_digits(value)) return 0
-	number = value + 0
-	if (number < 0 || number > max_context) return 0
+	# Keep the decimal text: an awk number rounds above 2^53. Seek reads an
+	# int64, so a larger value stays with rg.
+	sub(/^0+/, "", value)
+	if (value == "") value = "0"
+	if (length(value) > 19 || (length(value) == 19 && value > "9223372036854775807")) return 0
 	route_context_flag = flag
-	route_context_lines = number
+	route_context_lines = value
 	return 1
 }
 
@@ -305,7 +291,7 @@ function route_git_grep(first, last,    i, j, arg, flag, pattern_at, insensitive
 			pattern_at = i
 			break
 		}
-		if (length(arg) < 2 || substr(arg, 1, 2) == "--") return 0
+		if (substr(arg, 1, 2) == "--") return 0
 		for (j = 2; j <= length(arg); j++) {
 			flag = substr(arg, j, 1)
 			if (flag == "i") insensitive = 1
@@ -319,12 +305,9 @@ function route_git_grep(first, last,    i, j, arg, flag, pattern_at, insensitive
 	if (!fixed && !portable_regex_literal(route_pattern)) return 0
 	if (fixed) route_pattern = regexp_quote(route_pattern)
 
-	if (pattern_at == last) {
-		route_paths[++route_npaths] = "."
-	} else {
+	if (pattern_at < last) {
 		if (args[pattern_at + 1] != "--") return 0
-		if (pattern_at + 1 == last) route_paths[++route_npaths] = "."
-		else if (!copy_paths(pattern_at + 2, last) || !literal_git_paths()) return 0
+		if (pattern_at + 1 < last && (!copy_paths(pattern_at + 2, last) || !literal_git_paths())) return 0
 	}
 	route_insensitive = insensitive
 	route_files_only = files_only
@@ -339,11 +322,15 @@ function route_fd(first, last,    i) {
 	}
 	if (i > last || args[i] == "" || substr(args[i], 1, 1) == "-") return 0
 	route_pattern = args[i++]
-	if (i > last) route_paths[++route_npaths] = "."
-	else if (!copy_paths(i, last) || has_dash_path()) return 0
+	# fd matches its pattern on the file name, and the header holds the path as
+	# typed. A literal name with no "/" maps to a match inside the last path
+	# component; any other pattern stays with fd.
+	if (index(route_pattern, "/") || !portable_regex_literal(route_pattern)) return 0
+	if (i <= last && (!copy_paths(i, last) || has_dash_path())) return 0
+	route_insensitive = !has_upper(route_pattern)
+	route_pattern = "(^|/)[^/]*" route_pattern "[^/]*$"
 	route_query_kind = "file"
 	route_files_only = 1
-	route_insensitive = !has_upper(route_pattern)
 	return 1
 }
 
@@ -354,7 +341,6 @@ function route_find(first, last,    i, predicate_at, predicate_last, pattern) {
 			predicate_at = i
 			break
 		}
-		if (args[i] == "" || substr(args[i], 1, 1) == "-") return 0
 	}
 	if (!predicate_at || predicate_at <= first) return 0
 	predicate_last = last
@@ -399,7 +385,7 @@ function literal_git_paths(    i, path) {
 function literal_find_roots(    i, path) {
 	for (i = 1; i <= route_npaths; i++) {
 		path = route_paths[i]
-		if (path == "" || substr(path, 1, 1) == "-" || path == "!" || path == "(" || path == ")" || path == ",") return 0
+		if (path == "" || path == "!" || path == "(" || path == ")" || path == ",") return 0
 	}
 	return 1
 }

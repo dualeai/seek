@@ -5,18 +5,24 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/query"
 )
 
+// TestReadNativeGitDiffFixedChanges commits an add, a deletion, an edit, a
+// mode change, a type change and a rename. A rename reads as a deletion and
+// an add. Each diff entry has the modes and the path of its change.
 func TestReadNativeGitDiffFixedChanges(t *testing.T) {
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
@@ -48,7 +54,7 @@ func TestReadNativeGitDiffFixedChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink("modify.go", filepath.Join(repoDir, "type.go")); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
+		t.Fatal(err)
 	}
 	gitRunIn(t, repoDir, "mv", "rename-old.go", "rename-new.go")
 	if err := os.WriteFile(filepath.Join(repoDir, "add.go"), []byte("package added\n"), 0o644); err != nil {
@@ -64,7 +70,7 @@ func TestReadNativeGitDiffFixedChanges(t *testing.T) {
 	}
 	got := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		got = append(got, fmt.Sprintf("%s>%s:%s", entry.oldMode, entry.newMode, entry.newPath))
+		got = append(got, fmt.Sprintf("%s>%s:%s", entry.oldMode, entry.newMode, entry.path))
 	}
 	sort.Strings(got)
 	want := []string{
@@ -81,6 +87,8 @@ func TestReadNativeGitDiffFixedChanges(t *testing.T) {
 	}
 }
 
+// nativeVisibleDocument is one document that a search of an index sees, with
+// the fields that a delta build and a full build must agree on.
 type nativeVisibleDocument struct {
 	name     string
 	content  string
@@ -88,9 +96,11 @@ type nativeVisibleDocument struct {
 	version  string
 }
 
+// nativeVisibleDocuments returns every document that a search of the shards
+// in indexDir sees, after the tombstones, in a fixed order.
 func nativeVisibleDocuments(t testing.TB, indexDir string) []nativeVisibleDocument {
 	t.Helper()
-	searchers, err := loadShardsOptional(indexDir)
+	searchers, err := loadShards(indexDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,15 +140,18 @@ func nativeVisibleDocuments(t testing.TB, indexDir string) []nativeVisibleDocume
 	return documents
 }
 
+// assertNativeRepositoryParity fails the test unless every committed shard of
+// deltaDir and fullDir has the repository metadata of the first full shard,
+// apart from the tombstones.
 func assertNativeRepositoryParity(t testing.TB, deltaDir, fullDir string) {
 	t.Helper()
 	fullRepositories := zoektCommittedRepositoryMetadata(t, fullDir)
 	deltaRepositories := zoektCommittedRepositoryMetadata(t, deltaDir)
 	normalize := func(repository *zoekt.Repository) zoekt.Repository {
 		result := *repository
-		// Delta shards can store path tombstones that a clean full shard does not
-		// need. Document parity above tests their effect. All repository metadata
-		// must be equal.
+		// Delta shards can store path tombstones that a clean full shard does
+		// not need. The callers' document comparison tests their effect. All
+		// other repository metadata must be equal.
 		result.FileTombstones = nil
 		return result
 	}
@@ -161,13 +174,11 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 		modifiedContent = "package changed\n// DELTA_MODIFIED\n"
 	)
 	mutations := []struct {
-		name       string
-		wantBudget gitIndexBudget
-		mutate     func(*testing.T, string)
+		name   string
+		mutate func(*testing.T, string)
 	}{
 		{
-			name:       "add",
-			wantBudget: gitIndexBudget{candidates: 3, indexedBytes: int64(len(keepContent) + len(baseContent) + len(addedContent))},
+			name: "add",
 			mutate: func(t *testing.T, repoDir string) {
 				t.Helper()
 				if err := os.WriteFile(filepath.Join(repoDir, "added.go"), []byte(addedContent), 0o644); err != nil {
@@ -176,8 +187,7 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 			},
 		},
 		{
-			name:       "delete",
-			wantBudget: gitIndexBudget{candidates: 1, indexedBytes: int64(len(keepContent))},
+			name: "delete",
 			mutate: func(t *testing.T, repoDir string) {
 				t.Helper()
 				if err := os.Remove(filepath.Join(repoDir, "change.go")); err != nil {
@@ -186,8 +196,7 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 			},
 		},
 		{
-			name:       "modify",
-			wantBudget: gitIndexBudget{candidates: 2, indexedBytes: int64(len(keepContent) + len(modifiedContent))},
+			name: "modify",
 			mutate: func(t *testing.T, repoDir string) {
 				t.Helper()
 				if err := os.WriteFile(filepath.Join(repoDir, "change.go"), []byte(modifiedContent), 0o644); err != nil {
@@ -196,21 +205,19 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 			},
 		},
 		{
-			name:       "type-change",
-			wantBudget: gitIndexBudget{candidates: 2, indexedBytes: int64(len(keepContent) + len("keep.go"))},
+			name: "type-change",
 			mutate: func(t *testing.T, repoDir string) {
 				t.Helper()
 				if err := os.Remove(filepath.Join(repoDir, "change.go")); err != nil {
 					t.Fatal(err)
 				}
 				if err := os.Symlink("keep.go", filepath.Join(repoDir, "change.go")); err != nil {
-					t.Skipf("symlink unavailable: %v", err)
+					t.Fatal(err)
 				}
 			},
 		},
 		{
-			name:       "mode-only",
-			wantBudget: gitIndexBudget{candidates: 2, indexedBytes: int64(len(keepContent) + len(baseContent))},
+			name: "mode-only",
 			mutate: func(t *testing.T, repoDir string) {
 				t.Helper()
 				if err := os.Chmod(filepath.Join(repoDir, "change.go"), 0o755); err != nil {
@@ -219,16 +226,14 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 			},
 		},
 		{
-			name:       "rename",
-			wantBudget: gitIndexBudget{candidates: 2, indexedBytes: int64(len(keepContent) + len(baseContent))},
+			name: "rename",
 			mutate: func(t *testing.T, repoDir string) {
 				t.Helper()
 				gitRunIn(t, repoDir, "mv", "change.go", "renamed.go")
 			},
 		},
 		{
-			name:       "empty-diff",
-			wantBudget: gitIndexBudget{candidates: 2, indexedBytes: int64(len(keepContent) + len(baseContent))},
+			name: "empty-diff",
 			mutate: func(t *testing.T, repoDir string) {
 				t.Helper()
 			},
@@ -264,12 +269,12 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			delta, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.cacheDir, plan.indexDir, target, scan)
-			if err != nil || !eligible {
-				t.Fatalf("prepare delta: eligible=%t error=%v", eligible, err)
+			delta, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, target, scan)
+			if err != nil || delta == nil {
+				t.Fatalf("prepare delta: eligible=%t error=%v", delta != nil, err)
 			}
-			if delta.nextState.budget != test.wantBudget {
-				t.Fatalf("delta budget=%+v, want %+v", delta.nextState.budget, test.wantBudget)
+			if delta.nextState.head != target {
+				t.Fatalf("delta head=%s, want %s", delta.nextState.head, target)
 			}
 
 			seedBytes := make(map[string][]byte)
@@ -281,7 +286,7 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 				seedBytes[path] = content
 			}
 			deltaDir := t.TempDir()
-			if err := indexNativeGitDelta(t.Context(), paths.RepoDir, deltaDir, scan.paths(familyCommitted), delta); err != nil {
+			if err := indexNativeGitDelta(t.Context(), paths.RepoDir, deltaDir, scan.paths(familyCommitted), delta, indexParallelism()); err != nil {
 				t.Fatalf("build delta: %v", err)
 			}
 			for path, want := range seedBytes {
@@ -292,7 +297,7 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 			}
 
 			fullDir := t.TempDir()
-			if err := indexNativeGitFull(t.Context(), paths.RepoDir, fullDir, target, nil, 1); err != nil {
+			if _, err := indexNativeGitFull(t.Context(), paths.RepoDir, fullDir, target, 1, nil); err != nil {
 				t.Fatalf("build clean full: %v", err)
 			}
 			if got, want := nativeVisibleDocuments(t, deltaDir), nativeVisibleDocuments(t, fullDir); !slices.Equal(got, want) {
@@ -303,7 +308,9 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 	}
 }
 
-func prepareNativeDeltaFixture(t *testing.T) (string, gitPaths, corpusPlan) {
+// prepareNativeDeltaFixture commits base.go in a new repository and builds
+// its index. It returns the repository, its paths and its plan.
+func prepareNativeDeltaFixture(t *testing.T) (string, gitPaths, node) {
 	t.Helper()
 	repoDir := initEmptyGitRepo(t)
 	if err := os.WriteFile(filepath.Join(repoDir, "base.go"), []byte("package base\n// NATIVE_DELTA_BASE\n"), 0o644); err != nil {
@@ -316,27 +323,192 @@ func prepareNativeDeltaFixture(t *testing.T) (string, gitPaths, corpusPlan) {
 	return repoDir, paths, plan
 }
 
-func TestPrepareNativeGitDeltaFallsBackBeforeSeeding(t *testing.T) {
-	t.Run("ignore-change", func(t *testing.T) {
-		repoDir, paths, plan := prepareNativeDeltaFixture(t)
-		if err := os.MkdirAll(filepath.Join(repoDir, ".sourcegraph"), 0o755); err != nil {
+// TestNativeGitIndexesFilesThatAnIgnoreFileNames commits a root
+// .sourcegraph/ignore that names two files. Seek reads no ignore file: after
+// the delta that adds it and the next delta, the named files match.
+func TestNativeGitIndexesFilesThatAnIgnoreFileNames(t *testing.T) {
+	requireTools(t)
+	repoDir, paths, plan := prepareNativeDeltaFixture(t)
+	for name, content := range map[string]string{
+		".sourcegraph/ignore": "base.go\nnamed.go\n",
+		"named.go":            "package named\n// IGNORE_NAMED_FIRST\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(repoDir, name)), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(repoDir, ".sourcegraph", "ignore"), []byte("base.go\n"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(repoDir, name), []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		gitRunIn(t, repoDir, "add", ".")
-		gitRunIn(t, repoDir, "commit", "-m", "ignore change")
-		scan, err := scanFamily(plan.indexDir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.cacheDir, plan.indexDir, captureHeadForTest(t, paths.RepoDir), scan)
-		if err != nil || eligible {
-			t.Fatalf("ignore change: eligible=%t error=%v", eligible, err)
-		}
-	})
+	}
+	gitRunIn(t, repoDir, "add", ".")
+	gitRunIn(t, repoDir, "commit", "-m", "ignore file")
+	reindexGit(t, t.Context(), paths, plan)
+	if err := os.WriteFile(filepath.Join(repoDir, "named.go"), []byte("package named\n// IGNORE_NAMED_SECOND\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repoDir, "commit", "-a", "-m", "named change")
+	reindexGit(t, t.Context(), paths, plan)
 
+	for marker, want := range map[string]int{"NATIVE_DELTA_BASE": 1, "IGNORE_NAMED_FIRST": 0, "IGNORE_NAMED_SECOND": 1} {
+		results, err := searchPlannedCorpusForTest(t.Context(), plan, marker)
+		if err != nil || len(results) != want {
+			t.Fatalf("%s matches %d files, want %d; error=%v", marker, len(results), want, err)
+		}
+	}
+}
+
+// TestNativeGitTombstonedBytesCompactTheFamily commits the removal of 3 of 10
+// files of one size, then of 2 more. The first delta tombstones 3 files
+// against 7 live ones and stays a delta. With the second, deltas tombstoned 5
+// files against 5 live ones, so the build replaces the family
+// (deltaNeedsCompaction).
+func TestNativeGitTombstonedBytesCompactTheFamily(t *testing.T) {
+	requireTools(t)
+	// A small shardMax puts the floor of deltaNeedsCompaction below the
+	// byte counts of these files (634 bytes each).
+	swapForTest(t, &shardMax, 1024)
+	repoDir := initEmptyGitRepo(t)
+	for i := range 10 {
+		if err := os.WriteFile(filepath.Join(repoDir, fmt.Sprintf("c%02d.go", i)), []byte(compactionFixtureFile(i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitRunIn(t, repoDir, "add", ".")
+	gitRunIn(t, repoDir, "commit", "-m", "ten files")
+	paths, plan := planGitTestCorpus(t, repoDir)
+	reindexGit(t, t.Context(), paths, plan)
+	committed := func() shardFileState {
+		t.Helper()
+		return readShardFileState(t, plan.indexDir, fallbackGitRepositoryName(repoDir))
+	}
+	remove := func(files ...int) {
+		t.Helper()
+		for _, i := range files {
+			gitRunIn(t, repoDir, "rm", "-q", fmt.Sprintf("c%02d.go", i))
+		}
+		gitRunIn(t, repoDir, "commit", "-m", "remove")
+		reindexGit(t, t.Context(), paths, plan)
+	}
+
+	before := committed()
+	remove(0, 1, 2)
+	requireTombstoneOnlyDelta(t, before, committed())
+
+	before = committed()
+	remove(3, 4)
+	requireFullRebuild(t, before, committed())
+	for i := range 10 {
+		results, err := searchPlannedCorpusForTest(t.Context(), plan, fmt.Sprintf("compact_marker_%02d", i))
+		if want := min(max(i-4, 0), 1); err != nil || len(results) != want {
+			t.Fatalf("compact_marker_%02d matches %d files, want %d; error=%v", i, len(results), want, err)
+		}
+	}
+}
+
+// TestNativeGitBinaryBlobsCountTheirMarker commits the removal of 8 of 10
+// text files. Beside them is a blob of about 10,000 bytes whose NUL byte comes
+// after the probe of the reader. The reader sends its content, and Zoekt keeps
+// it by name only. The full build counts the blob as its marker. So 8 dead
+// text files against 2 live ones and the marker make the build replace the
+// family (deltaNeedsCompaction).
+func TestNativeGitBinaryBlobsCountTheirMarker(t *testing.T) {
+	requireTools(t)
+	// A small shardMax puts the floor of deltaNeedsCompaction below the
+	// byte counts of these files (634 bytes each).
+	swapForTest(t, &shardMax, 1024)
+	repoDir := initEmptyGitRepo(t)
+	for i := range 10 {
+		if err := os.WriteFile(filepath.Join(repoDir, fmt.Sprintf("c%02d.go", i)), []byte(compactionFixtureFile(i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lateBinary := append(bytes.Repeat([]byte("binary filler\n"), 700), 0)
+	if err := os.WriteFile(filepath.Join(repoDir, "blob.bin"), lateBinary, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repoDir, "add", ".")
+	gitRunIn(t, repoDir, "commit", "-m", "ten files and a binary")
+	paths, plan := planGitTestCorpus(t, repoDir)
+	reindexGit(t, t.Context(), paths, plan)
+	before := readShardFileState(t, plan.indexDir, fallbackGitRepositoryName(repoDir))
+	for i := range 8 {
+		gitRunIn(t, repoDir, "rm", "-q", fmt.Sprintf("c%02d.go", i))
+	}
+	gitRunIn(t, repoDir, "commit", "-m", "remove")
+	reindexGit(t, t.Context(), paths, plan)
+	requireFullRebuild(t, before, readShardFileState(t, plan.indexDir, fallbackGitRepositoryName(repoDir)))
+}
+
+// TestNativeGitDeltaCountsANewBinaryBlobAsItsMarker commits a binary blob of
+// 8,000 bytes. The delta admits it at its size. Its read adds its 36-byte
+// marker, not its 8,000 bytes, to the live bytes of the committed state.
+func TestNativeGitDeltaCountsANewBinaryBlobAsItsMarker(t *testing.T) {
+	requireTools(t)
+	repoDir := initGitRepo(t, "a.go", "package a\n// base\n")
+	paths, plan := planGitTestCorpus(t, repoDir)
+	reindexGit(t, t.Context(), paths, plan)
+	base, ok := readCommittedGitState(plan.cacheDir)
+	if !ok {
+		t.Fatal("no committed state after the full build")
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "blob.bin"), binaryFixtureFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repoDir, "add", "blob.bin")
+	gitRunIn(t, repoDir, "commit", "-qm", "binary")
+	reindexGit(t, t.Context(), paths, plan)
+	next, ok := readCommittedGitState(plan.cacheDir)
+	if !ok || next.baseHead != base.baseHead {
+		t.Fatalf("state ok=%t base=%s, want the delta on base %s", ok, next.baseHead, base.baseHead)
+	}
+	if got, want := next.liveBytes-base.liveBytes, int64(len("NOT-INDEXED: contains binary content")); got != want {
+		t.Fatalf("live bytes grew by %d, want %d", got, want)
+	}
+}
+
+// TestNativeGitBinaryOnlyCommitsStayDeltas commits 3 changes of only a binary
+// blob of 8,000 bytes beside 30 text files. The delta reads each old blob, so
+// each commit tombstones its 36-byte marker, not its 8,000 bytes. Every commit
+// stays a delta, and the dead bytes grow by 36 each time.
+func TestNativeGitBinaryOnlyCommitsStayDeltas(t *testing.T) {
+	requireTools(t)
+	// A small shardMax puts the floor of deltaNeedsCompaction below the
+	// byte counts of these files (634 bytes each).
+	swapForTest(t, &shardMax, 1024)
+	repoDir := initEmptyGitRepo(t)
+	for i := range 30 {
+		if err := os.WriteFile(filepath.Join(repoDir, fmt.Sprintf("c%02d.go", i)), []byte(compactionFixtureFile(i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "blob.bin"), binaryFixtureFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repoDir, "add", ".")
+	gitRunIn(t, repoDir, "commit", "-qm", "base")
+	paths, plan := planGitTestCorpus(t, repoDir)
+	reindexGit(t, t.Context(), paths, plan)
+	marker := int64(len("NOT-INDEXED: contains binary content"))
+	for step := 1; step <= 3; step++ {
+		blob := bytes.Repeat([]byte{0, byte(step + 10), 2, 3}, 2000)
+		if err := os.WriteFile(filepath.Join(repoDir, "blob.bin"), blob, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitRunIn(t, repoDir, "commit", "-qam", fmt.Sprintf("binary %d", step))
+		before := readShardFileState(t, plan.indexDir, fallbackGitRepositoryName(repoDir))
+		reindexGit(t, t.Context(), paths, plan)
+		requireTombstoneOnlyDeltaOrNewShard(t, before, readShardFileState(t, plan.indexDir, fallbackGitRepositoryName(repoDir)))
+		state, ok := readCommittedGitState(plan.cacheDir)
+		if !ok || state.deadBytes != marker*int64(step) {
+			t.Fatalf("commit %d: dead_bytes=%d ok=%t, want %d", step, state.deadBytes, ok, marker*int64(step))
+		}
+	}
+}
+
+// TestPrepareNativeGitDeltaFallsBackBeforeSeeding makes the delta not
+// eligible before it links a seed shard. The two causes are a change larger
+// than the build window and a damaged family manifest.
+func TestPrepareNativeGitDeltaFallsBackBeforeSeeding(t *testing.T) {
 	t.Run("payload-window", func(t *testing.T) {
 		repoDir, paths, plan := prepareNativeDeltaFixture(t)
 		if err := os.WriteFile(filepath.Join(repoDir, "base.go"), []byte("package changed\n// payload larger than test window\n"), 0o644); err != nil {
@@ -351,9 +523,9 @@ func TestPrepareNativeGitDeltaFallsBackBeforeSeeding(t *testing.T) {
 		oldWindow := indexWindowBytes
 		indexWindowBytes = 1
 		defer func() { indexWindowBytes = oldWindow }()
-		_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.cacheDir, plan.indexDir, captureHeadForTest(t, paths.RepoDir), scan)
-		if err != nil || eligible {
-			t.Fatalf("payload cap: eligible=%t error=%v", eligible, err)
+		delta, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan)
+		if err != nil || delta != nil {
+			t.Fatalf("payload cap: eligible=%t error=%v", delta != nil, err)
 		}
 	})
 
@@ -371,63 +543,44 @@ func TestPrepareNativeGitDeltaFallsBackBeforeSeeding(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(plan.indexDir, familyManifestFile), []byte("invalid\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.cacheDir, plan.indexDir, captureHeadForTest(t, paths.RepoDir), scan)
-		if err != nil || eligible {
-			t.Fatalf("invalid manifest: eligible=%t error=%v", eligible, err)
+		delta, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan)
+		if err != nil || delta != nil {
+			t.Fatalf("invalid manifest: eligible=%t error=%v", delta != nil, err)
 		}
 	})
 
-	t.Run("mutable-metadata-change", func(t *testing.T) {
-		repoDir, paths, plan := prepareNativeDeltaFixture(t)
-		if err := os.WriteFile(filepath.Join(repoDir, "next.go"), []byte("package next\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		gitRunIn(t, repoDir, "add", ".")
-		gitRunIn(t, repoDir, "commit", "-m", "metadata change")
-		gitRunIn(t, repoDir, "config", "zoekt.latestCommitDate", "1")
-		scan, err := scanFamily(plan.indexDir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.cacheDir, plan.indexDir, captureHeadForTest(t, paths.RepoDir), scan)
-		if err != nil || eligible {
-			t.Fatalf("mutable metadata change: eligible=%t error=%v", eligible, err)
-		}
-	})
+}
 
-	t.Run("metadata-key-removal", func(t *testing.T) {
-		repoDir := initGitRepo(t, "base.go", "package base\n")
-		gitRunIn(t, repoDir, "config", "zoekt.name", "metadata-removal")
-		gitRunIn(t, repoDir, "config", "zoekt.tenantID", "9")
-		gitRunIn(t, repoDir, "config", "zoekt.github-stars", "100")
-		paths, plan := planGitTestCorpus(t, repoDir)
-		reindexGit(t, context.Background(), paths, plan)
-		gitRunIn(t, repoDir, "config", "--unset", "zoekt.tenantID")
-		gitRunIn(t, repoDir, "config", "--unset", "zoekt.github-stars")
-		if err := os.WriteFile(filepath.Join(repoDir, "next.go"), []byte("package next\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		gitRunIn(t, repoDir, "add", ".")
-		gitRunIn(t, repoDir, "commit", "-m", "remove metadata")
-		scan, err := scanFamily(plan.indexDir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.cacheDir, plan.indexDir, captureHeadForTest(t, paths.RepoDir), scan)
-		if err != nil || eligible {
-			t.Fatalf("metadata key removal: eligible=%t error=%v", eligible, err)
-		}
-	})
+// TestPrepareNativeGitDeltaIgnoresZoektConfig changes the zoekt.* Git config
+// with a commit. Seek reads no such config, so the delta stays eligible.
+func TestPrepareNativeGitDeltaIgnoresZoektConfig(t *testing.T) {
+	requireTools(t)
+	repoDir, paths, plan := prepareNativeDeltaFixture(t)
+	if err := os.WriteFile(filepath.Join(repoDir, "next.go"), []byte("package next\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunIn(t, repoDir, "add", ".")
+	gitRunIn(t, repoDir, "commit", "-m", "config change")
+	gitRunIn(t, repoDir, "config", "zoekt.name", "config-change")
+	gitRunIn(t, repoDir, "config", "zoekt.web-url", "https://example.test/config-change")
+	scan, err := scanFamily(plan.indexDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan)
+	if err != nil || delta == nil {
+		t.Fatalf("zoekt config change: eligible=%t error=%v", delta != nil, err)
+	}
 }
 
 func TestPrepareNativeGitDeltaRejectsCommittedStateDamage(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
-		damage func(*testing.T, corpusPlan, gitSnapshot)
+		damage func(*testing.T, node, gitObjectID)
 	}{
 		{
 			name: "missing",
-			damage: func(t *testing.T, plan corpusPlan, _ gitSnapshot) {
+			damage: func(t *testing.T, plan node, _ gitObjectID) {
 				t.Helper()
 				if err := os.Remove(filepath.Join(plan.cacheDir, committedGitStateFile)); err != nil {
 					t.Fatal(err)
@@ -436,7 +589,7 @@ func TestPrepareNativeGitDeltaRejectsCommittedStateDamage(t *testing.T) {
 		},
 		{
 			name: "malformed",
-			damage: func(t *testing.T, plan corpusPlan, _ gitSnapshot) {
+			damage: func(t *testing.T, plan node, _ gitObjectID) {
 				t.Helper()
 				if err := os.WriteFile(filepath.Join(plan.cacheDir, committedGitStateFile), []byte("not state\n"), 0o644); err != nil {
 					t.Fatal(err)
@@ -445,13 +598,13 @@ func TestPrepareNativeGitDeltaRejectsCommittedStateDamage(t *testing.T) {
 		},
 		{
 			name: "wrong-head",
-			damage: func(t *testing.T, plan corpusPlan, target gitSnapshot) {
+			damage: func(t *testing.T, plan node, target gitObjectID) {
 				t.Helper()
 				state, ok := readCommittedGitState(plan.cacheDir)
 				if !ok {
 					t.Fatal("read committed state")
 				}
-				state.head = target.commitOID
+				state.head = target
 				if err := writeCommittedGitState(plan.cacheDir, state); err != nil {
 					t.Fatal(err)
 				}
@@ -459,7 +612,7 @@ func TestPrepareNativeGitDeltaRejectsCommittedStateDamage(t *testing.T) {
 		},
 		{
 			name: "base-shards-ahead",
-			damage: func(t *testing.T, plan corpusPlan, _ gitSnapshot) {
+			damage: func(t *testing.T, plan node, _ gitObjectID) {
 				t.Helper()
 				state, ok := readCommittedGitState(plan.cacheDir)
 				if !ok {
@@ -485,55 +638,16 @@ func TestPrepareNativeGitDeltaRejectsCommittedStateDamage(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.cacheDir, plan.indexDir, target, scan)
-			if err != nil || eligible {
-				t.Fatalf("damaged state: eligible=%t error=%v", eligible, err)
+			delta, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, target, scan)
+			if err != nil || delta != nil {
+				t.Fatalf("damaged state: eligible=%t error=%v", delta != nil, err)
 			}
 		})
 	}
 }
 
-func TestPrepareNativeGitDeltaChecksUpdatedCorpusTotals(t *testing.T) {
-	for _, metric := range []indexCapMetric{indexCapCandidateFiles, indexCapIndexedBytes} {
-		t.Run(string(metric), func(t *testing.T) {
-			repoDir, paths, plan := prepareNativeDeltaFixture(t)
-			baseState, ok := readCommittedGitState(plan.cacheDir)
-			if !ok {
-				t.Fatal("read committed state")
-			}
-			if err := os.WriteFile(filepath.Join(repoDir, "added.go"), []byte("package added\n"), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			gitRunIn(t, repoDir, "add", "added.go")
-			gitRunIn(t, repoDir, "commit", "-m", "cross saved total")
-
-			oldFiles, oldBytes := gitCandidateFileLimit, gitCorpusIndexedByteLimit
-			if metric == indexCapCandidateFiles {
-				gitCandidateFileLimit = baseState.budget.candidates
-			} else {
-				gitCorpusIndexedByteLimit = baseState.budget.indexedBytes
-			}
-			t.Cleanup(func() {
-				gitCandidateFileLimit = oldFiles
-				gitCorpusIndexedByteLimit = oldBytes
-			})
-
-			scan, err := scanFamily(plan.indexDir)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.cacheDir, plan.indexDir, captureHeadForTest(t, repoDir), scan)
-			if eligible || !errors.Is(err, errGitCommittedCapExceeded) {
-				t.Fatalf("eligible=%t error=%v, want committed %s cap error", eligible, err, metric)
-			}
-			capErr, ok := errors.AsType[indexCapExceededError](err)
-			if !ok || capErr.metric != metric {
-				t.Fatalf("cap error=%+v, want metric %s", capErr, metric)
-			}
-		})
-	}
-}
-
+// TestPrepareNativeGitDeltaAcceptsExplicitPriority sets zoekt.priority before
+// the first build. Seek reads no zoekt.* config, so the delta stays eligible.
 func TestPrepareNativeGitDeltaAcceptsExplicitPriority(t *testing.T) {
 	requireTools(t)
 	repoDir := initGitRepo(t, "base.go", "package base\n")
@@ -549,51 +663,9 @@ func TestPrepareNativeGitDeltaAcceptsExplicitPriority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.cacheDir, plan.indexDir, captureHeadForTest(t, paths.RepoDir), scan)
-	if err != nil || !eligible {
-		t.Fatalf("priority delta: eligible=%t error=%v", eligible, err)
-	}
-}
-
-func TestPrepareNativeGitDeltaCommitDateRank(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		targetDate string
-		eligible   bool
-	}{
-		{name: "same-month", targetDate: "2026-01-20T12:00:00Z", eligible: true},
-		{name: "next-month", targetDate: "2026-02-01T12:00:00Z", eligible: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			requireTools(t)
-			repoDir := initEmptyGitRepo(t)
-			if err := os.WriteFile(filepath.Join(repoDir, "base.go"), []byte("package base\n"), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			gitRunIn(t, repoDir, "add", ".")
-			t.Setenv("GIT_AUTHOR_DATE", "2026-01-01T12:00:00Z")
-			t.Setenv("GIT_COMMITTER_DATE", "2026-01-01T12:00:00Z")
-			gitRunIn(t, repoDir, "commit", "-m", "base")
-			gitRunIn(t, repoDir, "config", "zoekt.latestCommitDate", "")
-			paths, plan := planGitTestCorpus(t, repoDir)
-			reindexGit(t, t.Context(), paths, plan)
-
-			if err := os.WriteFile(filepath.Join(repoDir, "base.go"), []byte("package changed\n"), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			gitRunIn(t, repoDir, "add", "base.go")
-			t.Setenv("GIT_AUTHOR_DATE", tc.targetDate)
-			t.Setenv("GIT_COMMITTER_DATE", tc.targetDate)
-			gitRunIn(t, repoDir, "commit", "-m", "target")
-			scan, err := scanFamily(plan.indexDir)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.cacheDir, plan.indexDir, captureHeadForTest(t, paths.RepoDir), scan)
-			if err != nil || eligible != tc.eligible {
-				t.Fatalf("eligible=%t, want %t; error=%v", eligible, tc.eligible, err)
-			}
-		})
+	delta, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan)
+	if err != nil || delta == nil {
+		t.Fatalf("priority delta: eligible=%t error=%v", delta != nil, err)
 	}
 }
 
@@ -614,14 +686,116 @@ func TestPrepareNativeGitDeltaMissingBaseSelectsFull(t *testing.T) {
 	probe := exec.Command("git", "cat-file", "-e", oldCommit+"^{commit}")
 	probe.Dir = repoDir
 	if err := probe.Run(); err == nil {
-		t.Skip("Git retained the unreachable base object")
+		t.Fatal("Git kept the unreachable base commit after gc --prune=now, so the base is not missing")
 	}
 	scan, err := scanFamily(plan.indexDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, eligible, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.cacheDir, plan.indexDir, captureHeadForTest(t, paths.RepoDir), scan)
-	if err != nil || eligible {
-		t.Fatalf("missing base: eligible=%t error=%v", eligible, err)
+	delta, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan)
+	if err != nil || delta != nil {
+		t.Fatalf("missing base: eligible=%t error=%v", delta != nil, err)
+	}
+}
+
+// TestNativeDeltaWithNullShardMetadataIsNoCrash writes "null" into the .meta
+// file of committed shard 0, so that Zoekt's metadata reader panics, and then
+// asks for a native delta. The read runs through the shard-call guard: the
+// delta is not possible, and the process keeps running.
+func TestNativeDeltaWithNullShardMetadataIsNoCrash(t *testing.T) {
+	requireTools(t)
+	repoDir, paths, plan := prepareNativeDeltaFixture(t)
+	writeFixtureFile(t, filepath.Join(repoDir, "next.go"), "package next\n")
+	gitRunIn(t, repoDir, "add", ".")
+	gitRunIn(t, repoDir, "commit", "-q", "-m", "next")
+	scan, err := scanFamily(plan.indexDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shard, ok := committedShardZeroPath(scan)
+	if !ok {
+		t.Fatal("no shard 0")
+	}
+	writeFixtureFile(t, shard+".meta", "null")
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("the delta check panicked: %v", recovered)
+		}
+	}()
+	if delta, err := prepareNativeGitDelta(t.Context(), paths.RepoDir, plan.corpusStore, captureHeadForTest(t, paths.RepoDir), scan); delta != nil {
+		t.Fatalf("a delta on a base with a null record was eligible (err=%v)", err)
+	}
+}
+
+// TestNativeDeltaSeedLinkErrorFallsBack gives the delta a seed shard that
+// does not link. A full build links no seed. So the error wraps
+// errNativeDeltaFallback, which asks for a full build, and the link error.
+func TestNativeDeltaSeedLinkErrorFallsBack(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "git-x_v16.00000.zoekt")
+	err := indexNativeGitDelta(t.Context(), t.TempDir(), t.TempDir(), []string{missing}, &nativeGitDelta{}, 1)
+	if !errors.Is(err, errNativeDeltaFallback) || !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("seed link error %v, want errNativeDeltaFallback with the link error", err)
+	}
+}
+
+// TestNativeDeltaOnADamagedRecordBuildsInFull commits three times, so the
+// committed family has later shards with records. It damages the record of
+// shard 1 with bytes of the same size and file time, and commits once more.
+// The native delta reads that record in its Finish. The read panics on "null"
+// and returns a JSON error on other bytes. In both cases the stage builds the
+// family in full with no warning, and the search finds the new file.
+func TestNativeDeltaOnADamagedRecordBuildsInFull(t *testing.T) {
+	requireTools(t)
+	for _, record := range []string{"null", "{garbage"} {
+		t.Run(record, func(t *testing.T) {
+			setTestUserCache(t)
+			repo := initGitRepo(t, "f0.go", "package f\n// zqdelta0\n")
+			t.Chdir(repo)
+			search := func(query string) string {
+				t.Helper()
+				output, err := seek(t, "--lexical-only", query)
+				if err != nil {
+					t.Fatalf("%s: %v\n%s", query, err, output)
+				}
+				return output
+			}
+			search("zqdelta0")
+			for index := 1; index <= 3; index++ {
+				writeFileAt(t, repo, fmt.Sprintf("f%d.go", index), fmt.Sprintf("package f\n// zqdelta%d\n", index))
+				gitRunIn(t, repo, "add", ".")
+				gitRunIn(t, repo, "commit", "-q", "-m", fmt.Sprintf("f%d", index))
+				search(fmt.Sprintf("zqdelta%d", index))
+			}
+			cache, err := seekUserCacheRoot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			metas, _ := filepath.Glob(filepath.Join(cache, "corpora", "*", "index", "git-*_v16.00001.zoekt.meta"))
+			if len(metas) != 1 {
+				t.Fatalf("no record on shard 1 (%v): the deltas wrote no later shard", metas)
+			}
+			info, err := os.Stat(metas[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			damaged := []byte(record)
+			damaged = append(damaged, bytes.Repeat([]byte(" "), int(info.Size())-len(damaged))...)
+			if err := os.WriteFile(metas[0], damaged, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(metas[0], info.ModTime(), info.ModTime()); err != nil {
+				t.Fatal(err)
+			}
+			writeFileAt(t, repo, "f4.go", "package f\n// zqdelta4\n")
+			gitRunIn(t, repo, "add", ".")
+			gitRunIn(t, repo, "commit", "-q", "-m", "f4")
+			logs := captureTestLogs(t, slog.LevelWarn)
+			if output := search("zqdelta4"); !strings.Contains(output, "f4.go") {
+				t.Fatalf("the search after the damage lost the new file:\n%s", output)
+			}
+			if records := logs.Records(); len(records) > 0 {
+				t.Fatalf("the damaged delta gave the warning %q", records[0].Message)
+			}
+		})
 	}
 }

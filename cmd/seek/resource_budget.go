@@ -9,16 +9,17 @@ import (
 
 // searchResources supplies the effective Go CPU allowance and available-memory
 // probe for one command. Semantic extraction, CPU-provider model calls, and
-// USearch writers use its CPU gate. The gate and inference controller read CPU
-// changes while work is queued. Zoekt, USearch, and tokenizer worker pools take
-// a cpuLimit snapshot when each pool starts.
+// USearch writers use its CPU gate. The gate and the model-call controller
+// (semanticConcurrencyController) read CPU changes while work is queued. Zoekt,
+// USearch, and tokenizer worker pools take a cpuLimit snapshot when each pool
+// starts.
 type searchResources struct {
 	now             func() time.Time
 	effectiveCPUs   func() int
 	availableMemory func() int64
-	// callCPUs is the estimated gate reservation for one model call. Zero skips
-	// CPU-gate admission for an accelerated provider; it does not assert that the
-	// provider uses no physical CPU.
+	// callCPUs is the estimated gate reservation for one model call. Zero
+	// skips CPU-gate admission for an accelerated provider. It does not say
+	// that the provider uses no physical CPU.
 	callCPUs int
 	cpu      *dynamicCPUGate
 }
@@ -103,9 +104,10 @@ func (gate *dynamicCPUGate) acquire(ctx context.Context, cost int) (cpuLease, er
 		gate.mu.Lock()
 		limit := max(1, gate.limit())
 		if gate.used < limit {
-			// Let one last task fill partial capacity. A CPU model call can use
-			// more threads than the remaining count; the throughput controller
-			// measures that bounded wider probe and keeps it only when faster.
+			// Let one last task fill partial capacity. A CPU model call can
+			// use more threads than the remaining count. The model-call
+			// controller (semanticConcurrencyController) measures that wider
+			// probe and keeps it only when it is faster.
 			gate.used += cost
 			gate.mu.Unlock()
 			if retry != nil {

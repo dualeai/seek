@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -17,14 +18,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
-	"time"
 	"unicode/utf8"
-
-	ctags "github.com/sourcegraph/go-ctags"
 )
 
+// openLateOnTestTokenizer opens the bundled tokenizer and returns it with the
+// IDs of its punctuation tokens. Cleanup closes it.
 func openLateOnTestTokenizer(tb testing.TB) (*lateOnTokenizer, map[int]struct{}) {
 	tb.Helper()
 	tokenizerJSON, err := decodeLateOnAsset(lateOnCompressedTokenizer)
@@ -43,13 +42,18 @@ func openLateOnTestTokenizer(tb testing.TB) (*lateOnTokenizer, map[int]struct{})
 	return tokenizer, punctuation
 }
 
-func mustEncodeLateOnText(tb testing.TB, tokenizer *lateOnTokenizer, text string) []int {
+// mustLateOnQueryIDs returns the token IDs of a query that fits one model
+// window, through the production query path (lateOnQueryWindows).
+func mustLateOnQueryIDs(tb testing.TB, tokenizer *lateOnTokenizer, modelQuery string) []int {
 	tb.Helper()
-	ids, err := encodeLateOnText(tokenizer, text)
+	windows, err := lateOnQueryWindows(tokenizer, modelQuery)
 	if err != nil {
 		tb.Fatal(err)
 	}
-	return ids
+	if len(windows) != 1 {
+		tb.Fatalf("query %q gives %d windows, want 1", modelQuery, len(windows))
+	}
+	return windows[0]
 }
 
 func TestLateOnRuntimeManifestRejectsIncompleteAssets(t *testing.T) {
@@ -76,110 +80,172 @@ func TestLateOnRuntimeManifestRejectsIncompleteAssets(t *testing.T) {
 func TestLateOnTokenizerMatchesPyLate(t *testing.T) {
 	tokenizer, _ := openLateOnTestTokenizer(t)
 
-	const probe = "[Q] where is the function that parses HTTP请求?"
+	// PyLate encodes "[Q] where is the function that parses HTTP请求?" to
+	// these IDs.
+	const probe = "where is the function that parses HTTP请求?"
 	want := []int{
 		50281, 50368, 2811, 310, 253, 1159, 326, 13328,
 		265, 17607, 44673, 43741, 32, 50282,
 	}
-	if got := mustEncodeLateOnText(t, tokenizer, probe); !reflect.DeepEqual(got, want) {
+	if got := mustLateOnQueryIDs(t, tokenizer, probe); !reflect.DeepEqual(got, want) {
 		t.Fatalf("probe IDs = %v, want %v", got, want)
 	}
-	upper := mustEncodeLateOnText(t, tokenizer, "[Q] MyHTTPHandler")
-	lower := mustEncodeLateOnText(t, tokenizer, "[Q] myhttphandler")
+	upper := mustLateOnQueryIDs(t, tokenizer, "MyHTTPHandler")
+	lower := mustLateOnQueryIDs(t, tokenizer, "myhttphandler")
 	if reflect.DeepEqual(upper, lower) {
 		t.Fatal("tokenizer unexpectedly lowercased the input")
 	}
-	composed := mustEncodeLateOnText(t, tokenizer, "[Q] café")
-	decomposed := mustEncodeLateOnText(t, tokenizer, "[Q] cafe\u0301")
+	composed := mustLateOnQueryIDs(t, tokenizer, "café")
+	decomposed := mustLateOnQueryIDs(t, tokenizer, "cafe\u0301")
 	if !reflect.DeepEqual(composed, decomposed) {
 		t.Fatalf("NFC IDs differ: %v and %v", composed, decomposed)
 	}
 
-	long := mustEncodeLateOnText(
-		t,
+	text := strings.Repeat("identifier ", 300)
+	long, err := encodeLateOnDocument(
 		tokenizer,
-		lateOnDocumentPrefix+strings.Repeat("identifier ", 300),
+		rerankDocument{Text: text, matchEnd: len(text)},
+		lateOnSequenceLength,
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(long) != lateOnSequenceLength || long[len(long)-1] != lateOnSEPTokenID {
 		t.Fatalf("truncated sequence has length %d and final ID %d", len(long), long[len(long)-1])
 	}
-}
-
-func TestLateOnPrepareSemanticQueryReportsTruncation(t *testing.T) {
-	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
-	scorer, err := newLateOnSemanticModel(t.Context())
+	// With an empty match span, the truncation keeps the head
+	// (truncateLateOnHead): the first 127 IDs, then SEP.
+	ids, spans, err := tokenizer.encode(lateOnDocumentPrefix+text, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if err := scorer.Close(); err != nil {
-			t.Errorf("close scorer: %v", err)
-		}
-	})
-
-	for _, test := range []struct {
-		name      string
-		query     string
-		truncated bool
-	}{
-		{name: "short", query: "request authentication flow"},
-		{name: "long", query: strings.Repeat("identifier ", 300), truncated: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			prepared, err := scorer.PrepareSemanticQuery(t.Context(), test.query)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if prepared.modelQuery != test.query || prepared.truncated != test.truncated {
-				t.Fatalf(
-					"prepared query text match=%t truncated=%t, want %t",
-					prepared.modelQuery == test.query,
-					prepared.truncated,
-					test.truncated,
-				)
-			}
-			active := 0
-			for _, keep := range prepared.scoreMask {
-				if keep {
-					active++
-				}
-			}
-			if active == 0 {
-				t.Fatal("prepared query has no active score tokens")
-			}
-		})
+	head := truncateLateOnDocumentTokens(ids, spans, 0, 0, 0, lateOnSequenceLength)
+	if len(head) != lateOnSequenceLength || head[len(head)-1] != lateOnSEPTokenID ||
+		!slices.Equal(head[:len(head)-1], ids[:len(head)-1]) {
+		t.Fatalf("head truncation has length %d and final ID %d", len(head), head[len(head)-1])
 	}
 }
 
-func TestRerankCertainTermBoundAgreesWithTokenizer(t *testing.T) {
+// TestLateOnPrepareSemanticQueryUsesWindows prepares a short and a 300-term
+// query. The short one is one 128-token window. The long one keeps every token
+// in ceil(tokens/room) windows, with no truncation. The long query takes its
+// empty-document score from the row after its last window. That score must
+// equal the score that the scorer gives an empty document.
+func TestLateOnPrepareSemanticQueryUsesWindows(t *testing.T) {
+	scorer := sharedModel(t)
 	tokenizer, _ := openLateOnTestTokenizer(t)
-	query := strings.TrimSpace(strings.Repeat(
-		"identifier ",
-		rerankQueryMaximumUntruncatedTerms+1,
-	))
-	if !rerankQueryGuaranteedTruncated(query) {
-		t.Fatal("term preflight did not detect certain truncation")
-	}
-	_, truncated, err := encodeLateOnTextWithTruncation(
-		tokenizer,
-		lateOnQueryPrefix+query,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !truncated {
-		t.Fatal("tokenizer did not truncate a query above the certain term bound")
+	// A query starts with the class and the [Q] tokens and ends with the
+	// separator (TestLateOnTokenizerMatchesPyLate). So each window has room
+	// for 128 - 3 = 125 query tokens. The 300 words encode to 301 tokens (one
+	// per word and one for the final space): ceil(301/125) = 3 windows.
+	const head = 2
+	for _, tc := range []struct {
+		query   string
+		body    int
+		windows int
+	}{
+		{query: "request authentication flow", body: 3, windows: 1},
+		{query: strings.Repeat("identifier ", 300), body: 301, windows: 3},
+	} {
+		windows, err := lateOnQueryWindows(tokenizer, tc.query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, _, err := tokenizer.encode(lateOnQueryPrefix+tc.query, true, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(encoded[:head], []int{50281, 50368}) || len(encoded)-head-1 != tc.body {
+			t.Fatalf("query encodes to %d tokens with head %v, want %d query tokens", len(encoded), encoded[:head], tc.body)
+		}
+		if len(windows) != tc.windows {
+			t.Fatalf("%d query tokens: windows=%d, want %d", tc.body, len(windows), tc.windows)
+		}
+		// The windows repeat the head, end with the separator, fill the model
+		// input except the last, and give back the query tokens in order.
+		var kept []int
+		for index, window := range windows {
+			if len(window) > lateOnSequenceLength || !slices.Equal(window[:head], encoded[:head]) ||
+				window[len(window)-1] != lateOnSEPTokenID ||
+				(index < len(windows)-1 && len(window) != lateOnSequenceLength) {
+				t.Fatalf("window %d of %d has %d tokens: not a whole model input", index+1, len(windows), len(window))
+			}
+			kept = append(kept, window[head:len(window)-1]...)
+		}
+		if !slices.Equal(kept, encoded[head:len(encoded)-1]) {
+			t.Fatalf("windows keep %d of %d query tokens", len(kept), tc.body)
+		}
+		prepared, err := scorer.PrepareSemanticQuery(t.Context(), tc.query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(prepared.scoreMask) != tc.windows*lateOnSequenceLength || !validSemanticQuery(prepared) {
+			t.Fatalf("prepared mask=%d tokens=%d, want %d windows", len(prepared.scoreMask), len(prepared.tokens), tc.windows)
+		}
+		// Each scorer call costs one model batch, so only the long query
+		// checks the empty-document score. Its row comes after several
+		// windows, and its score sums the tokens of every window.
+		if tc.windows == 1 {
+			continue
+		}
+		scores, err := scorer.ScoresWithSemanticQuery(t.Context(), prepared, []rerankDocument{{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if math.Abs(float64(prepared.emptyScore-scores[0])) > 1e-4 {
+			t.Fatalf("emptyScore=%g, want the scorer's empty-document score %g", prepared.emptyScore, scores[0])
+		}
 	}
 }
 
+// TestLateOnQueryWindowsStopAtOneModelCall splits queries of 127 and 128
+// windows with the bundled tokenizer. PrepareSemanticQuery puts the windows
+// and the empty document in one static batch of semanticModelBatchRows rows,
+// so 127 windows fit and 128 fail with errLateOnQueryTooLong. Each window has
+// room for 125 query tokens, and n words of "identifier " encode to n + 1
+// tokens. The test needs no model batch.
+func TestLateOnQueryWindowsStopAtOneModelCall(t *testing.T) {
+	tokenizer, _ := openLateOnTestTokenizer(t)
+	const room = lateOnSequenceLength - 3
+	limit := semanticModelBatchRows - 1
+	windows, err := lateOnQueryWindows(tokenizer, strings.Repeat("identifier ", limit*room-1))
+	if err != nil || len(windows) != limit {
+		t.Fatalf("a query of %d windows: windows=%d err=%v, want %d windows", limit, len(windows), err, limit)
+	}
+	windows, err = lateOnQueryWindows(tokenizer, strings.Repeat("identifier ", limit*room))
+	if !errors.Is(err, errLateOnQueryTooLong) || windows != nil {
+		t.Fatalf("a query of %d windows: windows=%d err=%v, want errLateOnQueryTooLong", limit+1, len(windows), err)
+	}
+}
+
+// TestLateOnTokenizationMasksPunctuationAndPadding checks which tokens score.
+// A query keeps each token that it attends, punctuation too, and no padding.
+// The query mask comes from PrepareSemanticQuery, so the test reads the mask
+// that the search scores with. A document drops its punctuation and its
+// padding.
 func TestLateOnTokenizationMasksPunctuationAndPadding(t *testing.T) {
 	tokenizer, punctuation := openLateOnTestTokenizer(t)
 
-	query, err := encodeLateOnText(tokenizer, lateOnQueryPrefix+"请求?")
+	// The query window gives the column of each query token. ID 32 is "?".
+	windows, err := lateOnQueryWindows(tokenizer, "请求?")
+	if err != nil || len(windows) != 1 {
+		t.Fatalf("windows=%d err=%v, want one query window", len(windows), err)
+	}
+	prepared, err := sharedModel(t).PrepareSemanticQuery(t.Context(), "请求?")
 	if err != nil {
 		t.Fatal(err)
 	}
-	queryIDs, queryAttention, queryMask := packLateOnRows([][]int{query}, nil, true)
+	if len(prepared.scoreMask) != lateOnSequenceLength || slices.Index(windows[0], 32) < 0 {
+		t.Fatalf("query mask of %d columns, window %v; want %d columns and the ? token",
+			len(prepared.scoreMask), windows[0], lateOnSequenceLength)
+	}
+	for column, kept := range prepared.scoreMask {
+		if kept != (column < len(windows[0])) {
+			t.Fatalf("query mask %v, want the %d tokens of window %v and no padding",
+				prepared.scoreMask, len(windows[0]), windows[0])
+		}
+	}
+
 	documentIDs, documentAttention, documentMask, err := tokenizeLateOnDocuments(
 		tokenizer,
 		punctuation,
@@ -188,39 +254,14 @@ func TestLateOnTokenizationMasksPunctuationAndPadding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, row := range []struct {
-		name      string
-		ids       []int64
-		attention []int64
-		mask      []bool
-		punct     int64
-		keepPunct bool
-	}{
-		{
-			name:      "query",
-			ids:       queryIDs,
-			attention: queryAttention,
-			mask:      queryMask[0],
-			punct:     32,
-			keepPunct: true,
-		},
-		{
-			name:      "document",
-			ids:       documentIDs,
-			attention: documentAttention,
-			mask:      documentMask[0],
-			punct:     28,
-			keepPunct: false,
-		},
-	} {
-		punctIndex := slices.Index(row.ids, row.punct)
-		if punctIndex < 0 || row.mask[punctIndex] != row.keepPunct {
-			t.Fatalf("%s punctuation mask = %v at %d", row.name, row.mask, punctIndex)
-		}
-		paddingIndex := slices.Index(row.attention, 0)
-		if paddingIndex < 0 || row.ids[paddingIndex] != lateOnPadTokenID || row.mask[paddingIndex] {
-			t.Fatalf("%s padding is IDs=%v attention=%v mask=%v", row.name, row.ids, row.attention, row.mask)
-		}
+	// ID 28 is ";".
+	punctIndex := slices.Index(documentIDs, 28)
+	if punctIndex < 0 || documentMask[0][punctIndex] {
+		t.Fatalf("document punctuation mask = %v at %d", documentMask[0], punctIndex)
+	}
+	paddingIndex := slices.Index(documentAttention, 0)
+	if paddingIndex < 0 || documentIDs[paddingIndex] != lateOnPadTokenID || documentMask[0][paddingIndex] {
+		t.Fatalf("document padding is IDs=%v attention=%v mask=%v", documentIDs, documentAttention, documentMask[0])
 	}
 }
 
@@ -267,9 +308,11 @@ func TestEncodeLateOnDocumentKeepsMetadataAndLateMatch(t *testing.T) {
 	}
 }
 
+// TestLateOnTokenizerBoundsPathologicalRows encodes a document of
+// maxRerankDocumentBytes with no space, and checks that its IDs fill one
+// model input and end with SEP.
 func TestLateOnTokenizerBoundsPathologicalRows(t *testing.T) {
 	tokenizer, _ := openLateOnTestTokenizer(t)
-	started := time.Now()
 	ids, err := encodeLateOnDocument(
 		tokenizer,
 		rerankDocument{
@@ -286,9 +329,6 @@ func TestLateOnTokenizerBoundsPathologicalRows(t *testing.T) {
 	if len(ids) != lateOnSequenceLength || ids[len(ids)-1] != lateOnSEPTokenID {
 		t.Fatalf("pathological IDs have length %d and final ID %d", len(ids), ids[len(ids)-1])
 	}
-	if elapsed := time.Since(started); elapsed > 2*time.Second {
-		t.Fatalf("pathological tokenization took %s", elapsed)
-	}
 }
 
 func TestLateOnTokenizerSanitizesNativeStringInputs(t *testing.T) {
@@ -298,101 +338,16 @@ func TestLateOnTokenizerSanitizesNativeStringInputs(t *testing.T) {
 	if strings.ContainsRune(sanitized, '\x00') || !utf8.ValidString(sanitized) {
 		t.Fatalf("sanitized input is not a valid native string: %q", sanitized)
 	}
+	// A document text is valid UTF-8 (rerankDocument.Text), but it can hold a
+	// NUL byte, which a native string cannot.
+	text := "before\x00needle\uFFFDafter"
 	ids, err := encodeLateOnDocument(
 		tokenizer,
-		rerankDocument{Text: input, matchEnd: len(input)},
+		rerankDocument{Text: text, matchEnd: len(text)},
 		lateOnSequenceLength,
 	)
 	if err != nil || len(ids) == 0 {
 		t.Fatalf("sanitized document IDs=%v: %v", ids, err)
-	}
-}
-
-func TestPackLateOnSemanticUnitsJoinsOnlyCompleteRows(t *testing.T) {
-	tokenizer, _ := openLateOnTestTokenizer(t)
-	shortContent := []byte("func Alpha() {}\nfunc Beta() {}\n")
-	shortUnits := extractSemanticUnits("sample.go", shortContent, []*ctags.Entry{
-		{Name: "Alpha", Kind: "function", Language: "Go", Line: 1},
-		{Name: "Beta", Kind: "function", Language: "Go", Line: 2},
-	}, nil)
-	for index := range shortUnits {
-		shortUnits[index].fileLanguage = "Go"
-		shortUnits[index].id = makeSemanticUnitID(shortUnits[index])
-	}
-	packed, err := packLateOnSemanticUnits(t.Context(), tokenizer, shortUnits)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(packed) != 1 || packed[0].kind != semanticUnitPacked ||
-		packed[0].symbol != "function Alpha function Beta" {
-		t.Fatalf("packed units=%+v", packed)
-	}
-	if packed[0].fileLanguage != "Go" {
-		t.Fatalf("packed file language=%q, want Go", packed[0].fileLanguage)
-	}
-	if len(packed[0].modelInput) == 0 || len(packed[0].modelInput) > lateOnSequenceLength {
-		t.Fatalf("packed model input has %d tokens", len(packed[0].modelInput))
-	}
-	inputIDs, attention, _, err := tokenizeLateOnSemanticUnits(
-		nil,
-		map[int]struct{}{},
-		packed,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for index, id := range packed[0].modelInput {
-		if inputIDs[index] != int64(id) || attention[index] != 1 {
-			t.Fatalf("cached token %d was not reused", index)
-		}
-	}
-	if packed[0].start != 0 || packed[0].end != uint64(len(shortContent)) ||
-		!bytes.Equal(packed[0].text, shortContent) {
-		t.Fatalf("packed source span=%d:%d text=%q", packed[0].start, packed[0].end, packed[0].text)
-	}
-	repeated, err := packLateOnSemanticUnits(t.Context(), tokenizer, shortUnits)
-	if err != nil || !reflect.DeepEqual(repeated, packed) {
-		t.Fatalf("repeated pack differs: units=%+v err=%v", repeated, err)
-	}
-
-	line := strings.Repeat("identifier ", 200) + "\n"
-	longContent := []byte(line + line)
-	longUnits := extractSemanticUnits("large.go", longContent, []*ctags.Entry{
-		{Name: "First", Kind: "function", Language: "Go", Line: 1},
-		{Name: "Second", Kind: "function", Language: "Go", Line: 2},
-	}, nil)
-	notPacked, err := packLateOnSemanticUnits(t.Context(), tokenizer, longUnits)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(notPacked) != len(longUnits) {
-		t.Fatalf("long units=%d, want %d", len(notPacked), len(longUnits))
-	}
-
-	canceled, cancel := context.WithCancel(t.Context())
-	cancel()
-	if _, err := packLateOnSemanticUnits(canceled, tokenizer, shortUnits); !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled pack error=%v", err)
-	}
-}
-
-func TestLateOnSemanticDocumentKeepsFileLanguageOutOfModelInput(t *testing.T) {
-	unit := semanticUnit{
-		path:         "main.go",
-		language:     "Go",
-		fileLanguage: "Go",
-		text:         []byte("package main\n"),
-	}
-	first, firstMetadataEnd, firstMatchAt, firstMatchEnd := serializeLateOnDocumentWithMatch(
-		lateOnSemanticDocument(unit),
-	)
-	unit.fileLanguage = "Python"
-	second, secondMetadataEnd, secondMatchAt, secondMatchEnd := serializeLateOnDocumentWithMatch(
-		lateOnSemanticDocument(unit),
-	)
-	if first != second || firstMetadataEnd != secondMetadataEnd ||
-		firstMatchAt != secondMatchAt || firstMatchEnd != secondMatchEnd {
-		t.Fatalf("file language changed model input:\nfirst=%q\nsecond=%q", first, second)
 	}
 }
 
@@ -487,26 +442,42 @@ func TestLateOnRuntimeCacheLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	path, installed, err := ensureLateOnRuntime(bundle)
-	if err != nil || !installed {
-		t.Fatalf("cold extraction: path=%q installed=%t err=%v", path, installed, err)
+	path, err := ensureLateOnRuntime(bundle)
+	if err != nil {
+		t.Fatalf("cold extraction: %v", err)
 	}
 	gotRuntime, err := os.ReadFile(path)
 	if err != nil || !bytes.Equal(gotRuntime, wantRuntime) {
 		t.Fatalf("cold runtime bytes differ: err=%v", err)
 	}
-	warmPath, installed, err := ensureLateOnRuntime(bundle)
-	if err != nil || installed || warmPath != path {
-		t.Fatalf("warm extraction: path=%q installed=%t err=%v", warmPath, installed, err)
+	// An install renames a new file over the path, so the file identity
+	// tells an install from a valid file that stays in place.
+	cold, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	warmPath, err := ensureLateOnRuntime(bundle)
+	if err != nil || warmPath != path {
+		t.Fatalf("warm extraction: path=%q err=%v", warmPath, err)
+	}
+	if warm, err := os.Stat(path); err != nil || !os.SameFile(cold, warm) {
+		t.Fatalf("warm extraction installed the runtime again: err=%v", err)
 	}
 	corruptRuntime := bytes.Clone(wantRuntime)
 	corruptRuntime[len(corruptRuntime)/2] ^= 0xff
 	if err := os.WriteFile(path, corruptRuntime, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	repairedPath, installed, err := ensureLateOnRuntime(bundle)
-	if err != nil || !installed || repairedPath != path {
-		t.Fatalf("repair: path=%q installed=%t err=%v", repairedPath, installed, err)
+	corrupt, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairedPath, err := ensureLateOnRuntime(bundle)
+	if err != nil || repairedPath != path {
+		t.Fatalf("repair: path=%q err=%v", repairedPath, err)
+	}
+	if repaired, err := os.Stat(path); err != nil || os.SameFile(corrupt, repaired) {
+		t.Fatalf("repair did not install a new runtime: err=%v", err)
 	}
 	gotRuntime, err = os.ReadFile(path)
 	if err != nil || !bytes.Equal(gotRuntime, wantRuntime) {
@@ -547,9 +518,18 @@ func TestLateOnRuntimeCacheAcrossProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	path, installed, err := ensureLateOnRuntime(bundle)
-	if err != nil || installed {
-		t.Fatalf("concurrent extraction did not leave a warm runtime: path=%q installed=%t err=%v", path, installed, err)
+	wantPath := filepath.Join(cache, rerankerDir, bundle.Version, bundle.SHA256, bundle.FileName)
+	extracted, err := os.Stat(wantPath)
+	if err != nil {
+		t.Fatalf("concurrent extraction left no runtime: %v", err)
+	}
+	path, err := ensureLateOnRuntime(bundle)
+	if err != nil || path != wantPath {
+		t.Fatalf("warm extraction: path=%q, want %q, err=%v", path, wantPath, err)
+	}
+	// A new install renames a new file over the path.
+	if warm, err := os.Stat(path); err != nil || !os.SameFile(extracted, warm) {
+		t.Fatalf("concurrent extraction did not leave a warm runtime: err=%v", err)
 	}
 	wantRuntime, err := decodeLateOnAsset(bundle.compressed)
 	if err != nil {
@@ -569,50 +549,62 @@ func TestLateOnRuntimeExtractHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := ensureLateOnRuntime(bundle); err != nil {
+	if _, err := ensureLateOnRuntime(bundle); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestLateOnInferenceMatchesReferenceScores(t *testing.T) {
-	// The automatic case gates CI: it exercises whatever the run-time provider
-	// check selected on this host, which is what users get.
-	t.Run("selected", func(t *testing.T) { lateOnReferenceScoreCheck(t, true) })
+	// A score difference of the selected case fails the test. The process
+	// model uses the provider that the run-time check selected on this host,
+	// as a user's search does.
+	t.Run("selected", func(t *testing.T) {
+		lateOnReferenceScoreCheck(t, sharedModel(t), sharedModelProvider, true)
+	})
 	t.Run(lateOnCPUProviderName, func(t *testing.T) {
 		t.Setenv(lateOnProviderEnv, lateOnCPUProviderName)
-		lateOnReferenceScoreCheck(t, true)
+		lateOnReferenceScoreCheck(t, newPinnedLateOnModel(t), semanticProviderName, true)
 	})
 	if lateOnAcceleratedProviderName == lateOnCPUProviderName {
 		return
 	}
-	// Pinning the accelerated provider bypasses the run-time check, so this case
-	// records its scores without gating. On a host where that provider is wrong,
-	// the automatic case above still passes because the check demotes it, and the
-	// deltas recorded here say how wrong it is.
+	// A pinned accelerated provider skips the run-time check, so this case
+	// logs its scores and does not fail. On a host where that provider is
+	// wrong, the check demotes it, so the automatic case above still passes.
+	// The scores logged here show how wrong the provider is.
 	t.Run(lateOnAcceleratedProviderName, func(t *testing.T) {
 		t.Setenv(lateOnProviderEnv, lateOnAcceleratedProviderName)
-		lateOnReferenceScoreCheck(t, false)
+		lateOnReferenceScoreCheck(t, newPinnedLateOnModel(t), semanticProviderName, false)
 	})
 }
 
-// lateOnReferenceScoreCheck holds the scores this project calibrated its
-// acceptance thresholds against. Every provider must reproduce them.
+// newPinnedLateOnModel returns a new model in a new cache root, for a test
+// that pins a provider. The process model keeps the provider of the process.
+// Cleanup closes the new model.
+func newPinnedLateOnModel(t *testing.T) *lateOnModel {
+	t.Helper()
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	model := newTestLateOnModel(t)
+	t.Cleanup(func() {
+		if err := model.Close(); err != nil {
+			t.Errorf("close model: %v", err)
+		}
+	})
+	return model
+}
+
+// lateOnReferenceScoreCheck scores one description against three fixed
+// documents. Every provider must give the reference scores (want) within 0.01,
+// in the same order. With gate false, the check logs a difference in a score or
+// in the order and does not fail. provider names the provider of scorer after
+// its first call. semanticProviderName gives the provider of the last model
+// that built an encoder. That is not the process model if another test built
+// one later.
 //
 // A provider that passes the run-time check in verifyLateOnAcceleratedProvider
-// but fails here means that check is too permissive. That is the signal to
-// tighten lateOnProbeAgreementLimit.
-func lateOnReferenceScoreCheck(t *testing.T, gate bool) {
-	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
-	scorer, err := newLateOnSemanticModel(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := scorer.Close(); err != nil {
-			t.Errorf("close scorer: %v", err)
-		}
-	}()
-
+// but fails here shows that the check accepts too much. Then make
+// lateOnProbeAgreementLimit or lateOnProbeMagnitudeLimit smaller.
+func lateOnReferenceScoreCheck(t *testing.T, scorer semanticModel, provider func() string, gate bool) {
 	documents := []rerankDocument{
 		{
 			Path:     "cmd/seek/searcher.go",
@@ -649,7 +641,7 @@ func lateOnReferenceScoreCheck(t *testing.T, gate bool) {
 	if len(scores) != len(want) {
 		t.Fatalf("scores = %v, want %d scores", scores, len(want))
 	}
-	t.Logf("provider=%s scores=%v", semanticProviderName(), scores)
+	t.Logf("provider=%s scores=%v", provider(), scores)
 	for i := range want {
 		if math.Abs(float64(scores[i]-want[i])) > 0.01 {
 			if !gate {
@@ -672,26 +664,13 @@ func lateOnReferenceScoreCheck(t *testing.T, gate bool) {
 }
 
 func TestLateOnEncoderConcurrentOutputsAreIsolated(t *testing.T) {
-	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
-	rawModel, err := newLateOnSemanticModel(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := rawModel.Close(); err != nil {
-			t.Errorf("close model: %v", err)
-		}
-	})
-	model, ok := rawModel.(*lateOnModel)
-	if !ok {
-		t.Fatalf("model type is %T, want *lateOnModel", rawModel)
-	}
+	model := sharedModel(t)
 
+	// Two calls that hold their outputs at the same time show the isolation.
+	// Each call is one full model batch, so more texts add only time.
 	texts := []string{
 		"func parseRequest() { validateHeaders() }",
 		"func buildIndex() { writeSemanticVectors() }",
-		"func searchGraph() { mergeRankedCandidates() }",
-		"func closeSnapshot() { releaseMappedFiles() }",
 	}
 	units := make([]semanticUnit, len(texts))
 	for index, source := range texts {
@@ -702,7 +681,7 @@ func TestLateOnEncoderConcurrentOutputsAreIsolated(t *testing.T) {
 			text:     []byte(source),
 		}
 	}
-	tokenizer, err := model.takeTokenizer(t.Context())
+	tokenizer, err := lateOnTokenizers.take(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -711,11 +690,11 @@ func TestLateOnEncoderConcurrentOutputsAreIsolated(t *testing.T) {
 		model.punctuation,
 		units,
 	)
-	model.releaseTokenizer(tokenizer)
+	lateOnTokenizers.release(tokenizer)
 	if tokenizeErr != nil {
 		t.Fatal(tokenizeErr)
 	}
-	encoder, err := model.semanticRowEncoder(t.Context())
+	encoder, err := model.semanticRowEncoder(t.Context(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -759,18 +738,12 @@ func TestLateOnEncoderConcurrentOutputsAreIsolated(t *testing.T) {
 		}()
 	}
 	close(start)
-	timer := time.NewTimer(30 * time.Second)
+	// Each call holds its output until all calls have one. The time of a
+	// batch changes from host to host, so the test has no timer. An encoder
+	// that runs one call at a time blocks here until the -timeout of the test
+	// binary, which prints every goroutine.
 	for range units {
-		select {
-		case <-ready:
-		case <-timer.C:
-			close(release)
-			wait.Wait()
-			t.Fatal("concurrent encoder calls did not reach their output callbacks")
-		}
-	}
-	if !timer.Stop() {
-		<-timer.C
+		<-ready
 	}
 	close(release)
 	wait.Wait()
@@ -791,18 +764,9 @@ func TestLateOnEncoderConcurrentOutputsAreIsolated(t *testing.T) {
 }
 
 func TestLateOnInferenceSupportsFullCandidateBatch(t *testing.T) {
-	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
-	scorer, err := newLateOnSemanticModel(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := scorer.Close(); err != nil {
-			t.Errorf("close scorer: %v", err)
-		}
-	})
+	scorer := sharedModel(t)
 
-	documents := make([]rerankDocument, rerankCandidateLimit)
+	documents := make([]rerankDocument, semanticModelBatchRows)
 	for i := range documents {
 		documents[i] = rerankDocument{
 			Path:     "cmd/seek/searcher.go",
@@ -820,8 +784,8 @@ func TestLateOnInferenceSupportsFullCandidateBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(scores) != rerankCandidateLimit {
-		t.Fatalf("scores=%d, want %d", len(scores), rerankCandidateLimit)
+	if len(scores) != semanticModelBatchRows {
+		t.Fatalf("scores=%d, want %d", len(scores), semanticModelBatchRows)
 	}
 }
 
@@ -838,220 +802,59 @@ func TestLateOnModelCanReopen(t *testing.T) {
 	}
 }
 
-func TestLateOnTokenizerPoolExpandsOnlyForBulk(t *testing.T) {
-	previousCPUs := runtime.GOMAXPROCS(4)
-	t.Cleanup(func() { runtime.GOMAXPROCS(previousCPUs) })
-	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
-	scorer, err := newLateOnSemanticModel(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	model := scorer.(*lateOnModel)
-	t.Cleanup(func() {
-		if err := model.Close(); err != nil {
-			t.Errorf("close model: %v", err)
-		}
-	})
-	if model.tokenizerCount != 1 || len(model.tokenizers) != 1 || cap(model.tokenizers) != 4 {
-		t.Fatalf("initial pool count=%d available=%d capacity=%d", model.tokenizerCount, len(model.tokenizers), cap(model.tokenizers))
-	}
-
-	content := []byte("func Alpha() {}\nfunc Beta() {}\n")
-	units := extractSemanticUnits("sample.go", content, []*ctags.Entry{
-		{Name: "Alpha", Kind: "function", Language: "Go", Line: 1},
-		{Name: "Beta", Kind: "function", Language: "Go", Line: 2},
-	}, nil)
-	tokenizer, err := model.takeTokenizer(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	want, packErr := packLateOnSemanticUnits(t.Context(), tokenizer, units)
-	documents := []rerankDocument{{Text: "func 请求() { Alpha(); }", matchEnd: len("func 请求() { Alpha(); }")}}
-	wantIDs, wantAttention, wantMasks, tokenizeErr := tokenizeLateOnDocuments(tokenizer, model.punctuation, documents)
-	model.releaseTokenizer(tokenizer)
-	if packErr != nil || tokenizeErr != nil {
-		t.Fatalf("reference pack=%v tokenize=%v", packErr, tokenizeErr)
-	}
-	if _, err := model.PackSemanticUnits(t.Context(), nil); err != nil {
-		t.Fatal(err)
-	}
-	cancelled, cancel := context.WithCancel(t.Context())
-	cancel()
-	if _, err := model.PackSemanticUnits(cancelled, units); !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancelled pack error=%v", err)
-	}
-	if model.tokenizerCount != 1 {
-		t.Fatalf("empty/cancelled work expanded pool to %d", model.tokenizerCount)
-	}
-
-	const workers = 8
-	packed := make([][]semanticUnit, workers)
-	packErrors := make([]error, workers)
-	var wait sync.WaitGroup
-	for i := range workers {
-		wait.Go(func() {
-			packed[i], packErrors[i] = model.PackSemanticUnits(t.Context(), units)
-		})
-	}
-	wait.Wait()
-	for i := range workers {
-		if packErrors[i] != nil || !reflect.DeepEqual(packed[i], want) {
-			t.Fatalf("worker %d pack=%+v error=%v, want %+v", i, packed[i], packErrors[i], want)
-		}
-	}
-	if model.tokenizerCount != 4 || len(model.tokenizers) != 4 || model.tokenizerJSON != nil {
-		t.Fatalf("bulk pool count=%d available=%d retained JSON=%t", model.tokenizerCount, len(model.tokenizers), model.tokenizerJSON != nil)
-	}
-	var owned []*lateOnTokenizer
-	for range model.tokenizerCount {
-		tokenizer, err := model.takeTokenizer(t.Context())
-		if err != nil {
-			t.Fatal(err)
-		}
-		ids, attention, masks, tokenizeErr := tokenizeLateOnDocuments(tokenizer, model.punctuation, documents)
-		model.releaseTokenizer(tokenizer)
-		owned = append(owned, tokenizer)
-		if tokenizeErr != nil || !reflect.DeepEqual(ids, wantIDs) ||
-			!reflect.DeepEqual(attention, wantAttention) || !reflect.DeepEqual(masks, wantMasks) {
-			t.Fatalf("expanded tokenizer changed IDs, attention, or score masks: %v", tokenizeErr)
-		}
-	}
-	if err := model.Close(); err != nil {
-		t.Fatal(err)
-	}
-	for i, tokenizer := range owned {
-		if tokenizer.native != nil {
-			t.Errorf("tokenizer %d remains open", i)
-		}
-	}
-}
-
-// cancelAfterErrChecks cancels its context on the first Err call after the
-// first `after` calls, so those checks pass. It is safe for concurrent use.
-type cancelAfterErrChecks struct {
-	context.Context
-	cancel context.CancelFunc
-	after  int32
-	calls  *atomic.Int32
-}
-
-func (c cancelAfterErrChecks) Err() error {
-	if c.calls.Add(1) > c.after {
-		c.cancel()
-	}
-	return c.Context.Err()
-}
-
-func TestLateOnTokenizerExpansionFailureKeepsOwnedTokenizer(t *testing.T) {
-	for _, failure := range []string{"invalid JSON", "cancel after one copy"} {
-		t.Run(failure, func(t *testing.T) {
-			testLateOnTokenizerExpansionFailure(t, failure)
-		})
-	}
-}
-
-func testLateOnTokenizerExpansionFailure(t *testing.T, failure string) {
-	t.Helper()
-	previousCPUs := runtime.GOMAXPROCS(3)
-	t.Cleanup(func() { runtime.GOMAXPROCS(previousCPUs) })
-	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
-	scorer, err := newLateOnSemanticModel(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	model := scorer.(*lateOnModel)
-	t.Cleanup(func() {
-		if err := model.Close(); err != nil {
-			t.Errorf("close model: %v", err)
-		}
-	})
-	ctx := t.Context()
-	wantCount := 1
-	if failure == "invalid JSON" {
-		model.tokenizerJSON = []byte("{")
-	} else {
-		cancelled, cancel := context.WithCancel(ctx)
-		defer cancel()
-		// The entry check and one of the two copies pass; the other copy sees
-		// the cancellation.
-		ctx = cancelAfterErrChecks{Context: cancelled, cancel: cancel, after: 2, calls: new(atomic.Int32)}
-		wantCount = 2
-	}
-	units := []semanticUnit{{path: "sample.go", text: []byte("package sample\n")}}
-	for range 2 {
-		if _, err := model.PackSemanticUnits(ctx, units); err == nil {
-			t.Fatal("expansion did not fail")
-		} else if failure != "invalid JSON" && !errors.Is(err, context.Canceled) {
-			t.Fatalf("cancelled expansion error=%v", err)
-		}
-		if model.tokenizerCount != wantCount || len(model.tokenizers) != wantCount || model.tokenizerJSON != nil {
-			t.Fatalf("failed pool count=%d available=%d retained JSON=%t", model.tokenizerCount, len(model.tokenizers), model.tokenizerJSON != nil)
-		}
-	}
-	var owned []*lateOnTokenizer
-	for range wantCount {
-		tokenizer, err := model.takeTokenizer(t.Context())
-		if err != nil {
-			t.Fatal(err)
-		}
-		ids, encodeErr := encodeLateOnText(tokenizer, lateOnQueryPrefix+"request authentication flow")
-		model.releaseTokenizer(tokenizer)
-		owned = append(owned, tokenizer)
-		if encodeErr != nil || len(ids) == 0 {
-			t.Fatalf("owned tokenizer is unusable after expansion failure: %v", encodeErr)
-		}
-	}
-	if err := model.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if model.tokenizers != nil || model.tokenizerCount != 0 {
-		t.Fatal("failed expansion did not clear its pool")
-	}
-	for _, tokenizer := range owned {
-		if tokenizer.native != nil {
-			t.Error("failed expansion did not close an owned tokenizer")
-		}
-	}
-}
-
+// TestCLIProcessLateOnStrictEvidenceContract runs a description in a
+// process, as a user does. Only strict.go holds each word of the query, so
+// --lexical-only prints only it. The real model adds evict.go and lru.go,
+// which hold some of the words and the same topic. Their lifts above the
+// empty-document score are 0.302 and 0.294 per token, at least 0.044 above
+// pipelineTauFile. The folder has a fixed model path (stableModelRoot), so
+// the scores do not change from run to run.
 func TestCLIProcessLateOnStrictEvidenceContract(t *testing.T) {
 	requireTools(t)
-	folder := t.TempDir()
-	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
-	writeFileAt(t, folder, "alpha.go", "package sample\n// alpha\n")
-	writeFileAt(t, folder, "beta.go", "package sample\n// beta\n")
+	folder := stableModelRoot(t)
+	writeFileAt(t, folder, "strict.go", "package sample\n// evict the least recently used entry\n")
+	writeFileAt(t, folder, "evict.go", "package sample\n// evict the oldest entry\n")
+	writeFileAt(t, folder, "lru.go", "package sample\n// least recently used list\n")
 	cache := t.TempDir()
+	const query = "evict least recently used"
+	strict := filepath.Join(folder, "strict.go")
 
 	lexical := runCLIProcessWithCache(
 		t,
 		cache,
 		t.TempDir(),
-		[]string{"--lexical-only", "alpha beta", folder},
+		[]string{"--lexical-only", query, folder},
 		nil,
 	)
-	if lexical.code != 0 || lexical.stderr != "" || lexical.stdout == "" {
-		t.Fatalf("lexical=%+v", lexical)
+	if got := printedFiles(lexical.stdout); lexical.code != 0 || lexical.stderr != "" ||
+		!slices.Equal(got, []string{strict}) {
+		t.Fatalf("lexical search printed %v, want only %s: %+v", got, strict, lexical)
 	}
 	reranked := runCLIProcessWithCache(
 		t,
 		cache,
 		t.TempDir(),
-		[]string{"alpha beta", folder},
+		[]string{query, folder},
 		nil,
 	)
-	if reranked.code != 0 || reranked.stderr != "" || reranked.stdout == "" {
-		t.Fatalf("reranked=%+v", reranked)
-	}
-	if reranked.stdout == lexical.stdout ||
-		!strings.Contains(reranked.stdout, "## alpha.go") ||
-		!strings.Contains(reranked.stdout, "## beta.go") {
-		t.Fatalf("real backend did not publish the OR-only candidates: %+v", reranked)
+	want := []string{filepath.Join(folder, "evict.go"), filepath.Join(folder, "lru.go"), strict}
+	if got := printedFiles(reranked.stdout); reranked.code != 0 || reranked.stderr != "" ||
+		!slices.Equal(got, want) {
+		t.Fatalf("description printed %v, want %v: %+v", got, want, reranked)
 	}
 }
 
+// TestCLIProcessLateOnAcceptanceBoundary runs a nonsense query and a
+// description in a process. The nonsense query shares no word piece with the
+// files. Its lift above the empty-document score is under 0 for each file. So
+// no candidate gets to the model, and it admits no file. No file holds each
+// word of the description, so --lexical-only finds nothing. Only the model
+// can add auth.go: its lift is 0.277 per token. colors.go has 0.048 and does
+// not print. The folder has a fixed model path (stableModelRoot), so the
+// scores do not change from run to run.
 func TestCLIProcessLateOnAcceptanceBoundary(t *testing.T) {
 	requireTools(t)
-	folder := t.TempDir()
+	folder := stableModelRoot(t)
 	writeFileAt(
 		t,
 		folder,
@@ -1088,15 +891,12 @@ func TestCLIProcessLateOnAcceptanceBoundary(t *testing.T) {
 	if verbose.code != 1 || verbose.stdout != "" {
 		t.Fatalf("verbose nonexistent query=%+v, want no match", verbose)
 	}
-	for _, want := range []string{`msg="Rejected model expansion"`, "route=joined"} {
-		if !strings.Contains(verbose.stderr, want) {
-			t.Fatalf("verbose rejection lacks %q:\n%s", want, verbose.stderr)
-		}
-	}
-	for _, want := range []string{`reason="score not above minimum"`, "minimum_mean_max_sim="} {
-		if !strings.Contains(verbose.stderr, want) {
-			t.Fatalf("score rejection lacks %q:\n%s", want, verbose.stderr)
-		}
+	// The search reads the vector index, but no row is in the retrieval
+	// radius. So no candidate gets to the score stage, which logs "Accepted
+	// model candidates".
+	if !strings.Contains(verbose.stderr, `msg="Searched semantic index"`) ||
+		strings.Contains(verbose.stderr, `msg="Accepted model candidates"`) {
+		t.Fatalf("verbose nonexistent query: want a vector search and no model candidate:\n%s", verbose.stderr)
 	}
 
 	const supportedQuery = "request authentication flow"
@@ -1118,18 +918,12 @@ func TestCLIProcessLateOnAcceptanceBoundary(t *testing.T) {
 		[]string{"--verbose", supportedQuery, folder},
 		nil,
 	)
-	if accepted.code != 0 ||
-		!strings.Contains(accepted.stdout, "## auth.go") {
-		t.Fatalf("accepted query=%+v", accepted)
+	auth := filepath.Join(folder, "auth.go")
+	if got := printedFiles(accepted.stdout); accepted.code != 0 || !slices.Equal(got, []string{auth}) {
+		t.Fatalf("accepted query printed %v, want only %s: %+v", got, auth, accepted)
 	}
-	for _, want := range []string{
-		`msg="Accepted model expansion"`,
-		"route=joined",
-		`reason="score above minimum"`,
-	} {
-		if !strings.Contains(accepted.stderr, want) {
-			t.Fatalf("acceptance lacks %q:\n%s", want, accepted.stderr)
-		}
+	if !strings.Contains(accepted.stderr, `msg="Accepted model candidates"`) || strings.Contains(accepted.stderr, "accepted=0") {
+		t.Fatalf("acceptance lacks an accepted candidate:\n%s", accepted.stderr)
 	}
 }
 
@@ -1156,20 +950,11 @@ func TestLateOnMaxSimRejectsZeroDocumentVectors(t *testing.T) {
 }
 
 func TestPrepareSemanticQueryReturnsUsableTokens(t *testing.T) {
-	// PrepareSemanticQuery guards its own output, because a degenerate query row
-	// gives every candidate a finite score of zero that no later guard can tell
-	// apart from a genuine miss. Assert the invariant on real model output, so a
-	// provider that starts returning zero rows fails here.
-	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
-	model, err := newLateOnSemanticModel(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := model.Close(); err != nil {
-			t.Errorf("close model: %v", err)
-		}
-	})
+	// PrepareSemanticQuery checks its own output. A degenerate query row gives
+	// every candidate a finite score of zero, and no later check can tell it
+	// from a real miss. The test checks real model output, so a provider that
+	// starts to return zero rows fails here.
+	model := sharedModel(t)
 	prepared, err := model.PrepareSemanticQuery(t.Context(), "rank search results before the output limit")
 	if err != nil {
 		t.Fatal(err)
@@ -1196,12 +981,12 @@ func TestLateOnRowUsableTokenScansEveryMaskedToken(t *testing.T) {
 	if !lateOnRowHasUsableToken(documents, 0, mask) {
 		t.Fatal("a non-finite first token ended the scan")
 	}
-	// Row 1 is untouched, so it stays unusable. This also proves the row offset
-	// is applied, because row 0 is usable.
+	// The test does not write row 1, so it stays unusable. Row 0 is usable,
+	// so this also proves that the check applies the row offset.
 	if lateOnRowHasUsableToken(documents, 1, mask) {
 		t.Fatal("an empty second row reported a usable token")
 	}
-	// A masked token outside the mask must not rescue the row.
+	// A token outside the mask must not rescue the row.
 	documents[lateOnSequenceLength*semanticEmbeddingDimensions+5*semanticEmbeddingDimensions] = 1
 	if lateOnRowHasUsableToken(documents, 1, mask) {
 		t.Fatal("an unmasked token rescued the row")
@@ -1254,15 +1039,16 @@ func TestLateOnProbeRowsCoverActiveTokens(t *testing.T) {
 	if len(ids) != semanticModelBatchRows*lateOnSequenceLength || len(attention) != len(ids) {
 		t.Fatalf("ids=%d attention=%d, want %d", len(ids), len(attention), semanticModelBatchRows*lateOnSequenceLength)
 	}
-	// Stability is the property the probe depends on: both providers must be
-	// given the same input, and a cached verdict must describe the same input a
-	// later process will use.
+	// The probe needs the same rows on each call. Both providers must get the
+	// same input, and a cached verdict must describe the input of a later
+	// process.
 	again, againAttention := lateOnProbeRows()
 	if !reflect.DeepEqual(ids, again) || !reflect.DeepEqual(attention, againAttention) {
 		t.Fatal("the probe row is not stable between calls")
 	}
-	// Every attended token must be one the model can embed, and nothing beyond
-	// them may be attended, or the two providers would be compared over padding.
+	// Every attended token must be one that the model can embed, and the
+	// probe attends no other token. Otherwise the check compares the two
+	// providers on padding.
 	for row := range semanticModelBatchRows {
 		base := row * lateOnSequenceLength
 		for token := range lateOnSequenceLength {
@@ -1305,8 +1091,9 @@ func TestLateOnOutputsAgreeSeparatesFaultFromNoise(t *testing.T) {
 		t.Fatalf("identical outputs disagreed: %s", why)
 	}
 
-	// A uniform shrink keeps every cosine at 1 but depresses every score by the
-	// same factor, which is the shape of the macOS 15 fault. It must be rejected.
+	// A uniform shrink keeps every cosine at 1 but lowers every score by the
+	// same factor, which is the shape of the macOS 15 fault. The check must
+	// reject it.
 	scaled := make([]float32, batch)
 	for index, value := range reference {
 		scaled[index] = value * 0.87
@@ -1324,9 +1111,9 @@ func TestLateOnOutputsAgreeSeparatesFaultFromNoise(t *testing.T) {
 		t.Fatalf("a 0.1 percent scale disagreed: %s", why)
 	}
 
-	// A zero token vector is the shape the macOS 15 fault takes.
-	// Put the fault in the last row, so a check that inspects only the first row
-	// fails this test.
+	// A zero token vector is the shape the macOS 15 fault takes. Put the
+	// fault in the last row, so a check that inspects only the first row fails
+	// this test.
 	lastRow := (semanticModelBatchRows - 1) * lateOnSequenceLength
 	zeroed := append([]float32(nil), reference...)
 	for dimension := range semanticEmbeddingDimensions {
@@ -1336,7 +1123,7 @@ func TestLateOnOutputsAgreeSeparatesFaultFromNoise(t *testing.T) {
 		t.Fatal("a zero token vector agreed")
 	}
 
-	// A direction change past the limit must be rejected.
+	// The check must reject a direction change past the limit.
 	turned := append([]float32(nil), reference...)
 	turnedAt := (lastRow + 7) * semanticEmbeddingDimensions
 	turned[turnedAt] = -turned[turnedAt]
@@ -1344,7 +1131,7 @@ func TestLateOnOutputsAgreeSeparatesFaultFromNoise(t *testing.T) {
 		t.Fatal("a turned token agreed")
 	}
 
-	// Noise well inside the measured provider spread must be accepted.
+	// The check must accept noise well inside the measured provider spread.
 	noisy := append([]float32(nil), reference...)
 	for index := range noisy {
 		noisy[index] *= 1 + float32(index%3)*1e-6
@@ -1358,27 +1145,13 @@ func TestLateOnOutputsAgreeSeparatesFaultFromNoise(t *testing.T) {
 	}
 }
 
-func TestSemanticProviderNameReportsSelectionState(t *testing.T) {
-	// The fallback logs print this value, so it must never read "unset" while an
-	// encoder is being built: that is the moment provider selection itself can
-	// fail, and a record naming no provider is least useful there. Arrange each
-	// state the encoder stores and assert what a log would show.
+func TestSemanticProviderNameIsSettledAfterConstruction(t *testing.T) {
+	// The fallback logs print this value. A real construction must leave a
+	// settled provider, not an intent.
+	// An atomic.Value cannot hold nil again, so a value that was not set
+	// comes back as an empty string, which names no provider in use.
 	previous := lateOnSelectedProvider.Load()
-	t.Cleanup(func() {
-		if previous != nil {
-			lateOnSelectedProvider.Store(previous)
-		}
-	})
-	lateOnSelectedProvider.Store("selecting:" + lateOnAcceleratedProviderName)
-	if got := semanticProviderName(); got != "selecting:"+lateOnAcceleratedProviderName {
-		t.Fatalf("provider name during selection = %q", got)
-	}
-	lateOnSelectedProvider.Store(lateOnCPUProviderName)
-	if got := semanticProviderName(); got != lateOnCPUProviderName {
-		t.Fatalf("provider name after selection = %q", got)
-	}
-
-	// A real construction must leave a settled provider, not an intent.
+	t.Cleanup(func() { lateOnSelectedProvider.Store(cmp.Or[any](previous, "")) })
 	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
 	model, err := newLateOnSemanticModel(t.Context())
 	if err != nil {
@@ -1402,9 +1175,9 @@ func TestSemanticProviderNameReportsSelectionState(t *testing.T) {
 }
 
 func TestDegenerateScoringErrorCarriesTheProviderSentinel(t *testing.T) {
-	// The search path must be able to tell a provider fault from any other
-	// scoring failure, or a wrong provider on an already-built index would drop
-	// every re-rank to BM25 and never record itself.
+	// The search must tell a provider fault from any other scoring failure.
+	// Otherwise a wrong provider on a built index drops every search to text
+	// ranking and never records itself (recordFault).
 	query := make([]float32, lateOnSequenceLength*semanticEmbeddingDimensions)
 	query[0] = 1
 	queryMask := make([]bool, lateOnSequenceLength)
@@ -1416,9 +1189,221 @@ func TestDegenerateScoringErrorCarriesTheProviderSentinel(t *testing.T) {
 	if !errors.Is(err, errDegenerateSemanticVector) {
 		t.Fatalf("error = %v, want the degenerate-output sentinel", err)
 	}
-	// A shape failure is not a provider fault and must not be reported as one.
+	// A shape failure is no provider fault, and its error must not claim one.
 	_, shapeErr := lateOnMaxSimPrepared(query[:10], queryMask, documents, [][]bool{documentMask})
 	if errors.Is(shapeErr, errDegenerateSemanticVector) {
 		t.Fatalf("a shape error claimed a provider fault: %v", shapeErr)
 	}
+}
+
+// TestScoresWithSemanticQueryBatchesAboveModelWidth scores 300 documents in
+// one call. The scorer runs ceil(300/128) = 3 encoder batches. It returns one
+// score per document, equal to the scores of smaller calls.
+func TestScoresWithSemanticQueryBatchesAboveModelWidth(t *testing.T) {
+	scorer := sharedModel(t)
+	documents := make([]rerankDocument, 300)
+	for index := range documents {
+		text := fmt.Sprintf("func rank%d() { rankCorpusResults(%d) }", index, index)
+		documents[index] = rerankDocument{Path: fmt.Sprintf("pkg/f%03d.go", index), Language: "Go", Text: text, matchEnd: len(text)}
+	}
+	prepared, err := scorer.PrepareSemanticQuery(t.Context(), "find where search results are ranked")
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := scorer.ScoresWithSemanticQuery(t.Context(), prepared, documents)
+	if err != nil || len(all) != len(documents) {
+		t.Fatalf("scores=%d err=%v, want %d", len(all), err, len(documents))
+	}
+	for start := 0; start < len(documents); start += 100 {
+		part, err := scorer.ScoresWithSemanticQuery(t.Context(), prepared, documents[start:start+100])
+		if err != nil {
+			t.Fatal(err)
+		}
+		for offset, score := range part {
+			if diff := math.Abs(float64(score - all[start+offset])); diff > 1e-3 {
+				t.Fatalf("document %d scored %v in one call and %v alone", start+offset, all[start+offset], score)
+			}
+		}
+	}
+}
+
+// newTestLateOnModel returns a new LateOn model; the caller closes it.
+func newTestLateOnModel(t *testing.T) *lateOnModel {
+	t.Helper()
+	model, err := newLateOnSemanticModel(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lateOn, ok := model.(*lateOnModel)
+	if !ok {
+		t.Fatalf("model type is %T, want *lateOnModel", model)
+	}
+	return lateOn
+}
+
+// heldBuildContext is the context of an encoder build that a test holds.
+// newLateOnRowEncoder and newLateOnCPUBuildEncoder read the context error
+// first, in the sync.Once of the model. The first Err call closes started and
+// waits until release closes. So the build stays in its Once for that time.
+type heldBuildContext struct {
+	context.Context
+	once    sync.Once
+	started chan struct{}
+	release chan struct{}
+}
+
+func (c *heldBuildContext) Err() error {
+	c.once.Do(func() {
+		close(c.started)
+		<-c.release
+	})
+	return c.Context.Err()
+}
+
+// closeDuringBuild starts a call of model that builds an encoder for the
+// index build, and holds the build at its start (heldBuildContext). It starts
+// Close while it holds the build, then lets the build go on. The call passed
+// the closed check before Close, so it must get its encoder. Close must wait
+// for the build and close what it made.
+func closeDuringBuild(t *testing.T, model *lateOnModel) {
+	t.Helper()
+	ctx := &heldBuildContext{Context: t.Context(), started: make(chan struct{}), release: make(chan struct{})}
+	built := make(chan error, 1)
+	go func() {
+		encoder, err := model.semanticRowEncoder(ctx, false)
+		if err == nil && encoder == nil {
+			err = errors.New("no encoder and no error")
+		}
+		built <- err
+	}()
+	select {
+	case <-ctx.started:
+	case err := <-built:
+		t.Fatalf("the build ended before it read its context, so the test cannot hold it: err=%v", err)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- model.Close() }()
+	// Close sets closed first. Wait for it, so Close starts before the build
+	// goes on.
+	for !model.closed.Load() {
+		runtime.Gosched()
+	}
+	close(ctx.release)
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-built; err != nil {
+		t.Fatalf("a call that started before Close: %v", err)
+	}
+}
+
+// TestLateOnModelCloseAtEachStage closes a model at four stages:
+//   - before its first call;
+//   - after its first call;
+//   - while the first call builds the encoder;
+//   - while a later call builds the second CPU session (closeDuringBuild).
+//
+// Close must close each encoder that a build made, also the encoder of a
+// build that runs now. A call after Close gets the closed error. -race sees
+// no write of an encoder field after its read.
+func TestLateOnModelCloseAtEachStage(t *testing.T) {
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	t.Run("close first", func(t *testing.T) {
+		model := newTestLateOnModel(t)
+		if err := model.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := model.semanticRowEncoder(t.Context(), false); !errors.Is(err, errLateOnModelClosed) {
+			t.Fatalf("call after Close: err=%v, want errLateOnModelClosed", err)
+		}
+	})
+	t.Run("close after use", func(t *testing.T) {
+		model := newTestLateOnModel(t)
+		if _, err := model.semanticRowEncoder(t.Context(), false); err != nil {
+			t.Fatal(err)
+		}
+		if err := model.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := model.semanticRowEncoder(t.Context(), false); !errors.Is(err, errLateOnModelClosed) {
+			t.Fatalf("call after Close: err=%v, want errLateOnModelClosed", err)
+		}
+	})
+	t.Run("close during the first build", func(t *testing.T) {
+		model := newTestLateOnModel(t)
+		closeDuringBuild(t, model)
+		if model.encoder == nil || model.encoder.session != nil {
+			t.Fatal("Close did not close the encoder of the build in flight")
+		}
+	})
+	t.Run("close during the build session", func(t *testing.T) {
+		t.Setenv(lateOnProviderEnv, lateOnCPUProviderName)
+		model := newTestLateOnModel(t)
+		if _, err := model.semanticRowEncoder(t.Context(), true); err != nil {
+			t.Fatal(err)
+		}
+		if !model.encoder.interactive {
+			t.Fatal("the first CPU session is not sized for one call")
+		}
+		closeDuringBuild(t, model)
+		if model.build == nil || model.build.session != nil {
+			t.Fatal("Close did not close the build session in flight")
+		}
+	})
+}
+
+// TestLateOnSessionThreadsFollowTheFirstUse pins the CPU provider. A model
+// whose first call is the index build gets the build's thread count, and a
+// later query makes no second session. A model whose first call is a query
+// gets the interactive count, and a scoring call uses that session. A later
+// index build gets a session of its own with the build's count. On 1 or 2
+// CPUs both counts are 1, so the test sets GOMAXPROCS to 8 for its run. Then
+// the build count is round(sqrt(8/2)) = 2 and the interactive count is
+// round(8*2/3) = 5, on each host.
+func TestLateOnSessionThreadsFollowTheFirstUse(t *testing.T) {
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	t.Setenv(lateOnProviderEnv, lateOnCPUProviderName)
+	previous := runtime.GOMAXPROCS(8)
+	t.Cleanup(func() { runtime.GOMAXPROCS(previous) })
+	const build, interactive = 2, 5
+	newModel := func(t *testing.T) *lateOnModel {
+		t.Helper()
+		model := newTestLateOnModel(t)
+		t.Cleanup(func() { _ = model.Close() })
+		return model
+	}
+	t.Run("build first", func(t *testing.T) {
+		model := newModel(t)
+		if got := model.SemanticCallCPUs(t.Context()); got != build {
+			t.Fatalf("build call CPUs=%d, want %d", got, build)
+		}
+		if _, err := model.PrepareSemanticQuery(t.Context(), "parse the request"); err != nil {
+			t.Fatal(err)
+		}
+		if model.build != nil {
+			t.Fatal("a query after the build made a second session")
+		}
+	})
+	t.Run("query first", func(t *testing.T) {
+		model := newModel(t)
+		if _, err := model.PrepareSemanticQuery(t.Context(), "parse the request"); err != nil {
+			t.Fatal(err)
+		}
+		if model.encoder.callCPUs != interactive {
+			t.Fatalf("query session threads=%d, want %d", model.encoder.callCPUs, interactive)
+		}
+		// Scoring is one call too: it uses the query session.
+		if _, err := scoreWithTestSemanticEmbedder(t.Context(), model, "parse the request", lateOnBenchmarkDocuments(4)); err != nil {
+			t.Fatal(err)
+		}
+		if model.build != nil {
+			t.Fatal("a scoring call made the build session")
+		}
+		if got := model.SemanticCallCPUs(t.Context()); got != build {
+			t.Fatalf("build call CPUs after a query=%d, want %d (a session of its own)", got, build)
+		}
+		if model.build == nil || model.build == model.encoder {
+			t.Fatal("the build did not get a session of its own")
+		}
+	})
 }

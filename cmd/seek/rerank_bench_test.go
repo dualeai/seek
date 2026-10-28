@@ -16,8 +16,12 @@ import (
 	"time"
 )
 
+// seekBenchmarkBinaryEnv names the seek executable that BenchmarkCLIProcess
+// runs (make test-bench builds it).
 const seekBenchmarkBinaryEnv = "SEEK_BENCH_BINARY"
 
+// The benchmarks store their last results here, so the compiler keeps each
+// timed call.
 var (
 	benchmarkLateOnScores    []float32
 	benchmarkLateOnInputIDs  []int64
@@ -25,18 +29,20 @@ var (
 	benchmarkLateOnScoreMask [][]bool
 )
 
+// BenchmarkCLIProcess times the production executable on 256 files. It times
+// a lexical-only search and a search that gives the model no text. It times
+// descriptions on a first use and with a provider check. It also times warm
+// descriptions: with the default context, with -C 0, and with vector hits.
 func BenchmarkCLIProcess(b *testing.B) {
 	binary := seekBenchmarkBinary(b)
-	if err := checkCtagsCached(); err != nil {
-		b.Skipf("ctags required: %v", err)
-	}
+	requireTools(b)
 
 	root := b.TempDir()
 	fixture := filepath.Join(root, "fixture")
 	lexicalCache := filepath.Join(root, "lexical-cache")
 	semanticCache := filepath.Join(root, "semantic-cache")
-	// Use more than the model pool so the timed relaxed search also covers the
-	// candidate bound before deep result cloning.
+	// Write 256 files, twice the model batch: every file holds a query word,
+	// and five hold all three.
 	for i := range 256 {
 		terms := []string{"parse", "request", "handler"}
 		if i >= 5 {
@@ -56,15 +62,22 @@ func BenchmarkCLIProcess(b *testing.B) {
 
 	const queryText = "parse request handler"
 	lexicalArgs := []string{"--lexical-only", queryText, fixture}
-	ineligibleArgs := []string{"content:parse request handler", fixture}
+	// RerankIneligibleWarm times a strict search in the cache that holds
+	// vectors. A query of punctuation only gives the model no text (the
+	// querySupport rows T36 and T41). So the command starts no model. It
+	// matches the "()" of every fixture function.
+	ineligibleArgs := []string{`\(\)`, fixture}
+	if plan, err := planQuery(ineligibleArgs[0], semanticSearch); err != nil || plan.model != nil {
+		b.Fatalf("%q plans a model route: model=%t err=%v", ineligibleArgs[0], plan.model != nil, err)
+	}
 	eligibleArgs := []string{queryText, fixture}
 	eligibleDisplayContextZeroArgs := []string{"-C", "0", queryText, fixture}
-	// The relaxed lexical query starts with one content candidate. Semantic
-	// retrieval can expand it before final scoring.
+	// The strict query matches only candidate_00.go. Semantic retrieval can
+	// add files before the final scoring.
 	semanticExpansionArgs := []string{"candidate0 candidate_00", fixture}
 
-	// Keep the lexical-only no-model check independent from default searches,
-	// which can build semantic data even when a query is not eligible to rerank.
+	// Keep the lexical-only no-model check in its own cache, so the semantic
+	// data that default searches build cannot reach it.
 	output, err := runSeekBenchmarkCommand(
 		b.Context(), binary, lexicalCache, fixture, lexicalArgs, false,
 	)
@@ -118,10 +131,10 @@ func BenchmarkCLIProcess(b *testing.B) {
 	b.Run("RerankEligibleFirstUse", func(b *testing.B) {
 		for b.Loop() {
 			b.StopTimer()
-			// Remove the extracted run time, which is what "first use" measures.
-			// Keep reranker/coreml: it holds the compiled Core ML model and the
-			// provider verdict, and rebuilding both on every iteration would
-			// measure the Core ML compiler rather than Seek.
+			// Remove the extracted run time, which is what "first use"
+			// measures. Keep reranker/coreml: it holds the compiled Core ML
+			// model and the provider verdict. A new compile in each iteration
+			// would measure the Core ML compiler, not Seek.
 			entries, err := os.ReadDir(filepath.Join(semanticCache, "reranker"))
 			if err != nil && !os.IsNotExist(err) {
 				b.Fatal(err)
@@ -139,12 +152,11 @@ func BenchmarkCLIProcess(b *testing.B) {
 		}
 	})
 	b.Run("RerankEligibleProviderCheck", func(b *testing.B) {
-		// RerankEligibleFirstUse deliberately keeps the compiled Core ML model,
-		// and the provider verdict lives in the same directory, so that case
-		// never runs the provider check. Remove the verdict alone to measure the
-		// check itself: a second session on the reference provider and one batch
-		// through each. Without this the only cost this feature adds has no
-		// benchmark at all.
+		// RerankEligibleFirstUse keeps the compiled Core ML model, and the
+		// provider verdict is in the same folder, so that case never runs the
+		// provider check. Remove the verdict alone to measure the check: a
+		// second session on the reference provider and one batch through each.
+		// No other benchmark measures this cost.
 		for b.Loop() {
 			b.StopTimer()
 			removeProviderVerdicts(b, semanticCache)
@@ -199,7 +211,7 @@ func BenchmarkLateOnScoring_Top20(b *testing.B) {
 }
 
 func BenchmarkLateOnScoring_FullBatch(b *testing.B) {
-	benchmarkLateOnScoring(b, rerankCandidateLimit)
+	benchmarkLateOnScoring(b, semanticModelBatchRows)
 }
 
 func benchmarkLateOnScoring(b *testing.B, documentCount int) {
@@ -242,7 +254,6 @@ func benchmarkLateOnScoring(b *testing.B, documentCount int) {
 // model inference, and the production coarse and fine vector calculation.
 func BenchmarkSemanticModelPass100k(b *testing.B) {
 	b.Setenv("SEEK_CACHE_DIR", b.TempDir())
-	b.StopTimer()
 	scorer, err := newLateOnSemanticModel(b.Context())
 	if err != nil {
 		b.Fatal(err)
@@ -253,13 +264,6 @@ func BenchmarkSemanticModelPass100k(b *testing.B) {
 			b.Errorf("close scorer: %v", err)
 		}
 	})
-
-	// Real bulk work packs source units before embedding prepared rows.
-	if _, err := embedder.PackSemanticUnits(b.Context(), []semanticUnit{{
-		path: "benchmark.go", text: []byte("package benchmark\n"),
-	}}); err != nil {
-		b.Fatalf("prepare bulk tokenizers: %v", err)
-	}
 
 	const rowCount = 100_000
 	units := make([]semanticUnit, rowCount)
@@ -277,9 +281,7 @@ func BenchmarkSemanticModelPass100k(b *testing.B) {
 		len(vectors) != semanticModelBatchRows {
 		b.Fatalf("warm semantic model: vectors=%d error=%v", len(vectors), err)
 	}
-	callCPUs := semanticModelCallCPUs(b.Context(), embedder)
-	b.ResetTimer()
-	b.StartTimer()
+	callCPUs := embedder.SemanticCallCPUs(b.Context())
 
 	for b.Loop() {
 		b.StopTimer()
@@ -288,7 +290,7 @@ func BenchmarkSemanticModelPass100k(b *testing.B) {
 		for sequence := range batchCount {
 			start := sequence * semanticModelBatchRows
 			end := min(start+semanticModelBatchRows, len(units))
-			batches <- semanticBuildBatch{sequence: sequence, units: units[start:end]}
+			batches <- semanticBuildBatch{units: units[start:end]}
 		}
 		close(batches)
 		encoded := make(chan semanticEncodedBatch)
@@ -325,14 +327,14 @@ func BenchmarkLateOnDocumentTokenization_Top20Truncated(b *testing.B) {
 }
 
 func BenchmarkLateOnDocumentTokenization_FullBatchTruncated(b *testing.B) {
-	benchmarkLateOnDocumentTokenization(b, rerankCandidateLimit)
+	benchmarkLateOnDocumentTokenization(b, semanticModelBatchRows)
 }
 
 func benchmarkLateOnDocumentTokenization(b *testing.B, documentCount int) {
 	tokenizer, punctuation := openLateOnTestTokenizer(b)
 	documents := lateOnBenchmarkTruncatedDocuments(documentCount)
-	serialized, _, _, _ := serializeLateOnDocumentWithMatch(documents[0])
-	encoded, _, err := tokenizer.encode(lateOnDocumentPrefix+serialized, true, true)
+	// A limit far above one model row gives the document's full token count.
+	encoded, err := encodeLateOnDocument(tokenizer, documents[0], 1<<20)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -380,21 +382,39 @@ func BenchmarkLateOnRuntimeCache(b *testing.B) {
 				b.Fatal(err)
 			}
 			b.StartTimer()
-			if _, installed, err := ensureLateOnRuntime(bundle); err != nil || !installed {
-				b.Fatalf("cold runtime: installed=%t err=%v", installed, err)
+			path, err := ensureLateOnRuntime(bundle)
+			if err != nil {
+				b.Fatalf("cold runtime: %v", err)
 			}
+			b.StopTimer()
+			// The cache held no runtime, so a file at path is a new install.
+			if _, err := os.Stat(path); err != nil {
+				b.Fatalf("cold runtime not installed: %v", err)
+			}
+			b.StartTimer()
 		}
 	})
 	b.Run("Warm", func(b *testing.B) {
 		b.Setenv("SEEK_CACHE_DIR", b.TempDir())
-		if _, installed, err := ensureLateOnRuntime(bundle); err != nil || !installed {
-			b.Fatalf("prepare runtime: installed=%t err=%v", installed, err)
+		path, err := ensureLateOnRuntime(bundle)
+		if err != nil {
+			b.Fatalf("prepare runtime: %v", err)
+		}
+		installed, err := os.Stat(path)
+		if err != nil {
+			b.Fatal(err)
 		}
 		b.ReportAllocs()
 		for b.Loop() {
-			if _, installed, err := ensureLateOnRuntime(bundle); err != nil || installed {
-				b.Fatalf("warm runtime: installed=%t err=%v", installed, err)
+			if _, err := ensureLateOnRuntime(bundle); err != nil {
+				b.Fatalf("warm runtime: %v", err)
 			}
+			// An install renames a new file over the path.
+			b.StopTimer()
+			if warm, err := os.Stat(path); err != nil || !os.SameFile(installed, warm) {
+				b.Fatalf("warm runtime installed again: err=%v", err)
+			}
+			b.StartTimer()
 		}
 	})
 }
@@ -423,6 +443,9 @@ func lateOnBenchmarkDocuments(count int) []rerankDocument {
 	return documents
 }
 
+// lateOnBenchmarkTruncatedDocuments returns count documents whose text holds
+// more tokens than one model row, so the tokenizer cuts each one around its
+// match.
 func lateOnBenchmarkTruncatedDocuments(count int) []rerankDocument {
 	const match = "parseRequestHandler"
 	before := strings.Repeat("prefixContextValue ", 55)
@@ -480,6 +503,9 @@ func mustRunSeekBenchmark(
 	}
 }
 
+// runSeekBenchmarkCommand runs binary in directory with NO_COLOR and cache as
+// SEEK_CACHE_DIR. It returns stdout and stderr together, or nothing with
+// discardOutput.
 func runSeekBenchmarkCommand(
 	ctx context.Context,
 	binary, cache, directory string,
@@ -505,9 +531,9 @@ func runSeekBenchmarkCommand(
 	return output.Bytes(), err
 }
 
-// removeProviderVerdicts deletes every recorded provider verdict under the cache,
-// keeping the compiled models beside them. The next run therefore repeats the
-// provider check without repeating the Core ML compile.
+// removeProviderVerdicts deletes every recorded provider verdict under the
+// cache and keeps the compiled models beside them. So the next run repeats
+// the provider check but not the Core ML compile.
 func removeProviderVerdicts(b *testing.B, cacheDir string) {
 	b.Helper()
 	root := filepath.Join(cacheDir, "reranker", "coreml")

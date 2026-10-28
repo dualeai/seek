@@ -1,39 +1,42 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/index"
+	"golang.org/x/sys/unix"
 )
 
 const (
 	// stateFile stores the hash of the last indexed corpus state.
 	stateFile = ".state"
-	// stateTmpFile is used for atomic writes of the state file.
-	stateTmpFile = ".state.tmp"
 	// headFile stores the HEAD SHA of the last successful committed index.
 	// It is a fallback only: the shards record the commit they hold, and
 	// committedShardHead reads it. This file answers when that record cannot
-	// be read, so a damaged shard keeps the previous behaviour instead of
-	// rebuilding on every search.
+	// be read, so a shard with unreadable metadata does not cause a rebuild
+	// on every search.
 	headFile = ".head"
-	// emptyFile stores the state hash for a layer that is known to have
-	// no indexable shards. This prevents a missing/corrupt shard directory
-	// from being confused with an intentionally empty scoped layer.
+	// emptyFile stores the state hash of a Git node that is known to have
+	// no indexable shards. It tells an empty node apart from a missing or
+	// damaged shard directory.
 	emptyFile = ".empty"
 	// lockFile is the publish/read lock. Readers hold a shared lock while they
 	// list, open, and search shards. Publishers hold an exclusive lock while
@@ -42,9 +45,11 @@ const (
 	// buildLockFile lets only one process build a corpus at a time. Readers do
 	// not take this lock.
 	buildLockFile = ".build.lock"
-	// swappingMarkerFile records, while present, that a temp-swap publish was
-	// interrupted mid-rename; the named shard family may be torn and must be
-	// cleaned + fully rebuilt on the next build (see recoverIncompleteSwap).
+	// swappingMarkerFile names the shard family that publishShardFamilyLocked
+	// swaps. The publish removes it when the swap ends or moves the live
+	// family back. A crash during the swap, or a failed move back, leaves it.
+	// Then the family can be partial, so the next build removes the family
+	// and builds it in full (recoverIncompleteSwap).
 	swappingMarkerFile = ".swapping"
 	// buildDirPrefix names per-build temp index dirs (cacheDir/index/.build-*).
 	// Maintenance scans ignore these dot-prefixed directories.
@@ -60,19 +65,21 @@ const (
 // shardMax is the maximum corpus size (in bytes) per zoekt shard.
 // Smaller shards let Zoekt build more shards concurrently. It is a variable so
 // tests can swap it; production callers treat it as read-only.
-var shardMax = 10 * 1024 * 1024 // 10 MB
+var shardMax = 10 * 1024 * 1024 // 10 MiB
 
-// largeDocumentParallelism bounds concurrent shard and ctags jobs for documents
-// that fill a shard of their own (isolatesShard): one per CPU, and at least 3,
-// because seek's objective is the shortest time. Large windows also rotate on
+// largeDocumentParallelism bounds the shard and ctags jobs of one build for
+// documents that fill a shard of their own (isolatesShard). It is one per CPU,
+// because Seek's objective is the shortest time. The floor is 3, the fixed
+// count that Seek used before it sized this from the host. So a host with one
+// or two CPUs runs no fewer jobs than before. Large windows also rotate on
 // their real content bytes, which bounds memory for documents above the
 // read-weight clamp. Seek does not reduce index quality for these files: it
 // still indexes full content and runs symbol analysis.
 var largeDocumentParallelism = max(3, runtime.GOMAXPROCS(0))
 
-// computeStateHash computes the xxHash64 of the given state string.
-// In production, the input is a repoStateFingerprint (raw git status output
-// enriched with file stats).
+// computeStateHash returns the xxHash64 of stateVersion and rawOutput as 16
+// hex digits. In production, the input is gitCorpusFingerprint: the format
+// versions, the index options, the path identities, and repoStateFingerprint.
 func computeStateHash(rawOutput string) string {
 	h := xxhash.New()
 	_, _ = h.WriteString(stateVersion)
@@ -92,16 +99,18 @@ func formatHex16(v uint64) string {
 	return string(buf[:])
 }
 
-// repoStateFingerprint returns raw Git status output plus the path, mtime,
-// size, and inode of each dirty file. Git status porcelain does not include
-// working-tree content hashes, so these fields detect common changes to files
-// that are already dirty. This is a metadata fingerprint, not a content hash;
-// an edit that preserves every observed field can keep the same fingerprint.
+// repoStateFingerprint returns raw Git status output and the stat fields of
+// each dirty file: path, mtime, size, inode, mode, and ctime. The folder walk
+// keeps these fields too (folderCandidate). Git status porcelain does not
+// include working-tree content hashes, so these fields detect common changes
+// to files that are already dirty. This is a metadata fingerprint, not a
+// content hash; an edit that keeps every observed field can keep the same
+// fingerprint.
 //
-// Called twice per indexing cycle: once before indexing (to compute the
-// pre-state hash) and once after (to detect drift). The second call
-// reads the same metadata again so changes to an observed field cause the
-// build to be discarded.
+// The refresh of a node hashes its capture, and the build publishes that
+// state. A dirty file that changes after the capture changes the fingerprint
+// of the next capture, so the next search builds again. The read hashes the
+// capture again to see such an edit (gitNode.prepare).
 func repoStateFingerprint(repoDir string, state repoState) string {
 	if len(state.Files) == 0 {
 		return state.RawOutput
@@ -138,6 +147,12 @@ func repoStateFingerprint(repoDir string, state repoState) string {
 		b.WriteByte(0)
 		b.Write(strconv.AppendUint(numBuf[:0], stat.Ino, 10))
 		b.WriteByte(0)
+		// A chmod changes the mode and the ctime only: a file read by name
+		// only for its permissions is read again once they allow it.
+		b.Write(strconv.AppendUint(numBuf[:0], uint64(stat.Mode), 10))
+		b.WriteByte(0)
+		b.Write(strconv.AppendInt(numBuf[:0], statCtimeNano(stat), 10))
+		b.WriteByte(0)
 	}
 	return b.String()
 }
@@ -151,13 +166,78 @@ func readCacheFile(cacheDir, name string) string {
 	return strings.TrimSpace(string(data))
 }
 
-// writeCacheFile atomically writes value to cacheDir/name via tmp+rename.
+// cacheTmpSuffix ends the name of the temporary file of writeCacheFileFrom.
+// removeCacheFile removes that file with its record. The gc orphan sweep
+// removes an old one of a manifest (isOrphanManifestTmpName).
+const cacheTmpSuffix = ".tmp"
+
+// writeCacheFile atomically writes value to cacheDir/name
+// (writeCacheFileFrom).
 func writeCacheFile(cacheDir, name, value string) error {
-	tmpPath := filepath.Join(cacheDir, name+".tmp")
-	if err := os.WriteFile(tmpPath, []byte(value), 0o644); err != nil {
+	return writeCacheFileFrom(cacheDir, name, func(w io.Writer) error {
+		_, err := io.WriteString(w, value)
+		return err
+	})
+}
+
+// writeCacheFileFrom writes cacheDir/name through the temporary file
+// name+cacheTmpSuffix and a rename, so a reader sees the old file or the
+// complete new one. write fills the temporary file, and a failed step removes
+// it. Two writers of one name share the temporary file, so a record with
+// content is written only under the corpus's build or publish lock. The empty
+// markers .used and .last-gc also use it with no corpus lock. A lost race
+// fails one rename, and the marker records only its time.
+func writeCacheFileFrom(cacheDir, name string, write func(io.Writer) error) error {
+	tmpPath := filepath.Join(cacheDir, name+cacheTmpSuffix)
+	file, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, filepath.Join(cacheDir, name))
+	err = write(file)
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(tmpPath, filepath.Join(cacheDir, name))
+	}
+	if err != nil {
+		_ = os.Remove(tmpPath)
+	}
+	return err
+}
+
+// removeCacheFile removes cacheDir/name and the temporary file of its
+// writeCacheFileFrom (best effort).
+func removeCacheFile(cacheDir, name string) {
+	_ = os.Remove(filepath.Join(cacheDir, name))
+	_ = os.Remove(filepath.Join(cacheDir, name+cacheTmpSuffix))
+}
+
+// sharedTmpInfix marks the temp files of writeSharedCacheFile; the gc
+// orphan sweep removes old ones of .bm25-v2 and .size.
+const sharedTmpInfix = ".tmp-"
+
+// writeSharedCacheFile writes value to cacheDir/name through a temp file of
+// its own and a rename. Writers with no exclusive lock use it (.bm25-v2,
+// .size, the provider verdict): each concurrent writer renames a complete
+// file. The file has mode 0600 under any umask: only the cache owner reads it,
+// and the owner can replace it. os.CreateTemp alone applies the umask.
+func writeSharedCacheFile(cacheDir, name, value string) error {
+	tmp, err := os.CreateTemp(cacheDir, name+sharedTmpInfix+"*")
+	if err != nil {
+		return err
+	}
+	_, writeErr := tmp.WriteString(value)
+	chmodErr := tmp.Chmod(0o600)
+	closeErr := tmp.Close()
+	err = errors.Join(writeErr, chmodErr, closeErr)
+	if err == nil {
+		err = os.Rename(tmp.Name(), filepath.Join(cacheDir, name))
+	}
+	if err != nil {
+		_ = os.Remove(tmp.Name())
+	}
+	return err
 }
 
 // readStateFile reads the cached state hash.
@@ -179,50 +259,40 @@ func writeEmptyStateFile(cacheDir, state string) error {
 }
 
 func deleteEmptyStateFiles(cacheDir string) {
-	_ = os.Remove(filepath.Join(cacheDir, emptyFile))
-	_ = os.Remove(filepath.Join(cacheDir, emptyFile+".tmp"))
+	removeCacheFile(cacheDir, emptyFile)
 }
 
-// deleteStateFiles removes the cached working-tree state and its tmp files, so
-// a failed or drifted indexing cycle re-checks the corpus on the next search.
+// deleteStateFiles removes .state, .head, and .empty with their temporary
+// files, so a failed indexing cycle checks the corpus again on the next search.
 //
 // It keeps .git-committed-v1. That file describes the committed family still on
-// disk, which a failed build did not change, and dropping it forced the next
-// commit into a full rebuild. It still clears .head, which costs nothing now
-// that .head is only a fallback.
+// disk: a failed build did not change that family, or recorded it right after
+// its publish. Without the file, the next commit rebuilds in full. It clears
+// .head, which is only a fallback.
 func deleteStateFiles(cacheDir string) {
-	_ = os.Remove(filepath.Join(cacheDir, stateFile))
-	_ = os.Remove(filepath.Join(cacheDir, stateFile+".tmp"))
-	_ = os.Remove(filepath.Join(cacheDir, headFile))
-	_ = os.Remove(filepath.Join(cacheDir, headFile+".tmp"))
+	removeCacheFile(cacheDir, stateFile)
+	removeCacheFile(cacheDir, headFile)
 	deleteEmptyStateFiles(cacheDir)
-	// .git-committed-v1 is kept. It records the delta base of the committed
-	// family that is still on disk, and a failed build does not change that
-	// family. Deleting it forced the next commit to rebuild in full.
-	//
-	// A stale record cannot produce a wrong answer: prepareNativeGitDelta
-	// compares it with the commit read from the shard itself
-	// (git_native_delta.go:124-127) and rejects a delta when the two disagree.
+	// A stale .git-committed-v1 cannot give a wrong answer.
+	// prepareNativeGitDelta compares it with the commit that the shard
+	// records and rejects a delta when the two differ.
 }
 
 // indexParallelism returns the number of parallel indexing workers.
 func indexParallelism() int {
-	p := runtime.GOMAXPROCS(0)
-	if p < 1 {
-		p = 1
-	}
-	return p
+	return runtime.GOMAXPROCS(0)
 }
 
+// indexBuildOptions gives the Zoekt build options of every shard build.
 func indexBuildOptions(indexDir string, parallelism int) index.Options {
 	// Keep the same content and ctags contract for every accepted document.
 	// Large-file controls can change only Builder scheduling and parallelism.
 	//
-	// TODO: Zoekt still replaces the content of two kinds of documents with a
-	// NOT-INDEXED marker, and index.Options has no switch for either: content
-	// with a NUL byte (index.SkipReasonBinary) and content shorter than three
-	// bytes (index.SkipReasonTooSmall). Seek accepts both limits for now.
-	// Removing them needs a Zoekt change. The readers find a NUL in the first
+	// Zoekt replaces the content of two kinds of documents with a NOT-INDEXED
+	// marker. They are content with a NUL byte (index.SkipReasonBinary) and
+	// content shorter than three bytes (index.SkipReasonTooSmall).
+	// index.Options has no switch for either. Seek accepts both limits; only a
+	// Zoekt change can remove them. The readers find a NUL in the first
 	// binaryProbeBytes themselves and do not read the rest (readContent).
 	//
 	// TrigramMax at the content limit turns off Zoekt's distinct-trigram skip
@@ -230,6 +300,11 @@ func indexBuildOptions(indexDir string, parallelism int) index.Options {
 	// TrigramMax, so the count never decides whether content is searchable. The
 	// cost is index size and build memory for large files with many distinct
 	// non-ASCII trigrams.
+	//
+	// TODO(https://github.com/sourcegraph/zoekt/issues/1204): Zoekt skips a
+	// file whose ctags parse takes more than 1 minute, also with
+	// CTagsMustSucceed, so that file has no symbols. Set a longer timeout once
+	// Zoekt lets callers set it.
 	return index.Options{
 		IndexDir:         indexDir,
 		SizeMax:          int(documentContentLimit),
@@ -240,11 +315,10 @@ func indexBuildOptions(indexDir string, parallelism int) index.Options {
 	}
 }
 
-// ctagsOnce caches executable discovery for one process.
-var (
-	ctagsOnce sync.Once
-	ctagsErr  error
-)
+// envCtagsCommand names the Universal Ctags command. Zoekt's builder reads
+// it too (index.Builder), so checkCtags sets it to the "ctags" fallback that it
+// finds.
+const envCtagsCommand = "CTAGS_COMMAND"
 
 // ctagsUnavailableError identifies a failure to locate an executable Ctags
 // command. An explicit command records its CTAGS_COMMAND value. The wrapped
@@ -258,22 +332,16 @@ func (e *ctagsUnavailableError) Error() string {
 	if e.command != "" {
 		return fmt.Sprintf("cannot use CTAGS_COMMAND=%q: %v", e.command, e.cause)
 	}
-	if e.cause != nil {
-		return fmt.Sprintf("universal-ctags executable not found: %v", e.cause)
-	}
-	return "universal-ctags executable not found"
+	return fmt.Sprintf("universal-ctags executable not found: %v", e.cause)
 }
 
 func (e *ctagsUnavailableError) Unwrap() error {
 	return e.cause
 }
 
-// checkCtagsCached returns the cached result of checkCtags, running the
-// check at most once per process.
-func checkCtagsCached() error {
-	ctagsOnce.Do(func() { ctagsErr = checkCtags() })
-	return ctagsErr
-}
+// checkCtagsCached returns the result of checkCtags, which runs at most once
+// per process. Tests replace it to run the check again.
+var checkCtagsCached = sync.OnceValue(checkCtags)
 
 // checkCtags locates an executable command before Zoekt creates a builder. It
 // verifies the generic "ctags" fallback by version because that name can refer
@@ -286,8 +354,8 @@ func checkCtagsCached() error {
 //  3. "ctags" binary on PATH, verified via --version (Homebrew on macOS
 //     installs universal-ctags as "ctags")
 func checkCtags() error {
-	// 1. Explicit env var — trust the user.
-	if cmd := os.Getenv("CTAGS_COMMAND"); cmd != "" {
+	// 1. An explicit environment variable: trust the user.
+	if cmd := os.Getenv(envCtagsCommand); cmd != "" {
 		if _, err := exec.LookPath(cmd); err != nil {
 			return &ctagsUnavailableError{command: cmd, cause: err}
 		}
@@ -308,8 +376,12 @@ func checkCtags() error {
 		}
 		out, versionErr := exec.Command(ctags, "--version").Output()
 		if versionErr == nil && strings.Contains(string(out), "Universal Ctags") {
-			_ = os.Setenv("CTAGS_COMMAND", ctags)
+			_ = os.Setenv(envCtagsCommand, ctags)
 			return nil
+		}
+		if outOfFileDescriptors(versionErr) {
+			// No free descriptor says nothing about ctags.
+			return fmt.Errorf("check %q --version: %w", ctags, versionErr)
 		}
 		if versionErr != nil {
 			versionErr = fmt.Errorf("check %q --version: %w", ctags, versionErr)
@@ -320,124 +392,149 @@ func checkCtags() error {
 	}
 }
 
-// runIndexingWithCacheExecution makes the joined Git index current with
+// build makes the joined Git index of store current with
 // separate build and publish locks. Zoekt covers committed and uncommitted
-// files. The semantic generation covers the captured commit:
+// files. The semantic base generation covers the captured commit, and the
+// overlay generation covers the dirty files:
 //
 //   - .build.lock serializes builders for the complete build.
-//   - The committed family is built outside the publish lock. Native full uses
-//     an empty temporary directory; eligible native delta seeds current shards.
-//     These are the only committed-data routes. HEAD is checked before publish.
+//   - The build makes the committed family outside the publish lock. Native
+//     full uses an empty temporary directory; eligible native delta seeds
+//     current shards. These are the only committed-data routes. The build
+//     checks HEAD before the publish.
 //   - A required semantic generation builds beside the committed Zoekt branch.
 //     Each branch reads its own bounded stream from the same captured commit.
-//   - The uncommitted family is rebuilt under the publish lock so its shards,
-//     manifest, and state describe the same generation.
-//   - The joined descriptor is written last under the publish lock. A semantic
-//     failure keeps the Zoekt generation searchable without joined retrieval.
+//   - A full uncommitted rebuild builds in its own directory before the publish
+//     lock, and the lock covers only its swap. An uncommitted delta writes in
+//     place under the lock, only on a family that matches its manifest. The
+//     shards, manifest, and state describe the same generation.
+//   - The build writes the joined descriptor last, under the publish lock. A
+//     semantic failure keeps the Zoekt generation searchable without joined
+//     retrieval.
 //
-// Lexical readers normally hold a shared publish lock while they list, open,
-// and search shards. A timed-out lexical read can continue without the lock.
-// Joined readers require the strict shared lock because both indexes must name
-// the same generation. A failed swap can leave shards until the next build
-// repairs .swapping.
-func runIndexingWithCacheExecution(
+// Readers hold the shared publish lock while they list, open, and search
+// shards, so the text and vector indexes name the same generation. A reader
+// waits for a publish with no time limit. A failed swap moves the live family
+// back; only an interrupted swap, or a failed move back, leaves shards for the
+// next build to repair.
+//
+// peer reports a build that a peer runs: the node serves its current shards,
+// and the peer publishes the fresh ones.
+func (g *gitNode) build(
 	ctx context.Context,
-	paths gitPaths,
-	cacheDir string,
-	indexDir string,
+	store corpusStore,
+	state repoState,
+	preState string,
+	execution searchExecution,
+) (peer bool, err error) {
+	unlock, acquired, err := store.lockBuild(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !acquired {
+		return true, nil
+	}
+	defer unlock()
+	return false, g.buildLocked(ctx, store, state, preState, execution)
+}
+
+// buildLocked is the build under the build lock.
+func (g *gitNode) buildLocked(
+	ctx context.Context,
+	store corpusStore,
 	state repoState,
 	preState string,
 	execution searchExecution,
 ) error {
+	paths := g.paths
 	repoDir := paths.RepoDir
-	// Ensure partial temp files are cleaned up on all exit paths.
-	defer func() {
-		_ = os.Remove(filepath.Join(cacheDir, stateTmpFile))
-		_ = os.Remove(filepath.Join(cacheDir, headFile+".tmp"))
-		_ = os.Remove(filepath.Join(cacheDir, committedGitStateFile+".tmp"))
-	}()
-
-	buildFd, acquired, err := acquireBuildLock(ctx, cacheDir, indexDir)
-	if err != nil {
-		return err
-	}
-	if !acquired {
-		// Another builder is active and a usable index exists — serve current
-		// shards; the active builder publishes the fresh ones.
-		slog.Debug("Another process is indexing; serving current index")
-		return nil
-	}
-	defer releaseLock(buildFd)
-
-	// Repair a crash that left a half-published swap before trusting state.
-	recoverIncompleteSwap(cacheDir, indexDir)
+	cacheDir, indexDir := store.cacheDir, store.indexDir
 
 	// Check state and shard integrity again after acquiring the build lock. A
 	// peer can publish between the first check and this point.
 	cachedState := readStateFile(cacheDir)
-	// One scan supplies the post-lock check, the seed decision,
-	// and the needCommitted trigger below.
+	// One scan supplies the post-lock check, the seed decision, and the
+	// committed trigger.
 	sc, scErr := scanFamilyOptional(indexDir)
 	if scErr != nil {
 		return scErr
 	}
-	familyIntact := sc.matchesManifest(indexDir)
-	// Check the committed family separately. A dirty edit can change only the
-	// uncommitted family.
-	committedIntact := sc.matchesManifestFamily(indexDir, familyCommitted)
-	noHeadArtifacts := state.HeadSHA == "no-head" && sc.hasMember(familyCommitted)
-	committedPresent := committedSnapshotReady(cacheDir, indexDir, state, sc)
 	semanticSource := state.HeadSHA
-	// Prepare vectors only when a route can read them. The model itself stays
-	// available for re-ranking lexical candidates. runSearchCommand documents
-	// which searches this covers.
-	semanticRequired := execution.vectorsWanted(state.HeadSHA)
-	joinedReady := !semanticRequired || joinedGenerationMatches(
-		cacheDir,
-		indexDir,
+	hasDirty := len(state.Files) > 0
+	in := gitBuildInputs{
+		head:         state.HeadSHA,
+		preState:     preState,
+		cachedState:  cachedState,
+		dirty:        hasDirty,
+		familyIntact: sc.matchesManifest(),
+		// The committed family is checked separately: a dirty edit can
+		// change only the uncommitted family.
+		committedIntact: sc.matchesManifestFamily(familyCommitted),
+		committedMember: sc.hasMember(familyCommitted),
+		committedReady:  store.committedSnapshotReady(state, sc),
+		// Prepare vectors only when a route can read them. The model itself
+		// stays available for re-ranking lexical candidates. buildsVectors
+		// documents which searches this covers.
+		vectors: execution.buildsVectors(state.HeadSHA),
+		// A dirty node also binds the overlay of its dirty files.
+		overlay:    execution.buildsOverlay(hasDirty),
+		semanticOn: execution.policy == semanticSearch,
+	}
+	baseSource, overlaySource := "", ""
+	if in.vectors {
+		baseSource = semanticSource
+	}
+	if in.overlay {
+		overlaySource = semanticOverlaySource(preState)
+	}
+	in.joinedReady = (!in.vectors && !in.overlay) || store.joinedGenerationsMatch(
 		preState,
-		semanticSource,
+		baseSource,
+		overlaySource,
 	)
-	if cachedState == preState && !noHeadArtifacts && committedPresent && familyIntact && joinedReady {
+	// A blob that a build read as missing can arrive with no change to the
+	// state.
+	storeFingerprint := buildObjectStoreFingerprint(ctx, repoDir, cacheDir)
+	arrival, err := recheckMissingBlobs(ctx, repoDir, cacheDir, state.HeadSHA, in.vectors, storeFingerprint)
+	if err != nil {
+		return gitCorpusError(repoDir, indexDir, err)
+	}
+	in.arrival = arrival
+	if gitBuildCurrent(in) {
 		return nil
 	}
 
 	parallelism := execution.resources.cpuLimit()
 
-	if err := checkGitDirtyFileBudget(repoDir, indexDir, state.Files); err != nil {
-		deleteStateFiles(cacheDir)
-		return err
+	// publishedCommittedHead asks the shards rather than the sidecar;
+	// committedShardHead documents why.
+	if in.head != gitNoHead {
+		in.publishedHead = publishedCommittedHead(cacheDir, sc)
 	}
-
-	hasDirty := len(state.Files) > 0
-	// Rebuild when the published shards hold another commit, or the committed
-	// family no longer matches its manifest. publishedCommittedHead asks the
-	// shards rather than the sidecar; committedShardHead documents why.
-	needCommitted := state.HeadSHA != "no-head" &&
-		(publishedCommittedHead(cacheDir, sc) != state.HeadSHA || !committedIntact)
-	clearCommitted := noHeadArtifacts
-	semanticPresent := semanticRequired && semanticGenerationPresent(indexDir, semanticSource)
-	needSemantic := semanticRequired && !semanticPresent
+	if in.vectors {
+		in.basePresent = semanticGenerationPresent(indexDir, semanticSource)
+	}
+	if in.overlay {
+		in.overlayPresent = semanticGenerationPresent(indexDir, overlaySource)
+	}
+	build := decideGitBuild(in)
 
 	// Build Zoekt and semantic data together outside the publish lock. Each
 	// branch reads the same captured commit through its own bounded Git stream.
 	var buildDir string
-	var nextCommittedState *committedGitState
-	if needCommitted || clearCommitted || needSemantic {
+	var nextCommittedState committedGitState
+	if build.buildDir() {
 		buildDir, err = newBuildDir(indexDir)
 		if err != nil {
 			return err
 		}
 		defer discardBuildDir(buildDir)
 	}
-	var snapshot gitSnapshot
-	if needCommitted || needSemantic {
-		var ok bool
-		snapshot, ok, err = captureGitSnapshot(ctx, repoDir, state.HeadSHA)
-		if err != nil || !ok {
-			if err == nil {
-				err = fmt.Errorf("captured committed Git state has no commit")
-			}
+	var snapshot gitObjectID
+	var lexicalMissing, semanticMissing []missingBlob
+	if build.snapshot() {
+		snapshot, err = captureGitSnapshot(state.HeadSHA)
+		if err != nil {
 			deleteStateFiles(cacheDir)
 			return gitCorpusError(repoDir, indexDir, err)
 		}
@@ -446,41 +543,81 @@ func runIndexingWithCacheExecution(
 	var semanticErr error
 	semanticBuilt := false
 	semanticStaging := filepath.Join(buildDir, "semantic")
+	overlayStaging := filepath.Join(buildDir, "overlay")
+	overlayBuilt := false
 	var lexicalBuild func()
-	if needCommitted {
+	if build.committed {
 		lexicalBuild = func() {
-			nextCommittedState, lexicalErr = buildCommittedGitStage(
+			nextCommittedState, lexicalMissing, lexicalErr = buildCommittedGitStage(
 				ctx,
 				repoDir,
-				cacheDir,
-				indexDir,
+				store,
 				buildDir,
 				snapshot,
 				sc,
 				parallelism,
+				arrival,
 			)
 		}
 	}
 	var semanticBuild func()
-	if needSemantic {
+	if build.semantic || build.overlay {
 		semanticBuild = func() {
+			// Linked worktrees of this node find its generations by lineage.
+			lineage := semanticGitLineage(paths)
+			_ = writeCacheFile(cacheDir, semanticLineageFile, lineage)
 			semanticErr = runSemanticBuild(ctx, execution.model, func(embedder semanticModel) error {
-				_, err := buildSemanticGitGeneration(
-					ctx,
-					repoDir,
-					snapshot,
-					nil,
-					semanticStaging,
-					semanticSource,
-					embedder,
-					execution.resources,
-				)
-				return err
+				if build.semantic {
+					if err := buildSemanticGitGeneration(
+						ctx,
+						repoDir,
+						snapshot,
+						indexDir,
+						lineage,
+						semanticStaging,
+						semanticSource,
+						embedder,
+						execution.resources,
+						&semanticMissing,
+					); err != nil {
+						return err
+					}
+					semanticBuilt = true
+				}
+				if build.overlay {
+					// The staged base generation, when this build made one.
+					base := ""
+					if semanticBuilt {
+						base = semanticStaging
+					}
+					if err := buildSemanticOverlayGeneration(
+						ctx,
+						repoDir,
+						indexDir,
+						lineage,
+						overlayStaging,
+						overlaySource,
+						state.Files,
+						embedder,
+						execution.resources,
+						base,
+					); err != nil {
+						return err
+					}
+					overlayBuilt = true
+				}
+				return nil
 			})
-			semanticBuilt = semanticErr == nil
 		}
 	}
 	runJoinedIndexBuilds(lexicalBuild, semanticBuild)
+	if buildErr := cmp.Or(lexicalErr, semanticErr); buildErr != nil && ctx.Err() == nil &&
+		capturedCommitMissing(ctx, repoDir, build, snapshot) {
+		// The commit disappeared after git status captured it: no build can
+		// read it, so the next search must build again.
+		deleteStateFiles(cacheDir)
+		return gitCorpusError(repoDir, indexDir, fmt.Errorf("captured Git commit %s is missing: %w", snapshot, buildErr))
+	}
 	if lexicalErr != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
@@ -495,14 +632,7 @@ func runIndexingWithCacheExecution(
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		slog.Debug(
-			"Semantic index build failed; keeping lexical search",
-			"provider", semanticProviderName(),
-			"error", semanticErr,
-		)
-		if errors.Is(semanticErr, errDegenerateSemanticVector) {
-			rejectLateOnAcceleratedProvider(semanticErr.Error())
-		}
+		semanticBuildFailed(execution.model, "Semantic index build failed; keeping lexical search", semanticErr)
 	}
 	// HEAD must still equal the captured value before publication. This check
 	// also covers an unborn snapshot that had no committed Builder work.
@@ -514,11 +644,40 @@ func runIndexingWithCacheExecution(
 		return nil // discard build; live shards untouched
 	}
 
-	// Keep the committed publish, uncommitted build, and state files under one
-	// exclusive publish lock. Normal locked readers cannot interleave with these
-	// writes. The state and HEAD writes below must remain inside this lock.
+	// prepareUncommitted gives a delta or a prebuilt stage, or prebuildErr.
+	// prebuildErr is an EMFILE or ENFILE of the prebuild. Then the committed
+	// family and the vectors still publish, the live uncommitted family
+	// stays, and no state is written.
+	var prebuilt *uncommittedStage
+	var prebuildErr error
+	var delta *uncommittedDelta
+	if hasDirty {
+		delta, prebuilt, prebuildErr, err = prepareUncommitted(ctx, repoDir, store, cachedState, in.familyIntact, state, parallelism)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return gitCorpusError(repoDir, indexDir, err)
+		}
+		if prebuilt != nil {
+			defer prebuilt.discard()
+		}
+	}
+
+	// Keep the committed publish, the uncommitted swap or delta, and state
+	// files under one exclusive publish lock. Normal locked readers cannot
+	// interleave with these writes. The state and HEAD writes below must
+	// remain inside this lock.
 	var publishedNames []string
 	publishedCommitted := false
+	// afterLock runs after the publish lock is released: the removal of the
+	// files that a swap moved aside, so readers do not wait for it.
+	var afterLock func()
+	defer func() {
+		if afterLock != nil {
+			afterLock()
+		}
+	}()
 
 	pub, err := acquirePublishLock(ctx, cacheDir)
 	if err != nil {
@@ -531,27 +690,90 @@ func runIndexingWithCacheExecution(
 	if _, sErr := os.Stat(indexDir); sErr != nil {
 		return nil // evicted; discard
 	}
-	if execution.policy.semanticEnabled() &&
-		(needCommitted || clearCommitted || hasDirty) {
+	if build.dropJoined {
 		// The old descriptor must not name a family while that family changes.
 		removeJoinedGeneration(cacheDir)
 	}
 
-	if needCommitted || clearCommitted {
-		committedNames, pErr := publishShardFamilyLocked(cacheDir, indexDir, buildDir, familyCommitted)
+	if build.committed {
+		if err := writePendingMissingBlobRecord(cacheDir, lexicalMissingBlobsFile, state.HeadSHA, lexicalMissing); err != nil {
+			return fmt.Errorf("write missing-blob record: %w", err)
+		}
+	}
+	// recordFamily writes the family manifest and, once, the committed
+	// records. The manifest names the committed shards of the swap, or those
+	// on disk when no swap ran. With uncommitted, it also names the
+	// uncommitted files that the directory holds. It runs
+	// right after the committed publish, and again at the end. So a failed
+	// uncommitted step keeps records that name the published committed
+	// family. The manifest does not name an uncommitted family that this
+	// build did not write and that did not match the manifest at the start.
+	// So the next build sees the damage.
+	committedRecorded := false
+	recordFamily := func(uncommitted bool) (bool, error) {
+		names := append([]string(nil), publishedNames...)
+		// This process changed the directory, so scan it again.
+		post, postErr := scanFamily(indexDir)
+		if postErr != nil {
+			return false, postErr
+		}
+		for _, m := range post.members {
+			if m.uncommitted && uncommitted || !m.uncommitted && !publishedCommitted {
+				names = append(names, m.name)
+			}
+		}
+		if err := writeFamilyManifest(indexDir, names); err != nil {
+			return false, fmt.Errorf("write family manifest: %w", err)
+		}
+		if committedRecorded {
+			return post.hasShard(familyAll), nil
+		}
+		committedRecorded = true
+		if build.committed {
+			if err := writeCommittedGitState(cacheDir, nextCommittedState); err != nil {
+				return false, fmt.Errorf("write committed Git state: %w", err)
+			}
+			if err := writeMissingBlobRecord(cacheDir, lexicalMissingBlobsFile, missingBlobRecord{
+				head:        state.HeadSHA,
+				fingerprint: storeFingerprint,
+				blobs:       lexicalMissing,
+			}); err != nil {
+				return false, fmt.Errorf("write missing-blob record: %w", err)
+			}
+		} else if build.clearCommitted {
+			deleteCommittedGitState(cacheDir)
+			removeCacheFile(cacheDir, lexicalMissingBlobsFile)
+		}
+		return post.hasShard(familyAll), nil
+	}
+	if build.committed || build.clearCommitted {
+		committedNames, pErr := store.publishShardFamilyLocked(buildDir, familyCommitted)
 		if pErr != nil {
 			return fmt.Errorf("publish committed shards: %w", pErr)
 		}
 		publishedNames = committedNames
 		publishedCommitted = true
+		if _, err := recordFamily(in.familyIntact); err != nil {
+			deleteStateFiles(cacheDir)
+			return err
+		}
 	}
 
-	if hasDirty {
+	// partial is the error of a build that kept dirty files by name, or
+	// whose prebuild hit EMFILE or ENFILE. The publish goes on, and only the
+	// state and the joined descriptor stay unwritten.
+	var partial error
+	if hasDirty && prebuildErr != nil {
+		partial = prebuildErr
+	} else if hasDirty {
 		uncommittedErr := gitCorpusError(
 			repoDir,
 			indexDir,
-			indexUncommitted(ctx, repoDir, indexDir, cacheDir, state, cachedState, preState, parallelism),
+			indexUncommitted(ctx, repoDir, store, state, preState, parallelism, prebuilt, delta),
 		)
+		if found, ok := errors.AsType[*dirtyFilesKept](uncommittedErr); ok {
+			partial, uncommittedErr = found, nil
+		}
 		if uncommittedErr != nil {
 			deleteStateFiles(cacheDir)
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -560,7 +782,12 @@ func runIndexingWithCacheExecution(
 			return uncommittedErr
 		}
 	} else {
-		cleanUncommittedShards(indexDir)
+		discard, err := cleanUncommittedShards(indexDir)
+		afterLock = discard
+		if err != nil {
+			deleteStateFiles(cacheDir)
+			return err
+		}
 		deleteUncommittedManifest(cacheDir)
 	}
 
@@ -569,175 +796,165 @@ func runIndexingWithCacheExecution(
 		return ctxErr
 	}
 
-	// Read Git state again. Reusing the pre-build clean state cannot detect a
-	// file that became dirty while both branches ran.
-	postRepoState, postStateErr := gitRepoStateIn(ctx, repoDir)
-	if postStateErr != nil {
+	// The build publishes the captured state: a command runs one git status
+	// per node. A file that changes during the build changes the state that
+	// the next search captures, because the hash stats the dirty files when
+	// it runs. So that search builds again, and a change during the build
+	// never stays hidden behind a recorded state.
+	// Write the manifest under the same publish lock as the state, with the
+	// uncommitted files that this process just wrote. Record dirty-to-clean
+	// transitions too.
+	// A prebuild that hit EMFILE or ENFILE leaves the live uncommitted family
+	// as it was. So the record names that family only when it matched at the
+	// start.
+	finalHasShard, err := recordFamily(prebuildErr == nil || in.familyIntact)
+	if err != nil {
 		deleteStateFiles(cacheDir)
-		return postStateErr
+		return err
 	}
-	postState := gitCorpusStateHash(paths, postRepoState)
-
-	if postState == preState {
-		// Write the manifest under the same publish lock as the state. Use the
-		// committed names returned by the swap and scan the uncommitted files
-		// that this process just wrote. Record dirty-to-clean transitions too.
-		names := append([]string(nil), publishedNames...)
-		// This process changed the directory, so scan it again.
-		post, postErr := scanFamily(indexDir)
-		if postErr != nil {
-			deleteStateFiles(cacheDir)
-			return postErr
-		}
-		finalHasShard := post.hasShard()
-		for _, m := range post.members {
-			if m.uncommitted || !publishedCommitted {
-				names = append(names, m.name)
-			}
-		}
-		if err := writeFamilyManifest(indexDir, names); err != nil {
-			deleteStateFiles(cacheDir)
-			return fmt.Errorf("write family manifest: %w", err)
-		}
-		if needCommitted {
-			if nextCommittedState == nil {
-				deleteStateFiles(cacheDir)
-				return fmt.Errorf("committed Git build did not return publication state")
-			}
-			if err := writeCommittedGitState(cacheDir, *nextCommittedState); err != nil {
-				deleteStateFiles(cacheDir)
-				return fmt.Errorf("write committed Git state: %w", err)
-			}
-		} else if clearCommitted {
-			deleteCommittedGitState(cacheDir)
-		}
-		if err := writeStateFile(cacheDir, preState); err != nil {
-			deleteStateFiles(cacheDir)
-			return fmt.Errorf("write state file: %w", err)
-		}
-		if finalHasShard {
-			deleteEmptyStateFiles(cacheDir)
-		} else if err := writeEmptyStateFile(cacheDir, preState); err != nil {
-			deleteStateFiles(cacheDir)
-			return fmt.Errorf("write empty state file: %w", err)
-		}
-		// Persist HEAD so working-tree-only changes skip the committed indexer.
-		if err := writeHeadFile(cacheDir, state.HeadSHA); err != nil {
-			deleteStateFiles(cacheDir)
-			slog.Warn("Failed to write head file", "error", err)
-		}
-		if semanticRequired {
-			var activationErr error
-			if semanticBuilt {
-				activationErr = publishAndBindSemanticGeneration(
-					cacheDir, indexDir, preState, semanticSource, semanticStaging,
-				)
-			} else if semanticPresent {
-				activationErr = bindSemanticGeneration(cacheDir, indexDir, preState, semanticSource)
-			}
-			if activationErr != nil {
-				removeJoinedGeneration(cacheDir)
-				slog.Debug(
-					"Semantic index activation failed; keeping lexical search",
-					"provider", semanticProviderName(),
-					"error", activationErr,
-				)
-			}
-		}
-	} else {
-		// The working tree moved during the build, so the state and the
-		// uncommitted shards cannot be trusted. The committed vectors can:
-		// validateCommittedBuildHead already proved HEAD held, the generation is
-		// keyed by that commit, and it never reads the working tree. Publish it
-		// unbound so the next clean search binds it instead of embedding the
-		// same commit again. It stays unreachable until something binds it.
-		if semanticRequired && semanticBuilt {
-			keepDriftedSemanticGeneration(cacheDir, indexDir, semanticSource, semanticStaging)
-		}
+	if partial != nil {
+		// No state: the next search builds again and reads the kept files.
+		_ = os.Remove(filepath.Join(cacheDir, stateFile))
+		deleteEmptyStateFiles(cacheDir)
+	} else if err := writeStateFile(cacheDir, preState); err != nil {
 		deleteStateFiles(cacheDir)
-		slog.Warn("Index may be stale, will re-index on next search")
+		return fmt.Errorf("write state file: %w", err)
+	} else if finalHasShard {
+		deleteEmptyStateFiles(cacheDir)
+	} else if err := writeEmptyStateFile(cacheDir, preState); err != nil {
+		deleteStateFiles(cacheDir)
+		return fmt.Errorf("write empty state file: %w", err)
 	}
-
+	// Persist HEAD: the commit check reads it when no committed shard records
+	// the commit (headFile).
+	if err := writeHeadFile(cacheDir, state.HeadSHA); err != nil {
+		deleteStateFiles(cacheDir)
+		slog.Warn("Failed to write head file", "error", err)
+	}
+	if in.vectors || in.overlay {
+		var activationErr error
+		baseReady := build.baseBound
+		if semanticBuilt {
+			// The pending record comes first, so a generation never exists
+			// without a record that names its missing blobs.
+			activationErr = writePendingMissingBlobRecord(cacheDir, semanticMissingBlobsFile, semanticSource, semanticMissing)
+			if activationErr == nil {
+				activationErr = publishSemanticGeneration(indexDir, semanticStaging, semanticSource, arrival.semantic)
+			}
+			if activationErr == nil {
+				activationErr = writeMissingBlobRecord(cacheDir, semanticMissingBlobsFile, missingBlobRecord{
+					head:        semanticSource,
+					fingerprint: storeFingerprint,
+					blobs:       semanticMissing,
+				})
+			}
+			baseReady = activationErr == nil
+		}
+		overlayReady := build.overlayBound
+		if activationErr == nil && overlayBuilt {
+			activationErr = publishSemanticGeneration(indexDir, overlayStaging, overlaySource, false)
+			overlayReady = activationErr == nil
+		}
+		// Both parts or neither: a node never reads its base without the
+		// overlay that its dirty files need. With kept files no state binds.
+		if activationErr == nil && baseReady && overlayReady && partial == nil {
+			activationErr = store.bindSemanticGenerations(preState, baseSource, overlaySource)
+		}
+		if activationErr != nil {
+			removeJoinedGeneration(cacheDir)
+			slog.Debug(
+				"Semantic index activation failed; keeping lexical search",
+				"provider", semanticProviderName(),
+				"error", activationErr,
+			)
+		}
+	}
+	if partial != nil {
+		return gitCorpusError(repoDir, indexDir, partial)
+	}
 	return nil
 }
 
+// buildCommittedGitStage builds the committed family of snapshot in buildDir:
+// a native delta onto the published family when one is eligible, else a full
+// build. It returns the next committed state and the blobs that the build read
+// as missing.
 func buildCommittedGitStage(
 	ctx context.Context,
 	repoDir string,
-	cacheDir string,
-	indexDir string,
+	store corpusStore,
 	buildDir string,
-	snapshot gitSnapshot,
+	snapshot gitObjectID,
 	scan familyScan,
 	parallelism int,
-) (*committedGitState, error) {
-	delta, eligible, err := prepareNativeGitDelta(
-		ctx,
-		repoDir,
-		cacheDir,
-		indexDir,
-		snapshot,
-		scan,
-	)
-	if err != nil {
-		return nil, err
-	}
-	if eligible {
-		if err := indexNativeGitDelta(
+	arrival missingBlobArrival,
+) (committedGitState, []missingBlob, error) {
+	// A delta reads only the changed paths, so a blob that arrived for an
+	// unchanged path needs the full build.
+	if !arrival.lexical {
+		delta, err := prepareNativeGitDelta(
 			ctx,
 			repoDir,
-			buildDir,
-			scan.paths(familyCommitted),
-			delta,
-		); err != nil {
-			return nil, err
+			store,
+			snapshot,
+			scan,
+		)
+		if err != nil {
+			return committedGitState{}, nil, err
 		}
-		state := delta.nextState
-		return &state, nil
+		if delta != nil {
+			err := indexNativeGitDelta(
+				ctx,
+				repoDir,
+				buildDir,
+				scan.paths(familyCommitted),
+				delta,
+				parallelism,
+			)
+			switch {
+			case err == nil:
+				// The seed keeps the name-only files of the base paths that
+				// the delta did not change, so the record keeps their blobs.
+				return delta.nextState, deltaMissingBlobs(arrival.lexicalCarry, delta.changedPaths, delta.targetInfos), nil
+			case !errors.Is(err, errNativeDeltaFallback):
+				// A cancel, or a Git read error: a full build would read the
+				// same blob again.
+				return committedGitState{}, nil, err
+			}
+			// The delta's seed links or its Builder failed: build the family
+			// in full, from an empty build directory.
+			slog.Debug("Native Git delta build failed; full rebuild", "error", err)
+			cleanRepositoryShards(buildDir, delta.repository.Name)
+		}
 	}
-	budget, err := indexNativeGitFullWithBudget(
-		ctx,
-		repoDir,
-		buildDir,
-		snapshot,
-		nil,
-		parallelism,
-	)
+	var missing []missingBlob
+	liveBytes, err := indexNativeGitFull(ctx, repoDir, buildDir, snapshot, parallelism, &missing)
 	if err != nil {
-		return nil, err
+		return committedGitState{}, nil, err
 	}
 	buildScan, err := scanFamily(buildDir)
 	if err != nil {
-		return nil, err
+		return committedGitState{}, nil, err
 	}
-	return &committedGitState{
-		head:       snapshot.commitOID,
-		baseHead:   snapshot.commitOID,
-		budget:     budget,
+	return committedGitState{
+		head:       snapshot,
+		baseHead:   snapshot,
 		baseShards: nativeCommittedShardCount(buildScan),
-	}, nil
+		liveBytes:  liveBytes,
+	}, missing, nil
 }
 
 // publishedCommittedHead returns the commit the published committed family
 // holds, as the shards themselves record it. See committedShardHead for why the
 // shards and not the sidecar answer this.
 //
-// It falls back to the .head sidecar when no shard can answer, which covers a
+// It falls back to the .head sidecar when no shard can answer. That covers a
 // corpus that has not published yet and a shard whose metadata cannot be read.
 func publishedCommittedHead(cacheDir string, scan familyScan) string {
 	if head, known := committedShardHead(scan); known {
 		return head
 	}
 	return readHeadFile(cacheDir)
-}
-
-// keepDriftedSemanticGeneration publishes a finished committed generation that
-// a drifted build would otherwise discard. A failure here costs only the
-// rebuild it was trying to save, so it never fails the search.
-func keepDriftedSemanticGeneration(cacheDir, indexDir, source, stagingDir string) {
-	if err := publishUnboundSemanticGeneration(cacheDir, indexDir, source, stagingDir); err != nil {
-		slog.Debug("Could not keep the semantic generation after drift", "error", err)
-	}
 }
 
 // committedSnapshotReady reports whether scan has enough committed state for
@@ -747,13 +964,12 @@ func keepDriftedSemanticGeneration(cacheDir, indexDir, source, stagingDir string
 //
 // When a committed shard is present, the answer comes from the commit that
 // shard records, not from the .head sidecar. See committedShardHead.
-func committedSnapshotReady(cacheDir, indexDir string, state repoState, scan familyScan) bool {
-	if state.HeadSHA == "no-head" {
+func (store corpusStore) committedSnapshotReady(state repoState, scan familyScan) bool {
+	if state.HeadSHA == gitNoHead {
 		return !scan.hasMember(familyCommitted)
 	}
-	if scan.hasCommittedShard() {
-		// This used to return true on presence alone, which said nothing about
-		// which commit the shards hold.
+	if scan.hasShard(familyCommitted) {
+		// Presence alone says nothing about which commit the shards hold.
 		if shardHead, known := committedShardHead(scan); known {
 			return shardHead == state.HeadSHA
 		}
@@ -761,12 +977,12 @@ func committedSnapshotReady(cacheDir, indexDir string, state repoState, scan fam
 		// "stale" here would rebuild on every read of an unreadable shard.
 		return true
 	}
-	return readHeadFile(cacheDir) == state.HeadSHA && scan.matchesManifestFamily(indexDir, familyCommitted)
+	return readHeadFile(store.cacheDir) == state.HeadSHA && scan.matchesManifestFamily(familyCommitted)
 }
 
 // validateCommittedBuildHead distinguishes a real HEAD change from a failed
 // validation. A changed HEAD discards the new build and keeps the live index.
-// Cancellation and other Git failures propagate to the corpus worker.
+// It returns a cancellation and other Git failures to the caller.
 func validateCommittedBuildHead(
 	ctx context.Context,
 	paths gitPaths,
@@ -788,19 +1004,20 @@ func validateCommittedBuildHead(
 // It asks only for presence, so it uses the scan that skips the per-entry
 // lstat: neither a size nor a sidecar pairing decides this answer.
 func shardsExist(indexDir string) bool {
-	present, err := familyHasShard(indexDir)
-	return err == nil && present
+	names, err := familyShardNames(indexDir)
+	return err == nil && len(names) > 0
 }
 
 // maxCommittedDeltaShards is the pre-admission threshold for shards added after
 // the last committed full build. This shard check permits a delta when the
 // existing added count equals this value, so that delta can take the family
 // above the threshold. The next update selects a native full build. This value
-// does not limit the full base shard count. It matches maxFolderDeltaShards.
+// does not limit the full base shard count. It has the value of
+// maxFolderDeltaShards, which also counts only the shards above the full base.
 const maxCommittedDeltaShards = 64
 
-// fallbackGitRepositoryName returns the default opaque name for committed Git
-// shards. Local zoekt.name config can replace it. It is not based on basename:
+// fallbackGitRepositoryName returns the opaque name of the committed Git
+// repository and the prefix of its shards. It is not based on basename:
 // "uncommitted" is reserved for dirty-file shards.
 func fallbackGitRepositoryName(repoDir string) string {
 	return "git-" + hashParts("git_repository_name", canonicalCorpusPath(repoDir))
@@ -812,11 +1029,11 @@ func fallbackGitRepositoryName(repoDir string) string {
 // its size, or zero for a name-only document. A successful producer call
 // transfers ownership to the consumer. If a Builder accepts the content, Zoekt
 // can keep it until Finish returns, and guardWrappedShards can add it again.
-// The consumer releases the weight on an earlier error or after Finish and the
-// shard guard:
+// The consumer releases the weight on an earlier error, or:
 //
-//   - indexDocumentsWithRepository releases each window after Finish and the
-//     shard guard.
+//   - indexDocumentsWithRepository releases a normal document when
+//     Builder.Add returns, because Zoekt bounds the content that it keeps. It
+//     releases a window of large documents after Finish and the shard guard.
 //   - indexDeltaDocumentsWithRepository releases the set before return and,
 //     after Builder creation, only after Finish and the shard guard.
 //
@@ -831,40 +1048,38 @@ type fileContent struct {
 }
 
 // readFilesToChannel reads files from the working tree using a bounded
-// worker pool and sends them to out. Files whose content does not fit the
-// index, or that start with binary content (readContent), are sent by name
-// only. Skips symlinks and directories. Individual file
-// failures are non-fatal (files may be deleted or modified between
-// git status and read). The channel is closed after all workers exit.
+// worker pool and sends them to out. It sends some files by name only. These
+// are cloud-only files, files whose content does not fit the index, and files
+// that start with binary content (readContent). It skips files that are not
+// regular, such as symlinks and directories, and a file removed after git
+// status. It also sends by name only a file that it cannot read for a lasting
+// reason. Another read error goes to failure (dirtyFailure.passing), as in the
+// folder reader. It closes out after all workers exit.
 //
 // Each worker reserves readSemaphore weight before it opens a file. A
 // successful send transfers release ownership to the consumer. The worker
 // releases the weight on all other paths.
-func readFilesToChannel(ctx context.Context, repoDir string, files []string, parallelism int, out chan<- fileContent) {
+func readFilesToChannel(ctx context.Context, repoDir string, files []string, parallelism int, out chan<- fileContent, failure *dirtyFailure) {
 	workers := fileReadWorkerCount(parallelism, len(files))
 	ch := make(chan string, workers)
 	var wg sync.WaitGroup
 
 	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for f := range ch {
-				readOneDirtyFile(ctx, repoDir, f, out)
+				readOneDirtyFile(ctx, repoDir, f, out, failure)
 			}
-		}()
+		})
 	}
 
+feed:
 	for _, f := range files {
 		select {
 		case ch <- f:
 		case <-ctx.Done():
-			// Match streamFolderFiles: stop feeding workers on cancellation so
-			// the producer does not outlive the consumers.
-			close(ch)
-			wg.Wait()
-			close(out)
-			return
+			// As streamFolderFilesWithMarkers does, stop feeding workers on
+			// cancellation, so the producer does not outlive the consumers.
+			break feed
 		}
 	}
 	close(ch)
@@ -872,27 +1087,47 @@ func readFilesToChannel(ctx context.Context, repoDir string, files []string, par
 	close(out)
 }
 
-// readOneDirtyFile factors the per-file read so deferred Release of
-// readSemaphore weight runs on every exit path (including panics inside
-// readContent). The `released` sentinel transfers ownership to the
-// consumer once the channel send succeeds.
-func readOneDirtyFile(ctx context.Context, repoDir, f string, out chan<- fileContent) {
+// readOneDirtyFile reads one dirty file in its own function. So the deferred
+// Release of readSemaphore weight runs on every exit path, also on a panic in
+// readContent. The `released` flag transfers ownership to the consumer once
+// the channel send succeeds.
+func readOneDirtyFile(ctx context.Context, repoDir, f string, out chan<- fileContent, failure *dirtyFailure) {
 	srcPath := filepath.Join(repoDir, f)
+	failed := func(err error) {
+		switch {
+		case errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR):
+			// Gone after git status, or under a directory that is now a
+			// file: the next search's state drops it.
+		case folderReadIsLasting(err):
+			// An unreadable dirty file stays searchable by name.
+			slog.Debug("Indexing an unreadable uncommitted file by name only", "path", f, "error", err)
+			sendNameOnly(ctx, out, f, seekNoBytesReason)
+		default:
+			failure.passing(ctx, out, f, &folderReadError{path: srcPath, err: err})
+		}
+	}
 
-	// Use Lstat to avoid following symlinks
-	fi, err := os.Lstat(srcPath)
-	if err != nil {
+	// Use Lstat to avoid following symlinks.
+	var st unix.Stat_t
+	if err := dirtyLstat(srcPath, &st); err != nil {
+		failed(err)
 		return
 	}
 
-	// Only process regular files — skip directories (dirty
-	// submodules), symlinks, FIFOs, sockets, and devices to
-	// avoid blocking or reading unexpected data.
-	if !fi.Mode().IsRegular() {
+	// Only process regular files: skip directories, symlinks, FIFOs,
+	// sockets, and devices, which can block a read or hold unexpected
+	// data.
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
 		return
 	}
 
-	size := fi.Size()
+	// A cloud-only file is never opened: the open would download it.
+	if fileIsDataless(f, &st) {
+		sendNameOnly(ctx, out, f, seekNoBytesReason)
+		return
+	}
+
+	size := st.Size
 	if !documentContentFits(size) {
 		// Send the name without content or weight: Zoekt stores its
 		// NOT-INDEXED marker, and the name stays searchable.
@@ -915,13 +1150,15 @@ func readOneDirtyFile(ctx context.Context, repoDir, f string, out chan<- fileCon
 	// Fstat that os.ReadFile performs internally. readContent
 	// stops after its binary probe for a binary file, and keeps
 	// partial content only when the file shrank during the read.
-	fh, err := os.Open(srcPath)
+	fh, err := dirtyOpenFile(srcPath)
 	if err != nil {
+		failed(err)
 		return
 	}
 	buf, binary, _, err := readContent(fh, size)
 	_ = fh.Close()
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		failed(err)
 		return
 	}
 	if binary {
@@ -934,10 +1171,10 @@ func readOneDirtyFile(ctx context.Context, repoDir, f string, out chan<- fileCon
 		return
 	}
 
-	// Transfer Release ownership to the consumer. The select unblocks
-	// on ctx cancel so an abandoned consumer cannot wedge the worker
-	// holding semaphore weight indefinitely. released stays false on
-	// the ctx.Done path so the deferred sentinel returns the weight.
+	// Transfer Release ownership to the consumer. The select also ends on
+	// a cancel, so a consumer that stopped reading cannot keep the worker
+	// and its semaphore weight forever. released stays false on the
+	// ctx.Done path so the deferred sentinel returns the weight.
 	select {
 	case out <- fileContent{name: f, content: buf[:n], weight: weight}:
 		released = true
@@ -946,206 +1183,584 @@ func readOneDirtyFile(ctx context.Context, repoDir, f string, out chan<- fileCon
 	}
 }
 
-// streamFiles returns a channel that yields file contents read from
-// the working tree. The output channel is unbuffered because Zoekt's
-// public Builder API accepts []byte documents, not io.Reader streams.
-// In-flight memory is bounded by two limits, whichever is tighter:
-//   - the worker count (each worker holds at most one fileContent),
-//   - readSemaphore's readBudgetBytes weight budget (see caps.go).
-//
-// Each yielded fileContent carries its reserved readSemaphore weight. The
-// consumer releases it after Builder.Finish returns. A caller must drain the
-// channel or cancel ctx.
-func streamFiles(ctx context.Context, repoDir string, files []string, parallelism int) <-chan fileContent {
+// recordNameOnlyMarkers passes the documents of in to the channel that it
+// returns. It sets markers[name] to the marker bytes of each document that
+// the shard keeps by name only (nameOnlyMarkerBytes). The consumer must drain
+// the channel to its end, as indexDocuments does: markers is complete when
+// the channel closes.
+func recordNameOnlyMarkers(in <-chan fileContent, markers map[string]int64) <-chan fileContent {
 	out := make(chan fileContent)
-	go readFilesToChannel(ctx, repoDir, files, parallelism, out)
+	go func() {
+		defer close(out)
+		for doc := range in {
+			if marker := nameOnlyMarkerBytes(doc); marker > 0 {
+				markers[doc.name] = marker
+			}
+			out <- doc
+		}
+	}()
 	return out
 }
 
-func fileReadWorkerCount(parallelism, items int) int {
-	if items <= 0 {
-		return 0
-	}
-	if parallelism < 1 {
-		return 1
-	}
-	if parallelism > items {
-		return items
-	}
-	return parallelism
+// streamDirtyFiles returns a channel that yields file contents read from
+// the working tree. The output channel is unbuffered because Zoekt's
+// public Builder API accepts []byte documents, not io.Reader streams. Two
+// limits bound the memory of the documents that are read and not yet
+// released, and the smaller one applies:
+//   - the worker count (each worker holds at most one fileContent);
+//   - readSemaphore's readBudgetBytes weight budget (see caps.go).
+//
+// Each yielded fileContent carries its reserved readSemaphore weight. The
+// consumer releases it: a Zoekt build as fileContent states, and a vector
+// build after the last model batch of the file (semanticBuildOwner). A caller
+// must drain the channel or cancel ctx. failure decides what a temporary read
+// error does (dirtyFailure).
+func streamDirtyFiles(ctx context.Context, repoDir string, files []string, parallelism int, failure *dirtyFailure) <-chan fileContent {
+	out := make(chan fileContent)
+	go readFilesToChannel(ctx, repoDir, files, parallelism, out, failure)
+	return out
 }
 
-// indexUncommitted indexes the working-tree dirty files for repoDir into the
-// "uncommitted" Zoekt repo.
-//
-// State binding: the manifest is written tagged with preState (the freshly
-// computed state hash for this cycle). On the next cycle, runIndexingWithCache
-// reads .state — which now contains preState — and passes it back as
-// cachedState. tryUncommittedDelta then loads the manifest by matching
-// expectedState == cachedState. The folder indexer uses the same state binding.
-//
-// When a prior manifest is present and the existing shard count is below
-// maxUncommittedDeltaShards, only files whose (size, mtime, ino) changed are
-// re-read and written into a delta shard; vanished files become tombstones in
-// the .meta sidecars of older shards. Falls back to a full rebuild when the
-// manifest is missing/stale, the shard count exceeds the cap, or the delta
-// path returns an error.
-func indexUncommitted(
-	ctx context.Context,
-	repoDir, indexDir, cacheDir string,
-	state repoState,
-	cachedState, preState string,
-	parallelism int,
-) error {
-	if len(state.Files) == 0 {
-		cleanUncommittedShards(indexDir)
-		deleteUncommittedManifest(cacheDir)
+// dirtyFailure decides what a temporary read error (EIO, EMFILE, ESTALE:
+// folderReadError) does to a dirty file. The text index keeps the file by name
+// and notes the error. The build applies every other change, and the caller
+// returns the error after the publish. So no state is written, and the next
+// search reads the file again. The vector build stops instead (stop): a
+// generation bound to the state must hold every file.
+type dirtyFailure struct {
+	stop context.CancelCauseFunc
+	// keep keeps a file by name after a read error; without it the build
+	// stops. EMFILE and ENFILE stop it anyway: they are no property of the
+	// file, and the live family stays whole.
+	keep bool
+	mu   sync.Mutex
+	err  error
+	kept []string
+}
+
+// passing applies the failure rule to err, a read error of the dirty file
+// name. It stops the build, or sends the file by name only and notes err.
+func (failure *dirtyFailure) passing(ctx context.Context, out chan<- fileContent, name string, err error) {
+	if !failure.keep || outOfFileDescriptors(err) {
+		failure.stop(err)
+		return
+	}
+	failure.mu.Lock()
+	if failure.err == nil {
+		failure.err = err
+	}
+	failure.kept = append(failure.kept, name)
+	failure.mu.Unlock()
+	slog.Debug("Indexing an uncommitted file by name only after a read error", "path", name, "error", err)
+	sendNameOnly(ctx, out, name, seekNoBytesReason)
+}
+
+// noted returns the files that the text index kept by name after a read
+// error, as one dirtyFilesKept error, or nil.
+func (failure *dirtyFailure) noted() error {
+	failure.mu.Lock()
+	defer failure.mu.Unlock()
+	if failure.err == nil {
 		return nil
 	}
+	files := slices.Clone(failure.kept)
+	slices.Sort(files)
+	return &dirtyFilesKept{files: files, cause: failure.err}
+}
 
-	candidates := statUncommittedCandidates(repoDir, state.Files)
-	entries := make([]uncommittedManifestEntry, 0, len(candidates))
-	for _, c := range candidates {
-		entries = append(entries, c.manifestEntry())
+// dirtyFilesKept reports the dirty files that a build kept by name after a
+// temporary read error. The build published everything else, the state
+// stays unwritten, and a pending manifest marks these files kept, so the next
+// search reads only them again.
+type dirtyFilesKept struct {
+	files []string
+	cause error
+}
+
+func (e *dirtyFilesKept) Error() string {
+	return fmt.Sprintf("%d uncommitted files kept by name after a read error: %v", len(e.files), e.cause)
+}
+
+func (e *dirtyFilesKept) Unwrap() error { return e.cause }
+
+// keptEntrySize marks a manifest entry of a file kept by name. No stat has
+// this size, so the next diff reads the file again. Or it tombstones the file
+// when the file left the dirty set.
+const keptEntrySize = -1
+
+// markKept returns the manifest entries with each kept file marked.
+func markKept(entries []uncommittedManifestEntry, names []string) []uncommittedManifestEntry {
+	kept := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		kept[name] = struct{}{}
 	}
-
-	if cachedState != "" {
-		cleanEmptyShards(ctx, indexDir, repoUncommitted)
-		existing := repositoryShardFiles(indexDir, repoUncommitted)
-		shardCount := len(existing)
-		// The uncommitted family renumbers exactly like the committed one: a
-		// delta onto a gapped family writes over the survivors above the gap
-		// and makes dirty content permanently unsearchable. Fall through to the
-		// full rebuild instead, which clears the family first.
-		if shardCount > 0 && !pathsAreContiguous(existing) {
-			slog.Warn("Uncommitted shard family has a numbering gap; rebuilding it in full",
-				"index_dir", indexDir)
-			shardCount = 0
-		}
-		if shardCount > 0 && shardCount <= maxUncommittedDeltaShards {
-			if err := tryUncommittedDelta(ctx, repoDir, indexDir, cacheDir, candidates, cachedState, preState, entries); err == nil {
-				return nil
-			} else if errors.Is(err, errDeltaPayloadExceedsWindow) {
-				slog.Debug("Uncommitted delta payload exceeds window threshold; full rebuild", "error", err)
-			} else {
-				slog.Debug("Uncommitted delta indexing failed, falling back to full rebuild", "error", err)
-			}
-		} else if shardCount > maxUncommittedDeltaShards {
-			slog.Debug("Uncommitted delta shard limit reached, falling back to full rebuild", "shards", shardCount)
+	out := slices.Clone(entries)
+	for index := range out {
+		if _, ok := kept[out[index].Name]; ok {
+			out[index].Size = keptEntrySize
 		}
 	}
+	return out
+}
 
-	// Full rebuild: clear the old uncommitted family first. indexDocuments
-	// builds in place and its first window is non-delta, so zoekt's cleanup
-	// only reaches the contiguous prefix — a gapped family would leave stale
-	// shards live beside the freshly written ones.
-	cleanUncommittedShards(indexDir)
-	fileCh := streamFiles(ctx, repoDir, state.Files, parallelism)
-	_, err := indexDocuments(ctx, indexDir, repoUncommitted, repoDir, fileCh, parallelism)
+// onlyKept reports changed paths that are all kept files of the manifest:
+// such a delta reads only them, whatever the family's shard count. Both
+// callers give at least one changed path: a delta with none reads no file.
+func onlyKept(changed []string, manifest uncommittedManifest) bool {
+	kept := map[string]struct{}{}
+	for _, entry := range manifest.Files {
+		if entry.Size == keptEntrySize {
+			kept[entry.Name] = struct{}{}
+		}
+	}
+	for _, name := range changed {
+		if _, ok := kept[name]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// dirtyOpenFile opens a dirty file for reading, and dirtyLstat stats it. Tests
+// replace them to fail one chosen file with EIO or EMFILE. A test cannot make
+// these faults on disk. EIO comes from a failing disk, and a lower file limit
+// fails every open of the process. Tests also replace dirtyOpenFile to see
+// which files a build reads, or to write a file just after its read. No
+// file-system state shows these reads.
+var (
+	dirtyOpenFile = openWorkTreeFile
+	dirtyLstat    = lstatWorkTreeFile
+)
+
+// lstatWorkTreeFile stats path into st with no symlink follow. One stat gives
+// the file type, the size and the cloud-only flag. As os.Lstat does, it tries
+// again after EINTR and puts the path in the error.
+func lstatWorkTreeFile(path string, st *unix.Stat_t) error {
+	err := unix.Lstat(path, st)
+	for errors.Is(err, unix.EINTR) {
+		err = unix.Lstat(path, st)
+	}
 	if err != nil {
-		deleteUncommittedManifest(cacheDir)
+		return &fs.PathError{Op: "lstat", Path: path, Err: err}
+	}
+	return nil
+}
+
+// errNotRegularFile reports a work-tree path that is no longer a regular file
+// when it is opened. A FIFO, socket, device, directory or symlink replaced the
+// file after its stat. It wraps fs.ErrNotExist, so the dirty-file reader
+// treats the file as removed.
+var errNotRegularFile = fmt.Errorf("not a regular file: %w", fs.ErrNotExist)
+
+// openWorkTreeFile opens a work-tree file that a stat found regular. The path
+// can change between the stat and the open, and the open of a FIFO with no
+// writer blocks, with the build lock held. So the open does not block and does
+// not follow a symlink, and the open file must still be regular.
+func openWorkTreeFile(path string) (*os.File, error) {
+	const flags = os.O_RDONLY | syscall.O_NONBLOCK | syscall.O_NOFOLLOW
+	file, err := os.OpenFile(path, flags, 0)
+	// Linux: another process holds a write lease (a Samba oplock, an NFS
+	// delegation). The failed open starts the lease break, so the same open
+	// works after it, within the kernel's lease-break time (45 s by default).
+	deadline := time.Now().Add(time.Minute)
+	for wait := time.Millisecond; errors.Is(err, syscall.EWOULDBLOCK) && time.Now().Before(deadline); wait = min(2*wait, time.Second) {
+		time.Sleep(wait)
+		file, err = os.OpenFile(path, flags, 0)
+	}
+	switch {
+	case errors.Is(err, syscall.ELOOP):
+		// O_NOFOLLOW: the last component is now a symlink.
+		return nil, errNotRegularFile
+	case errors.Is(err, syscall.EOPNOTSUPP), errors.Is(err, syscall.ENXIO):
+		// A socket (EOPNOTSUPP on macOS, ENXIO on Linux) or a device with no
+		// driver.
+		return nil, errNotRegularFile
+	case errors.Is(err, syscall.ENOTDIR):
+		// A directory of the path is now a file.
+		return nil, errNotRegularFile
+	case err != nil:
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err == nil && !info.Mode().IsRegular() {
+		err = errNotRegularFile
+	}
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
+// fileReadWorkerCount returns the reader count for items files: parallelism,
+// at least one, and no more than the files.
+func fileReadWorkerCount(parallelism, items int) int {
+	return min(max(parallelism, 1), items)
+}
+
+// indexUncommitted publishes the dirty files of state into the "uncommitted"
+// Zoekt repo, under the publish lock. A stage built before the lock
+// (prebuilt) replaces the whole family. Otherwise uncommittedDeltaPossible
+// found delta. The files whose size, mtime, inode, mode, or ctime changed are
+// read again and written into a delta shard. Vanished files become tombstones
+// in the .meta sidecars of older shards. The manifest carries the tag
+// preState. The next build reads .state, which holds preState, and finds the
+// manifest by it. A delta that fails for a reason other than a read error
+// (folderReadError) rebuilds the family in full.
+func indexUncommitted(
+	ctx context.Context,
+	repoDir string,
+	store corpusStore,
+	state repoState,
+	preState string,
+	parallelism int,
+	prebuilt *uncommittedStage,
+	delta *uncommittedDelta,
+) error {
+	if prebuilt != nil {
+		return prebuilt.publish(store, preState)
+	}
+	if len(delta.changed) == 0 {
+		// No dirty file changed (a HEAD change, a vector build): the family
+		// stays, whatever its shard count.
+		if err := writeUncommittedManifest(store.cacheDir, preState, delta.entries, delta.tombstoned, delta.manifest.BaseShards); err != nil {
+			slog.Debug("Failed to refresh uncommitted manifest", "error", err)
+		}
+		return nil
+	}
+	err := tryUncommittedDelta(ctx, repoDir, store, delta, preState, parallelism)
+	if err == nil {
+		return nil
+	}
+	if _, ok := errors.AsType[*folderReadError](err); ok {
+		// The delta kept some files by name and published the rest
+		// (dirtyFilesKept), or EMFILE or ENFILE stopped it before any
+		// write. A full rebuild would read the same files.
 		return err
 	}
-	if err := writeUncommittedManifest(cacheDir, preState, entries); err != nil {
+	switch {
+	case errors.Is(err, errDeltaPayloadExceedsWindow):
+		slog.Debug("Uncommitted delta payload exceeds window threshold; full rebuild", "error", err)
+	case errors.Is(err, errDeltaCompaction):
+		slog.Debug("Uncommitted deltas tombstoned as many bytes as the family holds; full rebuild")
+	default:
+		slog.Debug("Uncommitted delta indexing failed, falling back to full rebuild", "error", err)
+	}
+	// The delta fell back (a large payload, a Builder error): build in full
+	// under the lock, as the prebuild does outside it.
+	stage, err := buildUncommittedStage(ctx, repoDir, store.indexDir, state, parallelism)
+	if err != nil {
+		return err
+	}
+	defer stage.discard()
+	return stage.publish(store, preState)
+}
+
+// uncommittedDelta is a change that the live uncommitted family can take. It
+// holds the manifest of the cached state, the files to read, and the changed
+// paths. entries are the manifest entries of the dirty files, each with the
+// marker of copyUncommittedMarkers. tombstoned is the content that deltas
+// tombstoned since the last full build, with this delta.
+type uncommittedDelta struct {
+	tombstoned int64
+	manifest   uncommittedManifest
+	entries    []uncommittedManifestEntry
+	toRead     []uncommittedCandidate
+	changed    []string
+}
+
+// uncommittedDeltaPossible returns the delta that the live uncommitted family
+// can take, or nil for a full rebuild. A delta needs:
+//   - a manifest of the cached state;
+//   - a family that matches .family-v1 (familyIntact);
+//   - a contiguous family with at most maxUncommittedDeltaShards shards above
+//     the shard count of its last full build (any count when only kept files
+//     changed). With no such count in the manifest, the cap counts every
+//     shard;
+//   - tombstoned content that does not need a compaction
+//     (deltaNeedsCompaction);
+//   - files to read that fit one index window.
+//
+// A delta of removals only reads no file. The function writes nothing, so a
+// build can ask before the publish lock. The build lock keeps other builds
+// out, so the delta stays valid under the publish lock. A read repair can
+// still remove .family-v1 under the publish lock alone. Then familyIntact is
+// stale, the build writes the manifest again, and the next damaged read
+// repairs once more.
+func uncommittedDeltaPossible(ctx context.Context, repoDir string, store corpusStore, cachedState string, familyIntact bool, files []string) *uncommittedDelta {
+	cacheDir, indexDir := store.cacheDir, store.indexDir
+	manifest, ok := readUncommittedManifest(cacheDir, cachedState)
+	if !ok {
+		return nil
+	}
+	if !familyIntact {
+		// The family lost a shard, has a damaged shard, or a move stopped part
+		// way. A manifest refresh with no change, or a delta, would record the
+		// rest as complete.
+		slog.Debug("Uncommitted family does not match its manifest; full rebuild", "index_dir", indexDir)
+		return nil
+	}
+	existing := repositoryShardFiles(indexDir, repoUncommitted)
+	if len(existing) == 0 {
+		return nil
+	}
+	// The uncommitted family renumbers as the committed one does. A delta
+	// onto a gapped family writes over the shards above the gap, and their
+	// dirty content can then never be found.
+	if !pathsAreContiguous(existing) {
+		slog.Warn("Uncommitted shard family has a numbering gap; rebuilding it in full",
+			"index_dir", indexDir)
+		return nil
+	}
+	candidates := statUncommittedCandidates(repoDir, files)
+	toRead, changed, tombstoned := diffUncommittedAgainstManifest(candidates, manifest)
+	entries := uncommittedManifestEntries(candidates)
+	copyUncommittedMarkers(entries, manifest)
+	delta := &uncommittedDelta{
+		manifest:   manifest,
+		entries:    entries,
+		toRead:     toRead,
+		changed:    changed,
+		tombstoned: manifest.DeadBytes + tombstoned,
+	}
+	if len(changed) == 0 {
+		return delta // the locked part only refreshes the manifest
+	}
+	// The delta falls back to a full rebuild in the cases below: build it
+	// before the lock instead. A delta of removals only is not such a case by
+	// itself: it reads no file, and Zoekt writes only its tombstones.
+	if uncommittedDeltaShardLimitExceeded(len(existing), manifest.BaseShards) && !onlyKept(changed, manifest) {
+		slog.Debug("Uncommitted delta shard limit reached, falling back to full rebuild",
+			"shards", len(existing), "base_shards", manifest.BaseShards)
+		return nil
+	}
+	// Before the reads, each changed file counts at an upper bound of its
+	// shard bytes (unreadFileMarker); tryUncommittedDelta checks again with
+	// the read bytes.
+	if deltaNeedsCompaction(delta.tombstoned, uncommittedLiveBytes(entries)) {
+		slog.Debug("Uncommitted deltas tombstoned as many bytes as the family holds; full rebuild")
+		return nil
+	}
+	var payload int64
+	window := indexWindow(ctx)
+	for _, candidate := range toRead {
+		if payload += candidate.Size; payload >= window {
+			slog.Debug("Uncommitted delta payload exceeds window threshold; full rebuild", "payload", payload, "window", window)
+			return nil
+		}
+	}
+	return delta
+}
+
+// uncommittedDeltaShardLimitExceeded reports an uncommitted family that a
+// delta must not extend. That family has fewer shards than its full base, or
+// more than maxUncommittedDeltaShards shards above it. base is 0 when no
+// manifest records it.
+func uncommittedDeltaShardLimitExceeded(current, base int) bool {
+	return current < base || current-base > maxUncommittedDeltaShards
+}
+
+// uncommittedStage is a full uncommitted family built in a build directory
+// (the gc sweep removes one that a crash leaves).
+type uncommittedStage struct {
+	dir     string
+	failure *dirtyFailure
+	entries []uncommittedManifestEntry
+}
+
+// prepareUncommitted decides how the uncommitted family changes. delta is the
+// change that the live family takes under the publish lock, or nil for a full
+// rebuild. A full rebuild reads every dirty file, so it builds its stage here,
+// in its own directory before the publish lock. Readers then wait only for the
+// swap. prebuildErr is an EMFILE or ENFILE of that build, which the caller can
+// survive; err is any other failure.
+func prepareUncommitted(
+	ctx context.Context,
+	repoDir string,
+	store corpusStore,
+	cachedState string,
+	familyIntact bool,
+	state repoState,
+	parallelism int,
+) (delta *uncommittedDelta, stage *uncommittedStage, prebuildErr, err error) {
+	if delta = uncommittedDeltaPossible(ctx, repoDir, store, cachedState, familyIntact, state.Files); delta != nil {
+		return delta, nil, nil, nil
+	}
+	stage, err = buildUncommittedStage(ctx, repoDir, store.indexDir, state, parallelism)
+	switch {
+	case err == nil:
+		return nil, stage, nil, nil
+	case ctx.Err() != nil:
+		return nil, nil, nil, ctx.Err()
+	case outOfFileDescriptors(err):
+		return nil, nil, err, nil
+	}
+	return nil, nil, nil, err
+}
+
+// buildUncommittedStage builds the full uncommitted family of state in a new
+// build directory. A file with a temporary read error is kept by name
+// (stage.failure). EMFILE, ENFILE, or a cancel discards the stage.
+func buildUncommittedStage(ctx context.Context, repoDir, indexDir string, state repoState, parallelism int) (*uncommittedStage, error) {
+	entries := uncommittedManifestEntries(statUncommittedCandidates(repoDir, state.Files))
+	dir, err := newBuildDir(indexDir)
+	if err != nil {
+		return nil, err
+	}
+	readCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stage := &uncommittedStage{dir: dir, failure: &dirtyFailure{keep: true, stop: cancel}, entries: entries}
+	markers := make(map[string]int64)
+	fileCh := recordNameOnlyMarkers(streamDirtyFiles(readCtx, repoDir, state.Files, parallelism, stage.failure), markers)
+	_, err = indexDocuments(readCtx, dir, repoUncommitted, repoDir, fileCh, parallelism)
+	for i := range entries {
+		entries[i].Marker = markers[entries[i].Name]
+	}
+	if readErr, ok := errors.AsType[*folderReadError](context.Cause(readCtx)); ok {
+		// EMFILE or ENFILE: the live family stays whole.
+		err = readErr
+	}
+	if err == nil {
+		// A cancel stops the readers with no error: the stage is partial.
+		err = ctx.Err()
+	}
+	if err != nil {
+		stage.discard()
+		return nil, err
+	}
+	return stage, nil
+}
+
+// publish replaces the whole live family with the stage, under the publish
+// lock, with the swap of the committed family (swapFiles). So a gapped old
+// family leaves no stale shard beside the new one, and a failed step moves
+// the live family back. A failed move back leaves a partial family and no
+// manifest, so the next search rebuilds it. A file kept by name after a read
+// error leaves the state unwritten.
+func (stage *uncommittedStage) publish(store corpusStore, preState string) error {
+	live := repositoryFamilyFiles(store.indexDir, repoUncommitted)
+	incoming := repositoryShardFiles(stage.dir, repoUncommitted)
+	if _, restored, err := swapFiles(store.indexDir, stage.dir, live, incoming); err != nil {
+		if !restored {
+			deleteUncommittedManifest(store.cacheDir)
+		}
+		return fmt.Errorf("publish uncommitted shards: %w", err)
+	}
+	removeRepositoryShardTemps(store.indexDir, repoUncommitted)
+	// The stage holds only the shards of this full build: the base of the
+	// delta cap.
+	baseShards := len(incoming)
+	if err := stage.failure.noted(); err != nil {
+		writePendingUncommittedManifest(store.cacheDir, stage.entries, err, 0, baseShards)
+		return err
+	}
+	if err := writeUncommittedManifest(store.cacheDir, preState, stage.entries, 0, baseShards); err != nil {
 		slog.Debug("Failed to write uncommitted manifest", "error", err)
 	}
 	return nil
 }
 
-// tryUncommittedDelta attempts a delta-only rebuild of the uncommitted shard
-// set. The manifest is looked up by cachedState (the .state value persisted
-// at the end of the previous cycle) and re-written tagged with preState (the
-// new .state value about to be persisted by runIndexingWithCache).
+func (stage *uncommittedStage) discard() {
+	discardBuildDir(stage.dir)
+}
+
+// tryUncommittedDelta writes delta into the live uncommitted family, with up
+// to parallelism shard jobs at the same time. It writes the manifest with the
+// tag preState (the new .state value). A delta of removals only reads no file,
+// and Zoekt writes only its tombstones (indexDeltaDocumentsWithRepository).
+// For one removed file of 400 dirty files, a full rebuild took 3.0 s, and this
+// delta took 0.12 s. The delta runs under the publish lock, so readers wait
+// less.
 func tryUncommittedDelta(
 	ctx context.Context,
-	repoDir, indexDir, cacheDir string,
-	candidates []uncommittedCandidate,
-	cachedState, preState string,
-	entries []uncommittedManifestEntry,
+	repoDir string,
+	store corpusStore,
+	delta *uncommittedDelta,
+	preState string,
+	parallelism int,
 ) error {
-	manifest, ok := readUncommittedManifest(cacheDir, cachedState)
-	if !ok {
-		return fmt.Errorf("uncommitted manifest missing or stale")
-	}
-	toRead, changedPaths := diffUncommittedAgainstManifest(candidates, manifest)
-	if len(changedPaths) == 0 {
-		// No file content drifted since the manifest was written — the
-		// state hash must have changed for some other reason (HEAD,
-		// untracked file added then removed, etc.). Refresh the manifest
-		// binding without touching shards.
-		if err := writeUncommittedManifest(cacheDir, preState, entries); err != nil {
-			slog.Debug("Failed to refresh uncommitted manifest", "error", err)
-		}
-		return nil
-	}
-
-	docs, err := readUncommittedCandidates(ctx, repoDir, toRead)
+	cacheDir, indexDir, entries := store.cacheDir, store.indexDir, delta.entries
+	docs, noted, err := readUncommittedCandidates(ctx, repoDir, delta.toRead)
 	if err != nil {
-		// readUncommittedCandidates returns (nil, errDeltaPayloadExceedsWindow)
-		// after releasing all weights internally — no further work here.
+		// readUncommittedCandidates releases every weight before it returns
+		// an error (errDeltaPayloadExceedsWindow or a folderReadError).
 		return err
 	}
-	if len(docs) == 0 && len(changedPaths) > 0 {
-		// Pure tombstone cycle (all changes are removals). Zoekt's
-		// builder rejects empty delta builds with the same error
-		// shape as the folder side; surface that as a fallback signal.
-		// docs is empty here; no weights to release.
-		return fmt.Errorf("uncommitted delta contains only removals")
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// A cancel cut the reads short: write nothing.
+		releaseFileContentWeights(docs)
+		return ctxErr
 	}
-	// indexDeltaDocuments releases all per-document readSemaphore weights;
-	// do not release them here.
-	if _, err := indexDeltaDocuments(indexDir, repoUncommitted, repoDir, docs, uncommittedDeltaShardMax, changedPaths); err != nil {
+	if kept, ok := errors.AsType[*dirtyFilesKept](noted); ok && onlyKept(delta.changed, delta.manifest) && len(kept.files) == len(delta.changed) {
+		// Every changed file is a kept file that failed again: the family
+		// holds it by name already, so write no shard and no tombstone.
+		releaseFileContentWeights(docs)
+		writePendingUncommittedManifest(cacheDir, entries, noted, delta.manifest.DeadBytes, delta.manifest.BaseShards)
+		return noted
+	}
+	// The reads give the bytes that each changed file's shard document holds.
+	setUncommittedMarkers(entries, docs)
+	if deltaNeedsCompaction(delta.tombstoned, uncommittedLiveBytes(entries)) {
+		releaseFileContentWeights(docs)
+		return errDeltaCompaction
+	}
+	// indexDeltaDocuments releases all per-document readSemaphore weights; do
+	// not release them here.
+	if _, err := indexDeltaDocuments(indexDir, repoUncommitted, repoDir, docs, parallelism, delta.changed); err != nil {
 		return err
 	}
-	if err := writeUncommittedManifest(cacheDir, preState, entries); err != nil {
+	if noted != nil {
+		// The delta applied every change and kept some files by name: no
+		// state, and a pending manifest that marks them.
+		writePendingUncommittedManifest(cacheDir, entries, noted, delta.tombstoned, delta.manifest.BaseShards)
+		return noted
+	}
+	if err := writeUncommittedManifest(cacheDir, preState, entries, delta.tombstoned, delta.manifest.BaseShards); err != nil {
 		slog.Debug("Failed to write uncommitted manifest", "error", err)
 	}
 	return nil
 }
 
 // readUncommittedCandidates loads file contents for the given
-// candidates from the working tree. Missing or non-regular files are
-// skipped silently (same policy as readFilesToChannel).
+// candidates from the working tree. It skips missing and non-regular files
+// with no notice, and sends unreadable ones by name only (as
+// readFilesToChannel does). The second result names the files kept by name
+// after a temporary read error (dirtyFailure.noted). EMFILE or ENFILE returns
+// a folderReadError and no documents.
 //
-// Two guards prevent a synchronous drain >= indexWindowBytes from
-// wedging the global readSemaphore:
-//   - Pre-flight: sum candidate.size (lstat already populated). If
-//     it already exceeds the window threshold, return immediately
-//     without spawning any reader — saves up to indexWindowBytes of
-//     wasted read I/O.
-//   - Bounded drain: if cumulative weight reaches the threshold
-//     mid-drain, cancel the inner context so workers unwind via
-//     Acquire's ctx-aware abort, then drain-and-release the remainder.
+// The delta holds every document read here until its Finish. So two checks
+// keep the held weight below the build's window, and the global readSemaphore
+// cannot stay full:
+//   - Before the reads: uncommittedDeltaPossible gives no delta when the sum
+//     of candidate.Size (from the earlier lstat) reaches the window.
+//   - During the reads: when the weight of the documents read reaches the
+//     window, it cancels the inner context. The workers stop at their next
+//     Acquire, and it releases the weight of every document. This check also
+//     sees a file that grew after its lstat.
 //
-// Both paths return errDeltaPayloadExceedsWindow. Caller
-// indexUncommitted catches via errors.Is and falls back to the
-// windowed full rebuild (streamFiles → indexDocuments).
-func readUncommittedCandidates(ctx context.Context, repoDir string, candidates []uncommittedCandidate) ([]fileContent, error) {
+// The second check returns errDeltaPayloadExceedsWindow. tryUncommittedDelta
+// returns it, and indexUncommitted then builds the family in full
+// (buildUncommittedStage).
+func readUncommittedCandidates(ctx context.Context, repoDir string, candidates []uncommittedCandidate) ([]fileContent, error, error) {
 	if len(candidates) == 0 {
-		return nil, nil
-	}
-	var preSum int64
-	for _, c := range candidates {
-		preSum += c.size
-		if preSum >= indexWindowBytes {
-			return nil, errDeltaPayloadExceedsWindow
-		}
+		return nil, nil, nil
 	}
 	files := make([]string, len(candidates))
 	for i, c := range candidates {
-		files[i] = c.name
+		files[i] = c.Name
 	}
-	innerCtx, cancelInner := context.WithCancel(ctx)
-	defer cancelInner()
-	ch := streamFiles(innerCtx, repoDir, files, fileReadWorkerCount(indexParallelism(), len(files)))
+	innerCtx, cancelInner := context.WithCancelCause(ctx)
+	defer cancelInner(nil)
+	failure := &dirtyFailure{keep: true, stop: cancelInner}
+	ch := streamDirtyFiles(innerCtx, repoDir, files, indexParallelism(), failure)
 	docs := make([]fileContent, 0, len(files))
 	var cumulative int64
 	exceeded := false
 	for doc := range ch {
 		if exceeded {
-			// Drain the rest releasing inline so workers (still holding
-			// weight on Acquired-but-not-yet-cancelled reads) and the
-			// producer goroutine can exit cleanly.
+			// Release each later document at once, so the workers that
+			// acquired weight before the cancel, and the producer, can
+			// end.
 			if doc.weight > 0 {
 				readSemaphore.Release(doc.weight)
 			}
@@ -1153,16 +1768,21 @@ func readUncommittedCandidates(ctx context.Context, repoDir string, candidates [
 		}
 		docs = append(docs, doc)
 		cumulative += doc.weight
-		if cumulative >= indexWindowBytes {
+		if cumulative >= indexWindow(ctx) {
 			exceeded = true
-			cancelInner()
+			cancelInner(nil)
 		}
+	}
+	if readErr, ok := errors.AsType[*folderReadError](context.Cause(innerCtx)); ok {
+		// EMFILE or ENFILE: no shard is written, the live family stays.
+		releaseFileContentWeights(docs)
+		return nil, nil, readErr
 	}
 	if exceeded {
 		releaseFileContentWeights(docs)
-		return nil, errDeltaPayloadExceedsWindow
+		return nil, nil, errDeltaPayloadExceedsWindow
 	}
-	return docs, nil
+	return docs, failure.noted(), nil
 }
 
 // indexDocuments adapts a repository name and source to the shared Builder
@@ -1179,18 +1799,32 @@ func indexDocuments(
 	return indexDocumentsWithRepository(ctx, indexDir, repository, fileCh, parallelism, nil)
 }
 
-// indexDocumentsWithRepository consumes fileContent through rotating Builder
-// windows. It calls Finish when a normal window reaches indexWindowBytes.
-// Documents that fill a shard of their own (isolatesShard) use separate windows
-// and a global concurrency limit; guardWrappedShards checks their shards after
-// Finish. This scheduling rule does not change content or symbol indexing. It
-// releases Builder-owned document weight after Finish and the shard guard, and
-// releases documents that no Builder accepted as soon as their error path ends.
-// See fileContent for ownership.
+// indexDocumentsWithRepository consumes fileContent with one Builder for the
+// normal documents of a build. It releases the read weight of a normal document
+// when Builder.Add returns. Zoekt then bounds the content that it keeps: one
+// pending shard, and at most parallelism shards that it builds at one time.
+// Windows of normal documents at the read window add a Finish barrier and a
+// .meta rewrite each. Against such windows, one Builder built the Kubernetes
+// graph of 41 nodes 10 % faster. It built the graph of 81 nodes 27 % to 30 %
+// faster (the windows took 33 % to 39 % longer).
+//
+// A document that fills a shard of its own (isolatesShard) goes to a separate
+// window. The window finishes at min(parallelism, largeDocumentParallelism)
+// documents, or when its content reaches or passes indexWindow(ctx).
+// guardWrappedShards checks those shards after Finish and can add the
+// documents again, so the window keeps their weight until then. Two Builders
+// cannot number shards in one directory at the same time, so each switch
+// between normal and large documents finishes the open Builder. This
+// scheduling rule does not change content or symbol indexing. A document that
+// no Builder accepted is released when its error path ends. See fileContent
+// for ownership.
 //
 // Window 0 uses IsDelta=false, so Finish prunes stale shards. Later windows use
-// IsDelta=true with no changed paths, so they skip deletion and tombstone work
-// and continue shard numbering. indexed is true after a Builder opens.
+// IsDelta=true with no changed paths, so they continue shard numbering. The
+// Finish of such a window rewrites the .meta sidecar of every older shard.
+// The first result is true after a Builder opens. When no document arrives,
+// it removes the shards of the repository in indexDir (a build directory) and
+// returns false.
 func indexDocumentsWithRepository(
 	ctx context.Context,
 	indexDir string,
@@ -1199,18 +1833,26 @@ func indexDocumentsWithRepository(
 	parallelism int,
 	cancelProducer context.CancelFunc,
 ) (bool, error) {
+	if cancelProducer == nil {
+		cancelProducer = func() {}
+	}
+	// A large window rotates at largeParallelism documents, so one build runs
+	// at most that many large shard jobs. Builds share no token. Else a
+	// consumer could wait for another build's token while it holds its
+	// document. At the same time, that build could wait for readers that the
+	// read budget blocks.
 	largeParallelism := min(max(parallelism, 1), largeDocumentParallelism)
+	window := indexWindow(ctx)
 	var current *index.Builder
-	var pendingWeight int64
+	// pendingWeight and pendingContent count the large window only.
 	// pendingContent counts real content bytes; readWeight stops counting at
-	// maxReadWeightBytes, so large windows also rotate on it.
+	// maxReadWeightBytes, so a large window rotates on content.
+	var pendingWeight int64
 	var pendingContent int64
 	var addErr error
 	indexedAny := false
-	openedWindows := 0
 	currentLarge := false
 	largeDocuments := 0
-	var largeReservations int64
 	// A large window gives each document its own shard; the guard checks them
 	// after Finish (guardWrappedShards).
 	var currentOpts index.Options
@@ -1233,7 +1875,13 @@ func indexDocumentsWithRepository(
 		if large {
 			firstShard = firstBuilderShard(opts)
 		}
-		b, err := index.NewBuilder(opts)
+		// A later window is a delta Builder: it reads the records of the
+		// shards that the earlier windows wrote.
+		var b *index.Builder
+		err := zoektShardCall(func() (err error) {
+			b, err = index.NewBuilder(opts)
+			return err
+		})
 		if err != nil {
 			return fmt.Errorf("create builder: %w", err)
 		}
@@ -1242,21 +1890,19 @@ func indexDocumentsWithRepository(
 		currentOpts = opts
 		currentFirstShard = firstShard
 		largeDocuments = 0
-		openedWindows++
 		indexedAny = true
 		return nil
 	}
 
-	// finishWindow Finishes the current builder and Releases pending
-	// weight. Always Releases even on Finish error: Finish's
-	// b.building.Wait() has joined the shard goroutines (or aborted
-	// them via b.buildError) before returning, so no goroutine retains
-	// any doc.Content past this point.
+	// finishWindow finishes the current Builder and releases the pending
+	// weight, also when Finish fails. Finish waits for every shard goroutine
+	// (b.building.Wait) before it returns, also after a shard error. So no
+	// goroutine keeps any doc.Content past this point.
 	finishWindow := func() error {
 		if current == nil {
 			return nil
 		}
-		err := current.Finish()
+		err := zoektShardCall(current.Finish)
 		if err == nil && currentLarge {
 			// Run before the weight release: the guard can add the
 			// documents again.
@@ -1269,41 +1915,32 @@ func indexDocumentsWithRepository(
 			readSemaphore.Release(pendingWeight)
 			pendingWeight = 0
 		}
-		if largeReservations > 0 {
-			largeDocumentSemaphore.Release(largeReservations)
-			largeReservations = 0
-		}
+		// openWindow sets currentLarge and largeDocuments again.
 		current = nil
-		currentLarge = false
-		largeDocuments = 0
 		return err
 	}
 
-	drainRemaining := func() {
+	// abandon stops the producer, releases the weight that the current
+	// document holds and no Builder accepted, and drains the rest.
+	abandon := func(weight int64) {
+		cancelProducer()
+		readSemaphore.Release(weight)
 		for d := range fileCh {
-			if d.weight > 0 {
-				readSemaphore.Release(d.weight)
-			}
+			readSemaphore.Release(d.weight)
 		}
 	}
 
 	for doc := range fileCh {
+		// An add error comes first: its cancelProducer can also end ctx, as
+		// in the Git full build, and that cancel must not replace it.
+		if addErr != nil {
+			readSemaphore.Release(doc.weight)
+			continue
+		}
 		if err := ctx.Err(); err != nil {
-			if cancelProducer != nil {
-				cancelProducer()
-			}
-			if doc.weight > 0 {
-				readSemaphore.Release(doc.weight)
-			}
-			drainRemaining()
+			abandon(doc.weight)
 			_ = finishWindow()
 			return indexedAny, err
-		}
-		if addErr != nil {
-			if doc.weight > 0 {
-				readSemaphore.Release(doc.weight)
-			}
-			continue
 		}
 
 		document := index.Document{
@@ -1317,89 +1954,46 @@ func indexDocumentsWithRepository(
 		large := isolatesShard(document, guardOpts)
 		if current != nil && large != currentLarge {
 			if err := finishWindow(); err != nil {
-				if cancelProducer != nil {
-					cancelProducer()
-				}
-				if doc.weight > 0 {
-					readSemaphore.Release(doc.weight)
-				}
-				drainRemaining()
+				abandon(doc.weight)
 				return indexedAny, err
 			}
 		}
-		if large {
-			if current != nil && !largeDocumentSemaphore.TryAcquire(1) {
-				if err := finishWindow(); err != nil {
-					if cancelProducer != nil {
-						cancelProducer()
-					}
-					if doc.weight > 0 {
-						readSemaphore.Release(doc.weight)
-					}
-					drainRemaining()
-					return indexedAny, err
-				}
-			}
-			if current == nil {
-				if err := largeDocumentSemaphore.Acquire(ctx, 1); err != nil {
-					if cancelProducer != nil {
-						cancelProducer()
-					}
-					if doc.weight > 0 {
-						readSemaphore.Release(doc.weight)
-					}
-					drainRemaining()
-					return indexedAny, err
-				}
-			}
-			largeReservations++
-		}
 		if current == nil {
-			if err := openWindow(openedWindows > 0, large); err != nil {
-				if largeReservations > 0 {
-					largeDocumentSemaphore.Release(largeReservations)
-					largeReservations = 0
-				}
-				if cancelProducer != nil {
-					cancelProducer()
-				}
-				if doc.weight > 0 {
-					readSemaphore.Release(doc.weight)
-				}
-				drainRemaining()
+			if err := openWindow(indexedAny, large); err != nil {
+				abandon(doc.weight)
 				return indexedAny, err
 			}
 		}
 
 		// Quality invariant: file size changes scheduling only. Do not set
-		// Document.Symbols to a non-nil empty slice or disable ctags for a large
-		// document. Either action would make sym: results depend on file size.
-		// Zoekt's Builder.Add buffers doc into b.todo before any error return, so
-		// doc.weight stays the window's responsibility either way and is Released
-		// by finishWindow.
-		pendingWeight += doc.weight
-		pendingContent += int64(len(doc.content))
+		// Document.Symbols to a non-nil empty slice or disable ctags for a
+		// large document. Either action would make sym: results depend on file
+		// size. Zoekt's Builder.Add buffers doc into b.todo before any error
+		// return. A large window keeps doc.weight until finishWindow, after the
+		// guard.
 		if currentLarge {
+			pendingWeight += doc.weight
+			pendingContent += int64(len(doc.content))
 			largeWindowDocs = append(largeWindowDocs, document)
 		}
-		if err := current.Add(document); err != nil {
+		err := current.Add(document)
+		if !currentLarge {
+			// From here, Zoekt's flush throttle bounds this content, and no
+			// guard adds a normal document again.
+			readSemaphore.Release(doc.weight)
+		}
+		if err != nil {
 			addErr = fmt.Errorf("add document %s: %w", doc.name, err)
-			if cancelProducer != nil {
-				cancelProducer()
-			}
+			cancelProducer()
 			continue
 		}
 		if large {
 			largeDocuments++
 		}
 
-		if pendingWeight >= indexWindowBytes ||
-			(currentLarge && (largeDocuments >= largeParallelism || pendingContent >= indexWindowBytes)) {
+		if currentLarge && (largeDocuments >= largeParallelism || pendingContent >= window) {
 			if err := finishWindow(); err != nil {
-				if cancelProducer != nil {
-					cancelProducer()
-				}
-				drainRemaining()
+				abandon(0)
 				return indexedAny, err
 			}
 		}
@@ -1407,9 +2001,7 @@ func indexDocumentsWithRepository(
 
 	if current != nil {
 		if err := finishWindow(); err != nil {
-			if cancelProducer != nil {
-				cancelProducer()
-			}
+			cancelProducer()
 			if addErr != nil {
 				return true, addErr
 			}
@@ -1426,18 +2018,65 @@ func indexDocumentsWithRepository(
 	return true, nil
 }
 
-// cleanUncommittedShards removes stale uncommitted shard files.
-func cleanUncommittedShards(indexDir string) {
-	cleanRepositoryShards(indexDir, repoUncommitted)
+// writePendingUncommittedManifest writes the manifest of a published family
+// that kept some files by name (noted, the *dirtyFilesKept of
+// dirtyFailure.noted). The manifest has no state, a kept mark on those files,
+// deadBytes, and baseShards. So the next search's delta reads the kept files
+// again.
+func writePendingUncommittedManifest(cacheDir string, entries []uncommittedManifestEntry, noted error, deadBytes int64, baseShards int) {
+	kept := noted.(*dirtyFilesKept)
+	if err := writeUncommittedManifest(cacheDir, "", markKept(entries, kept.files), deadBytes, baseShards); err != nil {
+		deleteUncommittedManifest(cacheDir)
+	}
 }
 
-func cleanRepositoryShards(indexDir, repoName string) {
-	for _, m := range repositoryShardFiles(indexDir, repoName) {
-		_ = os.Remove(m)
+// cleanUncommittedShards removes the live uncommitted family with the swap of
+// a publish (swapFiles, with no new file). A file that cannot move (an
+// immutable file) fails the removal and moves the family back. So no shard
+// stays without the others or without its tombstone records; such a shard
+// would serve replaced content. The caller runs discard, which deletes the
+// moved files, after the publish lock is released.
+func cleanUncommittedShards(indexDir string) (discard func(), err error) {
+	defer removeRepositoryShardTemps(indexDir, repoUncommitted)
+	discard = func() {}
+	live := repositoryFamilyFiles(indexDir, repoUncommitted)
+	if len(live) == 0 {
+		return discard, nil
 	}
+	dir, err := newBuildDir(indexDir)
+	if err != nil {
+		return discard, err
+	}
+	discard = func() { discardBuildDir(dir) }
+	if _, _, err := swapFiles(indexDir, dir, live, nil); err != nil {
+		return discard, fmt.Errorf("remove uncommitted shards: %w", err)
+	}
+	return discard, nil
+}
+
+// cleanRepositoryShards removes the shards, records and temporary shards of
+// repoName in a build directory.
+func cleanRepositoryShards(indexDir, repoName string) {
+	for _, file := range repositoryFamilyFiles(indexDir, repoName) {
+		_ = os.Remove(file)
+	}
+	removeRepositoryShardTemps(indexDir, repoName)
+}
+
+// repositoryFamilyFiles lists the shards and records of repoName.
+func repositoryFamilyFiles(indexDir, repoName string) []string {
 	metas, _ := filepath.Glob(filepath.Join(indexDir, repoName+"_v*.zoekt.meta"))
-	for _, m := range metas {
-		_ = os.Remove(m)
+	return append(repositoryShardFiles(indexDir, repoName), metas...)
+}
+
+// removeRepositoryShardTemps removes the shards that a Zoekt Builder of
+// repoName left under their temporary names (<shard>.<random>.tmp): Finish
+// renames them only when it ends. The caller holds the node's build lock, so
+// no Builder of the node writes them now.
+func removeRepositoryShardTemps(indexDir, repoName string) {
+	temps, _ := filepath.Glob(filepath.Join(indexDir, repoName+"_v*.zoekt.*.tmp"))
+	for _, temp := range temps {
+		_ = os.Remove(temp)
 	}
 }
 

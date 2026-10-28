@@ -15,6 +15,8 @@ import (
 // Search commands use exit code 1 for this normal outcome and print no error.
 var errNoMatch = errors.New("no match")
 
+// exitCodeForError gives the exit code of a command: 0 with no error, 1 for
+// errNoMatch, and 2 for any other error.
 func exitCodeForError(err error) int {
 	switch {
 	case err == nil:
@@ -38,6 +40,9 @@ func reportCLIError(w io.Writer, err error, verbose bool) {
 	}
 }
 
+// newCLILogger writes text records to w from the Warn level, or from the
+// Debug level with verbose. Its handler promotes Zoekt index-damage notices
+// (zoektWarningHandler).
 func newCLILogger(w io.Writer, verbose bool) *slog.Logger {
 	level := slog.LevelWarn
 	if verbose {
@@ -72,10 +77,10 @@ func (h zoektWarningHandler) Handle(ctx context.Context, r slog.Record) error {
 		if !isZoektDamageNotice(r.Message) {
 			return nil
 		}
-		if h.promoted.Add(1) > maxPromotedDamageNotices {
-			// Report at most one notice per affected file up to the limit, then
-			// report one summary.
-			if h.promoted.Load() == maxPromotedDamageNotices+1 {
+		if promoted := h.promoted.Add(1); promoted > maxPromotedDamageNotices {
+			// Promote the first maxPromotedDamageNotices notices, then write
+			// one summary and drop the rest.
+			if promoted == maxPromotedDamageNotices+1 {
 				sum := slog.NewRecord(r.Time, slog.LevelWarn,
 					"Further index-damage notices suppressed; the index is incomplete", 0)
 				return h.Handler.Handle(ctx, sum)
@@ -114,81 +119,43 @@ func (h zoektWarningHandler) WithGroup(name string) slog.Handler {
 	return zoektWarningHandler{Handler: h.Handler.WithGroup(name), promoted: h.promoted}
 }
 
+// formatCLIError returns the message that the CLI prints for err, with a hint
+// line for the errors that have one.
 func formatCLIError(err error) string {
+	if budgetErr, ok := errors.AsType[*cacheBudgetError](err); ok {
+		message := "seek: " + budgetErr.Error() + "\n"
+		// A text search builds no meaning-based index: name it when it fits.
+		textOnly := ""
+		if budgetErr.textFits {
+			textOnly = "; or use --lexical-only, which builds no meaning-based index"
+		}
+		if budgetErr.freeBound {
+			// Seek keeps 5 % of the volume free; the override replaces that
+			// floor, so the hint names the disk first.
+			return message + fmt.Sprintf("hint: the cache volume is nearly full and Seek keeps 5 %% of it free; "+
+				"free disk space, or set %s (it replaces that floor)%s", envCacheBudget, textOnly)
+		}
+		return message + fmt.Sprintf("hint: set %s to a larger size, for example %s=%s%s",
+			envCacheBudget, envCacheBudget, budgetSuggestion(budgetErr.planned), textOnly)
+	}
 	if queryErr, ok := errors.AsType[*querySyntaxError](err); ok {
 		return fmt.Sprintf("seek: invalid query %q: %v", queryErr.query, queryErr.cause)
-	}
-	if folderErr, ok := errors.AsType[*folderCorpusContextError](err); ok {
-		if capErr, ok := errors.AsType[indexCapExceededError](err); ok {
-			if message, ok := formatCorpusCapError(folderErr.root, false, capErr); ok {
-				return message
-			}
-		}
-	}
-	if gitErr, ok := errors.AsType[*gitCorpusContextError](err); ok {
-		if capErr, ok := errors.AsType[indexCapExceededError](err); ok {
-			if message, ok := formatCorpusCapError(gitErr.root, true, capErr); ok {
-				return message
-			}
-		}
 	}
 	if pathErr, ok := errors.AsType[*pathOperandError](err); ok {
 		return formatPathOperandError(pathErr)
 	}
+	if folderErr, ok := errors.AsType[*folderCorpusContextError](err); ok && errors.Is(err, fs.ErrNotExist) {
+		return fmt.Sprintf("seek: path does not exist: %q", folderErr.root)
+	}
 	if _, ok := errors.AsType[*gitUnavailableError](err); ok {
 		return "seek: Git is required but was not found\n" +
 			"hint: install Git and ensure git is on PATH"
-	}
-	if _, ok := errors.AsType[*searchRootError](err); ok {
-		return "seek: cannot determine a default Git search root\n" +
-			"hint: run seek in a Git worktree or pass a path after the query, for example: seek 'query' ."
 	}
 	if ctagsErr, ok := errors.AsType[*ctagsUnavailableError](err); ok {
 		problem, hint := ctagsUserMessage(ctagsErr)
 		return "seek: " + problem + "\nhint: " + hint
 	}
 	return "seek: " + err.Error()
-}
-
-func formatCorpusCapError(root string, git bool, capErr indexCapExceededError) (string, bool) {
-	target := fmt.Sprintf("%q", root)
-	indexedSubject := "indexable files"
-	candidateSubject := "files"
-	limitScope := "folder"
-	if git {
-		target = fmt.Sprintf("Git repository %q", root)
-		family := "working-tree"
-		if errors.Is(capErr, errGitCommittedCapExceeded) {
-			family = "committed-tree"
-			indexedSubject = family + " candidate blobs"
-		} else {
-			indexedSubject = family + " indexable files"
-		}
-		candidateSubject = family + " entries"
-		limitScope = "Git index-family"
-	}
-	const hint = "hint: pass smaller paths after the query; file: and -file: filters apply after indexing"
-	switch capErr.metric {
-	case indexCapIndexedBytes:
-		return fmt.Sprintf(
-			"seek: cannot index %s: the total size of %s exceeds the %d GiB %s limit\n%s",
-			target,
-			indexedSubject,
-			capErr.limit/(1024*1024*1024),
-			limitScope,
-			hint,
-		), true
-	case indexCapCandidateFiles:
-		return fmt.Sprintf(
-			"seek: cannot index %s: more than %d %s are candidates for indexing\n%s",
-			target,
-			capErr.limit,
-			candidateSubject,
-			hint,
-		), true
-	default:
-		return "", false
-	}
 }
 
 func ctagsUserMessage(err *ctagsUnavailableError) (problem, hint string) {
@@ -201,11 +168,25 @@ func ctagsUserMessage(err *ctagsUnavailableError) (problem, hint string) {
 }
 
 // reportStaleIndexWarning owns warnings for update failures when a prior index
-// remains usable. Ctags discovery errors get an actionable normal message.
+// remains usable. A cancellation writes only a debug line. Dirty files kept by
+// name after a read error get one warning with their count, the first path,
+// and the cause. A ctags discovery error gets a warning with a hint.
 // Debug output keeps the full typed error and its corpus context.
 func reportStaleIndexWarning(err error) {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		slog.Debug("Index update stopped after cancellation", "error", err)
+		return
+	}
+	if kept, ok := errors.AsType[*dirtyFilesKept](err); ok {
+		// The build published every other change. The first name holds the
+		// path, so the cause leaves it out.
+		cause := kept.cause
+		if pathErr, ok := errors.AsType[*fs.PathError](cause); ok {
+			cause = pathErr.Err
+		}
+		slog.Warn("Some uncommitted files could not be read; they are searchable by name only until a later search reads them",
+			"files", len(kept.files), "first", kept.files[0], "cause", cause.Error())
+		slog.Debug("Index update failure detail", "error", err)
 		return
 	}
 	if ctagsErr, ok := errors.AsType[*ctagsUnavailableError](err); ok {
@@ -220,6 +201,8 @@ func reportStaleIndexWarning(err error) {
 
 func formatPathOperandError(err *pathOperandError) string {
 	switch {
+	case errors.Is(err, errGitDirectoryOperand):
+		return fmt.Sprintf("seek: cannot search a Git directory: %q", err.operand)
 	case errors.Is(err, fs.ErrNotExist):
 		return fmt.Sprintf("seek: path does not exist: %q", err.operand)
 	case errors.Is(err, fs.ErrPermission):

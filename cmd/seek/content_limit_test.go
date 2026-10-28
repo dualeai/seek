@@ -21,45 +21,22 @@ func swapForTest[T any](tb testing.TB, variable *T, value T) {
 	tb.Cleanup(func() { *variable = old })
 }
 
-// swapShardFormatLimitForTest sets shardFormatLimit for one test.
-func swapShardFormatLimitForTest(tb testing.TB, limit int64) {
-	tb.Helper()
-	swapForTest(tb, &shardFormatLimit, limit)
-}
-
-// swapShardMaxForTest sets shardMax, the Zoekt shard size target, for one test.
-func swapShardMaxForTest(tb testing.TB, limit int) {
-	tb.Helper()
-	swapForTest(tb, &shardMax, limit)
-}
-
-// swapDocumentContentLimitForTest sets documentContentLimit for one test.
-func swapDocumentContentLimitForTest(tb testing.TB, limit int64) {
-	tb.Helper()
-	swapForTest(tb, &documentContentLimit, limit)
-}
-
-// TestRun_ContentLimitChangeRebuildsIndex checks that a cached index built
-// under one content limit is not reused under another: the second search must
-// see the file's content, which the first index held by name only.
+// TestRun_ContentLimitChangeRebuildsIndex checks that a search does not reuse
+// a cached index built under another content limit. The first index holds the
+// file by name only; the second search must find its content.
 func TestRun_ContentLimitChangeRebuildsIndex(t *testing.T) {
 	requireTools(t)
 	const needle = "content_limit_rebuild_marker"
 	content := needle + "\n" + strings.Repeat("filler text line\n", 256)
 
-	search := func(t *testing.T, dir string, operands []string) error {
-		t.Helper()
-		_, err := searchFrom(t, dir, needle, operands)
-		return err
-	}
 	expectRebuild := func(t *testing.T, dir string, operands []string) {
 		t.Helper()
-		swapDocumentContentLimitForTest(t, 1024)
-		if err := search(t, dir, operands); !errors.Is(err, errNoMatch) {
+		swapForTest(t, &documentContentLimit, 1024)
+		if _, err := searchFrom(t, dir, needle, operands); !errors.Is(err, errNoMatch) {
 			t.Fatalf("search under a 1 KiB limit: err=%v, want no content match", err)
 		}
-		swapDocumentContentLimitForTest(t, testDocumentContentLimit)
-		if err := search(t, dir, operands); err != nil {
+		swapForTest(t, &documentContentLimit, testDocumentContentLimit)
+		if _, err := searchFrom(t, dir, needle, operands); err != nil {
 			t.Fatalf("search after the limit change: err=%v, want the content match", err)
 		}
 	}

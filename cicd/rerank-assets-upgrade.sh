@@ -23,12 +23,29 @@ tokenizers_darwin_arm64_url="${tokenizers_release}/libtokenizers.darwin-arm64.ta
 tokenizers_linux_amd64_url="${tokenizers_release}/libtokenizers.linux-amd64.tar.gz"
 tokenizers_linux_arm64_url="${tokenizers_release}/libtokenizers.linux-arm64.tar.gz"
 
-usearch_version=2.26.2
+usearch_version=2.26.5
 usearch_release="https://github.com/unum-cloud/USearch/releases/download/v${usearch_version}"
 usearch_darwin_amd64_url="${usearch_release}/usearch_macos_x86_64_${usearch_version}.zip"
 usearch_darwin_arm64_url="${usearch_release}/usearch_macos_arm64_${usearch_version}.zip"
 usearch_linux_amd64_url="${usearch_release}/usearch_linux_amd64_${usearch_version}.so"
 usearch_linux_arm64_url="${usearch_release}/usearch_linux_arm64_${usearch_version}.so"
+
+# The NumKong release libraries hold the vector kernels (semantic_numkong.go).
+# Seek pins 7.8.4: its release has a library for each of the four release
+# targets. 7.8.5 has none for three of them.
+# The digests are the ones that the GitHub release gives for each asset:
+# gh api repos/ashvardanian/NumKong/releases/tags/v${numkong_version}
+#   --jq '.assets[]|.name+" "+.digest'
+numkong_version=7.8.4
+numkong_release="https://github.com/ashvardanian/NumKong/releases/download/v${numkong_version}"
+numkong_darwin_amd64_url="${numkong_release}/numkong_macos_x86_64_${numkong_version}.dylib"
+numkong_darwin_arm64_url="${numkong_release}/numkong_macos_arm64_${numkong_version}.dylib"
+numkong_linux_amd64_url="${numkong_release}/numkong_linux_amd64_${numkong_version}.so"
+numkong_linux_arm64_url="${numkong_release}/numkong_linux_arm64_${numkong_version}.so"
+numkong_darwin_amd64_sha256=c7e6b3b5efd14dcf977cfb1ba76100eaa6aa435c2361242708e83f8514438a59
+numkong_darwin_arm64_sha256=9b84bfb09c7261d177edce1159321be9e35df8310a575a3de0185379a34a25ec
+numkong_linux_amd64_sha256=05e567041cc627569962c698c9da2b4372fa76532f09265fd0636686bb880f68
+numkong_linux_arm64_sha256=cf418fbdbe443eab371e656a3630aae652a4dbc0b9cf63da905a0243b17662c2
 
 ort_darwin_arm64_url="https://github.com/microsoft/onnxruntime/releases/download/v${ort_version}/onnxruntime-osx-arm64-${ort_version}.tgz"
 ort_linux_amd64_url="https://github.com/microsoft/onnxruntime/releases/download/v${ort_version}/onnxruntime-linux-x64-${ort_version}.tgz"
@@ -97,6 +114,18 @@ extract_zip_member() {
 	replace_if_changed "${label}" "${temporary}" "${destination}" 0755
 }
 
+require_sha256() {
+	local label=$1
+	local path=$2
+	local want=$3
+	local got
+
+	got=$(file_sha256 "${path}")
+	if [[ ${got} != "${want}" ]]; then
+		fail "${label} has SHA-256 ${got}, want ${want}; delete ${path} and run this command again"
+	fi
+}
+
 write_runtime_manifest() {
 	local target=$1
 	local file_name=$2
@@ -139,6 +168,10 @@ usearch_darwin_amd64_source="${work_dir}/libusearch-darwin-amd64-${usearch_versi
 usearch_darwin_arm64_source="${work_dir}/libusearch-darwin-arm64-${usearch_version}.dylib"
 usearch_linux_amd64_source="${source_dir}/libusearch-linux-amd64-${usearch_version}.so"
 usearch_linux_arm64_source="${source_dir}/libusearch-linux-arm64-${usearch_version}.so"
+numkong_darwin_amd64_source="${source_dir}/libnumkong-darwin-amd64-${numkong_version}.dylib"
+numkong_darwin_arm64_source="${source_dir}/libnumkong-darwin-arm64-${numkong_version}.dylib"
+numkong_linux_amd64_source="${source_dir}/libnumkong-linux-amd64-${numkong_version}.so"
+numkong_linux_arm64_source="${source_dir}/libnumkong-linux-arm64-${numkong_version}.so"
 
 download "LateOn model" "${model_url}" "${model_source}"
 download "LateOn tokenizer" "${tokenizer_url}" "${tokenizer_source}"
@@ -166,6 +199,18 @@ download "USearch linux-amd64 library" "${usearch_linux_amd64_url}" \
 	"${usearch_linux_amd64_source}"
 download "USearch linux-arm64 library" "${usearch_linux_arm64_url}" \
 	"${usearch_linux_arm64_source}"
+download "NumKong darwin-amd64 library" "${numkong_darwin_amd64_url}" \
+	"${numkong_darwin_amd64_source}"
+download "NumKong darwin-arm64 library" "${numkong_darwin_arm64_url}" \
+	"${numkong_darwin_arm64_source}"
+download "NumKong linux-amd64 library" "${numkong_linux_amd64_url}" \
+	"${numkong_linux_amd64_source}"
+download "NumKong linux-arm64 library" "${numkong_linux_arm64_url}" \
+	"${numkong_linux_arm64_source}"
+require_sha256 "NumKong darwin-amd64 library" "${numkong_darwin_amd64_source}" "${numkong_darwin_amd64_sha256}"
+require_sha256 "NumKong darwin-arm64 library" "${numkong_darwin_arm64_source}" "${numkong_darwin_arm64_sha256}"
+require_sha256 "NumKong linux-amd64 library" "${numkong_linux_amd64_source}" "${numkong_linux_amd64_sha256}"
+require_sha256 "NumKong linux-arm64 library" "${numkong_linux_arm64_source}" "${numkong_linux_arm64_sha256}"
 
 extract_runtime "ONNX Runtime darwin-arm64 source" \
 	"${ort_darwin_arm64_archive}" \
@@ -223,6 +268,14 @@ package_asset "tracked USearch linux-amd64" "${usearch_linux_amd64_source}" \
 	"${repo_root}/cmd/seek/semantic_assets_linux_amd64/libusearch_c.so.zst"
 package_asset "tracked USearch linux-arm64" "${usearch_linux_arm64_source}" \
 	"${repo_root}/cmd/seek/semantic_assets_linux_arm64/libusearch_c.so.zst"
+package_asset "tracked NumKong darwin-amd64" "${numkong_darwin_amd64_source}" \
+	"${repo_root}/cmd/seek/semantic_assets_darwin_amd64/libnumkong.dylib.zst"
+package_asset "tracked NumKong darwin-arm64" "${numkong_darwin_arm64_source}" \
+	"${repo_root}/cmd/seek/semantic_assets_darwin_arm64/libnumkong.dylib.zst"
+package_asset "tracked NumKong linux-amd64" "${numkong_linux_amd64_source}" \
+	"${repo_root}/cmd/seek/semantic_assets_linux_amd64/libnumkong.so.zst"
+package_asset "tracked NumKong linux-arm64" "${numkong_linux_arm64_source}" \
+	"${repo_root}/cmd/seek/semantic_assets_linux_arm64/libnumkong.so.zst"
 track_file "tracked ONNX Runtime third-party notices" \
 	"${ort_notices_source}" "${repo_root}/ONNXRUNTIME_THIRD_PARTY_NOTICES.txt"
 

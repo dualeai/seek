@@ -1,75 +1,34 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
-	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
-	"github.com/sourcegraph/zoekt/index"
+	ctags "github.com/sourcegraph/go-ctags"
 )
 
-func TestSemanticDocumentLanguageMatchesZoektDetection(t *testing.T) {
-	options := indexBuildOptions("", 1)
-	options.SetDefaults()
-	checker := &index.DocChecker{}
-	tests := []struct {
-		name     string
-		document fileContent
-		want     string
-	}{
-		{
-			name: "Go source",
-			document: fileContent{
-				name:    "cmd/seek/main.go",
-				content: []byte("package main\nfunc main() {}\n"),
-			},
-			want: "Go",
-		},
-		{
-			name: "skipped Python source",
-			document: fileContent{
-				name:       "tool.py",
-				content:    []byte("print('ignored')\n"),
-				skipReason: index.SkipReasonTooLarge,
-			},
-			want: "Python",
-		},
-		{
-			name: "unknown extension",
-			document: fileContent{
-				name:    "NOTICE.unknown-seek-test",
-				content: []byte("plain words with no source markers\n"),
-			},
-			want: "",
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got := semanticDocumentLanguage(checker, options, test.document)
-			if got != test.want {
-				t.Fatalf("language=%q, want %q", got, test.want)
-			}
-		})
-	}
-}
-
+// semanticBuildTestEmbedder is a build model whose embed call runs the
+// function of the test; its query and score calls fail. The test controls
+// when each batch starts, waits and ends, and what it returns. So a test with
+// it proves how the build schedules, admits, cancels and releases batches, and
+// which units it sends. It cannot prove the time or memory of a real model
+// call, or anything about the vectors or the search.
 type semanticBuildTestEmbedder struct {
 	embed func(context.Context, []semanticUnit) ([]semanticUnitEmbedding, error)
-}
-
-func (semanticBuildTestEmbedder) PackSemanticUnits(
-	_ context.Context,
-	units []semanticUnit,
-) ([]semanticUnit, error) {
-	return units, nil
 }
 
 func (embedder semanticBuildTestEmbedder) EmbedSemanticUnits(
@@ -97,483 +56,462 @@ func (semanticBuildTestEmbedder) ScoresWithSemanticQuery(
 func (semanticBuildTestEmbedder) SemanticCallCPUs(context.Context) int { return 1 }
 func (semanticBuildTestEmbedder) Close() error                         { return nil }
 
-func TestCollectSemanticBatchesRestoresSequence(t *testing.T) {
+// collectTestRows runs the collector over model batches and copied rows and
+// returns its output and the coarse blocks that it sent, by sequence.
+func collectTestRows(
+	t *testing.T,
+	dir string,
+	batches []semanticEncodedBatch,
+	copies [][]semanticCopiedRow,
+) (semanticBuildOutput, map[int]int, error) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	firstUnits := make([]semanticUnit, semanticModelBatchRows)
-	firstEmbeddings := make([]semanticUnitEmbedding, semanticModelBatchRows)
-	firstVector := semanticVector{0: 1}
-	for row := range firstUnits {
-		firstUnits[row] = semanticUnit{
-			row:        uint64(row),
-			text:       []byte("first"),
-			modelInput: []int{1},
-		}
-		firstEmbeddings[row] = testSemanticUnitEmbedding(firstVector)
-	}
-	secondVector := semanticVector{1: 1}
-	encoded := make(chan semanticEncodedBatch, 2)
-	encoded <- semanticEncodedBatch{
-		sequence: 1,
-		units: []semanticUnit{{
-			row:        semanticModelBatchRows,
-			text:       []byte("second"),
-			modelInput: []int{2},
-		}},
-		embeddings: []semanticUnitEmbedding{testSemanticUnitEmbedding(secondVector)},
-	}
-	encoded <- semanticEncodedBatch{
-		sequence:   0,
-		units:      firstUnits,
-		embeddings: firstEmbeddings,
+	encoded := make(chan semanticEncodedBatch, len(batches))
+	for _, batch := range batches {
+		encoded <- batch
 	}
 	close(encoded)
+	copied := make(chan []semanticCopiedRow, len(copies))
+	for _, rows := range copies {
+		copied <- rows
+	}
+	close(copied)
+	coarseReady := make(chan semanticCoarseBatch, 64)
 	done := make(chan semanticBuildOutput, 1)
-	coarseReady := make(chan semanticCoarseBatch, 2)
-	vectorsPath := filepath.Join(t.TempDir(), semanticVectorsFile)
-	collectSemanticBatches(encoded, vectorsPath, coarseReady, cancel, done)
-	output := <-done
-	if output.err != nil {
-		t.Fatal(output.err)
-	}
-	if err := ctx.Err(); err != nil {
-		t.Fatalf("successful collection canceled its context: %v", err)
-	}
-	if got, want := []uint64{output.units[0].row, output.units[semanticModelBatchRows].row}, []uint64{0, semanticModelBatchRows}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("rows=%v, want %v", got, want)
-	}
-	if output.units[0].text != nil || output.units[semanticModelBatchRows].text != nil {
-		t.Fatal("collected rows kept source text")
-	}
-	if output.units[0].modelInput != nil || output.units[semanticModelBatchRows].modelInput != nil {
-		t.Fatal("collected rows kept transient model input")
-	}
-	coarseBySequence := make(map[int][]semanticCoarseVectors)
+	collectSemanticBatches(encoded, copied, dir, coarseReady, cancel, done)
+	blocks := map[int]int{}
 	for batch := range coarseReady {
-		coarseBySequence[batch.sequence] = batch.coarse
+		blocks[batch.sequence] = len(batch.coarse)
 	}
-	first := coarseBySequence[0]
-	second := coarseBySequence[1]
-	if len(first) != semanticModelBatchRows || len(second) != 1 ||
-		first[0][0][0] != 1 || second[0][0][1] != 1 {
-		t.Fatal("vectors are out of order")
+	output := <-done
+	return output, blocks, ctx.Err()
+}
+
+// testEmbeddedBatch returns a model batch with one unit for each of rows, each
+// embedded as vector.
+func testEmbeddedBatch(rows []uint64, vector semanticVector) semanticEncodedBatch {
+	batch := semanticEncodedBatch{}
+	for _, row := range rows {
+		batch.units = append(batch.units, semanticUnit{row: row, text: []byte("x"), modelInput: []int{1}})
+		batch.embeddings = append(batch.embeddings, testSemanticUnitEmbedding(vector))
 	}
-	wantBytes := uint64((semanticModelBatchRows + 1) * semanticFineVectorBytesPerUnit)
-	if output.vectorsArtifact.Bytes != wantBytes {
-		t.Fatalf("vector bytes=%d, want %d", output.vectorsArtifact.Bytes, wantBytes)
+	return batch
+}
+
+// TestCollectSemanticBatchesWritesRowsAtOffsets mixes model rows, out of
+// order, with rows copied from a live generation. Every row lands at its
+// offset in both vector files. The USearch stream gets the full first 128-row
+// block and the short last block.
+func TestCollectSemanticBatchesWritesRowsAtOffsets(t *testing.T) {
+	source := &semanticGeneration{
+		vectors: testSemanticFineVectors([]semanticUnitEmbedding{
+			testSemanticUnitEmbedding(semanticVector{2: 1}), testSemanticUnitEmbedding(semanticVector{3: 1}),
+		}),
+		coarse: make([]semanticCoarseSNORM16Vectors, 2),
 	}
-	raw, err := os.ReadFile(vectorsPath)
+	for row := range source.coarse {
+		for centroid := range source.coarse[row] {
+			source.coarse[row][centroid][2+row] = semanticSNORM16Scale
+		}
+	}
+	first := make([]uint64, 0, 128)
+	for row := range uint64(128) {
+		first = append(first, row)
+	}
+	dir := t.TempDir()
+	output, blocks, ctxErr := collectTestRows(t, dir,
+		[]semanticEncodedBatch{
+			testEmbeddedBatch([]uint64{130}, semanticVector{1: 1}),
+			testEmbeddedBatch(first, semanticVector{0: 1}),
+		},
+		[][]semanticCopiedRow{{{row: 128, ref: semanticReuseRef{generation: source, row: 0}}, {row: 129, ref: semanticReuseRef{generation: source, row: 1}}}},
+	)
+	if output.err != nil || ctxErr != nil {
+		t.Fatalf("collector err=%v ctx=%v", output.err, ctxErr)
+	}
+	if output.rows != 131 || output.vectorsArtifact.Bytes != 131*semanticFineVectorBytesPerUnit ||
+		output.coarseArtifact.Bytes != 131*semanticCoarseVectorBytesPerUnit {
+		t.Fatalf("output=%+v", output)
+	}
+	if blocks[0] != 128 || blocks[1] != 3 || len(blocks) != 2 {
+		t.Fatalf("coarse blocks=%v, want 128 and 3", blocks)
+	}
+	fine, err := os.ReadFile(filepath.Join(dir, semanticVectorsFile))
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondAt := semanticModelBatchRows * semanticFineVectorBytesPerUnit
-	if int16(binary.LittleEndian.Uint16(raw[:2])) != semanticSNORM16Scale ||
-		int16(binary.LittleEndian.Uint16(raw[secondAt+2:secondAt+4])) != semanticSNORM16Scale {
-		t.Fatal("fine vectors are out of order")
+	for row, dimension := range map[int]int{0: 0, 127: 0, 128: 2, 129: 3, 130: 1} {
+		at := row*semanticFineVectorBytesPerUnit + dimension*2
+		if code := binary.LittleEndian.Uint16(fine[at:]); code != semanticF16One {
+			t.Errorf("row %d dimension %d holds %d", row, dimension, code)
+		}
+	}
+	coarse, err := os.ReadFile(filepath.Join(dir, semanticCoarseFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if at := 129*semanticCoarseVectorBytesPerUnit + 3*2; int16(binary.LittleEndian.Uint16(coarse[at:])) != semanticSNORM16Scale {
+		t.Error("the copied coarse row is not at its offset")
 	}
 }
 
+// TestCollectSemanticBatchesRejectsInvalidInput checks that each of these
+// inputs fails the build and cancels it:
+//   - a row written twice, or a missing row;
+//   - a batch with mismatched embeddings;
+//   - a NaN vector.
 func TestCollectSemanticBatchesRejectsInvalidInput(t *testing.T) {
-	validBatch := func(sequence, rows int) semanticEncodedBatch {
-		units := make([]semanticUnit, rows)
-		embeddings := make([]semanticUnitEmbedding, rows)
-		for index := range rows {
-			units[index].row = uint64(sequence*semanticModelBatchRows + index)
-			embeddings[index] = testSemanticUnitEmbedding(semanticVector{0: 1})
-		}
-		return semanticEncodedBatch{
-			sequence:   sequence,
-			units:      units,
-			embeddings: embeddings,
-		}
-	}
-	maxBatches := (semanticMaxRows + semanticModelBatchRows - 1) / semanticModelBatchRows
-	tests := []struct {
-		name      string
-		batches   []semanticEncodedBatch
-		wantError error
-		wantText  string
-	}{
-		{name: "negative sequence", batches: []semanticEncodedBatch{validBatch(-1, 1)}, wantText: "exceeds limit"},
-		{name: "sequence over limit", batches: []semanticEncodedBatch{validBatch(maxBatches, 1)}, wantText: "exceeds limit"},
-		{name: "repeated sequence", batches: []semanticEncodedBatch{validBatch(0, 1), validBatch(0, 1)}, wantText: "was repeated"},
-		{name: "empty batch", batches: []semanticEncodedBatch{{sequence: 0}}, wantText: "mismatched rows"},
-		{
-			name: "unit and embedding count differ",
-			batches: []semanticEncodedBatch{{
-				sequence: 0,
-				units:    []semanticUnit{{row: 0}},
-			}},
-			wantText: "mismatched rows",
-		},
-		{name: "wrong row", batches: []semanticEncodedBatch{func() semanticEncodedBatch {
-			batch := validBatch(0, 1)
-			batch.units[0].row = 1
-			return batch
-		}()}, wantText: "row 0 is 1, want 0"},
-		{name: "missing sequence", batches: []semanticEncodedBatch{validBatch(1, 1)}, wantText: "did not complete"},
-		{name: "short nonfinal batch", batches: []semanticEncodedBatch{validBatch(0, 1), validBatch(1, 1)}, wantText: "has 1 rows, want"},
-		{name: "oversize batch", batches: []semanticEncodedBatch{validBatch(0, semanticModelBatchRows+1)}, wantText: "mismatched rows"},
-		{name: "model error", batches: []semanticEncodedBatch{func() semanticEncodedBatch {
-			batch := validBatch(0, 1)
-			batch.err = context.Canceled
-			return batch
-		}()}, wantError: context.Canceled},
-		{name: "invalid embedding", batches: []semanticEncodedBatch{func() semanticEncodedBatch {
-			batch := validBatch(0, 1)
-			batch.embeddings[0] = testSemanticUnitEmbedding(semanticVector{0: 2})
-			return batch
-		}()}, wantText: "semantic row 0 centroid 0"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
-			encoded := make(chan semanticEncodedBatch, len(test.batches))
-			for _, batch := range test.batches {
-				encoded <- batch
-			}
-			close(encoded)
-			done := make(chan semanticBuildOutput, 1)
-			collectSemanticBatches(
-				encoded,
-				filepath.Join(t.TempDir(), semanticVectorsFile),
-				nil,
-				cancel,
-				done,
-			)
-			output := <-done
-			if output.err == nil {
-				t.Fatal("invalid semantic batch was accepted")
-			}
-			if test.wantError != nil && !errors.Is(output.err, test.wantError) {
-				t.Fatalf("error=%v, want %v", output.err, test.wantError)
-			}
-			if test.wantText != "" && !strings.Contains(output.err.Error(), test.wantText) {
-				t.Fatalf("error=%q, want text %q", output.err, test.wantText)
-			}
-			if output.vectorsArtifact.Bytes != 0 {
-				t.Fatalf("failed build reported %d vector bytes", output.vectorsArtifact.Bytes)
-			}
-			if !errors.Is(ctx.Err(), context.Canceled) {
-				t.Fatalf("failed collection context error=%v, want cancellation", ctx.Err())
+	mismatched := testEmbeddedBatch([]uint64{0, 1}, semanticVector{0: 1})
+	mismatched.embeddings = mismatched.embeddings[:1]
+	invalid := testEmbeddedBatch([]uint64{0}, semanticVector{0: float32(math.NaN())})
+	for name, batches := range map[string][]semanticEncodedBatch{
+		"twice":      {testEmbeddedBatch([]uint64{0}, semanticVector{0: 1}), testEmbeddedBatch([]uint64{0}, semanticVector{0: 1})},
+		"missing":    {testEmbeddedBatch([]uint64{0, 2}, semanticVector{0: 1})},
+		"mismatched": {mismatched},
+		"invalid":    {invalid},
+	} {
+		t.Run(name, func(t *testing.T) {
+			output, _, ctxErr := collectTestRows(t, t.TempDir(), batches, nil)
+			if output.err == nil || !errors.Is(ctxErr, context.Canceled) {
+				t.Fatalf("err=%v ctx=%v, want a failed, canceled build", output.err, ctxErr)
 			}
 		})
 	}
 }
 
+// TestCollectSemanticBatchesAcceptsNoRows collects no row: the build succeeds
+// with two empty vector files and sends no block.
 func TestCollectSemanticBatchesAcceptsNoRows(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	encoded := make(chan semanticEncodedBatch)
-	close(encoded)
-	done := make(chan semanticBuildOutput, 1)
-	vectorsPath := filepath.Join(t.TempDir(), semanticVectorsFile)
-	collectSemanticBatches(encoded, vectorsPath, nil, cancel, done)
-	output := <-done
-	if output.err != nil {
-		t.Fatal(output.err)
+	dir := t.TempDir()
+	output, blocks, ctxErr := collectTestRows(t, dir, nil, nil)
+	if output.err != nil || ctxErr != nil || output.rows != 0 || len(blocks) != 0 ||
+		output.vectorsArtifact.Bytes != 0 || output.coarseArtifact.Bytes != 0 {
+		t.Fatalf("empty build output=%+v blocks=%v ctx=%v", output, blocks, ctxErr)
 	}
-	if len(output.units) != 0 || output.vectorsArtifact.Bytes != 0 {
-		t.Fatalf("empty build returned %d rows and %d vector bytes", len(output.units), output.vectorsArtifact.Bytes)
-	}
-	info, err := os.Stat(vectorsPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Size() != 0 {
-		t.Fatalf("empty vector file has %d bytes", info.Size())
-	}
-	if err := ctx.Err(); err != nil {
-		t.Fatalf("empty collection canceled its context: %v", err)
+	for _, name := range []string{semanticVectorsFile, semanticCoarseFile} {
+		if info, err := os.Stat(filepath.Join(dir, name)); err != nil || info.Size() != 0 {
+			t.Fatalf("%s: %v", name, err)
+		}
 	}
 }
 
+// TestCollectSemanticBatchesCancelsAfterVectorCreationFailure finds the vector
+// file already there: the build fails with os.ErrExist and cancels.
 func TestCollectSemanticBatchesCancelsAfterVectorCreationFailure(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	vectorsPath := filepath.Join(t.TempDir(), semanticVectorsFile)
-	if err := os.WriteFile(vectorsPath, nil, 0o600); err != nil {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, semanticVectorsFile), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	encoded := make(chan semanticEncodedBatch)
-	close(encoded)
-	done := make(chan semanticBuildOutput, 1)
-	collectSemanticBatches(encoded, vectorsPath, nil, cancel, done)
-	output := <-done
-	if !errors.Is(output.err, os.ErrExist) {
-		t.Fatalf("vector creation error=%v, want %v", output.err, os.ErrExist)
-	}
-	if !errors.Is(ctx.Err(), context.Canceled) {
-		t.Fatalf("vector creation failure context error=%v, want cancellation", ctx.Err())
+	output, _, ctxErr := collectTestRows(t, dir, nil, nil)
+	if !errors.Is(output.err, os.ErrExist) || !errors.Is(ctxErr, context.Canceled) {
+		t.Fatalf("err=%v ctx=%v, want an existing-file error and cancellation", output.err, ctxErr)
 	}
 }
 
+// TestEncodeSemanticBatchesAdmitsReadyWorkAfterOneCallCompletes runs 4 model
+// calls with a live limit of 2. The second call is slow: it ends only after
+// the fourth call starts. The third call waits until the second starts. So
+// the scheduler must start the fourth call when the third ends, beside the
+// slow call. The test runs in a synctest bubble with no timer. When every
+// goroutine blocks, a scheduler that waits for the slow call has not started
+// the fourth call, so the check fails at once.
 func TestEncodeSemanticBatchesAdmitsReadyWorkAfterOneCallCompletes(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	batches := make(chan semanticBuildBatch, 4)
-	for sequence := range 4 {
-		batches <- semanticBuildBatch{
-			sequence: sequence,
-			units:    []semanticUnit{{row: uint64(sequence)}},
-		}
-	}
-	close(batches)
-
-	slowStarted := make(chan struct{})
-	slowRelease := make(chan struct{})
-	fourthStarted := make(chan struct{})
-	var fourthOnce sync.Once
-	var active atomic.Int32
-	var peak atomic.Int32
-	embedder := semanticBuildTestEmbedder{embed: func(
-		_ context.Context,
-		units []semanticUnit,
-	) ([]semanticUnitEmbedding, error) {
-		current := active.Add(1)
-		defer active.Add(-1)
-		for observed := peak.Load(); current > observed; observed = peak.Load() {
-			if peak.CompareAndSwap(observed, current) {
-				break
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		batches := make(chan semanticBuildBatch, 4)
+		for sequence := range 4 {
+			batches <- semanticBuildBatch{
+				units: []semanticUnit{{row: uint64(sequence)}},
 			}
 		}
-		switch units[0].row {
-		case 1:
-			close(slowStarted)
-			<-slowRelease
-		case 2:
-			<-slowStarted
-		case 3:
-			fourthOnce.Do(func() { close(fourthStarted) })
-		}
-		return make([]semanticUnitEmbedding, len(units)), nil
-	}}
-	clock := time.Unix(1, 0)
-	resources := searchResources{
-		now: func() time.Time {
-			clock = clock.Add(time.Second)
-			return clock
-		},
-		effectiveCPUs:   func() int { return 2 },
-		availableMemory: func() int64 { return 1 << 30 },
-		callCPUs:        1,
-	}
-	encoded := make(chan semanticEncodedBatch, 4)
-	done := make(chan struct{})
-	go func() {
-		encodeSemanticBatches(ctx, embedder, batches, encoded, cancel, resources)
-		close(done)
-	}()
+		close(batches)
 
-	select {
-	case <-fourthStarted:
-	case <-time.After(5 * time.Second):
+		slowStarted := make(chan struct{})
+		slowRelease := make(chan struct{})
+		fourthStarted := make(chan struct{})
+		var fourthOnce sync.Once
+		var active atomic.Int32
+		var peak atomic.Int32
+		embedder := semanticBuildTestEmbedder{embed: func(
+			_ context.Context,
+			units []semanticUnit,
+		) ([]semanticUnitEmbedding, error) {
+			current := active.Add(1)
+			defer active.Add(-1)
+			for observed := peak.Load(); current > observed; observed = peak.Load() {
+				if peak.CompareAndSwap(observed, current) {
+					break
+				}
+			}
+			switch units[0].row {
+			case 1:
+				close(slowStarted)
+				<-slowRelease
+			case 2:
+				<-slowStarted
+			case 3:
+				fourthOnce.Do(func() { close(fourthStarted) })
+			}
+			return make([]semanticUnitEmbedding, len(units)), nil
+		}}
+		clock := time.Unix(1, 0)
+		resources := searchResources{
+			now: func() time.Time {
+				clock = clock.Add(time.Second)
+				return clock
+			},
+			effectiveCPUs:   func() int { return 2 },
+			availableMemory: func() int64 { return 1 << 30 },
+			callCPUs:        1,
+		}
+		encoded := make(chan semanticEncodedBatch, 4)
+		done := make(chan struct{})
+		go func() {
+			encodeSemanticBatches(ctx, embedder, batches, encoded, cancel, resources)
+			close(done)
+		}()
+
+		// Wait until each goroutine of the bubble blocks. The slow call then
+		// waits for its release, and a correct scheduler has started the
+		// fourth call beside it.
+		synctest.Wait()
+		select {
+		case <-fourthStarted:
+		default:
+			t.Error("the scheduler did not start the fourth call beside the slow call")
+		}
 		close(slowRelease)
-		t.Fatal("ready work waited for the slow model call")
-	}
-	close(slowRelease)
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("semantic workers did not stop")
-	}
-	for range encoded {
-	}
-	if got := peak.Load(); got != 2 {
-		t.Fatalf("peak model calls=%d, want the live two-call limit", got)
+		<-done
+		for range encoded {
+		}
+		if got := peak.Load(); got != 2 {
+			t.Fatalf("peak model calls=%d, want the live two-call limit", got)
+		}
+	})
+}
+
+// stepSemanticModelCalls runs in a synctest bubble, with a stub model whose
+// calls wait on step. It waits until each goroutine of the bubble blocks. The
+// scheduler has then started each call that its live limit admits, and waits
+// for one to end. It then ends one call, and does this again until the
+// scheduler returns. So the calls that run at each step are the scheduler's
+// limit, with no timer and whatever the load of the host. If the scheduler
+// waits with no running call, the send blocks too, and synctest stops the
+// test as a deadlock.
+func stepSemanticModelCalls(step chan<- struct{}, done <-chan struct{}) {
+	for {
+		synctest.Wait()
+		select {
+		case <-done:
+			return
+		default:
+		}
+		step <- struct{}{}
 	}
 }
 
+// TestEncodeSemanticBatchesTracksLiveCPULimit gives the scheduler 4 CPUs, then
+// 1 when 4 model calls run, then 4 again after 3 calls on 1 CPU. The
+// scheduler must reach 4 calls, start each call on 1 CPU alone, and grow
+// again after the recovery. Each model call waits for its step, so the calls
+// that the scheduler admits overlap on any host.
 func TestEncodeSemanticBatchesTracksLiveCPULimit(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	const batchCount = 48
-	batches := make(chan semanticBuildBatch, batchCount)
-	for sequence := range batchCount {
-		batches <- semanticBuildBatch{
-			sequence: sequence,
-			units:    []semanticUnit{{row: uint64(sequence)}},
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		const batchCount = 48
+		batches := make(chan semanticBuildBatch, batchCount)
+		for sequence := range batchCount {
+			batches <- semanticBuildBatch{
+				units: []semanticUnit{{row: uint64(sequence)}},
+			}
 		}
-	}
-	close(batches)
+		close(batches)
 
-	var effectiveCPUs atomic.Int32
-	effectiveCPUs.Store(4)
-	var phase atomic.Int32
-	var active atomic.Int32
-	var initialPeak atomic.Int32
-	var constrainedPeak atomic.Int32
-	var recoveredPeak atomic.Int32
-	var constrainedStarts atomic.Int32
-	var shrinkOnce sync.Once
-	var recoverOnce sync.Once
-	updatePeak := func(target *atomic.Int32, value int32) {
-		for observed := target.Load(); value > observed; observed = target.Load() {
-			if target.CompareAndSwap(observed, value) {
-				return
+		var effectiveCPUs atomic.Int32
+		effectiveCPUs.Store(4)
+		var phase atomic.Int32
+		var active atomic.Int32
+		var initialPeak atomic.Int32
+		var constrainedPeak atomic.Int32
+		var recoveredPeak atomic.Int32
+		var constrainedStarts atomic.Int32
+		var shrinkOnce sync.Once
+		var recoverOnce sync.Once
+		updatePeak := func(target *atomic.Int32, value int32) {
+			for observed := target.Load(); value > observed; observed = target.Load() {
+				if target.CompareAndSwap(observed, value) {
+					return
+				}
 			}
 		}
-	}
-	embedder := semanticBuildTestEmbedder{embed: func(
-		_ context.Context,
-		units []semanticUnit,
-	) ([]semanticUnitEmbedding, error) {
-		currentPhase := phase.Load()
-		current := active.Add(1)
-		defer active.Add(-1)
-		switch currentPhase {
-		case 0:
-			updatePeak(&initialPeak, current)
-			if current >= 4 {
-				shrinkOnce.Do(func() {
-					effectiveCPUs.Store(1)
-					phase.Store(1)
-				})
+		step := make(chan struct{})
+		embedder := semanticBuildTestEmbedder{embed: func(
+			callCtx context.Context,
+			units []semanticUnit,
+		) ([]semanticUnitEmbedding, error) {
+			currentPhase := phase.Load()
+			current := active.Add(1)
+			defer active.Add(-1)
+			switch currentPhase {
+			case 0:
+				updatePeak(&initialPeak, current)
+				if current >= 4 {
+					shrinkOnce.Do(func() {
+						effectiveCPUs.Store(1)
+						phase.Store(1)
+					})
+				}
+			case 1:
+				updatePeak(&constrainedPeak, current)
+				if constrainedStarts.Add(1) == 3 {
+					recoverOnce.Do(func() {
+						effectiveCPUs.Store(4)
+						phase.Store(2)
+					})
+				}
+			default:
+				updatePeak(&recoveredPeak, current)
 			}
-		case 1:
-			updatePeak(&constrainedPeak, current)
-			if constrainedStarts.Add(1) == 3 {
-				recoverOnce.Do(func() {
-					effectiveCPUs.Store(4)
-					phase.Store(2)
-				})
+			select {
+			case <-step:
+			case <-callCtx.Done():
 			}
-		default:
-			updatePeak(&recoveredPeak, current)
-		}
-		time.Sleep(3 * time.Millisecond)
-		return make([]semanticUnitEmbedding, len(units)), nil
-	}}
-	var clock atomic.Int64
-	encoded := make(chan semanticEncodedBatch, batchCount)
-	done := make(chan struct{})
-	go func() {
-		encodeSemanticBatches(ctx, embedder, batches, encoded, cancel, searchResources{
-			now: func() time.Time {
-				return time.Unix(clock.Add(1), 0)
-			},
-			effectiveCPUs: func() int { return int(effectiveCPUs.Load()) },
-			availableMemory: func() int64 {
-				return 1 << 30
-			},
-			callCPUs: 1,
-		})
-		close(done)
-	}()
+			return make([]semanticUnitEmbedding, len(units)), nil
+		}}
+		var clock atomic.Int64
+		encoded := make(chan semanticEncodedBatch, batchCount)
+		done := make(chan struct{})
+		go func() {
+			encodeSemanticBatches(ctx, embedder, batches, encoded, cancel, searchResources{
+				now: func() time.Time {
+					return time.Unix(clock.Add(1), 0)
+				},
+				effectiveCPUs: func() int { return int(effectiveCPUs.Load()) },
+				availableMemory: func() int64 {
+					return 1 << 30
+				},
+				callCPUs: 1,
+			})
+			close(done)
+		}()
 
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("semantic scheduler did not finish")
-	}
-	for range encoded {
-	}
-	if phase.Load() != 2 {
-		t.Fatalf("scheduler phase=%d, want CPU recovery", phase.Load())
-	}
-	if initialPeak.Load() < 4 {
-		t.Fatalf("initial peak=%d, want four model calls", initialPeak.Load())
-	}
-	if constrainedPeak.Load() != 1 {
-		t.Fatalf("constrained peak=%d, want one model call", constrainedPeak.Load())
-	}
-	if recoveredPeak.Load() < 2 {
-		t.Fatalf("recovered peak=%d, want renewed parallel calls", recoveredPeak.Load())
-	}
+		stepSemanticModelCalls(step, done)
+		for range encoded {
+		}
+		// A peak under 4 calls also keeps the phase at 0. Check the peak
+		// first, so that the failure gives the peak.
+		if initialPeak.Load() < 4 {
+			t.Fatalf("initial peak=%d, want four model calls", initialPeak.Load())
+		}
+		if phase.Load() != 2 {
+			t.Fatalf("scheduler phase=%d, want CPU recovery", phase.Load())
+		}
+		if constrainedPeak.Load() != 1 {
+			t.Fatalf("constrained peak=%d, want one model call", constrainedPeak.Load())
+		}
+		if recoveredPeak.Load() < 2 {
+			t.Fatalf("recovered peak=%d, want renewed parallel calls", recoveredPeak.Load())
+		}
+	})
 }
 
+// TestEncodeSemanticBatchesTracksLiveMemoryHeadroom drops the free memory
+// when the scheduler probes 2 model calls, and raises it on row 8. The
+// scheduler must probe 2 calls, run rows 6 to 8 one at a time, and grow again
+// after the rise. Each model call waits for its step, so the calls that the
+// scheduler admits overlap on any host.
 func TestEncodeSemanticBatchesTracksLiveMemoryHeadroom(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	const batchCount = 30
-	batches := make(chan semanticBuildBatch, batchCount)
-	for sequence := range batchCount {
-		batches <- semanticBuildBatch{
-			sequence: sequence,
-			units:    []semanticUnit{{row: uint64(sequence)}},
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		const batchCount = 30
+		batches := make(chan semanticBuildBatch, batchCount)
+		for sequence := range batchCount {
+			batches <- semanticBuildBatch{
+				units: []semanticUnit{{row: uint64(sequence)}},
+			}
 		}
-	}
-	close(batches)
+		close(batches)
 
-	var available atomic.Int64
-	available.Store(100)
-	var active atomic.Int32
-	var initialPeak atomic.Int32
-	var constrainedPeak atomic.Int32
-	var recoveredPeak atomic.Int32
-	var lowOnce sync.Once
-	updatePeak := func(target *atomic.Int32, value int32) {
-		for observed := target.Load(); value > observed; observed = target.Load() {
-			if target.CompareAndSwap(observed, value) {
-				return
+		var available atomic.Int64
+		available.Store(100)
+		var active atomic.Int32
+		var initialPeak atomic.Int32
+		var constrainedPeak atomic.Int32
+		var recoveredPeak atomic.Int32
+		var lowOnce sync.Once
+		updatePeak := func(target *atomic.Int32, value int32) {
+			for observed := target.Load(); value > observed; observed = target.Load() {
+				if target.CompareAndSwap(observed, value) {
+					return
+				}
 			}
 		}
-	}
-	embedder := semanticBuildTestEmbedder{embed: func(
-		_ context.Context,
-		units []semanticUnit,
-	) ([]semanticUnitEmbedding, error) {
-		row := units[0].row
-		current := active.Add(1)
-		defer active.Add(-1)
-		switch {
-		case row < 6:
-			updatePeak(&initialPeak, current)
-			if current >= 2 {
-				lowOnce.Do(func() { available.Store(30) })
+		step := make(chan struct{})
+		embedder := semanticBuildTestEmbedder{embed: func(
+			callCtx context.Context,
+			units []semanticUnit,
+		) ([]semanticUnitEmbedding, error) {
+			row := units[0].row
+			current := active.Add(1)
+			defer active.Add(-1)
+			switch {
+			case row < 6:
+				updatePeak(&initialPeak, current)
+				if current >= 2 {
+					lowOnce.Do(func() { available.Store(30) })
+				}
+			case row <= 8:
+				updatePeak(&constrainedPeak, current)
+				if row == 8 {
+					available.Store(1_000)
+				}
+			default:
+				updatePeak(&recoveredPeak, current)
 			}
-		case row <= 8:
-			updatePeak(&constrainedPeak, current)
-			if row == 8 {
-				available.Store(1_000)
+			select {
+			case <-step:
+			case <-callCtx.Done():
 			}
-		default:
-			updatePeak(&recoveredPeak, current)
-		}
-		time.Sleep(3 * time.Millisecond)
-		return make([]semanticUnitEmbedding, len(units)), nil
-	}}
-	var clock atomic.Int64
-	var memoryReads atomic.Int32
-	encoded := make(chan semanticEncodedBatch, batchCount)
-	done := make(chan struct{})
-	go func() {
-		encodeSemanticBatches(ctx, embedder, batches, encoded, cancel, searchResources{
-			now: func() time.Time {
-				return time.Unix(clock.Add(1), 0)
-			},
-			effectiveCPUs: func() int { return 4 },
-			availableMemory: func() int64 {
-				memoryReads.Add(1)
-				return available.Load()
-			},
-			callCPUs: 1,
-		})
-		close(done)
-	}()
+			return make([]semanticUnitEmbedding, len(units)), nil
+		}}
+		var clock atomic.Int64
+		encoded := make(chan semanticEncodedBatch, batchCount)
+		done := make(chan struct{})
+		go func() {
+			encodeSemanticBatches(ctx, embedder, batches, encoded, cancel, searchResources{
+				now: func() time.Time {
+					return time.Unix(clock.Add(1), 0)
+				},
+				effectiveCPUs:   func() int { return 4 },
+				availableMemory: available.Load,
+				callCPUs:        1,
+			})
+			close(done)
+		}()
 
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("semantic scheduler did not finish")
-	}
-	for range encoded {
-	}
-	if initialPeak.Load() < 2 {
-		t.Fatalf("initial peak=%d, want a memory probe", initialPeak.Load())
-	}
-	if constrainedPeak.Load() != 1 {
-		t.Fatalf("low-memory peak=%d, want one model call", constrainedPeak.Load())
-	}
-	if recoveredPeak.Load() < 2 {
-		t.Fatalf("recovered peak=%d, want renewed parallel calls", recoveredPeak.Load())
-	}
-	if memoryReads.Load() < 3 {
-		t.Fatalf("live memory reads=%d, want repeated readings", memoryReads.Load())
-	}
+		stepSemanticModelCalls(step, done)
+		for range encoded {
+		}
+		if initialPeak.Load() < 2 {
+			t.Fatalf("initial peak=%d, want a memory probe", initialPeak.Load())
+		}
+		if constrainedPeak.Load() != 1 {
+			t.Fatalf("low-memory peak=%d, want one model call", constrainedPeak.Load())
+		}
+		if recoveredPeak.Load() < 2 {
+			t.Fatalf("recovered peak=%d, want renewed parallel calls", recoveredPeak.Load())
+		}
+	})
 }
 
+// TestEncodeSemanticBatchesCancellationReleasesAllWeights fails every model
+// call of 4 batches that share one read-weight owner. The scheduler reports
+// the failure and cancels, and the deferred check finds all the read weight
+// released.
 func TestEncodeSemanticBatchesCancellationReleasesAllWeights(t *testing.T) {
 	checkWeight := withReadSemLock(t)
 	defer checkWeight()
@@ -588,16 +526,15 @@ func TestEncodeSemanticBatchesCancellationReleasesAllWeights(t *testing.T) {
 	if err := readSemaphore.Acquire(ctx, totalWeight); err != nil {
 		t.Fatal(err)
 	}
-	owner := &semanticBuildOwner{weight: totalWeight}
+	owner := newSemanticBuildOwner(totalWeight)
 	for sequence := range batchCount {
 		owner.retain()
 		batches <- semanticBuildBatch{
-			sequence: sequence,
-			units:    []semanticUnit{{row: uint64(sequence)}},
-			owners:   []*semanticBuildOwner{owner},
+			units:  []semanticUnit{{row: uint64(sequence)}},
+			owners: []*semanticBuildOwner{owner},
 		}
 	}
-	owner.seal()
+	owner.done()
 	close(batches)
 
 	wantErr := errors.New("model failed")
@@ -624,6 +561,9 @@ func TestEncodeSemanticBatchesCancellationReleasesAllWeights(t *testing.T) {
 	}
 }
 
+// TestBuildSemanticGenerationReleasesSourceWeightOnModelFailure fails the
+// model call after the build owns the read weight of one document. The build
+// returns the model error, and the deferred check finds the weight released.
 func TestBuildSemanticGenerationReleasesSourceWeightOnModelFailure(t *testing.T) {
 	requireTools(t)
 	checkWeight := withReadSemLock(t)
@@ -644,7 +584,7 @@ func TestBuildSemanticGenerationReleasesSourceWeightOnModelFailure(t *testing.T)
 	) ([]semanticUnitEmbedding, error) {
 		return nil, wantErr
 	}}
-	_, err := buildSemanticGeneration(
+	err := buildSemanticGeneration(
 		t.Context(),
 		filepath.Join(t.TempDir(), "semantic"),
 		"source-1",
@@ -653,12 +593,17 @@ func TestBuildSemanticGenerationReleasesSourceWeightOnModelFailure(t *testing.T)
 		func(context.Context) (<-chan fileContent, func() error) {
 			return documents, func() error { return nil }
 		},
+		&semanticReuseIndex{},
 	)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("semantic build error=%v, want %v", err, wantErr)
 	}
 }
 
+// TestBuildSemanticGenerationKeepsCollectorErrorAfterInternalCancellation
+// puts a vector file in the build directory first. The collector fails with
+// os.ErrExist and cancels the build. The build returns that error, not the
+// cancellation, and publishes no manifest.
 func TestBuildSemanticGenerationKeepsCollectorErrorAfterInternalCancellation(t *testing.T) {
 	requireTools(t)
 	dir := t.TempDir()
@@ -671,7 +616,7 @@ func TestBuildSemanticGenerationKeepsCollectorErrorAfterInternalCancellation(t *
 	) ([]semanticUnitEmbedding, error) {
 		return nil, errors.New("unexpected model call")
 	}}
-	_, err := buildSemanticGeneration(
+	err := buildSemanticGeneration(
 		t.Context(),
 		dir,
 		"source-collector-error",
@@ -685,6 +630,7 @@ func TestBuildSemanticGenerationKeepsCollectorErrorAfterInternalCancellation(t *
 			}()
 			return documents, ctx.Err
 		},
+		&semanticReuseIndex{},
 	)
 	if !errors.Is(err, os.ErrExist) {
 		t.Fatalf("semantic build error=%v, want existing vector file error", err)
@@ -697,6 +643,117 @@ func TestBuildSemanticGenerationKeepsCollectorErrorAfterInternalCancellation(t *
 	}
 }
 
+// TestBuildSemanticGenerationKeepsGraphErrorAfterInternalCancellation puts a
+// directory where the first graph shard goes, so the shard save fails and
+// cancels the build. The source then reports that cancellation, as the Git
+// source does after an internal cancel. The build returns the save error, not
+// the cancellation.
+func TestBuildSemanticGenerationKeepsGraphErrorAfterInternalCancellation(t *testing.T) {
+	requireTools(t)
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, semanticUSearchShardName(0)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	documents := make(chan fileContent, 1)
+	documents <- fileContent{name: "app.go", content: []byte("package sample\nfunc Alpha() {}\n")}
+	close(documents)
+	embedder := semanticBuildTestEmbedder{embed: func(_ context.Context, units []semanticUnit) ([]semanticUnitEmbedding, error) {
+		embeddings := make([]semanticUnitEmbedding, len(units))
+		for index := range embeddings {
+			embeddings[index] = testSemanticUnitEmbedding(semanticVector{0: 1})
+		}
+		return embeddings, nil
+	}}
+	err := buildSemanticGeneration(t.Context(), dir, "source-graph-error", embedder, searchResources{},
+		func(ctx context.Context) (<-chan fileContent, func() error) {
+			return documents, ctx.Err
+		}, &semanticReuseIndex{})
+	if err == nil || errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "USearch") {
+		t.Fatalf("semantic build error=%v, want the graph shard save error", err)
+	}
+}
+
+// semanticStubParser finds no symbol, so each file is one unit.
+type semanticStubParser struct{}
+
+func (semanticStubParser) Parse(string, []byte) ([]*ctags.Entry, error) { return nil, nil }
+func (semanticStubParser) Close()                                       {}
+
+// TestExtractSemanticDocumentsSendsWindowError gives the extractor a nil
+// tokenizer, which reports itself closed, so the window split of its one file
+// fails. The extractor must send that error to the build loop, which keeps the
+// first error of the build.
+func TestExtractSemanticDocumentsSendsWindowError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		jobs := make(chan semanticSourceDocument, 1)
+		jobs <- semanticSourceDocument{content: fileContent{name: "app.go", content: []byte("package sample\nfunc Alpha() {}\n")}}
+		close(jobs)
+		results := make(chan semanticExtractedFile)
+		go extractSemanticDocuments(t.Context(), semanticStubParser{}, nil, &semanticReuseIndex{}, searchResources{}, jobs, results)
+		synctest.Wait()
+		select {
+		case result := <-results:
+			if result.err == nil {
+				t.Fatal("extractor sent no window error")
+			}
+		default:
+			t.Fatal("extractor ended without sending its window error")
+		}
+	})
+}
+
+// TestBuildSemanticGenerationHashesRawContent builds a generation from one
+// file whose byte 0xff is not valid UTF-8. Each stored row must hold the
+// SHA-256 of the raw bytes, which the search computes from the shard copy
+// (checkedSemanticCandidate). The digest comes from "shasum -a 256", as in
+// TestSemanticContentIDUsesRawBytes.
+func TestBuildSemanticGenerationHashesRawContent(t *testing.T) {
+	requireTools(t)
+	want, err := hex.DecodeString("01ce0241d2a0e71a4fecd5a8d71157fe2787197732fc15d889cbcf36c38e3c68")
+	if err != nil {
+		t.Fatal(err)
+	}
+	documents := make(chan fileContent, 1)
+	documents <- fileContent{name: "raw.txt", content: []byte{'a', 0xff, 'b'}}
+	close(documents)
+	embedder := semanticBuildTestEmbedder{embed: func(_ context.Context, units []semanticUnit) ([]semanticUnitEmbedding, error) {
+		embeddings := make([]semanticUnitEmbedding, len(units))
+		for index := range embeddings {
+			embeddings[index] = testSemanticUnitEmbedding(semanticVector{0: 1})
+		}
+		return embeddings, nil
+	}}
+	dir := filepath.Join(t.TempDir(), "semantic")
+	if err := buildSemanticGeneration(t.Context(), dir, "source-raw", embedder, searchResources{},
+		func(context.Context) (<-chan fileContent, func() error) {
+			return documents, func() error { return nil }
+		}, &semanticReuseIndex{}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := readSemanticManifest(dir, "source-raw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(filepath.Join(dir, semanticRowsFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := readSemanticRowsFrom(file, manifest.Rows, false)
+	_ = file.Close()
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("rows=%d err=%v, want the rows of raw.txt", len(rows), err)
+	}
+	for _, row := range rows {
+		if !bytes.Equal(row.contentID[:], want) {
+			t.Fatalf("row %d content ID %x, want the SHA-256 of the raw bytes %x", row.row, row.contentID, want)
+		}
+	}
+}
+
+// TestSemanticConcurrencyControllerProbesSafeWidthsAndRejectsSlowerWidth
+// doubles the width from 1 to 8 while each width is faster and the free
+// memory allows it. Width 8 is slower than width 4, so the controller goes
+// back to 4.
 func TestSemanticConcurrencyControllerProbesSafeWidthsAndRejectsSlowerWidth(t *testing.T) {
 	started := time.Unix(1, 0)
 	controller := newSemanticConcurrencyController(started, 5_000)
@@ -746,6 +803,9 @@ func TestSemanticConcurrencyControllerProbesSafeWidthsAndRejectsSlowerWidth(t *t
 	}
 }
 
+// TestSemanticConcurrencyControllerIgnoresSourceLimitedWindow checks that a
+// window starts only when the width is full. A window with a source gap
+// (noteStarved) ends with no measure and does not change the width.
 func TestSemanticConcurrencyControllerIgnoresSourceLimitedWindow(t *testing.T) {
 	started := time.Unix(1, 0)
 	controller := newSemanticConcurrencyController(started, 10_000)
@@ -776,9 +836,6 @@ func TestSemanticConcurrencyControllerIgnoresSourceLimitedWindow(t *testing.T) {
 	if got := controller.activeLimit(8); got != 4 {
 		t.Fatalf("source-limited window selected %d calls, want 4", got)
 	}
-	if controller.windowSaturated {
-		t.Fatal("source-limited window stayed active")
-	}
 
 	controller.noteActive(4, started.Add(20*time.Second))
 	for range 8 {
@@ -790,6 +847,9 @@ func TestSemanticConcurrencyControllerIgnoresSourceLimitedWindow(t *testing.T) {
 	}
 }
 
+// TestSemanticConcurrencyControllerDoesNotLearnMemoryFromSourceGap measures a
+// memory drop over a window with a source gap. The controller learns no call
+// cost from that drop, so the width grows.
 func TestSemanticConcurrencyControllerDoesNotLearnMemoryFromSourceGap(t *testing.T) {
 	started := time.Unix(1, 0)
 	controller := &semanticConcurrencyController{
@@ -808,12 +868,18 @@ func TestSemanticConcurrencyControllerDoesNotLearnMemoryFromSourceGap(t *testing
 	for range 4 {
 		controller.noteCompletion(128)
 	}
+	// The memory drop of 900 spans the source gap. Charged to the one added
+	// call, the drop is more than the 100 still free and would cut the width
+	// to 1. With the known cost of 7 per call, the width grows from 2 to 4.
 	controller.evaluate(started.Add(11*time.Second), 8, 100)
-	if controller.growthCost != 7 {
-		t.Fatalf("source gap changed per-call memory cost to %d", controller.growthCost)
+	if got := controller.activeLimit(8); got != 4 {
+		t.Fatalf("source gap changed the width to %d, want 4", got)
 	}
 }
 
+// TestSemanticConcurrencyControllerReopensCeilingAfterSourceEpoch starts a new
+// epoch with a source gap. The controller drops the old ceiling and best rate,
+// and measures the widths again.
 func TestSemanticConcurrencyControllerReopensCeilingAfterSourceEpoch(t *testing.T) {
 	started := time.Unix(1, 0)
 	controller := &semanticConcurrencyController{
@@ -829,20 +895,32 @@ func TestSemanticConcurrencyControllerReopensCeilingAfterSourceEpoch(t *testing.
 		warmupDone:         true,
 	}
 	controller.noteStarved()
-	if controller.performanceCeiling != 0 || controller.bestRate != 0 {
-		t.Fatal("new source epoch kept the old service curve")
-	}
 
+	// The old curve stopped at width 8 with 1,024 rows/s. The new epoch
+	// measures 512 rows/s at width 8, then 768 at width 16. Each width beats
+	// the best rate of its own epoch, so the width stays 16. The old ceiling
+	// would hold the width at 8; the old best rate would cut 16 back to 8.
 	controller.noteActive(8, started)
 	for range 16 {
-		controller.noteCompletion(128)
+		controller.noteCompletion(32)
 	}
 	controller.evaluate(started.Add(time.Second), 16, 1_000)
 	if got := controller.activeLimit(16); got != 16 {
 		t.Fatalf("new source epoch selected %d calls, want a fresh 16-call probe", got)
 	}
+	controller.noteActive(16, started.Add(time.Second))
+	for range 32 {
+		controller.noteCompletion(24)
+	}
+	controller.evaluate(started.Add(2*time.Second), 16, 1_000)
+	if got := controller.activeLimit(16); got != 16 {
+		t.Fatalf("the old best rate cut the new epoch to %d calls, want 16", got)
+	}
 }
 
+// TestSemanticConcurrencyControllerDoesNotChargeStableOutputGrowthToCalls
+// lowers the free memory while the width stays at 8. The controller charges
+// memory only to added calls, so the drop does not cut the width.
 func TestSemanticConcurrencyControllerDoesNotChargeStableOutputGrowthToCalls(t *testing.T) {
 	started := time.Unix(1, 0)
 	controller := newSemanticConcurrencyController(started, 1_000)
@@ -891,6 +969,10 @@ func TestSemanticConcurrencyControllerDoesNotChargeStableOutputGrowthToCalls(t *
 	}
 }
 
+// TestSemanticConcurrencyControllerUsesMeasuredMemoryAndLiveCPU keeps the
+// width at 1 while the measured call cost does not fit the free memory. It
+// grows the width to 8 when the memory recovers, and cuts it to the live CPU
+// limit.
 func TestSemanticConcurrencyControllerUsesMeasuredMemoryAndLiveCPU(t *testing.T) {
 	started := time.Unix(1, 0)
 	controller := newSemanticConcurrencyController(started, 100)
@@ -931,6 +1013,9 @@ func TestSemanticConcurrencyControllerUsesMeasuredMemoryAndLiveCPU(t *testing.T)
 	}
 }
 
+// TestSemanticConcurrencyControllerRecalibratesAfterCPULimitChange changes the
+// CPU limit from 8 to 16. The controller drops the old window, ceiling and
+// best rate, and measures the widths again.
 func TestSemanticConcurrencyControllerRecalibratesAfterCPULimitChange(t *testing.T) {
 	started := time.Unix(1, 0)
 	controller := &semanticConcurrencyController{
@@ -950,19 +1035,113 @@ func TestSemanticConcurrencyControllerRecalibratesAfterCPULimitChange(t *testing
 	if got := controller.activeLimit(16); got != 2 {
 		t.Fatalf("changed CPU limit changed active width to %d, want 2", got)
 	}
-	if controller.performanceCeiling != 0 || controller.bestRate != 0 {
-		t.Fatal("changed CPU limit kept the old service curve")
-	}
-	if controller.windowSaturated || controller.noteCompletion(128) {
-		t.Fatal("changed CPU limit kept the old measurement window")
+	// The old window needed four completions at width 2.
+	for range 4 {
+		if controller.noteCompletion(128) {
+			t.Fatal("changed CPU limit kept the old measurement window")
+		}
 	}
 
+	// The old curve stopped at width 2 with 512 rows/s. The new curve
+	// measures 256 rows/s at width 2, then 384 at width 4. Each width beats
+	// the best rate of the new curve, so the width grows to 8. The old
+	// ceiling would hold the width at 2; the old best rate would cut 4 back
+	// to 2.
 	controller.noteActive(2, started)
 	for range 4 {
-		controller.noteCompletion(128)
+		controller.noteCompletion(64)
 	}
 	controller.evaluate(started.Add(time.Second), 16, 1_000)
 	if got := controller.activeLimit(16); got != 4 {
 		t.Fatalf("fresh service curve selected width %d, want 4", got)
+	}
+	controller.noteActive(4, started.Add(time.Second))
+	for range 8 {
+		controller.noteCompletion(48)
+	}
+	controller.evaluate(started.Add(2*time.Second), 16, 1_000)
+	if got := controller.activeLimit(16); got != 8 {
+		t.Fatalf("the old best rate held the width at %d, want 8", got)
+	}
+}
+
+// TestBuildSemanticFolderGenerationFailsOnTransientRead makes one open fail
+// with EMFILE: the vector build returns the error and publishes no manifest,
+// so the next search reads the file again.
+func TestBuildSemanticFolderGenerationFailsOnTransientRead(t *testing.T) {
+	requireTools(t)
+	folder := t.TempDir()
+	writeFileAt(t, folder, "a.go", "package sample\n// alpha\n")
+	writeFileAt(t, folder, "b.go", "package sample\n// beta\n")
+	var selected []folderCandidate
+	for _, name := range []string{"a.go", "b.go"} {
+		selected = append(selected, testFolderCandidate(t, name, filepath.Join(folder, name)))
+	}
+	realOpen := folderOpenFile
+	folderOpenFile = func(path string) (*os.File, error) {
+		if filepath.Base(path) == "b.go" {
+			return nil, &os.PathError{Op: "open", Path: path, Err: syscall.EMFILE}
+		}
+		return realOpen(path)
+	}
+	t.Cleanup(func() { folderOpenFile = realOpen })
+	embedder := semanticBuildTestEmbedder{embed: func(_ context.Context, units []semanticUnit) ([]semanticUnitEmbedding, error) {
+		embeddings := make([]semanticUnitEmbedding, len(units))
+		for index := range embeddings {
+			embeddings[index] = testSemanticUnitEmbedding(semanticVector{0: 1})
+		}
+		return embeddings, nil
+	}}
+	dir := filepath.Join(t.TempDir(), "semantic")
+	err := buildSemanticFolderGeneration(t.Context(), selected, t.TempDir(), "", "", dir, "source", embedder, liveSearchResources())
+	if !errors.Is(err, syscall.EMFILE) {
+		t.Fatalf("err=%v, want EMFILE", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, semanticManifestFile)); !os.IsNotExist(statErr) {
+		t.Fatalf("the failed build wrote a manifest: %v", statErr)
+	}
+}
+
+// TestStartSemanticCtagsParsersClosesTheStartedParsers starts four ctags
+// workers at the same time. One start gets a fatal error, and the three others
+// start. The start returns that error and stops the three ctags processes.
+// The script selects the failed start with set -C: the shell then creates the
+// file with O_EXCL, so exactly one start creates it. The script does not use
+// mkdir: before 0.11.0, the uutils mkdir of the Ubuntu 26.04 runners exits 0
+// when a concurrent call has made the folder first
+// (https://github.com/uutils/coreutils/issues/13970).
+func TestStartSemanticCtagsParsersClosesTheStartedParsers(t *testing.T) {
+	dir := t.TempDir()
+	command := filepath.Join(dir, "ctags")
+	writeExecutable(t, command, `#!/bin/sh
+if (set -C; : >"$ZQ_CTAGS_DIR/failed") 2>/dev/null; then
+	echo '{"_type":"error","message":"zqfatal","fatal":true}'
+	exit 1
+fi
+echo $$ >"$ZQ_CTAGS_DIR/pid.$$"
+echo '{"_type":"program","name":"zqctags"}'
+exec cat >/dev/null
+`)
+	t.Setenv("CTAGS_COMMAND", command)
+	t.Setenv("ZQ_CTAGS_DIR", dir)
+	parsers, err := startSemanticCtagsParsers(4)
+	if err == nil || parsers != nil {
+		t.Fatalf("parsers=%v err=%v, want no parser and an error", parsers, err)
+	}
+	if !strings.HasPrefix(err.Error(), "start semantic ctags worker: ") || !strings.Contains(err.Error(), "zqfatal") {
+		t.Fatalf("err=%q, want the start error of the failed worker", err)
+	}
+	pids, err := filepath.Glob(filepath.Join(dir, "pid.*"))
+	if err != nil || len(pids) != 3 {
+		t.Fatalf("started workers %v (err=%v), want 3", pids, err)
+	}
+	for _, path := range pids {
+		pid, err := strconv.Atoi(strings.TrimPrefix(filepath.Ext(path), "."))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+			t.Errorf("ctags process %d runs after the failed start (err=%v)", pid, err)
+		}
 	}
 }
