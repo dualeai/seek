@@ -278,6 +278,25 @@ func e2eRouteOracle(t *testing.T, filters string, operands ...string) []string {
 	return headerPaths(output)
 }
 
+// e2eRouteChdir makes dir the current folder and sets each node to its path
+// relative to dir. Seek prints each path with its operand at the start, and
+// file: matches the printed path. So with relative operands a file: pattern
+// matches only the fixture path. An absolute operand puts the temporary folder
+// in the path: the name of the macOS runner folder
+// /var/folders/5n/5t77mfb93jd7q8v9s6f0dn0m0000gn/T contains f0, so -file:f0
+// dropped every file.
+func e2eRouteChdir(t *testing.T, dir string, nodes ...*string) {
+	t.Helper()
+	t.Chdir(dir)
+	for _, node := range nodes {
+		rel, err := filepath.Rel(dir, *node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		*node = rel
+	}
+}
+
 // e2eRouteJoin joins root and each slash path rel, and sorts the result.
 func e2eRouteJoin(root string, rels ...string) []string {
 	paths := make([]string, len(rels))
@@ -335,8 +354,10 @@ func e2eRouteVerify(t *testing.T, run e2eRouteRun, want, backends []string) {
 			run.backends, len(got), len(want), got, want)
 	}
 	for _, scored := range run.scored {
-		suffix := string(filepath.Separator) + filepath.FromSlash(scored.Path)
-		if !slices.ContainsFunc(got, func(path string) bool { return strings.HasSuffix(path, suffix) }) {
+		// A search of "." prints the node-relative path itself.
+		rel := filepath.FromSlash(scored.Path)
+		suffix := string(filepath.Separator) + rel
+		if !slices.ContainsFunc(got, func(path string) bool { return path == rel || strings.HasSuffix(path, suffix) }) {
 			t.Fatalf("the model scored %s, which the output does not show", scored.Path)
 		}
 	}
@@ -490,7 +511,7 @@ func TestE2ERouteMaskKindsTakeEveryRoute(t *testing.T) {
 	}
 	writeFixtureFile(t, filepath.Join(loose, "extra.go"), "package loose\n// zqrow loose extra\n")
 	setTestUserCache(t)
-	t.Chdir(t.TempDir())
+	e2eRouteChdir(t, f.path("tree"), &repo, &loose)
 	in := func(rels ...string) []string { return e2eRouteJoin(repo, rels...) }
 	files := newE2ERouteRepoFiles()
 	at := func(sets ...[]string) []string { return e2eRouteJoin(repo, slices.Concat(sets...)...) }
@@ -569,7 +590,7 @@ func TestE2ERouteSaturatedShardGivesEveryAllowedRow(t *testing.T) {
 	f := newGraphFixture(t)
 	repo := e2eRouteRepo(t, f)
 	setTestUserCache(t)
-	t.Chdir(t.TempDir())
+	e2eRouteChdir(t, f.path("tree"), &repo)
 	files := newE2ERouteRepoFiles()
 	notFew := slices.Concat([]string{"README.md"}, files.dense, files.filler, files.tools)
 	for _, test := range []e2eRouteCase{
@@ -600,7 +621,7 @@ func TestE2ERouteDirtyExclusionTakesEveryRoute(t *testing.T) {
 	f := newGraphFixture(t)
 	repo := e2eRouteRepo(t, f)
 	setTestUserCache(t)
-	t.Chdir(t.TempDir())
+	e2eRouteChdir(t, f.path("tree"), &repo)
 	if run := e2eRouteSearch(t, &hybridTestScorer{mode: payloadAccept}, "zqalpha zqbeta", repo); run.err != nil || !slices.Equal(run.backends, []string{"usearch"}) {
 		t.Fatalf("clean search: err=%v backends=%v", run.err, run.backends)
 	}
@@ -753,7 +774,7 @@ func TestE2ERouteFilterInSomeUSearchShards(t *testing.T) {
 	gitRunIn(t, repo, "add", ".")
 	gitRunIn(t, repo, "commit", "-q", "-m", "shards")
 	setTestUserCache(t)
-	t.Chdir(t.TempDir())
+	e2eRouteChdir(t, f.path("tree"), &repo)
 
 	// Rows: README 1, a/anear 240, a/bulk 4,020 (402 for each file), b/near
 	// 300, b/zfar 402. A file of 402 rows is always an anchor. The cut falls
@@ -832,7 +853,7 @@ func TestE2ERouteRadiusBoundsEveryRoute(t *testing.T) {
 	writeFixtureFile(t, filepath.Join(repo, "radius/uin.go"), "package radius\n// "+inside+" untracked inside\n")
 	writeFixtureFile(t, filepath.Join(repo, "radius/uout.go"), "package radius\n// "+outside+" untracked outside\n")
 	setTestUserCache(t)
-	t.Chdir(t.TempDir())
+	e2eRouteChdir(t, f.path("tree"), &fold, &repo)
 	model := newE2ERouteModel(t)
 	inFold := e2eRouteJoin(fold, "radius/in.go")
 	inRepo := e2eRouteJoin(repo, "radius/cin.go", "radius/uin.go")
@@ -920,7 +941,7 @@ func TestE2ERouteLongQueryWindowsOnEveryRoute(t *testing.T) {
 	}
 	writeFileAt(t, folder, "x/plain.go", "package x\n// plain far\n")
 	setTestUserCache(t)
-	t.Chdir(t.TempDir())
+	e2eRouteChdir(t, folder, &folder)
 	var every, both, first []string
 	for index := range 300 {
 		every = append(every, fmt.Sprintf("w/b%03d.go", index))
@@ -981,7 +1002,7 @@ func TestE2ERouteModelScoresOrderVectorHits(t *testing.T) {
 			"package p\n// %s E2E_FINE_%s E2E_MODEL_%s file %d\n", e2eRouteNear, file.fine, file.model, index))
 	}
 	setTestUserCache(t)
-	t.Chdir(t.TempDir())
+	e2eRouteChdir(t, folder, &folder)
 	for _, test := range []struct {
 		name, filter string
 		want         []string

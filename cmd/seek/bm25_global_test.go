@@ -229,6 +229,9 @@ func TestBM25RescoreIsExact(t *testing.T) {
 	write("b/foo3.go", "package b\n// fobx foax foo\nfoo\nbar\n"+strings.Repeat("// long filler line for the length\n", 30))
 	write("b/foo4.go", "package b\n// foo\nfoo bar foo\nbar\n"+strings.Repeat("// another filler line\n", 12))
 	setTestUserCache(t)
+	// Use relative operands. file: matches the printed path, and the macOS
+	// temporary folder path (/var/folders/...) contains "fo".
+	t.Chdir(root)
 	for _, pattern := range []string{
 		"case:yes foo",
 		"case:yes foo bar",
@@ -243,8 +246,8 @@ func TestBM25RescoreIsExact(t *testing.T) {
 		"case:yes content:foo\\nbar",
 		"type:file case:yes foo",
 	} {
-		one := bm25NodeScores(t, pattern, root)
-		two := bm25NodeScores(t, pattern, filepath.Join(root, "a"), filepath.Join(root, "b"))
+		one := bm25NodeScores(t, pattern, ".")
+		two := bm25NodeScores(t, pattern, "a", "b")
 		if len(one) == 0 || len(one) != len(two) {
 			t.Fatalf("%s: one node %d hits, two nodes %d", pattern, len(one), len(two))
 		}
