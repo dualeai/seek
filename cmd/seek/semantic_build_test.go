@@ -1105,11 +1105,16 @@ func TestBuildSemanticFolderGenerationFailsOnTransientRead(t *testing.T) {
 // TestStartSemanticCtagsParsersClosesTheStartedParsers starts four ctags
 // workers at the same time. One start gets a fatal error, and the three others
 // start. The start returns that error and stops the three ctags processes.
+// The script selects the failed start with set -C: the shell then creates the
+// file with O_EXCL, so exactly one start creates it. The script does not use
+// mkdir: before 0.11.0, the uutils mkdir of the Ubuntu 26.04 runners exits 0
+// when a concurrent call has made the folder first
+// (https://github.com/uutils/coreutils/issues/13970).
 func TestStartSemanticCtagsParsersClosesTheStartedParsers(t *testing.T) {
 	dir := t.TempDir()
 	command := filepath.Join(dir, "ctags")
 	writeExecutable(t, command, `#!/bin/sh
-if mkdir "$ZQ_CTAGS_DIR/failed" 2>/dev/null; then
+if (set -C; : >"$ZQ_CTAGS_DIR/failed") 2>/dev/null; then
 	echo '{"_type":"error","message":"zqfatal","fatal":true}'
 	exit 1
 fi
