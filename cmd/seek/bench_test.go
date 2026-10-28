@@ -2527,7 +2527,12 @@ func BenchmarkManyShardGit_WarmSearch(b *testing.B) {
 // folder and the two repositories, and searchNodes reads them at the same
 // time. It times Seek's stages with a model that runs no inference
 // (benchmarkNodeModel). Both case queries give the model text, so both cases
-// run the model stages.
+// run the model stages. Each case, not the parent benchmark, changes the
+// current folder to the fixture. CodSpeed's version of the testing package
+// saves the result of a case after the case ends, and it finds the Git root
+// from the current folder at that time. The fixture folder is in no Git
+// repository, so a folder change in the parent makes that save panic. The
+// cleanup of the case restores the folder before the save.
 func BenchmarkMultiNode_WarmSearch(b *testing.B) {
 	requireTools(b)
 	setTestUserCache(b)
@@ -2539,17 +2544,17 @@ func BenchmarkMultiNode_WarmSearch(b *testing.B) {
 		gitRunIn(b, repo, "add", ".")
 		gitRunIn(b, repo, "commit", "-q", "-m", "fixture")
 	}
-	b.Chdir(root)
 	discardStdout(b)
-	if plans, err := planCorpora(b.Context(), []string{"."}); err != nil || len(plans) != 3 {
+	if plans, err := planCorpora(b.Context(), []string{root}); err != nil || len(plans) != 3 {
 		b.Fatalf("plans=%d err=%v, want 3 nodes", len(plans), err)
 	}
 	for _, c := range []struct{ name, query string }{
 		{"Strict", "handler"},
 		{"Description", "parse handler"},
 	} {
-		mustRunBenchmarkSearch(b, c.query, nil)
 		b.Run(c.name, func(b *testing.B) {
+			b.Chdir(root)
+			mustRunBenchmarkSearch(b, c.query, nil)
 			for b.Loop() {
 				mustRunBenchmarkSearch(b, c.query, nil)
 			}
