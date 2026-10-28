@@ -75,7 +75,7 @@ func TestShardScanHelper(t *testing.T) {
 	flipped := filepath.Join(filepath.Dir(parts[0]), "flipped.zoekt")
 	for offset := start; offset < len(original); offset++ {
 		current.Store(int64(offset))
-		data := append([]byte(nil), original...)
+		data := bytes.Clone(original)
 		data[offset] ^= 0xFF
 		if err := os.WriteFile(flipped, data, 0o600); err != nil {
 			t.Fatal(err)
@@ -179,8 +179,7 @@ func shardScan(t *testing.T, shard, content string, stop func(offset int, outcom
 			return hangs
 		}
 		err = cmd.Wait()
-		var exitErr *exec.ExitError
-		if err != nil && (!errors.As(err, &exitErr) || exitErr.ExitCode() != shardScanHangExit) {
+		if exitErr, ok := errors.AsType[*exec.ExitError](err); err != nil && (!ok || exitErr.ExitCode() != shardScanHangExit) {
 			t.Fatalf("the shard scan child from offset %d stopped: %v\n%s", start, err, stderr.String())
 		}
 		start = next
@@ -272,7 +271,7 @@ func TestCorruptShardIsRepairedNeverCrashes(t *testing.T) {
 			t.Logf("first offsets %v; %d hangs", found, hangs)
 			for name, offset := range found {
 				shard, original, info := corruptionTarget(t, cache, test.shard)
-				flipped := append([]byte(nil), original...)
+				flipped := bytes.Clone(original)
 				flipped[offset] ^= 0xFF
 				writeShardBytes(t, shard, flipped, info.ModTime(), test.newTime)
 				first := search()

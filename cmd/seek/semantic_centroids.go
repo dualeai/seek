@@ -10,14 +10,14 @@ import (
 const (
 	// These values define the stored representation. Each unit puts four
 	// once-refined centroids in USearch and stores 20 direct centroids for
-	// exact scoring. semanticRepresentationCompatibility includes them all,
-	// and semanticUSearchLayout includes the coarse count. So a change cannot
+	// exact scoring. semanticRepresentationCompatibility includes them all and
+	// the pass count (zero) of the direct centroids, and
+	// semanticUSearchLayout includes the coarse count. So a change cannot
 	// reuse an old generation. The coarse count must stay a power of two for
 	// the key shift of the bitmap filter (semanticUSearchCentroidShift).
 	semanticCoarseCentroidsPerUnit = 4
 	semanticFineCentroidsPerUnit   = 20
 	semanticCoarseRefinementPasses = 1
-	semanticFineRefinementPasses   = 0
 )
 
 type semanticCoarseVectors [semanticCoarseCentroidsPerUnit]semanticVector
@@ -44,16 +44,12 @@ func (set semanticCoarseSet) Len() int {
 	return set.rows
 }
 
-func (set semanticCoarseSet) At(row int) (*semanticCoarseVectors, bool) {
-	if row < 0 || row >= set.rows || set.offset < 0 {
-		return nil, false
-	}
-	batch := (set.offset + row) / semanticModelBatchRows
-	offset := (set.offset + row) % semanticModelBatchRows
-	if batch >= len(set.batches) || offset >= len(set.batches[batch]) {
-		return nil, false
-	}
-	return &set.batches[batch][offset], true
+// At gives the vectors of row, from 0 to Len()-1. The stream makes a set only
+// when all of its rows are ready, and only the last batch of a stream can be
+// short. So each such row is in a batch of the set.
+func (set semanticCoarseSet) At(row int) *semanticCoarseVectors {
+	at := set.offset + row
+	return &set.batches[at/semanticModelBatchRows][at%semanticModelBatchRows]
 }
 
 // semanticCentroidWorkspace holds the buffers of one centroid build, so a
@@ -79,14 +75,7 @@ func (workspace *semanticCentroidWorkspace) makeUnitEmbedding(
 	}
 	var result semanticUnitEmbedding
 	tokens := workspace.tokens[:tokenCount]
-	if err := workspace.selectCentroids(tokens, result.fine[:]); err != nil {
-		return semanticUnitEmbedding{}, err
-	}
-	if semanticFineRefinementPasses > 0 {
-		if err := workspace.refineCentroids(tokens, result.fine[:], semanticFineRefinementPasses); err != nil {
-			return semanticUnitEmbedding{}, err
-		}
-	}
+	workspace.selectCentroids(tokens, result.fine[:])
 	copy(result.coarse[:], result.fine[:semanticCoarseCentroidsPerUnit])
 	if err := workspace.refineCentroids(tokens, result.coarse[:], semanticCoarseRefinementPasses); err != nil {
 		return semanticUnitEmbedding{}, err
@@ -128,15 +117,12 @@ func (workspace *semanticCentroidWorkspace) loadTokens(
 // selectCentroids keeps the first scoreable token as a fixed anchor. It selects
 // the other centroids by farthest-first traversal. Stable token order resolves
 // every tie. With fewer tokens than centroids, the selected centroids repeat
-// in order to fill destination.
+// in order to fill destination. tokens holds at least one token (loadTokens).
 func (workspace *semanticCentroidWorkspace) selectCentroids(
 	tokens []semanticVector,
 	destination []semanticVector,
-) error {
+) {
 	count := len(destination)
-	if len(tokens) == 0 || count < 2 {
-		return fmt.Errorf("semantic centroid settings are invalid")
-	}
 	destination[0] = tokens[0]
 	nearest := workspace.nearest[:len(tokens)]
 	for token, vector := range tokens {
@@ -163,23 +149,20 @@ func (workspace *semanticCentroidWorkspace) selectCentroids(
 		destination[centroidCount] = destination[centroidCount%len(tokens)]
 		centroidCount++
 	}
-	return nil
 }
 
 // refineCentroids runs a number of passes (refinements) on centroids. In each
 // pass, every token after the first joins the most similar of the other
 // centroids. Then each centroid with members becomes the normalized mean of
 // its members. A centroid with no members keeps its value. Centroid zero stays
-// on the first scoreable token.
+// on the first scoreable token. tokens holds at least one token, and centroids
+// holds at least two (the per-unit centroid counts).
 func (workspace *semanticCentroidWorkspace) refineCentroids(
 	tokens []semanticVector,
 	centroids []semanticVector,
 	refinements int,
 ) error {
 	count := len(centroids)
-	if len(tokens) == 0 || count < 2 || refinements < 0 {
-		return fmt.Errorf("semantic centroid settings are invalid")
-	}
 	for range refinements {
 		sums := workspace.sums[:count]
 		members := workspace.members[:count]
@@ -251,7 +234,9 @@ func normalizeSemanticVector(vector *semanticVector) error {
 		}
 		squaredNorm += float64(value) * float64(value)
 	}
-	if squaredNorm == 0 || math.IsNaN(squaredNorm) || math.IsInf(squaredNorm, 0) {
+	// Each square of a finite float32 is finite in float64, and so is the sum
+	// of 48 of them: only a zero norm remains.
+	if squaredNorm == 0 {
 		return fmt.Errorf("%w: vector has zero or invalid norm", errDegenerateSemanticVector)
 	}
 	scale64 := 1 / math.Sqrt(squaredNorm)

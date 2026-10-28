@@ -20,7 +20,7 @@ import (
 // once. A search after close is a defect, not index damage.
 func TestNodeReadSharesOneLoad(t *testing.T) {
 	cacheDir := t.TempDir()
-	plan := node{corpusStore: corpusStore{cacheDir: cacheDir, indexDir: filepath.Join(cacheDir, "index")}}
+	plan := node{cacheDir: cacheDir, indexDir: filepath.Join(cacheDir, "index")}
 	read, readCtx, err := openNodeRead(t.Context(), plan, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -104,9 +104,7 @@ func TestNodeReadLoadsShardsOnce(t *testing.T) {
 		if got := shardLoads(logs); got != 1 {
 			t.Fatalf("shard loads=%d, want 1", got)
 		}
-		scorer.mu.Lock()
-		scored := slices.ContainsFunc(scorer.documents, func(document rerankDocument) bool { return document.Path == "c.go" })
-		scorer.mu.Unlock()
+		scored := slices.ContainsFunc(scorer.documents(), func(document rerankDocument) bool { return document.Path == "c.go" })
 		if !scored {
 			t.Fatalf("the model did not score c.go, so the relaxed query did not run:\n%s", out)
 		}
@@ -134,7 +132,7 @@ func TestRemoveDamagedFamilyManifestKeepsANewPublish(t *testing.T) {
 	newNode := func(t *testing.T) node {
 		t.Helper()
 		cacheDir := t.TempDir()
-		plan := node{corpusStore: corpusStore{cacheDir: cacheDir, indexDir: filepath.Join(cacheDir, "index")}}
+		plan := node{cacheDir: cacheDir, indexDir: filepath.Join(cacheDir, "index")}
 		writeFixtureFile(t, filepath.Join(plan.indexDir, "a.zoekt"), "shard")
 		writeFixtureFile(t, filepath.Join(cacheDir, lockFile), "")
 		if err := writeFamilyManifest(plan.indexDir, []string{"a.zoekt"}); err != nil {

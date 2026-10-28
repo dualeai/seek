@@ -476,11 +476,90 @@ func TestPlanSemanticUSearchShardsSendsQuarterShardsToExact(t *testing.T) {
 		t.Fatalf("large plan jobs=%+v exact rows=%d, want 2 jobs and %d rows",
 			large.jobs, len(large.exactRows), 5*semanticUSearchMaxShardRows/4)
 	}
-	if job := large.jobs[0]; job.index != 5 || !job.filtered || job.limit != semanticUSearchVectorsPerQuery {
+	if job := large.jobs[0]; job.index != 5 || !job.filtered {
 		t.Fatalf("large plan half-allowed job=%+v", job)
 	}
 	if job := large.jobs[1]; job.index != 6 || job.filtered {
 		t.Fatalf("large plan all-allowed job=%+v", job)
+	}
+}
+
+// TestSemanticUSearchNativeJobSearchesVectorsPerQueryKeys plans and runs the
+// native job of one unfiltered shard of random keys. It must give the rows of
+// a direct search of the shard with semanticUSearchVectorsPerQuery keys per
+// token. At the bound of this test, each token stops after its first request.
+// A request for fewer keys searches the graph less deeply and finds fewer of
+// the keys within the bound. So the rows show the key count of the job.
+func TestSemanticUSearchNativeJobSearchesVectorsPerQueryKeys(t *testing.T) {
+	t.Setenv("SEEK_CACHE_DIR", t.TempDir())
+	random := rand.New(rand.NewPCG(11, 12))
+	randomVector := func() semanticVector {
+		var vector semanticVector
+		for d := range vector {
+			vector[d] = float32(random.NormFloat64())
+		}
+		if err := normalizeSemanticVector(&vector); err != nil {
+			t.Fatal(err)
+		}
+		return vector
+	}
+	embeddings := make([]semanticUnitEmbedding, semanticUSearchMaxShardRows)
+	for row := range embeddings {
+		for centroid := range embeddings[row].coarse {
+			embeddings[row].coarse[centroid] = randomVector()
+		}
+	}
+	dir := t.TempDir()
+	built := streamTestUSearchShards(t, dir, embeddings,
+		fixedTestUSearchPlans(len(embeddings), len(embeddings)), nil)
+	if built.err != nil {
+		t.Fatal(built.err)
+	}
+	shard := built.shards[0]
+	path := filepath.Join(dir, shard.Name)
+	generation := &semanticGeneration{
+		manifest:          semanticManifest{Rows: uint64(len(embeddings)), USearchFiles: built.shards},
+		usearch:           []string{path},
+		usearchValidation: make([]semanticUSearchValidation, 1),
+	}
+	queries := make([]semanticVector, 32)
+	for index := range queries {
+		queries[index] = randomVector()
+	}
+	saved := semanticUSearchDeepenSimilarity
+	semanticUSearchDeepenSimilarity = 0.4
+	t.Cleanup(func() { semanticUSearchDeepenSimilarity = saved })
+	directRows := func(keys int) []uint64 {
+		t.Helper()
+		hits, saturated, err := searchSemanticUSearchShardTokens(t.Context(), path, shard, queries, keys, nil, false)
+		if err != nil || saturated {
+			t.Fatalf("direct search of %d keys saturated=%t error=%v", keys, saturated, err)
+		}
+		var rows []uint64
+		for _, tokenHits := range hits {
+			for _, hit := range tokenHits {
+				row, _ := semanticUSearchUnitAndCentroid(hit.row)
+				rows = append(rows, row)
+			}
+		}
+		slices.Sort(rows)
+		return slices.Compact(rows)
+	}
+	want := directRows(semanticUSearchVectorsPerQuery)
+	if slices.Equal(directRows(semanticUSearchVectorsPerQuery/4), want) {
+		t.Fatal("a quarter of the keys gives the same rows, so the test cannot tell the key counts apart")
+	}
+	plan, err := planSemanticUSearchShards(t.Context(), generation, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := executeSemanticUSearchPlan(t.Context(), generation, queries, nil, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got.rows, want) {
+		t.Fatalf("native job gave %d rows, want the %d rows of %d keys per token",
+			len(got.rows), len(want), semanticUSearchVectorsPerQuery)
 	}
 }
 
@@ -534,12 +613,8 @@ func TestMarkSemanticRowRangeFollowsMask(t *testing.T) {
 }
 
 func TestSemanticUSearchCentroidShiftMatchesStoredKeyLayout(t *testing.T) {
-	shift, err := semanticUSearchCentroidShift()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if 1<<shift != semanticCoarseCentroidsPerUnit {
-		t.Fatalf("centroid shift=%d, count=%d", shift, semanticCoarseCentroidsPerUnit)
+	if 1<<semanticUSearchCentroidShift != semanticCoarseCentroidsPerUnit {
+		t.Fatalf("centroid shift=%d, count=%d", semanticUSearchCentroidShift, semanticCoarseCentroidsPerUnit)
 	}
 }
 
@@ -924,7 +999,6 @@ func BenchmarkSemanticFilteredRetrieval(b *testing.B) {
 				if _, err := route.run(b.Context()); err != nil {
 					b.Fatal(err)
 				}
-				b.ResetTimer()
 				var hits []semanticHit
 				for b.Loop() {
 					hits, err = route.run(b.Context())
@@ -960,8 +1034,8 @@ func BenchmarkSemanticFilteredRetrieval(b *testing.B) {
 
 // benchmarkForcedNativeSemanticFilter is the forced-native baseline of
 // BenchmarkSemanticFilteredRetrieval. It sends every shard with an allowed
-// row to native search, with the job limits of planSemanticUSearchShards.
-// Then it runs the production plan executor and exact scoring on the result.
+// row to native search. Then it runs the production plan executor and exact
+// scoring on the result.
 func benchmarkForcedNativeSemanticFilter(
 	ctx context.Context,
 	generation *semanticGeneration,
@@ -985,15 +1059,7 @@ func benchmarkForcedNativeSemanticFilter(
 		if allowed == 0 {
 			continue
 		}
-		job := semanticUSearchQueryShard{index: shardIndex, limit: semanticUSearchVectorsPerQuery}
-		if allowed != shard.Rows {
-			job.filtered = true
-			job.limit = int(min(
-				uint64(semanticUSearchVectorsPerQuery),
-				allowed*semanticCoarseCentroidsPerUnit,
-			))
-		}
-		plan.jobs = append(plan.jobs, job)
+		plan.jobs = append(plan.jobs, semanticUSearchQueryShard{index: shardIndex, filtered: allowed != shard.Rows})
 	}
 	candidates, err := executeSemanticUSearchPlan(ctx, generation, queryVectors, &mask, plan)
 	if err != nil {
@@ -1028,7 +1094,6 @@ func BenchmarkPlanSemanticUSearchShardsScale(b *testing.B) {
 			}
 			b.ReportAllocs()
 			var plan semanticUSearchQueryPlan
-			b.ResetTimer()
 			for b.Loop() {
 				var err error
 				plan, err = planSemanticUSearchShards(b.Context(), generation, &mask)

@@ -71,7 +71,7 @@ func TestWriteCorpusResultsWithContextLimitNotice(t *testing.T) {
 	const want = "## first.go (Go)\n1 first match\n\n… 1 more file (showing 1 of 2)\n"
 	var output bytes.Buffer
 	wrote, err := writeCorpusResultsWithContext(
-		&output, results, 1, 0, hideCorpusContext, plainPalette,
+		&output, withHeaders(results), 1, 0, hideCorpusContext, plainPalette,
 	)
 	if err != nil || !wrote || output.String() != want {
 		t.Fatalf("streamed output=%q wrote=%t error=%v, want %q", output.String(), wrote, err, want)
@@ -1285,11 +1285,10 @@ func TestFormatCorpusResults_SameRelativePathDifferentCorpora(t *testing.T) {
 
 func TestFormatCorpusResults_FileCorpusContextUsesExactRoot(t *testing.T) {
 	fileResults := wrapCorpusResults(node{
-		id:            corpusID("file-corpus"),
-		kind:          corpusKindFolder,
-		rootType:      rootTypeFile,
-		displayRoot:   "/tmp",
-		selectedFiles: []string{"exact.txt"},
+		id:          corpusID("file-corpus"),
+		kind:        corpusKindFolder,
+		rootType:    rootTypeFile,
+		displayRoot: "/tmp",
 	}, []zoekt.FileMatch{{
 		FileName: "exact.txt", Language: "Text", Score: 10,
 		LineMatches: []zoekt.LineMatch{{Line: []byte("needle\n"), LineNumber: 1}},
@@ -1303,7 +1302,7 @@ func TestFormatCorpusResults_FileCorpusContextUsesExactRoot(t *testing.T) {
 		FileName: "note.txt", Language: "Text", Score: 9,
 		LineMatches: []zoekt.LineMatch{{Line: []byte("needle\n"), LineNumber: 1}},
 	}})
-	results := append(fileResults, folderResults...)
+	results := withHeaders(append(fileResults, folderResults...))
 
 	out := formatCorpusResultsWithContext(results, 0, 0, showCorpusContext, plainPalette)
 	if !strings.Contains(out, "## /tmp/exact.txt") {
@@ -1355,7 +1354,7 @@ func testFormatSamePathAcrossCorpora(
 		}
 	}
 
-	out := formatCorpusResultsWithContext(results, 0, 0, showCorpusContext, plainPalette)
+	out := formatCorpusResultsWithContext(withHeaders(results), 0, 0, showCorpusContext, plainPalette)
 	for _, header := range wantHeaders {
 		if !strings.Contains(out, "## "+header+" (") {
 			t.Fatalf("expected absolute path %s, got:\n%s", header, out)
@@ -1384,7 +1383,7 @@ func TestFormatCorpusResults_LimitAppliesAfterMerge(t *testing.T) {
 		},
 	}
 
-	out := formatCorpusResultsWithContext(results, 1, 0, showCorpusContext, plainPalette)
+	out := formatCorpusResultsWithContext(withHeaders(results), 1, 0, showCorpusContext, plainPalette)
 	if !strings.Contains(out, "## /tmp/high/high.txt") || strings.Contains(out, "low.txt") {
 		t.Fatalf("expected limit after merged sort, got:\n%s", out)
 	}

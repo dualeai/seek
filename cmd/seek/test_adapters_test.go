@@ -31,19 +31,10 @@ func runGCCommand(ctx context.Context, args []string) error {
 	return cmd.ExecuteContext(ctx)
 }
 
-// planGitOperands is a test adapter for expandGraph. It expands the graph
-// from one Git operand.
-func planGitOperands(ctx context.Context, paths gitPaths, operand string) ([]node, error) {
-	return expandGraph(ctx, plannedExternalOperands{gitRoots: []externalGitRoot{{
-		paths:    paths,
-		operands: []string{operand},
-	}}})
-}
-
 // parseSearchQuery is a test adapter for parseQueryHalves. It returns only
 // the expanded query.
 func parseSearchQuery(pattern string) (query.Q, error) {
-	_, expanded, err := parseSearchQueryForms(pattern)
+	_, expanded, _, err := parseQueryHalves(pattern)
 	return expanded, err
 }
 
@@ -65,8 +56,16 @@ func executeParsedShardSearchForTest(
 // puts files in testGitCorpusPlan, hides the corpus context, and uses
 // plainPalette.
 func formatGitCorpusResultsForTest(files []zoekt.FileMatch, limit, maxMatches int) string {
-	results := wrapCorpusResults(testGitCorpusPlan, files)
+	results := withHeaders(wrapCorpusResults(testGitCorpusPlan, files))
 	return formatCorpusResultsWithContext(results, limit, maxMatches, hideCorpusContext, plainPalette)
+}
+
+// withHeaders sets the headers of results as the command does before it
+// prints them (applyHeaders), with no path operand: each header is the path
+// joined to its display root. It returns results.
+func withHeaders(results []corpusSearchResult) []corpusSearchResult {
+	applyHeaders(results, displayOperands{})
+	return results
 }
 
 // searchPlannedCorpusForTest is a test adapter for searchPlannedCorpusParsed.
@@ -110,13 +109,6 @@ func formatCorpusResultsWithContext(
 // no entry.
 func parseGitStatusV2(raw string) repoState {
 	return parseGitStatusV2Skipping(raw, nil)
-}
-
-// parseSearchQueryForms is a test adapter for parseQueryHalves. It returns
-// the raw and the expanded query.
-func parseSearchQueryForms(pattern string) (query.Q, query.Q, error) {
-	raw, strict, _, err := parseQueryHalves(pattern)
-	return raw, strict, err
 }
 
 // extractSemanticUnits is a test adapter for extractSemanticUnitsWithID. It

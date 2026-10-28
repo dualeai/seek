@@ -48,7 +48,7 @@ func TestReader_OversizeCandidate_NoSemaphoreTouch(t *testing.T) {
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
 
-	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
+	swapForTest(t, &documentContentLimit, testDocumentContentLimit)
 	synctest.Test(t, func(t *testing.T) {
 		// Hold the whole read budget, as busy readers would: a reader that
 		// acquires any weight waits and sends nothing.
@@ -97,7 +97,7 @@ func TestReader_AboveBudgetCandidate_ClampsWeight(t *testing.T) {
 	defer testReadSemMu.Unlock()
 	// The budget grows with host memory and can pass the content limit; raise
 	// the limit so the candidate takes the weighted read path.
-	swapDocumentContentLimitForTest(t, readBudgetBytes+2)
+	swapForTest(t, &documentContentLimit, readBudgetBytes+2)
 
 	before := availableWeight(readSemaphore)
 	synctest.Test(t, func(t *testing.T) {

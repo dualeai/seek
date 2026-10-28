@@ -163,7 +163,7 @@ func (record *shardStatsRecord) stats(ctx context.Context, path string, searcher
 	if err := syscall.Stat(path, &st); err != nil {
 		return shardLengthStats{}, err
 	}
-	stats := shardLengthStats{Size: st.Size, MtimeNS: statMtimeNano(st), Ino: uint64(st.Ino)}
+	stats := shardLengthStats{Size: st.Size, MtimeNS: statMtimeNano(st), Ino: st.Ino}
 	name := filepath.Base(path)
 	record.mu.Lock()
 	cached, ok := record.shards[name]
@@ -1023,7 +1023,8 @@ func (bq bm25Query) multiLineMerges(lines []zoekt.LineMatch) (map[string]int, ma
 		// Join the pieces of one candidate until the text is one match; the
 		// candidate can also end with the newline after a piece.
 		text := pieces[index].text
-		key, joined := "", false
+		var key string
+		var joined bool
 		next := index
 		for {
 			if key, joined = bq.contentKey(text + "\n"); joined {

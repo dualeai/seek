@@ -51,25 +51,10 @@ type folderCandidate struct {
 	dataless bool
 }
 
-// heldBytes is the content bytes that the shard document of the file holds. A
-// file kept by name only holds the NOT-INDEXED marker: a file with a marker, a
-// cloud-only file, or one too large for the index. Any other file holds its
-// size. marker is the marker bytes that a read found (nameOnlyMarkerBytes),
-// zero when the shard holds the content, or unreadFileMarker. An unread file
-// counts at the larger of that value and the largest marker
-// (maxNotIndexedMarkerBytes).
+// heldBytes is the content bytes that the shard document of the file holds,
+// with marker as shardHeldBytes takes it. A cloud-only file has no bytes.
 func (c folderCandidate) heldBytes(marker int64) int64 {
-	switch {
-	case marker == unreadFileMarker:
-		return max(c.heldBytes(0), maxNotIndexedMarkerBytes)
-	case marker > 0:
-		return marker
-	case c.dataless:
-		return notIndexedMarkerBytes(seekNoBytesReason)
-	case !documentContentFits(c.size):
-		return notIndexedMarkerBytes(index.SkipReasonTooLarge)
-	}
-	return c.size
+	return shardHeldBytes(marker, c.size, c.dataless)
 }
 
 // indexedBytes is the content that the index reads for the file: none for a
@@ -179,38 +164,28 @@ func ensureFolderCorpusFreshWithExecution(
 	}
 	defer unlock()
 
-	if !stateReady {
-		var err error
-		stateHash, selected, err = folderCorpusState(ctx, plan)
-		if err != nil {
-			deleteStateFiles(plan.cacheDir)
-			return corpusSearchable, folderCorpusError(plan, err)
+	// The node walks again under the lock when it has no state, when the
+	// fingerprint gave a file count and no file list, or when a peer published
+	// another state.
+	walk := !stateReady || (!selectedLoaded && selectedCount > 0)
+	if stateReady {
+		if latestState := readStateFile(plan.cacheDir); latestState == stateHash {
+			if selectedCount == 0 {
+				return corpusKnownEmpty, nil
+			}
+			// A peer can publish a family after the pre-lock scan, so scan
+			// again when that scan found no complete family. Use the same test
+			// as the warm path: presence alone would accept one surviving shard
+			// of a torn family.
+			if (hasShards || folderFamilyUsable(plan.indexDir)) &&
+				(!semanticRequired || plan.joinedGenerationsMatch(stateHash, plan.folderSemanticSource(stateHash), "")) {
+				return corpusSearchable, nil
+			}
+		} else if latestState != cachedState {
+			walk = true
 		}
-		selectedCount = len(selected)
-		selectedLoaded = true
-	} else if latestState := readStateFile(plan.cacheDir); latestState == stateHash {
-		if selectedCount == 0 {
-			return corpusKnownEmpty, nil
-		}
-		// A peer can publish a family after the pre-lock scan, so scan again
-		// when that scan found no complete family. Use the same test as the
-		// warm path: presence alone would accept one surviving shard of a torn
-		// family.
-		if (hasShards || folderFamilyUsable(plan.indexDir)) &&
-			(!semanticRequired || plan.joinedGenerationsMatch(stateHash, plan.folderSemanticSource(stateHash), "")) {
-			return corpusSearchable, nil
-		}
-	} else if latestState != cachedState {
-		var err error
-		stateHash, selected, err = folderCorpusState(ctx, plan)
-		if err != nil {
-			deleteStateFiles(plan.cacheDir)
-			return corpusSearchable, folderCorpusError(plan, err)
-		}
-		selectedCount = len(selected)
-		selectedLoaded = true
 	}
-	if !selectedLoaded && selectedCount > 0 {
+	if walk {
 		var err error
 		stateHash, selected, err = folderCorpusState(ctx, plan)
 		if err != nil {
@@ -320,7 +295,7 @@ func ensureFolderCorpusFreshWithExecution(
 			lineage := plan.semanticFolderLineage()
 			_ = writeCacheFile(plan.cacheDir, semanticLineageFile, lineage)
 			semanticErr = runSemanticBuild(ctx, execution.model, func(embedder semanticModel) error {
-				_, err := buildSemanticFolderGeneration(
+				return buildSemanticFolderGeneration(
 					ctx,
 					selected,
 					plan.indexDir,
@@ -331,7 +306,6 @@ func ensureFolderCorpusFreshWithExecution(
 					embedder,
 					execution.resources,
 				)
-				return err
 			})
 			semanticBuilt = semanticErr == nil
 		}
@@ -538,8 +512,7 @@ func indexFolderDocumentsDelta(
 		markers[i] = unreadFileMarker
 	}
 	if manifest, ok := readFolderManifest(plan.cacheDir, cachedState); ok {
-		tombstoned = manifest.DeadBytes + folderManifestTombstonedBytes(selected, manifest)
-		folderManifestMarkers(selected, manifest, markers)
+		tombstoned = manifest.DeadBytes + folderManifestDiff(selected, manifest, markers)
 		if deltaNeedsCompaction(tombstoned, folderLiveBytes(selected, markers)) {
 			return false, 0, nil, errDeltaCompaction
 		}
@@ -609,25 +582,36 @@ func folderLiveBytesWithNames(selected []folderCandidate, markers []int64) int64
 	return live
 }
 
-// folderManifestMarkers copies the marker of each unchanged manifest entry to
-// markers, by index of selected. A changed file keeps its marker of
-// unreadFileMarker until it is read. Both slices are sorted by name.
-func folderManifestMarkers(selected []folderCandidate, manifest folderManifest, markers []int64) {
+// folderManifestDiff compares selected with the manifest in one pass; both
+// are sorted by name. It copies the marker of each unchanged entry to markers,
+// by index of selected. A changed file keeps its marker of unreadFileMarker
+// until it is read. It returns the held bytes of the entries that a delta to
+// selected tombstones: each changed and each removed file. It reads no file.
+func folderManifestDiff(selected []folderCandidate, manifest folderManifest, markers []int64) int64 {
+	var tombstoned int64
 	selectedIndex, manifestIndex := 0, 0
 	for selectedIndex < len(selected) && manifestIndex < len(manifest.Files) {
-		switch candidate, old := selected[selectedIndex], manifest.Files[manifestIndex]; {
+		candidate, old := selected[selectedIndex], manifest.Files[manifestIndex]
+		switch {
 		case candidate.name == old.Name:
 			if folderManifestFileMatchesCandidate(old, candidate) {
 				markers[selectedIndex] = old.Marker
+			} else {
+				tombstoned += old.heldBytes()
 			}
 			selectedIndex++
 			manifestIndex++
 		case candidate.name < old.Name:
 			selectedIndex++
 		default:
+			tombstoned += old.heldBytes()
 			manifestIndex++
 		}
 	}
+	for _, old := range manifest.Files[manifestIndex:] {
+		tombstoned += old.heldBytes()
+	}
+	return tombstoned
 }
 
 // setFolderMarkers sets the marker of each read document in markers, by index
@@ -645,34 +629,6 @@ func setFolderMarkers(selected []folderCandidate, docs []fileContent, markers []
 			markers[i] = marker
 		}
 	}
-}
-
-// folderManifestTombstonedBytes returns the held bytes of the manifest entries
-// that a delta to selected tombstones: each changed and each removed file. It
-// reads no file. Both slices are sorted by name.
-func folderManifestTombstonedBytes(selected []folderCandidate, manifest folderManifest) int64 {
-	var tombstoned int64
-	selectedIndex, manifestIndex := 0, 0
-	for selectedIndex < len(selected) && manifestIndex < len(manifest.Files) {
-		candidate, old := selected[selectedIndex], manifest.Files[manifestIndex]
-		switch {
-		case candidate.name == old.Name:
-			if !folderManifestFileMatchesCandidate(old, candidate) {
-				tombstoned += old.heldBytes()
-			}
-			selectedIndex++
-			manifestIndex++
-		case candidate.name < old.Name:
-			selectedIndex++
-		default:
-			tombstoned += old.heldBytes()
-			manifestIndex++
-		}
-	}
-	for ; manifestIndex < len(manifest.Files); manifestIndex++ {
-		tombstoned += manifest.Files[manifestIndex].heldBytes()
-	}
-	return tombstoned
 }
 
 // enumerateIndexedFolderChecksums returns the content checksum of each live
@@ -811,18 +767,11 @@ type folderManifestEntry struct {
 	Marker int64 `json:"marker,omitempty"`
 }
 
-// heldBytes is the content bytes that the shard document of the file holds.
-// That is the NOT-INDEXED marker for a file kept by name only, else its size.
+// heldBytes is the content bytes that the shard document of the file holds
+// (shardHeldBytes). writeFolderManifest stores no negative marker, so a
+// negative marker of a damaged manifest counts as none.
 func (file folderManifestEntry) heldBytes() int64 {
-	switch {
-	case file.Marker > 0:
-		return file.Marker
-	case file.Dataless:
-		return notIndexedMarkerBytes(seekNoBytesReason)
-	case !documentContentFits(file.Size):
-		return notIndexedMarkerBytes(index.SkipReasonTooLarge)
-	}
-	return file.Size
+	return shardHeldBytes(max(file.Marker, 0), file.Size, file.Dataless)
 }
 
 // readFolderManifest reads the folder manifest of cacheDir. It reports false
@@ -839,9 +788,9 @@ func readFolderManifest(cacheDir, expectedState string) (folderManifest, bool) {
 	return manifest, manifest.Version == folderManifestVersion && manifest.State == expectedState
 }
 
-// writeFolderManifest writes the manifest of selected, with deadBytes and,
-// when set, the marker bytes of each file by index. It stores an
-// unreadFileMarker as zero, because a manifest never stores that value.
+// writeFolderManifest writes the manifest of selected, with deadBytes and the
+// marker bytes of each file by index. It stores an unreadFileMarker as zero,
+// because a manifest never stores that value.
 func writeFolderManifest(cacheDir, state string, selected []folderCandidate, deadBytes int64, markers []int64) error {
 	manifest := folderManifest{
 		Version:   folderManifestVersion,
@@ -859,9 +808,7 @@ func writeFolderManifest(cacheDir, state string, selected []folderCandidate, dea
 			Dev:      candidate.dev,
 			Ino:      candidate.ino,
 			Dataless: candidate.dataless,
-		}
-		if markers != nil {
-			manifest.Files[i].Marker = max(markers[i], 0)
+			Marker:   max(markers[i], 0),
 		}
 	}
 	path := filepath.Join(cacheDir, folderManifestFileName)
@@ -977,7 +924,7 @@ func newFolderCandidate(name, path string, info os.FileInfo) folderCandidate {
 	}
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
 		candidate.ctime = statCtimeNano(*st)
-		candidate.dataless = statDatalessFlags(uint32(statFlags(*st)))
+		candidate.dataless = statDatalessFlags(statFlags(*st))
 	}
 	return candidate
 }
@@ -986,7 +933,7 @@ func newFolderCandidate(name, path string, info os.FileInfo) folderCandidate {
 // info. With no Stat_t, it returns zeros and the ModTime.
 func fileInfoIdentity(info os.FileInfo) (uint64, uint64, int64) {
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		return uint64(st.Dev), uint64(st.Ino), statMtimeNano(*st)
+		return uint64(st.Dev), st.Ino, statMtimeNano(*st)
 	}
 	return 0, 0, info.ModTime().UnixNano()
 }
@@ -1065,9 +1012,9 @@ func appendFolderFingerprintBytes(h *xxhash.Digest, part []byte) {
 // stream. The build then publishes nothing, so the next search reads the file
 // again.
 //
-// When markers is set, it also sets the marker bytes of each sent document by
-// index of candidates (nameOnlyMarkerBytes). Each worker writes its own
-// indexes, and the channel closes after every worker ends.
+// It also sets markers[i], the marker bytes of the document of candidates[i]
+// (nameOnlyMarkerBytes). Each worker writes its own indexes, and the channel
+// closes after every worker ends.
 func streamFolderFilesWithMarkers(
 	ctx context.Context,
 	candidates []folderCandidate,
@@ -1081,30 +1028,23 @@ func streamFolderFilesWithMarkers(
 
 	var wg sync.WaitGroup
 	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for i := range work {
 				if ctx.Err() != nil {
 					continue
 				}
-				marker := readOneFolderFileStreaming(ctx, candidates[i], out, fail)
-				if markers != nil {
-					markers[i] = marker
-				}
+				markers[i] = readOneFolderFileStreaming(ctx, candidates[i], out, fail)
 			}
-		}()
+		})
 	}
 
 	go func() {
+	feed:
 		for i := range candidates {
 			select {
 			case work <- i:
 			case <-ctx.Done():
-				close(work)
-				wg.Wait()
-				close(out)
-				return
+				break feed
 			}
 		}
 		close(work)

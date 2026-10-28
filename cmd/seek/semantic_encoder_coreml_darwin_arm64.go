@@ -205,8 +205,8 @@ func lateOnRunProbe(
 
 // providerArtifactTouchInterval bounds how often a search rewrites the
 // providerArtifactUsedFile marker. It lives here, apart from the name it
-// bounds, because this file holds the only writer. provider_artifact.go
-// compiles on every target, and there the interval would be unused.
+// bounds, because this file holds the only writer. gc.go compiles on every
+// target, and there the interval would be unused.
 const providerArtifactTouchInterval = 24 * time.Hour
 
 // touchProviderArtifactUse records that this compiled model is still wanted.

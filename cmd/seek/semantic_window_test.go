@@ -53,13 +53,17 @@ func TestLongUnitEmbedsEveryWindow(t *testing.T) {
 	documents := make(chan fileContent, 1)
 	documents <- makeFileContent(t, "long.go", content)
 	close(documents)
-	manifest, err := buildSemanticGeneration(
-		t.Context(), filepath.Join(t.TempDir(), "semantic"), "source-long", embedder, searchResources{},
+	dir := filepath.Join(t.TempDir(), "semantic")
+	if err := buildSemanticGeneration(
+		t.Context(), dir, "source-long", embedder, searchResources{},
 		func(context.Context) (<-chan fileContent, func() error) {
 			return documents, func() error { return nil }
 		},
-		nil,
-	)
+		&semanticReuseIndex{},
+	); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := readSemanticManifest(dir, "source-long")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,9 +384,7 @@ func TestScorerDocumentsNameTheModelPathBase(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		scorer.mu.Lock()
-		documents := slices.Clone(scorer.documents)
-		scorer.mu.Unlock()
+		documents := scorer.documents()
 		paths := map[string]bool{}
 		for _, document := range documents {
 			paths[document.Path] = true

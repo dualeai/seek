@@ -51,7 +51,7 @@ func semanticHostAvailableMemory() int64 {
 			}
 		}
 	}
-	if pages <= 0 || pageBytes <= 0 || pages > (1<<63-1)/pageBytes {
+	if pages <= 0 || pages > (1<<63-1)/pageBytes {
 		return 0
 	}
 	return pages * pageBytes

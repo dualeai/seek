@@ -67,7 +67,7 @@ func BenchmarkCLIProcess(b *testing.B) {
 	// querySupport rows T36 and T41). So the command starts no model. It
 	// matches the "()" of every fixture function.
 	ineligibleArgs := []string{`\(\)`, fixture}
-	if plan, err := planQuery(ineligibleArgs[0], defaultSearchPolicy()); err != nil || plan.model != nil {
+	if plan, err := planQuery(ineligibleArgs[0], semanticSearch); err != nil || plan.model != nil {
 		b.Fatalf("%q plans a model route: model=%t err=%v", ineligibleArgs[0], plan.model != nil, err)
 	}
 	eligibleArgs := []string{queryText, fixture}
@@ -254,7 +254,6 @@ func benchmarkLateOnScoring(b *testing.B, documentCount int) {
 // model inference, and the production coarse and fine vector calculation.
 func BenchmarkSemanticModelPass100k(b *testing.B) {
 	b.Setenv("SEEK_CACHE_DIR", b.TempDir())
-	b.StopTimer()
 	scorer, err := newLateOnSemanticModel(b.Context())
 	if err != nil {
 		b.Fatal(err)
@@ -283,8 +282,6 @@ func BenchmarkSemanticModelPass100k(b *testing.B) {
 		b.Fatalf("warm semantic model: vectors=%d error=%v", len(vectors), err)
 	}
 	callCPUs := embedder.SemanticCallCPUs(b.Context())
-	b.ResetTimer()
-	b.StartTimer()
 
 	for b.Loop() {
 		b.StopTimer()
@@ -385,21 +382,39 @@ func BenchmarkLateOnRuntimeCache(b *testing.B) {
 				b.Fatal(err)
 			}
 			b.StartTimer()
-			if _, installed, err := ensureLateOnRuntime(bundle); err != nil || !installed {
-				b.Fatalf("cold runtime: installed=%t err=%v", installed, err)
+			path, err := ensureLateOnRuntime(bundle)
+			if err != nil {
+				b.Fatalf("cold runtime: %v", err)
 			}
+			b.StopTimer()
+			// The cache held no runtime, so a file at path is a new install.
+			if _, err := os.Stat(path); err != nil {
+				b.Fatalf("cold runtime not installed: %v", err)
+			}
+			b.StartTimer()
 		}
 	})
 	b.Run("Warm", func(b *testing.B) {
 		b.Setenv("SEEK_CACHE_DIR", b.TempDir())
-		if _, installed, err := ensureLateOnRuntime(bundle); err != nil || !installed {
-			b.Fatalf("prepare runtime: installed=%t err=%v", installed, err)
+		path, err := ensureLateOnRuntime(bundle)
+		if err != nil {
+			b.Fatalf("prepare runtime: %v", err)
+		}
+		installed, err := os.Stat(path)
+		if err != nil {
+			b.Fatal(err)
 		}
 		b.ReportAllocs()
 		for b.Loop() {
-			if _, installed, err := ensureLateOnRuntime(bundle); err != nil || installed {
-				b.Fatalf("warm runtime: installed=%t err=%v", installed, err)
+			if _, err := ensureLateOnRuntime(bundle); err != nil {
+				b.Fatalf("warm runtime: %v", err)
 			}
+			// An install renames a new file over the path.
+			b.StopTimer()
+			if warm, err := os.Stat(path); err != nil || !os.SameFile(installed, warm) {
+				b.Fatalf("warm runtime installed again: err=%v", err)
+			}
+			b.StartTimer()
 		}
 	})
 }

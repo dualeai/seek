@@ -135,10 +135,8 @@ func (r *nodeRead) damage(err error) error {
 	if !errors.Is(err, errShardUnloadable) {
 		return err
 	}
-	manifest, statErr := os.Stat(filepath.Join(r.plan.indexDir, familyManifestFile))
-	if statErr != nil {
-		manifest = nil
-	}
+	// os.Stat gives a nil FileInfo with its error: no manifest.
+	manifest, _ := os.Stat(filepath.Join(r.plan.indexDir, familyManifestFile))
 	return &shardDamage{err: err, manifest: manifest}
 }
 

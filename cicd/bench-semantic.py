@@ -96,8 +96,8 @@ def require_tool(name: str) -> str:
     return path
 
 
-def output(command: list[str], *, cwd: Path | None = None) -> str:
-    result = subprocess.run(command, cwd=cwd, text=True, capture_output=True)
+def output(command: list[str]) -> str:
+    result = subprocess.run(command, text=True, capture_output=True)
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         stop(f"command failed: {' '.join(command)}{': ' + detail if detail else ''}")
@@ -174,13 +174,11 @@ def run_to_files(
     stdout_path: Path,
     stderr_path: Path,
     *,
-    cwd: Path | None = None,
-    env: dict[str, str] | None = None,
+    env: dict[str, str],
 ) -> int:
     with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
         return subprocess.run(
             command,
-            cwd=cwd,
             env=env,
             stdout=stdout_file,
             stderr=stderr_file,
@@ -413,8 +411,7 @@ def steady_cpu(
     windows = [
         weighted[bucket] / covered[bucket]
         for bucket in sorted(weighted)
-        if bucket * 5 >= 5
-        and bucket * 5 + 5 <= end_limit
+        if bucket * 5 + 5 <= end_limit
         and covered[bucket] >= 4.5
     ]
     return steady, windows
@@ -765,12 +762,11 @@ def main() -> int:
         ]
         if calibration_line is None or not zoekt_lines or calibration_line >= zoekt_lines[-1]:
             stop(f"sample {sample} did not prove overlapping Zoekt and semantic work", 1)
-        log = "\n".join(log_lines)
-        if re.search(r"Semantic .*failed|Joined search failed|Re-ranking failed", log):
+        if re.search(r"Semantic .*failed|Joined search failed|Re-ranking failed", sample_log):
             stop(
                 f"sample {sample} used a fallback path; see {run_dir / 'command.stderr'}", 1
             )
-        if 'msg="Searched semantic index" backend=usearch' not in log:
+        if 'msg="Searched semantic index" backend=usearch' not in sample_log:
             stop(f"sample {sample} did not use USearch for semantic retrieval", 1)
         if len(list(corpora.rglob(".joined-v1"))) != 1 or len(
             list(corpora.glob("**/semantic-*/manifest.json"))

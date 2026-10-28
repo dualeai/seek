@@ -253,10 +253,7 @@ func semanticUSearchShardID(
 	compatibility string,
 	plan semanticUSearchShardPlan,
 	coarse semanticCoarseSet,
-) (string, error) {
-	if uint64(coarse.Len()) != plan.rows {
-		return "", fmt.Errorf("USearch shard has %d coarse rows, want %d", coarse.Len(), plan.rows)
-	}
+) string {
 	hash := sha256.New()
 	writeSemanticHashField(hash, []byte("seek-usearch-shard-v1"))
 	writeSemanticHashField(hash, []byte(compatibility))
@@ -265,13 +262,10 @@ func semanticUSearchShardID(
 	binary.LittleEndian.PutUint64(count[:], plan.rows)
 	_, _ = hash.Write(count[:])
 	for row := range coarse.Len() {
-		vectors, ok := coarse.At(row)
-		if !ok {
-			return "", fmt.Errorf("semantic embedding row %d is missing", row)
-		}
+		vectors := coarse.At(row)
 		_, _ = hash.Write(unsafe.Slice((*byte)(unsafe.Pointer(vectors)), unsafe.Sizeof(*vectors)))
 	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 // semanticUSearchShardSource is a graph shard of a published generation that

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -32,10 +31,10 @@ func TestFix_NoShardGapDuringReindexing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx := context.Background()
-	paths, plan := planGitTestCorpus(t, dir)
+	ctx := t.Context()
+	_, plan := planGitTestCorpus(t, dir)
 
-	results, err := runSeekInPlannedGitCorpus(ctx, "uncommitted_v1", paths, plan)
+	results, err := runSeekInPlannedGitCorpus(ctx, "uncommitted_v1", plan)
 	if err != nil {
 		t.Fatalf("initial search failed: %v", err)
 	}
@@ -47,7 +46,7 @@ func TestFix_NoShardGapDuringReindexing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	results, err = runSeekInPlannedGitCorpus(ctx, "uncommitted_v2", paths, plan)
+	results, err = runSeekInPlannedGitCorpus(ctx, "uncommitted_v2", plan)
 	if err != nil {
 		t.Fatalf("post-reindex search failed: %v", err)
 	}
@@ -55,7 +54,7 @@ func TestFix_NoShardGapDuringReindexing(t *testing.T) {
 		t.Fatal("FIX FAILED: uncommitted_v2 not findable after re-indexing")
 	}
 
-	results, err = runSeekInPlannedGitCorpus(ctx, "uncommitted_v1", paths, plan)
+	results, err = runSeekInPlannedGitCorpus(ctx, "uncommitted_v1", plan)
 	if err != nil {
 		t.Fatalf("old marker search failed: %v", err)
 	}
@@ -97,7 +96,7 @@ func TestFix_SharedLockBlocksSearchDuringIndexing(t *testing.T) {
 			unlockFile(f)
 			_ = f.Close()
 		}()
-		err = acquireReadLock(context.Background(), f)
+		err = acquireReadLock(t.Context(), f)
 		acquiredAfterRelease.Store(released.Load())
 		done <- err
 	}()
@@ -140,18 +139,13 @@ func TestFix_ConcurrentSearchDuringReindex_Stress(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	gitRun(t, dir, "add", ".")
-	gitRun(t, dir, "commit", "-m", "add changing fixtures")
+	gitRunIn(t, dir, "add", ".")
+	gitRunIn(t, dir, "commit", "-m", "add changing fixtures")
 
-	ctx := context.Background()
+	ctx := t.Context()
 	paths, plan := planGitTestCorpus(t, dir)
 
-	// Initial index
-	state := mustGitRepoStateIn(t, ctx, dir)
-	currentState := gitCorpusStateHash(paths, state)
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, currentState); err != nil {
-		t.Fatalf("initial indexing: %v", err)
-	}
+	reindexGit(t, ctx, paths, plan)
 
 	// Verify baseline
 	results, err := searchPlannedCorpusForTest(ctx, plan, "always_findable_fix_test")
@@ -159,73 +153,46 @@ func TestFix_ConcurrentSearchDuringReindex_Stress(t *testing.T) {
 		t.Fatal("precondition: committed content must be findable")
 	}
 
-	var missedContent atomic.Int64
-	var searchErrors atomic.Int64
-	indexErrors := make(chan error, 1)
-	recordIndexError := func(err error) {
-		select {
-		case indexErrors <- err:
-		default:
-		}
-	}
-
+	// The writer and the searches report with t.Errorf, which is safe in any
+	// goroutine.
 	var wg sync.WaitGroup
 	start := make(chan struct{})
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		<-start
 		for iter := range iterations {
 			marker := fmt.Sprintf("uncommitted_fix_iter_%d", iter)
 			content := fmt.Sprintf("package main\n// %s\n", marker)
 			if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("changing_%d.go", iter)), []byte(content), 0o644); err != nil {
-				recordIndexError(fmt.Errorf("write dirty fixture %q: %w", marker, err))
+				t.Errorf("FIX REGRESSION: write dirty fixture %q: %v", marker, err)
 				return
 			}
 			state, err := gitRepoStateIn(ctx, dir)
 			if err != nil {
-				recordIndexError(fmt.Errorf("read repository state for %q: %w", marker, err))
+				t.Errorf("FIX REGRESSION: read repository state for %q: %v", marker, err)
 				return
 			}
-			currentState := gitCorpusStateHash(paths, state)
-			if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, currentState); err != nil {
-				recordIndexError(fmt.Errorf("refresh dirty fixture %q: %w", marker, err))
+			if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, gitCorpusStateHash(paths, state)); err != nil {
+				t.Errorf("FIX REGRESSION: concurrent indexing of %q failed: %v", marker, err)
 				return
 			}
 		}
-	}()
-
+	})
 	for range iterations {
 		wg.Go(func() {
 			<-start
 			res, err := searchPlannedCorpusForTest(ctx, plan, "always_findable_fix_test")
 			if err != nil {
-				searchErrors.Add(1)
-				return
-			}
-			if len(res) == 0 {
-				missedContent.Add(1)
+				t.Errorf("FIX REGRESSION: a search during reindexing failed: %v", err)
+			} else if len(res) == 0 {
+				t.Error("FIX REGRESSION: a search missed committed content during concurrent reindexing")
 			}
 		})
 	}
 	close(start)
 	wg.Wait()
 
-	if missedContent.Load() > 0 {
-		t.Errorf("FIX REGRESSION: %d/%d searches missed committed content during concurrent reindexing",
-			missedContent.Load(), iterations)
-	}
-	if searchErrors.Load() > 0 {
-		t.Errorf("FIX REGRESSION: %d searches returned errors", searchErrors.Load())
-	}
-	select {
-	case err := <-indexErrors:
-		t.Errorf("FIX REGRESSION: concurrent indexing failed: %v", err)
-	default:
-	}
-
 	latestMarker := fmt.Sprintf("uncommitted_fix_iter_%d", iterations-1)
-	latestFiles, err := runSeekInPlannedGitCorpus(ctx, latestMarker, paths, plan)
+	latestFiles, err := runSeekInPlannedGitCorpus(ctx, latestMarker, plan)
 	if err != nil {
 		t.Fatalf("final dirty search failed: %v", err)
 	}
@@ -250,13 +217,10 @@ func TestFix_ConcurrentSearchDuringReindex_Stress(t *testing.T) {
 func TestFix_ConcurrentSearchDuringCommittedSwap(t *testing.T) {
 	requireTools(t)
 	dir := initGitRepo(t, "stable.go", "package main\n// always_committed_marker\n")
-	ctx := context.Background()
+	ctx := t.Context()
 	paths, plan := planGitTestCorpus(t, dir)
 
-	st := mustGitRepoStateIn(t, ctx, dir)
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, st, gitCorpusStateHash(paths, st)); err != nil {
-		t.Fatalf("initial committed index: %v", err)
-	}
+	reindexGit(t, ctx, paths, plan)
 	markerFIFO := filepath.Join(plan.cacheDir, swappingMarkerFile+".tmp")
 	manifestFIFO := filepath.Join(plan.indexDir, familyManifestFile+".tmp")
 	for _, fifo := range []string{markerFIFO, manifestFIFO} {
@@ -273,7 +237,7 @@ func TestFix_ConcurrentSearchDuringCommittedSwap(t *testing.T) {
 	s := mustGitRepoStateIn(t, ctx, dir)
 	built := make(chan error, 1)
 	go func() {
-		built <- runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, s, gitCorpusStateHash(paths, s))
+		built <- runIndexingWithCache(ctx, paths, plan.corpusStore, s, gitCorpusStateHash(paths, s))
 	}()
 	select {
 	case <-waiting:
@@ -386,7 +350,7 @@ func TestDescriptionReadDuringRepublish_Stress(t *testing.T) {
 	writeFileAt(t, dir, "dirty.go", "package main\n// dirty\n")
 	paths, plan := planGitTestCorpus(t, dir)
 	execution := testSemanticSearchExecution(t, modelFactory(&hybridTestScorer{mode: payloadAccept}))
-	qp, err := planQuery("zqstress anchor file:go", defaultSearchPolicy())
+	qp, err := planQuery("zqstress anchor file:go", semanticSearch)
 	if err != nil || qp.model == nil || len(qp.model.filters) == 0 {
 		t.Fatalf("the query must plan a filtered model route: err=%v", err)
 	}
@@ -531,16 +495,9 @@ func TestGC_SkipsCorpusWithBuildInProgress(t *testing.T) {
 	dir := seedCorpus(t, root, fakeCorpusHash(91), time.Now().Add(-30*24*time.Hour))
 
 	// Simulate an in-flight builder holding the build lock.
-	bf, err := os.OpenFile(filepath.Join(dir, buildLockFile), os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { unlockFile(bf); _ = bf.Close() }()
-	if err := lockFileExclusive(bf); err != nil {
-		t.Fatalf("hold build lock: %v", err)
-	}
+	holdBuildLock(t, dir)
 
-	runGC(context.Background(), gcOptions{})
+	runGC(t.Context(), gcOptions{})
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("corpus with build in progress must survive gc, got %v", err)
@@ -583,15 +540,7 @@ func TestEvictionDuringBuildPerKind(t *testing.T) {
 			var release func()
 			wait, waitLock := lockWaitBuild, filepath.Join(cacheDir, buildLockFile)
 			if kind == "git" {
-				if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-					t.Fatal(err)
-				}
-				lock, held, err := tryBuildLock(cacheDir)
-				if err != nil || !held {
-					t.Fatalf("hold the build lock: held=%t err=%v", held, err)
-				}
-				release = sync.OnceFunc(func() { releaseLock(lock) })
-				t.Cleanup(release)
+				release = holdBuildLock(t, cacheDir)
 			} else {
 				if _, err := search(); err != nil {
 					t.Fatal(err)

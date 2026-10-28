@@ -298,10 +298,7 @@ func (e *ctagsUnavailableError) Error() string {
 	if e.command != "" {
 		return fmt.Sprintf("cannot use CTAGS_COMMAND=%q: %v", e.command, e.cause)
 	}
-	if e.cause != nil {
-		return fmt.Sprintf("universal-ctags executable not found: %v", e.cause)
-	}
-	return "universal-ctags executable not found"
+	return fmt.Sprintf("universal-ctags executable not found: %v", e.cause)
 }
 
 func (e *ctagsUnavailableError) Unwrap() error {
@@ -450,7 +447,7 @@ func (g *gitNode) buildLocked(
 		vectors: execution.buildsVectors(state.HeadSHA),
 		// A dirty node also binds the overlay of its dirty files.
 		overlay:    execution.buildsOverlay(hasDirty),
-		semanticOn: execution.policy.semanticEnabled(),
+		semanticOn: execution.policy == semanticSearch,
 	}
 	baseSource, overlaySource := "", ""
 	if in.vectors {
@@ -494,7 +491,7 @@ func (g *gitNode) buildLocked(
 	// Build Zoekt and semantic data together outside the publish lock. Each
 	// branch reads the same captured commit through its own bounded Git stream.
 	var buildDir string
-	var nextCommittedState *committedGitState
+	var nextCommittedState committedGitState
 	if build.buildDir() {
 		buildDir, err = newBuildDir(indexDir)
 		if err != nil {
@@ -502,15 +499,11 @@ func (g *gitNode) buildLocked(
 		}
 		defer discardBuildDir(buildDir)
 	}
-	var snapshot gitSnapshot
+	var snapshot gitObjectID
 	var lexicalMissing, semanticMissing []missingBlob
 	if build.snapshot() {
-		var ok bool
-		snapshot, ok, err = captureGitSnapshot(state.HeadSHA)
-		if err != nil || !ok {
-			if err == nil {
-				err = fmt.Errorf("captured committed Git state has no commit")
-			}
+		snapshot, err = captureGitSnapshot(state.HeadSHA)
+		if err != nil {
 			deleteStateFiles(cacheDir)
 			return gitCorpusError(repoDir, indexDir, err)
 		}
@@ -544,7 +537,7 @@ func (g *gitNode) buildLocked(
 			_ = writeCacheFile(cacheDir, semanticLineageFile, lineage)
 			semanticErr = runSemanticBuild(ctx, execution.model, func(embedder semanticModel) error {
 				if build.semantic {
-					if _, err := buildSemanticGitGeneration(
+					if err := buildSemanticGitGeneration(
 						ctx,
 						repoDir,
 						snapshot,
@@ -566,7 +559,7 @@ func (g *gitNode) buildLocked(
 					if semanticBuilt {
 						base = semanticStaging
 					}
-					if _, err := buildSemanticOverlayGeneration(
+					if err := buildSemanticOverlayGeneration(
 						ctx,
 						repoDir,
 						indexDir,
@@ -592,7 +585,7 @@ func (g *gitNode) buildLocked(
 		// The commit disappeared after git status captured it: no build can
 		// read it, so the next search must build again.
 		deleteStateFiles(cacheDir)
-		return gitCorpusError(repoDir, indexDir, fmt.Errorf("captured Git commit %s is missing: %w", snapshot.commitOID, buildErr))
+		return gitCorpusError(repoDir, indexDir, fmt.Errorf("captured Git commit %s is missing: %w", snapshot, buildErr))
 	}
 	if lexicalErr != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -705,10 +698,7 @@ func (g *gitNode) buildLocked(
 		}
 		committedRecorded = true
 		if build.committed {
-			if nextCommittedState == nil {
-				return false, fmt.Errorf("committed Git build did not return publication state")
-			}
-			if err := writeCommittedGitState(cacheDir, *nextCommittedState); err != nil {
+			if err := writeCommittedGitState(cacheDir, nextCommittedState); err != nil {
 				return false, fmt.Errorf("write committed Git state: %w", err)
 			}
 			if err := writeMissingBlobRecord(cacheDir, lexicalMissingBlobsFile, missingBlobRecord{
@@ -861,11 +851,11 @@ func buildCommittedGitStage(
 	repoDir string,
 	store corpusStore,
 	buildDir string,
-	snapshot gitSnapshot,
+	snapshot gitObjectID,
 	scan familyScan,
 	parallelism int,
 	arrival missingBlobArrival,
-) (*committedGitState, []missingBlob, error) {
+) (committedGitState, []missingBlob, error) {
 	// A delta reads only the changed paths, so a blob that arrived for an
 	// unchanged path needs the full build.
 	if !arrival.lexical {
@@ -877,7 +867,7 @@ func buildCommittedGitStage(
 			scan,
 		)
 		if err != nil {
-			return nil, nil, err
+			return committedGitState{}, nil, err
 		}
 		if eligible {
 			err := indexNativeGitDelta(
@@ -892,11 +882,10 @@ func buildCommittedGitStage(
 			case err == nil:
 				// The seed keeps the name-only files of the base paths that
 				// the delta did not change, so the record keeps their blobs.
-				state := delta.nextState
-				return &state, deltaMissingBlobs(arrival.lexicalCarry, delta.changedPaths, delta.targetInfos), nil
+				return delta.nextState, deltaMissingBlobs(arrival.lexicalCarry, delta.changedPaths, delta.targetInfos), nil
 			case !errors.Is(err, errNativeDeltaFallback):
 				// A cancel, or a Git read error that a full build reads again.
-				return nil, nil, err
+				return committedGitState{}, nil, err
 			}
 			// The delta's seed links or its Builder failed: build the family
 			// in full, from an empty build directory.
@@ -907,15 +896,15 @@ func buildCommittedGitStage(
 	var missing []missingBlob
 	liveBytes, err := indexNativeGitFull(ctx, repoDir, buildDir, snapshot, parallelism, &missing)
 	if err != nil {
-		return nil, nil, err
+		return committedGitState{}, nil, err
 	}
 	buildScan, err := scanFamily(buildDir)
 	if err != nil {
-		return nil, nil, err
+		return committedGitState{}, nil, err
 	}
-	return &committedGitState{
-		head:       snapshot.commitOID,
-		baseHead:   snapshot.commitOID,
+	return committedGitState{
+		head:       snapshot,
+		baseHead:   snapshot,
 		baseShards: nativeCommittedShardCount(buildScan),
 		liveBytes:  liveBytes,
 	}, missing, nil
@@ -1084,8 +1073,8 @@ func readOneDirtyFile(ctx context.Context, repoDir, f string, out chan<- fileCon
 	}
 
 	// Use Lstat to avoid following symlinks.
-	fi, err := dirtyLstat(srcPath)
-	if err != nil {
+	var st unix.Stat_t
+	if err := dirtyLstat(srcPath, &st); err != nil {
 		failed(err)
 		return
 	}
@@ -1093,18 +1082,17 @@ func readOneDirtyFile(ctx context.Context, repoDir, f string, out chan<- fileCon
 	// Only process regular files: skip directories, symlinks, FIFOs,
 	// sockets, and devices, which can block a read or hold unexpected
 	// data.
-	if !fi.Mode().IsRegular() {
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
 		return
 	}
 
 	// A cloud-only file is never opened: the open would download it.
-	var st unix.Stat_t
-	if unix.Lstat(srcPath, &st) == nil && fileIsDataless(f, &st) {
+	if fileIsDataless(f, &st) {
 		sendNameOnly(ctx, out, f, seekNoBytesReason)
 		return
 	}
 
-	size := fi.Size()
+	size := st.Size
 	if !documentContentFits(size) {
 		// Send the name without content or weight: Zoekt stores its
 		// NOT-INDEXED marker, and the name stays searchable.
@@ -1308,8 +1296,22 @@ func onlyKept(changed []string, manifest uncommittedManifest) bool {
 // file-system state shows these reads.
 var (
 	dirtyOpenFile = openWorkTreeFile
-	dirtyLstat    = os.Lstat
+	dirtyLstat    = lstatWorkTreeFile
 )
+
+// lstatWorkTreeFile stats path into st with no symlink follow. One stat gives
+// the file type, the size and the cloud-only flag. As os.Lstat does, it tries
+// again after EINTR and puts the path in the error.
+func lstatWorkTreeFile(path string, st *unix.Stat_t) error {
+	err := unix.Lstat(path, st)
+	for errors.Is(err, unix.EINTR) {
+		err = unix.Lstat(path, st)
+	}
+	if err != nil {
+		return &fs.PathError{Op: "lstat", Path: path, Err: err}
+	}
+	return nil
+}
 
 // errNotRegularFile reports a work-tree path that is no longer a regular file
 // when it is opened. A FIFO, socket, device, directory or symlink replaced the
@@ -1357,8 +1359,10 @@ func openWorkTreeFile(path string) (*os.File, error) {
 	return file, nil
 }
 
+// fileReadWorkerCount returns the reader count for items files: parallelism,
+// at least one, and no more than the files.
 func fileReadWorkerCount(parallelism, items int) int {
-	return min(max(parallelism, 1), max(items, 0))
+	return min(max(parallelism, 1), items)
 }
 
 // indexUncommitted publishes the dirty files of state into the "uncommitted"
@@ -1383,17 +1387,15 @@ func indexUncommitted(
 	if prebuilt != nil {
 		return prebuilt.publish(store, preState)
 	}
-	entries := uncommittedManifestEntries(delta.candidates)
-	copyUncommittedMarkers(entries, delta.manifest)
 	if len(delta.changed) == 0 {
 		// No dirty file changed (a HEAD change, a vector build): the family
 		// stays, whatever its shard count.
-		if err := writeUncommittedManifest(store.cacheDir, preState, entries, delta.tombstoned); err != nil {
+		if err := writeUncommittedManifest(store.cacheDir, preState, delta.entries, delta.tombstoned); err != nil {
 			slog.Debug("Failed to refresh uncommitted manifest", "error", err)
 		}
 		return nil
 	}
-	err := tryUncommittedDelta(ctx, repoDir, store, delta, preState, entries, parallelism)
+	err := tryUncommittedDelta(ctx, repoDir, store, delta, preState, parallelism)
 	if err == nil {
 		return nil
 	}
@@ -1422,13 +1424,14 @@ func indexUncommitted(
 }
 
 // uncommittedDelta is a change that the live uncommitted family can take. It
-// holds the manifest of the cached state, the dirty files' stats, the files to
-// read, and the changed paths. tombstoned is the content that deltas
+// holds the manifest of the cached state, the files to read, and the changed
+// paths. entries are the manifest entries of the dirty files, each with the
+// marker of copyUncommittedMarkers. tombstoned is the content that deltas
 // tombstoned since the last full build, with this delta.
 type uncommittedDelta struct {
 	tombstoned int64
 	manifest   uncommittedManifest
-	candidates []uncommittedCandidate
+	entries    []uncommittedManifestEntry
 	toRead     []uncommittedCandidate
 	changed    []string
 }
@@ -1475,9 +1478,11 @@ func uncommittedDeltaPossible(ctx context.Context, repoDir string, store corpusS
 	}
 	candidates := statUncommittedCandidates(repoDir, files)
 	toRead, changed, tombstoned := diffUncommittedAgainstManifest(candidates, manifest)
+	entries := uncommittedManifestEntries(candidates)
+	copyUncommittedMarkers(entries, manifest)
 	delta := &uncommittedDelta{
 		manifest:   manifest,
-		candidates: candidates,
+		entries:    entries,
 		toRead:     toRead,
 		changed:    changed,
 		tombstoned: manifest.DeadBytes + tombstoned,
@@ -1495,9 +1500,7 @@ func uncommittedDeltaPossible(ctx context.Context, repoDir string, store corpusS
 	// Before the reads, each changed file counts at an upper bound of its
 	// shard bytes (unreadFileMarker); tryUncommittedDelta checks again with
 	// the read bytes.
-	live := uncommittedManifestEntries(candidates)
-	copyUncommittedMarkers(live, manifest)
-	if deltaNeedsCompaction(delta.tombstoned, uncommittedLiveBytes(live)) {
+	if deltaNeedsCompaction(delta.tombstoned, uncommittedLiveBytes(entries)) {
 		slog.Debug("Uncommitted deltas tombstoned as many bytes as the family holds; full rebuild")
 		return nil
 	}
@@ -1626,10 +1629,9 @@ func tryUncommittedDelta(
 	store corpusStore,
 	delta *uncommittedDelta,
 	preState string,
-	entries []uncommittedManifestEntry,
 	parallelism int,
 ) error {
-	cacheDir, indexDir := store.cacheDir, store.indexDir
+	cacheDir, indexDir, entries := store.cacheDir, store.indexDir, delta.entries
 	docs, noted, err := readUncommittedCandidates(ctx, repoDir, delta.toRead)
 	if err != nil {
 		// readUncommittedCandidates releases every weight before it returns
@@ -1681,25 +1683,19 @@ func tryUncommittedDelta(
 // The delta holds every document read here until its Finish. So two checks
 // keep the held weight below the build's window, and the global readSemaphore
 // cannot stay full:
-//   - Before the reads: when the sum of candidate.size (from the earlier
-//     lstat) reaches the window, it returns at once and starts no reader.
+//   - Before the reads: uncommittedDeltaPossible gives no delta when the sum
+//     of candidate.size (from the earlier lstat) reaches the window.
 //   - During the reads: when the weight of the documents read reaches the
 //     window, it cancels the inner context. The workers stop at their next
-//     Acquire, and it releases the weight of every document.
+//     Acquire, and it releases the weight of every document. This check also
+//     sees a file that grew after its lstat.
 //
-// Both checks return errDeltaPayloadExceedsWindow. tryUncommittedDelta
+// The second check returns errDeltaPayloadExceedsWindow. tryUncommittedDelta
 // returns it, and indexUncommitted then builds the family in full
 // (buildUncommittedStage).
 func readUncommittedCandidates(ctx context.Context, repoDir string, candidates []uncommittedCandidate) ([]fileContent, error, error) {
 	if len(candidates) == 0 {
 		return nil, nil, nil
-	}
-	var preSum int64
-	for _, c := range candidates {
-		preSum += c.size
-		if preSum >= indexWindow(ctx) {
-			return nil, nil, errDeltaPayloadExceedsWindow
-		}
 	}
 	files := make([]string, len(candidates))
 	for i, c := range candidates {
@@ -1871,9 +1867,8 @@ func indexDocumentsWithRepository(
 			readSemaphore.Release(pendingWeight)
 			pendingWeight = 0
 		}
+		// openWindow sets currentLarge and largeDocuments again.
 		current = nil
-		currentLarge = false
-		largeDocuments = 0
 		return err
 	}
 

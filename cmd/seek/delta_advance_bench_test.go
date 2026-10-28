@@ -1,9 +1,9 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -38,14 +38,9 @@ func BenchmarkLargeRepo_CommittedAdvance(b *testing.B) {
 	chain := commits[1:]
 
 	repoDir := cloneBenchRepoAt(b, sourceRepo, base)
-	ctx := context.Background()
-	paths, plan := planGitTestCorpus(b, repoDir)
+	paths, plan := setupLargeRepoBench(b, repoDir)
+	ctx := b.Context()
 
-	if _, _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
-		b.Fatalf("cold base index: %v", err)
-	}
-
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		b.StopTimer()
 		// chain[0] is one commit ahead of base; advance through the chain.
@@ -54,7 +49,7 @@ func BenchmarkLargeRepo_CommittedAdvance(b *testing.B) {
 		idx := i % len(chain)
 		if idx == 0 && i > 0 {
 			gitRunIn(b, repoDir, "reset", "--hard", base)
-			if _, _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
+			if _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
 				b.Fatalf("chain replay base index: %v", err)
 			}
 		}
@@ -72,7 +67,7 @@ func BenchmarkLargeRepo_CommittedAdvance(b *testing.B) {
 		}
 		b.StartTimer()
 
-		if _, _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
+		if _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
 			b.Fatalf("delta advance index (iter %d): %v", i, err)
 		}
 		b.StopTimer()
@@ -90,11 +85,8 @@ func BenchmarkLargeRepo_CommittedAdvance(b *testing.B) {
 // one file again and again.
 func BenchmarkLargeRepo_UncommittedRealistic(b *testing.B) {
 	repoDir := cloneBenchRepoAt(b, requireBenchRepo(b), "HEAD")
-	ctx := context.Background()
-	paths, plan := planGitTestCorpus(b, repoDir)
-	if _, _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
-		b.Fatalf("initial indexing: %v", err)
-	}
+	paths, plan := setupLargeRepoBench(b, repoDir)
+	ctx := b.Context()
 
 	target := findSourceFiles(b, repoDir, 1)[0]
 	original, err := os.ReadFile(target)
@@ -103,15 +95,14 @@ func BenchmarkLargeRepo_UncommittedRealistic(b *testing.B) {
 	}
 
 	published := readStateFile(plan.cacheDir)
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		// Saves alternate in size, so a file system with whole-second times
 		// still sees each save.
-		body := fmt.Appendf(original[:len(original):len(original)], "\n// rapid_edit_marker_%09d%s\n", i, strings.Repeat("x", 1+i%2))
+		body := fmt.Appendf(slices.Clip(original), "\n// rapid_edit_marker_%09d%s\n", i, strings.Repeat("x", 1+i%2))
 		if err := os.WriteFile(target, body, 0o644); err != nil {
 			b.Fatal(err)
 		}
-		if _, _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
+		if _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
 			b.Fatalf("reindex iter %d: %v", i, err)
 		}
 		// Each save changes the dirty file's size or mtime, so the refresh

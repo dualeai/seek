@@ -33,7 +33,6 @@ func (model *cancellationTestModel) PrepareSemanticQuery(
 	text string,
 ) (*semanticQueryEmbedding, error) {
 	if model.failureStage == "prepare" {
-		model.prepareCalls.Add(1)
 		return nil, model.fail()
 	}
 	return model.hybridTestScorer.PrepareSemanticQuery(ctx, text)
@@ -44,7 +43,6 @@ func (model *cancellationTestModel) ScoresWithSemanticQuery(
 	*semanticQueryEmbedding,
 	[]rerankDocument,
 ) ([]float32, error) {
-	model.scoreCalls.Add(1)
 	return nil, model.fail()
 }
 
@@ -73,18 +71,18 @@ func TestRunSearchCommandLexicalModelCancellation(t *testing.T) {
 
 				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
-				model := &cancellationTestModel{
-					hybridTestScorer: hybridTestScorer{embedErr: errRerankUnavailable},
-					failureStage:     stage,
+				model := observeModel(&cancellationTestModel{
+					embedErr:     errRerankUnavailable,
+					failureStage: stage,
 					fail: func() error {
 						if cancelled {
 							cancel()
 						}
 						return errors.New("fake model failure")
 					},
-				}
+				})
 				output, err := captureStdout(t, func() error {
-					return seekRoot(ctx, t, modelFactory(model), "alpha beta", strict, relaxed)
+					return seekRoot(ctx, t, model.factory(), "alpha beta", strict, relaxed)
 				})
 				// The output shows the route: a cancelled command prints
 				// nothing and returns the cancellation; an ordinary model
@@ -100,9 +98,9 @@ func TestRunSearchCommandLexicalModelCancellation(t *testing.T) {
 				if stage == "score" {
 					wantScores = 1
 				}
-				if model.prepareCalls.Load() != 1 || model.scoreCalls.Load() != wantScores || model.closeCalls.Load() != 1 {
+				if model.prepares.Load() != 1 || model.scores.Load() != wantScores || model.closes.Load() != 1 {
 					t.Errorf("model calls: prepare=%d score=%d close=%d, want 1/%d/1",
-						model.prepareCalls.Load(), model.scoreCalls.Load(), model.closeCalls.Load(), wantScores)
+						model.prepares.Load(), model.scores.Load(), model.closes.Load(), wantScores)
 				}
 			})
 		}

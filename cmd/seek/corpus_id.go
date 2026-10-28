@@ -40,11 +40,7 @@ func newCorpusID(parts ...string) corpusID {
 // decide the shard content. A change of one gives a new corpus ID and a new
 // Git state hash.
 func indexOptionsHash() string {
-	return hashParts(indexOptionsParts()...)
-}
-
-func indexOptionsParts() []string {
-	return []string{
+	return hashParts(
 		"ctags_must_succeed", "true",
 		// TrigramMax always equals SizeMax (indexBuildOptions), so size_max
 		// covers both.
@@ -52,7 +48,7 @@ func indexOptionsParts() []string {
 		"shard_max", strconv.Itoa(shardMax),
 		"document_naming", seekDocumentNamingVersion,
 		"zoekt_compatibility", zoektCompatibilityVersion,
-	}
+	)
 }
 
 // gitCorpusFingerprint is the input of a Git node's state hash. It joins its

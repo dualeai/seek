@@ -787,3 +787,30 @@ func fakeGitPathsForPlanTest(t testing.TB, repoDir string) gitPaths {
 	}
 	return gitPaths{RepoDir: absRepoDir, CommonDir: gitDir}
 }
+
+// TestPathWithinMatchesRelWithin checks that pathWithin and relWithin give the
+// same containment, also for the file-system root "/" and for a sibling whose
+// name starts with the root name.
+func TestPathWithinMatchesRelWithin(t *testing.T) {
+	for _, tc := range []struct {
+		root, path string
+		want       bool
+	}{
+		{"/", "/", true},
+		{"/", "/a", true},
+		{"/", "/a/b", true},
+		{"/a", "/a", true},
+		{"/a", "/a/b", true},
+		{"/a", "/ab", false},
+		{"/a", "/", false},
+		{"/a/b", "/a", false},
+		{"/a", "/b/a", false},
+	} {
+		if got := pathWithin(tc.root, tc.path); got != tc.want {
+			t.Errorf("pathWithin(%q, %q)=%t, want %t", tc.root, tc.path, got, tc.want)
+		}
+		if _, got := relWithin(tc.root, tc.path); got != tc.want {
+			t.Errorf("relWithin(%q, %q) inside=%t, want %t", tc.root, tc.path, got, tc.want)
+		}
+	}
+}

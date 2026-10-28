@@ -44,7 +44,8 @@ type rerankDocument struct {
 	Path     string
 	Language string
 	Symbol   string
-	Text     string
+	// Text is valid UTF-8: each producer replaces invalid bytes with U+FFFD.
+	Text string
 	// matchAt and matchEnd are byte offsets in Text.
 	matchAt  int
 	matchEnd int
@@ -52,6 +53,15 @@ type rerankDocument struct {
 	// the model reads the path that the window header of its rows names.
 	modelBase string
 }
+
+// searchPolicy selects the search stages of one command. A semanticSearch
+// query also uses the model; --lexical-only selects lexicalOnlySearch.
+type searchPolicy bool
+
+const (
+	lexicalOnlySearch searchPolicy = false
+	semanticSearch    searchPolicy = true
+)
 
 // searchRunConfig is the search policy and the model factory of one command.
 type searchRunConfig struct {
@@ -516,11 +526,7 @@ func serializeLateOnDocumentWithMatch(
 	if len(header) > maxRerankDocumentBytes/4 {
 		header = rerankUTF8Prefix(header, maxRerankDocumentBytes/4)
 	}
-	text, matchAt, matchEnd := rerankValidTextSpan(
-		document.Text,
-		document.matchAt,
-		document.matchEnd,
-	)
+	text, matchAt, matchEnd := document.Text, document.matchAt, document.matchEnd
 	bodyStart, bodyEnd := rerankTextWindowBounds(
 		text,
 		matchAt,
@@ -548,14 +554,6 @@ func rerankPathTail(value string) string {
 		}
 	}
 	return value[at+1:]
-}
-
-func rerankValidTextSpan(text string, matchAt, matchEnd int) (string, int, int) {
-	if utf8.ValidString(text) {
-		return text, matchAt, matchEnd
-	}
-	text = strings.ToValidUTF8(text, "\uFFFD")
-	return text, 0, len(text)
 }
 
 func rerankTextWindowBounds(text string, matchAt, matchEnd, limit int) (int, int) {

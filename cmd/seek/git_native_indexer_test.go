@@ -13,12 +13,12 @@ import (
 	"github.com/sourcegraph/zoekt"
 )
 
-func captureHeadForTest(t *testing.T, repoDir string) gitSnapshot {
+func captureHeadForTest(t *testing.T, repoDir string) gitObjectID {
 	t.Helper()
 	head := gitOutputIn(t, repoDir, "rev-parse", "HEAD")
-	snapshot, ok, err := captureGitSnapshot(head)
-	if err != nil || !ok {
-		t.Fatalf("capture HEAD: ok=%t error=%v", ok, err)
+	snapshot, err := captureGitSnapshot(head)
+	if err != nil {
+		t.Fatalf("capture HEAD: %v", err)
 	}
 	return snapshot
 }
@@ -26,9 +26,6 @@ func captureHeadForTest(t *testing.T, repoDir string) gitSnapshot {
 func TestCaptureGitSnapshotAndRepositoryMetadata(t *testing.T) {
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
-	if _, _, err := captureGitSnapshot("no-head"); err != nil {
-		t.Fatalf("capture unborn snapshot: %v", err)
-	}
 	if err := os.WriteFile(filepath.Join(repoDir, "main.go"), []byte("package main\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -42,12 +39,12 @@ func TestCaptureGitSnapshotAndRepositoryMetadata(t *testing.T) {
 	gitRunIn(t, repoDir, "config", "remote.origin.url", "git@github.com:sourcegraph/zoekt.git")
 
 	head := gitOutputIn(t, repoDir, "rev-parse", "HEAD")
-	snapshot, ok, err := captureGitSnapshot(head)
-	if err != nil || !ok {
-		t.Fatalf("capture snapshot: ok=%t error=%v", ok, err)
+	snapshot, err := captureGitSnapshot(head)
+	if err != nil {
+		t.Fatalf("capture snapshot: %v", err)
 	}
-	if snapshot.commitOID.String() != head {
-		t.Fatalf("snapshot commit=%s, want %s", snapshot.commitOID, head)
+	if snapshot.String() != head {
+		t.Fatalf("snapshot commit=%s, want %s", snapshot, head)
 	}
 	want := zoekt.Repository{
 		Name:     fallbackGitRepositoryName(repoDir),
@@ -64,7 +61,7 @@ func TestCaptureGitSnapshotAndRepositoryMetadata(t *testing.T) {
 // missing commit.
 func TestCaptureGitSnapshotRejectsMalformedCommit(t *testing.T) {
 	for _, captured := range []string{"short", "ABCDEF0123456789ABCDEF0123456789ABCDEF01"} {
-		if _, _, err := captureGitSnapshot(captured); err == nil {
+		if _, err := captureGitSnapshot(captured); err == nil {
 			t.Fatalf("capture %q succeeded", captured)
 		}
 	}
@@ -84,7 +81,7 @@ func TestGitBuildWithAMissingCapturedCommitFails(t *testing.T) {
 	state := mustGitRepoStateIn(t, t.Context(), repoDir)
 	// A well-formed ID of no object in the repository.
 	state.HeadSHA = strings.Repeat("0", len(state.HeadSHA)-1) + "1"
-	err := runIndexingWithCache(t.Context(), paths, plan.cacheDir, plan.indexDir, state, gitCorpusStateHash(paths, state))
+	err := runIndexingWithCache(t.Context(), paths, plan.corpusStore, state, gitCorpusStateHash(paths, state))
 	if err == nil {
 		t.Fatal("the build of a missing commit succeeded")
 	}
@@ -111,9 +108,9 @@ func TestNativeGitSHA256FullAndDelta(t *testing.T) {
 	if len(head) != 64 {
 		t.Fatalf("SHA-256 HEAD has %d bytes", len(head))
 	}
-	snapshot, ok, err := captureGitSnapshot(head)
-	if err != nil || !ok || snapshot.commitOID.String() != head {
-		t.Fatalf("capture SHA-256: snapshot=%+v ok=%t error=%v", snapshot, ok, err)
+	snapshot, err := captureGitSnapshot(head)
+	if err != nil || snapshot.String() != head {
+		t.Fatalf("capture SHA-256: snapshot=%+v error=%v", snapshot, err)
 	}
 
 	paths, plan := planGitTestCorpus(t, repoDir)
@@ -168,7 +165,7 @@ func TestNativeGitFullKeepsHeadInEveryShard(t *testing.T) {
 	snapshot := captureHeadForTest(t, repoDir)
 	// Each document is about 45 bytes: below this target, so no document
 	// fills a shard alone, and each shard holds two documents.
-	swapShardMaxForTest(t, 64)
+	swapForTest(t, &shardMax, 64)
 
 	indexDir := t.TempDir()
 	if _, err := indexNativeGitFull(t.Context(), repoDir, indexDir, snapshot, 1, nil); err != nil {
@@ -186,7 +183,7 @@ func TestNativeGitFullKeepsHeadInEveryShard(t *testing.T) {
 	}
 	for _, repository := range zoektCommittedRepositoryMetadata(t, indexDir) {
 		if len(repository.Branches) != 1 || repository.Branches[0].Name != "HEAD" ||
-			repository.Branches[0].Version != snapshot.commitOID.String() {
+			repository.Branches[0].Version != snapshot.String() {
 			t.Fatalf("shard metadata=%+v", repository)
 		}
 	}

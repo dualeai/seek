@@ -338,9 +338,12 @@ func TestLateOnTokenizerSanitizesNativeStringInputs(t *testing.T) {
 	if strings.ContainsRune(sanitized, '\x00') || !utf8.ValidString(sanitized) {
 		t.Fatalf("sanitized input is not a valid native string: %q", sanitized)
 	}
+	// A document text is valid UTF-8 (rerankDocument.Text), but it can hold a
+	// NUL byte, which a native string cannot.
+	text := "before\x00needle\uFFFDafter"
 	ids, err := encodeLateOnDocument(
 		tokenizer,
-		rerankDocument{Text: input, matchEnd: len(input)},
+		rerankDocument{Text: text, matchEnd: len(text)},
 		lateOnSequenceLength,
 	)
 	if err != nil || len(ids) == 0 {
@@ -439,26 +442,42 @@ func TestLateOnRuntimeCacheLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	path, installed, err := ensureLateOnRuntime(bundle)
-	if err != nil || !installed {
-		t.Fatalf("cold extraction: path=%q installed=%t err=%v", path, installed, err)
+	path, err := ensureLateOnRuntime(bundle)
+	if err != nil {
+		t.Fatalf("cold extraction: %v", err)
 	}
 	gotRuntime, err := os.ReadFile(path)
 	if err != nil || !bytes.Equal(gotRuntime, wantRuntime) {
 		t.Fatalf("cold runtime bytes differ: err=%v", err)
 	}
-	warmPath, installed, err := ensureLateOnRuntime(bundle)
-	if err != nil || installed || warmPath != path {
-		t.Fatalf("warm extraction: path=%q installed=%t err=%v", warmPath, installed, err)
+	// An install renames a new file over the path, so the file identity
+	// tells an install from a valid file that stays in place.
+	cold, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	warmPath, err := ensureLateOnRuntime(bundle)
+	if err != nil || warmPath != path {
+		t.Fatalf("warm extraction: path=%q err=%v", warmPath, err)
+	}
+	if warm, err := os.Stat(path); err != nil || !os.SameFile(cold, warm) {
+		t.Fatalf("warm extraction installed the runtime again: err=%v", err)
 	}
 	corruptRuntime := bytes.Clone(wantRuntime)
 	corruptRuntime[len(corruptRuntime)/2] ^= 0xff
 	if err := os.WriteFile(path, corruptRuntime, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	repairedPath, installed, err := ensureLateOnRuntime(bundle)
-	if err != nil || !installed || repairedPath != path {
-		t.Fatalf("repair: path=%q installed=%t err=%v", repairedPath, installed, err)
+	corrupt, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairedPath, err := ensureLateOnRuntime(bundle)
+	if err != nil || repairedPath != path {
+		t.Fatalf("repair: path=%q err=%v", repairedPath, err)
+	}
+	if repaired, err := os.Stat(path); err != nil || os.SameFile(corrupt, repaired) {
+		t.Fatalf("repair did not install a new runtime: err=%v", err)
 	}
 	gotRuntime, err = os.ReadFile(path)
 	if err != nil || !bytes.Equal(gotRuntime, wantRuntime) {
@@ -499,9 +518,18 @@ func TestLateOnRuntimeCacheAcrossProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	path, installed, err := ensureLateOnRuntime(bundle)
-	if err != nil || installed {
-		t.Fatalf("concurrent extraction did not leave a warm runtime: path=%q installed=%t err=%v", path, installed, err)
+	wantPath := filepath.Join(cache, rerankerDir, bundle.version, bundle.sha256, bundle.fileName)
+	extracted, err := os.Stat(wantPath)
+	if err != nil {
+		t.Fatalf("concurrent extraction left no runtime: %v", err)
+	}
+	path, err := ensureLateOnRuntime(bundle)
+	if err != nil || path != wantPath {
+		t.Fatalf("warm extraction: path=%q, want %q, err=%v", path, wantPath, err)
+	}
+	// A new install renames a new file over the path.
+	if warm, err := os.Stat(path); err != nil || !os.SameFile(extracted, warm) {
+		t.Fatalf("concurrent extraction did not leave a warm runtime: err=%v", err)
 	}
 	wantRuntime, err := decodeLateOnAsset(bundle.compressed)
 	if err != nil {
@@ -521,7 +549,7 @@ func TestLateOnRuntimeExtractHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := ensureLateOnRuntime(bundle); err != nil {
+	if _, err := ensureLateOnRuntime(bundle); err != nil {
 		t.Fatal(err)
 	}
 }

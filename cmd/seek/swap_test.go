@@ -22,10 +22,10 @@ func TestTempSwap_RecoversFromIncompleteSwap(t *testing.T) {
 
 	dir := initGitRepo(t, "app.go", "package main\n// RECOVER_MARKER\n")
 	ctx := context.Background()
-	paths, plan := planGitTestCorpus(t, dir)
+	_, plan := planGitTestCorpus(t, dir)
 
 	// Initial build.
-	if files, err := runSeekInPlannedGitCorpus(ctx, "RECOVER_MARKER", paths, plan); err != nil || len(files) == 0 {
+	if files, err := runSeekInPlannedGitCorpus(ctx, "RECOVER_MARKER", plan); err != nil || len(files) == 0 {
 		t.Fatalf("initial build: files=%v err=%v", files, err)
 	}
 	if _, ok := readCommittedGitState(plan.cacheDir); !ok {
@@ -37,7 +37,7 @@ func TestTempSwap_RecoversFromIncompleteSwap(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	files, err := runSeekInPlannedGitCorpus(ctx, "RECOVER_MARKER", paths, plan)
+	files, err := runSeekInPlannedGitCorpus(ctx, "RECOVER_MARKER", plan)
 	if err != nil {
 		t.Fatalf("search after incomplete-swap recovery: %v", err)
 	}
@@ -105,9 +105,9 @@ func TestTempSwap_CommittedDeltaKeepsPriorShards(t *testing.T) {
 
 	dir := initGitRepo(t, "a.go", "package main\n// DELTA_BASE\n")
 	ctx := context.Background()
-	paths, plan := planGitTestCorpus(t, dir)
+	_, plan := planGitTestCorpus(t, dir)
 
-	if _, err := runSeekInPlannedGitCorpus(ctx, "DELTA_BASE", paths, plan); err != nil {
+	if _, err := runSeekInPlannedGitCorpus(ctx, "DELTA_BASE", plan); err != nil {
 		t.Fatalf("initial build: %v", err)
 	}
 	base := committedShardCount(t, plan.indexDir)
@@ -117,11 +117,11 @@ func TestTempSwap_CommittedDeltaKeepsPriorShards(t *testing.T) {
 
 	// A new commit adds a file, so the committed build adds a delta shard.
 	writeTrackedFile(t, dir, "b.go", "package main\n// DELTA_NEXT\n")
-	if files, err := runSeekInPlannedGitCorpus(ctx, "DELTA_NEXT", paths, plan); err != nil || len(files) == 0 {
+	if files, err := runSeekInPlannedGitCorpus(ctx, "DELTA_NEXT", plan); err != nil || len(files) == 0 {
 		t.Fatalf("delta rebuild: files=%v err=%v", files, err)
 	}
 	// The delta builds on the linked shards, so the old content stays.
-	if files, err := runSeekInPlannedGitCorpus(ctx, "DELTA_BASE", paths, plan); err != nil || len(files) == 0 {
+	if files, err := runSeekInPlannedGitCorpus(ctx, "DELTA_BASE", plan); err != nil || len(files) == 0 {
 		t.Fatalf("base content lost after delta rebuild: files=%v err=%v", files, err)
 	}
 	if got := committedShardCount(t, plan.indexDir); got <= base {
@@ -199,7 +199,7 @@ func TestTempSwap_ReaderExcludedFromTornWindow(t *testing.T) {
 	paths, plan := planGitTestCorpus(t, dir)
 
 	st := mustGitRepoStateIn(t, ctx, dir)
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, st, gitCorpusStateHash(paths, st)); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, st, gitCorpusStateHash(paths, st)); err != nil {
 		t.Fatalf("initial build: %v", err)
 	}
 	_, waiting := captureTestLogsWithSignal(t, slog.LevelWarn, lockWaitPublish, filepath.Join(plan.cacheDir, lockFile))
@@ -277,7 +277,7 @@ func TestPublishStepFailureKeepsTheLiveFamily(t *testing.T) {
 	} {
 		t.Run(test.kind, func(t *testing.T) {
 			setTestUserCache(t)
-			swapShardMaxForTest(t, 4096)
+			swapForTest(t, &shardMax, 4096)
 			root := t.TempDir()
 			write := func(index int, marker string) {
 				writeFileAt(t, root, fmt.Sprintf("f%d.txt", index), marker+"\n"+strings.Repeat(fmt.Sprintf("fill %d of the torn swap fixture\n", index), 128))

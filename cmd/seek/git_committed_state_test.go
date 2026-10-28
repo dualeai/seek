@@ -215,12 +215,7 @@ func TestCommittedGitDeltaRunsNoRecursiveLsTree(t *testing.T) {
 	// The shim rejects only a recursive ls-tree, the full-tree command, and
 	// passes every other Git call to the real Git. This checks the process
 	// boundary without copying the delta accounting algorithm into the test.
-	realGit, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
-	shimDir := t.TempDir()
-	shim := "#!/bin/sh\n" + gitShimSubcommand + `recursive=false
+	installGitShim(t, `recursive=false
 for arg do
   if [ "$arg" = -r ]; then
     recursive=true
@@ -231,12 +226,7 @@ if [ "$subcommand" = ls-tree ] && [ "$recursive" = true ]; then
   exit 43
 fi
 exec "$SEEK_TEST_REAL_GIT" "$@"
-`
-	if err := os.WriteFile(filepath.Join(shimDir, "git"), []byte(shim), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("SEEK_TEST_REAL_GIT", realGit)
-	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+`)
 	probe := exec.Command("git", "--literal-pathspecs", "--no-pager", "--no-replace-objects", "ls-tree", "-r", "HEAD")
 	probe.Dir = repoDir
 	if err := probe.Run(); err == nil {

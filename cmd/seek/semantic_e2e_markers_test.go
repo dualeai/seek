@@ -42,7 +42,7 @@ func e2eMarkerText(t *testing.T, word string, operands ...string) string {
 // e2eMarkerSearch runs query on operands with stubSearch in accept mode. It
 // also fails the test on an error other than no match, because some tests of
 // this file read only the output of a search.
-func e2eMarkerSearch(t *testing.T, query string, operands ...string) (string, *hybridTestScorer, error) {
+func e2eMarkerSearch(t *testing.T, query string, operands ...string) (string, *observedModel, error) {
 	t.Helper()
 	output, scorer, err := stubSearch(t, payloadAccept, slices.Concat([]string{query}, operands)...)
 	if err != nil && !errors.Is(err, errNoMatch) {
@@ -53,12 +53,10 @@ func e2eMarkerSearch(t *testing.T, query string, operands ...string) (string, *h
 
 // e2eMarkerModelPaths returns the sorted, distinct node-relative paths that
 // the test model embedded and scored.
-func e2eMarkerModelPaths(scorer *hybridTestScorer) (embedded, scored []string) {
-	scorer.mu.Lock()
-	defer scorer.mu.Unlock()
-	embedded = slices.Clone(scorer.embeddedPaths)
+func e2eMarkerModelPaths(scorer *observedModel) (embedded, scored []string) {
+	embedded = scorer.unitPaths()
 	slices.Sort(embedded)
-	return slices.Compact(embedded), slices.Compact(documentPaths(scorer.documents))
+	return slices.Compact(embedded), slices.Compact(documentPaths(scorer.documents()))
 }
 
 // e2eMarkerSameBlocks fails the test unless the text oracle prints at least
@@ -120,8 +118,8 @@ func TestE2EMarkerUncommittedTagOnDirtyVectorHits(t *testing.T) {
 	}
 	e2eMarkerSameBlocks(t, "cold", cold, e2eMarkerText(t, "zqtagmark", repo))
 	warm, scorer, _ := e2eMarkerSearch(t, e2eMarkerQuery, repo)
-	if warm != cold || scorer.embedCalls.Load() != 0 {
-		t.Fatalf("warm search embeds %d batches or differs:\ncold:\n%s\nwarm:\n%s", scorer.embedCalls.Load(), cold, warm)
+	if warm != cold || scorer.embeds.Load() != 0 {
+		t.Fatalf("warm search embeds %d batches or differs:\ncold:\n%s\nwarm:\n%s", scorer.embeds.Load(), cold, warm)
 	}
 }
 
@@ -190,9 +188,7 @@ func TestE2EMarkerDirtyCommittedRowsNeverPrint(t *testing.T) {
 		if _, scored := e2eMarkerModelPaths(scorer); !slices.Equal(scored, []string{"clean.go", "edited.go", "gitmv_new.go", "mv_new.go"}) {
 			t.Fatalf("%s: the model scored %q, want only the current files", label, scored)
 		}
-		scorer.mu.Lock()
-		defer scorer.mu.Unlock()
-		for _, document := range scorer.documents {
+		for _, document := range scorer.documents() {
 			if strings.Contains(document.Text, "zqoldtext") {
 				t.Fatalf("%s: the model scored the committed copy of %s:\n%s", label, document.Path, document.Text)
 			}
@@ -315,9 +311,7 @@ func TestE2EMarkerVectorOnlyDuplicatesCollapse(t *testing.T) {
 	}
 	// One document for each printed result: one of the 4 copies and the
 	// edited copy.
-	scorer.mu.Lock()
-	documents := slices.Clone(scorer.documents)
-	scorer.mu.Unlock()
+	documents := scorer.documents()
 	shared := slices.IndexFunc(documents, func(document rerankDocument) bool {
 		return strings.Contains(document.Text, "zqdupmark shared")
 	})
@@ -341,7 +335,7 @@ func TestE2EMarkerVectorOnlyDuplicatesCollapse(t *testing.T) {
 // as the text search does.
 func TestE2EMarkerNameOnlyFilesNeverReachTheModel(t *testing.T) {
 	requireTools(t)
-	swapDocumentContentLimitForTest(t, 12<<10)
+	swapForTest(t, &documentContentLimit, 12<<10)
 	f := newGraphFixture(t)
 	big := "zqnamemark " + strings.Repeat("large text ", 1300) + "\n"
 	// The NUL byte is after the probe of readContent: only the full check
@@ -616,8 +610,8 @@ func TestE2EMarkerCommitMovesTheBaseAndTheOverlay(t *testing.T) {
 	gitRunIn(t, repo, "add", ".")
 	gitRunIn(t, repo, "commit", "-q", "-m", "second")
 	committed := step("second commit", []string{header("changed.go", ""), header("new.go", ""), header("stay.go", "")})
-	if warm, scorer, _ := e2eMarkerSearch(t, e2eMarkerQuery, repo); warm != committed || scorer.embedCalls.Load() != 0 {
-		t.Fatalf("warm search embeds %d batches or differs:\n%s", scorer.embedCalls.Load(), warm)
+	if warm, scorer, _ := e2eMarkerSearch(t, e2eMarkerQuery, repo); warm != committed || scorer.embeds.Load() != 0 {
+		t.Fatalf("warm search embeds %d batches or differs:\n%s", scorer.embeds.Load(), warm)
 	}
 }
 

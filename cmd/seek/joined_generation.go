@@ -14,8 +14,10 @@ import (
 )
 
 const (
-	joinedGenerationFile     = ".joined-v1"
-	joinedGenerationVersion  = 2
+	joinedGenerationFile    = ".joined-v1"
+	joinedGenerationVersion = 2
+	// joinedGenerationMaxBytes bounds the read of a damaged descriptor. A
+	// descriptor that Seek writes holds only short hashes, far below it.
 	joinedGenerationMaxBytes = 16 << 10
 )
 
@@ -126,9 +128,6 @@ func (store corpusStore) writeJoinedGenerations(
 		return err
 	}
 	content = append(content, '\n')
-	if len(content) > joinedGenerationMaxBytes {
-		return fmt.Errorf("joined generation descriptor is too large")
-	}
 	return writeCacheFile(store.cacheDir, joinedGenerationFile, string(content))
 }
 

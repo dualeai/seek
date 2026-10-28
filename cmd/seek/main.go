@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -336,12 +335,6 @@ func useColor(f *os.File) bool {
 	return term.IsTerminal(int(f.Fd()))
 }
 
-// touchPlanUsed marks the corpus as used: scoped and unscoped searches of one
-// repository read one index, so both keep it recent for LRU eviction.
-func touchPlanUsed(plan node) {
-	touchUsed(plan.cacheDir)
-}
-
 func dirtyFileSetFromState(state repoState) dirtyFileSet {
 	if len(state.Files) == 0 {
 		return nil
@@ -357,24 +350,12 @@ func wrapCorpusResults(plan node, files []zoekt.FileMatch) []corpusSearchResult 
 	if len(files) == 0 {
 		return nil
 	}
-	var selected map[string]struct{}
-	if len(plan.selectedFiles) > 0 {
-		selected = make(map[string]struct{}, len(plan.selectedFiles))
-		for _, name := range plan.selectedFiles {
-			selected[name] = struct{}{}
-		}
-	}
 	results := make([]corpusSearchResult, len(files))
 	for i, file := range files {
-		displayName := file.FileName
-		if _, ok := selected[file.FileName]; ok {
-			displayName = filepath.Base(file.FileName)
-		}
 		results[i] = corpusSearchResult{
 			corpusID:    plan.id,
 			kind:        plan.kind,
 			displayRoot: plan.displayRoot,
-			displayName: displayName,
 			file:        file,
 			modelBase:   plan.modelPathBase(),
 		}

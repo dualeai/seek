@@ -155,31 +155,20 @@ func TestCollectSemanticBatchesWritesRowsAtOffsets(t *testing.T) {
 // TestCollectSemanticBatchesRejectsInvalidInput checks that each of these
 // inputs fails the build and cancels it:
 //   - a row written twice, or a missing row;
-//   - a batch with mismatched embeddings, or an empty or oversize batch;
-//   - a NaN vector;
-//   - a copied row with no source.
+//   - a batch with mismatched embeddings;
+//   - a NaN vector.
 func TestCollectSemanticBatchesRejectsInvalidInput(t *testing.T) {
 	mismatched := testEmbeddedBatch([]uint64{0, 1}, semanticVector{0: 1})
 	mismatched.embeddings = mismatched.embeddings[:1]
-	oversize := make([]uint64, semanticModelBatchRows+1)
-	for row := range oversize {
-		oversize[row] = uint64(row)
-	}
 	invalid := testEmbeddedBatch([]uint64{0}, semanticVector{0: float32(math.NaN())})
-	for name, test := range map[string]struct {
-		batches []semanticEncodedBatch
-		copies  [][]semanticCopiedRow
-	}{
-		"twice":      {batches: []semanticEncodedBatch{testEmbeddedBatch([]uint64{0}, semanticVector{0: 1}), testEmbeddedBatch([]uint64{0}, semanticVector{0: 1})}},
-		"missing":    {batches: []semanticEncodedBatch{testEmbeddedBatch([]uint64{0, 2}, semanticVector{0: 1})}},
-		"mismatched": {batches: []semanticEncodedBatch{mismatched}},
-		"empty":      {batches: []semanticEncodedBatch{{}}},
-		"oversize":   {batches: []semanticEncodedBatch{testEmbeddedBatch(oversize, semanticVector{0: 1})}},
-		"invalid":    {batches: []semanticEncodedBatch{invalid}},
-		"copy ref":   {copies: [][]semanticCopiedRow{{{row: 0}}}},
+	for name, batches := range map[string][]semanticEncodedBatch{
+		"twice":      {testEmbeddedBatch([]uint64{0}, semanticVector{0: 1}), testEmbeddedBatch([]uint64{0}, semanticVector{0: 1})},
+		"missing":    {testEmbeddedBatch([]uint64{0, 2}, semanticVector{0: 1})},
+		"mismatched": {mismatched},
+		"invalid":    {invalid},
 	} {
 		t.Run(name, func(t *testing.T) {
-			output, _, ctxErr := collectTestRows(t, t.TempDir(), test.batches, test.copies)
+			output, _, ctxErr := collectTestRows(t, t.TempDir(), batches, nil)
 			if output.err == nil || !errors.Is(ctxErr, context.Canceled) {
 				t.Fatalf("err=%v ctx=%v, want a failed, canceled build", output.err, ctxErr)
 			}
@@ -541,7 +530,7 @@ func TestEncodeSemanticBatchesCancellationReleasesAllWeights(t *testing.T) {
 			owners: []*semanticBuildOwner{owner},
 		}
 	}
-	owner.seal()
+	owner.done()
 	close(batches)
 
 	wantErr := errors.New("model failed")
@@ -591,7 +580,7 @@ func TestBuildSemanticGenerationReleasesSourceWeightOnModelFailure(t *testing.T)
 	) ([]semanticUnitEmbedding, error) {
 		return nil, wantErr
 	}}
-	_, err := buildSemanticGeneration(
+	err := buildSemanticGeneration(
 		t.Context(),
 		filepath.Join(t.TempDir(), "semantic"),
 		"source-1",
@@ -600,7 +589,7 @@ func TestBuildSemanticGenerationReleasesSourceWeightOnModelFailure(t *testing.T)
 		func(context.Context) (<-chan fileContent, func() error) {
 			return documents, func() error { return nil }
 		},
-		nil,
+		&semanticReuseIndex{},
 	)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("semantic build error=%v, want %v", err, wantErr)
@@ -623,7 +612,7 @@ func TestBuildSemanticGenerationKeepsCollectorErrorAfterInternalCancellation(t *
 	) ([]semanticUnitEmbedding, error) {
 		return nil, errors.New("unexpected model call")
 	}}
-	_, err := buildSemanticGeneration(
+	err := buildSemanticGeneration(
 		t.Context(),
 		dir,
 		"source-collector-error",
@@ -637,7 +626,7 @@ func TestBuildSemanticGenerationKeepsCollectorErrorAfterInternalCancellation(t *
 			}()
 			return documents, ctx.Err
 		},
-		nil,
+		&semanticReuseIndex{},
 	)
 	if !errors.Is(err, os.ErrExist) {
 		t.Fatalf("semantic build error=%v, want existing vector file error", err)
@@ -672,10 +661,13 @@ func TestBuildSemanticGenerationHashesRawContent(t *testing.T) {
 		return embeddings, nil
 	}}
 	dir := filepath.Join(t.TempDir(), "semantic")
-	manifest, err := buildSemanticGeneration(t.Context(), dir, "source-raw", embedder, searchResources{},
+	if err := buildSemanticGeneration(t.Context(), dir, "source-raw", embedder, searchResources{},
 		func(context.Context) (<-chan fileContent, func() error) {
 			return documents, func() error { return nil }
-		}, nil)
+		}, &semanticReuseIndex{}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := readSemanticManifest(dir, "source-raw")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1043,7 +1035,7 @@ func TestBuildSemanticFolderGenerationFailsOnTransientRead(t *testing.T) {
 		return embeddings, nil
 	}}
 	dir := filepath.Join(t.TempDir(), "semantic")
-	_, err := buildSemanticFolderGeneration(t.Context(), selected, t.TempDir(), "", "", dir, "source", embedder, liveSearchResources())
+	err := buildSemanticFolderGeneration(t.Context(), selected, t.TempDir(), "", "", dir, "source", embedder, liveSearchResources())
 	if !errors.Is(err, syscall.EMFILE) {
 		t.Fatalf("err=%v, want EMFILE", err)
 	}

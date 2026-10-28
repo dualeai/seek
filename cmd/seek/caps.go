@@ -95,6 +95,8 @@ func withIndexWindow(ctx context.Context, nodes int) context.Context {
 // indexWindow is the window of a build under ctx: the window of its command,
 // or indexWindowBytes outside a command. A large-document window rotates at
 // it, a delta payload must stay below it, and a build slot takes two of it.
+// Every production build runs under runSearchCommand, so only tests that call
+// a build directly use indexWindowBytes.
 func indexWindow(ctx context.Context) int64 {
 	if window, ok := ctx.Value(indexWindowKey{}).(int64); ok {
 		return window

@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"runtime/debug"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"unicode"
@@ -629,20 +628,19 @@ func displayedContextFiles(files []zoekt.FileMatch, config searchConfig) map[int
 	for i := range files {
 		candidates[i] = i
 	}
-	sort.Slice(candidates, func(i, j int) bool {
-		left := files[candidates[i]]
-		right := files[candidates[j]]
-		if left.Score != right.Score {
-			return left.Score > right.Score
+	slices.SortFunc(candidates, func(i, j int) int {
+		left, right := &files[i], &files[j]
+		switch {
+		case left.Score > right.Score:
+			return -1
+		case left.Score < right.Score:
+			return 1
 		}
-		return left.FileName < right.FileName
+		return strings.Compare(left.FileName, right.FileName)
 	})
-	if len(candidates) > limit {
-		candidates = candidates[:limit]
-	}
 
-	selected := make(map[int]struct{}, len(candidates))
-	for _, index := range candidates {
+	selected := make(map[int]struct{}, limit)
+	for _, index := range candidates[:limit] {
 		selected[index] = struct{}{}
 	}
 	return selected

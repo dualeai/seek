@@ -257,7 +257,7 @@ func (b *nativeGitBatch) close() error {
 	}
 	closeErr := b.stdin.Close()
 	eofErr := readExactEOF(b.reader)
-	waitErr := waitNativeGitChild(b.ctx, b.execCmd, "git cat-file --batch-command", &b.stderr)
+	waitErr := gitCommandError(b.ctx, "git cat-file --batch-command", b.execCmd.Wait(), &b.stderr)
 	if waitErr != nil {
 		return waitErr
 	}

@@ -172,7 +172,7 @@ func (x *graphExpansion) expandGitNode(node *externalGitRoot) error {
 	inScope := node.childrenInScope()
 	x.mu.Unlock()
 	if err != nil {
-		return x.nodeError(node.paths.RepoDir, gitNodeError(x.ctx, node.paths, err))
+		return x.nodeError(node.paths.RepoDir, gitNodeError(node.paths, err))
 	}
 	for _, child := range inScope {
 		x.addGitChild(canonicalCorpusPath(node.paths.RepoDir), child)
@@ -181,12 +181,8 @@ func (x *graphExpansion) expandGitNode(node *externalGitRoot) error {
 }
 
 // gitNodeError gives a capture failure the same context as an index failure:
-// the work tree and its index directory. A canceled search keeps its context
-// error.
-func gitNodeError(ctx context.Context, paths gitPaths, err error) error {
-	if ctx.Err() != nil {
-		return err
-	}
+// the work tree and its index directory.
+func gitNodeError(paths gitPaths, err error) error {
 	indexDir := ""
 	if plan, planErr := buildGitCorpusPlan(paths.RepoDir, paths.CommonDir); planErr == nil {
 		indexDir = plan.indexDir
@@ -273,8 +269,14 @@ func (x *graphExpansion) plans() ([]node, error) {
 		plan.gitState = &capturedGitState{state: root.state}
 		plans = append(plans, plan)
 	}
+	byRoot := make(map[string][]*node, len(x.folders))
 	for _, plan := range x.folders {
-		if folderNodeCovered(*plan, x.folders) {
+		if plan.folder != nil {
+			byRoot[plan.root] = append(byRoot[plan.root], plan)
+		}
+	}
+	for _, plan := range x.folders {
+		if folderNodeCovered(plan, byRoot) {
 			continue
 		}
 		warnUnreadableFolders(*plan)
@@ -291,24 +293,40 @@ func (x *graphExpansion) plans() ([]node, error) {
 
 // folderNodeCovered reports whether the walk of another folder node reaches
 // the root of plan. The root must be below that node, and below no directory
-// that its walk did not enter.
-func folderNodeCovered(plan node, folders map[corpusID]*node) bool {
-	for _, other := range folders {
-		if other.id == plan.id || other.folder == nil || !pathWithin(other.root, plan.root) {
-			continue
-		}
-		reached := true
-		for dir := range other.folder.skipDirs {
-			if pathWithin(dir, plan.root) {
-				reached = false
-				break
+// that its walk did not enter. byRoot holds the captured folder nodes by root.
+// The check looks up only the paths that hold the root (pathHolders), so a
+// search with many file operands does not compare each node with all others.
+func folderNodeCovered(plan *node, byRoot map[string][]*node) bool {
+	holders := pathHolders(plan.root)
+	for _, root := range holders {
+		for _, other := range byRoot[root] {
+			if other.id == plan.id {
+				continue
 			}
-		}
-		if reached {
-			return true
+			if !slices.ContainsFunc(holders, func(dir string) bool {
+				_, skipped := other.folder.skipDirs[dir]
+				return skipped
+			}) {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// pathHolders returns every root that holds path (pathWithin): path itself,
+// each prefix of path that ends before a separator, and the root "/".
+func pathHolders(path string) []string {
+	holders := []string{path}
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i] == filepath.Separator {
+			holders = append(holders, path[:i])
+		}
+	}
+	if sep := string(filepath.Separator); path != sep && strings.HasPrefix(path, sep) {
+		holders = append(holders, sep)
+	}
+	return holders
 }
 
 // childrenInScope returns the captured children inside the operands of node
@@ -462,7 +480,7 @@ func foreignGitDir(dir string) (string, bool) {
 	switch {
 	case info.Mode()&os.ModeSymlink != 0:
 	case info.Mode().IsRegular():
-		if target, err = parseGitFilePointer(gitPath, dir); err != nil {
+		if target, err = parseGitFilePointer(gitPath); err != nil {
 			return "", false
 		}
 	case info.IsDir():

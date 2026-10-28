@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 )
 
@@ -64,7 +63,8 @@ func gitRepoStateIn(ctx context.Context, dir string) (repoState, error) {
 	if err != nil {
 		return repoState{}, err
 	}
-	return parseGitStatusV2Skipping(string(out), untrackedBareRepos(dir, string(out))), nil
+	raw := string(out)
+	return parseGitStatusV2Skipping(raw, untrackedBareRepos(dir, raw)), nil
 }
 
 // untrackedBareRepos returns the untracked directories of a work tree that are
@@ -201,22 +201,6 @@ const gitlinkMode = "160000"
 func v2Field(entry string, n int) string {
 	field, _, _ := strings.Cut(extractV2Path(entry, n), " ")
 	return field
-}
-
-func gitVersionOutputAtLeast(out []byte, major, minor int) bool {
-	// Parse "git version 2.43.0" or "git version 2.43.0.windows.1"
-	s := strings.TrimSpace(string(out))
-	s = strings.TrimPrefix(s, "git version ")
-	parts := strings.SplitN(s, ".", 3)
-	if len(parts) < 2 {
-		return false
-	}
-	maj, err1 := strconv.Atoi(parts[0])
-	min, err2 := strconv.Atoi(parts[1])
-	if err1 != nil || err2 != nil {
-		return false
-	}
-	return maj > major || (maj == major && min >= minor)
 }
 
 // extractV2Path returns the rest of a porcelain v2 entry after skipFields

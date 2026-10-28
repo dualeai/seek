@@ -167,13 +167,10 @@ func TestEncodeSemanticFineVectorsLayout(t *testing.T) {
 	for index := range buffer {
 		buffer[index] = 0xa5
 	}
-	encoded, err := encodeSemanticFineVectors(buffer, []semanticUnitEmbedding{embedding}, 7)
-	if err != nil {
+	if err := encodeSemanticFineVectors(buffer, &embedding.fine, 7); err != nil {
 		t.Fatal(err)
 	}
-	if len(encoded) != semanticFineVectorBytesPerUnit {
-		t.Fatalf("bytes=%d, want %d", len(encoded), semanticFineVectorBytesPerUnit)
-	}
+	encoded := buffer[:semanticFineVectorBytesPerUnit]
 	const vectorBytes = semanticEmbeddingDimensions * 2
 	for centroid := range semanticFineCentroidsPerUnit {
 		at := centroid * vectorBytes
@@ -192,14 +189,8 @@ func TestEncodeSemanticFineVectorsLayout(t *testing.T) {
 			t.Fatalf("byte after payload %d changed", index)
 		}
 	}
-	if _, err := encodeSemanticFineVectors(buffer[:semanticFineVectorBytesPerUnit-1], []semanticUnitEmbedding{embedding}, 0); err == nil {
-		t.Fatal("short output buffer was accepted")
-	}
-	if _, err := encodeSemanticFineVectors(buffer, []semanticUnitEmbedding{embedding}, -1); err == nil {
-		t.Fatal("negative start row was accepted")
-	}
 	invalid := testSemanticUnitEmbedding(semanticVector{0: 1, 1: 1})
-	if _, err := encodeSemanticFineVectors(buffer, []semanticUnitEmbedding{invalid}, 0); err == nil {
+	if err := encodeSemanticFineVectors(buffer, &invalid.fine, 0); err == nil {
 		t.Fatal("a vector that is not normalized was accepted")
 	}
 }
@@ -208,16 +199,13 @@ func TestEncodeSemanticFineVectorsLayout(t *testing.T) {
 // -0.5, 0.5, sqrt(0.5), 1, and -1 at their places, and zero elsewhere.
 func TestSemanticF16LittleEndianGolden(t *testing.T) {
 	const rowBytes = 1_920
-	encoded, err := encodeSemanticFineVectors(
-		make([]byte, rowBytes),
-		[]semanticUnitEmbedding{testSemanticGoldenEmbedding()},
-		0,
-	)
-	if err != nil {
-		t.Fatal(err)
+	if semanticFineVectorBytesPerUnit != rowBytes {
+		t.Fatalf("encoded row has %d bytes, want %d", semanticFineVectorBytesPerUnit, rowBytes)
 	}
-	if len(encoded) != rowBytes {
-		t.Fatalf("encoded row has %d bytes, want %d", len(encoded), rowBytes)
+	encoded := make([]byte, rowBytes)
+	golden := testSemanticGoldenEmbedding()
+	if err := encodeSemanticFineVectors(encoded, &golden.fine, 0); err != nil {
+		t.Fatal(err)
 	}
 	want := make([]byte, rowBytes)
 	for at, code := range map[int]uint16{
@@ -361,8 +349,8 @@ func TestCheckedSemanticVectorBytesUsesF16Stride(t *testing.T) {
 	}
 }
 
-var semanticF16BenchmarkBytes []byte
-
+// BenchmarkEncodeSemanticFineVectors encodes one model batch, one row at a
+// time, as the row writer does.
 func BenchmarkEncodeSemanticFineVectors(b *testing.B) {
 	const rows = semanticModelBatchRows
 	vector := semanticUSearchTestVector(7)
@@ -374,12 +362,12 @@ func BenchmarkEncodeSemanticFineVectors(b *testing.B) {
 	}
 	buffer := make([]byte, rows*semanticFineVectorBytesPerUnit)
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
-		encoded, err := encodeSemanticFineVectors(buffer, embeddings, 0)
-		if err != nil {
-			b.Fatal(err)
+		for row := range embeddings {
+			at := row * semanticFineVectorBytesPerUnit
+			if err := encodeSemanticFineVectors(buffer[at:at+semanticFineVectorBytesPerUnit], &embeddings[row].fine, uint64(row)); err != nil {
+				b.Fatal(err)
+			}
 		}
-		semanticF16BenchmarkBytes = encoded
 	}
 }

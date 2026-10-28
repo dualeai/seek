@@ -259,12 +259,8 @@ static void seek_nk_dots_f32(int backend, float const* vectors, size_t count, vo
 import "C"
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"log/slog"
-	"path/filepath"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -372,41 +368,15 @@ func semanticNumKongBackendName(backend int) string {
 	return C.GoString(C.seek_nk_backend_name(C.int(backend)))
 }
 
-// semanticNumKongAssetKey names the cache directory of the bundled library by
-// a hash of its compressed bytes, so a new library gets a new directory.
+// semanticNumKongAssetKey is the digest of the bundled library.
 func semanticNumKongAssetKey() string {
-	digest := sha256.Sum256(semanticNumKongCompressedRuntime)
-	return hex.EncodeToString(digest[:16])
+	return semanticRuntimeAssetKey(semanticNumKongCompressedRuntime)
 }
 
 // extractSemanticNumKongRuntime installs the bundled NumKong library in the
 // cache, as extractSemanticUSearchRuntime installs USearch.
 func extractSemanticNumKongRuntime() (string, error) {
-	runtimeBytes, err := decodeLateOnAsset(semanticNumKongCompressedRuntime)
-	if err != nil {
-		return "", fmt.Errorf("load NumKong runtime: %w", err)
-	}
-	cacheRoot, err := seekUserCacheRoot()
-	if err != nil {
-		return "", err
-	}
-	dir := filepath.Join(cacheRoot, "semantic", "numkong", semanticNumKongAssetKey())
-	digest := sha256.Sum256(runtimeBytes)
-	wantSHA256 := hex.EncodeToString(digest[:])
-	defer touchRuntimeUse(dir)
-	path, _, err := installPrivateAsset(
-		dir,
-		semanticNumKongRuntimeFileName,
-		".numkong-*.tmp",
-		func(path string) bool {
-			return validFileDigest(path, int64(len(runtimeBytes)), wantSHA256)
-		},
-		func(writer io.Writer) error {
-			_, err := writer.Write(runtimeBytes)
-			return err
-		},
-	)
-	return path, err
+	return installSemanticRuntime("NumKong", semanticNumKongCompressedRuntime, semanticNumKongRuntimeFileName)
 }
 
 // semanticNumKongPack holds query tokens in the layout of one kernel family.

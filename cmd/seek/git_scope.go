@@ -55,14 +55,10 @@ func (spec gitScopeSpec) query() (query.Q, error) {
 		queries = append(queries, dirQ)
 	}
 
-	switch len(queries) {
-	case 0:
-		return nil, nil
-	case 1:
+	if len(queries) == 1 {
 		return queries[0], nil
-	default:
-		return query.NewOr(queries...), nil
 	}
+	return query.NewOr(queries...), nil
 }
 
 // buildGitScopeSpec resolves the path operands below the work-tree root. An

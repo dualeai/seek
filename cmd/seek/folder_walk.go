@@ -117,7 +117,7 @@ var folderDirIdentity = func(f *os.File) (dirIdentity, error) {
 	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
 		return dirIdentity{}, err
 	}
-	return dirIdentity{dev: uint64(st.Dev), ino: uint64(st.Ino)}, nil
+	return dirIdentity{dev: uint64(st.Dev), ino: st.Ino}, nil
 }
 
 // fileIsDataless reports a cloud-only file (SF_DATALESS). Tests replace it to
@@ -443,7 +443,7 @@ func fstatatRegularFile(dirFD int, name string) (folderCandidate, bool) {
 		mtime:    st.Mtim.Nano(),
 		ctime:    st.Ctim.Nano(),
 		dev:      uint64(st.Dev),
-		ino:      uint64(st.Ino),
+		ino:      st.Ino,
 		dataless: fileIsDataless(name, &st),
 	}, true
 }

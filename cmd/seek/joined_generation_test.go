@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -190,46 +191,44 @@ func TestJoinedGenerationInvalidatesDescriptorOnLazyGraphDamage(t *testing.T) {
 	}
 }
 
+// TestReadJoinedGenerationRejectsInvalidJSON reads a valid descriptor, then
+// descriptors that each differ from it by one defect. The format number comes
+// from joinedGenerationVersion, so each defect stays the only one after a
+// format change.
 func TestReadJoinedGenerationRejectsInvalidJSON(t *testing.T) {
 	const digest = "0000000000000000000000000000000000000000000000000000000000000000"
+	format := fmt.Sprintf(`"format":%d`, joinedGenerationVersion)
+	const fields = `"state":"s","family_sha256":"` + digest + `","semantic_key":"k"`
+	valid := "{" + format + "," + fields + "}"
+	read := func(t *testing.T, content string) error {
+		t.Helper()
+		cacheDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(cacheDir, joinedGenerationFile), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := readJoinedGeneration(cacheDir)
+		return err
+	}
+	if err := read(t, valid); err != nil {
+		t.Fatalf("valid joined descriptor was rejected: %v", err)
+	}
 	tests := []struct {
 		name    string
 		content string
 	}{
+		{name: "duplicate field", content: "{" + format + "," + format + "," + fields + "}"},
+		{name: "unknown field", content: "{" + format + "," + fields + `,"extra":true}`},
+		{name: "trailing value", content: valid + "{}"},
 		{
-			name: "duplicate field",
-			content: `{"format":2,"format":2,"state":"s","family_sha256":"` +
-				digest + `","semantic_key":"k"}`,
+			name:    "wrong format",
+			content: fmt.Sprintf(`{"format":%d,`, joinedGenerationVersion-1) + fields + "}",
 		},
-		{
-			name: "unknown field",
-			content: `{"format":2,"state":"s","family_sha256":"` + digest +
-				`","semantic_key":"k","extra":true}`,
-		},
-		{
-			name: "trailing value",
-			content: `{"format":2,"state":"s","family_sha256":"` + digest +
-				`","semantic_key":"k"}{}`,
-		},
-		{
-			name: "wrong format",
-			content: `{"format":1,"state":"s","family_sha256":"` + digest +
-				`","semantic_key":"k"}`,
-		},
-		{name: "incomplete", content: `{"format":2}`},
-		{name: "no generation", content: `{"format":2,"state":"s","family_sha256":"` + digest + `"}`},
+		{name: "incomplete", content: "{" + format + "}"},
+		{name: "no generation", content: "{" + format + `,"state":"s","family_sha256":"` + digest + `"}`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			cacheDir := t.TempDir()
-			if err := os.WriteFile(
-				filepath.Join(cacheDir, joinedGenerationFile),
-				[]byte(test.content),
-				0o600,
-			); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := readJoinedGeneration(cacheDir); err == nil {
+			if read(t, test.content) == nil {
 				t.Fatal("invalid joined descriptor was accepted")
 			}
 		})

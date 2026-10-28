@@ -65,8 +65,8 @@ const (
 // test values for one test.
 func swapGuardLimitsForTest(tb testing.TB) {
 	tb.Helper()
-	swapShardMaxForTest(tb, guardShardMax)
-	swapShardFormatLimitForTest(tb, guardShardFormatLimit)
+	swapForTest(tb, &shardMax, guardShardMax)
+	swapForTest(tb, &shardFormatLimit, guardShardFormatLimit)
 }
 
 // guardDocs returns the documents named in order, each above guardShardMax.

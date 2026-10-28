@@ -278,7 +278,7 @@ func TestSearchFallbacksRecordAProviderFault(t *testing.T) {
 			folder := t.TempDir()
 			writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
 			path := pinAcceleratedProviderForTest(t)
-			search := func(scorer *hybridTestScorer) {
+			search := func(scorer semanticModel) {
 				t.Helper()
 				output, err := seekWith(t, modelFactory(scorer), "alpha beta", folder)
 				if err != nil || !strings.Contains(output, "strict.go") {
@@ -291,9 +291,10 @@ func TestSearchFallbacksRecordAProviderFault(t *testing.T) {
 			}
 			failing := &hybridTestScorer{}
 			test.fail(failing, fmt.Errorf("%s: %w", test.name, errDegenerateSemanticVector))
-			search(failing)
-			if failing.embedCalls.Load() != 0 {
-				t.Fatalf("the second search embedded %d batches, want the built index", failing.embedCalls.Load())
+			observed := observeModel(failing)
+			search(observed)
+			if observed.embeds.Load() != 0 {
+				t.Fatalf("the second search embedded %d batches, want the built index", observed.embeds.Load())
 			}
 			if record := readLateOnProviderRecord(path); record.faults != 1 {
 				t.Fatalf("provider record=%+v, want one fault from the %s fallback", record, test.name)
@@ -627,13 +628,13 @@ func TestOneCommandRecordsOneProviderFault(t *testing.T) {
 	writeFileAt(t, folder, "strict.go", "package sample\n// alpha beta\n")
 	path := pinAcceleratedProviderForTest(t)
 	degenerate := fmt.Errorf("both: %w", errDegenerateSemanticVector)
-	scorer := &hybridTestScorer{embedErr: degenerate, scoreErr: degenerate}
-	output, err := seekWith(t, modelFactory(scorer), "alpha beta", folder)
+	scorer := observeModel(&hybridTestScorer{embedErr: degenerate, scoreErr: degenerate})
+	output, err := seekWith(t, scorer.factory(), "alpha beta", folder)
 	if err != nil || !strings.Contains(output, "strict.go") {
 		t.Fatalf("output=%q err=%v, want the strict file", output, err)
 	}
-	if scorer.embedCalls.Load() == 0 || scorer.scoreCalls.Load() == 0 {
-		t.Fatalf("embed calls=%d score calls=%d: both must fail", scorer.embedCalls.Load(), scorer.scoreCalls.Load())
+	if scorer.embeds.Load() == 0 || scorer.scores.Load() == 0 {
+		t.Fatalf("embed calls=%d score calls=%d: both must fail", scorer.embeds.Load(), scorer.scores.Load())
 	}
 	if record := readLateOnProviderRecord(path); record.faults != 1 {
 		t.Fatalf("provider record=%+v, want one fault for the command", record)

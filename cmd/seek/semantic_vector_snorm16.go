@@ -42,40 +42,22 @@ func decodeSemanticSNORM16Vector(stored semanticSNORM16Vector) semanticVector {
 	return vector
 }
 
+// encodeSemanticSNORM16Vector stores a normalized vector as SNORM16 codes. The
+// norm check leaves every component finite, but a component can still be just
+// past -1 or 1, which no code holds. A component in [-1, 1] gives a code from
+// -32767 through 32767.
 func encodeSemanticSNORM16Vector(vector *semanticVector) (semanticSNORM16Vector, error) {
 	if err := validateNormalizedSemanticVector(vector); err != nil {
 		return semanticSNORM16Vector{}, err
 	}
 	var encoded semanticSNORM16Vector
-	for dimension := range vector {
-		value := vector[dimension]
-		// Keep the valid path local. The error helper is too large to inline
-		// and would otherwise run once for every stored component.
-		if value >= -1 && value <= 1 {
-			encoded[dimension] = int16(math.RoundToEven(float64(value) * semanticSNORM16Scale))
-			continue
+	for dimension, value := range vector {
+		if !(value >= -1 && value <= 1) {
+			return semanticSNORM16Vector{}, fmt.Errorf("component %d is outside [-1, 1]", dimension)
 		}
-		code, err := encodeSemanticSNORM16Component(value)
-		if err != nil {
-			return semanticSNORM16Vector{}, fmt.Errorf("component %d %w", dimension, err)
-		}
-		encoded[dimension] = code
+		encoded[dimension] = int16(math.RoundToEven(float64(value) * semanticSNORM16Scale))
 	}
 	return encoded, nil
-}
-
-func encodeSemanticSNORM16Component(value float32) (int16, error) {
-	if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
-		return 0, fmt.Errorf("is not finite")
-	}
-	if value < -1 || value > 1 {
-		return 0, fmt.Errorf("is outside [-1, 1]")
-	}
-	code := math.RoundToEven(float64(value) * semanticSNORM16Scale)
-	if code < -semanticSNORM16Scale || code > semanticSNORM16Scale {
-		return 0, fmt.Errorf("is outside the codec range")
-	}
-	return int16(code), nil
 }
 
 func validateSemanticSNORM16Vector(vector *semanticSNORM16Vector) error {

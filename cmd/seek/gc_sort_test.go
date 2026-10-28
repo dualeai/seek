@@ -475,18 +475,18 @@ func gcTableRows(out string) []string {
 	return rows
 }
 
-// assertDryRunLiveParity runs --dry-run, then --force with the same sort, and
-// checks that the rows match byte for byte, as reportGCPlan states. The dry
-// run goes first: it predicts and changes nothing, so the live run starts
-// from the same state.
-func assertDryRunLiveParity(t *testing.T, wantRows int, sortArg string) {
+// assertDryRunLiveParity runs --dry-run, then --force, both with --sort=size,
+// on a cache of two corpora. It checks that the rows match byte for byte, as
+// reportGCPlan states. The dry run goes first: it predicts and changes
+// nothing, so the live run starts from the same state.
+func assertDryRunLiveParity(t *testing.T) {
 	t.Helper()
-	dry := runGCCapture(t, "--dry-run", sortArg)
-	live := runGCCapture(t, "--force", sortArg)
+	dry := runGCCapture(t, "--dry-run", "--sort=size")
+	live := runGCCapture(t, "--force", "--sort=size")
 	dryRows, liveRows := gcTableRows(dry), gcTableRows(live)
-	if len(dryRows) != wantRows || len(liveRows) != wantRows {
-		t.Fatalf("expected %d rows each, got dry=%d live=%d\ndry:\n%s\nlive:\n%s",
-			wantRows, len(dryRows), len(liveRows), dry, live)
+	if len(dryRows) != 2 || len(liveRows) != 2 {
+		t.Fatalf("expected 2 rows each, got dry=%d live=%d\ndry:\n%s\nlive:\n%s",
+			len(dryRows), len(liveRows), dry, live)
 	}
 	for i := range dryRows {
 		if dryRows[i] != liveRows[i] {
@@ -504,7 +504,7 @@ func TestGCCmd_SortBySize_DryRunLiveParity_Kept(t *testing.T) {
 	usedAt := time.Now().Add(-48 * time.Hour)
 	seedCorpusWithSize(t, root, fakeCorpusHash(1), usedAt, 1024)
 	seedCorpusWithSize(t, root, fakeCorpusHash(2), usedAt, 64*1024)
-	assertDryRunLiveParity(t, 2, "--sort=size")
+	assertDryRunLiveParity(t)
 }
 
 // TestGCCmd_SortBySize_DryRunLiveParity_Evicted uses corpora over the
@@ -519,7 +519,7 @@ func TestGCCmd_SortBySize_DryRunLiveParity_Evicted(t *testing.T) {
 	small, large := fakeCorpusHash(1), fakeCorpusHash(2)
 	smallDir := seedCorpusWithSize(t, root, small, stale, 1024)
 	largeDir := seedCorpusWithSize(t, root, large, stale, 64*1024)
-	assertDryRunLiveParity(t, 2, "--sort=size")
+	assertDryRunLiveParity(t)
 	// The parity must hold on evicted rows, so the live run must evict both.
 	for _, dir := range []string{smallDir, largeDir} {
 		if _, err := os.Stat(dir); !os.IsNotExist(err) {

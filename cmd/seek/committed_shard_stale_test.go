@@ -23,9 +23,9 @@ func TestCommittedShards_FromAnotherCommitAreNotServed(t *testing.T) {
 	const file = "app.go"
 	dir := initGitRepo(t, file, "package main\n// STALE_MARKER alpha\n")
 	ctx := context.Background()
-	paths, plan := planGitTestCorpus(t, dir)
+	_, plan := planGitTestCorpus(t, dir)
 
-	if files, err := runSeekInPlannedGitCorpus(ctx, "alpha", paths, plan); err != nil || len(files) == 0 {
+	if files, err := runSeekInPlannedGitCorpus(ctx, "alpha", plan); err != nil || len(files) == 0 {
 		t.Fatalf("build at the first commit: files=%v err=%v", files, err)
 	}
 	first := mustGitRepoStateIn(t, ctx, dir)
@@ -41,7 +41,7 @@ func TestCommittedShards_FromAnotherCommitAreNotServed(t *testing.T) {
 	}
 	gitRunIn(t, dir, "add", ".")
 	gitRunIn(t, dir, "commit", "-m", "second")
-	if files, err := runSeekInPlannedGitCorpus(ctx, "gamma", paths, plan); err != nil || len(files) == 0 {
+	if files, err := runSeekInPlannedGitCorpus(ctx, "gamma", plan); err != nil || len(files) == 0 {
 		t.Fatalf("build at the second commit: files=%v err=%v", files, err)
 	}
 
@@ -58,7 +58,7 @@ func TestCommittedShards_FromAnotherCommitAreNotServed(t *testing.T) {
 		t.Fatal("the working tree still holds the second commit")
 	}
 
-	files, err := runSeekInPlannedGitCorpus(ctx, "gamma", paths, plan)
+	files, err := runSeekInPlannedGitCorpus(ctx, "gamma", plan)
 	if err != nil {
 		t.Fatalf("search after the restored state files: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestCommittedShards_FromAnotherCommitAreNotServed(t *testing.T) {
 		t.Fatalf("served content from another commit: %v", files)
 	}
 	// The corpus must still answer for the commit that is checked out.
-	if files, err := runSeekInPlannedGitCorpus(ctx, "alpha", paths, plan); err != nil || len(files) == 0 {
+	if files, err := runSeekInPlannedGitCorpus(ctx, "alpha", plan); err != nil || len(files) == 0 {
 		t.Fatalf("search for the checked-out commit: files=%v err=%v", files, err)
 	}
 }

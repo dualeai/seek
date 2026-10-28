@@ -171,11 +171,11 @@ func TestGC_HumanBytes(t *testing.T) {
 // leave a partial rune after the ellipsis.
 func TestGC_FormatRoot_MultibyteTruncationIsValidUTF8(t *testing.T) {
 	info := corpusDisplayInfo{source: "/tmp/" + strings.Repeat("日本語", 30)}
-	got := formatRoot(info, 20)
+	got := formatRoot(info)
 	if !utf8.ValidString(got) {
 		t.Fatalf("formatRoot returned invalid UTF-8: %q", got)
 	}
-	if len(got) > 20 {
+	if len(got) > gcRootWidth {
 		t.Fatalf("formatRoot exceeded width budget: %d bytes (%q)", len(got), got)
 	}
 	if !strings.HasPrefix(got, "...") {
@@ -188,7 +188,7 @@ func TestGC_FormatRoot_MultibyteTruncationIsValidUTF8(t *testing.T) {
 // each corpus keeps one row of the table.
 func TestGC_FormatRoot_ControlCharsSanitized(t *testing.T) {
 	info := corpusDisplayInfo{source: "/tmp/evil\npath\twith\rctl"}
-	got := formatRoot(info, 52)
+	got := formatRoot(info)
 	if strings.ContainsAny(got, "\n\r\t") {
 		t.Fatalf("control characters leaked into table cell: %q", got)
 	}

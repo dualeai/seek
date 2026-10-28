@@ -3,59 +3,102 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // installPrivateAsset installs fileName in directory (mode 0700) through a
 // temporary file and a rename, unless valid accepts the file there already.
-// It returns the path, and whether this call wrote the file.
+// It returns the path.
 func installPrivateAsset(
 	directory string,
 	fileName string,
 	temporaryPattern string,
 	valid func(string) bool,
 	write func(io.Writer) error,
-) (string, bool, error) {
+) (string, error) {
 	path := filepath.Join(directory, fileName)
 	if valid(path) {
-		return path, false, nil
+		return path, nil
 	}
 	// A collection can remove an empty parent (reranker/<version>) between
 	// the steps of MkdirAll, and a second call makes it again. macOS reports
 	// that race as EINVAL, so any error gets the second call.
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
-			return "", false, err
+			return "", err
 		}
 	}
 	if err := os.Chmod(directory, 0o700); err != nil {
-		return "", false, err
+		return "", err
 	}
 	temporary, err := os.CreateTemp(directory, temporaryPattern)
 	if err != nil {
-		return "", false, err
+		return "", err
 	}
 	temporaryPath := temporary.Name()
 	defer func() { _ = os.Remove(temporaryPath) }()
 	if err := temporary.Chmod(0o700); err != nil {
 		_ = temporary.Close()
-		return "", false, err
+		return "", err
 	}
 	if err := write(temporary); err != nil {
 		_ = temporary.Close()
-		return "", false, err
+		return "", err
 	}
 	if err := temporary.Close(); err != nil {
-		return "", false, err
+		return "", err
 	}
 	if err := os.Rename(temporaryPath, path); err != nil {
 		if valid(path) {
-			return path, false, nil
+			return path, nil
 		}
-		return "", false, fmt.Errorf("install private asset: %w", err)
+		return "", fmt.Errorf("install private asset: %w", err)
 	}
-	return path, true, nil
+	return path, nil
+}
+
+// installSemanticRuntime installs the bundled library of a vector engine in
+// semantic/<engine>/<asset key> of the cache, unless a file with its digest is
+// there, and returns its path. engine names the library in errors (USearch,
+// NumKong), and in lowercase it names the folder. It marks the folder as used
+// for GC (touchRuntimeUse).
+func installSemanticRuntime(engine string, compressed []byte, fileName string) (string, error) {
+	runtimeBytes, err := decodeLateOnAsset(compressed)
+	if err != nil {
+		return "", fmt.Errorf("load %s runtime: %w", engine, err)
+	}
+	cacheRoot, err := seekUserCacheRoot()
+	if err != nil {
+		return "", err
+	}
+	folder := strings.ToLower(engine)
+	dir := filepath.Join(cacheRoot, "semantic", folder, semanticRuntimeAssetKey(compressed))
+	digest := sha256.Sum256(runtimeBytes)
+	wantSHA256 := hex.EncodeToString(digest[:])
+	defer touchRuntimeUse(dir)
+	return installPrivateAsset(
+		dir,
+		fileName,
+		"."+folder+"-*.tmp",
+		func(path string) bool {
+			return validFileDigest(path, int64(len(runtimeBytes)), wantSHA256)
+		},
+		func(writer io.Writer) error {
+			_, err := writer.Write(runtimeBytes)
+			return err
+		},
+	)
+}
+
+// semanticRuntimeAssetKey names the cache folder of a bundled library by a
+// hash of its compressed bytes, so a new library gets a new folder.
+func semanticRuntimeAssetKey(compressed []byte) string {
+	digest := sha256.Sum256(compressed)
+	return hex.EncodeToString(digest[:16])
 }

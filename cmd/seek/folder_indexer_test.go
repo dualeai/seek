@@ -63,7 +63,7 @@ func TestFolderCorpusState_UnreadableDirectoryRootFails(t *testing.T) {
 }
 
 func TestFolderCorpusState_OversizeNameOnlyFileChangesFingerprint(t *testing.T) {
-	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
+	swapForTest(t, &documentContentLimit, testDocumentContentLimit)
 	root := t.TempDir()
 	path := filepath.Join(root, "large.bin")
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
@@ -132,7 +132,7 @@ func TestStreamFolderFiles_OutputChannelUnbuffered(t *testing.T) {
 		[]folderCandidate{newFolderCandidate("note.txt", path, info)},
 		4,
 		fail,
-		nil,
+		make([]int64, 1),
 	)
 	if cap(ch) != 0 {
 		t.Fatalf("streamFolderFilesWithMarkers output must be unbuffered, got cap=%d", cap(ch))
@@ -401,7 +401,7 @@ func TestFolderCorpusTombstonedBytesCompactTheFamily(t *testing.T) {
 	requireTools(t)
 	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
 	// shard) below the bytes of two fixture files of 634 bytes.
-	swapShardMaxForTest(t, 1024)
+	swapForTest(t, &shardMax, 1024)
 	ctx := context.Background()
 	root := t.TempDir()
 	for i := range 10 {
@@ -449,7 +449,7 @@ func TestFolderCorpusWithNoManifestCountsDeadBytesFromShards(t *testing.T) {
 	requireTools(t)
 	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
 	// shard) below the bytes of two fixture files of 634 bytes.
-	swapShardMaxForTest(t, 1024)
+	swapForTest(t, &shardMax, 1024)
 	ctx := context.Background()
 	root := t.TempDir()
 	for i := range 10 {
@@ -509,7 +509,7 @@ func TestFolderCorpusBinaryFilesCountTheirMarker(t *testing.T) {
 	requireTools(t)
 	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
 	// shard) below the bytes of two fixture files of 634 bytes.
-	swapShardMaxForTest(t, 1024)
+	swapForTest(t, &shardMax, 1024)
 	ctx := context.Background()
 	for _, dropManifest := range []bool{false, true} {
 		t.Run(fmt.Sprintf("drop manifest %t", dropManifest), func(t *testing.T) {
@@ -559,7 +559,7 @@ func TestFolderCorpusTextFileThatBecomesBinaryCompacts(t *testing.T) {
 	requireTools(t)
 	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
 	// shard) below the bytes of two fixture files of 634 bytes.
-	swapShardMaxForTest(t, 1024)
+	swapForTest(t, &shardMax, 1024)
 	ctx := context.Background()
 	root := t.TempDir()
 	for i := range 10 {
@@ -602,7 +602,7 @@ func TestFolderCorpusBinaryFileThatBecomesTextStaysADelta(t *testing.T) {
 	requireTools(t)
 	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
 	// shard) below the bytes of two fixture files of 634 bytes.
-	swapShardMaxForTest(t, 1024)
+	swapForTest(t, &shardMax, 1024)
 	ctx := context.Background()
 	root := t.TempDir()
 	for i := range 10 {
@@ -647,7 +647,7 @@ func TestFolderCorpusWithNoManifestTinyFilesStayADelta(t *testing.T) {
 	requireTools(t)
 	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
 	// shard) below the bytes of two fixture files of 634 bytes.
-	swapShardMaxForTest(t, 1024)
+	swapForTest(t, &shardMax, 1024)
 	ctx := context.Background()
 	root := t.TempDir()
 	for i := range 2 {

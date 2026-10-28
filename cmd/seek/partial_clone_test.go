@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -51,7 +50,7 @@ func TestPartialCloneWarnsOncePerCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if scorer.embedCalls.Load() == 0 {
+	if scorer.embeds.Load() == 0 {
 		t.Fatal("the semantic build did not run, so the test proves nothing")
 	}
 	assertOneMissingBlobWarning(t, logs)
@@ -63,20 +62,13 @@ func TestPartialCloneWarnsOncePerCommand(t *testing.T) {
 func TestPartialCloneNeedsNoLazyFetchGit(t *testing.T) {
 	requireTools(t)
 	clone := newPartialClone(t)
-	realGit, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
 	cwdLog := filepath.Join(t.TempDir(), "git-cwd.log")
-	shim := t.TempDir()
-	writeExecutable(t, filepath.Join(shim, "git"), "#!/bin/sh\n"+gitShimSubcommand+
-		"if [ \"$subcommand\" = version ]; then\n  echo 'git version 2.43.0'\n  exit 0\nfi\n"+
+	installGitShim(t, "if [ \"$subcommand\" = version ]; then\n  echo 'git version 2.43.0'\n  exit 0\nfi\n"+
 		"if [ \"$subcommand\" != config ]; then\n  pwd >> '"+cwdLog+"'\nfi\n"+
-		"exec '"+realGit+"' \"$@\"\n")
-	t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
+		"exec \"$SEEK_TEST_REAL_GIT\" \"$@\"\n")
 
 	logs := captureTestLogs(t, slog.LevelWarn)
-	err = seekRoot(context.Background(), t, nil, "--lexical-only", "zqpartialmarker", clone)
+	err := seekRoot(context.Background(), t, nil, "--lexical-only", "zqpartialmarker", clone)
 	if !errors.Is(err, errNoMatch) || !logsMention(logs.Records(), "a partial clone needs Git 2.45 or later") {
 		t.Fatalf("err=%v warnings=%v, want the partial-clone version warning", err, logs.Records())
 	}
@@ -120,8 +112,8 @@ func TestPartialCloneBlobArrivesLater(t *testing.T) {
 	requireTools(t)
 	clone := newPartialClone(t, "far/still.txt")
 	source := filepath.Join(filepath.Dir(clone), "source")
-	scorer := &hybridTestScorer{}
-	newModel := modelFactory(scorer)
+	scorer := observeModel(&hybridTestScorer{})
+	newModel := scorer.factory()
 	lexical := func(t *testing.T) string {
 		t.Helper()
 		out, err := seek(t, "--lexical-only", "zqpartialmarker", clone)
@@ -152,7 +144,7 @@ func TestPartialCloneBlobArrivesLater(t *testing.T) {
 		t.Fatalf("the missing blob matched by content before it arrived:\n%s", out)
 	}
 	describe()
-	embedded := scorer.embedCalls.Load()
+	embedded := scorer.embeds.Load()
 	if embedded == 0 {
 		t.Fatal("the semantic build did not run, so the test proves nothing")
 	}
@@ -162,14 +154,11 @@ func TestPartialCloneBlobArrivesLater(t *testing.T) {
 		t.Fatalf("the arrived blob is still name-only:\n%s", out)
 	}
 	describe()
-	if scorer.embedCalls.Load() == embedded {
+	if scorer.embeds.Load() == embedded {
 		t.Fatal("the semantic generation kept the name-only file after its blob arrived")
 	}
-	scorer.mu.Lock()
-	refreshed := slices.Contains(scorer.embeddedPaths, "dir/missing.txt")
-	scorer.mu.Unlock()
-	if !refreshed {
-		t.Fatalf("embedded %v, want dir/missing.txt", scorer.embeddedPaths)
+	if paths := scorer.unitPaths(); !slices.Contains(paths, "dir/missing.txt") {
+		t.Fatalf("embedded %v, want dir/missing.txt", paths)
 	}
 	plans, err := planCorpora(context.Background(), []string{clone})
 	if err != nil {
@@ -260,18 +249,15 @@ func TestPartialCloneBlobArrivesDuringDelta(t *testing.T) {
 	writeFixtureFile(t, filepath.Join(source, "kept.txt"), "zqpartialmarker kept two\n")
 	gitRunIn(t, source, "commit", "-qam", "two")
 	gitRunIn(t, clone, "pull", "-q", "--ff-only")
-	realGit, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
 	// The shim keeps its stdout open until the fetch ends, so the recheck
 	// reads the end of the cat-file output only after the blob arrived. The
 	// rename of the armed file lets one cat-file run the fetch. The prepare
 	// before the build runs `git cat-file --batch`, which the shim passes on.
 	armed := filepath.Join(t.TempDir(), "armed")
-	shim := t.TempDir()
-	writeExecutable(t, filepath.Join(shim, "git"), "#!/bin/sh\n"+gitShimSubcommand+
-		"case \"$subcommand $*\" in\n"+
+	t.Setenv("SEEK_TEST_ARMED", armed)
+	t.Setenv("SEEK_TEST_CLONE", clone)
+	t.Setenv("SEEK_TEST_OID", gitOutputIn(t, clone, "rev-parse", "HEAD:dir/missing.txt"))
+	installGitShim(t, "case \"$subcommand $*\" in\n"+
 		"cat-file*--batch-command*)\n"+
 		"  if mv \"$SEEK_TEST_ARMED\" \"$SEEK_TEST_ARMED.done\" 2>/dev/null; then\n"+
 		"    \"$SEEK_TEST_REAL_GIT\" \"$@\"\n"+
@@ -281,11 +267,6 @@ func TestPartialCloneBlobArrivesDuringDelta(t *testing.T) {
 		"  fi ;;\n"+
 		"esac\n"+
 		"exec \"$SEEK_TEST_REAL_GIT\" \"$@\"\n")
-	t.Setenv("SEEK_TEST_REAL_GIT", realGit)
-	t.Setenv("SEEK_TEST_ARMED", armed)
-	t.Setenv("SEEK_TEST_CLONE", clone)
-	t.Setenv("SEEK_TEST_OID", gitOutputIn(t, clone, "rev-parse", "HEAD:dir/missing.txt"))
-	t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
 	writeFixtureFile(t, armed, "")
 	lexical()
 	if _, err := os.Stat(armed + ".done"); err != nil {

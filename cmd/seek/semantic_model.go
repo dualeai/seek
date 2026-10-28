@@ -220,8 +220,8 @@ type searchExecution struct {
 	// not-indexed check. Nil records nothing.
 	opened *openedNodes
 	// operands give the display paths that headers and file: filters read.
-	// With nil, file: filters read node-relative paths and headers show
-	// absolute paths.
+	// With no operand, file: filters read node-relative paths and headers
+	// show absolute paths.
 	operands displayOperands
 }
 
@@ -230,14 +230,14 @@ type searchExecution struct {
 // semantic search, a model exists, and head is not "no-head". A folder node
 // passes an empty head.
 func (e searchExecution) buildsVectors(head string) bool {
-	return e.vectors && e.policy.semanticEnabled() && e.model != nil && head != "no-head"
+	return e.vectors && e.policy == semanticSearch && e.model != nil && head != "no-head"
 }
 
 // buildsOverlay reports whether a Git node with dirty files builds and binds
 // the overlay of their work-tree bytes. Then every file of the node is in
 // vector retrieval, committed or not, with or without a commit.
 func (e searchExecution) buildsOverlay(dirty bool) bool {
-	return e.vectors && e.policy.semanticEnabled() && e.model != nil && dirty
+	return e.vectors && e.policy == semanticSearch && e.model != nil && dirty
 }
 
 // semanticBuildFailed logs a failed vector build that keeps the text index,

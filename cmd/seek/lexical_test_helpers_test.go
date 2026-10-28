@@ -10,7 +10,7 @@ import (
 // testLexicalSearchExecution is the execution of a --lexical-only search: no
 // model and no vectors.
 func testLexicalSearchExecution() searchExecution {
-	return searchExecution{policy: lexicalOnlySearchPolicy()}
+	return searchExecution{policy: lexicalOnlySearch}
 }
 
 // testSemanticSearchExecution offers a model to a corpus build and asks for
@@ -24,7 +24,7 @@ func testSemanticSearchExecution(tb testing.TB, factory semanticModelFactory) se
 	future := newSemanticModelFuture(factory)
 	tb.Cleanup(func() { _ = future.Close() })
 	return searchExecution{
-		policy:  defaultSearchPolicy(),
+		policy:  semanticSearch,
 		model:   future,
 		vectors: true,
 	}
@@ -36,40 +36,28 @@ func ensureFolderCorpusFresh(ctx context.Context, plan node) (corpusIndexState, 
 	return ensureFolderCorpusFreshWithExecution(ctx, plan, testLexicalSearchExecution())
 }
 
-// runIndexingWithCache builds the Git node of paths into cacheDir and indexDir
-// for state, with a lexical execution. preState is the state hash that the
-// build records (gitCorpusStateHash).
+// runIndexingWithCache builds the Git node of paths into store for state, with
+// a lexical execution. preState is the state hash that the build records
+// (gitCorpusStateHash).
 func runIndexingWithCache(
 	ctx context.Context,
 	paths gitPaths,
-	cacheDir string,
-	indexDir string,
+	store corpusStore,
 	state repoState,
 	preState string,
 ) error {
-	_, err := (&gitNode{paths: paths}).build(
-		ctx,
-		corpusStore{cacheDir: cacheDir, indexDir: indexDir},
-		state,
-		preState,
-		testLexicalSearchExecution(),
-	)
+	_, err := (&gitNode{paths: paths}).build(ctx, store, state, preState, testLexicalSearchExecution())
 	return err
 }
 
 // prepareAndSearchCorpus makes the node at plan current and runs userQ on it
-// with a lexical execution (strictNode). With paths and no node behavior, plan
-// is a Git node of paths.
+// with a lexical execution (strictNode).
 func prepareAndSearchCorpus(
 	ctx context.Context,
 	plan node,
-	paths *gitPaths,
 	userQ query.Q,
 	config searchConfig,
 ) ([]corpusSearchResult, dirtyFileSet, error) {
-	if plan.behavior == nil && paths != nil {
-		plan.behavior = &gitNode{paths: *paths}
-	}
 	return strictNode(ctx, plan, queryPlan{strict: userQ}, config, testLexicalSearchExecution())
 }
 
@@ -77,8 +65,9 @@ func ensureGitCorpusFresh(
 	ctx context.Context,
 	plan node,
 	paths gitPaths,
-) (repoState, corpusIndexState, error) {
-	return (&gitNode{paths: paths}).refresh(ctx, plan, testLexicalSearchExecution())
+) (corpusIndexState, error) {
+	_, indexState, err := (&gitNode{paths: paths}).refresh(ctx, plan, testLexicalSearchExecution())
+	return indexState, err
 }
 
 func ensureCombinedGitCorpus(

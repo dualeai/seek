@@ -19,6 +19,15 @@ import (
 	ort "github.com/yalue/onnxruntime_go"
 )
 
+// lateOnModelBytes decodes the embedded model once per process. The first
+// encoder and the index build session (newLateOnCPUBuildEncoder) both read it.
+// A second decode took about 20 ms of the 60 ms that the build session took to
+// make on 18 CPUs. The decoded model stays in memory for the life of the
+// process.
+var lateOnModelBytes = sync.OnceValues(func() ([]byte, error) {
+	return decodeLateOnAsset(lateOnCompressedModel)
+})
+
 // lateOnSelectedProvider records the provider the encoder settled on. Index and
 // search paths read it for their logs, and rejectLateOnAcceleratedProvider
 // reads it to find the provider in use; they do not hold the encoder.
@@ -68,7 +77,7 @@ func lateOnForcedProvider() (string, error) {
 		return "", nil
 	}
 	accepted := []string{lateOnCPUProviderName}
-	if lateOnProviderHasAccelerator && lateOnAcceleratedProviderName != lateOnCPUProviderName {
+	if lateOnProviderHasAccelerator {
 		accepted = append(accepted, lateOnAcceleratedProviderName)
 	}
 	if slices.Contains(accepted, value) {
@@ -259,7 +268,7 @@ func newLateOnRowEncoder(ctx context.Context, interactive bool) (built *lateOnSt
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	model, decodeErr := decodeLateOnAsset(lateOnCompressedModel)
+	model, decodeErr := lateOnModelBytes()
 	if decodeErr != nil {
 		return nil, fmt.Errorf("load LateOn model: %w", decodeErr)
 	}
@@ -403,9 +412,6 @@ func newLateOnRowEncoder(ctx context.Context, interactive bool) (built *lateOnSt
 		if cachedVerdict == lateOnVerdictTrusted {
 			reason = "cached verdict"
 		}
-		if reason == "" {
-			reason = "default"
-		}
 	} else if !lateOnProviderHasAccelerator {
 		reason = "only provider"
 	}
@@ -434,7 +440,7 @@ func newLateOnCPUBuildEncoder(ctx context.Context) (*lateOnStaticRowEncoder, err
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	model, err := decodeLateOnAsset(lateOnCompressedModel)
+	model, err := lateOnModelBytes()
 	if err != nil {
 		return nil, fmt.Errorf("load LateOn model: %w", err)
 	}
@@ -529,10 +535,7 @@ func lateOnCPUThreads(interactive bool) int {
 // run at the same time (semanticModelCallLimit). An accelerated session costs
 // 0.
 func (encoder *lateOnStaticRowEncoder) CallCPUs() int {
-	if encoder == nil {
-		return 1
-	}
-	return max(0, encoder.callCPUs)
+	return encoder.callCPUs
 }
 
 // Run encodes the token rows in inputIDs and passes their output to consume.

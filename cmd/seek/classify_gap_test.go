@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -31,26 +32,18 @@ func writeUntrackedFile(tb testing.TB, repo, name, content string) string {
 // .gitignore, and writes name. It returns the path of the file.
 func writeIgnoredFile(tb testing.TB, repo, name, content string) string {
 	tb.Helper()
-	appendFileAt(tb, repo, ".gitignore", name+"\n")
+	ignore, err := os.OpenFile(filepath.Join(repo, ".gitignore"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	_, err = ignore.WriteString(name + "\n")
+	if err = errors.Join(err, ignore.Close()); err != nil {
+		tb.Fatal(err)
+	}
 	gitRunIn(tb, repo, "add", ".gitignore")
 	gitRunIn(tb, repo, "commit", "-m", "ignore "+name)
 	writeFileAt(tb, repo, name, content)
 	return filepath.Join(repo, name)
-}
-
-// appendFileAt appends content to name in repo and creates the file if it is
-// missing.
-func appendFileAt(tb testing.TB, repo, name, content string) {
-	tb.Helper()
-	p := filepath.Join(repo, name)
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		tb.Fatal(err)
-	}
-	defer func() { _ = f.Close() }()
-	if _, err := f.WriteString(content); err != nil {
-		tb.Fatal(err)
-	}
 }
 
 // planForOperands plans the nodes of operands and stops the test on an error.

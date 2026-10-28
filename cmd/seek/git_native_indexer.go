@@ -7,38 +7,32 @@ import (
 	"github.com/sourcegraph/zoekt"
 )
 
-type gitSnapshot struct {
-	commitOID gitObjectID
-}
-
 // captureGitSnapshot verifies the form of a full SHA-1 or SHA-256 commit ID.
 // It runs no Git process. The git status call that captured the ID read the
 // commit and its tree, and that call fails ("bad object HEAD") when either is
 // missing.
 // A commit that disappears after that call fails the build that reads it, and
 // the build then checks the commit (capturedCommitMissing). A separate check
-// here costs one Git process per committed build and delta. The "no-head"
-// value returns ok=false without an error.
-func captureGitSnapshot(captured string) (gitSnapshot, bool, error) {
-	if captured == "no-head" {
-		return gitSnapshot{}, false, nil
-	}
+// here costs one Git process per committed build and delta. Only a build that
+// reads the commit calls it (gitBuildPlan.snapshot), and such a build has a
+// commit: the "no-head" value is an error.
+func captureGitSnapshot(captured string) (gitObjectID, error) {
 	oid, err := parseGitObjectID([]byte(captured))
 	if err != nil {
-		return gitSnapshot{}, false, fmt.Errorf("captured Git commit: %w", err)
+		return "", fmt.Errorf("captured Git commit: %w", err)
 	}
-	return gitSnapshot{commitOID: oid}, true, nil
+	return oid, nil
 }
 
 // capturedCommitMissing reports whether the captured commit of a build that
 // read it is no longer in the repository. It runs one git cat-file, and only
 // after such a build failed. A failed check reports false, so the build keeps
 // its other error handling.
-func capturedCommitMissing(ctx context.Context, repoDir string, build gitBuildPlan, snapshot gitSnapshot) bool {
+func capturedCommitMissing(ctx context.Context, repoDir string, build gitBuildPlan, snapshot gitObjectID) bool {
 	if !build.snapshot() {
 		return false
 	}
-	exists, err := nativeGitCommitExists(ctx, repoDir, snapshot.commitOID)
+	exists, err := nativeGitCommitExists(ctx, repoDir, snapshot)
 	return err == nil && !exists
 }
 
@@ -49,11 +43,11 @@ func capturedCommitMissing(ctx context.Context, repoDir string, build gitBuildPl
 // committed build and delta. The repo: filter matches the opaque name. It
 // sets no repository rank and no commit time: Zoekt reads them only in its
 // classic scorer, and every Seek search uses BM25 (searchOpts.UseBM25Scoring).
-func nativeGitRepository(repoDir string, snapshot gitSnapshot) zoekt.Repository {
+func nativeGitRepository(repoDir string, snapshot gitObjectID) zoekt.Repository {
 	return zoekt.Repository{
 		Name:     fallbackGitRepositoryName(repoDir),
 		Source:   repoDir,
-		Branches: []zoekt.RepositoryBranch{{Name: "HEAD", Version: snapshot.commitOID.String()}},
+		Branches: []zoekt.RepositoryBranch{{Name: "HEAD", Version: snapshot.String()}},
 	}
 }
 
@@ -62,24 +56,14 @@ func nativeGitRepository(repoDir string, snapshot gitSnapshot) zoekt.Repository 
 // file, such as .sourcegraph/ignore, applies. Thus the build needs no Git
 // process to read such a file.
 // The error channel gets one value when the stream ends; missing, when set,
-// then holds the blobs that the stream read as missing.
+// then holds the blobs that the stream read as missing. When contentBytes is
+// set, the stream adds to it the bytes that the shard documents of the sent
+// documents hold (heldContentBytes), before the error channel gets its value.
+// A binary blob then counts as its marker.
 func streamNativeGitDocuments(
 	ctx context.Context,
 	repoDir string,
-	snapshot gitSnapshot,
-	missing *[]missingBlob,
-) (<-chan fileContent, <-chan error) {
-	return streamCountedNativeGitDocuments(ctx, repoDir, snapshot, missing, nil)
-}
-
-// streamCountedNativeGitDocuments is streamNativeGitDocuments that also counts
-// content. When contentBytes is set, it adds the bytes that the shard documents
-// of the sent documents hold (heldContentBytes). It adds them before the error
-// channel gets its value. A binary blob then counts as its marker.
-func streamCountedNativeGitDocuments(
-	ctx context.Context,
-	repoDir string,
-	snapshot gitSnapshot,
+	snapshot gitObjectID,
 	missing *[]missingBlob,
 	contentBytes *int64,
 ) (<-chan fileContent, <-chan error) {
@@ -141,7 +125,7 @@ func indexNativeGitFull(
 	ctx context.Context,
 	repoDir string,
 	indexDir string,
-	snapshot gitSnapshot,
+	snapshot gitObjectID,
 	parallelism int,
 	missing *[]missingBlob,
 ) (int64, error) {
@@ -152,7 +136,7 @@ func indexNativeGitFull(
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var contentBytes int64
-	documents, result := streamCountedNativeGitDocuments(streamCtx, repoDir, snapshot, missing, &contentBytes)
+	documents, result := streamNativeGitDocuments(streamCtx, repoDir, snapshot, missing, &contentBytes)
 	_, buildErr := indexDocumentsWithRepository(
 		streamCtx,
 		indexDir,

@@ -224,10 +224,8 @@ func TestFileOfHalfTheShardFormatGetsNoVectorRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err=%v output:\n%s", err, output)
 	}
-	scorer.mu.Lock()
-	defer scorer.mu.Unlock()
 	embedded := map[string]int{}
-	for _, path := range scorer.embeddedPaths {
+	for _, path := range scorer.unitPaths() {
 		embedded[path]++
 	}
 	if embedded["large.go"] != 0 || embedded["small.go"] == 0 {

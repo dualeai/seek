@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -114,7 +115,7 @@ func testSemanticUSearchCompatibility(t *testing.T) string {
 // writeTestSemanticGeneration writes a generation of units to dir with no
 // model. It sends embeddings to the row collector of the build
 // (collectSemanticBatches), writes placeholder USearch shards, and writes the
-// manifest.
+// manifest. It returns the manifest that it reads back from dir.
 func writeTestSemanticGeneration(
 	ctx context.Context,
 	dir string,
@@ -167,7 +168,7 @@ func writeTestSemanticGeneration(
 		}
 		shardRows = semanticUSearchMaxShardRows
 	}
-	return writeSemanticGenerationFromParts(
+	if err := writeSemanticGenerationFromParts(
 		buildCtx,
 		dir,
 		source,
@@ -177,7 +178,10 @@ func writeTestSemanticGeneration(
 		output.coarseArtifact,
 		shardRows,
 		shards,
-	)
+	); err != nil {
+		return semanticManifest{}, err
+	}
+	return readSemanticManifestUnchecked(dir)
 }
 
 // writeTestUSearchShard writes placeholder graph files of at most
@@ -291,7 +295,6 @@ func BenchmarkReadSemanticRows(b *testing.B) {
 	encoded, _ := semanticRowsBenchmarkFixture(b)
 	b.SetBytes(int64(len(encoded)))
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
 		decoded, err := readSemanticRowsFrom(bytes.NewReader(encoded), 4_096, true)
 		if err != nil {
@@ -305,7 +308,6 @@ func BenchmarkReadVerifiedSemanticRows(b *testing.B) {
 	encoded, artifact := semanticRowsBenchmarkFixture(b)
 	b.SetBytes(int64(len(encoded)))
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
 		decoded, err := readVerifiedSemanticRows(bytes.NewReader(encoded), artifact.SHA256, 4_096)
 		if err != nil {
@@ -393,7 +395,7 @@ func writeSemanticOpenBenchmarkGeneration(
 			Name: name, Start: uint64(start), Rows: uint64(rows), ID: artifact.SHA256, semanticArtifact: artifact,
 		}
 	}
-	if _, err := writeSemanticGenerationFromParts(
+	if err := writeSemanticGenerationFromParts(
 		b.Context(), dir, source, "", units, semanticSizedArtifact{Bytes: vectorBytes},
 		semanticSizedArtifact{Bytes: coarseBytes}, shardRows, shards,
 	); err != nil {
@@ -467,6 +469,33 @@ func TestReadVerifiedSemanticRowsReadsInputOnce(t *testing.T) {
 	}
 	if len(decoded) != 1 || reader.bytes != int64(len(encoded)) {
 		t.Fatalf("decoded rows=%d bytes=%d, want 1 and %d", len(decoded), reader.bytes, len(encoded))
+	}
+}
+
+// TestReadSemanticRowsRejectsWrongRowIndex gives the second row of a valid
+// rows.bin the index 7. The read that trusts the file (no full check) must
+// still fail: the filter mask uses the position of a row as its index
+// (buildSemanticFilterMask).
+func TestReadSemanticRowsRejectsWrongRowIndex(t *testing.T) {
+	rows := []semanticUnit{
+		{row: 0, path: "main.go", start: 0, end: 1, kind: semanticUnitSymbol, parserResult: semanticParserCTags},
+		{row: 1, path: "main.go", start: 1, end: 2, kind: semanticUnitSymbol, parserResult: semanticParserCTags},
+	}
+	path := filepath.Join(t.TempDir(), semanticRowsFile)
+	if _, err := writeSemanticRows(path, rows); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSemanticRowsFrom(bytes.NewReader(encoded), 2, false); err != nil {
+		t.Fatalf("valid rows: %v", err)
+	}
+	second := semanticRowsHeaderBytes + semanticRowFixedBytes + len(rows[0].path)
+	binary.LittleEndian.PutUint64(encoded[second:], 7)
+	if _, err := readSemanticRowsFrom(bytes.NewReader(encoded), 2, false); err == nil {
+		t.Fatal("rows.bin with index 7 at position 1 was accepted")
 	}
 }
 
@@ -751,9 +780,10 @@ func testLargeSemanticManifest(t *testing.T, rows uint64) semanticManifest {
 	for start := uint64(0); start < rows; start += semanticUSearchMaxShardRows {
 		manifest.USearchFiles = append(manifest.USearchFiles, semanticUSearchShard{
 			Name: semanticUSearchShardName(len(manifest.USearchFiles)), Start: start,
-			Rows:             min(semanticUSearchMaxShardRows, rows-start),
-			ID:               strings.Repeat("0", sha256.Size*2),
-			semanticArtifact: semanticArtifact{Bytes: 1, SHA256: strings.Repeat("0", sha256.Size*2)},
+			Rows:   min(semanticUSearchMaxShardRows, rows-start),
+			ID:     strings.Repeat("0", sha256.Size*2),
+			Bytes:  1,
+			SHA256: strings.Repeat("0", sha256.Size*2),
 		})
 	}
 	return manifest
@@ -808,7 +838,7 @@ func TestWriteSemanticGenerationHonorsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	dir := t.TempDir()
-	_, err := writeSemanticGenerationFromParts(
+	err := writeSemanticGenerationFromParts(
 		ctx, dir, "head", "", nil, semanticSizedArtifact{}, semanticSizedArtifact{}, 0, nil,
 	)
 	if !errors.Is(err, context.Canceled) {
@@ -950,7 +980,6 @@ func BenchmarkExactSemanticRange(b *testing.B) {
 			floor := floorPerToken * float32(tokenCount)
 			ctx := context.Background()
 			b.ReportAllocs()
-			b.ResetTimer()
 			for b.Loop() {
 				hits, err := exactSemanticRange(ctx, vectors, &packed, nil, 0, len(vectors), floor)
 				if err != nil {

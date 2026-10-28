@@ -214,12 +214,9 @@ import "C"
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 	mathbits "math/bits"
@@ -332,36 +329,11 @@ func semanticUSearchLayout() string {
 // semanticUSearchAssetKey is the digest of the bundled library (70 to 90 KB
 // compressed, so the hash costs about 30 us).
 func semanticUSearchAssetKey() string {
-	digest := sha256.Sum256(semanticUSearchCompressedRuntime)
-	return hex.EncodeToString(digest[:16])
+	return semanticRuntimeAssetKey(semanticUSearchCompressedRuntime)
 }
 
 func extractSemanticUSearchRuntime() (string, error) {
-	runtimeBytes, err := decodeLateOnAsset(semanticUSearchCompressedRuntime)
-	if err != nil {
-		return "", fmt.Errorf("load USearch runtime: %w", err)
-	}
-	cacheRoot, err := seekUserCacheRoot()
-	if err != nil {
-		return "", err
-	}
-	dir := filepath.Join(cacheRoot, "semantic", "usearch", semanticUSearchAssetKey())
-	digest := sha256.Sum256(runtimeBytes)
-	wantSHA256 := hex.EncodeToString(digest[:])
-	defer touchRuntimeUse(dir)
-	path, _, err := installPrivateAsset(
-		dir,
-		semanticUSearchRuntimeFileName,
-		".usearch-*.tmp",
-		func(path string) bool {
-			return validFileDigest(path, int64(len(runtimeBytes)), wantSHA256)
-		},
-		func(writer io.Writer) error {
-			_, err := writer.Write(runtimeBytes)
-			return err
-		},
-	)
-	return path, err
+	return installSemanticRuntime("USearch", semanticUSearchCompressedRuntime, semanticUSearchRuntimeFileName)
 }
 
 // semanticUSearchShardsBuilt counts the graph shards that builds made, not
@@ -414,9 +386,7 @@ func buildSemanticUSearchStream(
 		}
 		errorOnce.Do(func() {
 			firstErr = err
-			if cancel != nil {
-				cancel()
-			}
+			cancel()
 		})
 	}
 	compatibility, err := semanticUSearchCompatibility()
@@ -585,13 +555,10 @@ func prepareSemanticUSearchShard(
 	name := semanticUSearchShardName(job.shard)
 	path := filepath.Join(dir, name)
 	shard := semanticUSearchShard{Name: name, Start: job.plan.start, Rows: job.plan.rows}
-	id, err := semanticUSearchShardID(compatibility, job.plan, job.embeddings)
-	if err != nil {
-		return shard, nil, err
-	}
-	shard.ID = id
-	if source, ok := sources[id]; ok {
+	shard.ID = semanticUSearchShardID(compatibility, job.plan, job.embeddings)
+	if source, ok := sources[shard.ID]; ok {
 		reuse := semanticUSearchShardReuse{source: source}
+		var err error
 		if source.link {
 			reuse, err = verifySemanticUSearchShardSource(source)
 		} else {
@@ -705,10 +672,7 @@ func buildSemanticUSearchShard(
 				return err
 			}
 		}
-		coarse, ok := embeddings.At(row)
-		if !ok {
-			return fmt.Errorf("semantic embedding row %d is missing", row)
-		}
+		coarse := embeddings.At(row)
 		for centroid := range coarse {
 			vector := &coarse[centroid]
 			if err := validateNormalizedSemanticVector(vector); err != nil {
@@ -745,13 +709,10 @@ func buildSemanticUSearchShard(
 	return nil
 }
 
-// semanticUSearchQueryShard defines one shard search. limit is the number of
-// vector keys that the first request asks for each query token, not a
-// semantic row count. A token can search again with more keys. filtered is
-// true only when the shard must use the bitmap predicate.
+// semanticUSearchQueryShard defines one shard search. filtered is true only
+// when the shard must use the bitmap predicate.
 type semanticUSearchQueryShard struct {
 	index    int
-	limit    int
 	filtered bool
 }
 
@@ -831,7 +792,7 @@ func planSemanticUSearchShards(
 		if err := ctx.Err(); err != nil {
 			return semanticUSearchQueryPlan{}, err
 		}
-		job := semanticUSearchQueryShard{index: shardIndex, limit: semanticUSearchVectorsPerQuery}
+		job := semanticUSearchQueryShard{index: shardIndex}
 		if mask == nil {
 			plan.jobs = append(plan.jobs, job)
 			continue
@@ -852,7 +813,6 @@ func planSemanticUSearchShards(
 			continue
 		}
 		job.filtered = true
-		job.limit = int(min(uint64(semanticUSearchVectorsPerQuery), allowedVectors))
 		plan.jobs = append(plan.jobs, job)
 	}
 	if len(exactShards) != 0 {
@@ -943,7 +903,7 @@ func executeSemanticUSearchPlan(
 						generation.usearch[job.index],
 						generation.manifest.USearchFiles[job.index],
 						queryVectors,
-						job.limit,
+						semanticUSearchVectorsPerQuery,
 						mask,
 						job.filtered,
 					)
@@ -1132,21 +1092,14 @@ func searchSemanticUSearchShardTokens(
 	baseKey := semanticUSearchVectorKey(shard.Start, 0)
 	seenKeys := make([]byte, (vectorCount+7)/8)
 	allHits := make([][]semanticHit, len(queries))
-	var centroidShift uint8
-	if filtered {
-		if mask == nil || len(mask.bits) == 0 {
-			return nil, false, fmt.Errorf("filtered USearch call has no bitmap")
-		}
-		centroidShift, err = semanticUSearchCentroidShift()
-		if err != nil {
-			return nil, false, err
-		}
-	}
 	// bits stays nil for an unfiltered search.
 	var bits *C.uint8_t
 	var bitBytes C.size_t
 	var bitRows C.uint64_t
 	if filtered {
+		if mask == nil || len(mask.bits) == 0 {
+			return nil, false, fmt.Errorf("filtered USearch call has no bitmap")
+		}
 		if shard.Start >= mask.rows {
 			return nil, false, fmt.Errorf("USearch shard starts at row %d outside the filter", shard.Start)
 		}
@@ -1166,7 +1119,7 @@ func searchSemanticUSearchShardTokens(
 				C.size_t(len(queries)),
 				C.size_t(semanticEmbeddingDimensions),
 				C.size_t(count),
-				bits, bitBytes, bitRows, C.uint64_t(shard.Start), C.uint8_t(centroidShift),
+				bits, bitBytes, bitRows, C.uint64_t(shard.Start), C.uint8_t(semanticUSearchCentroidShift),
 				&keys[0], &distances[0],
 				(*C.seek_usearch_hit_t)(unsafe.Pointer(&nativeHits[0])),
 				(*C.size_t)(unsafe.Pointer(&found[0])),
@@ -1250,16 +1203,11 @@ func semanticUSearchUnitAndCentroid(key uint64) (uint64, int) {
 	return key / semanticCoarseCentroidsPerUnit, int(key % semanticCoarseCentroidsPerUnit)
 }
 
-// semanticUSearchCentroidShift returns the key-to-row shift used by the C
-// bitmap predicate. The coarse-centroid count must be a power of two so
-// key >> shift has the same result as division by that count.
-func semanticUSearchCentroidShift() (uint8, error) {
-	count := uint(semanticCoarseCentroidsPerUnit)
-	if count == 0 || count&(count-1) != 0 {
-		return 0, fmt.Errorf("USearch centroid count must be a power of two")
-	}
-	return uint8(mathbits.TrailingZeros(count)), nil
-}
+// semanticUSearchCentroidShift is the key-to-row shift of the C bitmap
+// predicate. The coarse-centroid count is a power of two, so key >> shift has
+// the same result as division by that count. A test checks that 1 << shift is
+// that count.
+const semanticUSearchCentroidShift = 2
 
 func newSemanticUSearchIndex() (C.seek_usearch_index_t, error) {
 	var cErr C.seek_usearch_error_t

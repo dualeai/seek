@@ -173,7 +173,7 @@ func reportStaleIndexWarning(err error) {
 		slog.Debug("Index update stopped after cancellation", "error", err)
 		return
 	}
-	if kept, ok := errors.AsType[*dirtyFilesKept](err); ok && len(kept.files) > 0 {
+	if kept, ok := errors.AsType[*dirtyFilesKept](err); ok {
 		// The build published every other change. The first name holds the
 		// path, so the cause leaves it out.
 		cause := kept.cause

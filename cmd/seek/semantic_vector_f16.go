@@ -120,33 +120,21 @@ func validateSemanticF16Vector(vector *semanticF16Vector) error {
 	return nil
 }
 
-// encodeSemanticFineVectors writes the fine centroids of embeddings to buffer
-// in the vectors.f16 layout and returns the written bytes.
-func encodeSemanticFineVectors(
-	buffer []byte,
-	embeddings []semanticUnitEmbedding,
-	startRow int,
-) ([]byte, error) {
-	wantBytes := len(embeddings) * semanticFineVectorBytesPerUnit
-	if startRow < 0 || len(buffer) < wantBytes {
-		return nil, fmt.Errorf("semantic vector buffer is too small")
-	}
-	encoded := buffer[:wantBytes]
+// encodeSemanticFineVectors writes the fine centroids of one row to the first
+// semanticFineVectorBytesPerUnit bytes of dst, in the vectors.f16 layout. row
+// names the row in an error.
+func encodeSemanticFineVectors(dst []byte, fine *semanticFineVectors, row uint64) error {
 	at := 0
-	// Use indexes so range does not copy a 4,608-byte embedding or a 192-byte
-	// vector.
-	for row := range embeddings {
-		embedding := &embeddings[row]
-		for centroid := range embedding.fine {
-			stored, err := encodeSemanticF16Vector(&embedding.fine[centroid])
-			if err != nil {
-				return nil, fmt.Errorf("semantic row %d centroid %d: %w", startRow+row, centroid, err)
-			}
-			for dimension := range stored {
-				binary.LittleEndian.PutUint16(encoded[at:at+2], stored[dimension])
-				at += 2
-			}
+	// Use indexes so range does not copy a 192-byte vector.
+	for centroid := range fine {
+		stored, err := encodeSemanticF16Vector(&fine[centroid])
+		if err != nil {
+			return fmt.Errorf("semantic row %d centroid %d: %w", row, centroid, err)
+		}
+		for dimension := range stored {
+			binary.LittleEndian.PutUint16(dst[at:at+2], stored[dimension])
+			at += 2
 		}
 	}
-	return encoded, nil
+	return nil
 }

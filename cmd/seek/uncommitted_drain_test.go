@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -8,15 +10,45 @@ import (
 	"testing"
 )
 
+// TestUncommittedDeltaPossible_StatSizesAtTheWindowGiveNoDelta checks the
+// check before the reads: when the stat sizes of the files to read reach the
+// window, uncommittedDeltaPossible gives no delta, so no reader starts.
+func TestUncommittedDeltaPossible_StatSizesAtTheWindowGiveNoDelta(t *testing.T) {
+	repoDir, cacheDir, indexDir := t.TempDir(), t.TempDir(), t.TempDir()
+	// A live family of one shard. Only its name counts here.
+	if err := os.WriteFile(filepath.Join(indexDir, repoUncommitted+"_v16.00000.zoekt"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUncommittedManifest(cacheDir, "cached", nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	const fileSize = 512 * 1024
+	names := []string{"a.go", "b.go"}
+	for _, name := range names {
+		if err := os.WriteFile(filepath.Join(repoDir, name), bytes.Repeat([]byte("a"), fileSize), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := corpusStore{cacheDir: cacheDir, indexDir: indexDir}
+	for _, tc := range []struct {
+		window int64
+		delta  bool
+	}{
+		{window: 2*fileSize + 1, delta: true},
+		{window: 2 * fileSize, delta: false},
+	} {
+		ctx := context.WithValue(t.Context(), indexWindowKey{}, tc.window)
+		if got := uncommittedDeltaPossible(ctx, repoDir, store, "cached", true, names); (got != nil) != tc.delta {
+			t.Fatalf("window %d: delta=%v, want %v", tc.window, got != nil, tc.delta)
+		}
+	}
+}
+
 // TestReadUncommittedCandidates_BoundedDrainOnOversize checks that
 // readUncommittedCandidates returns errDeltaPayloadExceedsWindow and releases
-// every acquired weight when the candidates reach the window. It covers both
-// guards:
-//   - pre-flight: no file exists, so only the check of the stat sizes can
-//     return the error. It reads no file.
-//   - mid-drain: each candidate states 1 byte, so the stat sizes pass and the
-//     reads reach the window. The drain must then release the weight of every
-//     read.
+// every acquired weight when the reads reach the window. Each candidate states
+// 1 byte, so the stat sizes pass and the reads reach the window. The drain
+// must then release the weight of every read.
 func TestReadUncommittedCandidates_BoundedDrainOnOversize(t *testing.T) {
 	testReadSemMu.Lock()
 	defer testReadSemMu.Unlock()
@@ -24,6 +56,7 @@ func TestReadUncommittedCandidates_BoundedDrainOnOversize(t *testing.T) {
 	const testBudget int64 = 4 * 1024 * 1024 // 4 MiB
 	restore := swapReadSemaphoreForTest(testBudget)
 	defer restore()
+	defer goroutineLeakGuard(t)()
 
 	// 12 files of 512 KiB hold 6 MiB, above the 2 MiB window of the 4 MiB
 	// budget.
@@ -33,46 +66,31 @@ func TestReadUncommittedCandidates_BoundedDrainOnOversize(t *testing.T) {
 	for i := range payload {
 		payload[i] = byte('a' + i%26)
 	}
-	for _, tc := range []struct {
-		name          string
-		writeFiles    bool
-		candidateSize int64
-	}{
-		{name: "pre-flight", writeFiles: false, candidateSize: fileSize},
-		{name: "mid-drain", writeFiles: true, candidateSize: 1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			defer goroutineLeakGuard(t)()
-			repoDir := t.TempDir()
-			candidates := make([]uncommittedCandidate, fileCount)
-			for i := 0; i < fileCount; i++ {
-				name := testFileName("dirty", i)
-				candidates[i] = uncommittedCandidate{name: name, size: tc.candidateSize}
-				if !tc.writeFiles {
-					continue
-				}
-				path := filepath.Join(repoDir, name)
-				if err := os.WriteFile(path, payload, 0o644); err != nil {
-					t.Fatal(err)
-				}
-				info, err := os.Lstat(path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				_, candidates[i].ino, candidates[i].mtime = fileInfoIdentity(info)
-			}
+	repoDir := t.TempDir()
+	candidates := make([]uncommittedCandidate, fileCount)
+	for i := range fileCount {
+		name := testFileName("dirty", i)
+		candidates[i] = uncommittedCandidate{name: name, size: 1}
+		path := filepath.Join(repoDir, name)
+		if err := os.WriteFile(path, payload, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, candidates[i].ino, candidates[i].mtime = fileInfoIdentity(info)
+	}
 
-			docs, _, err := readUncommittedCandidates(t.Context(), repoDir, candidates)
-			if !errors.Is(err, errDeltaPayloadExceedsWindow) {
-				t.Fatalf("expected errDeltaPayloadExceedsWindow, got err=%v docs=%d", err, len(docs))
-			}
-			if docs != nil {
-				t.Fatalf("expected nil docs on bounded-drain abort, got %d", len(docs))
-			}
-			if got := availableWeight(readSemaphore); got != testBudget {
-				t.Fatalf("semaphore leak after bounded drain: got=%d want=%d", got, testBudget)
-			}
-		})
+	docs, _, err := readUncommittedCandidates(t.Context(), repoDir, candidates)
+	if !errors.Is(err, errDeltaPayloadExceedsWindow) {
+		t.Fatalf("expected errDeltaPayloadExceedsWindow, got err=%v docs=%d", err, len(docs))
+	}
+	if docs != nil {
+		t.Fatalf("expected nil docs on bounded-drain abort, got %d", len(docs))
+	}
+	if got := availableWeight(readSemaphore); got != testBudget {
+		t.Fatalf("semaphore leak after bounded drain: got=%d want=%d", got, testBudget)
 	}
 }
 

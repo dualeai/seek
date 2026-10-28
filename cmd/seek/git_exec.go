@@ -74,27 +74,40 @@ func hardenedGitCommand(ctx context.Context, repoDir string, args []string) *exe
 // 2.45 that honors GIT_NO_LAZY_FETCH (the 2024 security releases).
 var noLazyFetchMinPatch = map[int]int{39: 4, 40: 2, 41: 1, 42: 2, 43: 4, 44: 1}
 
-// gitHonorsNoLazyFetch reports whether `git version` output names a Git that
-// honors GIT_NO_LAZY_FETCH: 2.45 or later, or a maintenance release listed in
-// noLazyFetchMinPatch.
-func gitHonorsNoLazyFetch(out []byte) bool {
+// gitVersionNumbers reads the major, minor, and patch numbers of `git version`
+// output, such as "git version 2.43.0.windows.1". Each number ends at its
+// first character that is not a digit, and a missing number is 0. A patch
+// field with no digit is also 0: a Git built from a source snapshot prints
+// "git version 2.47.GIT". ok is false when the major or minor number has no
+// digit.
+func gitVersionNumbers(out []byte) (major, minor, patch int, ok bool) {
 	fields := strings.SplitN(strings.TrimPrefix(strings.TrimSpace(string(out)), "git version "), ".", 4)
-	numbers := make([]int, 3)
-	for i := range numbers {
-		if i >= len(fields) {
-			break
-		}
+	var numbers [3]int
+	for i := range min(len(fields), len(numbers)) {
 		digits := fields[i]
 		if end := strings.IndexFunc(digits, func(r rune) bool { return r < '0' || r > '9' }); end >= 0 {
 			digits = digits[:end]
 		}
+		if digits == "" && i == 2 {
+			break
+		}
 		n, err := strconv.Atoi(digits)
 		if err != nil {
-			return false
+			return 0, 0, 0, false
 		}
 		numbers[i] = n
 	}
-	major, minor, patch := numbers[0], numbers[1], numbers[2]
+	return numbers[0], numbers[1], numbers[2], true
+}
+
+// gitHonorsNoLazyFetch reports whether `git version` output names a Git that
+// honors GIT_NO_LAZY_FETCH: 2.45 or later, or a maintenance release listed in
+// noLazyFetchMinPatch.
+func gitHonorsNoLazyFetch(out []byte) bool {
+	major, minor, patch, ok := gitVersionNumbers(out)
+	if !ok {
+		return false
+	}
 	if major != 2 {
 		return major > 2
 	}
@@ -261,11 +274,8 @@ func repoIsPartialClone(ctx context.Context, repoDir string) bool {
 }
 
 // readRepoGitConfig reads the filter drivers and the partial-clone mark of
-// repoDir, once per command. An empty repoDir reads nothing.
+// repoDir, once per command.
 func readRepoGitConfig(ctx context.Context, repoDir string) (repoGitConfig, error) {
-	if repoDir == "" {
-		return repoGitConfig{}, nil
-	}
 	if cached, ok := repoConfigCache.Load(repoDir); ok {
 		return cached.(repoGitConfig), nil
 	}

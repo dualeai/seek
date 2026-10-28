@@ -75,8 +75,9 @@ func isUncommittedShard(base string) bool {
 // This scan uses os.ReadDir because it reports directory read errors. A partial
 // list could cause publication of an incomplete family.
 type familyScan struct {
-	dir     string
-	members []familyMember // sorted by name
+	dir string
+	// members are sorted by name, because os.ReadDir sorts its entries.
+	members []familyMember
 }
 
 type familyMember struct {
@@ -118,7 +119,6 @@ func scanFamily(dir string) (familyScan, error) {
 		}
 		sc.members = append(sc.members, m)
 	}
-	slices.SortFunc(sc.members, func(a, b familyMember) int { return strings.Compare(a.name, b.name) })
 	return sc, nil
 }
 

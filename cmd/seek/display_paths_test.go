@@ -88,9 +88,9 @@ func TestSemanticFileFilterIsSearchRootRelative(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := headerPaths(output); scorer.embedCalls.Load() == 0 ||
+	if got := headerPaths(output); scorer.embeds.Load() == 0 ||
 		!slices.Equal(got, []string{"gitA/README.md", "gitA/net/retry.go"}) {
-		t.Fatalf("headers=%v (embeds=%d), want the files of gitA only:\n%s", got, scorer.embedCalls.Load(), output)
+		t.Fatalf("headers=%v (embeds=%d), want the files of gitA only:\n%s", got, scorer.embeds.Load(), output)
 	}
 }
 
@@ -213,22 +213,36 @@ func TestFileNameLineShowsTheHeader(t *testing.T) {
 
 // TestHeadersArePathsForTypedSubpaths types operands as their paths below the
 // node root: the headers are the node paths, so file: needs no listing. From a
-// cwd below the root, "." changes the headers.
+// cwd below the root, "." changes the headers. An operand in another form at
+// or below the root, in either order, and an operand above the root that holds
+// it, change them too.
 func TestHeadersArePathsForTypedSubpaths(t *testing.T) {
 	root := t.TempDir()
-	for _, dir := range []string{"sub", "pkg"} {
+	for _, dir := range []string{"sub/deep", "pkg"} {
 		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	t.Chdir(root)
 	node := canonicalCorpusPath(root)
-	if operands := newDisplayOperands([]string{"sub", "./pkg"}); !operands.headersArePaths(node) {
-		t.Fatal("operands typed as their paths need no rewrite")
-	}
-	t.Chdir(filepath.Join(root, "sub"))
-	if operands := newDisplayOperands([]string{"."}); operands.headersArePaths(node) {
-		t.Fatal("a cwd below the root changes the headers")
+	sub, pkg := filepath.Join(node, "sub"), filepath.Join(node, "pkg")
+	for _, tc := range []struct {
+		cwd, node string
+		operands  []string
+		want      bool
+	}{
+		{root, node, []string{"sub", "./pkg"}, true},
+		{root, node, []string{"."}, true},
+		{sub, node, []string{"."}, false},
+		{root, node, []string{"sub", pkg}, false},
+		{root, node, []string{pkg, "sub"}, false},
+		{root, node, []string{".", node}, false},
+		{sub, sub, []string{"deep"}, true},
+		{sub, sub, []string{"..", "deep"}, false},
+	} {
+		t.Chdir(tc.cwd)
+		if got := newDisplayOperands(tc.operands).headersArePaths(tc.node); got != tc.want {
+			t.Errorf("cwd %s, operands %q, node %s: got %v, want %v", tc.cwd, tc.operands, tc.node, got, tc.want)
+		}
 	}
 }
 
@@ -248,6 +262,31 @@ func TestExplicitFileAtomInOrReadsTheHeader(t *testing.T) {
 	for _, query := range []string{"file:^beta", "file:^beta or content:^beta", "file:^beta or ^beta"} {
 		if out, headers := searchHeaders(t, query); !slices.Contains(headers, "beta.go") {
 			t.Fatalf("%q: headers=%v, want beta.go:\n%s", query, headers, out)
+		}
+	}
+}
+
+// TestHeaderTakesTheDeepestFirstOperand checks which operand gives a header:
+// the deepest root that holds the file, the first operand typed for one root,
+// ".", and the root "/". A relative path has no holder.
+func TestHeaderTakesTheDeepestFirstOperand(t *testing.T) {
+	root := canonicalCorpusPath(t.TempDir())
+	file := filepath.Join(root, "sub", "deep", "a.go")
+	writeFixtureFile(t, file, "a\n")
+	t.Chdir(root)
+	// Enough ".." to reach "/" from any temporary folder.
+	top := strings.Repeat("../", 64)
+	outside := filepath.Join(filepath.Dir(root), "x.go")
+	operands := newDisplayOperands([]string{"sub", "./sub/", filepath.Join(root, "sub"), file, ".", top})
+	for abs, want := range map[string]string{
+		filepath.Join(root, "sub", "b.go"): "sub/b.go",
+		file:                               file,
+		filepath.Join(root, "c.go"):        "c.go",
+		outside:                            filepath.Join(filepath.Clean(top), outside),
+		"sub/b.go":                         "sub/b.go",
+	} {
+		if got := operands.header(abs); got != want {
+			t.Errorf("header(%q) = %q, want %q", abs, got, want)
 		}
 	}
 }

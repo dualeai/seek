@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"unicode"
 
 	"github.com/sourcegraph/zoekt"
@@ -149,33 +150,47 @@ func prepareCorpusResultsForDisplay(
 
 // rankCorpusResultsForDisplay sorts a copy of results for display. Each node
 // read returns one current copy per file, so the results need no
-// deduplication.
+// deduplication. Equal results keep their input order, as in a stable sort. A
+// result is 384 bytes, so the sort moves positions and copies each result
+// once. On 30,000 results, a stable sort of the results took 40 to 55 ms.
 func rankCorpusResultsForDisplay(results []corpusSearchResult) []corpusSearchResult {
-	ranked := slices.Clone(results)
-	sort.SliceStable(ranked, func(i, j int) bool {
-		left := ranked[i]
-		right := ranked[j]
-		if left.rankOverride > 0 && right.rankOverride > 0 && left.rankOverride != right.rankOverride {
-			return left.rankOverride < right.rankOverride
+	order := make([]int, len(results))
+	for index := range order {
+		order[index] = index
+	}
+	slices.SortFunc(order, func(left, right int) int {
+		if c := compareCorpusResults(&results[left], &results[right]); c != 0 {
+			return c
 		}
-		return lessCorpusResultBM25(left, right)
+		return cmp.Compare(left, right)
 	})
+	ranked := make([]corpusSearchResult, len(results))
+	for position, index := range order {
+		ranked[position] = results[index]
+	}
 	return ranked
 }
 
-// lessCorpusResultBM25 orders by score (highest first), then by file name,
-// display root, and corpus ID, so the order is fixed.
-func lessCorpusResultBM25(left, right corpusSearchResult) bool {
-	if left.file.Score != right.file.Score {
-		return left.file.Score > right.file.Score
+// compareCorpusResults orders by the model rank when both results have one.
+// Else it orders by score (highest first), then by file name, display root,
+// and corpus ID, so the order is fixed.
+func compareCorpusResults(left, right *corpusSearchResult) int {
+	if left.rankOverride > 0 && right.rankOverride > 0 && left.rankOverride != right.rankOverride {
+		return cmp.Compare(left.rankOverride, right.rankOverride)
 	}
-	if left.file.FileName != right.file.FileName {
-		return left.file.FileName < right.file.FileName
+	switch {
+	case left.file.Score > right.file.Score:
+		return -1
+	case left.file.Score < right.file.Score:
+		return 1
 	}
-	if left.displayRoot != right.displayRoot {
-		return left.displayRoot < right.displayRoot
+	if c := strings.Compare(left.file.FileName, right.file.FileName); c != 0 {
+		return c
 	}
-	return left.corpusID < right.corpusID
+	if c := strings.Compare(left.displayRoot, right.displayRoot); c != 0 {
+		return c
+	}
+	return strings.Compare(string(left.corpusID), string(right.corpusID))
 }
 
 // normalizeLineMatches keeps the best maxMatches lines (every line when
@@ -253,13 +268,12 @@ func formatCorpusFileMatch(sb corpusFormatWriter, result corpusSearchResult, dis
 	}
 
 	// The file header is the operand as typed, with the path below it
-	// (applyHeaders). With no header from the caller, it is the path relative
-	// to the node, or the absolute path in multi-node output. The [git] or
-	// [folder] tag marks the node kind in multi-node output.
+	// (applyHeaders). The [git] or [folder] tag marks the node kind in
+	// multi-node output.
 	showRoot := displayMode == showCorpusContext && result.displayRoot != ""
 	sb.writeString("## ")
 	sb.writeString(pal.file)
-	writeSanitizedString(sb, displayHeader(result, showRoot))
+	writeSanitizedString(sb, result.header)
 	sb.writeString(pal.reset)
 	sb.writeString(" (")
 	writeSanitizedString(sb, lang)
@@ -287,15 +301,7 @@ func formatCorpusFileMatch(sb corpusFormatWriter, result corpusSearchResult, dis
 			if index > 0 {
 				sb.writeString(", ")
 			}
-			path := duplicate.header
-			switch {
-			case path != "":
-			case showRoot:
-				path = duplicate.displayPath()
-			default:
-				path = duplicate.path
-			}
-			writeSanitizedString(sb, path)
+			writeSanitizedString(sb, duplicate.header)
 		}
 		sb.writeByte('\n')
 	}
@@ -305,7 +311,7 @@ func formatCorpusFileMatch(sb corpusFormatWriter, result corpusSearchResult, dis
 	lastEmittedLine := 0
 
 	for i, lm := range fm.LineMatches {
-		matchLine := int(lm.LineNumber)
+		matchLine := lm.LineNumber
 
 		// Count the "before" context lines and find their bounds. The count
 		// makes no slice of lines, because this code runs for each match line.

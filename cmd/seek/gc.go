@@ -32,6 +32,13 @@ const (
 	// accelerator model that no search used, and the runtime directory of
 	// another Seek version. The cache budget does not cover them.
 	providerArtifactMaxAge = 14 * 24 * time.Hour
+	// providerArtifactUsedFile records the last time a process wanted a
+	// compiled accelerator model. The collector measures the age of the model
+	// from it, as it measures the age of a corpus from usedFile. The
+	// accelerated provider writes it (touchProviderArtifactUse). The name is
+	// here because the collector compiles on every target, and the provider
+	// code only where an accelerator exists.
+	providerArtifactUsedFile = ".used"
 
 	envGCInterval = "SEEK_GC_INTERVAL"
 
@@ -60,7 +67,7 @@ const (
 )
 
 // gcRowResult is what evictCorpus returns. action fills the ACTION column. err
-// is set only for trashed and failed; evictPlanned logs it with slog.Warn.
+// is set only for trashed and failed; evictIfPlanned logs it with slog.Warn.
 type gcRowResult struct {
 	action gcAction
 	err    error
@@ -310,8 +317,9 @@ func runGC(ctx context.Context, opts gcOptions) {
 	// Compiled accelerator models and old runtimes come last. Corpus eviction
 	// reclaims more and is the collection's main job, so it takes the time
 	// budget first.
-	sweepAgedProviderArtifacts(ctx, opts.writer, cacheRoot, time.Now().Add(-providerArtifactAge(opts.evictAll)))
-	sweepRetiredRuntimes(ctx, opts.writer, cacheRoot, time.Now().Add(-providerArtifactAge(opts.evictAll)))
+	before := time.Now().Add(-providerArtifactAge(opts.evictAll))
+	sweepAgedProviderArtifacts(ctx, opts.writer, cacheRoot, before)
+	sweepRetiredRuntimes(ctx, opts.writer, cacheRoot, before)
 
 	// Update the stamp last, also after a partial failure. Else a lasting
 	// error would make GC run again on each run of Seek.
@@ -319,8 +327,7 @@ func runGC(ctx context.Context, opts gcOptions) {
 }
 
 // sweepRetiredRuntimes removes the native runtimes of other Seek versions.
-// These are ONNX Runtime under reranker/<version>/<sha256> or the older flat
-// reranker/ort-<version>-<platform>-<hash>, USearch under
+// These are ONNX Runtime under reranker/<version>/<sha256>, USearch under
 // semantic/usearch/<key>, and NumKong under semantic/numkong/<key>. The
 // runtimes of this binary stay. A runtime goes when its directory is older
 // than the age bound (retiredRuntimes), and its next use installs it again.
@@ -376,20 +383,11 @@ func retiredRuntimes(cacheRoot string, before time.Time) []string {
 	current := filepath.Join(rerankerRoot, bundle.version, bundle.sha256)
 	entries, _ := os.ReadDir(rerankerRoot)
 	for _, entry := range entries {
-		// Take only runtime names: reranker/coreml and other provider
-		// caches keep their own rules.
-		name := strings.TrimPrefix(entry.Name(), providerArtifactDiscardPrefix)
-		path := filepath.Join(rerankerRoot, entry.Name())
-		switch {
-		case !entry.IsDir():
-		case strings.HasPrefix(name, "ort-"):
-			// The older flat layout holds the library itself.
-			if runtimeAged(entry, before) {
-				due = append(due, path)
-			}
-		case isRuntimeVersionDir(entry):
-			// reranker/<version>/<sha256>: each runtime by its own age.
-			due = append(due, agedRuntimeDirs(path, current, before)...)
+		// Take only the reranker/<version> directories, and each runtime in
+		// one by its own age: reranker/coreml and other provider caches keep
+		// their own rules.
+		if isRuntimeVersionDir(entry) {
+			due = append(due, agedRuntimeDirs(filepath.Join(rerankerRoot, entry.Name()), current, before)...)
 		}
 	}
 	return due
@@ -790,26 +788,34 @@ func sweepCorpusOrphans(e corpusDirEntry, now time.Time) {
 	}
 }
 
-// evictIfPlanned applies the eviction plan to one corpus. The streaming and
-// the silent loops of runGC share it.
+// evictIfPlanned applies the eviction plan to one corpus and logs a failed or
+// partial eviction. The loops of runGC and enforceCacheBudget share it.
 func evictIfPlanned(e corpusDirEntry, trashDir string, evict map[corpusID]bool) gcRowResult {
 	if !evict[e.name] {
 		return gcRowResult{action: actionKept}
 	}
-	return evictPlanned(e, trashDir)
+	res := evictCorpus(e, trashDir)
+	switch res.action {
+	case actionFailed:
+		slog.Warn("gc eviction failed", "corpus", e.name, "error", res.err)
+	case actionTrashed:
+		slog.Warn("gc partial eviction", "corpus", e.name, "error", res.err)
+	}
+	return res
 }
 
 // evictCorpus deletes a corpus in two steps (rename, then RemoveAll) under a
 // non-blocking lock of the corpus. Its gcRowResult tells the outcome:
 //   - actionLocked: another Seek holds the corpus .lock or .build.lock.
-//   - actionKept: .used is newer than cutoff (a new use since the list).
+//   - actionKept: .used is newer than e.usedAt, the time of the list (a new
+//     use since the list).
 //   - actionGone: the corpus directory went away (another process).
 //   - actionEvicted: the rename and RemoveAll worked.
 //   - actionTrashed: the rename worked and RemoveAll failed; drainTrash
 //     finishes it.
 //   - actionFailed: the lock open, build-lock check, or rename gave an error
 //     other than ENOENT.
-func evictCorpus(e corpusDirEntry, trashDir string, cutoff time.Time) gcRowResult {
+func evictCorpus(e corpusDirEntry, trashDir string) gcRowResult {
 	lockPath := filepath.Join(e.path, lockFile)
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
@@ -837,7 +843,7 @@ func evictCorpus(e corpusDirEntry, trashDir string, cutoff time.Time) gcRowResul
 	}
 	releaseLock(bf)
 
-	if used, ok := readUsedAt(e.path); ok && used.After(cutoff) {
+	if used, ok := readUsedAt(e.path); ok && used.After(e.usedAt) {
 		return gcRowResult{action: actionKept}
 	}
 
@@ -935,7 +941,8 @@ var (
 )
 
 // touchUsed updates <cacheDir>/.used. It logs errors at Debug level and skips
-// caches on network filesystems.
+// caches on network filesystems. Scoped and unscoped searches of one
+// repository read one index, so both keep it recent for LRU eviction.
 func touchUsed(cacheDir string) {
 	nfsCheckOnce.Do(func() {
 		if root, err := seekUserCacheRoot(); err == nil {

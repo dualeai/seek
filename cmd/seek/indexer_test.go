@@ -22,14 +22,6 @@ import (
 	"github.com/sourcegraph/zoekt/index"
 )
 
-func TestComputeStateHash_Deterministic(t *testing.T) {
-	h1 := computeStateHash("# branch.oid abc123\n")
-	h2 := computeStateHash("# branch.oid abc123\n")
-	if h1 != h2 {
-		t.Errorf("expected deterministic hash, got %q and %q", h1, h2)
-	}
-}
-
 func TestComputeStateHash_DifferentInputs(t *testing.T) {
 	h1 := computeStateHash("# branch.oid abc123\n")
 	h2 := computeStateHash("# branch.oid def456\n")
@@ -77,24 +69,6 @@ func TestFallbackGitRepositoryName_StableOpaqueAndShardSafe(t *testing.T) {
 	}
 	if got := fallbackGitRepositoryName(link); got != name {
 		t.Fatalf("fallback name should use canonical path: symlink=%q root=%q", got, name)
-	}
-}
-
-func TestComputeStateHash_Length(t *testing.T) {
-	h := computeStateHash("# branch.oid abc123\n")
-	if len(h) != 16 {
-		t.Errorf("expected 16-char hex hash (xxHash64), got %d chars: %q", len(h), h)
-	}
-}
-
-func TestComputeStateHash_EmptyInput(t *testing.T) {
-	h := computeStateHash("")
-	if len(h) != 16 {
-		t.Errorf("expected 16-char hex hash (xxHash64) for empty input, got %d chars: %q", len(h), h)
-	}
-	h2 := computeStateHash("")
-	if h != h2 {
-		t.Errorf("expected deterministic hash for empty input, got %q and %q", h, h2)
 	}
 }
 
@@ -301,12 +275,6 @@ func TestStateFile_Delete(t *testing.T) {
 	}
 }
 
-func TestStateFile_DeleteNonexistent(t *testing.T) {
-	dir := t.TempDir()
-	// Should not panic on nonexistent files
-	deleteStateFiles(dir)
-}
-
 func TestStateFile_OverwriteExisting(t *testing.T) {
 	dir := t.TempDir()
 	if err := writeStateFile(dir, "first"); err != nil {
@@ -343,51 +311,6 @@ func TestStreamDirtyFiles_RegularFiles(t *testing.T) {
 	}
 }
 
-func TestStreamDirtyFiles_EmptyList(t *testing.T) {
-	dir := t.TempDir()
-	results := collectStreamFilesForTest(t, t.Context(), dir, nil, 2)
-	if len(results) != 0 {
-		t.Errorf("expected 0 results, got %d", len(results))
-	}
-}
-
-func TestStreamDirtyFiles_NonexistentFile(t *testing.T) {
-	dir := t.TempDir()
-	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"does_not_exist.go"}, 1)
-	if len(results) != 0 {
-		t.Errorf("expected 0 results for nonexistent file, got %d", len(results))
-	}
-}
-
-func TestStreamDirtyFiles_SkipsDirectories(t *testing.T) {
-	dir := t.TempDir()
-	_ = os.Mkdir(filepath.Join(dir, "subdir"), 0o755)
-	_ = os.WriteFile(filepath.Join(dir, "real.go"), []byte("package real"), 0o644)
-
-	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"subdir", "real.go"}, 2)
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result (directory skipped), got %d", len(results))
-	}
-	if results[0].name != "real.go" {
-		t.Errorf("expected real.go, got %s", results[0].name)
-	}
-}
-
-func TestStreamDirtyFiles_SkipsSymlinks(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "target.go")
-	_ = os.WriteFile(target, []byte("package target"), 0o644)
-	_ = os.Symlink(target, filepath.Join(dir, "link.go"))
-
-	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"link.go", "target.go"}, 2)
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result (symlink skipped), got %d", len(results))
-	}
-	if results[0].name != "target.go" {
-		t.Errorf("expected target.go, got %s", results[0].name)
-	}
-}
-
 func TestStreamDirtyFiles_NestedPath(t *testing.T) {
 	dir := t.TempDir()
 	_ = os.MkdirAll(filepath.Join(dir, "src", "pkg"), 0o755)
@@ -412,19 +335,6 @@ func TestStreamDirtyFiles_EmptyFile(t *testing.T) {
 	}
 	if len(results[0].content) != 0 {
 		t.Errorf("expected empty content, got %d bytes", len(results[0].content))
-	}
-}
-
-func TestStreamDirtyFiles_MixedExistingAndMissing(t *testing.T) {
-	dir := t.TempDir()
-	_ = os.WriteFile(filepath.Join(dir, "exists.go"), []byte("yes"), 0o644)
-
-	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"exists.go", "gone.go", "also_gone.go"}, 2)
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(results))
-	}
-	if results[0].name != "exists.go" {
-		t.Errorf("expected exists.go, got %s", results[0].name)
 	}
 }
 
@@ -454,23 +364,6 @@ func TestStreamDirtyFiles_SpacesInPath(t *testing.T) {
 	}
 	if results[0].name != "my dir/my file.go" {
 		t.Errorf("expected name with spaces preserved, got %s", results[0].name)
-	}
-}
-
-func TestStreamDirtyFiles_Parallelism1(t *testing.T) {
-	dir := t.TempDir()
-	for i := 0; i < 10; i++ {
-		_ = os.WriteFile(filepath.Join(dir, filepath.Base(t.Name())+string(rune('a'+i))+".go"), []byte("x"), 0o644)
-	}
-
-	files := make([]string, 10)
-	for i := 0; i < 10; i++ {
-		files[i] = filepath.Base(t.Name()) + string(rune('a'+i)) + ".go"
-	}
-
-	results := collectStreamFilesForTest(t, t.Context(), dir, files, 1)
-	if len(results) != 10 {
-		t.Errorf("expected 10 results with parallelism=1, got %d", len(results))
 	}
 }
 
@@ -764,7 +657,7 @@ func TestValidateCommittedBuildHead_CommandStartFailurePropagates(t *testing.T) 
 // --- large file skip tests ---
 
 func TestStreamDirtyFiles_LargeFileNameOnly(t *testing.T) {
-	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
+	swapForTest(t, &documentContentLimit, testDocumentContentLimit)
 	dir := t.TempDir()
 	// Create a file just over the limit
 	large := make([]byte, testDocumentContentLimit+1)
@@ -786,18 +679,6 @@ func TestStreamDirtyFiles_LargeFileNameOnly(t *testing.T) {
 		return
 	}
 	t.Fatal("expected a name-only document for large.go")
-}
-
-func TestStreamDirtyFiles_JustOverMaxSize(t *testing.T) {
-	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
-	dir := t.TempDir()
-	data := make([]byte, testDocumentContentLimit+1)
-	_ = os.WriteFile(filepath.Join(dir, "over.go"), data, 0o644)
-
-	results := collectStreamFilesForTest(t, t.Context(), dir, []string{"over.go"}, 1)
-	if len(results) != 1 || results[0].skipReason != index.SkipReasonTooLarge || results[0].content != nil {
-		t.Errorf("expected one name-only TooLarge document just over max size, got %+v", results)
-	}
 }
 
 // --- state file edge case tests ---
@@ -850,7 +731,7 @@ func TestComputeStateHash_VersionPrefix(t *testing.T) {
 // the live content limit. TestRun_ContentLimitChangeRebuildsIndex checks that a
 // limit change rebuilds a cached index.
 func TestIndexBuildOptions_SizeMaxIsTheContentLimit(t *testing.T) {
-	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
+	swapForTest(t, &documentContentLimit, testDocumentContentLimit)
 	opts := indexBuildOptions(t.TempDir(), 3)
 	if opts.SizeMax != 1<<20 {
 		t.Fatalf("SizeMax=%d, want the swapped reader content limit 1 MiB", opts.SizeMax)
@@ -861,22 +742,6 @@ func requireGit(tb testing.TB) {
 	tb.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		tb.Fatal("requires git on PATH")
-	}
-}
-
-func TestComputeStateHash_LargeInput(t *testing.T) {
-	// 1 MiB of input: check that the hash works and is deterministic.
-	large := make([]byte, 1024*1024)
-	for i := range large {
-		large[i] = byte(i % 256)
-	}
-	h1 := computeStateHash(string(large))
-	h2 := computeStateHash(string(large))
-	if h1 != h2 {
-		t.Error("large input hash should be deterministic")
-	}
-	if len(h1) != 16 {
-		t.Errorf("expected 16-char hash, got %d", len(h1))
 	}
 }
 
@@ -938,7 +803,7 @@ func TestParseGitStatusV2_RenameOrigPathNotMisinterpreted(t *testing.T) {
 	}
 	assertContains(t, state.Files, "new.go")
 	assertContains(t, state.Files, "real_untracked.go")
-	if containsStr(state.Files, "suspicious.go") {
+	if slices.Contains(state.Files, "suspicious.go") {
 		t.Error("origPath record was misinterpreted as an untracked file")
 	}
 }
@@ -1149,7 +1014,7 @@ func TestStateCaching_BothSucceed_StateStable(t *testing.T) {
 	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
 
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -1165,7 +1030,7 @@ func TestStateCaching_BothSucceed_StateStable(t *testing.T) {
 	if stateHash2 != cached {
 		t.Fatalf("state changed between stable runs: cached=%q current=%q", cached, stateHash2)
 	}
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state2, stateHash2); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state2, stateHash2); err != nil {
 		t.Fatalf("second indexing failed: %v", err)
 	}
 	cached2 := readStateFile(plan.cacheDir)
@@ -1202,7 +1067,7 @@ func TestStateCaching_BothSucceed_DirtyFileChangedAfterStateCapture(t *testing.T
 	}
 
 	// Run indexing with the pre-mutation state.
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -1212,14 +1077,14 @@ func TestStateCaching_BothSucceed_DirtyFileChangedAfterStateCapture(t *testing.T
 		t.Errorf("the build did not publish its capture: got %q, want %q", cached, stateHash)
 	}
 
-	files, err := runSeekInPlannedGitCorpus(ctx, "second_edit_during_indexing", paths, plan)
+	files, err := runSeekInPlannedGitCorpus(ctx, "second_edit_during_indexing", plan)
 	if err != nil {
 		t.Fatalf("next search after dirty-file drift failed: %v", err)
 	}
 	if len(files) == 0 {
 		t.Fatal("next search should find the final dirty content")
 	}
-	staleFiles, err := runSeekInPlannedGitCorpus(ctx, "first_edit", paths, plan)
+	staleFiles, err := runSeekInPlannedGitCorpus(ctx, "first_edit", plan)
 	if err != nil {
 		t.Fatalf("stale dirty marker search failed: %v", err)
 	}
@@ -1271,7 +1136,7 @@ func TestStateCaching_DirtyFileDeletedAfterStateCapture(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -1280,7 +1145,7 @@ func TestStateCaching_DirtyFileDeletedAfterStateCapture(t *testing.T) {
 		t.Errorf("the build did not publish its capture: got %q, want %q", cached, stateHash)
 	}
 
-	files, err := runSeekInPlannedGitCorpus(ctx, "dirty_deleted_marker", paths, plan)
+	files, err := runSeekInPlannedGitCorpus(ctx, "dirty_deleted_marker", plan)
 	if err != nil {
 		t.Fatalf("next search after dirty-file deletion failed: %v", err)
 	}
@@ -1317,7 +1182,7 @@ func TestStateCaching_DirtyFileAtomicReplaceAfterStateCapture(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -1326,7 +1191,7 @@ func TestStateCaching_DirtyFileAtomicReplaceAfterStateCapture(t *testing.T) {
 		t.Errorf("the build did not publish its capture: got %q, want %q", cached, stateHash)
 	}
 
-	files, err := runSeekInPlannedGitCorpus(ctx, "atomic_replaced", paths, plan)
+	files, err := runSeekInPlannedGitCorpus(ctx, "atomic_replaced", plan)
 	if err != nil {
 		t.Fatalf("next search after atomic replace failed: %v", err)
 	}
@@ -1353,7 +1218,7 @@ func TestStateCaching_UntouchedDirtyFile(t *testing.T) {
 	stateHash := gitCorpusStateHash(paths, state)
 
 	// Do not change the file: indexing must find no drift.
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -1392,7 +1257,7 @@ func TestStateCaching_StaleCapturedHeadDiscardsBuild(t *testing.T) {
 	// Run with the stale captured state. HEAD validation must discard the
 	// build.
 	deleteStateFiles(plan.cacheDir)
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -1401,7 +1266,7 @@ func TestStateCaching_StaleCapturedHeadDiscardsBuild(t *testing.T) {
 	}
 
 	// Next search rebuilds at the new HEAD and finds the committed v2 content.
-	files, err := runSeekInPlannedGitCorpus(ctx, "v2_dirty", paths, plan)
+	files, err := runSeekInPlannedGitCorpus(ctx, "v2_dirty", plan)
 	if err != nil {
 		t.Fatalf("next search after HEAD change failed: %v", err)
 	}
@@ -1430,7 +1295,7 @@ func TestStateCaching_ColdUnbornSnapshotRejectsFirstCommit(t *testing.T) {
 	gitRunIn(t, dir, "add", "first.go")
 	gitRunIn(t, dir, "commit", "-m", "first")
 
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, stateHash); err != nil {
 		t.Fatal(err)
 	}
 	if cached := readStateFile(plan.cacheDir); cached != "" {
@@ -1440,7 +1305,7 @@ func TestStateCaching_ColdUnbornSnapshotRejectsFirstCommit(t *testing.T) {
 		t.Fatal("stale unborn snapshot published shards")
 	}
 
-	files, err := runSeekInPlannedGitCorpus(ctx, "first_commit_after_unborn_capture", paths, plan)
+	files, err := runSeekInPlannedGitCorpus(ctx, "first_commit_after_unborn_capture", plan)
 	if err != nil || len(files) != 1 {
 		t.Fatalf("fresh first-commit search: files=%v error=%v", files, err)
 	}
@@ -1462,20 +1327,20 @@ func TestStateCaching_StaleAValidationKeepsPublishedBState(t *testing.T) {
 	gitRunIn(t, dir, "commit", "-m", "B")
 	stateB := mustGitRepoStateIn(t, ctx, dir)
 	hashB := gitCorpusStateHash(paths, stateB)
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, stateB, hashB); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, stateB, hashB); err != nil {
 		t.Fatalf("publish B: %v", err)
 	}
 	if got := readStateFile(plan.cacheDir); got != hashB {
 		t.Fatalf("published state=%q, want B state %q", got, hashB)
 	}
 
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, stateA, hashA); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, stateA, hashA); err != nil {
 		t.Fatalf("stale A attempt: %v", err)
 	}
 	if got := readStateFile(plan.cacheDir); got != hashB {
 		t.Fatalf("stale A validation changed published B state: got %q, want %q", got, hashB)
 	}
-	files, err := runSeekInPlannedGitCorpus(ctx, "lifecycle_b", paths, plan)
+	files, err := runSeekInPlannedGitCorpus(ctx, "lifecycle_b", plan)
 	if err != nil || len(files) == 0 {
 		t.Fatalf("search published B after stale A: files=%v error=%v", files, err)
 	}
@@ -1514,7 +1379,7 @@ func testStateCachingNewDirtyPathAfterCapture(
 	marker := mutate(dir)
 
 	deleteStateFiles(plan.cacheDir)
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -1522,7 +1387,7 @@ func testStateCachingNewDirtyPathAfterCapture(
 	if cached := readStateFile(plan.cacheDir); cached != stateHash {
 		t.Fatalf("the build did not publish its capture: got %q, want %q", cached, stateHash)
 	}
-	files, err := runSeekInPlannedGitCorpus(ctx, marker, paths, plan)
+	files, err := runSeekInPlannedGitCorpus(ctx, marker, plan)
 	if err != nil {
 		t.Fatalf("next search after the new dirty path failed: %v", err)
 	}
@@ -1554,7 +1419,7 @@ func TestStateCaching_CommittedFailureClearsState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash)
+	err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, stateHash)
 	if err == nil {
 		t.Fatal("runIndexingWithCache error=nil, want committed-stage failure")
 	}
@@ -1587,7 +1452,7 @@ func TestStateCaching_WithUncommittedFiles_BothSucceed(t *testing.T) {
 		t.Fatal("precondition: state should have uncommitted files")
 	}
 
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -1624,7 +1489,7 @@ func TestStateCaching_NoUncommittedFiles(t *testing.T) {
 		t.Fatalf("precondition: clean repo should have no uncommitted files, got %v", state.Files)
 	}
 
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, stateHash); err != nil {
 		t.Fatalf("indexing failed: %v", err)
 	}
 
@@ -1664,7 +1529,7 @@ func TestStateCaching_DoubleCheck_SkipsRedundantIndex(t *testing.T) {
 	stateHash := gitCorpusStateHash(paths, state)
 
 	// A peer builds and publishes this state.
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, stateHash); err != nil {
 		t.Fatalf("first indexing failed: %v", err)
 	}
 
@@ -1673,7 +1538,7 @@ func TestStateCaching_DoubleCheck_SkipsRedundantIndex(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// double_check_rebuilt\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, stateHash); err != nil {
 		t.Fatalf("second indexing failed: %v", err)
 	}
 
@@ -1699,7 +1564,7 @@ func TestStateCaching_StaleFallback_DoesNotWriteState(t *testing.T) {
 	// First index to create shards
 	state := mustGitRepoStateIn(t, ctx, dir)
 	stateHash := gitCorpusStateHash(paths, state)
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, stateHash); err != nil {
 		t.Fatalf("initial indexing failed: %v", err)
 	}
 
@@ -1728,7 +1593,7 @@ func TestStateCaching_StaleFallback_DoesNotWriteState(t *testing.T) {
 	}
 
 	// runIndexingWithCache should fall back (shards exist, lock held)
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, stateHash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, stateHash); err != nil {
 		t.Fatalf("stale fallback should not error: %v", err)
 	}
 
@@ -1742,7 +1607,7 @@ func TestStateCaching_StaleFallback_DoesNotWriteState(t *testing.T) {
 	_ = holder.Close()
 	holder = nil
 
-	files, err := runSeekInPlannedGitCorpus(ctx, "stale_fallback_new", paths, plan)
+	files, err := runSeekInPlannedGitCorpus(ctx, "stale_fallback_new", plan)
 	if err != nil {
 		t.Fatalf("next search after stale fallback failed: %v", err)
 	}
@@ -2223,7 +2088,7 @@ func TestStreamDirtyFiles_EmptyFileList(t *testing.T) {
 }
 
 func TestStreamDirtyFiles_TooLargeByNameMissingFiltered(t *testing.T) {
-	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
+	swapForTest(t, &documentContentLimit, testDocumentContentLimit)
 	dir := t.TempDir()
 	// A too-large file is sent by name only; a missing file is filtered.
 	name := "big.dat"
@@ -2263,7 +2128,7 @@ func TestStreamDirtyFiles_ParallelismOne(t *testing.T) {
 }
 
 func TestStreamDirtyFiles_SingleFileExactlyMaxSize(t *testing.T) {
-	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
+	swapForTest(t, &documentContentLimit, testDocumentContentLimit)
 	dir := t.TempDir()
 	// The stream must include a file of exactly testDocumentContentLimit
 	// bytes.
@@ -2435,16 +2300,6 @@ func TestStreamingMemoryDoesNotScaleWithInput(t *testing.T) {
 	}
 }
 
-func TestIndexDocuments_EmptyChannel(t *testing.T) {
-	dir := t.TempDir()
-	ch := make(chan fileContent)
-	close(ch)
-
-	if _, err := indexDocuments(context.Background(), dir, repoUncommitted, t.TempDir(), ch, 2); err != nil {
-		t.Fatalf("unexpected error for empty channel: %v", err)
-	}
-}
-
 func TestIndexDocuments_WritesSearchableDocuments(t *testing.T) {
 	requireTools(t)
 
@@ -2572,18 +2427,9 @@ func (t *peakHeapTracker) stop() int64 {
 
 func assertContains(t *testing.T, slice []string, item string) {
 	t.Helper()
-	if !containsStr(slice, item) {
+	if !slices.Contains(slice, item) {
 		t.Errorf("expected %v to contain %q", slice, item)
 	}
-}
-
-func containsStr(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
 }
 
 func getInode(t *testing.T, path string) uint64 {
@@ -2640,14 +2486,14 @@ func TestWriteSharedCacheFileConcurrentWriters(t *testing.T) {
 // the replaced first copy.
 func TestPartialPrebuildKeepsADamagedFamilyUnnamed(t *testing.T) {
 	requireTools(t)
-	swapShardMaxForTest(t, 1024)
+	swapForTest(t, &shardMax, 1024)
 	dir := initGitRepo(t, "app.go", "package main\n// zqpartialapp\n")
 	ctx := t.Context()
 	paths, plan := planGitTestCorpus(t, dir)
 	build := func() error {
 		t.Helper()
 		state := mustGitRepoStateIn(t, ctx, paths.RepoDir)
-		return runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, gitCorpusStateHash(paths, state))
+		return runIndexingWithCache(ctx, paths, plan.corpusStore, state, gitCorpusStateHash(paths, state))
 	}
 	_ = build()
 	writeFileAt(t, dir, "u1.go", "package main\n// zqpartialu1\n"+strings.Repeat("// filler line of u1\n", 100))

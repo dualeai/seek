@@ -7,8 +7,6 @@ import (
 	"path/filepath"
 	"sort"
 	"syscall"
-
-	"github.com/sourcegraph/zoekt/index"
 )
 
 const (
@@ -219,25 +217,10 @@ func diffUncommittedAgainstManifest(
 	return toRead, changedPaths, tombstoned
 }
 
-// heldBytes is the content bytes that the shard document of the entry holds.
-// A file kept by name only holds its NOT-INDEXED marker. Such a file has a
-// Marker, a size of -1 (kept), or a size too large for the index. Any other
-// file holds its size. An unread file (unreadFileMarker) counts at the larger
-// of that value and the largest marker (maxNotIndexedMarkerBytes).
+// heldBytes is the content bytes that the shard document of the entry holds
+// (shardHeldBytes). A file kept by name (size -1) has no bytes.
 func (e uncommittedManifestEntry) heldBytes() int64 {
-	switch {
-	case e.Marker == unreadFileMarker:
-		unread := e
-		unread.Marker = 0
-		return max(unread.heldBytes(), maxNotIndexedMarkerBytes)
-	case e.Marker > 0:
-		return e.Marker
-	case e.Size < 0:
-		return notIndexedMarkerBytes(seekNoBytesReason)
-	case !documentContentFits(e.Size):
-		return notIndexedMarkerBytes(index.SkipReasonTooLarge)
-	}
-	return e.Size
+	return shardHeldBytes(e.Marker, e.Size, e.Size < 0)
 }
 
 // uncommittedLiveBytes returns the content bytes that the shard documents of

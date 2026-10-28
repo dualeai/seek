@@ -313,9 +313,8 @@ type e2eRouteCase struct {
 
 // e2eRouteVerify checks one vector search against want. It checks the route,
 // that no USearch call failed over to exact vectors, and that the result set
-// equals want. The model must score only files that the output shows. It
-// returns the result paths.
-func e2eRouteVerify(t *testing.T, run e2eRouteRun, want, backends []string) []string {
+// equals want. The model must score only files that the output shows.
+func e2eRouteVerify(t *testing.T, run e2eRouteRun, want, backends []string) {
 	t.Helper()
 	if len(want) == 0 {
 		if !errors.Is(run.err, errNoMatch) || run.output != "" {
@@ -342,7 +341,6 @@ func e2eRouteVerify(t *testing.T, run e2eRouteRun, want, backends []string) []st
 			t.Fatalf("the model scored %s, which the output does not show", scored.Path)
 		}
 	}
-	return got
 }
 
 // e2eRouteCheck runs the text oracle and the description of test with a model
@@ -892,7 +890,7 @@ func TestE2ERouteLongQueryWindowsOnEveryRoute(t *testing.T) {
 		words[index] = fmt.Sprintf("zqw%03d", index)
 	}
 	long := strings.Join(words, " ")
-	plan, err := planQuery(long, defaultSearchPolicy())
+	plan, err := planQuery(long, semanticSearch)
 	if err != nil || plan.model == nil {
 		t.Fatalf("plan the long query: model %v, err %v", plan.model, err)
 	}

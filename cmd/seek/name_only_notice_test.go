@@ -18,11 +18,11 @@ import (
 // fails them.
 const oneNameOnlyNotice = "\n\n1 name-only file could also match: binary, too large, not on disk, or unreadable\n"
 
-// nameOnlyNotice runs query on operands and returns its output and its
-// name-only notice line, or "" when it prints none.
-func nameOnlyNotice(t *testing.T, query string, operands ...string) (string, string) {
+// nameOnlyNotice runs query in the current folder and returns its output and
+// its name-only notice line, or "" when it prints none.
+func nameOnlyNotice(t *testing.T, query string) (string, string) {
 	t.Helper()
-	out, err := seek(t, slices.Concat([]string{"--lexical-only", query}, operands)...)
+	out, err := seek(t, "--lexical-only", query)
 	if err != nil {
 		t.Fatalf("run %q: %v\n%s", query, err, out)
 	}
@@ -60,7 +60,7 @@ func TestBinaryNoticeCountsOnlyFilterPassingFiles(t *testing.T) {
 // file above it is indexed by name only and counted.
 func TestNameOnlyNoticeCountsOversizedFiles(t *testing.T) {
 	requireTools(t)
-	swapDocumentContentLimitForTest(t, 64)
+	swapForTest(t, &documentContentLimit, 64)
 	folder := t.TempDir()
 	writeFileAt(t, folder, "small.txt", "zqoversizemarker\n")
 	writeFileAt(t, folder, "large.txt", "zqoversizemarker "+strings.Repeat("large text ", 20)+"\n")

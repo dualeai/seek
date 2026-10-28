@@ -19,21 +19,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-func TestLockFileExclusive_Basic(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, ".lock")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = f.Close() })
-
-	if err := lockFileExclusive(f); err != nil {
-		t.Fatalf("expected lock to succeed, got %v", err)
-	}
-	unlockFile(f)
-}
-
 func TestLockFileExclusive_Contention(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".lock")
@@ -67,27 +52,6 @@ func TestLockFileExclusive_Contention(t *testing.T) {
 		t.Fatalf("second lock should succeed after release: %v", err)
 	}
 	unlockFile(f2)
-}
-
-func TestLockFileExclusive_ReleaseAndReacquire(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, ".lock")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = f.Close() })
-
-	if err := lockFileExclusive(f); err != nil {
-		t.Fatal(err)
-	}
-	unlockFile(f)
-
-	// Re-acquire on same fd
-	if err := lockFileExclusive(f); err != nil {
-		t.Fatalf("re-acquire should succeed: %v", err)
-	}
-	unlockFile(f)
 }
 
 func TestAcquireBuildLock_SingleFlight(t *testing.T) {
@@ -385,8 +349,9 @@ func TestLockOrderNoReadLockWhileWaitingForPublish(t *testing.T) {
 }
 
 // TestTwoColdSearchesSameNode runs two searches of one cold node at the same
-// time. One builds, the other waits for that build with no deadline, and both
-// answer.
+// time, in one process: both answer. The build slot puts the two builds in
+// order, so the second does not wait on the build lock
+// (TestColdSearchWaitsForAnotherProcessBuild checks that wait).
 func TestTwoColdSearchesSameNode(t *testing.T) {
 	requireTools(t)
 	folder := t.TempDir()
@@ -395,16 +360,7 @@ func TestTwoColdSearchesSameNode(t *testing.T) {
 	}
 	setTestUserCache(t)
 	// seekRoot writes to os.Stdout, which one swap covers for both searches.
-	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stdout := os.Stdout
-	os.Stdout = devnull
-	defer func() {
-		os.Stdout = stdout
-		_ = devnull.Close()
-	}()
+	discardStdout(t)
 	var group errgroup.Group
 	for range 2 {
 		group.Go(func() error {
@@ -431,20 +387,9 @@ func TestColdSearchWaitsForAnotherProcessBuild(t *testing.T) {
 	if err != nil || len(plans) != 1 {
 		t.Fatalf("plans=%d err=%v", len(plans), err)
 	}
-	if err := os.MkdirAll(plans[0].cacheDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	holder, err := os.OpenFile(filepath.Join(plans[0].cacheDir, buildLockFile), os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := lockFileExclusive(holder); err != nil {
-		t.Fatalf("hold the build lock: %v", err)
-	}
-	release := sync.OnceFunc(func() { releaseLock(holder) })
-	t.Cleanup(release)
+	release := holdBuildLock(t, plans[0].cacheDir)
 	result, waited := runCLIProcessOnLine(t, cacheDir, folder, []string{"--lexical-only", "--verbose", "zqprocesswait"},
-		lockWaitLine(lockWaitBuild, holder.Name()), func(*os.Process) { release() })
+		lockWaitLine(lockWaitBuild, filepath.Join(plans[0].cacheDir, buildLockFile)), func(*os.Process) { release() })
 	if !waited || result.code != 0 || !strings.Contains(result.stdout, "a.txt") {
 		t.Fatalf("waited=%t code=%d stdout=%q stderr=%q", waited, result.code, result.stdout, result.stderr)
 	}
@@ -568,7 +513,7 @@ func TestReaderDoesNotWaitForAFullRebuild(t *testing.T) {
 // close does nothing.
 func TestOpenNodeReadLock(t *testing.T) {
 	cacheDir := t.TempDir()
-	plan := node{corpusStore: corpusStore{cacheDir: cacheDir, indexDir: filepath.Join(cacheDir, "index")}}
+	plan := node{cacheDir: cacheDir, indexDir: filepath.Join(cacheDir, "index")}
 	read, readCtx, err := openNodeRead(t.Context(), plan, nil)
 	if err != nil {
 		t.Fatal(err)

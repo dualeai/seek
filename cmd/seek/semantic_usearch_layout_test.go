@@ -526,7 +526,7 @@ func TestGraphShardsSurviveAOneFileCommit(t *testing.T) {
 	gitRunIn(t, repo, "add", ".")
 	gitRunIn(t, repo, "commit", "-q", "-m", "files")
 	t.Chdir(t.TempDir())
-	reuseSearch(t, "alpha beta", repo)
+	reuseSearch(t, repo)
 	generation := func() (string, semanticManifest) {
 		t.Helper()
 		root, err := seekUserCacheRoot()
@@ -559,7 +559,7 @@ func TestGraphShardsSurviveAOneFileCommit(t *testing.T) {
 	writeFileAt(t, repo, "pkg/d12/f0600.go", "package sample\n// alpha beta changed file\n\nfunc Changed() int {\n\treturn 1\n}\n")
 	gitRunIn(t, repo, "commit", "-q", "-am", "change one")
 	builtBefore := semanticUSearchShardsBuilt.Load()
-	reuseSearch(t, "alpha beta", repo)
+	reuseSearch(t, repo)
 	built := semanticUSearchShardsBuilt.Load() - builtBefore
 	secondDir, secondManifest := generation()
 	if secondDir == firstDir {
@@ -583,7 +583,7 @@ func TestGraphShardsSurviveAOneFileCommit(t *testing.T) {
 		t.Fatalf("the commit built %d and linked %d of %d shards", built, linked, len(secondManifest.USearchFiles))
 	}
 	hashed := semanticShardsHashed.Load()
-	reuseSearch(t, "alpha beta", repo)
+	reuseSearch(t, repo)
 	if semanticShardsHashed.Load() != hashed {
 		t.Fatalf("the search after the bind hashed %d shards", semanticShardsHashed.Load()-hashed)
 	}
@@ -604,7 +604,7 @@ func TestFolderOneFileChangeReusesGraphShards(t *testing.T) {
 			fmt.Sprintf("package sample\n// alpha beta file %d\n", index))
 	}
 	t.Chdir(t.TempDir())
-	reuseSearch(t, "alpha beta", folder)
+	reuseSearch(t, folder)
 	root, err := seekUserCacheRoot()
 	if err != nil {
 		t.Fatal(err)
@@ -640,7 +640,7 @@ func TestFolderOneFileChangeReusesGraphShards(t *testing.T) {
 		t.Fatal(err)
 	}
 	built := semanticUSearchShardsBuilt.Load()
-	reuseSearch(t, "alpha beta", folder)
+	reuseSearch(t, folder)
 	second, _ := filepath.Glob(glob)
 	if len(second) != 1 || second[0] == first[0] {
 		t.Fatalf("generations %v after the change, first %v", second, first)
@@ -682,17 +682,17 @@ func TestWorktreeGraphSourceIsCopiedNotLinked(t *testing.T) {
 	gitRunIn(t, repo, "add", ".")
 	gitRunIn(t, repo, "commit", "-q", "-m", "files")
 	t.Chdir(t.TempDir())
-	reuseSearch(t, "alpha beta", repo)
+	reuseSearch(t, repo)
 	worktree := filepath.Join(t.TempDir(), "wt")
 	gitRunIn(t, repo, "worktree", "add", "-q", "--detach", worktree)
 	built := semanticUSearchShardsBuilt.Load()
-	reuseSearch(t, "alpha beta", worktree)
+	reuseSearch(t, worktree)
 	if made := semanticUSearchShardsBuilt.Load() - built; made != 0 {
 		t.Fatalf("the second worktree built %d graphs, want every graph reused", made)
 	}
 	hashed := semanticShardsHashed.Load()
-	reuseSearch(t, "alpha beta", repo)
-	reuseSearch(t, "alpha beta", repo)
+	reuseSearch(t, repo)
+	reuseSearch(t, repo)
 	if got := semanticShardsHashed.Load() - hashed; got != 0 {
 		t.Fatalf("two warm searches of the first worktree hashed %d graph shards", got)
 	}
@@ -775,7 +775,7 @@ func TestDamagedGraphShardIsRebuiltOnce(t *testing.T) {
 			}
 			t.Chdir(t.TempDir())
 			logs := captureTestLogs(t, slog.LevelWarn)
-			reuseSearch(t, "alpha beta", root)
+			reuseSearch(t, root)
 			cache, err := seekUserCacheRoot()
 			if err != nil {
 				t.Fatal(err)
@@ -807,7 +807,7 @@ func TestDamagedGraphShardIsRebuiltOnce(t *testing.T) {
 
 			from := len(logs.Records())
 			hashed := semanticShardsHashed.Load()
-			_, output := reuseSearchWith(t, &hybridTestScorer{}, "alpha beta", root)
+			_, output := reuseSearchWith(t, &hybridTestScorer{}, root)
 			shards, vectors, skips, next := repairWarnings(logs, from)
 			if semanticShardsHashed.Load() == hashed || shards != 0 || vectors != 1 || skips != 0 {
 				t.Fatalf("search with the damaged shard: hashed %d shards, warnings %d/%d/%d; want a hash and one vector repair",
@@ -817,12 +817,12 @@ func TestDamagedGraphShardIsRebuiltOnce(t *testing.T) {
 				t.Fatalf("the search with the damaged shard printed no %q, want its text hits", header)
 			}
 			built := semanticUSearchShardsBuilt.Load()
-			reuseSearch(t, "alpha beta", root)
+			reuseSearch(t, root)
 			if semanticUSearchShardsBuilt.Load() == built {
 				t.Fatal("the search after the repair built no graph shard")
 			}
 			hashed, built = semanticShardsHashed.Load(), semanticUSearchShardsBuilt.Load()
-			reuseSearch(t, "alpha beta", root)
+			reuseSearch(t, root)
 			shards, vectors, skips, _ = repairWarnings(logs, next)
 			if got := semanticShardsHashed.Load() - hashed; got != 0 || semanticUSearchShardsBuilt.Load() != built ||
 				shards+vectors+skips != 0 {

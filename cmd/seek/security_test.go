@@ -1,11 +1,9 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -111,19 +109,12 @@ func TestFilterDriverReadFailureFailsClosed(t *testing.T) {
 	const marker = "zqfailclosedmarker"
 	f := newGraphFixture(t)
 	repo := f.HostileRepo("repo", vectorCleanFilter, marker)
-	realGit, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
-	shim := t.TempDir()
-	writeExecutable(t, filepath.Join(shim, "git"), "#!/bin/sh\n"+gitShimSubcommand+
-		"if [ \"$subcommand\" = config ]; then\n  echo forced-config-failure >&2\n  exit 128\nfi\n"+
-		"exec '"+realGit+"' \"$@\"\n")
-	t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
+	installGitShim(t, "if [ \"$subcommand\" = config ]; then\n  echo forced-config-failure >&2\n  exit 128\nfi\n"+
+		"exec \"$SEEK_TEST_REAL_GIT\" \"$@\"\n")
 	setTestUserCache(t)
 
 	logs := captureTestLogs(t, slog.LevelWarn)
-	err = seekRoot(context.Background(), t, nil, "--lexical-only", marker, repo)
+	err := seekRoot(t.Context(), t, nil, "--lexical-only", marker, repo)
 	if !errors.Is(err, errNoMatch) || !logsMention(logs.Records(), "forced-config-failure") {
 		t.Fatalf("err=%v warnings=%v, want the driver-list read failure", err, logs.Records())
 	}

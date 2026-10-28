@@ -99,7 +99,7 @@ func prepareNativeGitDelta(
 	ctx context.Context,
 	repoDir string,
 	store corpusStore,
-	target gitSnapshot,
+	target gitObjectID,
 	scan familyScan,
 ) (*nativeGitDelta, bool, error) {
 	cacheDir, indexDir := store.cacheDir, store.indexDir
@@ -134,7 +134,7 @@ func prepareNativeGitDelta(
 		return nil, false, nil
 	}
 	baseOID, err := parseGitObjectID([]byte(existingHead))
-	if err != nil || len(baseOID) != len(target.commitOID) || baseOID == target.commitOID {
+	if err != nil || len(baseOID) != len(target) || baseOID == target {
 		return nil, false, nil
 	}
 	committedState, ok := readCommittedGitState(cacheDir)
@@ -164,7 +164,7 @@ func prepareNativeGitDelta(
 		return nil, false, nil
 	}
 
-	diff, err := readNativeGitDiff(ctx, repoDir, baseOID, target.commitOID, maxNativeGitDeltaPaths)
+	diff, err := readNativeGitDiff(ctx, repoDir, baseOID, target, maxNativeGitDeltaPaths)
 	if errors.Is(err, errNativeGitDeltaTooLarge) {
 		return nil, false, nil
 	}
@@ -206,10 +206,9 @@ func prepareNativeGitDelta(
 		baseLiveBytes: committedState.liveBytes,
 		oldBytes:      oldBytes,
 		nextState: committedGitState{
-			head:       target.commitOID,
+			head:       target,
 			baseHead:   committedState.baseHead,
 			baseShards: committedState.baseShards,
-			liveBytes:  liveBytes,
 			deadBytes:  tombstoned,
 		},
 	}, true, nil
@@ -230,13 +229,13 @@ func scanNativeGitDeltaChanges(
 	entries := make([]gitTreeEntry, 0, 2*len(diff))
 	for _, entry := range diff {
 		if nativeGitBlobMode(entry.newMode) {
-			entries = append(entries, gitTreeEntry{mode: entry.newMode, oid: entry.newOID, path: entry.path})
+			entries = append(entries, gitTreeEntry{oid: entry.newOID, path: entry.path})
 		}
 	}
 	newEntries := len(entries)
 	for _, entry := range diff {
 		if nativeGitBlobMode(entry.oldMode) {
-			entries = append(entries, gitTreeEntry{mode: entry.oldMode, oid: entry.oldOID, path: entry.path})
+			entries = append(entries, gitTreeEntry{oid: entry.oldOID, path: entry.path})
 		}
 	}
 	if len(entries) == 0 {
@@ -246,11 +245,7 @@ func scanNativeGitDeltaChanges(
 	if err != nil {
 		return nil, 0, err
 	}
-	defer func() {
-		if !batch.finished {
-			batch.abort(nil)
-		}
-	}()
+	defer batch.abort(nil)
 	targetInfos := make([]gitBlobInfo, 0, newEntries)
 	oldInfos := make([]gitBlobInfo, 0, len(entries)-newEntries)
 	for start := 0; start < len(entries); start += gitObjectBatchSize {

@@ -170,6 +170,12 @@ var (
 	lateOnEnvironmentErr  error
 )
 
+// lateOnRuntimeForPlatform gives the ONNX Runtime bundle that this target
+// embeds (rerank_backend_assets_<target>.go).
+func lateOnRuntimeForPlatform() (lateOnRuntimeBundle, error) {
+	return lateOnRuntimeBundleFromManifest(lateOnRuntimeManifestJSON, lateOnCompressedRuntime)
+}
+
 func lateOnRuntimeBundleFromManifest(
 	manifestJSON []byte,
 	compressed []byte,
@@ -217,7 +223,7 @@ func newLateOnSemanticModel(ctx context.Context) (semanticModel, error) {
 	if err != nil {
 		return nil, err
 	}
-	runtimePath, _, err := ensureLateOnRuntime(bundle)
+	runtimePath, err := ensureLateOnRuntime(bundle)
 	if err != nil {
 		return nil, fmt.Errorf("prepare ONNX Runtime: %w", err)
 	}
@@ -530,7 +536,7 @@ func (s *lateOnModel) scoreDocumentBatch(
 // session.
 // The CLI starts the query before any vector build. So when a command also
 // builds vectors on the CPU provider, a build call gets a second CPU session
-// with the build's thread count. That session takes about 90 ms to make. If
+// with the build's thread count. That session takes about 40 ms to make. If
 // it fails, build calls use the first session.
 // On 18 CPUs, one call at a time on 12 threads encodes about 245 rows/s
 // (523 ms per 128 rows). The build's calls, 3 threads each, encode about
@@ -1073,12 +1079,12 @@ func decodeLateOnAsset(compressed []byte) ([]byte, error) {
 
 // ensureLateOnRuntime installs the ONNX Runtime library of bundle in
 // reranker/<version>/<sha256> of the cache, unless a file with its digest is
-// there. It returns the path, and whether this call wrote the file. It marks
-// the directory as used for GC (touchRuntimeUse).
-func ensureLateOnRuntime(bundle lateOnRuntimeBundle) (string, bool, error) {
+// there. It returns the path. It marks the directory as used for GC
+// (touchRuntimeUse).
+func ensureLateOnRuntime(bundle lateOnRuntimeBundle) (string, error) {
 	cacheRoot, err := seekUserCacheRoot()
 	if err != nil {
-		return "", false, err
+		return "", err
 	}
 	directory := filepath.Join(
 		cacheRoot,

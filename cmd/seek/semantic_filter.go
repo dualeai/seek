@@ -20,7 +20,7 @@ type semanticPathFilter struct {
 }
 
 func newSemanticSubstringFilter(node *query.Substring) (semanticPathFilter, error) {
-	if node == nil || !node.FileName || node.Content || node.Pattern == "" {
+	if node.Pattern == "" {
 		return semanticPathFilter{}, fmt.Errorf("invalid semantic filename substring")
 	}
 	filter := semanticPathFilter{
@@ -42,7 +42,7 @@ func newSemanticSubstringFilter(node *query.Substring) (semanticPathFilter, erro
 }
 
 func newSemanticRegexpFilter(node *query.Regexp) (semanticPathFilter, error) {
-	if node == nil || !node.FileName || node.Content || node.Regexp == nil {
+	if node.Regexp == nil {
 		return semanticPathFilter{}, fmt.Errorf("invalid semantic filename regular expression")
 	}
 	prefix := ""
@@ -56,16 +56,14 @@ func newSemanticRegexpFilter(node *query.Regexp) (semanticPathFilter, error) {
 	return semanticPathFilter{regexp: compiled}, nil
 }
 
-// newSemanticPathFilter builds the filter of one file: atom, a substring or a
-// regular expression (fileNameAtom).
+// newSemanticPathFilter builds the filter of one file: atom. The caller gives
+// only an atom that fileNameAtom accepts: a substring or a regular expression
+// with FileName set and Content not set.
 func newSemanticPathFilter(atom query.Q) (semanticPathFilter, error) {
-	switch typed := atom.(type) {
-	case *query.Substring:
-		return newSemanticSubstringFilter(typed)
-	case *query.Regexp:
-		return newSemanticRegexpFilter(typed)
+	if substring, ok := atom.(*query.Substring); ok {
+		return newSemanticSubstringFilter(substring)
 	}
-	return semanticPathFilter{}, fmt.Errorf("file atom %s is %T, not a substring or a regular expression", atom, atom)
+	return newSemanticRegexpFilter(atom.(*query.Regexp))
 }
 
 // matches reports whether path matches the filter. A long case-insensitive
@@ -114,32 +112,18 @@ const semanticFilteredExactRows = 256
 
 // buildSemanticFilterMask evaluates keep once for each adjacent group of rows
 // of one file. It writes bitmap ranges and shard counts during that same pass,
-// for the bitmap filter of USearch's filtered search.
+// for the bitmap filter of USearch's filtered search. The open of a
+// generation checks that each row holds its index and a path
+// (readSemanticRowsFrom), and that the shards cover the rows in order
+// (validateSemanticUSearchShardMetadata). So the mask does not check them
+// again.
 func buildSemanticFilterMask(
 	ctx context.Context,
 	generation *semanticGeneration,
 	keep func(path string) bool,
 ) (semanticFilterMask, error) {
-	if generation == nil || keep == nil {
-		return semanticFilterMask{}, fmt.Errorf("semantic filter input is missing")
-	}
 	rowCount := uint64(len(generation.rows))
-	if generation.manifest.Rows != rowCount {
-		return semanticFilterMask{}, fmt.Errorf("semantic row count does not match its manifest")
-	}
 	shards := generation.manifest.USearchFiles
-	if len(shards) > 0 {
-		var next uint64
-		for index, shard := range shards {
-			if shard.Start != next || shard.Rows > rowCount-shard.Start {
-				return semanticFilterMask{}, fmt.Errorf("semantic shard %d is outside its row set", index)
-			}
-			next = shard.Start + shard.Rows
-		}
-		if next != rowCount {
-			return semanticFilterMask{}, fmt.Errorf("semantic shards do not cover their row set")
-		}
-	}
 	var bits []byte
 	var shardAllowed []uint64
 	var exactRows []uint64
@@ -153,18 +137,12 @@ func buildSemanticFilterMask(
 			return semanticFilterMask{}, err
 		}
 		first := generation.rows[at]
-		if first.row != uint64(at) || first.path == "" {
-			return semanticFilterMask{}, fmt.Errorf("semantic row %d has invalid identity", at)
-		}
 		end := at + 1
 		for end < len(generation.rows) && generation.rows[end].path == first.path {
 			if end&4095 == 0 {
 				if err := ctx.Err(); err != nil {
 					return semanticFilterMask{}, err
 				}
-			}
-			if generation.rows[end].row != uint64(end) {
-				return semanticFilterMask{}, fmt.Errorf("semantic row %d has invalid identity", end)
 			}
 			end++
 		}

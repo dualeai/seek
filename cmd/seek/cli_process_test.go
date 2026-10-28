@@ -58,15 +58,8 @@ func TestCLIProcessErrorsAndExitCodes(t *testing.T) {
 			code:         2,
 		},
 		{
+			// Seek removed --rerank, so it must stay an unknown flag.
 			name:           "unknown flag fallback",
-			args:           []string{"--unknown", "needle"},
-			dir:            empty,
-			stderrPrefix:   "seek: ",
-			stderrContains: []string{"--unknown"},
-			code:           2,
-		},
-		{
-			name:           "removed rerank flag",
 			args:           []string{"--rerank", "needle"},
 			dir:            empty,
 			stderrPrefix:   "seek: ",

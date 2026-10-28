@@ -269,14 +269,21 @@ func corpusSizes(entries []corpusDirEntry, record bool) map[corpusID]int64 {
 
 // plannedCacheBytes estimates the cache that the search needs: for a node
 // that the search rebuilds, its new generation; for any other node, its
-// ledger size. rebuilds reports whether any node rebuilds.
+// ledger size. rebuilds reports whether any node rebuilds. The kind of each
+// node gives its estimate (nodeKind.estimate), with the rule of the build: a
+// node rebuilds with no published state, a state other than the capture, or
+// no generation for the vectors that the search wants. probe reads file heads
+// so that binary files count 0; without it every file counts by its size. A
+// vector build copies the rows of a node's live generation. So with a live
+// generation it adds only the changed content, and with none it adds all of
+// it.
 func plannedCacheBytes(ctx context.Context, plans []node, vectors, probe bool) (int64, bool, error) {
 	var planned atomic.Int64
 	var rebuilds atomic.Bool
 	var group errgroup.Group
 	for _, plan := range plans {
 		group.Go(func() error {
-			bytes, rebuild, err := plannedNodeBytes(ctx, plan, vectors, probe)
+			bytes, rebuild, err := plan.behavior.estimate(ctx, plan, vectors, probe)
 			if rebuild {
 				rebuilds.Store(true)
 			}
@@ -297,22 +304,6 @@ func plannedCacheBytes(ctx context.Context, plans []node, vectors, probe bool) (
 		return 0, false, err
 	}
 	return planned.Load(), rebuilds.Load(), nil
-}
-
-// plannedNodeBytes estimates one node with its kind (nodeKind.estimate). A
-// node with no kind (a failed Git node's cache record) counts its published
-// size and no rebuild. rebuild reports a node that the search builds, with the
-// rule of the build. That is a node with no published state, a state other
-// than the capture, or no generation for the vectors that the search wants.
-// probe reads file heads so that binary files count 0; without
-// it every file counts by its size. A vector build copies the rows of a node's
-// live generation. So with a live generation it adds only the changed content,
-// and with none it adds all of it.
-func plannedNodeBytes(ctx context.Context, plan node, vectors, probe bool) (bytes int64, rebuild bool, err error) {
-	if plan.behavior == nil {
-		return publishedCorpusBytes(plan.cacheDir), false, nil
-	}
-	return plan.behavior.estimate(ctx, plan, vectors, probe)
 }
 
 // estimate gives the folder's next generation from the walk capture: all
@@ -748,9 +739,7 @@ func enforceCacheBudget(plans []node) {
 		return
 	}
 	for _, entry := range entries {
-		if evict[entry.name] {
-			evictPlanned(entry, trashDir)
-		}
+		evictIfPlanned(entry, trashDir, evict)
 	}
 	evictPlannedUnits(cacheRoot, evict)
 	drainTrash(trashDir)
@@ -862,19 +851,6 @@ func planCorpusEviction(
 		total -= sizes[entry.name]
 	}
 	return evict, nil
-}
-
-// evictPlanned evicts one corpus of an eviction plan. A corpus used again
-// since the plan was made is kept.
-func evictPlanned(entry corpusDirEntry, trashDir string) gcRowResult {
-	res := evictCorpus(entry, trashDir, entry.usedAt)
-	switch res.action {
-	case actionFailed:
-		slog.Warn("gc eviction failed", "corpus", entry.name, "error", res.err)
-	case actionTrashed:
-		slog.Warn("gc partial eviction", "corpus", entry.name, "error", res.err)
-	}
-	return res
 }
 
 // checkCacheRoot makes the corpora directory and checks that Seek can write

@@ -244,6 +244,29 @@ func (o *observedModel) Close() error {
 	return nil
 }
 
+// unitPaths returns the path of each unit to embed, in call order.
+func (o *observedModel) unitPaths() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	paths := make([]string, 0, len(o.units))
+	for _, unit := range o.units {
+		paths = append(paths, unit.path)
+	}
+	return paths
+}
+
+// documents returns each document that the search sent to the model, with
+// the documents of a failed call, in call order.
+func (o *observedModel) documents() []rerankDocument {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	documents := make([]rerankDocument, 0, len(o.scored))
+	for _, scored := range o.scored {
+		documents = append(documents, scored.document)
+	}
+	return documents
+}
+
 // documentPaths returns the sorted path of each document. A document that
 // the search sent twice shows twice.
 func documentPaths(documents []rerankDocument) []string {
@@ -289,10 +312,9 @@ func seekWith(t *testing.T, newModel semanticModelFactory, args ...string) (stri
 }
 
 // modelFactory returns a factory that gives model at each call. The command
-// closes the model at its end. A test model keeps its counters and records
-// after Close, so the test reads them after the command. It is a function and
-// not a method of hybridTestScorer. A type that embeds hybridTestScorer would
-// get the method, and the factory would give the inner model.
+// closes the model at its end. It is a function and not a method of
+// hybridTestScorer. A type that embeds hybridTestScorer would get the method,
+// and the factory would give the inner model.
 func modelFactory(model semanticModel) semanticModelFactory {
 	return func(context.Context) (semanticModel, error) { return model, nil }
 }
@@ -309,7 +331,8 @@ func failingModelFactory(starts *atomic.Int32) semanticModelFactory {
 }
 
 // stubSearch runs args through the root command, as main does, with a new
-// hybridTestScorer in mode, and returns the output, the model and the error.
+// hybridTestScorer in mode, and returns the output, the observed model and the
+// error.
 //   - With payloadAccept, every row is a candidate and the model accepts every
 //     candidate. A test proves which rows a search reads and which files
 //     print, not which files a real model finds.
@@ -319,11 +342,11 @@ func failingModelFactory(starts *atomic.Int32) semanticModelFactory {
 //
 // With payloadReject and payloadFar, only the strict hits print. A test
 // proves which rows a build writes and which documents the model scores.
-func stubSearch(t *testing.T, mode payloadMode, args ...string) (string, *hybridTestScorer, error) {
+func stubSearch(t *testing.T, mode payloadMode, args ...string) (string, *observedModel, error) {
 	t.Helper()
-	scorer := &hybridTestScorer{mode: mode}
-	output, err := seekWith(t, modelFactory(scorer), args...)
-	return output, scorer, err
+	model := observeModel(&hybridTestScorer{mode: mode})
+	output, err := seekWith(t, model.factory(), args...)
+	return output, model, err
 }
 
 // printedResult is one result in the output of a search.

@@ -84,7 +84,7 @@ func detectGitBoundary(absDir string) (gitPaths, detectStatus) {
 // directory whose core.worktree names absDir, or an in-tree Git directory.
 // Any other target is ambiguous, so Git decides.
 func detectGitFileBoundary(absDir, gitFile string) (gitPaths, detectStatus) {
-	resolved, err := parseGitFilePointer(gitFile, absDir)
+	resolved, err := parseGitFilePointer(gitFile)
 	if err != nil {
 		return gitPaths{}, ambiguous
 	}
@@ -201,7 +201,7 @@ func openNoFollow(path string) (*os.File, error) {
 // relative to the directory that holds the `.git` file, or absolute. A `\r\n`
 // line end and spaces around the path are accepted. A missing prefix, an
 // empty path, or a NUL byte in the path is an error.
-func parseGitFilePointer(gitFile, parentDir string) (string, error) {
+func parseGitFilePointer(gitFile string) (string, error) {
 	line, err := readFirstLineNoFollow(gitFile)
 	if err != nil {
 		return "", err
@@ -218,7 +218,7 @@ func parseGitFilePointer(gitFile, parentDir string) (string, error) {
 		return "", fmt.Errorf("NUL byte in gitdir pointer")
 	}
 	if !filepath.IsAbs(ptr) {
-		ptr = filepath.Join(parentDir, ptr)
+		ptr = filepath.Join(filepath.Dir(gitFile), ptr)
 	}
 	return filepath.Clean(ptr), nil
 }
@@ -280,15 +280,7 @@ func hasLinkedWorktreeBackref(gitDirReal, commonDir, gitFile string) bool {
 		return false
 	}
 	line, ok := readGitPathFile(gitDirReal, "gitdir")
-	if !ok {
-		return false
-	}
-	backref, err := os.Stat(line)
-	if err != nil {
-		return false
-	}
-	self, err := os.Stat(gitFile)
-	return err == nil && os.SameFile(backref, self)
+	return ok && sameFile(line, gitFile)
 }
 
 // readCommonDir reads <gitDir>/commondir (one short line that holds a path)

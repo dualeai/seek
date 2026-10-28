@@ -31,25 +31,19 @@ import (
 //
 // It cannot prove meaning, the acceptance threshold (tau), the retrieval
 // radius, the document cut or rank.
+//
+// It records no call. A test that reads the calls or their inputs wraps it in
+// observeModel.
 type hybridTestScorer struct {
-	prepareCalls atomic.Int32
-	embedCalls   atomic.Int32
-	scoreCalls   atomic.Int32
-	closeCalls   atomic.Int32
-	embedErr     error
-	prepareErr   error
-	scoreErr     error
-	mode         payloadMode
+	embedErr   error
+	prepareErr error
+	scoreErr   error
+	mode       payloadMode
 	// vectorForUnit, when set, gives the vector of each unit; the mode then
 	// sets only the scores.
 	vectorForUnit func(semanticUnit) semanticVector
 	// queryVector, when set, replaces the first of the two query tokens.
 	queryVector *semanticVector
-	mu          sync.Mutex
-	// documents holds each document that the model scored and embeddedPaths
-	// the path of each unit to embed, over all calls, in call order.
-	documents     []rerankDocument
-	embeddedPaths []string
 }
 
 // payloadMode is the verdict of hybridTestScorer on every row and every
@@ -73,12 +67,6 @@ func (scorer *hybridTestScorer) EmbedSemanticUnits(
 	_ context.Context,
 	units []semanticUnit,
 ) ([]semanticUnitEmbedding, error) {
-	scorer.embedCalls.Add(1)
-	scorer.mu.Lock()
-	for _, unit := range units {
-		scorer.embeddedPaths = append(scorer.embeddedPaths, unit.path)
-	}
-	scorer.mu.Unlock()
 	if scorer.embedErr != nil {
 		return nil, scorer.embedErr
 	}
@@ -155,7 +143,6 @@ func (scorer *hybridTestScorer) PrepareSemanticQuery(
 	_ context.Context,
 	query string,
 ) (*semanticQueryEmbedding, error) {
-	scorer.prepareCalls.Add(1)
 	if scorer.prepareErr != nil {
 		return nil, scorer.prepareErr
 	}
@@ -179,13 +166,9 @@ func (scorer *hybridTestScorer) ScoresWithSemanticQuery(
 	query *semanticQueryEmbedding,
 	documents []rerankDocument,
 ) ([]float32, error) {
-	scorer.scoreCalls.Add(1)
 	if scorer.scoreErr != nil {
 		return nil, scorer.scoreErr
 	}
-	scorer.mu.Lock()
-	scorer.documents = append(scorer.documents, documents...)
-	scorer.mu.Unlock()
 	scores := make([]float32, len(documents))
 	if scorer.mode == payloadAccept {
 		// A raw score sums one similarity per kept query token, so the
@@ -202,10 +185,7 @@ func (scorer *hybridTestScorer) ScoresWithSemanticQuery(
 	return scores, nil
 }
 
-func (scorer *hybridTestScorer) Close() error {
-	scorer.closeCalls.Add(1)
-	return nil
-}
+func (*hybridTestScorer) Close() error { return nil }
 
 func (*hybridTestScorer) SemanticCallCPUs(context.Context) int { return 1 }
 
@@ -352,15 +332,17 @@ func TestRunDefaultJoinedSearchAddsSemanticOnlyFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plans, err := planGitOperands(t.Context(), paths, canonicalCorpusPath(repo))
+	plans, err := expandGraph(t.Context(), plannedExternalOperands{gitRoots: []externalGitRoot{{
+		paths:    paths,
+		operands: []string{canonicalCorpusPath(repo)},
+	}}})
 	if err != nil || len(plans) != 1 {
 		t.Fatalf("plan Git corpus: plans=%d error=%v", len(plans), err)
 	}
 	plan := plans[0]
 	t.Chdir(repo)
 
-	scorer := &hybridTestScorer{mode: payloadAccept}
-	model := observeModel(scorer)
+	model := observeModel(&hybridTestScorer{mode: payloadAccept})
 	output, err := seekWith(t, model.factory(), "alpha beta")
 	if err != nil {
 		t.Fatal(err)
@@ -379,10 +361,7 @@ func TestRunDefaultJoinedSearchAddsSemanticOnlyFile(t *testing.T) {
 			model.scores.Load(), model.closes.Load(),
 		)
 	}
-	scorer.mu.Lock()
-	scored := documentPaths(scorer.documents)
-	scorer.mu.Unlock()
-	if !slices.Equal(scored, want) {
+	if scored := documentPaths(model.documents()); !slices.Equal(scored, want) {
 		t.Fatalf("scored documents=%v, want %v", scored, want)
 	}
 
@@ -535,12 +514,10 @@ func TestRunDefaultFilteredNativeFailureRecoversExactly(t *testing.T) {
 			t.Fatalf("filtered fallback contains %q:\n%s", leak, output)
 		}
 	}
-	if scorer.scoreCalls.Load() != 1 {
-		t.Fatalf("filtered lexical re-rank calls=%d, want 1", scorer.scoreCalls.Load())
+	if scorer.scores.Load() != 1 {
+		t.Fatalf("filtered lexical re-rank calls=%d, want 1", scorer.scores.Load())
 	}
-	scorer.mu.Lock()
-	scored := documentPaths(scorer.documents)
-	scorer.mu.Unlock()
+	scored := documentPaths(scorer.documents())
 	if !slices.Equal(scored, kept) {
 		t.Fatalf("scored documents=%v, want the %d kept files", scored, len(kept))
 	}
@@ -584,20 +561,18 @@ func TestVectorOnlyFilePrintsOnlyWhenTheModelAcceptsIt(t *testing.T) {
 			writeFileAt(t, folder, "semantic.go",
 				"package sample\n// dispatches a request to its handler\n")
 			output, scorer, err := stubSearch(t, test.mode, "alpha beta", folder)
-			if scorer.embedCalls.Load() == 0 {
+			if scorer.embeds.Load() == 0 {
 				t.Fatal("the build embedded no row")
 			}
-			scorer.mu.Lock()
-			documents := slices.Clone(scorer.documents)
-			scorer.mu.Unlock()
+			documents := scorer.documents()
 			wantCalls := int32(0)
 			if test.scored {
 				wantCalls = 1
 			}
-			if scorer.scoreCalls.Load() != wantCalls ||
+			if scorer.scores.Load() != wantCalls ||
 				test.scored && (len(documents) != 1 || documents[0].Path != "semantic.go") {
 				t.Fatalf("score calls=%d documents=%+v, want %d calls with semantic.go",
-					scorer.scoreCalls.Load(), documents, wantCalls)
+					scorer.scores.Load(), documents, wantCalls)
 			}
 			if !test.prints {
 				if exitCodeForError(err) != 1 || output != "" {
@@ -622,7 +597,7 @@ func TestRunDefaultRepairsDamagedSemanticGeneration(t *testing.T) {
 	writeFileAt(t, folder, "app.go", "package sample\n// alpha\n")
 	plan := planFolderTestCorpus(t, folder)
 
-	run := func(scorer *hybridTestScorer) string {
+	run := func(scorer semanticModel) string {
 		t.Helper()
 		// The query gives the model text, so it builds the generation that
 		// this test then damages and repairs.
@@ -633,8 +608,7 @@ func TestRunDefaultRepairsDamagedSemanticGeneration(t *testing.T) {
 		return output
 	}
 
-	first := &hybridTestScorer{}
-	wantOutput := run(first)
+	wantOutput := run(&hybridTestScorer{})
 	state, _, err := folderCorpusFingerprint(t.Context(), plan)
 	if err != nil {
 		t.Fatal(err)
@@ -650,11 +624,11 @@ func TestRunDefaultRepairsDamagedSemanticGeneration(t *testing.T) {
 		t.Fatal("damaged semantic data stayed active")
 	}
 
-	repair := &hybridTestScorer{}
+	repair := observeModel(&hybridTestScorer{})
 	if got := run(repair); got != wantOutput {
 		t.Fatalf("repair output=%q, want %q", got, wantOutput)
 	}
-	if repair.embedCalls.Load() == 0 {
+	if repair.embeds.Load() == 0 {
 		t.Fatal("repair did not rebuild semantic data")
 	}
 	requireSearchableGeneration(t, plan, plan.folderSemanticSource(state))
@@ -723,19 +697,19 @@ func TestRunDefaultSemanticBuildFailureKeepsLexicalSearchAndCanRepair(t *testing
 	}
 	wantErr := errors.New("test semantic build failure")
 	logs := captureTestLogs(t, slog.LevelDebug)
-	scorer := &hybridTestScorer{mode: payloadAccept, embedErr: wantErr}
+	scorer := observeModel(&hybridTestScorer{mode: payloadAccept, embedErr: wantErr})
 
-	output, err := seekWith(t, modelFactory(scorer), "alpha beta", folder)
+	output, err := seekWith(t, scorer.factory(), "alpha beta", folder)
 	// The node gives its strict hits; a relaxed match alone is no candidate.
 	if err != nil || output != lexicalOutput {
 		t.Fatalf("semantic build fallback: error=%v output=%q, want the lexical output %q", err, output, lexicalOutput)
 	}
 	// One failed build stops embedding; the query is still prepared and the
 	// strict candidates are scored once, and the model is closed once.
-	if scorer.embedCalls.Load() != 1 || scorer.prepareCalls.Load() != 1 ||
-		scorer.scoreCalls.Load() != 1 || scorer.closeCalls.Load() != 1 {
+	if scorer.embeds.Load() != 1 || scorer.prepares.Load() != 1 ||
+		scorer.scores.Load() != 1 || scorer.closes.Load() != 1 {
 		t.Fatalf("fallback calls embed=%d prepare=%d score=%d close=%d",
-			scorer.embedCalls.Load(), scorer.prepareCalls.Load(), scorer.scoreCalls.Load(), scorer.closeCalls.Load())
+			scorer.embeds.Load(), scorer.prepares.Load(), scorer.scores.Load(), scorer.closes.Load())
 	}
 	if _, statErr := os.Lstat(filepath.Join(plan.cacheDir, joinedGenerationFile)); !os.IsNotExist(statErr) {
 		t.Fatalf("failed semantic build left a joined descriptor: %v", statErr)
@@ -761,7 +735,7 @@ func TestRunDefaultSemanticBuildFailureKeepsLexicalSearchAndCanRepair(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if repairScorer.embedCalls.Load() == 0 ||
+	if repairScorer.embeds.Load() == 0 ||
 		!plan.joinedGenerationsMatch(state, plan.folderSemanticSource(state), "") {
 		t.Fatal("a later healthy run did not repair the joined index")
 	}
@@ -810,8 +784,8 @@ func TestRunDefaultSemanticQueryFailureUsesLexicalOutput(t *testing.T) {
 
 	wantErr := errors.New("test semantic query failure")
 	logs := captureTestLogs(t, slog.LevelDebug)
-	scorer := &hybridTestScorer{prepareErr: wantErr}
-	output, err := seekWith(t, modelFactory(scorer), "alpha beta", folder)
+	scorer := observeModel(&hybridTestScorer{prepareErr: wantErr})
+	output, err := seekWith(t, scorer.factory(), "alpha beta", folder)
 	if err != nil || output != lexicalOutput {
 		t.Fatalf(
 			"semantic query fallback: error=%v output=%q, want %q",
@@ -821,8 +795,8 @@ func TestRunDefaultSemanticQueryFailureUsesLexicalOutput(t *testing.T) {
 		)
 	}
 	assertTestLogError(t, logs, "Model stages failed; using strict order", wantErr)
-	if scorer.embedCalls.Load() != 1 || scorer.prepareCalls.Load() != 1 || scorer.scoreCalls.Load() != 0 {
-		t.Fatalf("query failure calls embed=%d prepare=%d score=%d", scorer.embedCalls.Load(), scorer.prepareCalls.Load(), scorer.scoreCalls.Load())
+	if scorer.embeds.Load() != 1 || scorer.prepares.Load() != 1 || scorer.scores.Load() != 0 {
+		t.Fatalf("query failure calls embed=%d prepare=%d score=%d", scorer.embeds.Load(), scorer.prepares.Load(), scorer.scores.Load())
 	}
 }
 
@@ -902,8 +876,8 @@ func TestDirtyGitSearchUsesCommittedVectors(t *testing.T) {
 			if got := headerPaths(out); err != nil || !slices.Equal(got, want) || strings.Contains(out, "DIRTY_MARKER") {
 				t.Fatalf("clean headers=%v error=%v, want %v with no dirty bytes:\n%s", got, err, want, out)
 			}
-			if clean.embedCalls.Load() != 0 {
-				t.Fatalf("next clean embeds=%d, want 0", clean.embedCalls.Load())
+			if clean.embeds.Load() != 0 {
+				t.Fatalf("next clean embeds=%d, want 0", clean.embeds.Load())
 			}
 		})
 	}
@@ -940,8 +914,8 @@ func TestDefaultFolderBuildPublishesAndUpdatesJoinedGeneration(t *testing.T) {
 	folder := t.TempDir()
 	writeFileAt(t, folder, "app.go", "package sample\n// first semantic folder text\n")
 	plan := planFolderTestCorpus(t, folder)
-	scorer := &hybridTestScorer{}
-	execution := testSemanticSearchExecution(t, modelFactory(scorer))
+	scorer := observeModel(&hybridTestScorer{})
+	execution := testSemanticSearchExecution(t, scorer.factory())
 
 	if state, err := ensureFolderCorpusFreshWithExecution(t.Context(), plan, execution); err != nil {
 		t.Fatal(err)
@@ -974,8 +948,8 @@ func TestDefaultFolderBuildPublishesAndUpdatesJoinedGeneration(t *testing.T) {
 	if len(semanticDirs) != 1 {
 		t.Fatalf("semantic generation directories=%v, want one current directory", semanticDirs)
 	}
-	if scorer.embedCalls.Load() < 2 {
-		t.Fatalf("semantic model calls=%d, want a build and an update", scorer.embedCalls.Load())
+	if scorer.embeds.Load() < 2 {
+		t.Fatalf("semantic model calls=%d, want a build and an update", scorer.embeds.Load())
 	}
 }
 
@@ -990,7 +964,7 @@ func TestLexicalOnlyFolderBuildStartsNoModelAndWritesNoSemanticData(t *testing.T
 	plan := planFolderTestCorpus(t, folder)
 	var factoryCalls atomic.Int32
 	future := newSemanticModelFuture(failingModelFactory(&factoryCalls))
-	execution := searchExecution{policy: lexicalOnlySearchPolicy(), model: future, vectors: true}
+	execution := searchExecution{policy: lexicalOnlySearch, model: future, vectors: true}
 
 	if _, err := ensureFolderCorpusFreshWithExecution(t.Context(), plan, execution); err != nil {
 		t.Fatal(err)

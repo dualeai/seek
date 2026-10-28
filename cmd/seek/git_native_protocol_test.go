@@ -80,6 +80,10 @@ case "$FAKE_GIT_MODE" in
 		printf 'git version 3.0.1\n'
 		exit 0
 		;;
+	version_snapshot)
+		printf 'git version 2.47.GIT\n'
+		exit 0
+		;;
 	batch_session_valid)
 		read_object_command
 		test "$verb" = info || exit 65
@@ -326,6 +330,7 @@ func TestRequireNativeGitVersion(t *testing.T) {
 		{mode: "version_old", wantErr: true},
 		{mode: "version_minimum"},
 		{mode: "version_newer"},
+		{mode: "version_snapshot"},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
 			installFakeGit(t)
@@ -361,6 +366,8 @@ func TestGitHonorsNoLazyFetch(t *testing.T) {
 		"git version 2.45.0":           true,
 		"git version 2.56.0":           true,
 		"git version 2.43.4.windows.1": true,
+		"git version 2.43.GIT":         false,
+		"git version 2.47.GIT":         true,
 		"git version 3.0.0":            true,
 		"git version garbage":          false,
 	} {
@@ -448,7 +455,7 @@ func TestBoundedGitStderrKeepsStartAndEnd(t *testing.T) {
 
 func TestNativeGitTreeStartFailure(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
-	err := readNativeGitTreeRecords(t.Context(), t.TempDir(), []string{"ls-tree"}, func([]gitTreeEntry) error { return nil })
+	err := readNativeGitTree(t.Context(), t.TempDir(), nativeTestOID, func([]gitTreeEntry) error { return nil })
 	if err == nil || !errors.Is(err, exec.ErrNotFound) {
 		t.Fatalf("error=%v, want Git executable failure", err)
 	}
@@ -458,7 +465,7 @@ func TestNativeGitTreeChecksLateExitAndBoundedStderr(t *testing.T) {
 	installFakeGit(t)
 	t.Setenv("FAKE_GIT_MODE", "valid_then_fail")
 	seen := 0
-	err := readNativeGitTreeRecords(t.Context(), t.TempDir(), []string{"ls-tree"}, func(entries []gitTreeEntry) error {
+	err := readNativeGitTree(t.Context(), t.TempDir(), nativeTestOID, func(entries []gitTreeEntry) error {
 		seen += len(entries)
 		return nil
 	})
@@ -475,7 +482,7 @@ func TestNativeGitTreeChecksLateExitAndBoundedStderr(t *testing.T) {
 func TestNativeGitTreeRejectsEarlyEOF(t *testing.T) {
 	installFakeGit(t)
 	t.Setenv("FAKE_GIT_MODE", "truncated")
-	err := readNativeGitTreeRecords(t.Context(), t.TempDir(), []string{"ls-tree"}, func([]gitTreeEntry) error { return nil })
+	err := readNativeGitTree(t.Context(), t.TempDir(), nativeTestOID, func([]gitTreeEntry) error { return nil })
 	if err == nil || !strings.Contains(err.Error(), "truncated Git tree record") {
 		t.Fatalf("error=%v", err)
 	}
@@ -486,7 +493,7 @@ func TestNativeGitTreeParseFailureKillsAndJoinsChild(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "pid")
 	t.Setenv("FAKE_GIT_PID_FILE", pidFile)
 	t.Setenv("FAKE_GIT_MODE", "malformed_then_hang")
-	err := readNativeGitTreeRecords(t.Context(), t.TempDir(), []string{"ls-tree"}, func([]gitTreeEntry) error { return nil })
+	err := readNativeGitTree(t.Context(), t.TempDir(), nativeTestOID, func([]gitTreeEntry) error { return nil })
 	if err == nil {
 		t.Fatal("malformed tree succeeded")
 	}
@@ -525,7 +532,7 @@ func TestNativeGitTreeCancellationAndDeadline(t *testing.T) {
 			ctx, end := test.context()
 			defer end()
 			pidLine := stopWhenFakeGitStarts(t, pidFile, end)
-			err := readNativeGitTreeRecords(ctx, t.TempDir(), []string{"ls-tree"}, func([]gitTreeEntry) error { return nil })
+			err := readNativeGitTree(ctx, t.TempDir(), nativeTestOID, func([]gitTreeEntry) error { return nil })
 			if !errors.Is(err, test.want) {
 				t.Fatalf("error=%v, want %v", err, test.want)
 			}
@@ -698,7 +705,7 @@ func TestNativeGitBatchCheckReplyFailures(t *testing.T) {
 // TestNativeGitBatchCheckExactLimitAndOversize checks blobs of exactly the
 // document limit and one byte more: only the second is oversize.
 func TestNativeGitBatchCheckExactLimitAndOversize(t *testing.T) {
-	swapDocumentContentLimitForTest(t, 100<<20)
+	swapForTest(t, &documentContentLimit, 100<<20)
 	batch := startFakeNativeGitBatch(t, t.Context(), "batch_check_limits")
 	infos, err := batch.check([]gitTreeEntry{
 		fakeTreeEntry(nativeTestOID),
@@ -794,7 +801,7 @@ func TestReadNativeGitBlobsReadsExactContent(t *testing.T) {
 }
 
 func TestReadNativeGitBlobsDoesNotStartChildForOversize(t *testing.T) {
-	swapDocumentContentLimitForTest(t, 100<<20)
+	swapForTest(t, &documentContentLimit, 100<<20)
 	t.Setenv("PATH", t.TempDir())
 	info := gitBlobInfo{entry: fakeTreeEntry(nativeTestOID), size: documentContentLimit + 1, oversize: true}
 	called := false

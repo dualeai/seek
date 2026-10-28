@@ -50,6 +50,8 @@ var errNativeGitDeltaTooLarge = errors.New("native Git delta has too many change
 type gitObjectID string
 
 // gitTreeEntry is one ls-tree record: the mode, the object ID, and the path.
+// A batch request reads only the object ID and the path, so the other blob
+// requests leave the mode empty.
 type gitTreeEntry struct {
 	mode string
 	oid  gitObjectID
@@ -138,7 +140,8 @@ func requireNativeGitVersion(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if gitVersionOutputAtLeast(out, minNativeGitMajor, minNativeGitMinor) {
+	if major, minor, _, ok := gitVersionNumbers(out); ok &&
+		(major > minNativeGitMajor || major == minNativeGitMajor && minor >= minNativeGitMinor) {
 		return nil
 	}
 	return fmt.Errorf(
@@ -193,10 +196,6 @@ func nativeGitReadError(ctx context.Context, operation string, err error) error 
 		return ctxErr
 	}
 	return fmt.Errorf("%s: %w", operation, err)
-}
-
-func waitNativeGitChild(ctx context.Context, cmd *exec.Cmd, operation string, stderr *boundedGitStderr) error {
-	return gitCommandError(ctx, operation, cmd.Wait(), stderr)
 }
 
 // abortNativeGitChild closes stdin when it is set, kills the Git child, and
@@ -269,15 +268,15 @@ func parseNativeGitTreeRecord(record []byte) (gitTreeEntry, error) {
 	return gitTreeEntry{mode: mode, oid: oid, path: string(path)}, nil
 }
 
-// readNativeGitTreeRecords runs the Git ls-tree command of args and passes its
+// readNativeGitTree runs `git ls-tree` on the captured commit and passes its
 // records to consume in groups of at most gitObjectBatchSize.
-func readNativeGitTreeRecords(
+func readNativeGitTree(
 	ctx context.Context,
 	repoDir string,
-	args []string,
+	snapshot gitObjectID,
 	consume func([]gitTreeEntry) error,
 ) error {
-	cmd := newGitCommand(ctx, repoDir, args...)
+	cmd := newGitCommand(ctx, repoDir, "ls-tree", "-r", "-z", "--full-tree", "--no-abbrev", snapshot.String())
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("open git ls-tree stdout: %w", err)
@@ -331,7 +330,7 @@ func readNativeGitTreeRecords(
 					return err
 				}
 			}
-			return waitNativeGitChild(ctx, cmd, "git ls-tree", &stderr)
+			return gitCommandError(ctx, "git ls-tree", cmd.Wait(), &stderr)
 		default:
 			abortNativeGitChild(cmd, nil)
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -340,16 +339,6 @@ func readNativeGitTreeRecords(
 			return fmt.Errorf("read git ls-tree: %w", readErr)
 		}
 	}
-}
-
-func readNativeGitTree(
-	ctx context.Context,
-	repoDir string,
-	snapshot gitSnapshot,
-	consume func([]gitTreeEntry) error,
-) error {
-	args := []string{"ls-tree", "-r", "-z", "--full-tree", "--no-abbrev", snapshot.commitOID.String()}
-	return readNativeGitTreeRecords(ctx, repoDir, args, consume)
 }
 
 func readNativeGitBatchHeader(reader *bufio.Reader) ([]byte, error) {
@@ -495,25 +484,20 @@ func parseNativeGitDiffHeader(header, path []byte, oidLength int) (gitDiffEntry,
 	}, nil
 }
 
+// readNativeGitNULRecord reads one NUL-terminated record without its NUL. It
+// reports false at the end of the output, and io.ErrUnexpectedEOF for a last
+// record with no NUL.
 func readNativeGitNULRecord(reader *bufio.Reader) ([]byte, bool, error) {
-	var complete []byte
-	for {
-		part, err := reader.ReadSlice(0)
-		if errors.Is(err, bufio.ErrBufferFull) {
-			complete = append(complete, part...)
-			continue
-		}
-		complete = append(complete, part...)
-		switch {
-		case err == nil:
-			return complete[:len(complete)-1], true, nil
-		case errors.Is(err, io.EOF) && len(complete) == 0:
-			return nil, false, nil
-		case errors.Is(err, io.EOF):
-			return nil, false, io.ErrUnexpectedEOF
-		default:
-			return nil, false, err
-		}
+	record, err := reader.ReadBytes(0)
+	switch {
+	case err == nil:
+		return record[:len(record)-1], true, nil
+	case errors.Is(err, io.EOF) && len(record) == 0:
+		return nil, false, nil
+	case errors.Is(err, io.EOF):
+		return nil, false, io.ErrUnexpectedEOF
+	default:
+		return nil, false, err
 	}
 }
 
@@ -527,9 +511,6 @@ func readNativeGitDiff(
 	targetOID gitObjectID,
 	maxEntries int,
 ) ([]gitDiffEntry, error) {
-	if len(baseOID) != len(targetOID) {
-		return nil, fmt.Errorf("git delta object formats differ")
-	}
 	cmd := newGitCommand(ctx, repoDir,
 		"diff-tree",
 		"-r",
@@ -561,7 +542,7 @@ func readNativeGitDiff(
 			return nil, nativeGitReadError(ctx, "read Git raw diff header", err)
 		}
 		if !ok {
-			if err := waitNativeGitChild(ctx, cmd, "git diff-tree", &stderr); err != nil {
+			if err := gitCommandError(ctx, "git diff-tree", cmd.Wait(), &stderr); err != nil {
 				return nil, err
 			}
 			return entries, nil

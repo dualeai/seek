@@ -65,11 +65,6 @@ type node struct {
 	rootType    rootType
 	root        string
 	displayRoot string
-	// selectedFiles are the corpus-relative (slash) names that the user gave
-	// as file operands. A result with one of these names gets its base name
-	// as the fallback header (displayHeader). It is for display only and is
-	// never part of the corpus ID.
-	selectedFiles []string
 	corpusStore
 	// scope is the search-time filter for a scoped Git search. A scoped and an
 	// unscoped search of one repo read the same combined whole-repo index
@@ -126,17 +121,13 @@ type corpusSearchResult struct {
 	corpusID    corpusID
 	kind        corpusKind
 	displayRoot string
-	// displayName is the header when no header is set (displayHeader): the
-	// base name of a selected file, otherwise the corpus-relative FileName.
-	displayName string
 	file        zoekt.FileMatch
 	// rankOverride is one-based. Zero keeps the normal BM25 ordering.
 	rankOverride int
 	// also holds the other paths whose content and match equal this result's,
 	// in tie order.
 	also []corpusCopy
-	// header is the display path (applyHeaders); empty keeps the node-relative
-	// form.
+	// header is the display path that the formatter prints (applyHeaders).
 	header string
 	// modelBase is the model path base of the node (modelPathBase).
 	modelBase string
@@ -148,10 +139,6 @@ type corpusCopy struct {
 	displayRoot string
 	path        string
 	header      string
-}
-
-func (c corpusCopy) displayPath() string {
-	return filepath.Join(c.displayRoot, c.path)
 }
 
 type corpusIndexState uint8
@@ -201,7 +188,7 @@ func buildGitCorpusPlan(repoDir, commonDir string) (node, error) {
 	if err != nil {
 		return node{}, fmt.Errorf("stat git common dir: %w", err)
 	}
-	return newCorpusPlan(corpusKindGit, rootTypeWorktree, root, "git",
+	return newCorpusPlan(corpusKindGit, rootTypeWorktree, root,
 		"git_common_dir", commonID, "git_committed_backend", "native-v1")
 }
 
@@ -211,27 +198,25 @@ func planFolderCorpus(root string, info os.FileInfo) (node, error) {
 	if info.IsDir() {
 		rt = rootTypeDirectory
 	}
-	plan, err := newCorpusPlan(corpusKindFolder, rt, root, "folder")
+	plan, err := newCorpusPlan(corpusKindFolder, rt, root)
 	if err != nil {
 		return node{}, err
 	}
 	plan.behavior = &folderNode{}
 	if rt == rootTypeFile {
-		// A single-file corpus indexes the file under its base name. Results
-		// show relative to the parent directory, so the header names the file
-		// that the user selected. With many corpora, the header is still an
-		// absolute path that opens directly.
+		// A single-file corpus indexes the file under its base name. Its
+		// display root is the parent folder, so the display root joined to
+		// the name is the file path (applyHeaders).
 		plan.displayRoot = filepath.Dir(root)
-		plan.selectedFiles = []string{filepath.Base(root)}
 	}
 	return plan, nil
 }
 
 // newCorpusPlan gives the node of one corpus. Its ID hashes the kind, the root
 // type, the root's file identity, the format versions, the build options
-// (indexOptionsHash), and extraIDParts. statSubject names the root in a stat
-// error.
-func newCorpusPlan(kind corpusKind, rt rootType, root, statSubject string, extraIDParts ...string) (node, error) {
+// (indexOptionsHash), and extraIDParts. A stat error of the root names the
+// kind.
+func newCorpusPlan(kind corpusKind, rt rootType, root string, extraIDParts ...string) (node, error) {
 	cacheRoot, err := seekUserCacheRoot()
 	if err != nil {
 		return node{}, err
@@ -240,7 +225,7 @@ func newCorpusPlan(kind corpusKind, rt rootType, root, statSubject string, extra
 	root = canonicalCorpusPath(root)
 	rootID, err := filesystemIdentity(root)
 	if err != nil {
-		return node{}, fmt.Errorf("stat %s root: %w", statSubject, err)
+		return node{}, fmt.Errorf("stat %s root: %w", kind, err)
 	}
 
 	// The root identity (dev:ino) names the corpus; the root path is for
@@ -289,17 +274,16 @@ func planGitCorpus(paths gitPaths, operands []string) (node, error) {
 	if plan.scope, err = spec.query(); err != nil {
 		return node{}, err
 	}
-	plan.selectedFiles = spec.files
 	return plan, nil
 }
 
 // pathWithin reports whether path is root or a descendant of it (bool-only
 // containment; relWithin is the variant that also returns the relative path).
+// The file-system root "/" ends with the separator, so it holds every path
+// that starts with it.
 func pathWithin(root, path string) bool {
-	if path == root {
-		return true
-	}
-	return strings.HasPrefix(path, root+string(filepath.Separator))
+	rest, ok := strings.CutPrefix(path, root)
+	return ok && (rest == "" || rest[0] == filepath.Separator || root == string(filepath.Separator))
 }
 
 // relWithin returns path relative to root and whether path is inside root
@@ -337,7 +321,7 @@ func filesystemIdentity(path string) (string, error) {
 		return "", err
 	}
 	return strconv.FormatUint(uint64(st.Dev), 10) + ":" +
-		strconv.FormatUint(uint64(st.Ino), 10), nil
+		strconv.FormatUint(st.Ino, 10), nil
 }
 
 // canonicalCorpusPath returns path with its symlinks resolved, or the clean
@@ -347,7 +331,7 @@ func canonicalCorpusPath(path string) string {
 		return resolved // EvalSymlinks returns a clean path.
 	}
 	if abs, err := filepath.Abs(path); err == nil {
-		return filepath.Clean(abs)
+		return abs // Abs returns a clean path.
 	}
 	return filepath.Clean(path)
 }

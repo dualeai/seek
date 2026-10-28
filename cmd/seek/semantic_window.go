@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -203,7 +204,7 @@ func semanticWindowHeader(unit semanticUnit, base string) string {
 // byte offset in that text back to the raw offset. Invalid UTF-8 runs and NUL
 // bytes become U+FFFD as in sanitizeLateOnTokenizerInput.
 func sanitizedSemanticText(raw []byte) (string, func(int) int) {
-	if utf8.Valid(raw) && !strings.Contains(string(raw), "\x00") {
+	if utf8.Valid(raw) && bytes.IndexByte(raw, 0) < 0 {
 		return string(raw), func(offset int) int { return min(max(offset, 0), len(raw)) }
 	}
 	var text strings.Builder

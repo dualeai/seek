@@ -56,7 +56,7 @@ func seedCorpus(tb testing.TB, cacheRoot, hash string, usedAt time.Time) string 
 // smaller budget.
 func cacheRootForTest(tb testing.TB) string {
 	tb.Helper()
-	clearGCEnvForTest(tb)
+	tb.Setenv(envGCInterval, "")
 	setTestUserCache(tb)
 	root, err := seekUserCacheRoot()
 	if err != nil {
@@ -66,11 +66,6 @@ func cacheRootForTest(tb testing.TB) string {
 		tb.Fatalf("mkdir cache root: %v", err)
 	}
 	return root
-}
-
-func clearGCEnvForTest(tb testing.TB) {
-	tb.Helper()
-	tb.Setenv(envGCInterval, "")
 }
 
 // resetNFSCheck clears the NFS check that touchUsed does once per process, now
@@ -85,34 +80,11 @@ func resetNFSCheck(tb testing.TB) {
 	})
 }
 
-// captureStdoutGC swaps os.Stdout with a pipe, runs fn, and returns
-// everything fn wrote. It restores os.Stdout on return, also when fn panics,
-// so a failing test does not leave stdout redirected for the rest of the
-// suite. NOT safe for t.Parallel: it changes the process-wide os.Stdout.
-func captureStdoutGC(tb testing.TB, fn func()) (out string) {
+// captureStdoutGC is captureStdout for a function with no error.
+func captureStdoutGC(tb testing.TB, fn func()) string {
 	tb.Helper()
-	r, w, err := os.Pipe()
-	if err != nil {
-		tb.Fatalf("pipe: %v", err)
-	}
-	orig := os.Stdout
-	os.Stdout = w
-	done := make(chan struct{})
-	var buf bytes.Buffer
-	go func() {
-		_, _ = buf.ReadFrom(r)
-		close(done)
-	}()
-	// The deferred function runs after fn, also when fn panics, so it
-	// restores stdout and waits for the reader before it sets `out`.
-	defer func() {
-		os.Stdout = orig
-		_ = w.Close()
-		<-done
-		out = buf.String()
-	}()
-	fn()
-	return
+	out, _ := captureStdout(tb, func() error { fn(); return nil })
+	return out
 }
 
 // requireRow asserts that the captured table output has a row for the corpus
@@ -387,7 +359,7 @@ func TestGC_TOCTOU_RefreshedUsedUnderLock_SkipsEvict(t *testing.T) {
 	if err := os.MkdirAll(trashDir, 0o755); err != nil {
 		t.Fatalf("mkdir trash: %v", err)
 	}
-	res := evictCorpus(entry, trashDir, entry.usedAt)
+	res := evictCorpus(entry, trashDir)
 	if res.action != actionKept {
 		t.Fatalf("expected actionKept after .used refresh under lock, got %s err=%v", res.String(), res.err)
 	}
@@ -479,7 +451,7 @@ func TestGCCmd_DryRun_TableLayout(t *testing.T) {
 // TestGCCmd_DryRun_DoesNotCreateMissingCacheRoot checks the user-facing
 // promise that a dry run does not change the filesystem.
 func TestGCCmd_DryRun_DoesNotCreateMissingCacheRoot(t *testing.T) {
-	clearGCEnvForTest(t)
+	t.Setenv(envGCInterval, "")
 	root := filepath.Join(t.TempDir(), "missing-cache")
 	t.Setenv("SEEK_CACHE_DIR", root)
 
@@ -765,12 +737,10 @@ func TestRace_ConcurrentGCInvocations(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < N; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range N {
+		wg.Go(func() {
 			runGC(context.Background(), gcOptions{skipThrottle: true})
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -824,15 +794,13 @@ func TestRace_TouchUsedConcurrent(t *testing.T) {
 	const N = 50
 	var wg sync.WaitGroup
 	var fails atomic.Int64
-	for i := 0; i < N; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range N {
+		wg.Go(func() {
 			touchUsed(dir)
 			if _, err := os.Stat(filepath.Join(dir, usedFile)); err != nil {
 				fails.Add(1)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	if fails.Load() != 0 {
@@ -861,9 +829,9 @@ func TestGC_DisplayName_ReadsRepositorySourceFromShard(t *testing.T) {
 
 	dir := initGitRepo(t, "app.go", "package main\n// disp_name_marker\n")
 	ctx := context.Background()
-	paths, plan := planGitTestCorpus(t, dir)
+	_, plan := planGitTestCorpus(t, dir)
 
-	if _, err := runSeekInPlannedGitCorpus(ctx, "disp_name_marker", paths, plan); err != nil {
+	if _, err := runSeekInPlannedGitCorpus(ctx, "disp_name_marker", plan); err != nil {
 		t.Fatalf("runSeekInPlannedGitCorpus: %v", err)
 	}
 
@@ -953,8 +921,8 @@ func TestGC_DisplayName_GoneFlag(t *testing.T) {
 
 	dir := initGitRepo(t, "app.go", "package main\n// gone_marker\n")
 	ctx := context.Background()
-	paths, plan := planGitTestCorpus(t, dir)
-	if _, err := runSeekInPlannedGitCorpus(ctx, "gone_marker", paths, plan); err != nil {
+	_, plan := planGitTestCorpus(t, dir)
+	if _, err := runSeekInPlannedGitCorpus(ctx, "gone_marker", plan); err != nil {
 		t.Fatalf("runSeekInPlannedGitCorpus: %v", err)
 	}
 
@@ -979,27 +947,22 @@ func TestGC_DisplayName_GoneFlag(t *testing.T) {
 }
 
 // TestGC_FormatRoot checks the ROOT cell: the [empty] and [gone] markers, and
-// the cut of a long path to the column width.
+// the cut of a long path to the column width (gcRootWidth, 52 bytes).
 func TestGC_FormatRoot(t *testing.T) {
 	cases := []struct {
-		info  corpusDisplayInfo
-		width int
-		want  string
+		info corpusDisplayInfo
+		want string
 	}{
-		{corpusDisplayInfo{}, 20, "[empty]"},
-		{corpusDisplayInfo{source: "/tmp/x"}, 20, "/tmp/x"},
-		{corpusDisplayInfo{source: "/tmp/x", gone: true}, 20, "[gone] /tmp/x"},
-		{corpusDisplayInfo{source: "/very/long/path/to/some/repo/inside"}, 20, ".../some/repo/inside"},
-		{corpusDisplayInfo{source: "/exactly/twenty/c"}, 17, "/exactly/twenty/c"},
-		// width less than ellipsis falls back to hard truncate.
-		{corpusDisplayInfo{source: "/abcdefghij"}, 2, "/a"},
-		// width 3 = exactly ellipsis length, keep=0 → hard truncate path.
-		{corpusDisplayInfo{source: "/abcdefghij"}, 3, "/ab"},
+		{corpusDisplayInfo{}, "[empty]"},
+		{corpusDisplayInfo{source: "/tmp/x"}, "/tmp/x"},
+		{corpusDisplayInfo{source: "/tmp/x", gone: true}, "[gone] /tmp/x"},
+		{corpusDisplayInfo{source: "/very/long/path/to/some/repo/inside/a/deeply/nested/workspace/folder"}, "...some/repo/inside/a/deeply/nested/workspace/folder"},
+		{corpusDisplayInfo{source: "/exactly/fifty-two/bytes/of/path/for/the/root/column"}, "/exactly/fifty-two/bytes/of/path/for/the/root/column"},
 	}
 	for i, c := range cases {
-		got := formatRoot(c.info, c.width)
+		got := formatRoot(c.info)
 		if got != c.want {
-			t.Errorf("case %d: formatRoot(%+v, %d) = %q, want %q", i, c.info, c.width, got, c.want)
+			t.Errorf("case %d: formatRoot(%+v) = %q, want %q", i, c.info, got, c.want)
 		}
 	}
 }
@@ -1415,12 +1378,10 @@ func TestRace_TrashDrainConcurrent(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 5 {
+		wg.Go(func() {
 			runGC(context.Background(), gcOptions{skipThrottle: true})
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -1797,8 +1758,8 @@ func TestSweepCorpusOrphansRemovesOldSharedTmpFiles(t *testing.T) {
 }
 
 // TestSweepRetiredRuntimesKeepsThisBinarysRuntimes plans and runs the runtime
-// sweep. The sweep removes old runtimes of other versions, the old flat layout,
-// and a cut sweep's leftover. Each runtime counts by its own age. It keeps this
+// sweep. The sweep removes old runtimes of other versions and a cut sweep's
+// leftover. Each runtime counts by its own age. It keeps this
 // binary's runtimes, other provider caches, and recent or used runtimes. The
 // plan lists each runtime that the sweep removes. An emptied or old empty
 // version directory goes; a new empty one stays.
@@ -1844,12 +1805,10 @@ func TestSweepRetiredRuntimesKeepsThisBinarysRuntimes(t *testing.T) {
 	gone := []string{
 		stale,
 		dir(old, rerankerDir, "0.0.1", "retired"),
-		dir(old, rerankerDir, "ort-0.0.0-flat-layout"),
 		dir(old, rerankerDir, bundle.version, "retired-sha"),
 		dir(old, "semantic", "usearch", "retired"),
 		dir(old, "semantic", "numkong", "retired"),
 		dir(now, "semantic", "usearch", providerArtifactDiscardPrefix+"cut"),
-		dir(now, rerankerDir, providerArtifactDiscardPrefix+"ort-0.0.0-cut"),
 	}
 	// An old empty version directory is no runtime, but it goes. A new one
 	// can be an install in progress, so it stays.
@@ -1873,8 +1832,8 @@ func TestSweepRetiredRuntimesKeepsThisBinarysRuntimes(t *testing.T) {
 		}
 	})
 	// Each runtime holds one byte, so the bytes show the size measure too.
-	if !strings.Contains(plan, "retired runtimes to remove: 8 (8B)") {
-		t.Errorf("plan=%q, want 8 runtimes (8B) to remove", plan)
+	if !strings.Contains(plan, "retired runtimes to remove: 6 (6B)") {
+		t.Errorf("plan=%q, want 6 runtimes (6B) to remove", plan)
 	}
 	for _, path := range gone {
 		if !strings.Contains(plan, path) {
@@ -1892,8 +1851,8 @@ func TestSweepRetiredRuntimesKeepsThisBinarysRuntimes(t *testing.T) {
 			t.Errorf("%s stays after the sweep: %v", path, err)
 		}
 	}
-	if !strings.Contains(report.String(), "retired runtimes removed: 8 (8B)") {
-		t.Errorf("report=%q, want 8 removed runtimes (8B)", report.String())
+	if !strings.Contains(report.String(), "retired runtimes removed: 6 (6B)") {
+		t.Errorf("report=%q, want 6 removed runtimes (6B)", report.String())
 	}
 	if _, err := os.Stat(filepath.Join(root, rerankerDir, "0.0.1")); !os.IsNotExist(err) {
 		t.Errorf("the emptied version directory stays: %v", err)
@@ -1916,7 +1875,7 @@ func TestRuntimeUseTouchesItsDirectory(t *testing.T) {
 		name    string
 		install func() (string, error)
 	}{
-		{"onnx runtime", func() (string, error) { path, _, err := ensureLateOnRuntime(bundle); return path, err }},
+		{"onnx runtime", func() (string, error) { return ensureLateOnRuntime(bundle) }},
 		{"usearch", extractSemanticUSearchRuntime},
 		{"numkong", extractSemanticNumKongRuntime},
 	} {

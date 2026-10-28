@@ -29,19 +29,19 @@ func TestRunSearchCommandEmbeddingFaultRecordsOnce(t *testing.T) {
 				gitRunIn(t, root, "commit", "-m", "search fixture")
 			}
 			verdict := pinAcceleratedProviderForTest(t)
-			scorer := &hybridTestScorer{embedErr: errDegenerateSemanticVector}
+			scorer := observeModel(&hybridTestScorer{embedErr: errDegenerateSemanticVector})
 
 			// Start with no index. Query preparation and final scoring still
 			// work when the vector build fails, so the strict file returns; a
 			// relaxed match alone is no candidate.
-			output, err := seekWith(t, modelFactory(scorer), "alpha beta", root)
+			output, err := seekWith(t, scorer.factory(), "alpha beta", root)
 			if err != nil || !strings.Contains(output, "strict.go") || strings.Contains(output, "relaxed.go") {
 				t.Fatalf("embedding fault fallback: output=%q error=%v", output, err)
 			}
-			if scorer.embedCalls.Load() != 1 || scorer.prepareCalls.Load() != 1 ||
-				scorer.scoreCalls.Load() != 1 || scorer.closeCalls.Load() != 1 {
+			if scorer.embeds.Load() != 1 || scorer.prepares.Load() != 1 ||
+				scorer.scores.Load() != 1 || scorer.closes.Load() != 1 {
 				t.Errorf("model calls: embed=%d prepare=%d score=%d close=%d, want 1/1/1/1",
-					scorer.embedCalls.Load(), scorer.prepareCalls.Load(), scorer.scoreCalls.Load(), scorer.closeCalls.Load())
+					scorer.embeds.Load(), scorer.prepares.Load(), scorer.scores.Load(), scorer.closes.Load())
 			}
 			if record := readLateOnProviderRecord(verdict); record.faults != 1 {
 				t.Errorf("provider record=%+v, want one fault without rejection", record)

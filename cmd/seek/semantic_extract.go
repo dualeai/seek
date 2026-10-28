@@ -141,9 +141,6 @@ func extractSemanticUnitsWithID(
 		if i+1 < len(anchors) {
 			end = anchors[i+1].offset
 		}
-		if end <= current.offset {
-			continue
-		}
 		units = appendSemanticSpan(units, path, content, contentID,
 			current.offset, end, semanticUnitSymbol, parserResult,
 			language, current.symbol, &idBuffer)
@@ -185,10 +182,9 @@ func semanticContentIsEligible(content []byte) bool {
 	return checker.Check(content, int(documentContentLimit), false) == index.SkipReasonNone
 }
 
+// semanticSymbolMetadata joins the ctags context of a non-nil entry: parent
+// kind, parent, kind, name, and signature.
 func semanticSymbolMetadata(entry *ctags.Entry) string {
-	if entry == nil {
-		return ""
-	}
 	parts := make([]string, 0, 5)
 	for _, value := range []string{
 		entry.ParentKind,

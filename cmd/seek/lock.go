@@ -186,7 +186,8 @@ func (store corpusStore) acquireBuildLock(ctx context.Context) (*os.File, bool, 
 	// Mark the corpus as used when the build starts. Then a concurrent gc does
 	// not evict it between the release of this lock and the search's open of
 	// the publish lock. An open in the trashed directory fails with ENOENT. gc
-	// keeps a corpus whose readUsedAt time is after its cutoff (gc.go).
+	// keeps a corpus whose readUsedAt time is after the time of its list
+	// (evictCorpus).
 	touchUsed(store.cacheDir)
 	return f, true, nil
 }
@@ -307,9 +308,7 @@ func pollLock(ctx context.Context, path, reason string, lockFn func() error, ini
 		ended = waits.start()
 		defer waits.stop()
 	}
-	if reason != "" {
-		slog.Debug(reason, "lock", path)
-	}
+	slog.Debug(reason, "lock", path)
 	backoff := initialBackoff
 	for {
 		err := lockFn()

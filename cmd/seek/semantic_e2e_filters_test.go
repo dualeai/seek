@@ -160,8 +160,8 @@ func e2eFilterCheckTable(t *testing.T, rows []e2eFilterRow) {
 //   - other, a Git node with zoekt.name=zqnamed, which Seek does not read:
 //     other.go is committed in the repository with the opaque name.
 //
-// Each live file holds zqmark. It returns the cache home.
-func e2eFilterContentTree(t *testing.T) string {
+// Each live file holds zqmark.
+func e2eFilterContentTree(t *testing.T) {
 	t.Helper()
 	f := newGraphFixture(t)
 	repo := f.GitRepo("tree/repo", "clean.go", "package repo\n// zqmark zqkeep ZqCase\nfunc ZqHeld() {}\n")
@@ -179,9 +179,8 @@ func e2eFilterContentTree(t *testing.T) string {
 	writeFixtureFile(t, f.path("tree/loose/loose.go"), "package loose\n// zqmark zqkeep zqcase\nfunc ZqHeld() {}\n")
 	other := f.GitRepo("tree/other", "other.go", "package other\n// zqmark zqdrop ZqCase\nfunc ZqFreed() {}\n")
 	gitRunIn(t, other, "config", "zoekt.name", "zqnamed")
-	home := setTestUserCache(t)
+	setTestUserCache(t)
 	t.Chdir(f.path("tree"))
-	return home
 }
 
 // e2eFilterOtherRepo returns the opaque repository name of the other node of

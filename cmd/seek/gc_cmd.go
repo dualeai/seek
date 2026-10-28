@@ -49,9 +49,7 @@ func runGCCommandCmd(ctx context.Context, opts gcCmdOptions) error {
 		if err != nil {
 			return fmt.Errorf("compute the cache budget: %w", err)
 		}
-		if err := reportGCPlan(ctx, os.Stdout, cacheRoot, entries, evict, sortKey); err != nil {
-			return err
-		}
+		reportGCPlan(ctx, os.Stdout, cacheRoot, entries, evict, sortKey)
 		before := time.Now().Add(-providerArtifactAge(opts.all))
 		reportDirPlan(os.Stdout, "compiled model files", agedProviderArtifacts(ctx, cacheRoot, before),
 			"Seek compiles these again when it needs them.")
@@ -188,9 +186,9 @@ func sortGCRows(rows []gcRow, key gcSortKey) {
 // eviction.
 func renderGCRow(w io.Writer, e corpusDirEntry, info corpusDisplayInfo, size int64, now time.Time, action string) {
 	age := now.Sub(e.usedAt)
-	_, _ = fmt.Fprintf(w, "  %-10s  %-52s  %-6s  %-6s  %s\n",
+	_, _ = fmt.Fprintf(w, "  %-10s  %-*s  %-6s  %-6s  %s\n",
 		truncateHash(e.name),
-		formatRoot(info, 52),
+		gcRootWidth, formatRoot(info),
 		humanDuration(age),
 		humanBytes(size),
 		action,
@@ -248,10 +246,10 @@ func emitGCRow(w io.Writer, stats *gcTableStats, r gcRow, now time.Time, res gcR
 //
 // The summary counts the rendered rows. Both branches stop early on a cancel
 // of ctx, and the summary tells what the plan measured.
-func reportGCPlan(ctx context.Context, w io.Writer, cacheRoot string, entries []corpusDirEntry, evict map[corpusID]bool, sortKey gcSortKey) error {
+func reportGCPlan(ctx context.Context, w io.Writer, cacheRoot string, entries []corpusDirEntry, evict map[corpusID]bool, sortKey gcSortKey) {
 	printGCTableBanner(w, cacheRoot, len(entries))
 	if len(entries) == 0 {
-		return nil
+		return
 	}
 	now := time.Now()
 	stats := &gcTableStats{}
@@ -274,16 +272,18 @@ func reportGCPlan(ctx context.Context, w io.Writer, cacheRoot string, entries []
 		}
 	}
 	stats.summary(w, "evictable")
-	return nil
 }
 
-// formatRoot renders a corpusDisplayInfo for the table. It marks a missing
-// source with [gone]. It cuts a long path from the left and keeps its end, so
-// a base name that fits in the kept bytes stays whole. It removes control
-// characters: a newline is valid in a POSIX path, but it would break the
-// layout of one row per corpus. Each cut is on a rune boundary, so a multibyte
-// path never shows a partial rune.
-func formatRoot(info corpusDisplayInfo, width int) string {
+// gcRootWidth is the byte width of the ROOT column of gcTableHeader.
+const gcRootWidth = 52
+
+// formatRoot renders a corpusDisplayInfo for the ROOT column. It marks a
+// missing source with [gone]. It cuts a path longer than gcRootWidth from the
+// left and keeps its end, so a base name that fits in the kept bytes stays
+// whole. It removes control characters: a newline is valid in a POSIX path,
+// but it would break the layout of one row per corpus. The cut is on a rune
+// boundary, so a multibyte path never shows a partial rune.
+func formatRoot(info corpusDisplayInfo) string {
 	if info.source == "" {
 		return "[empty]"
 	}
@@ -291,14 +291,11 @@ func formatRoot(info corpusDisplayInfo, width int) string {
 	if info.gone {
 		path = "[gone] " + path
 	}
-	if len(path) <= width {
+	if len(path) <= gcRootWidth {
 		return path
 	}
 	const ellipsis = "..."
-	keep := width - len(ellipsis)
-	if keep <= 0 {
-		return path[:backupToRuneBoundary([]byte(path), width)]
-	}
+	keep := gcRootWidth - len(ellipsis)
 	cut := len(path) - keep
 	// Move to the next rune boundary, so the cut never splits a rune. It
 	// keeps at most `keep` bytes.
@@ -313,23 +310,16 @@ func formatRoot(info corpusDisplayInfo, width int) string {
 // paragraph separators), and also tab, which would break the column
 // alignment. A clean string (the usual case) returns with no allocation.
 func sanitizeCell(s string) string {
-	clean := true
-	for _, r := range s {
-		if r == '\t' || stripRune(r) {
-			clean = false
-			break
-		}
-	}
-	if clean {
+	drop := func(r rune) bool { return r == '\t' || stripRune(r) }
+	if !strings.ContainsFunc(s, drop) {
 		return s
 	}
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range s {
-		if r == '\t' || stripRune(r) {
-			continue
+		if !drop(r) {
+			b.WriteRune(r)
 		}
-		b.WriteRune(r)
 	}
 	return b.String()
 }

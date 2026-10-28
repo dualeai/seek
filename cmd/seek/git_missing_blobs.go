@@ -313,17 +313,13 @@ func presentGitBlobs(ctx context.Context, repoDir string, oids []gitObjectID) (m
 	}
 	entries := make([]gitTreeEntry, len(oids))
 	for i, oid := range oids {
-		entries[i] = gitTreeEntry{mode: "100644", oid: oid}
+		entries[i] = gitTreeEntry{oid: oid}
 	}
 	batch, err := startNativeGitBatch(ctx, repoDir)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if !batch.finished {
-			batch.abort(nil)
-		}
-	}()
+	defer batch.abort(nil)
 	for start := 0; start < len(entries); start += gitObjectBatchSize {
 		infos, err := batch.check(entries[start:min(start+gitObjectBatchSize, len(entries))])
 		if err != nil {

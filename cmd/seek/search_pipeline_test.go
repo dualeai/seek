@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math/rand/v2"
+	"path/filepath"
 	"slices"
 	"testing"
 )
@@ -85,7 +86,7 @@ func TestDuplicateCollapseRepresentative(t *testing.T) {
 	head := merged[0]
 	also := make([]string, len(head.also))
 	for index, duplicate := range head.also {
-		also[index] = duplicate.displayPath()
+		also[index] = filepath.Join(duplicate.displayRoot, duplicate.path)
 	}
 	if head.displayPath() != "/a/a.go" || !slices.Equal(also, []string{"/m/a.go", "/z/a.go"}) {
 		t.Fatalf("representative=%s also=%v, want /a/a.go with /m/a.go, /z/a.go", head.displayPath(), head.also)
@@ -103,7 +104,7 @@ func TestAcceptanceIsPerFile(t *testing.T) {
 	// Over 4 tokens above an empty-document score of 3, a noise score of 3.6
 	// lifts (3.6 - 3) / 4 = 0.15, under tau_file 0.25. The relevant score of
 	// 4.04 lifts (4.04 - 3) / 4 = 0.26, above it.
-	const tokens, emptyScore, tauFile = 4, 3, 0.25
+	const tokens, emptyScore = 4, 3
 	verdict := func(poolSize int) bool {
 		scored := make(nodeHits, poolSize)
 		scores := make([]float32, poolSize)
@@ -113,42 +114,34 @@ func TestAcceptanceIsPerFile(t *testing.T) {
 		}
 		scored[poolSize/2] = nodeHit{corpus: "c", path: "relevant.go", semantic: true}
 		scores[poolSize/2] = 4.04
-		accepted, err := acceptFiles(scored, scores, emptyScore, tokens, tauFile, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return slices.ContainsFunc(accepted.hits, func(hit nodeHit) bool { return hit.path == "relevant.go" }) &&
-			len(accepted.hits) == 1
+		accepted := acceptFiles(scored, scores, emptyScore, tokens, nil)
+		return slices.ContainsFunc(accepted, func(hit nodeHit) bool { return hit.path == "relevant.go" }) &&
+			len(accepted) == 1
 	}
 	if !verdict(128) || !verdict(4096) {
 		t.Fatal("the relevant file's verdict depends on the pool size")
 	}
 	strict := nodeHits{{corpus: "c", path: "strict.go", strict: true}}
-	accepted, err := acceptFiles(strict, []float32{0}, emptyScore, tokens, tauFile, nil)
-	if err != nil || len(accepted.hits) != 1 {
-		t.Fatalf("a strict all-word file was not admitted: %+v %v", accepted, err)
+	if accepted := acceptFiles(strict, []float32{0}, emptyScore, tokens, nil); len(accepted) != 1 {
+		t.Fatalf("a strict all-word file was not admitted: %+v", accepted)
 	}
 }
 
-// TestCandidateFilesKeepsNameOnlyOutOfTheModel puts strict, relaxed, semantic
-// and name-only hits through the candidate set. The model scores strict and
-// semantic files with no limit on their count. It does not score a
-// relaxed-only file, which cannot pass tau_file. A name-only file enters only
-// as a strict match and never gets a model score.
+// TestCandidateFilesKeepsNameOnlyOutOfTheModel puts strict, semantic and
+// name-only hits through the candidate set. The model scores strict and
+// semantic files with no limit on their count. A name-only file enters only as
+// a strict match and never gets a model score.
 func TestCandidateFilesKeepsNameOnlyOutOfTheModel(t *testing.T) {
 	hits := nodeHits{
 		{path: "strict.go", strict: true},
-		{path: "relaxed.go", lexical: true},
 		{path: "semantic.go", semantic: true},
 		{path: "strict.bin", strict: true, nameOnly: true},
-		{path: "relaxed.bin", lexical: true, nameOnly: true},
 	}
 	for index := range 300 {
 		hits = append(hits, nodeHit{path: fmt.Sprintf("more%03d.go", index), semantic: true})
 	}
 	scored, nameOnly := candidateFiles(hits)
-	if len(scored) != 302 || len(nameOnly) != 1 || nameOnly[0].path != "strict.bin" ||
-		slices.ContainsFunc(scored, func(hit nodeHit) bool { return hit.path == "relaxed.go" }) {
+	if len(scored) != 302 || len(nameOnly) != 1 || nameOnly[0].path != "strict.bin" {
 		t.Fatalf("scored=%d nameOnly=%+v", len(scored), nameOnly)
 	}
 	if slices.ContainsFunc(scored, func(hit nodeHit) bool { return hit.nameOnly }) {

@@ -31,7 +31,6 @@ func (g *gitNode) prepare(ctx context.Context, plan node, execution searchExecut
 	}
 	return openedNode{
 		plan:       plan,
-		state:      state,
 		indexState: indexState,
 		// The capture's dirty files, also for a stale index. The committed
 		// copy of a file that is dirty now is old text, so it stays hidden.

@@ -685,6 +685,32 @@ func TestChildrenInScopeAddsEachChildOnce(t *testing.T) {
 	}
 }
 
+// TestPlansDropFolderNodesThatAWalkReaches gives the plan step folder nodes
+// below a node at the file-system root "/". The walk of "/" reaches each one,
+// except below its skip directory "/s". A node below "/s" stays, and the node
+// "/s/h" reaches its own file. "/sx.txt" is not below "/s".
+func TestPlansDropFolderNodesThatAWalkReaches(t *testing.T) {
+	x := &graphExpansion{ctx: t.Context(), folders: make(map[corpusID]*node)}
+	for _, root := range []string{"/", "/a", "/a/f.txt", "/s/g.txt", "/s/h", "/s/h/i.txt", "/sx.txt"} {
+		capture := &folderCapture{skipDirs: make(map[string]struct{})}
+		if root == "/" {
+			capture.skipDirs["/s"] = struct{}{}
+		}
+		x.folders[corpusID(root)] = &node{id: corpusID(root), root: root, folder: capture}
+	}
+	plans, err := x.plans()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var roots []string
+	for _, plan := range plans {
+		roots = append(roots, plan.root)
+	}
+	if want := []string{"/", "/s/g.txt", "/s/h"}; !slices.Equal(roots, want) {
+		t.Fatalf("roots=%q, want %q", roots, want)
+	}
+}
+
 // TestValidGitHeadSymlinkAndNewline covers the HEAD forms that Git also
 // accepts: a symbolic link into refs/, and "ref:" with the name on the next
 // line.

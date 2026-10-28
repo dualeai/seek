@@ -77,14 +77,17 @@ func semanticModelCompatibilityFor(model, tokenizer []byte) string {
 	return semanticModelAlgorithmRevision + "-" + hex.EncodeToString(hash.Sum(nil)[:16])
 }
 
+// semanticRepresentationCompatibility names the stored representation in the
+// generation key. The "r0" after the fine count is the number of refinement
+// passes of the fine centroids: Seek stores them as selectCentroids selects
+// them.
 func semanticRepresentationCompatibility() string {
 	return fmt.Sprintf(
-		"%s-c%d-r%d-f%d-r%d-d%d",
+		"%s-c%d-r%d-f%d-r0-d%d",
 		semanticRepresentationRevision,
 		semanticCoarseCentroidsPerUnit,
 		semanticCoarseRefinementPasses,
 		semanticFineCentroidsPerUnit,
-		semanticFineRefinementPasses,
 		semanticEmbeddingDimensions,
 	)
 }
@@ -237,6 +240,9 @@ func prepareSemanticGenerationDirectory(dir string) error {
 	return nil
 }
 
+// writeSemanticGenerationFromParts writes rows.bin and the manifest of a
+// generation whose vector files and graph shards are in dir. The build made
+// dir (prepareSemanticGenerationDirectory) before it wrote those files.
 func writeSemanticGenerationFromParts(
 	ctx context.Context,
 	dir string,
@@ -247,47 +253,44 @@ func writeSemanticGenerationFromParts(
 	coarseArtifact semanticSizedArtifact,
 	usearchShardRows uint64,
 	usearchShards []semanticUSearchShard,
-) (semanticManifest, error) {
+) error {
 	if source == "" {
-		return semanticManifest{}, fmt.Errorf("semantic generation identity is missing")
+		return fmt.Errorf("semantic generation identity is missing")
 	}
 	if err := ctx.Err(); err != nil {
-		return semanticManifest{}, err
+		return err
 	}
 	wantVectorBytes, sizeOK := checkedSemanticVectorBytes(uint64(len(units)))
 	if !sizeOK {
-		return semanticManifest{}, fmt.Errorf("semantic vector size is invalid")
+		return fmt.Errorf("semantic vector size is invalid")
 	}
 	if vectorsArtifact.Bytes != wantVectorBytes {
-		return semanticManifest{}, fmt.Errorf("semantic vector artifact has %d bytes, want %d", vectorsArtifact.Bytes, wantVectorBytes)
+		return fmt.Errorf("semantic vector artifact has %d bytes, want %d", vectorsArtifact.Bytes, wantVectorBytes)
 	}
 	if wantCoarse, ok := checkedSemanticCoarseBytes(uint64(len(units))); !ok || coarseArtifact.Bytes != wantCoarse {
-		return semanticManifest{}, fmt.Errorf("semantic coarse artifact has %d bytes, want %d", coarseArtifact.Bytes, wantCoarse)
+		return fmt.Errorf("semantic coarse artifact has %d bytes, want %d", coarseArtifact.Bytes, wantCoarse)
 	}
 	usearchCompatibility, err := semanticUSearchCompatibility()
 	if err != nil {
-		return semanticManifest{}, err
-	}
-	if err := prepareSemanticGenerationDirectory(dir); err != nil {
-		return semanticManifest{}, err
+		return err
 	}
 	// The shard build hashed each shard when it saved it. The lazy check at
 	// first use hashes a shard again only if its file changed.
 	if err := validateSemanticUSearchShardMetadata(
 		uint64(len(units)), usearchShardRows, usearchShards, semanticSourceHasGraph(source),
 	); err != nil {
-		return semanticManifest{}, err
+		return err
 	}
 	rowsArtifact, err := writeSemanticRows(filepath.Join(dir, semanticRowsFile), units)
 	if err != nil {
-		return semanticManifest{}, fmt.Errorf("write semantic generation: %w", err)
+		return fmt.Errorf("write semantic generation: %w", err)
 	}
 	rowsInfo, err := os.Lstat(filepath.Join(dir, semanticRowsFile))
 	if err != nil {
-		return semanticManifest{}, fmt.Errorf("write semantic generation: %w", err)
+		return fmt.Errorf("write semantic generation: %w", err)
 	}
 
-	manifest := semanticManifest{
+	return writeSemanticManifest(filepath.Join(dir, semanticManifestFile), semanticManifest{
 		Format:           semanticFormatVersion,
 		Source:           source,
 		Model:            semanticModelCompatibility(),
@@ -306,11 +309,7 @@ func writeSemanticGenerationFromParts(
 		USearchShardRows: usearchShardRows,
 		USearchFiles:     usearchShards,
 		ModelPathBase:    modelPathBase,
-	}
-	if err := writeSemanticManifest(filepath.Join(dir, semanticManifestFile), manifest); err != nil {
-		return semanticManifest{}, err
-	}
-	return manifest, nil
+	})
 }
 
 // writeSemanticRows writes the rows file. It starts with the magic and a
@@ -449,16 +448,11 @@ func openSemanticGenerationWithOptions(
 	if err != nil {
 		return nil, fmt.Errorf("validate %s: %w", semanticRowsFile, err)
 	}
-	vectorsFile, err := openRegularSemanticFile(filepath.Join(dir, semanticVectorsFile))
+	vectors, vectorMap, err := mapSemanticRows[semanticFineF16Vectors](filepath.Join(dir, semanticVectorsFile), manifest.Rows)
 	if err != nil {
 		return nil, fmt.Errorf("validate %s: %w", semanticVectorsFile, err)
 	}
-	defer func() { _ = vectorsFile.Close() }()
-	vectors, vectorMap, err := mapSemanticVectors(vectorsFile, manifest.Rows)
-	if err != nil {
-		return nil, err
-	}
-	coarse, coarseMap, err := mapSemanticCoarse(filepath.Join(dir, semanticCoarseFile), manifest.Rows)
+	coarse, coarseMap, err := mapSemanticRows[semanticCoarseSNORM16Vectors](filepath.Join(dir, semanticCoarseFile), manifest.Rows)
 	if err != nil {
 		_ = unix.Munmap(vectorMap)
 		return nil, fmt.Errorf("validate %s: %w", semanticCoarseFile, err)
@@ -479,14 +473,10 @@ func openSemanticGenerationWithOptions(
 	}, nil
 }
 
+// validateUSearchShard checks the graph shard at index once. The open makes a
+// path and a check state for each shard of the manifest, and the search plan
+// gives only the index of a manifest shard.
 func (generation *semanticGeneration) validateUSearchShard(index int) error {
-	if generation == nil || index < 0 || index >= len(generation.usearch) ||
-		index >= len(generation.manifest.USearchFiles) {
-		return fmt.Errorf("USearch semantic shard %d is unavailable", index)
-	}
-	if len(generation.usearchValidation) != len(generation.usearch) {
-		return fmt.Errorf("USearch semantic validation state is invalid")
-	}
 	validation := &generation.usearchValidation[index]
 	validation.once.Do(func() {
 		shard := generation.manifest.USearchFiles[index]
@@ -678,10 +668,7 @@ func validateSemanticManifest(manifest semanticManifest, source string) error {
 		!rowsOK || manifest.RowsFile.Bytes < minimumRowsBytes {
 		return fmt.Errorf("semantic generation has invalid lengths")
 	}
-	if _, err := decodeSemanticDigest(manifest.RowsFile.SHA256); err != nil {
-		return err
-	}
-	return nil
+	return validateSemanticDigest(manifest.RowsFile.SHA256)
 }
 
 func checkedSemanticRowsMinimumBytes(rows uint64) (uint64, bool) {
@@ -720,10 +707,10 @@ func validateSemanticUSearchShardMetadata(rows, shardRows uint64, shards []seman
 			shard.Rows == 0 || shard.Rows > rows-next || shard.Rows > shardRows || shard.Bytes == 0 {
 			return fmt.Errorf("USearch shard %d metadata is invalid", index)
 		}
-		if _, err := decodeSemanticDigest(shard.SHA256); err != nil {
+		if err := validateSemanticDigest(shard.SHA256); err != nil {
 			return err
 		}
-		if _, err := decodeSemanticDigest(shard.ID); err != nil {
+		if err := validateSemanticDigest(shard.ID); err != nil {
 			return fmt.Errorf("USearch shard %d has an invalid ID", index)
 		}
 		next += shard.Rows
@@ -742,30 +729,6 @@ func checkedSemanticCoarseBytes(rows uint64) (uint64, bool) {
 	return rows * rowBytes, true
 }
 
-// mapSemanticCoarse maps the coarse vectors of every row, as
-// mapSemanticVectors maps the fine ones.
-func mapSemanticCoarse(path string, count uint64) ([]semanticCoarseSNORM16Vectors, []byte, error) {
-	file, err := openRegularSemanticFile(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer func() { _ = file.Close() }()
-	wantBytes, ok := checkedSemanticCoarseBytes(count)
-	info, err := file.Stat()
-	if !ok || err != nil || uint64(info.Size()) != wantBytes {
-		return nil, nil, fmt.Errorf("semantic coarse file length mismatch")
-	}
-	if count == 0 {
-		return nil, nil, nil
-	}
-	mapped, err := unix.Mmap(int(file.Fd()), 0, int(wantBytes), unix.PROT_READ, unix.MAP_PRIVATE)
-	if err != nil {
-		return nil, nil, fmt.Errorf("map semantic coarse vectors: %w", err)
-	}
-	coarse := unsafe.Slice((*semanticCoarseSNORM16Vectors)(unsafe.Pointer(&mapped[0])), int(count))
-	return coarse, mapped, nil
-}
-
 func checkedSemanticVectorBytes(rows uint64) (uint64, bool) {
 	const rowBytes = semanticFineVectorBytesPerUnit
 	if rows > math.MaxUint64/rowBytes {
@@ -774,12 +737,12 @@ func checkedSemanticVectorBytes(rows uint64) (uint64, bool) {
 	return rows * rowBytes, true
 }
 
-func decodeSemanticDigest(value string) ([]byte, error) {
-	digest, err := hex.DecodeString(value)
-	if err != nil || len(digest) != sha256.Size {
-		return nil, fmt.Errorf("semantic artifact has an invalid SHA-256")
+// validateSemanticDigest checks that value is a hex SHA-256 digest.
+func validateSemanticDigest(value string) error {
+	if digest, err := hex.DecodeString(value); err != nil || len(digest) != sha256.Size {
+		return fmt.Errorf("semantic artifact has an invalid SHA-256")
 	}
-	return digest, nil
+	return nil
 }
 
 func openRegularSemanticFile(path string) (*os.File, error) {
@@ -987,39 +950,30 @@ func internSemanticRowLanguage(interned map[string]string, raw []byte) string {
 	return value
 }
 
-// mapSemanticVectors checks the exact payload length and maps its bytes
-// directly as binary16 rows. This view needs a little-endian target. It does
-// not check the component codes; exactSemanticRange checks each vector before
-// it scores it.
-func mapSemanticVectors(file *os.File, count uint64) ([]semanticFineF16Vectors, []byte, error) {
-	wantBytes, ok := checkedSemanticVectorBytes(count)
-	if !ok {
-		return nil, nil, fmt.Errorf("semantic vector length overflows")
+// mapSemanticRows checks that the file at path holds exactly count rows of T
+// and maps its bytes as those rows. The view needs a little-endian target, as
+// every supported build target is. It does not check the codes. The exact
+// scorer (exactSemanticRange) and a copy (semanticRowVectorsValid) check each
+// vector before they use it.
+func mapSemanticRows[T any](path string, count uint64) ([]T, []byte, error) {
+	file, err := openRegularSemanticFile(path)
+	if err != nil {
+		return nil, nil, err
 	}
+	defer func() { _ = file.Close() }()
+	rowBytes := uint64(unsafe.Sizeof(*new(T)))
 	info, err := file.Stat()
-	if err != nil || uint64(info.Size()) != wantBytes {
-		return nil, nil, fmt.Errorf("semantic vector file length mismatch")
+	if err != nil || count > math.MaxUint64/rowBytes || uint64(info.Size()) != count*rowBytes {
+		return nil, nil, fmt.Errorf("semantic artifact length mismatch")
 	}
 	if count == 0 {
 		return nil, nil, nil
 	}
-	mapped, err := unix.Mmap(
-		int(file.Fd()),
-		0,
-		int(wantBytes),
-		unix.PROT_READ,
-		unix.MAP_PRIVATE,
-	)
+	mapped, err := unix.Mmap(int(file.Fd()), 0, int(count*rowBytes), unix.PROT_READ, unix.MAP_PRIVATE)
 	if err != nil {
-		return nil, nil, fmt.Errorf("map semantic vectors: %w", err)
+		return nil, nil, fmt.Errorf("map semantic artifact: %w", err)
 	}
-	byteOrder := uint16(1)
-	if *(*byte)(unsafe.Pointer(&byteOrder)) != 1 {
-		_ = unix.Munmap(mapped)
-		return nil, nil, fmt.Errorf("semantic vector codec needs a little-endian target")
-	}
-	vectors := unsafe.Slice((*semanticFineF16Vectors)(unsafe.Pointer(&mapped[0])), int(count))
-	return vectors, mapped, nil
+	return unsafe.Slice((*T)(unsafe.Pointer(&mapped[0])), int(count)), mapped, nil
 }
 
 type semanticHit struct {

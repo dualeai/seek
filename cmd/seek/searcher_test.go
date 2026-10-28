@@ -121,8 +121,8 @@ func TestCloneFileMatchesCopiesContextOnlyForPossibleDisplayedFiles(t *testing.T
 	}
 
 	plan := node{id: corpusID("repo"), kind: corpusKindGit}
-	want := formatCorpusResultsWithContext(wrapCorpusResults(plan, full), 2, 0, hideCorpusContext, plainPalette)
-	got := formatCorpusResultsWithContext(wrapCorpusResults(plan, selected), 2, 0, hideCorpusContext, plainPalette)
+	want := formatCorpusResultsWithContext(withHeaders(wrapCorpusResults(plan, full)), 2, 0, hideCorpusContext, plainPalette)
+	got := formatCorpusResultsWithContext(withHeaders(wrapCorpusResults(plan, selected)), 2, 0, hideCorpusContext, plainPalette)
 	if got != want {
 		t.Fatalf("selective context changed output:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
@@ -178,8 +178,8 @@ func TestPerCorpusContextLimitPreservesGlobalTopFiles(t *testing.T) {
 		wrapCorpusResults(planA, cloneFileMatches(filesA, defaultSearchConfig())),
 		wrapCorpusResults(planB, cloneFileMatches(filesB, defaultSearchConfig()))...,
 	)
-	want := formatCorpusResultsWithContext(full, 2, 0, showCorpusContext, plainPalette)
-	got := formatCorpusResultsWithContext(selective, 2, 0, showCorpusContext, plainPalette)
+	want := formatCorpusResultsWithContext(withHeaders(full), 2, 0, showCorpusContext, plainPalette)
+	got := formatCorpusResultsWithContext(withHeaders(selective), 2, 0, showCorpusContext, plainPalette)
 	if got != want {
 		t.Fatalf("per-corpus context selection changed global output:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
@@ -350,10 +350,10 @@ func TestSearchPlannedCorpusParsed_ContextFileSelectionAfterShardMerge(t *testin
 			}
 
 			want := formatCorpusResultsWithContext(
-				wrapCorpusResults(plan, full), 1, 0, hideCorpusContext, plainPalette,
+				withHeaders(wrapCorpusResults(plan, full)), 1, 0, hideCorpusContext, plainPalette,
 			)
 			got := formatCorpusResultsWithContext(
-				wrapCorpusResults(plan, selected), 1, 0, hideCorpusContext, plainPalette,
+				withHeaders(wrapCorpusResults(plan, selected)), 1, 0, hideCorpusContext, plainPalette,
 			)
 			if got != want {
 				t.Fatalf("selective context changed merged-shard output:\n--- got ---\n%s\n--- want ---\n%s", got, want)
@@ -568,9 +568,7 @@ func TestDeltaBuilderWithNullShardMetadataIsNoCrash(t *testing.T) {
 // build fails as index damage, and the process keeps running.
 func TestFullBuildLaterWindowWithNullRecordIsNoCrash(t *testing.T) {
 	requireTools(t)
-	oldShardMax := shardMax
-	shardMax = 1024
-	t.Cleanup(func() { shardMax = oldShardMax })
+	swapForTest(t, &shardMax, 1024)
 	indexDir := t.TempDir()
 	source := t.TempDir()
 	files := make(chan fileContent)

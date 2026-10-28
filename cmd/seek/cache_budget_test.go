@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -15,6 +14,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // TestCacheBudgetNeverLeavesLessThanFloor checks the default budget formula:
@@ -403,11 +404,11 @@ func TestCacheBudgetCountsColdVectorBytes(t *testing.T) {
 			if err != nil || len(plans) != 1 {
 				t.Fatalf("plans=%d err=%v", len(plans), err)
 			}
-			lexical, _, err := plannedNodeBytes(t.Context(), plans[0], false, false)
+			lexical, _, err := plans[0].behavior.estimate(t.Context(), plans[0], false, false)
 			if err != nil || lexical != row.lexical {
 				t.Fatalf("lexical estimate %d (err=%v), want %d", lexical, err, row.lexical)
 			}
-			vectors, rebuild, err := plannedNodeBytes(t.Context(), plans[0], true, false)
+			vectors, rebuild, err := plans[0].behavior.estimate(t.Context(), plans[0], true, false)
 			if err != nil || !rebuild || vectors != row.vectors {
 				t.Fatalf("estimate with vectors %d (rebuild=%t err=%v), want %d", vectors, rebuild, err, row.vectors)
 			}
@@ -907,10 +908,8 @@ func TestDirtyReadErrorKeepsTheLiveFamily(t *testing.T) {
 		t.Fatalf("the next search misses the change:\n%s", output)
 	}
 	_, scorer, err := stubSearch(t, payloadAccept, "zqlive alpha beta", ".")
-	scorer.mu.Lock()
-	defer scorer.mu.Unlock()
-	if err != nil || !slices.Contains(scorer.embeddedPaths, "b.txt") {
-		t.Fatalf("the next description embedded %v, want the change of b.txt (err=%v)", scorer.embeddedPaths, err)
+	if err != nil || !slices.Contains(scorer.unitPaths(), "b.txt") {
+		t.Fatalf("the next description embedded %v, want the change of b.txt (err=%v)", scorer.unitPaths(), err)
 	}
 }
 
@@ -973,11 +972,11 @@ func TestDirtyLstatErrorKeepsTheName(t *testing.T) {
 	setTestUserCache(t)
 	t.Chdir(repo)
 	realLstat := dirtyLstat
-	dirtyLstat = func(path string) (os.FileInfo, error) {
+	dirtyLstat = func(path string, st *unix.Stat_t) error {
 		if filepath.Base(path) == "b.txt" {
-			return nil, &os.PathError{Op: "lstat", Path: path, Err: syscall.EIO}
+			return &os.PathError{Op: "lstat", Path: path, Err: syscall.EIO}
 		}
-		return realLstat(path)
+		return realLstat(path, st)
 	}
 	out, headers := searchHeaders(t, "zqlstat", ".")
 	dirtyLstat = realLstat
@@ -1143,7 +1142,7 @@ func TestCacheBudgetEstimatesAnOrphanBranch(t *testing.T) {
 		t.Fatalf("plans=%d err=%v", len(plans), err)
 	}
 	for _, vectors := range []bool{false, true} {
-		if _, rebuild, err := plannedNodeBytes(t.Context(), plans[0], vectors, false); err != nil || !rebuild {
+		if _, rebuild, err := plans[0].behavior.estimate(t.Context(), plans[0], vectors, false); err != nil || !rebuild {
 			t.Fatalf("vectors=%t: rebuild=%t err=%v, want a rebuild with no error", vectors, rebuild, err)
 		}
 	}
@@ -1167,7 +1166,7 @@ func TestCacheBudgetCountsOnlyVectorsForACurrentTextIndex(t *testing.T) {
 	if err != nil || len(plans) != 1 {
 		t.Fatalf("plans=%d err=%v", len(plans), err)
 	}
-	bytes, rebuild, err := plannedNodeBytes(t.Context(), plans[0], true, false)
+	bytes, rebuild, err := plans[0].behavior.estimate(t.Context(), plans[0], true, false)
 	if err != nil || !rebuild {
 		t.Fatalf("rebuild=%t err=%v", rebuild, err)
 	}
@@ -1210,7 +1209,7 @@ func TestCacheBudgetCountsVectorsBehindTheTextIndex(t *testing.T) {
 			if err != nil || len(plans) != 1 {
 				t.Fatalf("plans=%d err=%v", len(plans), err)
 			}
-			bytes, rebuild, err := plannedNodeBytes(t.Context(), plans[0], true, false)
+			bytes, rebuild, err := plans[0].behavior.estimate(t.Context(), plans[0], true, false)
 			if err != nil || !rebuild {
 				t.Fatalf("rebuild=%t err=%v", rebuild, err)
 			}
@@ -1249,7 +1248,7 @@ func TestCacheBudgetCountsTheChangedFilesOfABoundFolder(t *testing.T) {
 	if err != nil || len(plans) != 1 {
 		t.Fatalf("plans=%d err=%v", len(plans), err)
 	}
-	bytes, rebuild, err := plannedNodeBytes(t.Context(), plans[0], true, false)
+	bytes, rebuild, err := plans[0].behavior.estimate(t.Context(), plans[0], true, false)
 	if err != nil || !rebuild {
 		t.Fatalf("rebuild=%t err=%v", rebuild, err)
 	}
@@ -1283,7 +1282,7 @@ func TestCacheBudgetCountsACommitAfterTheVectors(t *testing.T) {
 	if err != nil || len(plans) != 1 {
 		t.Fatalf("plans=%d err=%v", len(plans), err)
 	}
-	bytes, rebuild, err := plannedNodeBytes(t.Context(), plans[0], true, false)
+	bytes, rebuild, err := plans[0].behavior.estimate(t.Context(), plans[0], true, false)
 	if err != nil || !rebuild {
 		t.Fatalf("rebuild=%t err=%v", rebuild, err)
 	}
@@ -1295,22 +1294,12 @@ func TestCacheBudgetCountsACommitAfterTheVectors(t *testing.T) {
 	}
 	// The vectors hold the text index's commit, so the estimate reuses the
 	// text figure: one git diff-tree for the commit range.
-	realGit, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
-	shimDir := t.TempDir()
-	calls := filepath.Join(shimDir, "calls")
-	shim := "#!/bin/sh\n" + gitShimSubcommand + `echo "$subcommand" >> "$SEEK_TEST_GIT_CALLS"
+	calls := filepath.Join(t.TempDir(), "calls")
+	installGitShim(t, `echo "$subcommand" >> "$SEEK_TEST_GIT_CALLS"
 exec "$SEEK_TEST_REAL_GIT" "$@"
-`
-	if err := os.WriteFile(filepath.Join(shimDir, "git"), []byte(shim), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("SEEK_TEST_REAL_GIT", realGit)
+`)
 	t.Setenv("SEEK_TEST_GIT_CALLS", calls)
-	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	if _, _, err := plannedNodeBytes(t.Context(), plans[0], true, false); err != nil {
+	if _, _, err := plans[0].behavior.estimate(t.Context(), plans[0], true, false); err != nil {
 		t.Fatal(err)
 	}
 	logged, _ := os.ReadFile(calls)

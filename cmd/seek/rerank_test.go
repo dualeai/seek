@@ -19,7 +19,7 @@ import (
 // the whole text, the plan keeps no filter, and relaxed retrieval is an or of
 // the three words as content atoms.
 func TestPlanRerankQuery(t *testing.T) {
-	raw, _, err := parseSearchQueryForms("Handle shell completion")
+	raw, _, _, err := parseQueryHalves("Handle shell completion")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestPlanRerankQueryAcceptsPlainProgrammingName(t *testing.T) {
 		"find std::vector handling in C++ code",
 	} {
 		t.Run(pattern, func(t *testing.T) {
-			raw, _, err := parseSearchQueryForms(pattern)
+			raw, _, _, err := parseQueryHalves(pattern)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -135,7 +135,7 @@ func TestPlanRerankQueryAcceptsFileAndLanguageFilters(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			qp, err := planQuery(test.pattern, defaultSearchPolicy())
+			qp, err := planQuery(test.pattern, semanticSearch)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -186,7 +186,7 @@ func TestPlanRerankQueryUsesZoektNormalizedTree(t *testing.T) {
 		"(alpha beta) file:go",
 	} {
 		t.Run(pattern, func(t *testing.T) {
-			raw, _, err := parseSearchQueryForms(pattern)
+			raw, _, _, err := parseQueryHalves(pattern)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -208,7 +208,7 @@ func TestPlainDescriptionFallbackRejectsMalformedSyntax(t *testing.T) {
 		"find C++ foo**",
 	} {
 		t.Run(pattern, func(t *testing.T) {
-			if _, _, err := parseSearchQueryForms(pattern); err == nil {
+			if _, _, _, err := parseQueryHalves(pattern); err == nil {
 				t.Fatal("malformed explicit syntax must stay an error")
 			}
 		})
@@ -227,7 +227,7 @@ func TestPlanRerankQueryRejectsSyntax(t *testing.T) {
 	}
 	for _, pattern := range tests {
 		t.Run(pattern, func(t *testing.T) {
-			raw, _, err := parseSearchQueryForms(pattern)
+			raw, _, _, err := parseQueryHalves(pattern)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -354,10 +354,10 @@ func TestRunRerankAcceptanceWithoutStrictResults(t *testing.T) {
 	beta := t.TempDir()
 	writeFileAt(t, alpha, "alpha.go", "package sample\n// alpha only\n")
 	writeFileAt(t, beta, "beta.go", "package sample\n// beta only\n")
-	scorer := &hybridTestScorer{embedErr: errRerankUnavailable}
-	output, err := seekWith(t, modelFactory(scorer), "alpha beta", alpha, beta)
-	if !errors.Is(err, errNoMatch) || output != "" || scorer.scoreCalls.Load() != 0 {
-		t.Fatalf("output=%q err=%v model calls=%d, want no match and no model call", output, err, scorer.scoreCalls.Load())
+	scorer := observeModel(&hybridTestScorer{embedErr: errRerankUnavailable})
+	output, err := seekWith(t, scorer.factory(), "alpha beta", alpha, beta)
+	if !errors.Is(err, errNoMatch) || output != "" || scorer.scores.Load() != 0 {
+		t.Fatalf("output=%q err=%v model calls=%d, want no match and no model call", output, err, scorer.scores.Load())
 	}
 }
 
@@ -373,13 +373,13 @@ func TestRunRerankStrictEvidenceContract(t *testing.T) {
 	relaxed := t.TempDir()
 	writeFileAt(t, strict, "strict.go", "package sample\n// alpha beta\n")
 	writeFileAt(t, relaxed, "relaxed.go", "package sample\n// alpha only\n")
-	scorer := &hybridTestScorer{embedErr: errRerankUnavailable}
-	output, err := seekWith(t, modelFactory(scorer), "alpha beta", strict, relaxed)
+	scorer := observeModel(&hybridTestScorer{embedErr: errRerankUnavailable})
+	output, err := seekWith(t, scorer.factory(), "alpha beta", strict, relaxed)
 	if err != nil || !strings.Contains(output, "strict.go") || strings.Contains(output, "relaxed.go") {
 		t.Fatalf("output=%q err=%v, want strict.go only", output, err)
 	}
-	if scorer.scoreCalls.Load() != 1 || len(scorer.documents) != 1 {
-		t.Fatalf("model calls=%d documents=%d, want one call with the strict file", scorer.scoreCalls.Load(), len(scorer.documents))
+	if scorer.scores.Load() != 1 || len(scorer.documents()) != 1 {
+		t.Fatalf("model calls=%d documents=%d, want one call with the strict file", scorer.scores.Load(), len(scorer.documents()))
 	}
 }
 
@@ -667,8 +667,8 @@ func TestRunRerankWithDirtyFilesAcrossCorpora(t *testing.T) {
 	writeFileAt(t, repoOne, "untracked.go", "package sample\n// alpha beta untracked\n")
 	repoTwo := initGitRepo(t, "same.go", "package sample\n// alpha beta second repository\n")
 
-	scorer := &hybridTestScorer{embedErr: errRerankUnavailable}
-	output, err := seekWith(t, modelFactory(scorer), "alpha beta", repoOne, repoTwo)
+	scorer := observeModel(&hybridTestScorer{embedErr: errRerankUnavailable})
+	output, err := seekWith(t, scorer.factory(), "alpha beta", repoOne, repoTwo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -687,12 +687,7 @@ func TestRunRerankWithDirtyFilesAcrossCorpora(t *testing.T) {
 	if strings.Contains(output, "alpha beta committed") || strings.Contains(output, filepath.Join(repoOne, "same.go")) {
 		t.Fatalf("output shows the stale or relaxed-only same.go of repo one:\n%s", output)
 	}
-	paths := make([]string, 0, len(scorer.documents))
-	for _, document := range scorer.documents {
-		paths = append(paths, document.Path)
-	}
-	slices.Sort(paths)
-	if !slices.Equal(paths, []string{"same.go", "untracked.go"}) {
+	if paths := documentPaths(scorer.documents()); !slices.Equal(paths, []string{"same.go", "untracked.go"}) {
 		t.Fatalf("model documents=%v, want the two strict files", paths)
 	}
 }
@@ -718,8 +713,8 @@ func TestRunRerankModelContextStaysOutOfDisplay(t *testing.T) {
 	}, "\n"))
 	writeFileAt(t, folder, "relaxed.go", "package sample\n// alpha only\n")
 
-	scorer := &hybridTestScorer{embedErr: errRerankUnavailable}
-	output, err := seekWith(t, modelFactory(scorer), "-C", "0", "alpha beta", folder)
+	scorer := observeModel(&hybridTestScorer{embedErr: errRerankUnavailable})
+	output, err := seekWith(t, scorer.factory(), "-C", "0", "alpha beta", folder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -727,7 +722,7 @@ func TestRunRerankModelContextStaysOutOfDisplay(t *testing.T) {
 		t.Fatalf("internal model context reached output:\n%s", output)
 	}
 	modelSawContext := false
-	for _, document := range scorer.documents {
+	for _, document := range scorer.documents() {
 		if document.Path == "target.go" &&
 			strings.Contains(document.Text, "hidden before three") &&
 			strings.Contains(document.Text, "hidden after three") {
@@ -735,7 +730,7 @@ func TestRunRerankModelContextStaysOutOfDisplay(t *testing.T) {
 		}
 	}
 	if !modelSawContext {
-		t.Fatalf("model did not receive fixed context: %+v", scorer.documents)
+		t.Fatalf("model did not receive fixed context: %+v", scorer.documents())
 	}
 }
 

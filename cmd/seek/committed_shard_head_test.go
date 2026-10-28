@@ -15,9 +15,9 @@ func TestCommittedShardHead_ReportsThePublishedCommit(t *testing.T) {
 
 	dir := initGitRepo(t, "app.go", "package main\n// SHARDHEAD_MARKER\n")
 	ctx := context.Background()
-	paths, plan := planGitTestCorpus(t, dir)
+	_, plan := planGitTestCorpus(t, dir)
 
-	if files, err := runSeekInPlannedGitCorpus(ctx, "SHARDHEAD_MARKER", paths, plan); err != nil || len(files) == 0 {
+	if files, err := runSeekInPlannedGitCorpus(ctx, "SHARDHEAD_MARKER", plan); err != nil || len(files) == 0 {
 		t.Fatalf("initial build: files=%v err=%v", files, err)
 	}
 
@@ -45,7 +45,7 @@ func TestCommittedShardHead_ReportsThePublishedCommit(t *testing.T) {
 	gitRunIn(t, dir, "add", ".")
 	gitRunIn(t, dir, "commit", "-m", "second")
 
-	if files, err := runSeekInPlannedGitCorpus(ctx, "SHARDHEAD_MARKER", paths, plan); err != nil || len(files) == 0 {
+	if files, err := runSeekInPlannedGitCorpus(ctx, "SHARDHEAD_MARKER", plan); err != nil || len(files) == 0 {
 		t.Fatalf("rebuild after second commit: files=%v err=%v", files, err)
 	}
 	moved := mustGitRepoStateIn(t, ctx, dir)
@@ -100,8 +100,8 @@ func TestCommittedShardHead_UnknownWithoutACommittedShard(t *testing.T) {
 	requireTools(t)
 	repo := initGitRepo(t, "app.go", "package main\n// DAMAGED_SHARD_MARKER\n")
 	ctx := context.Background()
-	paths, plan := planGitTestCorpus(t, repo)
-	if files, err := runSeekInPlannedGitCorpus(ctx, "DAMAGED_SHARD_MARKER", paths, plan); err != nil || len(files) == 0 {
+	_, plan := planGitTestCorpus(t, repo)
+	if files, err := runSeekInPlannedGitCorpus(ctx, "DAMAGED_SHARD_MARKER", plan); err != nil || len(files) == 0 {
 		t.Fatalf("build: files=%v err=%v", files, err)
 	}
 	built, err := scanFamily(plan.indexDir)

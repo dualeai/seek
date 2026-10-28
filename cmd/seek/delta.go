@@ -85,6 +85,29 @@ const unreadFileMarker int64 = -1
 // document kept by name only (notIndexedMarkerBytes).
 var maxNotIndexedMarkerBytes = notIndexedMarkerBytes(index.SkipReasonTooLarge)
 
+// shardHeldBytes is the content bytes that the shard document of a file of size
+// bytes holds. A file kept by name only holds its NOT-INDEXED marker: a file
+// with a marker, a file of which Seek has no bytes (noBytes), or a file too
+// large for the index. Any other file holds its size. marker is the marker
+// bytes that a read found (nameOnlyMarkerBytes), zero when the shard holds the
+// content, or unreadFileMarker. An unread file counts at the larger of that
+// value and the largest marker (maxNotIndexedMarkerBytes).
+func shardHeldBytes(marker, size int64, noBytes bool) int64 {
+	held := size
+	switch {
+	case marker > 0:
+		held = marker
+	case noBytes:
+		held = notIndexedMarkerBytes(seekNoBytesReason)
+	case !documentContentFits(size):
+		held = notIndexedMarkerBytes(index.SkipReasonTooLarge)
+	}
+	if marker == unreadFileMarker {
+		return max(held, maxNotIndexedMarkerBytes)
+	}
+	return held
+}
+
 // nameOnlyMarkerBytes returns the bytes of the marker that the shard document
 // of doc holds in place of its content. It returns zero when the shard holds
 // the content. The skip reason comes from the reader, or from Zoekt's own

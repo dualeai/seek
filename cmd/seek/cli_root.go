@@ -34,11 +34,9 @@ type cliFlags struct {
 // suggestFlagError adds the did-you-mean hint (`--verbos` gives "did you mean
 // --verbose?").
 //
-// `seek gc` takes only flags, so when args[0] is "gc" nothing is spliced.
+// The scan stops at a subcommand name such as "gc", so the flags of a
+// subcommand get no `--`.
 func splicePassthroughSeparator(args []string, flags *pflag.FlagSet) []string {
-	if len(args) == 0 || args[0] == "gc" {
-		return args
-	}
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--" {
@@ -87,7 +85,7 @@ func lookupExactFlag(flags *pflag.FlagSet, token string) *pflag.Flag {
 // and the search RunE callback. A search that gives the model text loads its
 // model with newModel. Subcommands attach via AddCommand.
 func newRootCmd(newModel semanticModelFactory) *cobra.Command {
-	flags := &cliFlags{search: defaultSearchConfig()}
+	flags := &cliFlags{}
 	cmd := &cobra.Command{
 		Use:   "seek [flags] <query> [path...]",
 		Short: "Ranked local code search with exact and descriptive queries",
@@ -117,10 +115,11 @@ the meaning-based index and all model work.`,
 			// encoder would report it as one more reason to keep lexical
 			// search, and the fallback path shows that only with --verbose.
 			//
-			// Only commands that can use the model check it. `gc`, `completion`
-			// and a --lexical-only search do not read the setting, so a typo in
-			// it must not stop them.
-			if flags.lexicalOnly || !commandUsesSemanticModel(cmd) {
+			// Only the root search command can use the model; every
+			// subcommand is management or output. `gc`, `completion` and a
+			// --lexical-only search do not read the setting, so a typo in it
+			// must not stop them.
+			if flags.lexicalOnly || cmd.HasParent() {
 				return nil
 			}
 			_, err := lateOnForcedProvider()
@@ -139,9 +138,9 @@ the meaning-based index and all model work.`,
 			return selectSearchConfig(cmd, flags)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			policy := defaultSearchPolicy()
+			policy := semanticSearch
 			if flags.lexicalOnly {
-				policy = lexicalOnlySearchPolicy()
+				policy = lexicalOnlySearch
 			}
 			return runSearchCommand(
 				cmd.Context(),
@@ -174,25 +173,21 @@ the meaning-based index and all model work.`,
 	// newRootCmd has returned.
 	cmd.InitDefaultHelpFlag()
 	cmd.InitDefaultVersionFlag()
-	if f := cmd.Flags().Lookup("version"); f != nil {
-		f.Usage = "print version and exit"
-	}
-	if f := cmd.Flags().Lookup("help"); f != nil {
-		f.Usage = "print this help and exit"
-	}
+	cmd.Flags().Lookup("version").Usage = "print version and exit"
+	cmd.Flags().Lookup("help").Usage = "print this help and exit"
 
+	// A subcommand with no function of its own uses the function of its
+	// parent, so this one covers `seek gc` too.
 	cmd.SetFlagErrorFunc(suggestFlagError)
-	gc := newGCCmd()
-	gc.SetFlagErrorFunc(suggestFlagError)
-	cmd.AddCommand(gc)
+	cmd.AddCommand(newGCCmd())
 	return cmd
 }
 
-// newSearchRunConfig returns the run config of policy. Only a policy with
-// semantic search gets the model factory newModel.
+// newSearchRunConfig returns the run config of policy. Only the semanticSearch
+// policy gets the model factory newModel.
 func newSearchRunConfig(policy searchPolicy, newModel semanticModelFactory) searchRunConfig {
 	config := searchRunConfig{policy: policy}
-	if policy.semanticEnabled() {
+	if policy == semanticSearch {
 		config.newModel = newModel
 	}
 	return config
@@ -238,39 +233,23 @@ func rootArgsValidator(_ *cobra.Command, args []string) error {
 // suggestFlagError adds a did-you-mean hint, by Levenshtein distance, to the
 // error of an unknown flag. Cobra suggests only command names and pflag
 // suggests nothing, so this hook puts the hint in the error message that the
-// CLI prints.
+// CLI prints. Cobra calls it with a parse error only. By then the flag set of
+// cmd also holds the persistent flags of its parents, so `seek gc --verbos`
+// gets "did you mean --verbose?".
 func suggestFlagError(cmd *cobra.Command, err error) error {
-	if err == nil {
-		return nil
-	}
 	notExistErr, ok := errors.AsType[*pflag.NotExistError](err)
 	if !ok {
 		return err
 	}
-	bad := notExistErr.GetSpecifiedName()
-	if bad == "" {
-		return err
-	}
-	candidates := collectFlagNames(cmd)
-	suggestion := closestFlag(bad, candidates)
-	if suggestion == "" {
-		return err
-	}
-	return fmt.Errorf("%w (did you mean --%s?)", err, suggestion)
-}
-
-// collectFlagNames returns every long-form flag name registered on the
-// command and its ancestors. Includes inherited persistent flags so
-// suggestions like "did you mean --verbose?" work on subcommands.
-func collectFlagNames(cmd *cobra.Command) []string {
 	var names []string
 	cmd.Flags().VisitAll(func(f *pflag.Flag) {
 		names = append(names, f.Name)
 	})
-	cmd.InheritedFlags().VisitAll(func(f *pflag.Flag) {
-		names = append(names, f.Name)
-	})
-	return names
+	suggestion := closestFlag(notExistErr.GetSpecifiedName(), names)
+	if suggestion == "" {
+		return err
+	}
+	return fmt.Errorf("%w (did you mean --%s?)", err, suggestion)
 }
 
 // closestFlag returns the candidate whose Levenshtein distance to `want`
@@ -313,10 +292,4 @@ func levenshtein(a, b string) int {
 		prev, curr = curr, prev
 	}
 	return prev[len(b)]
-}
-
-// commandUsesSemanticModel reports whether this command can load the model.
-// Only the root search command does; every subcommand is management or output.
-func commandUsesSemanticModel(cmd *cobra.Command) bool {
-	return cmd != nil && !cmd.HasParent()
 }

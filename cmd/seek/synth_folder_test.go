@@ -43,7 +43,7 @@ func planSynthCorpus(t *testing.T, root string) node {
 	return plan
 }
 
-// synthFolderWords is the vocabulary of writeRandomFolder in long mode.
+// synthFolderWords is the vocabulary of writeRandomFolder.
 var synthFolderWords = []string{
 	"alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
 }
@@ -62,26 +62,13 @@ var synthFolderWords = []string{
 // The path comes from t.TempDir(), so the testing package removes it.
 func writeRandomFolder(t *testing.T, total, fileSize int64) string {
 	t.Helper()
-	if total <= 0 {
-		t.Fatalf("writeRandomFolder: non-positive total=%d", total)
-	}
-	if fileSize <= 0 {
-		t.Fatalf("writeRandomFolder: non-positive fileSize=%d", fileSize)
-	}
-
 	root := t.TempDir()
 	seed := uint64(crc32.ChecksumIEEE([]byte(t.Name())))
-	if seed == 0 {
-		seed = 1
-	}
 	rng := rand.New(rand.NewPCG(seed, seed^0x9E3779B97F4A7C15))
 
 	var written int64
 	for i := 0; written < total; i++ {
-		sz := fileSize
-		if remaining := total - written; remaining < sz {
-			sz = remaining
-		}
+		sz := min(fileSize, total-written)
 		p := filepath.Join(root, fmt.Sprintf("f%05d.bin", i))
 		// Words and spaces have no NUL byte, so the content is indexable
 		// text, not a binary file.
@@ -112,9 +99,6 @@ func writeSparseFile(t *testing.T, path string, size int64) {
 	prefix := bytes.Repeat([]byte("x"), int(min(size, 2*binaryProbeBytes)))
 	if err := os.WriteFile(path, prefix, 0o644); err != nil {
 		t.Fatalf("writeSparseFile create %q: %v", path, err)
-	}
-	if size == 0 {
-		return
 	}
 	if err := os.Truncate(path, size); err != nil {
 		t.Fatalf("writeSparseFile truncate %q to %d: %v", path, size, err)

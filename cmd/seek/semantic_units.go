@@ -66,7 +66,8 @@ func (segment *semanticUnitSegment) find(key semanticRowKey) ([]byte, bool) {
 // openSemanticUnits maps every segment of the store, newest first. A segment
 // that does not map is skipped: the store only saves model work.
 func openSemanticUnits(cacheRoot string) []*semanticUnitSegment {
-	entries, err := os.ReadDir(semanticUnitsDirFor(cacheRoot))
+	dir := semanticUnitsDirFor(cacheRoot)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
@@ -75,7 +76,7 @@ func openSemanticUnits(cacheRoot string) []*semanticUnitSegment {
 		if !strings.HasSuffix(entry.Name(), semanticUnitsSegmentExt) {
 			continue
 		}
-		if segment, err := mapSemanticUnitSegment(filepath.Join(semanticUnitsDirFor(cacheRoot), entry.Name())); err == nil {
+		if segment, err := mapSemanticUnitSegment(filepath.Join(dir, entry.Name())); err == nil {
 			segments = append(segments, segment)
 		}
 	}

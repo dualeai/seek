@@ -273,8 +273,8 @@ func TestNativeGitDeltaMatchesCleanFull(t *testing.T) {
 			if err != nil || !eligible {
 				t.Fatalf("prepare delta: eligible=%t error=%v", eligible, err)
 			}
-			if delta.nextState.head != target.commitOID {
-				t.Fatalf("delta head=%s, want %s", delta.nextState.head, target.commitOID)
+			if delta.nextState.head != target {
+				t.Fatalf("delta head=%s, want %s", delta.nextState.head, target)
 			}
 
 			seedBytes := make(map[string][]byte)
@@ -366,7 +366,7 @@ func TestNativeGitTombstonedBytesCompactTheFamily(t *testing.T) {
 	requireTools(t)
 	// A small shardMax puts the floor of deltaNeedsCompaction below the
 	// byte counts of these files (634 bytes each).
-	swapShardMaxForTest(t, 1024)
+	swapForTest(t, &shardMax, 1024)
 	repoDir := initEmptyGitRepo(t)
 	for i := range 10 {
 		if err := os.WriteFile(filepath.Join(repoDir, fmt.Sprintf("c%02d.go", i)), []byte(compactionFixtureFile(i)), 0o644); err != nil {
@@ -415,7 +415,7 @@ func TestNativeGitBinaryBlobsCountTheirMarker(t *testing.T) {
 	requireTools(t)
 	// A small shardMax puts the floor of deltaNeedsCompaction below the
 	// byte counts of these files (634 bytes each).
-	swapShardMaxForTest(t, 1024)
+	swapForTest(t, &shardMax, 1024)
 	repoDir := initEmptyGitRepo(t)
 	for i := range 10 {
 		if err := os.WriteFile(filepath.Join(repoDir, fmt.Sprintf("c%02d.go", i)), []byte(compactionFixtureFile(i)), 0o644); err != nil {
@@ -474,7 +474,7 @@ func TestNativeGitBinaryOnlyCommitsStayDeltas(t *testing.T) {
 	requireTools(t)
 	// A small shardMax puts the floor of deltaNeedsCompaction below the
 	// byte counts of these files (634 bytes each).
-	swapShardMaxForTest(t, 1024)
+	swapForTest(t, &shardMax, 1024)
 	repoDir := initEmptyGitRepo(t)
 	for i := range 30 {
 		if err := os.WriteFile(filepath.Join(repoDir, fmt.Sprintf("c%02d.go", i)), []byte(compactionFixtureFile(i)), 0o644); err != nil {
@@ -576,11 +576,11 @@ func TestPrepareNativeGitDeltaIgnoresZoektConfig(t *testing.T) {
 func TestPrepareNativeGitDeltaRejectsCommittedStateDamage(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
-		damage func(*testing.T, node, gitSnapshot)
+		damage func(*testing.T, node, gitObjectID)
 	}{
 		{
 			name: "missing",
-			damage: func(t *testing.T, plan node, _ gitSnapshot) {
+			damage: func(t *testing.T, plan node, _ gitObjectID) {
 				t.Helper()
 				if err := os.Remove(filepath.Join(plan.cacheDir, committedGitStateFile)); err != nil {
 					t.Fatal(err)
@@ -589,7 +589,7 @@ func TestPrepareNativeGitDeltaRejectsCommittedStateDamage(t *testing.T) {
 		},
 		{
 			name: "malformed",
-			damage: func(t *testing.T, plan node, _ gitSnapshot) {
+			damage: func(t *testing.T, plan node, _ gitObjectID) {
 				t.Helper()
 				if err := os.WriteFile(filepath.Join(plan.cacheDir, committedGitStateFile), []byte("not state\n"), 0o644); err != nil {
 					t.Fatal(err)
@@ -598,13 +598,13 @@ func TestPrepareNativeGitDeltaRejectsCommittedStateDamage(t *testing.T) {
 		},
 		{
 			name: "wrong-head",
-			damage: func(t *testing.T, plan node, target gitSnapshot) {
+			damage: func(t *testing.T, plan node, target gitObjectID) {
 				t.Helper()
 				state, ok := readCommittedGitState(plan.cacheDir)
 				if !ok {
 					t.Fatal("read committed state")
 				}
-				state.head = target.commitOID
+				state.head = target
 				if err := writeCommittedGitState(plan.cacheDir, state); err != nil {
 					t.Fatal(err)
 				}
@@ -612,7 +612,7 @@ func TestPrepareNativeGitDeltaRejectsCommittedStateDamage(t *testing.T) {
 		},
 		{
 			name: "base-shards-ahead",
-			damage: func(t *testing.T, plan node, _ gitSnapshot) {
+			damage: func(t *testing.T, plan node, _ gitObjectID) {
 				t.Helper()
 				state, ok := readCommittedGitState(plan.cacheDir)
 				if !ok {

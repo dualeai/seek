@@ -504,7 +504,7 @@ func TestFolderReader_FileGrew_NoLeak(t *testing.T) {
 	// The read fails, so the file stays searchable by name only, with no
 	// content and no read weight.
 	var docs []fileContent
-	for fc := range streamFolderFilesWithMarkers(readCtx, []folderCandidate{c}, 1, cancel, nil) {
+	for fc := range streamFolderFilesWithMarkers(readCtx, []folderCandidate{c}, 1, cancel, make([]int64, 1)) {
 		docs = append(docs, fc)
 	}
 	if cause := context.Cause(readCtx); cause != nil {

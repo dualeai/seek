@@ -16,7 +16,7 @@ var ansiCodeRE = regexp.MustCompile("\x1b\\[[0-9;]*m")
 // fmtOneFile formats a single git-corpus file match with the given palette and
 // hideCorpusContext (relative paths), the common shape for these unit tests.
 func fmtOneFile(fm zoekt.FileMatch, pal palette) string {
-	res := []corpusSearchResult{{corpusID: corpusID("c"), kind: corpusKindGit, file: fm}}
+	res := withHeaders([]corpusSearchResult{{corpusID: corpusID("c"), kind: corpusKindGit, file: fm}})
 	return formatCorpusResultsWithContext(res, 0, 0, hideCorpusContext, pal)
 }
 
@@ -308,7 +308,7 @@ func TestSanitize_DisplayRootControlBytesStripped(t *testing.T) {
 		file: zoekt.FileMatch{FileName: "f.txt", Language: "Text", Score: 1,
 			LineMatches: []zoekt.LineMatch{{Line: []byte("x\n"), LineNumber: 1}}},
 	}}
-	out := formatCorpusResultsWithContext(results, 0, 0, showCorpusContext, plainPalette)
+	out := formatCorpusResultsWithContext(withHeaders(results), 0, 0, showCorpusContext, plainPalette)
 	if strings.Contains(out, "\x1b") {
 		t.Fatalf("control byte in displayRoot leaked, got:\n%q", out)
 	}

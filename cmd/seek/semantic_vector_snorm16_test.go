@@ -29,6 +29,19 @@ func semanticSourceSquaredNormBounds() (float64, float64) {
 	return lower, upper
 }
 
+// encodeTestSNORM16Component encodes value as component 0 of a vector whose
+// component 1 makes the norm 1, and returns the code of component 0.
+func encodeTestSNORM16Component(value float32) (int16, error) {
+	vector := semanticVector{0: value}
+	if value >= -1 && value <= 1 {
+		vector[1] = float32(math.Sqrt(1 - float64(value)*float64(value)))
+	}
+	stored, err := encodeSemanticSNORM16Vector(&vector)
+	return stored[0], err
+}
+
+// TestSemanticSNORM16ComponentCodes checks the codes of chosen components and
+// rejects a component past -1 or 1 and a component that is not finite.
 func TestSemanticSNORM16ComponentCodes(t *testing.T) {
 	negativeZero := math.Float32frombits(1 << 31)
 	tests := []struct {
@@ -45,7 +58,7 @@ func TestSemanticSNORM16ComponentCodes(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := encodeSemanticSNORM16Component(test.value)
+			got, err := encodeTestSNORM16Component(test.value)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -61,21 +74,22 @@ func TestSemanticSNORM16ComponentCodes(t *testing.T) {
 		float32(math.Inf(-1)),
 		float32(math.Inf(1)),
 	} {
-		if _, err := encodeSemanticSNORM16Component(value); err == nil {
+		if _, err := encodeTestSNORM16Component(value); err == nil {
 			t.Fatalf("invalid value %v was accepted", value)
 		}
 	}
 }
 
 // TestSemanticSNORM16ComponentRoundTripAllCodes decodes every valid code with
-// the production decoder and encodes the result again. The float64 quotient
-// code/32767 is the exact value that the decoder must round to float32.
+// the production decoder and encodes the result again with the production
+// encoder. The float64 quotient code/32767 is the exact value that the decoder
+// must round to float32.
 func TestSemanticSNORM16ComponentRoundTripAllCodes(t *testing.T) {
 	var maximumDecodeError float64
 	for value := -32_767; value <= 32_767; value++ {
 		code := int16(value)
 		decoded := decodeSemanticSNORM16Vector(semanticSNORM16Vector{0: code})[0]
-		got, err := encodeSemanticSNORM16Component(decoded)
+		got, err := encodeTestSNORM16Component(decoded)
 		if err != nil {
 			t.Fatalf("code %d: %v", code, err)
 		}

@@ -200,13 +200,13 @@ func TestWarmFolderVectorSearchTakesNoBuildSlot(t *testing.T) {
 	folder := t.TempDir()
 	writeFileAt(t, folder, "a.go", "package a\n// alpha beta handler\n")
 	writeFileAt(t, folder, "b.go", "package a\n// dispatches a request to its handler\n")
-	scorer := &hybridTestScorer{mode: payloadAccept}
-	model := modelFactory(scorer)
+	scorer := observeModel(&hybridTestScorer{mode: payloadAccept})
+	model := scorer.factory()
 	cold, err := seekWith(t, model, "alpha beta", folder)
 	if err != nil {
 		t.Fatal(err)
 	}
-	embeds := scorer.embedCalls.Load()
+	embeds := scorer.embeds.Load()
 	if embeds == 0 || !slices.Contains(headerPaths(cold), filepath.Join(folder, "b.go")) {
 		t.Fatalf("the cold search embedded %d calls and printed %v, want b.go from the vectors:\n%s",
 			embeds, headerPaths(cold), cold)
@@ -217,8 +217,8 @@ func TestWarmFolderVectorSearchTakesNoBuildSlot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the warm vector search failed while every build slot was held: %v", err)
 	}
-	if warm != cold || scorer.embedCalls.Load() != embeds {
+	if warm != cold || scorer.embeds.Load() != embeds {
 		t.Fatalf("the warm search embedded %d calls, want 0, and must print b.go from the vectors as the cold search did; cold:\n%s\nwarm:\n%s",
-			scorer.embedCalls.Load()-embeds, cold, warm)
+			scorer.embeds.Load()-embeds, cold, warm)
 	}
 }

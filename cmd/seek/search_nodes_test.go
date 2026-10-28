@@ -229,20 +229,20 @@ func TestConcurrentCommandsShareTheReadBudget(t *testing.T) {
 }
 
 // awaitBuildSlotWaiter returns with waited true when a build waits for a slot
-// in buildWindows. When ended gives a value first, the build did not wait:
-// it returns that value with waited false. A waiter makes TryAcquire(0) fail
-// and changes no weight, so the loop reads the state of the semaphore, not a
-// clock. A test whose build runs ctags and Git processes uses it: such a
-// build cannot run in a synctest bubble.
-func awaitBuildSlotWaiter[T any](ended <-chan T) (value T, waited bool) {
+// in buildWindows. When the search ends first, the build did not wait: it
+// returns the search error from ended with waited false. A waiter makes
+// TryAcquire(0) fail and changes no weight, so the loop reads the state of
+// the semaphore, not a clock. A test whose build runs ctags and Git processes
+// uses it: such a build cannot run in a synctest bubble.
+func awaitBuildSlotWaiter(ended <-chan error) (waited bool, err error) {
 	for {
 		select {
-		case value = <-ended:
-			return value, false
+		case err = <-ended:
+			return false, err
 		default:
 		}
 		if !buildWindows.TryAcquire(0) {
-			return value, true
+			return true, nil
 		}
 		runtime.Gosched()
 	}
@@ -316,7 +316,7 @@ func TestBuildsWithFewLargeDocumentTokensFinish(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, _, err := searchNodes(t.Context(), plans, func(nodeCtx context.Context, plan node) ([]corpusSearchResult, dirtyFileSet, error) {
-		return prepareAndSearchCorpus(nodeCtx, plan, nil, userQ, defaultSearchConfig())
+		return prepareAndSearchCorpus(nodeCtx, plan, userQ, defaultSearchConfig())
 	}); err != nil {
 		t.Fatalf("the builds did not finish: %v", err)
 	}
@@ -357,7 +357,7 @@ func TestSearchesTakeNoBuildSlot(t *testing.T) {
 			_, err := seek(t, "--lexical-only", marker, cold)
 			done <- err
 		}()
-		if err, waited := awaitBuildSlotWaiter(done); !waited {
+		if waited, err := awaitBuildSlotWaiter(done); !waited {
 			t.Fatalf("a cold build of %s ran with no free slot: %v", cold, err)
 		}
 		release()
@@ -491,7 +491,7 @@ func TestSearchNodesRealIndexingBeyondTheWindow(t *testing.T) {
 			defer others.Done()
 			<-firstWaits
 		}
-		return prepareAndSearchCorpus(nodeCtx, plan, nil, userQ, defaultSearchConfig())
+		return prepareAndSearchCorpus(nodeCtx, plan, userQ, defaultSearchConfig())
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -545,26 +545,15 @@ func TestCancelDuringGraphSearch(t *testing.T) {
 	first := f.graphRepo("folder/one", "a.txt", "zqcancelmarker")
 	second := f.graphRepo("folder/two", "b.txt", "zqcancelmarker")
 	setTestUserCache(t)
-	realGit, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatal(err)
-	}
 	started := filepath.Join(t.TempDir(), "build-started")
 	if err := unix.Mkfifo(started, 0o600); err != nil {
 		t.Fatalf("make the FIFO that signals the content read: %v", err)
 	}
-	shimDir := t.TempDir()
-	shim := "#!/bin/sh\n" + gitShimSubcommand +
-		"if [ \"$subcommand\" = cat-file ]; then\n" +
-		"  exec cat /dev/zero 4>&1 > \"$SEEK_TEST_BUILD_STARTED\"\n" +
-		"fi\n" +
-		"exec \"$SEEK_TEST_REAL_GIT\" \"$@\"\n"
-	if err := os.WriteFile(filepath.Join(shimDir, "git"), []byte(shim), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("SEEK_TEST_REAL_GIT", realGit)
+	installGitShim(t, "if [ \"$subcommand\" = cat-file ]; then\n"+
+		"  exec cat /dev/zero 4>&1 > \"$SEEK_TEST_BUILD_STARTED\"\n"+
+		"fi\n"+
+		"exec \"$SEEK_TEST_REAL_GIT\" \"$@\"\n")
 	t.Setenv("SEEK_TEST_BUILD_STARTED", started)
-	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	defer goroutineLeakGuard(t)()
 	logs := captureTestLogs(t, slog.LevelWarn)
 
@@ -590,7 +579,7 @@ func TestCancelDuringGraphSearch(t *testing.T) {
 			_ = signal.Close()
 		}
 	}()
-	err = seekRoot(ctx, t, nil, "--lexical-only", "zqcancelmarker", f.path("folder"))
+	err := seekRoot(ctx, t, nil, "--lexical-only", "zqcancelmarker", f.path("folder"))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err=%v, want the cancellation", err)
 	}
@@ -617,8 +606,6 @@ func TestCancelDuringGraphSearch(t *testing.T) {
 // One has a bad HEAD, one has a corrupt index, and the build of the third
 // cannot read its content. The readable content returns, each failure warns
 // once, and the exit is 0.
-// Root, or any user who can read a mode-000 folder, reads the locked folder.
-// The test then removes it and expects the 3 other warnings.
 func TestPartialFailureContract(t *testing.T) {
 	requireTools(t)
 	const words = "zqpartial contract"
@@ -632,36 +619,11 @@ func TestPartialFailureContract(t *testing.T) {
 			badIndex := f.graphRepo("tree/badindex", "index.txt", words)
 			writeFixtureFile(t, filepath.Join(badIndex, ".git", "index"), "not an index\n")
 			badBuild := f.graphRepo("tree/badbuild", "build.txt", words)
-			locked := f.path("tree/locked")
-			if err := os.Chmod(locked, 0); err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
-			// Root opens the locked folder: remove it, so no part of the
-			// search reads hidden.txt or warns about the folder.
-			unreadable := true
+			chmodUnreadableOrFatal(t, f.path("tree/locked"), 0)
 			hidden := []string{"hidden.txt", "head.txt", "index.txt", "build.txt"}
-			if dir, err := os.Open(locked); err == nil {
-				_ = dir.Close()
-				if err := os.RemoveAll(locked); err != nil {
-					t.Fatal(err)
-				}
-				unreadable, hidden = false, hidden[1:]
-			}
 			// The build of badbuild cannot read its content.
-			realGit, err := exec.LookPath("git")
-			if err != nil {
-				t.Fatal(err)
-			}
-			shimDir := t.TempDir()
-			shim := "#!/bin/sh\n" + gitShimSubcommand +
-				"case \"$PWD $*\" in *badbuild*) if [ \"$subcommand\" = cat-file ]; then echo forced-read-failure >&2; exit 3; fi ;; esac\n" +
-				"exec \"$SEEK_TEST_REAL_GIT\" \"$@\"\n"
-			if err := os.WriteFile(filepath.Join(shimDir, "git"), []byte(shim), 0o755); err != nil {
-				t.Fatal(err)
-			}
-			t.Setenv("SEEK_TEST_REAL_GIT", realGit)
-			t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			installGitShim(t, "case \"$PWD $*\" in *badbuild*) if [ \"$subcommand\" = cat-file ]; then echo forced-read-failure >&2; exit 3; fi ;; esac\n"+
+				"exec \"$SEEK_TEST_REAL_GIT\" \"$@\"\n")
 			setTestUserCache(t)
 			logs := captureTestLogs(t, slog.LevelWarn)
 			out, _, err := stubSearch(t, payloadFar, query, f.path("tree"))
@@ -674,7 +636,7 @@ func TestPartialFailureContract(t *testing.T) {
 				}
 			}
 			records := logs.Records()
-			if len(records) != len(hidden) || logsMention(records, "could not be read") != unreadable ||
+			if len(records) != len(hidden) || !logsMention(records, "could not be read") ||
 				!logsMention(records, badHead) || !logsMention(records, badIndex) || !logsMention(records, badBuild) {
 				t.Fatalf("warnings=%v, want one for each of the %d failed parts", records, len(hidden))
 			}
@@ -785,14 +747,7 @@ func TestPersistentShardDamageFailsOnce(t *testing.T) {
 	}
 	// The repair rebuilds a family that fails its manifest. A peer that
 	// holds the build lock keeps the damage for this command.
-	holder, err := os.OpenFile(filepath.Join(plan.cacheDir, buildLockFile), os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := lockFileExclusive(holder); err != nil {
-		t.Fatalf("hold the build lock: %v", err)
-	}
-	defer releaseLock(holder)
+	holdBuildLock(t, plan.cacheDir)
 	logs := captureTestLogs(t, slog.LevelWarn)
 	before := nodePreparations.Load()
 	out, err := seekWith(t, newModel, slices.Concat([]string{words}, operands)...)
@@ -903,14 +858,7 @@ func TestDescriptionSearchWhileAPeerBuilds(t *testing.T) {
 	for _, plan := range plans {
 		// In one process a second open file description conflicts, as a
 		// peer process does.
-		holder, err := os.OpenFile(filepath.Join(plan.cacheDir, buildLockFile), os.O_CREATE|os.O_RDWR, 0o644)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := lockFileExclusive(holder); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { releaseLock(holder) })
+		holdBuildLock(t, plan.cacheDir)
 	}
 	writeFixtureFile(t, filepath.Join(repo, "b.txt"), "zqpeer alpha beta edited\n")
 	f.graphFile("plain/c.txt", "zqpeer alpha beta edited")
@@ -1082,14 +1030,7 @@ func TestPeerBuildPrintsNoStaleTextOfAnEditedFile(t *testing.T) {
 	if err != nil || len(plans) != 1 {
 		t.Fatalf("plans=%d err=%v", len(plans), err)
 	}
-	holder, err := os.OpenFile(filepath.Join(plans[0].cacheDir, buildLockFile), os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { releaseLock(holder) })
-	if err := lockFileExclusive(holder); err != nil {
-		t.Fatal(err)
-	}
+	holdBuildLock(t, plans[0].cacheDir)
 	writeFixtureFile(t, filepath.Join(repo, "a.txt"), "edited while a peer builds\n")
 	for _, test := range []struct {
 		name     string
@@ -1129,14 +1070,7 @@ func TestPeerBuildUncommittedCopyWinsForARevertedFile(t *testing.T) {
 	if err != nil || len(plans) != 1 {
 		t.Fatalf("plans=%d err=%v", len(plans), err)
 	}
-	holder, err := os.OpenFile(filepath.Join(plans[0].cacheDir, buildLockFile), os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { releaseLock(holder) })
-	if err := lockFileExclusive(holder); err != nil {
-		t.Fatal(err)
-	}
+	holdBuildLock(t, plans[0].cacheDir)
 	writeFixtureFile(t, filepath.Join(repo, "a.txt"), committed)
 	if out, err := exec.Command("git", "-C", repo, "status", "--porcelain").Output(); err != nil || len(out) != 0 {
 		t.Fatalf("the revert left the work tree dirty: %q err=%v", out, err)

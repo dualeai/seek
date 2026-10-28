@@ -15,11 +15,12 @@ import (
 	"time"
 )
 
-// reuseSearch runs one descriptive search with a fresh test model in the far
-// mode and returns the path of each unit that the model embedded.
-func reuseSearch(t *testing.T, query string, root string) []string {
+// reuseSearch runs the descriptive search "alpha beta" with a fresh test
+// model in the far mode and returns the path of each unit that the model
+// embedded.
+func reuseSearch(t *testing.T, root string) []string {
 	t.Helper()
-	units, _ := reuseSearchWith(t, &hybridTestScorer{}, query, root)
+	units, _ := reuseSearchWith(t, &hybridTestScorer{}, root)
 	paths := make([]string, len(units))
 	for index, unit := range units {
 		paths[index] = unit.path
@@ -27,12 +28,13 @@ func reuseSearch(t *testing.T, query string, root string) []string {
 	return paths
 }
 
-// reuseSearchWith runs one descriptive search with model and returns a copy
-// of each unit that the model embedded, in call order, and the output.
-func reuseSearchWith(t *testing.T, model semanticModel, query string, root string) ([]semanticUnit, string) {
+// reuseSearchWith runs the descriptive search "alpha beta" with model and
+// returns a copy of each unit that the model embedded, in call order, and the
+// output.
+func reuseSearchWith(t *testing.T, model semanticModel, root string) ([]semanticUnit, string) {
 	t.Helper()
 	observed := observeModel(model)
-	output, err := seekWith(t, observed.factory(), query, root)
+	output, err := seekWith(t, observed.factory(), "alpha beta", root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,12 +80,12 @@ func TestEmbeddingCacheReusesUnchangedFilesAcrossCommits(t *testing.T) {
 	gitRunIn(t, repo, "add", ".")
 	gitRunIn(t, repo, "commit", "-q", "-m", "files")
 	t.Chdir(t.TempDir())
-	if first := reuseSearch(t, "alpha beta", repo); len(first) < 201 {
+	if first := reuseSearch(t, repo); len(first) < 201 {
 		t.Fatalf("the first build embedded %d rows, want every file", len(first))
 	}
 	writeFileAt(t, repo, "pkg/f100.go", "package sample\n// alpha beta changed file\n")
 	gitRunIn(t, repo, "commit", "-q", "-am", "change one")
-	second := reuseSearch(t, "alpha beta", repo)
+	second := reuseSearch(t, repo)
 	if len(second) == 0 || slices.ContainsFunc(second, func(path string) bool { return path != "pkg/f100.go" }) {
 		t.Fatalf("the second build embedded %v, want pkg/f100.go only", second)
 	}
@@ -98,12 +100,12 @@ func TestOneLineEditReembedsOneUnit(t *testing.T) {
 		"func Beta() int {\n\treturn 2 // alpha beta\n}\n\nfunc Gamma() int {\n\treturn 3 // alpha beta\n}\n"
 	repo := initGitRepo(t, "three.go", content)
 	t.Chdir(t.TempDir())
-	if first := reuseSearch(t, "alpha beta", repo); len(first) < 3 {
+	if first := reuseSearch(t, repo); len(first) < 3 {
 		t.Fatalf("the first build embedded %d rows", len(first))
 	}
 	writeFileAt(t, repo, "three.go", strings.Replace(content, "return 2", "return 22", 1))
 	gitRunIn(t, repo, "commit", "-q", "-am", "edit Beta")
-	second, _ := reuseSearchWith(t, &hybridTestScorer{}, "alpha beta", repo)
+	second, _ := reuseSearchWith(t, &hybridTestScorer{}, repo)
 	if len(second) != 1 || !bytes.HasPrefix(second[0].text, []byte("func Beta() int {\n\treturn 22 ")) {
 		var got []string
 		for _, unit := range second {
@@ -123,12 +125,12 @@ func TestLinkedWorktreesEmbedNothingNew(t *testing.T) {
 	gitRunIn(t, repo, "add", ".")
 	gitRunIn(t, repo, "commit", "-q", "-m", "two")
 	t.Chdir(t.TempDir())
-	if first := reuseSearch(t, "alpha beta", repo); len(first) == 0 {
+	if first := reuseSearch(t, repo); len(first) == 0 {
 		t.Fatal("the first build embedded nothing")
 	}
 	worktree := filepath.Join(t.TempDir(), "wt")
 	gitRunIn(t, repo, "worktree", "add", "-q", "--detach", worktree)
-	if second := reuseSearch(t, "alpha beta", worktree); len(second) != 0 {
+	if second := reuseSearch(t, worktree); len(second) != 0 {
 		t.Fatalf("the linked worktree embedded %v, want nothing", second)
 	}
 }
@@ -146,12 +148,12 @@ func TestRunFolderChangeEmbedsOnlyChangedFile(t *testing.T) {
 		writeFileAt(t, folder, fmt.Sprintf("f%02d.go", i), fmt.Sprintf("package sample\n// alpha file %d\n", i))
 	}
 	t.Chdir(t.TempDir())
-	if first, _ := reuseSearchWith(t, &hybridTestScorer{mode: payloadAccept}, "alpha beta", folder); len(first) < 50 {
+	if first, _ := reuseSearchWith(t, &hybridTestScorer{mode: payloadAccept}, folder); len(first) < 50 {
 		t.Fatalf("the first build embedded %d rows", len(first))
 	}
 	const edit = "dispatches a request to its handler"
 	writeFileAt(t, folder, "f07.go", "package sample\n// "+edit+"\n")
-	units, output := reuseSearchWith(t, &hybridTestScorer{mode: payloadAccept}, "alpha beta", folder)
+	units, output := reuseSearchWith(t, &hybridTestScorer{mode: payloadAccept}, folder)
 	_, block, found := strings.Cut(output, "## "+filepath.Join(folder, "f07.go"))
 	block, _, _ = strings.Cut(block, "\n## ")
 	if !found || !strings.Contains(block, edit) || strings.Contains(output, "alpha file 7\n") {
@@ -216,11 +218,11 @@ func TestFileReuseRowsMatchFreshRows(t *testing.T) {
 		documents := make(chan fileContent, 1)
 		documents <- makeFileContent(t, path, content)
 		close(documents)
-		if _, err := buildSemanticGeneration(t.Context(), dir, "source", embedder, searchResources{},
+		if err := buildSemanticGeneration(t.Context(), dir, "source", embedder, searchResources{},
 			func(context.Context) (<-chan fileContent, func() error) {
 				return documents, func() error { return nil }
 			},
-			nil); err != nil {
+			&semanticReuseIndex{}); err != nil {
 			t.Fatal(err)
 		}
 		return dir
@@ -278,15 +280,15 @@ func TestBranchSwitchEmbedsNothingNew(t *testing.T) {
 	gitRunIn(t, repo, "commit", "-q", "-am", "b")
 	t.Chdir(t.TempDir())
 	gitRunIn(t, repo, "checkout", "-q", "a")
-	if first := reuseSearch(t, "alpha beta", repo); len(first) < 21 {
+	if first := reuseSearch(t, repo); len(first) < 21 {
 		t.Fatalf("branch a embedded %d rows", len(first))
 	}
 	gitRunIn(t, repo, "checkout", "-q", "b")
-	if second := reuseSearch(t, "alpha beta", repo); len(second) != 5 {
+	if second := reuseSearch(t, repo); len(second) != 5 {
 		t.Fatalf("branch b embedded %d rows, want the 5 changed files", len(second))
 	}
 	gitRunIn(t, repo, "checkout", "-q", "a")
-	if third := reuseSearch(t, "alpha beta", repo); len(third) != 0 {
+	if third := reuseSearch(t, repo); len(third) != 0 {
 		t.Fatalf("back on branch a the search embedded %v, want nothing", third)
 	}
 }
@@ -317,7 +319,7 @@ func TestDamagedSourceRowIsNotCopied(t *testing.T) {
 	setTestUserCache(t)
 	repo := initGitRepo(t, "a.go", "package sample\n// alpha beta one\n")
 	t.Chdir(t.TempDir())
-	if first := reuseSearch(t, "alpha beta", repo); len(first) == 0 {
+	if first := reuseSearch(t, repo); len(first) == 0 {
 		t.Fatal("the first build embedded nothing")
 	}
 	plans, err := planCorpora(context.Background(), []string{repo})
@@ -335,7 +337,7 @@ func TestDamagedSourceRowIsNotCopied(t *testing.T) {
 	writeFileAt(t, repo, "b.go", "package sample\n// alpha beta two\n")
 	gitRunIn(t, repo, "add", ".")
 	gitRunIn(t, repo, "commit", "-q", "-m", "two")
-	if second := reuseSearch(t, "alpha beta", repo); !slices.Contains(second, "a.go") {
+	if second := reuseSearch(t, repo); !slices.Contains(second, "a.go") {
 		t.Fatalf("the build copied a damaged row: embedded %v", second)
 	}
 }
@@ -396,7 +398,7 @@ func TestColdFolderReadsNoOtherCorpus(t *testing.T) {
 	writeFileAt(t, cold, name, content)
 	t.Chdir(t.TempDir())
 	for _, root := range []string{repo, first, cold} {
-		if embedded := reuseSearch(t, "alpha beta", root); !slices.Contains(embedded, name) {
+		if embedded := reuseSearch(t, root); !slices.Contains(embedded, name) {
 			t.Fatalf("%s embedded %v, want %s: its build copied rows of another corpus", root, embedded, name)
 		}
 	}
@@ -552,7 +554,7 @@ func TestReuseLoadIndexesTheNodeTailsOfOtherCorpora(t *testing.T) {
 	top := "package x\n// alpha beta top\n" + filler
 	writeFileAt(t, holder, "top.go", top)
 	t.Chdir(t.TempDir())
-	if first := reuseSearch(t, "alpha beta", holder); len(first) == 0 {
+	if first := reuseSearch(t, holder); len(first) == 0 {
 		t.Fatal("the folder embedded nothing")
 	}
 	real, err := filepath.EvalSymlinks(holder)
@@ -704,13 +706,13 @@ func TestRenamedLongTailFileReusesItsRows(t *testing.T) {
 		writeFileAt(t, holder, fmt.Sprintf("c/f%d.go", index), fmt.Sprintf("package c\n// alpha beta c %d\n", index))
 	}
 	t.Chdir(t.TempDir())
-	if first := reuseSearch(t, "alpha beta", holder); len(first) == 0 {
+	if first := reuseSearch(t, holder); len(first) == 0 {
 		t.Fatal("the folder embedded nothing")
 	}
 	if err := os.Rename(filepath.Join(holder, dir, "one.go"), filepath.Join(holder, dir, "two.go")); err != nil {
 		t.Fatal(err)
 	}
-	if embedded := reuseSearch(t, "alpha beta", filepath.Join(holder, "b")); len(embedded) != 0 {
+	if embedded := reuseSearch(t, filepath.Join(holder, "b")); len(embedded) != 0 {
 		t.Fatalf("the subfolder embedded %v after the rename, want nothing", embedded)
 	}
 }
@@ -771,7 +773,7 @@ func TestCopiedOrMovedSubfolderReusesTheFolderRows(t *testing.T) {
 			}
 			writeFileAt(t, holder, "a/top.go", "package top\n// alpha beta top\n")
 			t.Chdir(t.TempDir())
-			if first := reuseSearch(t, "alpha beta", holder); len(first) == 0 {
+			if first := reuseSearch(t, holder); len(first) == 0 {
 				t.Fatal("the folder embedded nothing")
 			}
 			if row.move {
@@ -783,7 +785,7 @@ func TestCopiedOrMovedSubfolderReusesTheFolderRows(t *testing.T) {
 					writeFileAt(t, holder, fmt.Sprintf("b/src/pkg/x/f%d.go", index), fmt.Sprintf("package x\n// alpha beta file %d\n", index))
 				}
 			}
-			if embedded := reuseSearch(t, "alpha beta", filepath.Join(holder, "b")); !slices.Equal(embedded, row.want) {
+			if embedded := reuseSearch(t, filepath.Join(holder, "b")); !slices.Equal(embedded, row.want) {
 				t.Fatalf("the subfolder embedded %v, want %v", embedded, row.want)
 			}
 		})
@@ -806,7 +808,7 @@ func TestUnitStoreSegmentsStayFew(t *testing.T) {
 	}
 	for n := range 17 {
 		writeFileAt(t, folder, "change.go", version(n))
-		reuseSearch(t, "alpha beta", folder)
+		reuseSearch(t, folder)
 	}
 	cacheRoot, err := seekUserCacheRoot()
 	if err != nil {
@@ -817,7 +819,7 @@ func TestUnitStoreSegmentsStayFew(t *testing.T) {
 		t.Fatalf("segments=%d after 16 archives, want 1 to 5 (about log2 of the records)", len(segments))
 	}
 	writeFileAt(t, folder, "change.go", version(3))
-	if embedded := reuseSearch(t, "alpha beta", folder); len(embedded) != 0 {
+	if embedded := reuseSearch(t, folder); len(embedded) != 0 {
 		t.Fatalf("an archived version embedded %v again", embedded)
 	}
 }

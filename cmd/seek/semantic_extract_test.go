@@ -102,12 +102,12 @@ func buildSemanticTestUnits(t *testing.T, files map[string][]byte) []semanticUni
 		documents <- makeFileContent(t, name, files[name])
 	}
 	close(documents)
-	if _, err := buildSemanticGeneration(
+	if err := buildSemanticGeneration(
 		t.Context(), filepath.Join(t.TempDir(), "semantic"), "source-extract", embedder, searchResources{},
 		func(context.Context) (<-chan fileContent, func() error) {
 			return documents, func() error { return nil }
 		},
-		nil,
+		&semanticReuseIndex{},
 	); err != nil {
 		t.Fatal(err)
 	}

@@ -94,7 +94,7 @@ type semanticFileReuse struct {
 // semanticReuseIndex maps the rows that a build can copy: the rows of live
 // generations, and the unit store. shards maps the graph shards of the live
 // generations by ID. base is the model path base of the build's node
-// (modelPathBase). A nil index copies nothing.
+// (modelPathBase). A zero index copies nothing.
 type semanticReuseIndex struct {
 	base        string
 	generations []*semanticGeneration
@@ -370,9 +370,6 @@ func (index *semanticReuseIndex) add(generation *semanticGeneration, tails map[s
 // same model path tail and content, set for name. It reports false when a row
 // of the match has no valid vectors. The caller assigns row numbers.
 func (index *semanticReuseIndex) fileRows(name string, contentID semanticContentID) ([]semanticUnit, bool) {
-	if index == nil {
-		return nil, false
-	}
 	match, ok := index.files[semanticFileReuseKey{tail: semanticModelPathTail(index.base, name), contentID: contentID}]
 	if !ok {
 		return nil, false
@@ -459,9 +456,6 @@ func semanticGenerationShape(generation *semanticGeneration) (shape semanticShap
 // a row with another tail (matchesOtherTails) also look up the row keys that
 // add skipped. The first such file indexes them.
 func (index *semanticReuseIndex) markReused(rows []semanticUnit) {
-	if index == nil {
-		return
-	}
 	var pendingRows map[semanticRowKey]semanticReuseRef
 	if len(index.skipped) > 0 && index.matchesOtherTails(rows) {
 		index.pendingOnce.Do(func() {
@@ -502,26 +496,7 @@ func (index *semanticReuseIndex) markReused(rows []semanticUnit) {
 	}
 }
 
-// modelBase is the model path base of the build's node; "" for a nil index.
-func (index *semanticReuseIndex) modelBase() string {
-	if index == nil {
-		return ""
-	}
-	return index.base
-}
-
-// usearchShards gives the graph shards that a build can reuse, by ID.
-func (index *semanticReuseIndex) usearchShards() semanticUSearchShardSources {
-	if index == nil {
-		return nil
-	}
-	return index.shards
-}
-
 func (index *semanticReuseIndex) Close() {
-	if index == nil {
-		return
-	}
 	for _, generation := range index.generations {
 		_ = generation.Close()
 	}

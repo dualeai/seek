@@ -86,7 +86,7 @@ func FuzzReadOneFolderFileStreaming_Sizes(f *testing.F) {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, size int64) {
-		swapDocumentContentLimitForTest(t, testDocumentContentLimit)
+		swapForTest(t, &documentContentLimit, testDocumentContentLimit)
 		const sizes = testDocumentContentLimit + 2
 		size = (size%sizes + sizes) % sizes
 		testReadSemMu.Lock()

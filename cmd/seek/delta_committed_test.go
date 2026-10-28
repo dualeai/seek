@@ -14,11 +14,11 @@ import (
 // reindexGit runs one build of the Git node at plan for the current state of
 // the repository. It passes the state hash that a search gives the build. The
 // build picks a committed delta or a full build.
-func reindexGit(t *testing.T, ctx context.Context, paths gitPaths, plan node) {
+func reindexGit(t testing.TB, ctx context.Context, paths gitPaths, plan node) {
 	t.Helper()
 	state := mustGitRepoStateIn(t, ctx, paths.RepoDir)
 	hash := gitCorpusStateHash(paths, state)
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, hash); err != nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, hash); err != nil {
 		t.Fatalf("runIndexingWithCache: %v", err)
 	}
 }
@@ -41,8 +41,8 @@ func TestDeltaCommitted_ModifyFileTombstonesOldContent(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "foo.go"), []byte("package main\n// delta_modify_v2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, dir, "add", ".")
-	gitRun(t, dir, "commit", "-m", "v2")
+	gitRunIn(t, dir, "add", ".")
+	gitRunIn(t, dir, "commit", "-m", "v2")
 
 	reindexGit(t, ctx, paths, plan)
 
@@ -81,8 +81,8 @@ func TestDeltaCommitted_DeleteFileRemovesFromIndex(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, "doomed.go")); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, dir, "add", "-A")
-	gitRun(t, dir, "commit", "-m", "remove doomed")
+	gitRunIn(t, dir, "add", "-A")
+	gitRunIn(t, dir, "commit", "-m", "remove doomed")
 
 	reindexGit(t, ctx, paths, plan)
 
@@ -104,8 +104,8 @@ func TestDeltaCommitted_RenameKeepsContentAtNewPath(t *testing.T) {
 
 	reindexGit(t, ctx, paths, plan)
 
-	gitRun(t, dir, "mv", "old.go", "new.go")
-	gitRun(t, dir, "commit", "-m", "rename")
+	gitRunIn(t, dir, "mv", "old.go", "new.go")
+	gitRunIn(t, dir, "commit", "-m", "rename")
 
 	reindexGit(t, ctx, paths, plan)
 
@@ -134,8 +134,8 @@ func TestDeltaCommitted_HeadRewindFallsBackCleanly(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		gitRun(t, dir, "add", ".")
-		gitRun(t, dir, "commit", "-m", fmt.Sprintf("step %d", i))
+		gitRunIn(t, dir, "add", ".")
+		gitRunIn(t, dir, "commit", "-m", fmt.Sprintf("step %d", i))
 		reindexGit(t, ctx, paths, plan)
 	}
 
@@ -158,7 +158,7 @@ func TestDeltaCommitted_HeadRewindFallsBackCleanly(t *testing.T) {
 	// Reset to step 0 (HEAD~4). The indexed commit stays in the object store,
 	// so the native delta can diff it against the new HEAD. The content of the
 	// 4 later commits must leave the index.
-	gitRun(t, dir, "reset", "--hard", "HEAD~4")
+	gitRunIn(t, dir, "reset", "--hard", "HEAD~4")
 	reindexGit(t, ctx, paths, plan)
 
 	for i := range 5 {
@@ -201,8 +201,8 @@ func TestDeltaCommitted_RebaseLeavesNoDuplicateHits(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		gitRun(t, dir, "add", ".")
-		gitRun(t, dir, "commit", "-m", fmt.Sprintf("step %d", i))
+		gitRunIn(t, dir, "add", ".")
+		gitRunIn(t, dir, "commit", "-m", fmt.Sprintf("step %d", i))
 		reindexGit(t, ctx, paths, plan)
 	}
 
@@ -215,8 +215,8 @@ func TestDeltaCommitted_RebaseLeavesNoDuplicateHits(t *testing.T) {
 	// indexed commit stays in the object store, so the native delta can diff
 	// it against the new HEAD, and the diff is empty. Each marker must still
 	// give exactly one file.
-	gitRun(t, dir, "reset", "--soft", "HEAD~10")
-	gitRun(t, dir, "commit", "-m", "squashed steps")
+	gitRunIn(t, dir, "reset", "--soft", "HEAD~10")
+	gitRunIn(t, dir, "commit", "-m", "squashed steps")
 	reindexGit(t, ctx, paths, plan)
 
 	for i := range 10 {
@@ -249,8 +249,8 @@ func TestDeltaCommitted_ShardThresholdTriggersFullRebuild(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		gitRun(t, dir, "add", ".")
-		gitRun(t, dir, "commit", "-m", fmt.Sprintf("cycle %d", i))
+		gitRunIn(t, dir, "add", ".")
+		gitRunIn(t, dir, "commit", "-m", fmt.Sprintf("cycle %d", i))
 		reindexGit(t, ctx, paths, plan)
 		shardSeries = append(shardSeries, committedShardCount(t, plan.indexDir))
 	}
@@ -293,8 +293,8 @@ func TestDeltaCommitted_SubmoduleHostStaysSearchable(t *testing.T) {
 	gitRunIn(t, subSrc, "add", ".")
 	gitRunIn(t, subSrc, "commit", "-m", "sub initial")
 
-	gitRun(t, dir, "-c", "protocol.file.allow=always", "submodule", "add", subSrc, "mysub")
-	gitRun(t, dir, "commit", "-m", "add submodule")
+	gitRunIn(t, dir, "-c", "protocol.file.allow=always", "submodule", "add", subSrc, "mysub")
+	gitRunIn(t, dir, "commit", "-m", "add submodule")
 
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
@@ -303,8 +303,8 @@ func TestDeltaCommitted_SubmoduleHostStaysSearchable(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "added.go"), []byte("package main\n// submodule_delta_added\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, dir, "add", ".")
-	gitRun(t, dir, "commit", "-m", "post-submodule add")
+	gitRunIn(t, dir, "add", ".")
+	gitRunIn(t, dir, "commit", "-m", "post-submodule add")
 	reindexGit(t, ctx, paths, plan)
 
 	if results, _ := searchPlannedCorpusForTest(ctx, plan, "submodule_delta_marker"); len(results) == 0 {
@@ -335,9 +335,7 @@ func TestDeltaCommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 		reindexing[i] = make(chan struct{})
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		started := 0
 		// A writer that stops early starts the remaining searches.
 		defer func() {
@@ -352,8 +350,8 @@ func TestDeltaCommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 				t.Errorf("write: %v", err)
 				return
 			}
-			gitRun(t, dir, "add", ".")
-			gitRun(t, dir, "commit", "-m", fmt.Sprintf("step %d", i))
+			gitRunIn(t, dir, "add", ".")
+			gitRunIn(t, dir, "commit", "-m", fmt.Sprintf("step %d", i))
 			state, err := gitRepoStateIn(ctx, dir)
 			if err != nil {
 				t.Errorf("read repository state: %v", err)
@@ -362,18 +360,16 @@ func TestDeltaCommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 			hash := gitCorpusStateHash(paths, state)
 			close(reindexing[i])
 			started++
-			if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, hash); err != nil {
+			if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, hash); err != nil {
 				t.Errorf("reindex: %v", err)
 				return
 			}
 		}
-	}()
+	})
 
 	for i := range iterations {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			<-reindexing[idx]
+		wg.Go(func() {
+			<-reindexing[i]
 			res, err := searchPlannedCorpusForTest(ctx, plan, "concurrent_delta_stable")
 			if err != nil {
 				searchErr.Add(1)
@@ -382,7 +378,7 @@ func TestDeltaCommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 			if len(res) == 0 {
 				missed.Add(1)
 			}
-		}(i)
+		})
 	}
 	wg.Wait()
 

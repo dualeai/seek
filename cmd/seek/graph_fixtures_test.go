@@ -275,7 +275,8 @@ func markerScriptBody(marker string) string {
 	return "#!/bin/sh\nmkdir -p '" + filepath.Dir(marker) + "'\ntouch '" + marker + "'\n"
 }
 
-func writeFixtureFile(t *testing.T, path, content string) {
+// writeFixtureFile writes content to path and makes the parent folders.
+func writeFixtureFile(t testing.TB, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
@@ -285,7 +286,7 @@ func writeFixtureFile(t *testing.T, path, content string) {
 	}
 }
 
-func writeExecutable(t *testing.T, path, content string) {
+func writeExecutable(t testing.TB, path, content string) {
 	t.Helper()
 	writeFixtureFile(t, path, content)
 	if err := os.Chmod(path, 0o755); err != nil {
@@ -358,3 +359,18 @@ for arg do
   esac
 done
 `
+
+// installGitShim puts a git script first on PATH until the test ends. The
+// script runs gitShimSubcommand, then body. SEEK_TEST_REAL_GIT names the real
+// Git, so body can pass a call on to it.
+func installGitShim(t *testing.T, body string) {
+	t.Helper()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	writeExecutable(t, filepath.Join(dir, "git"), "#!/bin/sh\n"+gitShimSubcommand+body)
+	t.Setenv("SEEK_TEST_REAL_GIT", realGit)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}

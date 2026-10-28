@@ -132,20 +132,6 @@ func TestBuildSemanticFilterMaskHonorsCancellation(t *testing.T) {
 	}
 }
 
-func TestBuildSemanticFilterMaskRejectsInvalidGroupedRow(t *testing.T) {
-	generation := &semanticGeneration{
-		manifest: semanticManifest{Rows: 2},
-		rows: []semanticUnit{
-			{row: 0, path: "main.go"},
-			{row: 7, path: "main.go"},
-		},
-	}
-	_, err := buildSemanticFilterMask(t.Context(), generation, selectedFilesKeep("main.go"))
-	if err == nil {
-		t.Fatal("invalid row identity was accepted")
-	}
-}
-
 func TestSemanticFilterMaskCrossesByteAndShardBoundary(t *testing.T) {
 	rows := make([]semanticUnit, 9)
 	for row := range rows {

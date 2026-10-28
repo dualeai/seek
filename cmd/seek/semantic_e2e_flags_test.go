@@ -25,10 +25,8 @@ const e2eFlagQuery = "zqalpha zqbeta"
 // e2eFlagScoredNames returns the base name of each document that scorer
 // scored, over all its calls, sorted. A document that the search scores twice
 // shows twice (documentPaths).
-func e2eFlagScoredNames(scorer *hybridTestScorer) []string {
-	scorer.mu.Lock()
-	paths := documentPaths(scorer.documents)
-	scorer.mu.Unlock()
+func e2eFlagScoredNames(scorer *observedModel) []string {
+	paths := documentPaths(scorer.documents())
 	names := make([]string, len(paths))
 	for index, path := range paths {
 		names[index] = filepath.Base(path)
@@ -598,12 +596,12 @@ func TestE2EFlagNoVectorResultExitsOneWithNoOutput(t *testing.T) {
 	t.Chdir(f.path("tree"))
 	live := []string{"committed.go", "folder.go", "modified.go", "untracked.go"}
 	for _, flags := range [][]string{nil, {"-n", "1", "-m", "1", "-C", "5"}} {
-		var scorers []*hybridTestScorer
+		var scorers []*observedModel
 		args := append(slices.Clone(flags), e2eFlagQuery, ".")
 		output, err := e2eFlagColdWarm(t, func() (string, error) {
-			scorer := &hybridTestScorer{mode: payloadReject}
+			scorer := observeModel(&hybridTestScorer{mode: payloadReject})
 			scorers = append(scorers, scorer)
-			return seekWith(t, modelFactory(scorer), args...)
+			return seekWith(t, scorer.factory(), args...)
 		})
 		var stderr bytes.Buffer
 		reportCLIError(&stderr, err, false)
@@ -710,12 +708,12 @@ func TestE2EFlagPathOperandsScopeVectorHits(t *testing.T) {
 		{"folder and its symlink", []string{ext, extLink}, extFiles, ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			var scorers []*hybridTestScorer
+			var scorers []*observedModel
 			args := append([]string{e2eFlagQuery}, test.operands...)
 			output, err := e2eFlagColdWarm(t, func() (string, error) {
-				scorer := &hybridTestScorer{mode: payloadAccept}
+				scorer := observeModel(&hybridTestScorer{mode: payloadAccept})
 				scorers = append(scorers, scorer)
-				return seekWith(t, modelFactory(scorer), args...)
+				return seekWith(t, scorer.factory(), args...)
 			})
 			if err != nil {
 				t.Fatalf("%v: %v\n%s", args, err, output)
@@ -749,7 +747,7 @@ func TestE2EFlagPathOperandsScopeVectorHits(t *testing.T) {
 					t.Fatalf("%v: the model scored %v, want only %v", test.operands, got, want)
 				}
 			}
-			if embeds := scorers[1].embedCalls.Load(); embeds != 0 {
+			if embeds := scorers[1].embeds.Load(); embeds != 0 {
 				t.Fatalf("%v: the warm search embedded units in %d calls, want 0", test.operands, embeds)
 			}
 		})

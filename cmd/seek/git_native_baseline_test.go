@@ -250,7 +250,7 @@ func TestNativeGitIndexer_AlternatesIsComplete(t *testing.T) {
 // gitlink has none. The one repository record has the Seek name and source,
 // one HEAD branch, and none of the zoekt.* config values.
 func TestNativeGitIndexer_VisibleContract(t *testing.T) {
-	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
+	swapForTest(t, &documentContentLimit, testDocumentContentLimit)
 	requireTools(t)
 	repoDir := initEmptyGitRepo(t)
 

@@ -97,7 +97,7 @@ func TestQuerySupportRowsRoute(t *testing.T) {
 			if _, err := query.Parse(pattern); err != nil && row.id != "T31" {
 				t.Fatalf("Zoekt rejects %q: %v", pattern, err)
 			}
-			raw, _, err := parseSearchQueryForms(pattern)
+			raw, _, _, err := parseQueryHalves(pattern)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -178,7 +178,7 @@ func TestCppFallbackKeepsFilters(t *testing.T) {
 		t.Fatalf("output=%q err=%v, want parse.go only", output, err)
 	}
 	for _, pattern := range []string{"find C++ -handler", "find C++ OR handler"} {
-		if _, _, err := parseSearchQueryForms(pattern); err != nil {
+		if _, _, _, err := parseQueryHalves(pattern); err != nil {
 			t.Errorf("%q: %v", pattern, err)
 		}
 	}
@@ -194,7 +194,7 @@ func TestCppFallbackKeepsFilters(t *testing.T) {
 				pattern, got.modelQuery, len(got.filters), model)
 		}
 	}
-	raw, _, err := parseSearchQueryForms("\"foo  bar\" C++")
+	raw, _, _, err := parseQueryHalves("\"foo  bar\" C++")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +210,7 @@ var strictFilterRows = map[string]bool{"T11": true, "T18": true, "T19": true}
 // is not eligible for the model routes.
 func planFor(t *testing.T, pattern string) rerankQueryPlan {
 	t.Helper()
-	raw, _, err := parseSearchQueryForms(pattern)
+	raw, _, _, err := parseQueryHalves(pattern)
 	if err != nil {
 		t.Fatal(err)
 	}

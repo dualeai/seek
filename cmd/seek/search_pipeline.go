@@ -1,11 +1,11 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,9 +22,9 @@ import (
 )
 
 // The one search pipeline moves three stage types between its stages: a
-// queryPlan in, nodeHits from each node, and one ranked list out. A query with
-// no model stage gets corpusSearchResult values from each node (strictNode)
-// and has no ranked list.
+// queryPlan in, nodeHits from each node, and one ranked list of nodeHits out
+// (rankModelQuery). A query with no model stage gets corpusSearchResult values
+// from each node (strictNode) and has no ranked list.
 
 // Retrieval rule: a semantic hit is a row whose summed fine MaxSim F reaches
 // S0 + (tau_file - delta) * T (semanticRetrievalFloor). S0 is the
@@ -166,45 +166,67 @@ type nodeHit struct {
 
 type nodeHits []nodeHit
 
-// ranked is the pipeline output: the accepted files in display order.
-type ranked struct {
-	hits nodeHits
-}
-
 func (hit nodeHit) displayPath() string {
 	return filepath.Join(hit.displayRoot, hit.path)
 }
 
-// compareNodeHits is the one tie key: score, then the display path,
-// then the unit start. Corpus and generation IDs are never order keys, so the
-// order does not depend on how the search splits into nodes.
-func compareNodeHits(left, right nodeHit) int {
+// nodeHitKey is the one tie key of a hit: score, then the display path, then
+// the unit start. Corpus and generation IDs are never order keys, so the order
+// does not depend on how the search splits into nodes.
+type nodeHitKey struct {
+	score float32
+	path  string
+	start uint64
+}
+
+// nodeHitKeys gives the tie key of each hit. A sort reads the keys, so it
+// builds each display path once and moves no hit.
+func nodeHitKeys(hits nodeHits) []nodeHitKey {
+	keys := make([]nodeHitKey, len(hits))
+	for index := range hits {
+		keys[index] = nodeHitKey{score: hits[index].score, path: hits[index].displayPath(), start: hits[index].start}
+	}
+	return keys
+}
+
+// compareNodeHits compares two tie keys: the higher score first.
+func compareNodeHits(left, right nodeHitKey) int {
 	switch {
 	case left.score > right.score:
 		return -1
 	case left.score < right.score:
 		return 1
 	}
-	if c := strings.Compare(left.displayPath(), right.displayPath()); c != 0 {
+	if c := strings.Compare(left.path, right.path); c != 0 {
 		return c
 	}
-	switch {
-	case left.start < right.start:
-		return -1
-	case left.start > right.start:
-		return 1
-	}
-	return 0
+	return cmp.Compare(left.start, right.start)
 }
 
-// mergeNodeHits sorts a copy of the hits of every node once with the tie key.
-// It then collapses copies with the same content and match on the sorted
-// list. The representative is the copy with the smallest tie key, and the
-// other paths follow in order. The same (corpus, path) twice keeps its first,
-// best hit. No step cuts a node's hits.
+// sortByNodeHitKey sorts positions by the tie keys of their hits. Equal keys
+// keep the order of their positions, as a stable sort does. A hit is 632
+// bytes, so the sort moves positions, not hits. The merge of 30,000 hits took
+// 55 to 73 ms with a stable sort of the hits, and 21 to 24 ms with this sort.
+func sortByNodeHitKey(positions []int, keys []nodeHitKey) {
+	slices.SortFunc(positions, func(left, right int) int {
+		if c := compareNodeHits(keys[left], keys[right]); c != 0 {
+			return c
+		}
+		return cmp.Compare(left, right)
+	})
+}
+
+// mergeNodeHits sorts the hits of every node once with the tie key. It then
+// collapses copies with the same content and match on the sorted list. The
+// representative is the copy with the smallest tie key, and the other paths
+// follow in order. The same (corpus, path) twice keeps its first, best hit. No
+// step cuts a node's hits. The result is a new slice.
 func mergeNodeHits(hits nodeHits) nodeHits {
-	merged := slices.Clone(hits)
-	sortNodeHits(merged)
+	order := make([]int, len(hits))
+	for index := range order {
+		order[index] = index
+	}
+	sortByNodeHitKey(order, nodeHitKeys(hits))
 	type fileKey struct {
 		corpus corpusID
 		path   string
@@ -213,10 +235,11 @@ func mergeNodeHits(hits nodeHits) nodeHits {
 		content semanticContentID
 		match   string
 	}
-	seenFiles := make(map[fileKey]struct{}, len(merged))
-	representative := make(map[copyKey]int, len(merged))
-	out := merged[:0]
-	for _, hit := range merged {
+	seenFiles := make(map[fileKey]struct{}, len(hits))
+	representative := make(map[copyKey]int, len(hits))
+	out := make(nodeHits, 0, len(hits))
+	for _, index := range order {
+		hit := &hits[index]
 		file := fileKey{corpus: hit.corpus, path: hit.path}
 		if _, seen := seenFiles[file]; seen {
 			continue
@@ -230,31 +253,26 @@ func mergeNodeHits(hits nodeHits) nodeHits {
 			}
 			representative[key] = len(out)
 		}
-		out = append(out, hit)
+		out = append(out, *hit)
 	}
 	return out
 }
 
-func sortNodeHits(hits nodeHits) {
-	slices.SortStableFunc(hits, compareNodeHits)
-}
-
-// candidateFiles gives the set that the model scores. The set holds the strict
-// all-word files, which are admitted and need a model rank. It also holds
-// every file with a semantic hit within the retrieval radius, with no count. A
-// relaxed lexical match alone is a rank signal, not a candidate. It has no row
-// within the radius, so it cannot pass tau_file. Relaxed matching returns
-// 2,819 to 31,238 files of a Kubernetes checkout for a description. A
-// name-only file (a binary file, a macOS dataless file, a missing blob) has no
-// model text. It enters only as a strict all-word match, and the model never
-// scores it.
+// candidateFiles gives the set that the model scores, and the name-only files
+// apart. Each hit (nodeEvidenceHits) is a strict all-word file, which is
+// admitted and needs a model rank, or a file with a semantic hit within the
+// retrieval radius. The set holds every hit that is not name-only, with no
+// count. A relaxed lexical match alone is a rank signal, not a candidate, so
+// the relaxed search reads only the semantic files. A file with no row within
+// the radius cannot pass tau_file, and relaxed matching returns 2,819 to
+// 31,238 files of a Kubernetes checkout for a description. A name-only file (a
+// binary file, a macOS dataless file, a missing blob) has no model text. It
+// enters only as a strict all-word match, and the model never scores it.
 func candidateFiles(hits nodeHits) (scored nodeHits, nameOnly nodeHits) {
 	for _, hit := range hits {
-		switch {
-		case hit.nameOnly && hit.strict:
+		if hit.nameOnly {
 			nameOnly = append(nameOnly, hit)
-		case hit.nameOnly:
-		case hit.strict || hit.semantic:
+		} else {
 			scored = append(scored, hit)
 		}
 	}
@@ -262,9 +280,9 @@ func candidateFiles(hits nodeHits) (scored nodeHits, nameOnly nodeHits) {
 }
 
 // acceptFiles admits every strict all-word file. It also admits each
-// model-added file whose lift (s(f) - emptyScore)/T passes tauFile on its own,
-// with no candidate count. So the verdict for a file does not depend on the
-// other candidates. The order is weighted reciprocal-rank fusion of the
+// model-added file whose lift (s(f) - emptyScore)/T passes pipelineTauFile on
+// its own, with no candidate count. So the verdict for a file does not depend
+// on the other candidates. The order is weighted reciprocal-rank fusion of the
 // lexical rank (strict files first, then relaxed) and the model rank (2:1,
 // k = 60). scores holds one raw model score per scored candidate. The nameOnly
 // files come after them in tie order.
@@ -273,17 +291,14 @@ func acceptFiles(
 	scores []float32,
 	emptyScore float32,
 	activeTokens int,
-	tauFile float32,
 	nameOnly nodeHits,
-) (ranked, error) {
-	if len(scores) != len(scored) {
-		return ranked{}, fmt.Errorf("model scores %d candidates, want %d", len(scores), len(scored))
-	}
-	if activeTokens <= 0 {
-		return ranked{}, fmt.Errorf("semantic query has no active tokens")
-	}
+) nodeHits {
+	keys := nodeHitKeys(scored)
 	lexicalRank := ranks(len(scored), func(left, right int) int {
-		return compareLexicalRank(scored[left], scored[right])
+		if c := lexicalClass(&scored[left]) - lexicalClass(&scored[right]); c != 0 {
+			return c
+		}
+		return compareNodeHits(keys[left], keys[right])
 	})
 	// Semantic-only files share the last lexical rank, so the model alone
 	// orders them; their vector score is not a lexical signal.
@@ -305,34 +320,39 @@ func acceptFiles(
 		case scores[left] < scores[right]:
 			return 1
 		}
-		return compareNodeHits(scored[left], scored[right])
+		return compareNodeHits(keys[left], keys[right])
 	})
-	accepted := make(nodeHits, 0, len(scored)+len(nameOnly))
+	var kept []int
 	for index, hit := range scored {
-		if math.IsNaN(float64(scores[index])) || math.IsInf(float64(scores[index]), 0) {
-			return ranked{}, fmt.Errorf("invalid model score")
-		}
-		if !hit.strict && !meanMaxSimPasses(scores[index], emptyScore, activeTokens, tauFile) {
+		if !hit.strict && !meanMaxSimPasses(scores[index], emptyScore, activeTokens) {
 			continue
 		}
-		fused := hit
-		fused.score = float32(rerankLexicalWeight/(rerankRRFConstant+float64(lexicalRank[index])) +
+		keys[index].score = float32(rerankLexicalWeight/(rerankRRFConstant+float64(lexicalRank[index])) +
 			1/(rerankRRFConstant+float64(modelRank[index])))
-		accepted = append(accepted, fused)
+		kept = append(kept, index)
 	}
-	sortNodeHits(accepted)
-	accepted = append(accepted, nameOnly...)
-	return ranked{hits: accepted}, nil
+	sortByNodeHitKey(kept, keys)
+	accepted := make(nodeHits, 0, len(kept)+len(nameOnly))
+	for _, index := range kept {
+		accepted = append(accepted, scored[index])
+		accepted[len(accepted)-1].score = keys[index].score
+	}
+	return append(accepted, nameOnly...)
 }
 
-// ranks gives each of n items its rank from 1 in the stable order of compare,
-// which compares two item indexes.
+// ranks gives each of n items its rank from 1 in the order of compare, which
+// compares two item indexes. Equal items keep their index order.
 func ranks(n int, compare func(left, right int) int) []int {
 	order := make([]int, n)
 	for index := range order {
 		order[index] = index
 	}
-	slices.SortStableFunc(order, compare)
+	slices.SortFunc(order, func(left, right int) int {
+		if c := compare(left, right); c != 0 {
+			return c
+		}
+		return cmp.Compare(left, right)
+	})
 	rank := make([]int, n)
 	for position, index := range order {
 		rank[index] = position + 1
@@ -340,31 +360,24 @@ func ranks(n int, compare func(left, right int) int) []int {
 	return rank
 }
 
-// compareLexicalRank orders strict all-word files first, then relaxed lexical
-// files, each by their lexical score and the tie key. Semantic-only files
-// come last, and acceptFiles gives them one shared rank.
-func compareLexicalRank(left, right nodeHit) int {
-	rank := func(hit nodeHit) int {
-		switch {
-		case hit.strict:
-			return 0
-		case hit.lexical:
-			return 1
-		}
-		return 2
+// lexicalClass orders strict all-word files first, then relaxed lexical
+// files; each class sorts by the lexical score and the tie key. Semantic-only
+// files come last, and acceptFiles gives them one shared rank.
+func lexicalClass(hit *nodeHit) int {
+	switch {
+	case hit.strict:
+		return 0
+	case hit.lexical:
+		return 1
 	}
-	if c := rank(left) - rank(right); c != 0 {
-		return c
-	}
-	return compareNodeHits(left, right)
+	return 2
 }
 
 // openedNode is a prepared node: what the read step of a route reads. Its
 // index is current, or with indexState corpusStale the last complete one (a
-// failed build, a peer's build). state is the Git status of the capture.
+// failed build, a peer's build).
 type openedNode struct {
 	plan       node
-	state      repoState
 	indexState corpusIndexState
 	dirty      dirtyFileSet
 	// version gives the state that the index must hold at read time. It also
@@ -763,14 +776,14 @@ type queryPlan struct {
 }
 
 // planQuery parses pattern into the stage-one plan. It plans the model stages
-// only when policy enables semantic search.
+// only for the semanticSearch policy.
 func planQuery(pattern string, policy searchPolicy) (queryPlan, error) {
 	raw, strict, halves, err := parseQueryHalves(pattern)
 	if err != nil {
 		return queryPlan{}, err
 	}
 	plan := queryPlan{raw: raw, strict: strict, halves: halves}
-	if policy.semanticEnabled() {
+	if policy == semanticSearch {
 		if model, ok := planRerankQuery(raw); ok {
 			plan.model = &model
 		}
@@ -787,7 +800,7 @@ func strictNode(ctx context.Context, plan node, qp queryPlan, config searchConfi
 	err := openNode(ctx, plan, execution, func(node openedNode) error {
 		results, dirty, nameOnly = nil, node.dirty, 0
 		if node.indexState == corpusKnownEmpty {
-			touchPlanUsed(node.plan)
+			touchUsed(node.plan.cacheDir)
 			return nil
 		}
 		// One read lock and one shard load cover the file listing, the search
@@ -812,7 +825,7 @@ func strictNode(ctx context.Context, plan node, qp queryPlan, config searchConfi
 		if err != nil {
 			return err
 		}
-		touchPlanUsed(node.plan)
+		touchUsed(node.plan.cacheDir)
 		results = wrapCorpusResults(node.plan, files)
 		return nil
 	})
@@ -836,13 +849,13 @@ func retrieveNode(ctx context.Context, plan node, qp queryPlan, config searchCon
 	err := openNode(ctx, plan, execution, func(node openedNode) error {
 		hits, dirty, nameOnly = nil, node.dirty, 0
 		if node.indexState == corpusKnownEmpty {
-			touchPlanUsed(node.plan)
+			touchUsed(node.plan.cacheDir)
 			return nil
 		}
 		var readErr error
 		hits, readErr = readNodeEvidence(ctx, node, qp, config, execution, &nameOnly)
 		if readErr == nil {
-			touchPlanUsed(node.plan)
+			touchUsed(node.plan.cacheDir)
 		}
 		return readErr
 	})
@@ -1314,13 +1327,13 @@ func lexicalMatchKey(file zoekt.FileMatch) string {
 
 // rankModelQuery runs the model stages over the merged hits:
 // the candidate set, the model score of each candidate in batches, and the
-// per-file acceptance. A model error gives the strict order with one debug
-// line.
-func rankModelQuery(ctx context.Context, hits nodeHits, qp queryPlan, execution searchExecution) (ranked, error) {
+// per-file acceptance. It gives the accepted files in display order. A model
+// error gives the strict order with one debug line.
+func rankModelQuery(ctx context.Context, hits nodeHits, qp queryPlan, execution searchExecution) (nodeHits, error) {
 	merged := mergeNodeHits(hits)
 	scored, nameOnly := candidateFiles(merged)
 	if len(scored) == 0 {
-		return ranked{hits: nameOnly}, nil
+		return nameOnly, nil
 	}
 	model, prepared, err := execution.model.prepareQuery(ctx, qp.model.modelQuery)
 	if err == nil && (model == nil || prepared == nil) {
@@ -1339,17 +1352,14 @@ func rankModelQuery(ctx context.Context, hits nodeHits, qp queryPlan, execution 
 		activeTokens, err = semanticQueryTokenCount(prepared)
 	}
 	if err == nil {
-		var accepted ranked
-		accepted, err = acceptFiles(scored, scores, prepared.emptyScore, activeTokens, pipelineTauFile, nameOnly)
-		if err == nil {
-			slog.Debug("Accepted model candidates", "candidates", len(scored),
-				"accepted", len(accepted.hits)-len(nameOnly), "tau_file", pipelineTauFile,
-				"empty_score", prepared.emptyScore)
-			return accepted, nil
-		}
+		accepted := acceptFiles(scored, scores, prepared.emptyScore, activeTokens, nameOnly)
+		slog.Debug("Accepted model candidates", "candidates", len(scored),
+			"accepted", len(accepted)-len(nameOnly), "tau_file", pipelineTauFile,
+			"empty_score", prepared.emptyScore)
+		return accepted, nil
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return ranked{}, ctxErr
+		return nil, ctxErr
 	}
 	slog.Debug("Model stages failed; using strict order", "provider", semanticProviderName(), "error", err)
 	execution.model.recordFault(err)
@@ -1359,13 +1369,13 @@ func rankModelQuery(ctx context.Context, hits nodeHits, qp queryPlan, execution 
 			strict = append(strict, hit)
 		}
 	}
-	return ranked{hits: strict}, nil
+	return strict, nil
 }
 
 // presentRanked turns the ranked hits into display results in rank order.
-func presentRanked(r ranked) []corpusSearchResult {
-	out := make([]corpusSearchResult, len(r.hits))
-	for index, hit := range r.hits {
+func presentRanked(hits nodeHits) []corpusSearchResult {
+	out := make([]corpusSearchResult, len(hits))
+	for index, hit := range hits {
 		result := hit.display
 		result.rankOverride = index + 1
 		result.also = hit.also

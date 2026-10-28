@@ -108,8 +108,8 @@ func TestDeltaUncommitted_DirtyToCommittedLeavesOneCopy(t *testing.T) {
 	}
 
 	// Commit it and index. The dirty set is now empty.
-	gitRun(t, dir, "add", ".")
-	gitRun(t, dir, "commit", "-m", "promote dirty to committed")
+	gitRunIn(t, dir, "add", ".")
+	gitRunIn(t, dir, "commit", "-m", "promote dirty to committed")
 	reindexGit(t, ctx, paths, plan)
 
 	results, err := searchPlannedCorpusForTest(ctx, plan, "dirty_then_committed")
@@ -173,7 +173,7 @@ func TestDeltaUncommitted_EmptyDirtySetCleansShards(t *testing.T) {
 
 	// Revert the file to its committed content. The next cycle's dirty set
 	// is empty → shards must be cleaned and the manifest dropped.
-	gitRun(t, dir, "checkout", "--", "app.go")
+	gitRunIn(t, dir, "checkout", "--", "app.go")
 	reindexGit(t, ctx, paths, plan)
 
 	if got := repositoryShardCount(plan.indexDir, repoUncommitted); got != 0 {
@@ -601,7 +601,7 @@ func TestDeltaUncommitted_TombstonedBytesCompactTheFamily(t *testing.T) {
 	requireTools(t)
 	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
 	// shard) below the bytes of two of these files of 634 bytes.
-	swapShardMaxForTest(t, 1024)
+	swapForTest(t, &shardMax, 1024)
 	dir := initGitRepo(t, "app.go", "package main\n// committed_base\n")
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
@@ -679,7 +679,7 @@ func TestDeltaUncommitted_TextFileThatBecomesBinaryCompacts(t *testing.T) {
 	requireTools(t)
 	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
 	// shard) below the bytes of two of these files of 634 bytes.
-	swapShardMaxForTest(t, 1024)
+	swapForTest(t, &shardMax, 1024)
 	dir := initGitRepo(t, "app.go", "package main\n// committed_base\n")
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
@@ -717,7 +717,7 @@ func TestDeltaUncommitted_BinaryFileThatBecomesTextStaysADelta(t *testing.T) {
 	requireTools(t)
 	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
 	// shard) below the bytes of two of these files of 634 bytes.
-	swapShardMaxForTest(t, 1024)
+	swapForTest(t, &shardMax, 1024)
 	dir := initGitRepo(t, "app.go", "package main\n// committed_base\n")
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
@@ -759,7 +759,7 @@ func TestDeltaUncommitted_BinaryFilesCountTheirMarker(t *testing.T) {
 	requireTools(t)
 	// A shardMax of 1 KiB puts the floor of deltaNeedsCompaction (one full
 	// shard) below the bytes of two of these files of 634 bytes.
-	swapShardMaxForTest(t, 1024)
+	swapForTest(t, &shardMax, 1024)
 	dir := initGitRepo(t, "app.go", "package main\n// committed_base\n")
 	ctx := context.Background()
 	paths, plan := planGitTestCorpus(t, dir)
@@ -824,9 +824,7 @@ func TestDeltaUncommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 		reindexing[i] = make(chan struct{})
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		started := 0
 		// A writer that stops early starts the remaining searches.
 		defer func() {
@@ -847,18 +845,16 @@ func TestDeltaUncommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 			hash := gitCorpusStateHash(paths, state)
 			close(reindexing[i])
 			started++
-			if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, hash); err != nil {
+			if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, hash); err != nil {
 				t.Errorf("reindex: %v", err)
 				return
 			}
 		}
-	}()
+	})
 
 	for i := range iterations {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			<-reindexing[idx]
+		wg.Go(func() {
+			<-reindexing[i]
 			res, err := searchPlannedCorpusForTest(ctx, plan, "uncommitted_concurrent_stable")
 			if err != nil {
 				searchErr.Add(1)
@@ -867,7 +863,7 @@ func TestDeltaUncommitted_ConcurrentSearchSeesConsistentResults(t *testing.T) {
 			if len(res) == 0 {
 				missed.Add(1)
 			}
-		}(i)
+		})
 	}
 	wg.Wait()
 

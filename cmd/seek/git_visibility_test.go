@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"testing"
 )
@@ -184,13 +183,8 @@ func TestGitVisibility_LeadingColonOperands(t *testing.T) {
 	}
 }
 
+// writeFileAt is writeFixtureFile for the path rel below repo.
 func writeFileAt(tb testing.TB, repo, rel, content string) {
 	tb.Helper()
-	p := filepath.Join(repo, rel)
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		tb.Fatal(err)
-	}
-	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
-		tb.Fatal(err)
-	}
+	writeFixtureFile(tb, filepath.Join(repo, rel), content)
 }

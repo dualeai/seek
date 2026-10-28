@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"path/filepath"
-	"sort"
+	"strings"
 
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/query"
@@ -22,16 +22,27 @@ type displayOperand struct {
 	root  string
 }
 
-// displayOperands is deepest first.
-type displayOperands []displayOperand
+// displayOperands holds the operands. The zero value has no operand.
+type displayOperands struct {
+	// byRoot holds the first operand of each root (header).
+	byRoot map[string]displayOperand
+	// typedAsPath holds each operand root and each folder above one. The
+	// value is true when every operand at or below the folder is typed as the
+	// path of its root below the folder: "" for the folder itself
+	// (headersArePaths).
+	typedAsPath map[string]bool
+}
 
-// newDisplayOperands resolves the path operands, or "." when there are none,
-// deepest root first. An operand with no absolute path is skipped.
+// newDisplayOperands resolves the path operands, or "." when there are none.
+// An operand with no absolute path is skipped.
 func newDisplayOperands(operands []string) displayOperands {
 	if len(operands) == 0 {
 		operands = []string{"."}
 	}
-	out := make(displayOperands, 0, len(operands))
+	resolved := displayOperands{
+		byRoot:      make(map[string]displayOperand, len(operands)),
+		typedAsPath: make(map[string]bool, len(operands)),
+	}
 	for _, operand := range operands {
 		abs, err := filepath.Abs(operand)
 		if err != nil {
@@ -44,23 +55,52 @@ func newDisplayOperands(operands []string) displayOperands {
 		if typed == "." {
 			typed = ""
 		}
-		out = append(out, displayOperand{typed: typed, root: root})
+		resolved.add(displayOperand{typed: typed, root: root})
 	}
-	sort.SliceStable(out, func(left, right int) bool { return len(out[left].root) > len(out[right].root) })
-	return out
+	return resolved
 }
 
-// header is the display path of the file at abs.
+// add puts the operand in both maps. It updates the entry of the root and of
+// each folder above it, so its cost grows only with the folder depth.
+// headersArePaths then reads the answer for a node from one entry.
+func (operands displayOperands) add(operand displayOperand) {
+	if _, ok := operands.byRoot[operand.root]; !ok {
+		operands.byRoot[operand.root] = operand
+	}
+	for dir, ok := operand.root, true; ok; dir, ok = parentFolder(dir) {
+		if typed, seen := operands.typedAsPath[dir]; !seen || typed {
+			rel := strings.TrimPrefix(operand.root[len(dir):], string(filepath.Separator))
+			operands.typedAsPath[dir] = operand.typed == rel
+		}
+	}
+}
+
+// parentFolder returns the folder that holds the clean path dir. It returns
+// false for "/" and for a path with no separator. It cuts bytes: filepath.Dir
+// would clean each parent again.
+func parentFolder(dir string) (string, bool) {
+	cut := strings.LastIndexByte(dir, filepath.Separator)
+	if cut < 0 || dir == string(filepath.Separator) {
+		return "", false
+	}
+	return dir[:max(cut, 1)], true
+}
+
+// header is the display path of the file at abs, or abs when no operand holds
+// it. Each root is a clean absolute path (canonicalCorpusPath, onDiskPath), so
+// only abs and its parent folders can be the root of an operand that holds
+// abs. header looks them up, deepest first: the cost does not grow with the
+// operand count.
 func (operands displayOperands) header(abs string) string {
-	for _, operand := range operands {
-		rel, ok := relWithin(operand.root, abs)
-		if !ok {
-			continue
+	path := filepath.Clean(abs)
+	for dir, ok := path, true; ok; dir, ok = parentFolder(dir) {
+		if operand, held := operands.byRoot[dir]; held {
+			if dir == path {
+				return operand.typed
+			}
+			rel := strings.TrimPrefix(path[len(dir):], string(filepath.Separator))
+			return filepath.Join(operand.typed, rel)
 		}
-		if rel == "." {
-			return operand.typed
-		}
-		return filepath.Join(operand.typed, rel)
 	}
 	return abs
 }
@@ -68,30 +108,25 @@ func (operands displayOperands) header(abs string) string {
 // headersArePaths reports whether every file of the node at root shows its
 // node-relative path, so a file: filter needs no rewrite. That is so when
 // three conditions hold:
-//   - The operand at the root, if any, is ".".
+//   - At least one operand is at or below the root.
+//   - Each operand at or below the root is typed as its path below the root
+//     ("." at the root).
 //   - No operand above the root is the deepest one that holds it.
-//   - Every operand below the root is typed as its path below the root.
+//
+// Each node calls it. It reads the maps that newDisplayOperands built once,
+// so its cost does not grow with the operand count.
 func (operands displayOperands) headersArePaths(root string) bool {
-	holder, below := false, false
-	for _, operand := range operands {
-		rel, inside := relWithin(root, operand.root)
-		switch {
-		case inside && rel == ".":
-			if operand.typed != "" {
-				return false
-			}
-			holder = true
-		case inside:
-			if operand.typed != rel {
-				return false
-			}
-			below = true
-		case !holder && pathWithin(operand.root, root):
-			// The deepest operand that holds the root is above it.
-			return false
+	root = filepath.Clean(root)
+	if !operands.typedAsPath[root] {
+		return false
+	}
+	// The deepest operand that holds the root, if any, has its root there.
+	for dir, ok := root, true; ok; dir, ok = parentFolder(dir) {
+		if _, held := operands.byRoot[dir]; held {
+			return dir == root
 		}
 	}
-	return holder || below
+	return true
 }
 
 // applyHeaders sets the display path of every result and of its copies. It
@@ -188,7 +223,7 @@ func nodeHeaderQuery(ctx context.Context, read *nodeRead, qp queryPlan, operands
 	if !hasFileNameAtom(qp.halves, queries...) {
 		return qp, nil
 	}
-	if len(operands) == 0 || operands.headersArePaths(plan.displayRoot) {
+	if len(operands.byRoot) == 0 || operands.headersArePaths(plan.displayRoot) {
 		// The headers are the index paths: Zoekt matches each explicit
 		// file: atom on them and adds its file-name term. The header sets
 		// below keep that term (the atom-or-not-atom clause).
@@ -268,19 +303,4 @@ func rewriteFileNameAtoms(qp queryPlan, replace func(query.Q) query.Q) queryPlan
 		out.model = &model
 	}
 	return out
-}
-
-// displayHeader is the header of a result. For a result with no header, it is
-// the path joined to its display root with showRoot, else the display name,
-// else the node-relative path.
-func displayHeader(result corpusSearchResult, showRoot bool) string {
-	switch {
-	case result.header != "":
-		return result.header
-	case showRoot:
-		return filepath.Join(result.displayRoot, result.file.FileName)
-	case result.displayName != "":
-		return result.displayName
-	}
-	return result.file.FileName
 }

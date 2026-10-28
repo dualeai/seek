@@ -169,13 +169,14 @@ func TestRootCmd_RejectsNegativeLimit(t *testing.T) {
 }
 
 // TestSearchRunConfigBindsTheModelFactory checks which model factory the run
-// config binds. The default policy binds the given factory. The lexical-only
-// policy binds no factory, so a --lexical-only search starts no model.
+// config binds. The semanticSearch policy binds the given factory. The
+// lexicalOnlySearch policy binds no factory, so a --lexical-only search starts
+// no model.
 func TestSearchRunConfigBindsTheModelFactory(t *testing.T) {
-	if config := newSearchRunConfig(defaultSearchPolicy(), newLateOnSemanticModel); config.newModel == nil {
-		t.Fatalf("default run config has no model: %+v", config)
+	if config := newSearchRunConfig(semanticSearch, newLateOnSemanticModel); config.newModel == nil {
+		t.Fatalf("semantic run config has no model: %+v", config)
 	}
-	if lexical := newSearchRunConfig(lexicalOnlySearchPolicy(), newLateOnSemanticModel); lexical.newModel != nil {
+	if lexical := newSearchRunConfig(lexicalOnlySearch, newLateOnSemanticModel); lexical.newModel != nil {
 		t.Fatalf("lexical-only run config started a model: %+v", lexical)
 	}
 }
@@ -365,9 +366,9 @@ func TestSuggestFlagError_NoSuggestionWhenTooFar(t *testing.T) {
 }
 
 // TestSuggestFlagError_SubcommandInheritedFlag checks that a typo of an
-// inherited persistent flag on the gc subcommand still gets a suggestion. It
-// covers the InheritedFlags branch of collectFlagNames (the local Flags of
-// `gc` do not include --verbose).
+// inherited persistent flag on the gc subcommand still gets a suggestion. gc
+// sets no flag error function and declares no --verbose, so the hint needs
+// the function of the root and the parsed flag set of gc.
 func TestSuggestFlagError_SubcommandInheritedFlag(t *testing.T) {
 	root := newQuietRootCmd()
 	root.SetArgs([]string{"gc", "--verbos"})

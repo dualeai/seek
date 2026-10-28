@@ -89,9 +89,7 @@ func TestLanguageFilterKeepsTheVectorHitsOfThatLanguage(t *testing.T) {
 			if got := headerPaths(output); !slices.Equal(got, oracle) {
 				t.Fatalf("vector results %v, want the text oracle %v:\n%s", got, oracle, output)
 			}
-			scorer.mu.Lock()
-			defer scorer.mu.Unlock()
-			for _, document := range scorer.documents {
+			for _, document := range scorer.documents() {
 				if !slices.Contains(want, filepath.Base(document.Path)) {
 					t.Fatalf("the model scored %s, which %s drops", document.Path, test.filter)
 				}
@@ -117,8 +115,8 @@ func TestLanguageFilterWithNoFileOfThatLanguage(t *testing.T) {
 	tree := languageFilterFixture(t)
 	t.Chdir(t.TempDir())
 	output, scorer, err := stubSearch(t, payloadAccept, "zqalpha zqbeta lang:rust", tree)
-	if !errors.Is(err, errNoMatch) || output != "" || scorer.scoreCalls.Load() != 0 {
-		t.Fatalf("err=%v score calls=%d output:\n%s", err, scorer.scoreCalls.Load(), output)
+	if !errors.Is(err, errNoMatch) || output != "" || scorer.scores.Load() != 0 {
+		t.Fatalf("err=%v score calls=%d output:\n%s", err, scorer.scores.Load(), output)
 	}
 }
 

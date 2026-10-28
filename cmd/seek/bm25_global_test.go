@@ -182,12 +182,12 @@ func bm25NodeSearch(t *testing.T, pattern string, operands ...string) (map[strin
 		t.Fatal(err)
 	}
 	ctx = withIndexWindow(ctx, len(plans))
-	qp, err := planQuery(pattern, lexicalOnlySearchPolicy())
+	qp, err := planQuery(pattern, lexicalOnlySearch)
 	if err != nil {
 		t.Fatal(err)
 	}
 	execution := searchExecution{
-		policy:    lexicalOnlySearchPolicy(),
+		policy:    lexicalOnlySearch,
 		resources: liveSearchResources(),
 		opened:    &openedNodes{},
 		// The operands give the headers that file: atoms read, as in a search.
@@ -445,7 +445,7 @@ func TestBM25InPlaceAverageReadsItsOwnShards(t *testing.T) {
 	}
 	// From here each file of split gets its own shard. With one shard Zoekt's
 	// score is final and no rescore runs.
-	swapShardMaxForTest(t, 64)
+	swapForTest(t, &shardMax, 64)
 	split, command := bm25NodeSearch(t, "case:yes foo", filepath.Join(root, "split"))
 	if shards := shardCount(filepath.Join(root, "split")); shards < 2 {
 		t.Fatalf("split: %d shards, want 2 or more", shards)

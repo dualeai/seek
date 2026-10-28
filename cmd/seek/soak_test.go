@@ -28,7 +28,7 @@ func TestSoak_LargeFolderStaysFresh(t *testing.T) {
 	root := t.TempDir()
 	const totalFiles = 1024
 	const fileSize int64 = 4 * 1024 * 1024 // 4 MiB, so 4 GiB in all
-	for i := 0; i < totalFiles; i++ {
+	for i := range totalFiles {
 		writeSparseFile(t, filepath.Join(root, fmt.Sprintf("f%05d.bin", i)), fileSize)
 	}
 

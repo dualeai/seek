@@ -142,7 +142,7 @@ func TestPublishKeepsAFamilyWithAnImmutableShard(t *testing.T) {
 // change.
 func TestUncommittedPublishKeepsAFamilyWithAnImmutableShard(t *testing.T) {
 	requireTools(t)
-	swapShardMaxForTest(t, 1024)
+	swapForTest(t, &shardMax, 1024)
 	dir := initGitRepo(t, "app.go", "package main\n// zqucommitted\n")
 	ctx := t.Context()
 	paths, plan := planGitTestCorpus(t, dir)
@@ -165,7 +165,7 @@ func TestUncommittedPublishKeepsAFamilyWithAnImmutableShard(t *testing.T) {
 	writeFileAt(t, dir, "u2.go", "package main\n// zqu2new\n")
 	build := func() error {
 		state := mustGitRepoStateIn(t, ctx, paths.RepoDir)
-		return runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, gitCorpusStateHash(paths, state))
+		return runIndexingWithCache(ctx, paths, plan.corpusStore, state, gitCorpusStateHash(paths, state))
 	}
 	found := func(pattern string) int {
 		t.Helper()
@@ -206,7 +206,7 @@ func TestUncommittedPublishKeepsAFamilyWithAnImmutableShard(t *testing.T) {
 // the flag cleared, the next build removes the family.
 func TestNoDirtyCleanKeepsAFamilyWithAnImmutableShard(t *testing.T) {
 	requireTools(t)
-	swapShardMaxForTest(t, 1024)
+	swapForTest(t, &shardMax, 1024)
 	dir := initGitRepo(t, "app.go", "package main\n// zqcleanapp\n")
 	ctx := t.Context()
 	paths, plan := planGitTestCorpus(t, dir)
@@ -231,7 +231,7 @@ func TestNoDirtyCleanKeepsAFamilyWithAnImmutableShard(t *testing.T) {
 	gitRunIn(t, dir, "commit", "-q", "-m", "commit the dirty files")
 	build := func() error {
 		state := mustGitRepoStateIn(t, ctx, paths.RepoDir)
-		return runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, gitCorpusStateHash(paths, state))
+		return runIndexingWithCache(ctx, paths, plan.corpusStore, state, gitCorpusStateHash(paths, state))
 	}
 	found := func(pattern string) int {
 		t.Helper()
@@ -269,7 +269,7 @@ func TestNoDirtyCleanKeepsAFamilyWithAnImmutableShard(t *testing.T) {
 // full committed rebuild, during the failure and after the flag clears.
 func TestCommittedPublishIsRecordedWhenTheUncommittedStepFails(t *testing.T) {
 	requireTools(t)
-	swapShardMaxForTest(t, 1024)
+	swapForTest(t, &shardMax, 1024)
 	dir := initGitRepo(t, "app.go", "package main\n// zqrecordc1\n")
 	ctx := t.Context()
 	paths, plan := planGitTestCorpus(t, dir)
@@ -297,7 +297,7 @@ func TestCommittedPublishIsRecordedWhenTheUncommittedStepFails(t *testing.T) {
 	writeFileAt(t, dir, "u2.go", "package main\n// zqrecordnew\n")
 	build := func() error {
 		state := mustGitRepoStateIn(t, ctx, paths.RepoDir)
-		return runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, gitCorpusStateHash(paths, state))
+		return runIndexingWithCache(ctx, paths, plan.corpusStore, state, gitCorpusStateHash(paths, state))
 	}
 	committedShard := func() os.FileInfo {
 		t.Helper()
@@ -350,7 +350,7 @@ func TestCommittedPublishIsRecordedWhenTheUncommittedStepFails(t *testing.T) {
 // next build still sees the damage.
 func TestEarlyRecordKeepsADamagedUncommittedFamilyUnnamed(t *testing.T) {
 	requireTools(t)
-	swapShardMaxForTest(t, 1024)
+	swapForTest(t, &shardMax, 1024)
 	dir := initGitRepo(t, "app.go", "package main\n// zqdamagec1\n")
 	ctx := t.Context()
 	paths, plan := planGitTestCorpus(t, dir)
@@ -377,7 +377,7 @@ func TestEarlyRecordKeepsADamagedUncommittedFamilyUnnamed(t *testing.T) {
 	gitRunIn(t, dir, "add", "app.go")
 	gitRunIn(t, dir, "commit", "-q", "-m", "second")
 	state := mustGitRepoStateIn(t, ctx, paths.RepoDir)
-	if err := runIndexingWithCache(ctx, paths, plan.cacheDir, plan.indexDir, state, gitCorpusStateHash(paths, state)); err == nil {
+	if err := runIndexingWithCache(ctx, paths, plan.corpusStore, state, gitCorpusStateHash(paths, state)); err == nil {
 		t.Fatal("the build published over an immutable uncommitted shard")
 	}
 	scan, err := scanFamily(plan.indexDir)

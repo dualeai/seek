@@ -7,27 +7,27 @@ import (
 )
 
 // TestMeanMaxSimPassesStrictBoundary proves that a lift equal to the
-// threshold fails and the next float32 above it passes. It also proves that
-// the rule subtracts the empty-document score and then divides by the token
-// count.
+// threshold (pipelineTauFile) fails and the next float32 above it passes. It
+// also proves that the rule subtracts the empty-document score and then
+// divides by the token count.
 func TestMeanMaxSimPassesStrictBoundary(t *testing.T) {
-	const threshold float32 = 0.25
-	if meanMaxSimPasses(threshold, 0, 1, threshold) {
+	const threshold = pipelineTauFile
+	if meanMaxSimPasses(threshold, 0, 1) {
 		t.Fatal("threshold equality passed")
 	}
-	if meanMaxSimPasses(math.Nextafter32(threshold, 0), 0, 1, threshold) {
+	if meanMaxSimPasses(math.Nextafter32(threshold, 0), 0, 1) {
 		t.Fatal("the float32 below the threshold passed")
 	}
-	if !meanMaxSimPasses(math.Nextafter32(threshold, 1), 0, 1, threshold) {
+	if !meanMaxSimPasses(math.Nextafter32(threshold, 1), 0, 1) {
 		t.Fatal("the float32 above the threshold did not pass")
 	}
-	// Over 4 tokens, (3.6 - 3.2) / 4 = 0.1 is under the threshold, and
-	// (3.6 - 2.0) / 4 = 0.4 is above it. The score alone, 3.6 / 4 = 0.9, and
-	// the difference alone, 0.4, are above it.
-	if meanMaxSimPasses(3.6, 3.2, 4, threshold) {
+	// Over 4 tokens, (3.6 - 3.2) / 4 = 0.1 is under the threshold of 0.25,
+	// and (3.6 - 2.0) / 4 = 0.4 is above it. The score alone, 3.6 / 4 = 0.9,
+	// and the difference alone, 0.4, are above it.
+	if meanMaxSimPasses(3.6, 3.2, 4) {
 		t.Fatal("a score with a lift under the threshold passed")
 	}
-	if !meanMaxSimPasses(3.6, 2.0, 4, threshold) {
+	if !meanMaxSimPasses(3.6, 2.0, 4) {
 		t.Fatal("a score with a lift above the threshold did not pass")
 	}
 }

@@ -26,7 +26,7 @@ func TestIntegration_DetachedHEAD(t *testing.T) {
 	dir := initGitRepo(t, "app.go", "package main\n// detached_marker\n")
 
 	// Detach HEAD
-	gitRun(t, dir, "checkout", "--detach", "HEAD")
+	gitRunIn(t, dir, "checkout", "--detach", "HEAD")
 
 	files, err := runSeekInRepo(t, dir, "detached_marker")
 	if err != nil {
@@ -108,7 +108,7 @@ func TestIntegration_StagedButNotCommitted(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "staged.go"), []byte("package main\n// staged_only_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, dir, "add", "staged.go")
+	gitRunIn(t, dir, "add", "staged.go")
 
 	files, err := runSeekInRepo(t, dir, "staged_only_marker")
 	if err != nil {
@@ -125,15 +125,15 @@ func TestIntegration_MultipleBranches(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// main_branch_marker\n")
-	defaultBranch := gitCurrentBranch(t, dir)
+	defaultBranch := gitOutputIn(t, dir, "symbolic-ref", "--quiet", "--short", "HEAD")
 
 	// Create and switch to a new branch with different content
-	gitRun(t, dir, "checkout", "-b", "feature")
+	gitRunIn(t, dir, "checkout", "-b", "feature")
 	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// feature_branch_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, dir, "add", "app.go")
-	gitRun(t, dir, "commit", "-m", "feature change")
+	gitRunIn(t, dir, "add", "app.go")
+	gitRunIn(t, dir, "commit", "-m", "feature change")
 
 	// Search should find feature branch content
 	files, err := runSeekInRepo(t, dir, "feature_branch_marker")
@@ -145,7 +145,7 @@ func TestIntegration_MultipleBranches(t *testing.T) {
 	}
 
 	// Switch back to the default branch: the search finds its content.
-	gitRun(t, dir, "checkout", defaultBranch)
+	gitRunIn(t, dir, "checkout", defaultBranch)
 
 	files, err = runSeekInRepo(t, dir, "main_branch_marker")
 	if err != nil {
@@ -171,8 +171,8 @@ func TestIntegration_NestedDirectoryStructure(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(nested, "deep.go"), []byte("package main\n// deep_nested_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, dir, "add", ".")
-	gitRun(t, dir, "commit", "-m", "add nested file")
+	gitRunIn(t, dir, "add", ".")
+	gitRunIn(t, dir, "commit", "-m", "add nested file")
 
 	files, err := runSeekInRepo(t, dir, "deep_nested_marker")
 	if err != nil {
@@ -322,7 +322,7 @@ func TestStateFile_CorruptContent(t *testing.T) {
 	requireTools(t)
 	dir := initGitRepo(t, "app.go", "package main\n// corrupt_state_marker\n")
 	paths, plan := planGitTestCorpus(t, dir)
-	if _, _, err := ensureGitCorpusFresh(t.Context(), plan, paths); err != nil {
+	if _, err := ensureGitCorpusFresh(t.Context(), plan, paths); err != nil {
 		t.Fatal(err)
 	}
 	valid := readStateFile(plan.cacheDir)
@@ -332,7 +332,7 @@ func TestStateFile_CorruptContent(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(plan.cacheDir, stateFile), []byte("CORRUPT!@#$%"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := ensureGitCorpusFresh(t.Context(), plan, paths); err != nil {
+	if _, err := ensureGitCorpusFresh(t.Context(), plan, paths); err != nil {
 		t.Fatal(err)
 	}
 	if got := readStateFile(plan.cacheDir); got != valid {
@@ -458,8 +458,8 @@ func TestIntegration_GitignoredFileNotIndexed(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("ignored/\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, dir, "add", ".gitignore")
-	gitRun(t, dir, "commit", "-m", "add gitignore")
+	gitRunIn(t, dir, "add", ".gitignore")
+	gitRunIn(t, dir, "commit", "-m", "add gitignore")
 
 	// Create ignored file
 	if err := os.MkdirAll(filepath.Join(dir, "ignored"), 0o755); err != nil {
@@ -489,8 +489,8 @@ func TestIntegration_EmptyFileCommittedAndUncommitted(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "empty.go"), []byte(""), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, dir, "add", "empty.go")
-	gitRun(t, dir, "commit", "-m", "add empty file")
+	gitRunIn(t, dir, "add", "empty.go")
+	gitRunIn(t, dir, "commit", "-m", "add empty file")
 
 	// Create empty untracked file
 	if err := os.WriteFile(filepath.Join(dir, "empty_new.go"), []byte(""), 0o644); err != nil {
@@ -539,23 +539,23 @@ func TestIntegration_MergeConflictState(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// base_content\n")
-	defaultBranch := gitCurrentBranch(t, dir)
+	defaultBranch := gitOutputIn(t, dir, "symbolic-ref", "--quiet", "--short", "HEAD")
 
 	// Create a branch with a conflicting change
-	gitRun(t, dir, "checkout", "-b", "conflict-branch")
+	gitRunIn(t, dir, "checkout", "-b", "conflict-branch")
 	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// conflict_branch_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, dir, "add", "app.go")
-	gitRun(t, dir, "commit", "-m", "branch change")
+	gitRunIn(t, dir, "add", "app.go")
+	gitRunIn(t, dir, "commit", "-m", "branch change")
 
 	// Go back and make a conflicting change on the default branch
-	gitRun(t, dir, "checkout", defaultBranch)
+	gitRunIn(t, dir, "checkout", defaultBranch)
 	if err := os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n// master_conflict_marker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gitRun(t, dir, "add", "app.go")
-	gitRun(t, dir, "commit", "-m", "default branch change")
+	gitRunIn(t, dir, "add", "app.go")
+	gitRunIn(t, dir, "commit", "-m", "default branch change")
 
 	// Try a merge. It conflicts.
 	cmd := exec.Command("git", "merge", "conflict-branch")
@@ -607,8 +607,8 @@ func TestIntegration_SubmoduleDirtySkipped(t *testing.T) {
 	gitRunIn(t, subSrc, "commit", "-m", "sub initial")
 
 	// Allow local file transport and add submodule
-	gitRun(t, dir, "-c", "protocol.file.allow=always", "submodule", "add", subSrc, "mysub")
-	gitRun(t, dir, "commit", "-m", "add submodule")
+	gitRunIn(t, dir, "-c", "protocol.file.allow=always", "submodule", "add", subSrc, "mysub")
+	gitRunIn(t, dir, "commit", "-m", "add submodule")
 
 	// Make the submodule dirty
 	if err := os.WriteFile(filepath.Join(dir, "mysub", "dirty.go"), []byte("package sub\n// dirty\n"), 0o644); err != nil {
@@ -749,13 +749,11 @@ func TestStreamDirtyFiles_RacyDeletion(t *testing.T) {
 
 	// Delete half the files concurrently while reading
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for i := 0; i < numFiles; i += 2 {
 			_ = os.Remove(filepath.Join(dir, fileNames[i]))
 		}
-	}()
+	})
 
 	results := collectStreamFilesForTest(t, t.Context(), dir, fileNames, 4)
 	wg.Wait()
@@ -784,17 +782,7 @@ func TestAcquireBuildLock_ContextCancellation(t *testing.T) {
 	indexDir := filepath.Join(dir, "index")
 
 	// Hold the build lock so a second acquire must poll.
-	holder, err := os.OpenFile(filepath.Join(dir, buildLockFile), os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		unlockFile(holder)
-		_ = holder.Close()
-	}()
-	if err := lockFileExclusive(holder); err != nil {
-		t.Fatal(err)
-	}
+	holdBuildLock(t, dir)
 
 	// No shards exist, so acquireBuildLock polls (it does not skip).
 	ctx, cancel := context.WithCancel(t.Context())
@@ -816,7 +804,7 @@ func TestAcquireBuildLock_ContextCancellation(t *testing.T) {
 // indexed when an uncommitted file exceeds testDocumentContentLimit; that file
 // is indexed by name only.
 func TestIntegration_VeryLargeUncommittedFile(t *testing.T) {
-	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
+	swapForTest(t, &documentContentLimit, testDocumentContentLimit)
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// normal_content_marker\n")
@@ -930,7 +918,7 @@ func TestIntegration_CoreQuotePath(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// base\n")
-	gitRun(t, dir, "config", "core.quotePath", "true")
+	gitRunIn(t, dir, "config", "core.quotePath", "true")
 
 	// Create file with non-ASCII name
 	if err := os.WriteFile(filepath.Join(dir, "données.go"), []byte("package main\n// quotepath_marker\n"), 0o644); err != nil {
@@ -952,7 +940,7 @@ func TestIntegration_StatusShowUntrackedFilesNo(t *testing.T) {
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// committed_marker\n")
-	gitRun(t, dir, "config", "status.showUntrackedFiles", "no")
+	gitRunIn(t, dir, "config", "status.showUntrackedFiles", "no")
 
 	// Create untracked file
 	if err := os.WriteFile(filepath.Join(dir, "untracked.go"), []byte("package main\n// invisible_untracked_marker\n"), 0o644); err != nil {
@@ -972,7 +960,7 @@ func TestIntegration_StatusShowUntrackedFilesNoNestedFileSearchable(t *testing.T
 	requireTools(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// committed_marker\n")
-	gitRun(t, dir, "config", "status.showUntrackedFiles", "no")
+	gitRunIn(t, dir, "config", "status.showUntrackedFiles", "no")
 
 	nested := filepath.Join(dir, "a", "b", "c")
 	if err := os.MkdirAll(nested, 0o755); err != nil {

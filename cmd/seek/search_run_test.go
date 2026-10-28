@@ -37,8 +37,8 @@ func TestColdSearchEqualsWarmSearch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cold != warm || scorer.embedCalls.Load() != 0 {
-		t.Fatalf("cold and warm differ (warm embeds=%d):\ncold:\n%s\nwarm:\n%s", scorer.embedCalls.Load(), cold, warm)
+	if cold != warm || scorer.embeds.Load() != 0 {
+		t.Fatalf("cold and warm differ (warm embeds=%d):\ncold:\n%s\nwarm:\n%s", scorer.embeds.Load(), cold, warm)
 	}
 }
 
@@ -67,8 +67,8 @@ func TestRunScopedSearchUsesWholeRepoGeneration(t *testing.T) {
 	if got := headerPaths(output); err != nil || !slices.Equal(got, []string{filepath.Join(sub, "in.go")}) {
 		t.Fatalf("err=%v, the scoped search printed %v, want only in.go:\n%s", err, got, output)
 	}
-	if scorer.embedCalls.Load() != 0 {
-		t.Fatalf("the scoped search embedded %d batches, want 0", scorer.embedCalls.Load())
+	if scorer.embeds.Load() != 0 {
+		t.Fatalf("the scoped search embedded %d batches, want 0", scorer.embeds.Load())
 	}
 	if records := logs.Records(); len(records) != 0 {
 		t.Fatalf("the scoped search warned: %v", records)
@@ -79,7 +79,7 @@ func TestRunScopedSearchUsesWholeRepoGeneration(t *testing.T) {
 	if noneErr != nil || dotErr != nil || none != dot || !slices.Equal(headerPaths(none), []string{"in.go"}) {
 		t.Fatalf("no path and . differ or print more than in.go:\nnone=%q err=%v\ndot=%q err=%v", none, noneErr, dot, dotErr)
 	}
-	if embeds := noneScorer.embedCalls.Load() + dotScorer.embedCalls.Load(); embeds != 0 {
+	if embeds := noneScorer.embeds.Load() + dotScorer.embeds.Load(); embeds != 0 {
 		t.Fatalf("the searches from the subfolder embedded %d batches, want 0", embeds)
 	}
 }
@@ -110,8 +110,8 @@ func TestPassThroughAtomMasksSemantic(t *testing.T) {
 	writeFixtureFile(t, f.path("tree/a.go"), "package a\n// alpha beta\n")
 	setTestUserCache(t)
 	output, scorer, err := stubSearch(t, payloadAccept, "alpha beta repo:nomatch", f.path("tree"))
-	if !errors.Is(err, errNoMatch) || output != "" || scorer.scoreCalls.Load() != 0 {
-		t.Fatalf("err=%v score calls=%d output:\n%s", err, scorer.scoreCalls.Load(), output)
+	if !errors.Is(err, errNoMatch) || output != "" || scorer.scores.Load() != 0 {
+		t.Fatalf("err=%v score calls=%d output:\n%s", err, scorer.scores.Load(), output)
 	}
 }
 
@@ -214,10 +214,8 @@ func TestMoreThan128AcceptedFilesAllPrint(t *testing.T) {
 	if err != nil || strings.Count(output, "## ") != 300 {
 		t.Fatalf("err=%v results=%d, want 300", err, strings.Count(output, "## "))
 	}
-	scorer.mu.Lock()
-	defer scorer.mu.Unlock()
-	if len(scorer.documents) != 300 {
-		t.Fatalf("the model scored %d documents, want 300", len(scorer.documents))
+	if len(scorer.documents()) != 300 {
+		t.Fatalf("the model scored %d documents, want 300", len(scorer.documents()))
 	}
 }
 
@@ -237,12 +235,10 @@ func TestNameOnlyFilesNeverModelScored(t *testing.T) {
 	if strings.Index(output, "alpha_beta.bin") < strings.Index(output, "target.go") {
 		t.Fatalf("the name-only file prints before the scored file:\n%s", output)
 	}
-	scorer.mu.Lock()
-	defer scorer.mu.Unlock()
-	if slices.Contains(scorer.embeddedPaths, "alpha_beta.bin") {
+	if slices.Contains(scorer.unitPaths(), "alpha_beta.bin") {
 		t.Fatal("the model embedded a name-only file")
 	}
-	if slices.ContainsFunc(scorer.documents, func(document rerankDocument) bool { return document.Path == "alpha_beta.bin" }) {
+	if slices.ContainsFunc(scorer.documents(), func(document rerankDocument) bool { return document.Path == "alpha_beta.bin" }) {
 		t.Fatal("the model scored a name-only file")
 	}
 }
@@ -277,7 +273,7 @@ func searchShape(t *testing.T, mode payloadMode, query, folder string) (string, 
 			searches++
 		}
 	}
-	return output, scorer.prepareCalls.Load(), searches
+	return output, scorer.prepares.Load(), searches
 }
 
 // TestEveryQueryShapeUsesVectors searches with a model that accepts every
@@ -677,8 +673,8 @@ func TestModelInputIndependentOfSearchRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if scorer.embedCalls.Load() == 0 || !strings.Contains(first, "sub/b.go") {
-		t.Fatalf("the first search built no vectors (embeds=%d):\n%s", scorer.embedCalls.Load(), first)
+	if scorer.embeds.Load() == 0 || !strings.Contains(first, "sub/b.go") {
+		t.Fatalf("the first search built no vectors (embeds=%d):\n%s", scorer.embeds.Load(), first)
 	}
 	requireRowsKeyModelPath(t, resolvedPath(t, repo), "")
 	second, scorer, err := stubSearch(t, payloadFar, "alpha beta", f.path("parent"))
@@ -688,12 +684,10 @@ func TestModelInputIndependentOfSearchRoot(t *testing.T) {
 	if !strings.Contains(second, "b.go") {
 		t.Fatalf("the parent search lost the repository:\n%s", second)
 	}
-	scorer.mu.Lock()
-	defer scorer.mu.Unlock()
-	if got := scorer.embedCalls.Load(); got != 0 {
-		t.Fatalf("the parent search embedded %d batches (%v), want 0", got, scorer.embeddedPaths)
+	if got := scorer.embeds.Load(); got != 0 {
+		t.Fatalf("the parent search embedded %d batches (%v), want 0", got, scorer.unitPaths())
 	}
-	for _, document := range scorer.documents {
+	for _, document := range scorer.documents() {
 		if document.modelBase != "" {
 			t.Fatalf("the model reads %s below %q, want the repository-relative path", document.Path, document.modelBase)
 		}
@@ -792,7 +786,7 @@ func TestFileRootReusesOnlyFoldersThatHoldIt(t *testing.T) {
 				generations, _ = testLogAttrs(record)["generations"].(int64)
 			}
 		}
-		return generations, scorer.embedCalls.Load()
+		return generations, scorer.embeds.Load()
 	}
 	if _, _, err := stubSearch(t, payloadFar, "alpha beta", f.path("dir/sub")); err != nil {
 		t.Fatal(err)
@@ -823,9 +817,7 @@ func TestFolderModelInputIndependentOfSearchRoot(t *testing.T) {
 		if err != nil {
 			t.Fatalf("search %s: %v\n%s", operand, err, output)
 		}
-		scorer.mu.Lock()
-		defer scorer.mu.Unlock()
-		return slices.Compact(slices.Sorted(slices.Values(scorer.embeddedPaths)))
+		return slices.Compact(slices.Sorted(slices.Values(scorer.unitPaths())))
 	}
 	t.Run("folder then subfolder", func(t *testing.T) {
 		setTestUserCache(t)
@@ -870,9 +862,7 @@ func TestDisplayLimitsApplyAfterTheRank(t *testing.T) {
 		if err != nil {
 			t.Fatalf("-n %d: %v", limit, err)
 		}
-		scorer.mu.Lock()
-		defer scorer.mu.Unlock()
-		return output, scorer.documents
+		return output, scorer.documents()
 	}
 	unlimited, _ := search(0)
 	full := headerOrder(unlimited)

@@ -46,16 +46,14 @@ func TestRunDirtySearchOverlay(t *testing.T) {
 		t.Fatalf("headers=%v, want [a.go b.go keep.go] with b.go [uncommitted] and no committed text of a.go:\n%s",
 			got, output)
 	}
-	scorer.mu.Lock()
-	embedded := slices.Clone(scorer.embeddedPaths)
-	scorer.mu.Unlock()
+	embedded := scorer.unitPaths()
 	slices.Sort(embedded)
 	if embedded = slices.Compact(embedded); !slices.Equal(embedded, []string{"a.go", "b.go"}) {
 		t.Fatalf("embedded %v, want only the dirty files a.go and b.go", embedded)
 	}
 	// The same dirty tree again embeds nothing.
-	if _, scorer, err = stubSearch(t, payloadAccept, "alpha beta", "."); err != nil || scorer.embedCalls.Load() != 0 {
-		t.Fatalf("an unchanged dirty tree embedded %d batches (err=%v)", scorer.embedCalls.Load(), err)
+	if _, scorer, err = stubSearch(t, payloadAccept, "alpha beta", "."); err != nil || scorer.embeds.Load() != 0 {
+		t.Fatalf("an unchanged dirty tree embedded %d batches (err=%v)", scorer.embeds.Load(), err)
 	}
 }
 
@@ -75,11 +73,11 @@ func TestNoHeadRepoUsesVectors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := headerPaths(output); scorer.embedCalls.Load() == 0 || !slices.Equal(got, []string{"other.go", "target.go"}) ||
+	if got := headerPaths(output); scorer.embeds.Load() == 0 || !slices.Equal(got, []string{"other.go", "target.go"}) ||
 		!strings.Contains(output, "## other.go (Go) [uncommitted]") ||
 		!strings.Contains(output, "## target.go (Go) [uncommitted]") {
 		t.Fatalf("headers=%v (embeds=%d), want other.go and target.go, both [uncommitted]:\n%s",
-			got, scorer.embedCalls.Load(), output)
+			got, scorer.embeds.Load(), output)
 	}
 }
 
@@ -150,9 +148,7 @@ func TestOverlayDamageRepairs(t *testing.T) {
 	_ = rows.Close()
 	_, _, _ = stubSearch(t, payloadAccept, "alpha beta", ".")
 	output, scorer, err := stubSearch(t, payloadAccept, "alpha beta", ".")
-	scorer.mu.Lock()
-	embedded := slices.Contains(scorer.embeddedPaths, "u.go")
-	scorer.mu.Unlock()
+	embedded := slices.Contains(scorer.unitPaths(), "u.go")
 	if err != nil || !embedded || !strings.Contains(output, "## u.go (Go) [uncommitted]") {
 		t.Fatalf("the overlay was not repaired: err=%v embedded u.go=%t\n%s", err, embedded, output)
 	}
@@ -181,10 +177,8 @@ func TestOverlayColdBuildReusesTheStagedBase(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		scorer.mu.Lock()
-		defer scorer.mu.Unlock()
 		count := 0
-		for _, path := range scorer.embeddedPaths {
+		for _, path := range scorer.unitPaths() {
 			if path == "big.go" {
 				count++
 			}

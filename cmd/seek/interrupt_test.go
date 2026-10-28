@@ -179,37 +179,18 @@ func TestLockWaitIsCountedBeforeItsLogLine(t *testing.T) {
 	defer cancel()
 	ctx := withLockWaits(canceled, waits)
 	counted := make(chan bool, 1)
-	old := slog.Default()
-	slog.SetDefault(slog.New(countingHandler{onRecord: func(message string) {
-		if message == "Waiting for a test lock" {
-			ended := waits.endRunning()
-			if !ended {
-				// The interrupt cannot end a wait that is not counted: the
-				// context ends it, so the test fails instead of hanging.
-				cancel()
-			}
-			counted <- ended
+	captureTestLogsWithAction(t, slog.LevelError, "Waiting for a test lock", func() {
+		ended := waits.endRunning()
+		if !ended {
+			// The interrupt cannot end a wait that is not counted: the
+			// context ends it, so the test fails instead of hanging.
+			cancel()
 		}
-	}}))
-	t.Cleanup(func() { slog.SetDefault(old) })
+		counted <- ended
+	})
 	err := pollLock(ctx, "/cache/.lock", "Waiting for a test lock", func() error { return syscall.EWOULDBLOCK },
 		time.Millisecond, time.Millisecond)
 	if !<-counted || !errors.Is(err, errLockWaitEnded) {
 		t.Fatalf("the wait was not counted at its log line (err=%v)", err)
 	}
 }
-
-// countingHandler calls onRecord with the message of each record, at every
-// level.
-type countingHandler struct{ onRecord func(string) }
-
-func (handler countingHandler) Enabled(context.Context, slog.Level) bool { return true }
-
-func (handler countingHandler) Handle(_ context.Context, record slog.Record) error {
-	handler.onRecord(record.Message)
-	return nil
-}
-
-func (handler countingHandler) WithAttrs([]slog.Attr) slog.Handler { return handler }
-
-func (handler countingHandler) WithGroup(string) slog.Handler { return handler }
