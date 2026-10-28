@@ -117,8 +117,8 @@ func statOperand(operand string) (string, os.FileInfo, error) {
 func resolveOperands(ctx context.Context, operands []string) (plannedExternalOperands, error) {
 	var result plannedExternalOperands
 
-	// Resolve each operand to its canonical path and owning Git worktree. A
-	// file operand is resolved through its parent directory. Group in-repo
+	// Resolve each operand to its canonical path and owning Git worktree.
+	// Resolve a file operand through its parent directory. Group in-repo
 	// operands by repository so visibility needs one Git check per root.
 	resolved := make([]resolvedOperand, 0, len(operands))
 	pathsByRepo := make(map[string][]string)

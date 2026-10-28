@@ -886,14 +886,14 @@ func TestDirtyReadErrorKeepsTheLiveFamily(t *testing.T) {
 		return realOpen(path)
 	}
 	out, got := strict()
-	if !slices.Equal(got, []string{"a.txt", "c.txt", "u.txt"}) || !strings.Contains(out, nameOnlyNoticeLine(1)) {
+	if !slices.Equal(got, []string{"a.txt", "c.txt", "u.txt"}) || !strings.Contains(out, oneNameOnlyNotice) {
 		dirtyOpenFile = realOpen
 		t.Fatalf("strict search during the failure %v, want the other files and b.txt by name:\n%s", got, out)
 	}
 	output, _, err := stubSearch(t, payloadAccept, "zqlive alpha beta", ".")
 	dirtyOpenFile = realOpen
 	if got := headerPaths(output); err != nil || !slices.Equal(got, []string{"a.txt", "c.txt", "u.txt"}) ||
-		strings.Contains(output, "zqlive first") || !strings.Contains(output, nameOnlyNoticeLine(1)) {
+		strings.Contains(output, "zqlive first") || !strings.Contains(output, oneNameOnlyNotice) {
 		t.Fatalf("description during the failure printed %v, want a.txt, c.txt and u.txt with the notice: err=%v\n%s", got, err, output)
 	}
 	plans, err := planCorpora(t.Context(), []string{repo})
@@ -952,7 +952,8 @@ func TestDirtyReadErrorPrintsNoStaleText(t *testing.T) {
 	if out, headers := searchHeaders(t, "zqgonetext", "."); len(headers) != 0 {
 		t.Fatalf("stale text printed: %v\n%s", headers, out)
 	}
-	if out, headers := searchHeaders(t, "zqnewdirty", "."); !slices.Equal(headers, []string{"d.txt"}) || !strings.Contains(out, nameOnlyNoticeLine(2)) {
+	const twoNameOnly = "\n\n2 name-only files could also match: binary, too large, not on disk, or unreadable\n"
+	if out, headers := searchHeaders(t, "zqnewdirty", "."); !slices.Equal(headers, []string{"d.txt"}) || !strings.Contains(out, twoNameOnly) {
 		t.Fatalf("headers=%v, want b.txt and c.txt counted by name only:\n%s", headers, out)
 	}
 }
@@ -980,7 +981,7 @@ func TestDirtyLstatErrorKeepsTheName(t *testing.T) {
 	}
 	out, headers := searchHeaders(t, "zqlstat", ".")
 	dirtyLstat = realLstat
-	if !slices.Equal(headers, []string{"a.txt"}) || !strings.Contains(out, nameOnlyNoticeLine(1)) {
+	if !slices.Equal(headers, []string{"a.txt"}) || !strings.Contains(out, oneNameOnlyNotice) {
 		t.Fatalf("during the error: headers=%v, want a.txt and b.txt by name:\n%s", headers, out)
 	}
 	_, headers = searchHeaders(t, "zqlstat", ".")

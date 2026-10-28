@@ -347,9 +347,9 @@ func e2eRouteVerify(t *testing.T, run e2eRouteRun, want, backends []string) []st
 
 // e2eRouteCheck runs the text oracle and the description of test with a model
 // that accepts every row. Both must print the files of test.want. Both
-// searches parse the filters with the Seek parser, so a parser fault moves
-// both. It does not move test.want. A route that reads rows must want a file,
-// so that two empty results cannot pass.
+// searches parse the filters with the Seek parser, so a parser fault changes
+// both results. It does not change test.want. A route that reads rows must
+// want a file, so that two empty results cannot pass.
 func e2eRouteCheck(t *testing.T, test e2eRouteCase) e2eRouteRun {
 	t.Helper()
 	want := slices.Sorted(slices.Values(test.want))
@@ -593,8 +593,8 @@ func TestE2ERouteSaturatedShardGivesEveryAllowedRow(t *testing.T) {
 // another route: the filtered USearch, the shard-exact, and the direct exact
 // route. The committed rows hold the version mark zqv1, and the edited and
 // untracked files zqv2. The dirty files are three edited files, a deleted
-// file, and two untracked files. Then the filler files are edited and 80 dense
-// files are deleted. The model accepts every row. At each step the output
+// file, and two untracked files. Then the test edits the filler files and
+// deletes 80 dense files. The model accepts every row. At each step the output
 // must print the files of the work tree that the case lists, as the
 // lexical-only search does. The model never scores a deleted file or the zqv1
 // text of an edited file, and no edited file shows a zqv1 line.

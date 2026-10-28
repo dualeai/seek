@@ -1284,10 +1284,10 @@ func readFolderDocument(candidate folderCandidate) (fileContent, error) {
 }
 
 // folderOpenFile opens a folder file for reading. Tests replace it to fail one
-// chosen file with EIO or EMFILE. A test cannot make these faults on disk. EIO
-// comes from a failing disk, and a lower file limit fails every open of the
-// process. Tests also replace it to write a file between the text read and the
-// vector read of one build. No file-system event marks that time.
+// chosen file with EMFILE. A test cannot make this fault on disk, because a
+// lower file limit fails every open of the process. Tests also replace it to
+// write a file between the text read and the vector read of one build. No
+// file-system event marks that time.
 var folderOpenFile = openWorkTreeFile
 
 var errFolderFileGrew = errors.New("file grew beyond its stat size")

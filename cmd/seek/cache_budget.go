@@ -64,7 +64,7 @@ func (e *cacheBudgetError) Error() string {
 }
 
 // budgetSuggestion gives the budget that the hint of the budget error names.
-// It is twice the planned size, rounded up to whole GiB, so the next searches
+// It is the next whole GiB above twice the planned size, so the next searches
 // fit too.
 func budgetSuggestion(planned int64) string {
 	const gib = int64(1) << 30
@@ -153,10 +153,10 @@ func parseByteSize(value string) (int64, error) {
 	return int64(bytes), nil
 }
 
-// corpusSize returns the ledger size of a corpus directory. A corpus with no
-// ledger entry (a publish that crashed before it), or one older than the
-// corpus's last publish, is measured again. record writes the measure into
-// the ledger; a dry run passes false so that it writes nothing.
+// corpusSize returns the ledger size of a corpus directory. It measures a
+// corpus again when its ledger entry is missing (a publish that crashed before
+// it) or older than its last publish. record writes the measure into the
+// ledger; a dry run passes false so that it writes nothing.
 func corpusSize(dir string, record bool) int64 {
 	if !ledgerStale(dir) {
 		if data, err := os.ReadFile(filepath.Join(dir, corpusSizeFile)); err == nil {

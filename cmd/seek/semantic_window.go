@@ -161,10 +161,10 @@ func semanticUnitWindows(tokenizer *lateOnTokenizer, unit semanticUnit, base str
 // scorer's tokenization of its text.
 const semanticWindowSpareTokens = 2
 
-// semanticWindowCut picks the end of a window that would end at last. It
-// takes the latest line start in the window's second half, else the latest
-// word start, else the latest valid cut. A window with no valid cut ends at
-// last.
+// semanticWindowCut picks the end of a window that would end at last. In the
+// window's second half, it takes the latest line start, else the latest word
+// start, else the latest valid cut. With no valid cut in that half, the window
+// ends at last.
 func semanticWindowCut(first, last, room int, valid, lineStart, wordStart func(int) bool) int {
 	for _, kind := range [...]func(int) bool{lineStart, wordStart, func(int) bool { return true }} {
 		for cut := last; cut > first+room/2; cut-- {

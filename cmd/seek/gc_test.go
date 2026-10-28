@@ -456,6 +456,26 @@ func TestGCCmd_DryRun_NoEvictions(t *testing.T) {
 	}
 }
 
+// TestGCCmd_DryRun_TableLayout compares the header and the row of a one-corpus
+// dry-run table with hand-written lines. In both lines the columns start at
+// byte 2 (CORPUS), 14 (ROOT), 68 (AGE), 76 (SIZE) and 84 (ACTION). The other
+// table tests find rows by their hash and action only, so this test is the one
+// that pins the header text and the column widths.
+func TestGCCmd_DryRun_TableLayout(t *testing.T) {
+	root := cacheRootForTest(t)
+	seedCorpus(t, root, fakeCorpusHash(1), time.Now().Add(-49*time.Hour))
+
+	out := runGCCapture(t, "--dry-run")
+
+	header := "  CORPUS      ROOT" + strings.Repeat(" ", 50) + "AGE     SIZE    ACTION"
+	// The seeded corpus has no shard, so ROOT shows [empty]. Its files are
+	// the size ledger, which the size skips, and an empty .used marker.
+	row := "  00000...01  [empty]" + strings.Repeat(" ", 45) + "  2d      0B      kept"
+	if lines := strings.Split(out, "\n"); len(lines) < 3 || lines[1] != header || lines[2] != row {
+		t.Fatalf("table lines\n%q\nwant header and row\n%q\n%q", lines, header, row)
+	}
+}
+
 // TestGCCmd_DryRun_DoesNotCreateMissingCacheRoot checks the user-facing
 // promise that a dry run does not change the filesystem.
 func TestGCCmd_DryRun_DoesNotCreateMissingCacheRoot(t *testing.T) {
@@ -1298,36 +1318,49 @@ func TestGC_IsCorpusHashName_AcceptsProductionHash(t *testing.T) {
 }
 
 // TestGC_Integration_PrepareAndSearchTouchesUsed checks that a warm search
-// marks its corpus as used. The first search builds, and the build also
-// touches .used. So the test ages .used and searches again. That search
-// builds nothing, and only the touch of the search path (strictNode) can make
-// .used fresh.
+// marks its corpus as used, on both routes of the root command. The first
+// search builds the text index and the vectors, and the build also touches
+// .used. So the test ages .used before each warm search. A warm search builds
+// nothing, so only the touch of its route can make .used fresh: retrieveNode
+// for a query that the model reads, strictNode for --lexical-only.
 func TestGC_Integration_PrepareAndSearchTouchesUsed(t *testing.T) {
 	requireTools(t)
 	resetNFSCheck(t)
+	setTestUserCache(t)
 
 	dir := initGitRepo(t, "app.go", "package main\n// integration_used_marker\n")
-	ctx := context.Background()
-	paths, plan := planGitTestCorpus(t, dir)
-
-	if _, err := runSeekInPlannedGitCorpus(ctx, "integration_used_marker", paths, plan); err != nil {
-		t.Fatalf("runSeekInPlannedGitCorpus: %v", err)
+	plans, err := planCorpora(t.Context(), []string{dir})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%d err=%v", len(plans), err)
 	}
-	usedPath := filepath.Join(plan.cacheDir, usedFile)
-	old := time.Now().Add(-30 * 24 * time.Hour)
-	if err := os.Chtimes(usedPath, old, old); err != nil {
-		t.Fatalf("age .used after the build: %v", err)
+	usedPath := filepath.Join(plans[0].cacheDir, usedFile)
+	if out, _, err := stubSearch(t, payloadFar, "integration_used_marker", dir); err != nil || !strings.Contains(out, "app.go") {
+		t.Fatalf("cold search: err=%v output:\n%s", err, out)
 	}
-	if files, err := runSeekInPlannedGitCorpus(ctx, "integration_used_marker", paths, plan); err != nil || len(files) != 1 {
-		t.Fatalf("warm search: files=%v err=%v", files, err)
-	}
-
-	st, err := os.Stat(usedPath)
-	if err != nil {
-		t.Fatalf(".used should exist after successful search via prepareAndSearchCorpus: %v", err)
-	}
-	if time.Since(st.ModTime()) > time.Minute {
-		t.Fatalf("the warm search did not touch .used (%v ago)", time.Since(st.ModTime()))
+	for _, route := range []struct {
+		name   string
+		search func() (string, error)
+	}{
+		{"model", func() (string, error) {
+			out, _, err := stubSearch(t, payloadFar, "integration_used_marker", dir)
+			return out, err
+		}},
+		{"lexical-only", func() (string, error) { return seek(t, "--lexical-only", "integration_used_marker", dir) }},
+	} {
+		old := time.Now().Add(-30 * 24 * time.Hour)
+		if err := os.Chtimes(usedPath, old, old); err != nil {
+			t.Fatalf("age .used: %v", err)
+		}
+		if out, err := route.search(); err != nil || !strings.Contains(out, "app.go") {
+			t.Fatalf("%s warm search: err=%v output:\n%s", route.name, err, out)
+		}
+		st, err := os.Stat(usedPath)
+		if err != nil {
+			t.Fatalf("%s warm search: .used is missing: %v", route.name, err)
+		}
+		if time.Since(st.ModTime()) > time.Minute {
+			t.Fatalf("the %s warm search did not touch .used (%v ago)", route.name, time.Since(st.ModTime()))
+		}
 	}
 }
 

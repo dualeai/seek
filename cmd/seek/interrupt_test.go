@@ -13,8 +13,9 @@ import (
 
 // TestCLIProcess_FirstInterruptEndsOnlyLockWaits searches a warm folder and a
 // cold folder whose build lock another process holds. The search waits for
-// the lock with no deadline. The first interrupt ends that wait: the cold node
-// is skipped with one warning, the warm node prints, and the exit code is 0.
+// the lock with no deadline. The first interrupt ends that wait: the search
+// skips the cold node with one warning, the warm node prints, and the exit
+// code is 0.
 func TestCLIProcess_FirstInterruptEndsOnlyLockWaits(t *testing.T) {
 	requireTools(t)
 	cache := t.TempDir()

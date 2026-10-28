@@ -2265,7 +2265,8 @@ func TestStreamDirtyFiles_ParallelismOne(t *testing.T) {
 func TestStreamDirtyFiles_SingleFileExactlyMaxSize(t *testing.T) {
 	swapDocumentContentLimitForTest(t, testDocumentContentLimit)
 	dir := t.TempDir()
-	// A file of exactly testDocumentContentLimit bytes must be included.
+	// The stream must include a file of exactly testDocumentContentLimit
+	// bytes.
 	data := make([]byte, testDocumentContentLimit)
 	for i := range data {
 		data[i] = 'x'

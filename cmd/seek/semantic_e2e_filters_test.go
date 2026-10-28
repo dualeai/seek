@@ -428,9 +428,9 @@ func TestE2EFilterDescriptionAtomsReachTheModel(t *testing.T) {
 //   - filters alone.
 //
 // With a model that accepts every row, a form prints every live file that its
-// filters keep, and so every file of the strict search. Both file sets are
-// worked out by hand; the filters alone with --lexical-only must keep the same
-// files.
+// filters keep, and so every file of the strict search. The test works out
+// both file sets by hand; the filters alone with --lexical-only must keep the
+// same files.
 func TestE2EFilterEveryFormUsesVectors(t *testing.T) {
 	requireTools(t)
 	home := e2eFilterPathTree(t)

@@ -413,9 +413,9 @@ func (g *gitNode) refresh(
 // refreshState refreshes, for the captured state, the whole-repository index
 // that serves scoped and unscoped searches. Zoekt combines committed and dirty
 // files. When the command reads vectors, a joined semantic generation binds the
-// captured commit and the overlay of the dirty files. An update failure is
-// returned when no shards exist; with published shards, the function warns and
-// leaves the prior generation searchable (corpusStale). A peer's build also
+// captured commit and the overlay of the dirty files. It returns an update
+// failure when no shards exist. With published shards, it warns and leaves
+// the prior generation searchable (corpusStale). A peer's build also
 // gives corpusStale, with no warning. A node that .empty marks as empty for the
 // captured state gives corpusKnownEmpty.
 func (g *gitNode) refreshState(

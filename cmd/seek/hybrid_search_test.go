@@ -1036,7 +1036,7 @@ func TestRunDefaultFolderJoinedSearchKeepsGuardedFileByName(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got, want := headerPaths(output), []string{filepath.Join(folder, "strict.go")}; !slices.Equal(got, want) ||
-		!strings.Contains(output, nameOnlyNoticeLine(1)) {
+		!strings.Contains(output, oneNameOnlyNotice) {
 		t.Fatalf("headers=%v, want %v and the name-only notice:\n%s", got, want, output)
 	}
 	for _, record := range logs.Records() {

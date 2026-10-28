@@ -46,9 +46,9 @@ const (
 //
 // Seek's objective is the shortest time, so the budget grows with the host: a
 // quarter of its physical memory, and at least maxInFlightBytes. Zoekt needs
-// several times the content it builds, so the rest of memory is left for the
-// builds. Other allocations are not covered, so this value does not bound
-// process RSS.
+// several times the content it builds, so Seek leaves the rest of memory to
+// the builds. The budget does not cover other allocations, so this value does
+// not bound process RSS.
 var readBudgetBytes = max(int64(maxInFlightBytes), hostPhysicalMemory()/4)
 
 // indexWindowBytes is the window when no command set one (indexWindow). It is

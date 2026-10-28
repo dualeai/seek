@@ -645,11 +645,11 @@ func acquireBuildSlot(ctx context.Context) (func(), error) {
 }
 
 // searchNodes runs every node of the graph at the same time: search opens one
-// node and reads it. A node that fails to open is skipped with one warning.
+// node and reads it. It skips a node that fails to open, with one warning.
 // The others still answer: exit 0 on matches, 1 on none, never 2 for a node
 // failure. Any other error stops the search. A cancellation returns ctx.Err()
-// once, with no warning per node. The node outputs are concatenated in plan
-// order; the next stage orders them.
+// once, with no warning per node. It joins the node outputs in plan order; the
+// next stage orders them.
 func searchNodes[T any](
 	ctx context.Context,
 	plans []node,

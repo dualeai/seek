@@ -510,7 +510,7 @@ func stripRune(r rune) bool {
 		// Strip C0 controls and DEL, but keep tab.
 		return (r < 0x20 || r == 0x7f) && r != '\t'
 	}
-	if unicode.IsControl(r) { // C1 controls (U+0080–U+009F)
+	if unicode.IsControl(r) { // C1 controls (U+0080 to U+009F)
 		return true
 	}
 	switch r {

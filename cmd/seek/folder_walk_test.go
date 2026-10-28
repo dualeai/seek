@@ -471,7 +471,7 @@ func onColdBuildWait(t *testing.T, folder string, act func() error) <-chan error
 }
 
 // TestFolderFileReplacedByFIFOAfterWalkDoesNotBlock replaces a walked file
-// with a FIFO before the build opens it: the test does it while the cold
+// with a FIFO before the build opens it. The test does this while the cold
 // search waits for the build lock. The open does not block on the FIFO, the
 // build reads the file as removed, and the search finds the other file. The
 // query lists file names, so a FIFO indexed as an empty file shows. A build

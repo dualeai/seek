@@ -208,7 +208,8 @@ func TestGCCmd_DryRun_NoCorpora(t *testing.T) {
 	if !strings.Contains(out, "no corpora") {
 		t.Fatalf("expected 'no corpora' line; got:\n%s", out)
 	}
-	if strings.Contains(out, "corpora,") { // the summary line "N corpora, ... total"
+	// The summary line is "N corpora, ... total".
+	if strings.Contains(out, "corpora,") {
 		t.Fatalf("empty dry-run must not print a summary line; got:\n%s", out)
 	}
 }

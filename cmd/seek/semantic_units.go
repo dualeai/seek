@@ -118,9 +118,11 @@ func closeSemanticUnits(segments []*semanticUnitSegment) {
 }
 
 // archiveSupersededUnits writes one new segment into the store before the
-// bind removes the generations of indexDir other than keep. The segment holds
-// the windows of those generations that keep and the store do not hold. The
-// caller holds the node's publish lock. A failure loses only reuse.
+// caller removes the generations of indexDir other than keep. The caller is a
+// bind (bindSemanticGenerations) or a vector repair (removeDamagedVectors).
+// The segment holds the windows of those generations that keep and the store
+// do not hold. The caller holds the node's publish lock. A failure loses only
+// reuse.
 //
 // The new segment also takes in existing segments, smallest first, while the
 // next one holds at most twice the records taken so far. Those segments are

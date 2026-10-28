@@ -45,10 +45,11 @@ const (
 
 // semanticUSearchShardRowsFor gives the shard size of a generation of rows
 // rows on cpus CPUs. It is the largest power of two from 256 to 4,096 that is
-// at most rows / cpus. So a small generation builds its graphs on all CPUs.
-// One shard of 4,096 rows takes 436 ms on one CPU, and 16 shards of 256 rows
-// take 17 ms on 16 CPUs. A power of two keeps the size, and so the cut, the
-// same when a commit adds or removes a few rows.
+// at most rows / cpus, or 256 when rows / cpus is smaller. So a generation of
+// 256 rows or more per CPU builds its graphs on all CPUs. One shard of 4,096
+// rows takes 436 ms on one CPU, and 16 shards of 256 rows take 17 ms on 16
+// CPUs. A power of two keeps the size, and so the cut, the same when a commit
+// adds or removes a few rows.
 func semanticUSearchShardRowsFor(rows uint64, cpus int) uint64 {
 	perCPU := rows / uint64(max(1, cpus))
 	size := uint64(semanticUSearchMaxShardRows)

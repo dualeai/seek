@@ -21,9 +21,10 @@ import (
 //  3. Index again. indexFolderDocumentsDelta returns
 //     errDeltaPayloadExceedsWindow, and indexFolderDocuments then does a full
 //     rebuild through streamFolderFilesWithMarkers and indexDocuments.
-//  4. Check that the base shard file is replaced. A delta keeps it and adds
-//     shards; a full rebuild writes a new one. Check also that a search finds
-//     the new content, and that the read semaphore has its full budget again.
+//  4. Check that the build replaced the base shard file. A delta keeps it and
+//     adds shards; a full rebuild writes a new one. Check also that a search
+//     finds the new content, and that the read semaphore has its full budget
+//     again.
 //
 // The test uses the real folder pipeline and mocks no changed documents.
 func TestIndexFolderDocumentsDelta_FallsBackOnOversizePayload(t *testing.T) {

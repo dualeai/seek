@@ -150,7 +150,10 @@ func committedShardCount(t *testing.T, indexDir string) int {
 // fast path (swapPending) and take the build lock. lockBuild then runs
 // recoverIncompleteSwap, which reads the label (shardFamilyFromLabel), cleans
 // familyAll, and clears the state, so the folder builds again. After the
-// build, the marker is gone and a search finds the content.
+// build, the marker is gone and the search finds the content. The searches
+// run through the CLI. There the walk of the graph expansion gives the folder
+// state (plan.folder), and only the swapPending check stops the warm fast
+// path.
 func TestTempSwap_RecoversFolderIncompleteSwap(t *testing.T) {
 	requireTools(t)
 	setTestUserCache(t)
@@ -158,34 +161,28 @@ func TestTempSwap_RecoversFolderIncompleteSwap(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "f.txt"), []byte("FOLDER_RECOVER_MARKER\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Lstat(root)
-	if err != nil {
-		t.Fatal(err)
+	plans, err := planCorpora(t.Context(), []string{root})
+	if err != nil || len(plans) != 1 {
+		t.Fatalf("plans=%d err=%v", len(plans), err)
 	}
-	plan, err := planFolderCorpus(root, info)
-	if err != nil {
-		t.Fatalf("planFolderCorpus: %v", err)
+	search := func(step string) {
+		t.Helper()
+		out, err := seek(t, "--lexical-only", "FOLDER_RECOVER_MARKER", root)
+		if err != nil || !strings.Contains(out, "f.txt") {
+			t.Fatalf("%s: err=%v output:\n%s", step, err, out)
+		}
 	}
-
-	ctx := context.Background()
-	if st, err := ensureFolderCorpusFresh(ctx, plan); err != nil || st != corpusSearchable {
-		t.Fatalf("initial folder build: st=%v err=%v", st, err)
-	}
+	search("initial folder search")
 
 	// A publish of familyAll that stopped during its swap leaves this marker.
-	if err := os.WriteFile(filepath.Join(plan.cacheDir, swappingMarkerFile), []byte(familyAll.label()), 0o644); err != nil {
+	marker := filepath.Join(plans[0].cacheDir, swappingMarkerFile)
+	if err := os.WriteFile(marker, []byte("all"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	if st, err := ensureFolderCorpusFresh(ctx, plan); err != nil || st != corpusSearchable {
-		t.Fatalf("folder build after marker: st=%v err=%v", st, err)
-	}
-	if _, err := os.Stat(filepath.Join(plan.cacheDir, swappingMarkerFile)); !os.IsNotExist(err) {
+	search("folder search after the marker")
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("folder swapping marker should be cleared after recovery, stat err=%v", err)
-	}
-	files, err := searchPlannedCorpusForTest(ctx, plan, "FOLDER_RECOVER_MARKER")
-	if err != nil || len(files) == 0 {
-		t.Fatalf("folder content lost after recovery: files=%v err=%v", files, err)
 	}
 }
 

@@ -278,10 +278,11 @@ func reportGCPlan(ctx context.Context, w io.Writer, cacheRoot string, entries []
 }
 
 // formatRoot renders a corpusDisplayInfo for the table. It marks a missing
-// source with [gone]. It cuts a long path from the left, so the base name
-// always stays. It removes control characters: a newline is valid in a POSIX
-// path, but it would break the layout of one row per corpus. Each cut is on a
-// rune boundary, so a multibyte path never shows a partial rune.
+// source with [gone]. It cuts a long path from the left and keeps its end, so
+// a base name that fits in the kept bytes stays whole. It removes control
+// characters: a newline is valid in a POSIX path, but it would break the
+// layout of one row per corpus. Each cut is on a rune boundary, so a multibyte
+// path never shows a partial rune.
 func formatRoot(info corpusDisplayInfo, width int) string {
 	if info.source == "" {
 		return "[empty]"

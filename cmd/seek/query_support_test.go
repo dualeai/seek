@@ -21,8 +21,22 @@ var zoektQueryKeys = []string{
 }
 
 // TestQuerySupportRowsCoverInventory checks that the table has each row
-// T01-T41 once and names every Zoekt key.
+// T01-T41 once and names every Zoekt key. It also parses each key with the
+// pinned Zoekt parser, which the planner runs (parseQueryHalves). The parser
+// must read the key as a key and not as a plain search word. So a Zoekt
+// version that drops a key fails here.
 func TestQuerySupportRowsCoverInventory(t *testing.T) {
+	for _, key := range zoektQueryKeys {
+		sample := key + "x"
+		if key == "or" {
+			sample = "alpha or beta"
+		}
+		parsed, err := query.Parse(sample)
+		_, isOr := parsed.(*query.Or)
+		if err == nil && (reflect.DeepEqual(parsed, &query.Substring{Pattern: sample}) || key == "or" && !isOr) {
+			t.Errorf("Zoekt parses %q as %v, not with the key %q", sample, parsed, key)
+		}
+	}
 	seen := map[string]bool{}
 	for _, row := range querySupport {
 		if seen[row.id] {

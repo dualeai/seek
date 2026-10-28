@@ -12,6 +12,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// oneNameOnlyNotice is the notice that a search prints for one name-only file,
+// after the blank line that ends the results. Tests compare the output with
+// this literal, not with nameOnlyNoticeLine. So a change of the printed words
+// fails them.
+const oneNameOnlyNotice = "\n\n1 name-only file could also match: binary, too large, not on disk, or unreadable\n"
+
 // nameOnlyNotice runs query on operands and returns its output and its
 // name-only notice line, or "" when it prints none.
 func nameOnlyNotice(t *testing.T, query string, operands ...string) (string, string) {

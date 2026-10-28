@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -56,6 +57,32 @@ func (h *dirtyEIOHook) reads() []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return slices.Clone(h.opened)
+}
+
+// TestKeptFileWarningReachesTheSearch keeps an untracked file by name through
+// the root command. The search prints the other file and writes one warning.
+// The warning gives the count, the first path and the cause, so the kept-file
+// error reaches the warning from the build with its type.
+func TestKeptFileWarningReachesTheSearch(t *testing.T) {
+	requireTools(t)
+	f := newGraphFixture(t)
+	repo := f.GitRepo("repo", "c.txt", "zqwarn committed\n")
+	for _, name := range []string{"a.txt", "b.txt"} {
+		writeFixtureFile(t, filepath.Join(repo, name), "zqwarn dirty "+name+"\n")
+	}
+	setTestUserCache(t)
+	installDirtyEIO(t, "b.txt")
+	logs := captureTestLogs(t, slog.LevelWarn)
+	if out, headers := searchHeaders(t, "zqwarn dirty", repo); !slices.Equal(headers, []string{filepath.Join(repo, "a.txt")}) {
+		t.Fatalf("headers=%v, want a.txt:\n%s", headers, out)
+	}
+	records := logs.Records()
+	want := map[string]any{"files": int64(1), "first": "b.txt", "cause": "input/output error"}
+	if len(records) != 1 || records[0].Message !=
+		"Some uncommitted files could not be read; they are searchable by name only until a later search reads them" ||
+		!maps.Equal(testLogAttrs(records[0]), want) {
+		t.Fatalf("warnings=%v, want one kept-file warning with %v", records, want)
+	}
 }
 
 // TestKeptFileRemovedLeavesNoGhost keeps an untracked file by name, then

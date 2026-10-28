@@ -218,15 +218,34 @@ func TestLateOnQueryWindowsStopAtOneModelCall(t *testing.T) {
 	}
 }
 
+// TestLateOnTokenizationMasksPunctuationAndPadding checks which tokens score.
+// A query keeps each token that it attends, punctuation too, and no padding.
+// The query mask comes from PrepareSemanticQuery, so the test reads the mask
+// that the search scores with. A document drops its punctuation and its
+// padding.
 func TestLateOnTokenizationMasksPunctuationAndPadding(t *testing.T) {
 	tokenizer, punctuation := openLateOnTestTokenizer(t)
 
-	// PrepareSemanticQuery packs the query windows with the query flag set.
+	// The query window gives the column of each query token. ID 32 is "?".
 	windows, err := lateOnQueryWindows(tokenizer, "请求?")
+	if err != nil || len(windows) != 1 {
+		t.Fatalf("windows=%d err=%v, want one query window", len(windows), err)
+	}
+	prepared, err := sharedModel(t).PrepareSemanticQuery(t.Context(), "请求?")
 	if err != nil {
 		t.Fatal(err)
 	}
-	queryIDs, queryAttention, queryMask := packLateOnRows(windows, nil, true)
+	if len(prepared.scoreMask) != lateOnSequenceLength || slices.Index(windows[0], 32) < 0 {
+		t.Fatalf("query mask of %d columns, window %v; want %d columns and the ? token",
+			len(prepared.scoreMask), windows[0], lateOnSequenceLength)
+	}
+	for column, kept := range prepared.scoreMask {
+		if kept != (column < len(windows[0])) {
+			t.Fatalf("query mask %v, want the %d tokens of window %v and no padding",
+				prepared.scoreMask, len(windows[0]), windows[0])
+		}
+	}
+
 	documentIDs, documentAttention, documentMask, err := tokenizeLateOnDocuments(
 		tokenizer,
 		punctuation,
@@ -235,39 +254,14 @@ func TestLateOnTokenizationMasksPunctuationAndPadding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, row := range []struct {
-		name      string
-		ids       []int64
-		attention []int64
-		mask      []bool
-		punct     int64
-		keepPunct bool
-	}{
-		{
-			name:      "query",
-			ids:       queryIDs,
-			attention: queryAttention,
-			mask:      queryMask[0],
-			punct:     32,
-			keepPunct: true,
-		},
-		{
-			name:      "document",
-			ids:       documentIDs,
-			attention: documentAttention,
-			mask:      documentMask[0],
-			punct:     28,
-			keepPunct: false,
-		},
-	} {
-		punctIndex := slices.Index(row.ids, row.punct)
-		if punctIndex < 0 || row.mask[punctIndex] != row.keepPunct {
-			t.Fatalf("%s punctuation mask = %v at %d", row.name, row.mask, punctIndex)
-		}
-		paddingIndex := slices.Index(row.attention, 0)
-		if paddingIndex < 0 || row.ids[paddingIndex] != lateOnPadTokenID || row.mask[paddingIndex] {
-			t.Fatalf("%s padding is IDs=%v attention=%v mask=%v", row.name, row.ids, row.attention, row.mask)
-		}
+	// ID 28 is ";".
+	punctIndex := slices.Index(documentIDs, 28)
+	if punctIndex < 0 || documentMask[0][punctIndex] {
+		t.Fatalf("document punctuation mask = %v at %d", documentMask[0], punctIndex)
+	}
+	paddingIndex := slices.Index(documentAttention, 0)
+	if paddingIndex < 0 || documentIDs[paddingIndex] != lateOnPadTokenID || documentMask[0][paddingIndex] {
+		t.Fatalf("document padding is IDs=%v attention=%v mask=%v", documentIDs, documentAttention, documentMask[0])
 	}
 }
 

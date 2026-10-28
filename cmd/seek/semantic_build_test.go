@@ -303,9 +303,9 @@ func TestEncodeSemanticBatchesAdmitsReadyWorkAfterOneCallCompletes(t *testing.T)
 // calls wait on step. It waits until each goroutine of the bubble blocks. The
 // scheduler has then started each call that its live limit admits, and waits
 // for one to end. It then ends one call, and does this again until the
-// scheduler returns. So the calls in flight at each step are the scheduler's
+// scheduler returns. So the calls that run at each step are the scheduler's
 // limit, with no timer and whatever the load of the host. If the scheduler
-// waits with no call in flight, the send blocks too, and synctest stops the
+// waits with no running call, the send blocks too, and synctest stops the
 // test as a deadlock.
 func stepSemanticModelCalls(step chan<- struct{}, done <-chan struct{}) {
 	for {
@@ -320,7 +320,7 @@ func stepSemanticModelCalls(step chan<- struct{}, done <-chan struct{}) {
 }
 
 // TestEncodeSemanticBatchesTracksLiveCPULimit gives the scheduler 4 CPUs, then
-// 1 when 4 model calls are in flight, then 4 again after 3 calls on 1 CPU. The
+// 1 when 4 model calls run, then 4 again after 3 calls on 1 CPU. The
 // scheduler must reach 4 calls, start each call on 1 CPU alone, and grow
 // again after the recovery. Each model call waits for its step, so the calls
 // that the scheduler admits overlap on any host.

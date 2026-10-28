@@ -370,17 +370,19 @@ func checkCtags() error {
 // overlay generation covers the dirty files:
 //
 //   - .build.lock serializes builders for the complete build.
-//   - The committed family is built outside the publish lock. Native full uses
-//     an empty temporary directory; eligible native delta seeds current shards.
-//     These are the only committed-data routes. HEAD is checked before publish.
+//   - The build makes the committed family outside the publish lock. Native
+//     full uses an empty temporary directory; eligible native delta seeds
+//     current shards. These are the only committed-data routes. The build
+//     checks HEAD before the publish.
 //   - A required semantic generation builds beside the committed Zoekt branch.
 //     Each branch reads its own bounded stream from the same captured commit.
 //   - A full uncommitted rebuild builds in its own directory before the publish
 //     lock, and the lock covers only its swap. An uncommitted delta writes in
 //     place under the lock, only on a family that matches its manifest. The
 //     shards, manifest, and state describe the same generation.
-//   - The joined descriptor is written last under the publish lock. A semantic
-//     failure keeps the Zoekt generation searchable without joined retrieval.
+//   - The build writes the joined descriptor last, under the publish lock. A
+//     semantic failure keeps the Zoekt generation searchable without joined
+//     retrieval.
 //
 // Readers hold the shared publish lock while they list, open, and search
 // shards, so the text and vector indexes name the same generation. A reader
@@ -618,6 +620,7 @@ func (g *gitNode) buildLocked(
 		return nil // discard build; live shards untouched
 	}
 
+	// prepareUncommitted gives a delta or a prebuilt stage, or prebuildErr.
 	// prebuildErr is an EMFILE or ENFILE of the prebuild. Then the committed
 	// family and the vectors still publish, the live uncommitted family
 	// stays, and no state is written.
@@ -1021,13 +1024,13 @@ type fileContent struct {
 }
 
 // readFilesToChannel reads files from the working tree using a bounded
-// worker pool and sends them to out. Cloud-only files, files whose content
-// does not fit the index, and files that start with binary content
-// (readContent) are sent by name only. It skips files that are not regular,
-// such as symlinks and directories, and a file removed after git status. A
-// file that cannot be read for a lasting reason is sent by name only. Another
-// read error goes to failure (dirtyFailure.passing), as in the folder reader.
-// The channel is closed after all workers exit.
+// worker pool and sends them to out. It sends some files by name only. These
+// are cloud-only files, files whose content does not fit the index, and files
+// that start with binary content (readContent). It skips files that are not
+// regular, such as symlinks and directories, and a file removed after git
+// status. It also sends by name only a file that it cannot read for a lasting
+// reason. Another read error goes to failure (dirtyFailure.passing), as in the
+// folder reader. It closes out after all workers exit.
 //
 // Each worker reserves readSemaphore weight before it opens a file. A
 // successful send transfers release ownership to the consumer. The worker
@@ -1517,9 +1520,6 @@ type uncommittedStage struct {
 	entries []uncommittedManifestEntry
 }
 
-// buildUncommittedStage builds the full uncommitted family of state in a new
-// build directory. A file with a temporary read error is kept by name
-// (stage.failure). EMFILE, ENFILE, or a cancel discards the stage.
 // prepareUncommitted decides how the uncommitted family changes. delta is the
 // change that the live family takes under the publish lock, or nil for a full
 // rebuild. A full rebuild reads every dirty file, so it builds its stage here,
@@ -1550,6 +1550,9 @@ func prepareUncommitted(
 	return nil, nil, nil, err
 }
 
+// buildUncommittedStage builds the full uncommitted family of state in a new
+// build directory. A file with a temporary read error is kept by name
+// (stage.failure). EMFILE, ENFILE, or a cancel discards the stage.
 func buildUncommittedStage(ctx context.Context, repoDir, indexDir string, state repoState, parallelism int) (*uncommittedStage, error) {
 	entries := uncommittedManifestEntries(statUncommittedCandidates(repoDir, state.Files))
 	dir, err := newBuildDir(indexDir)
@@ -1790,8 +1793,8 @@ func indexDocumentsWithRepository(
 		cancelProducer = func() {}
 	}
 	// A large window rotates at largeParallelism documents, so one build runs
-	// at most that many large shard jobs. No token is shared between builds.
-	// Else a consumer could wait for another build's token while it holds its
+	// at most that many large shard jobs. Builds share no token. Else a
+	// consumer could wait for another build's token while it holds its
 	// document. At the same time, that build could wait for readers that the
 	// read budget blocks.
 	largeParallelism := min(max(parallelism, 1), largeDocumentParallelism)

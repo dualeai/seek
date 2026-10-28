@@ -718,15 +718,25 @@ func TestRenamedLongTailFileReusesItsRows(t *testing.T) {
 // TestSemanticModelPathTailIsTheTailOfTheModelPath compares the tail with the
 // last 4 parts of the joined model path. It uses names of 1 to 6 parts and
 // every kind of base: none (Git), the root folder, and short and deep
-// folders. Odd paths check rerankPathTail alone.
+// folders. Odd paths check rerankPathTail alone. The test joins the base and
+// the name itself, not with semanticModelPath. So a wrong join, such as
+// "//f.go" for the root folder, also fails it.
 func TestSemanticModelPathTailIsTheTailOfTheModelPath(t *testing.T) {
 	lastParts := func(value string) string {
 		parts := strings.Split(value, "/")
 		return strings.Join(parts[max(len(parts)-4, 0):], "/")
 	}
+	// joined is the model path of a clean base and name. With no base, it is
+	// the name alone. Else it joins the base and the name with one slash.
+	joined := func(base, name string) string {
+		if base == "" {
+			return name
+		}
+		return strings.TrimSuffix(base, "/") + "/" + name
+	}
 	for _, base := range []string{"", "/", "/h", "/h/i", "/a/b/c/d/e"} {
 		for _, name := range []string{"f.go", "a/f.go", "a/b/f.go", "a/b/c/f.go", "a/b/c/d/f.go", "a/b/c/d/e/f.go"} {
-			if got, want := semanticModelPathTail(base, name), lastParts(semanticModelPath(base, name)); got != want {
+			if got, want := semanticModelPathTail(base, name), lastParts(joined(base, name)); got != want {
 				t.Fatalf("base %q, name %q: tail %q, want %q", base, name, got, want)
 			}
 		}

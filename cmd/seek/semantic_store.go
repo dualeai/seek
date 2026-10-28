@@ -49,8 +49,8 @@ const (
 // semanticRowsHashed counts the full checks of rows.bin, and
 // semanticShardsHashed the USearch shards that a check hashed. A full check
 // reads the whole file, which a warm search must not do again. Each count is
-// one atomic add next to that read, so it costs nothing. Tests read the counts
-// to prove that a search trusts a checked file.
+// one atomic add at that read, and the read costs much more than the add.
+// Tests read the counts to prove that a search trusts a checked file.
 var (
 	semanticRowsHashed   atomic.Int64
 	semanticShardsHashed atomic.Int64

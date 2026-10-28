@@ -711,8 +711,8 @@ func TestPartialLoss_FolderFamily(t *testing.T) {
 
 	assertAll := func(label string) {
 		t.Helper()
-		// Run one refresh (the healing invocation). Then read the family that
-		// it published, exactly as the git matrix does.
+		// Run one refresh: after a damage, it must repair the family. Then
+		// read the family that it published, exactly as the git matrix does.
 		if st, err := ensureFolderCorpusFresh(ctx, plan); err != nil || st != corpusSearchable {
 			t.Errorf("%s: folder refresh: st=%v err=%v", label, st, err)
 			return

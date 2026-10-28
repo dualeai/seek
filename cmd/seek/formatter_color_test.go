@@ -279,7 +279,8 @@ func TestLongLine_WindowCutLandsOnRuneBoundary(t *testing.T) {
 	const emoji = "🎉" // U+1F389, 4 bytes
 	matchStart := matchCtxBytes + 100
 	winStart := matchStart - matchCtxBytes
-	pre := strings.Repeat("a", winStart-2) // emoji begins 2 bytes before winStart
+	// The emoji begins 2 bytes before winStart.
+	pre := strings.Repeat("a", winStart-2)
 	gap := strings.Repeat("b", matchStart-len(pre)-len(emoji))
 	line := pre + emoji + gap + "MATCH" + strings.Repeat("c", matchCtxBytes+200) + "\n"
 	if len(line) <= maxLineBytes {
@@ -398,7 +399,8 @@ func TestColor_ManyFragmentsSpillToHeap(t *testing.T) {
 	// spill to a heap-grown slice; all spans must still render. Exercises the
 	// spill path that the [16] capacity bound otherwise leaves untested.
 	const count = 20
-	line := strings.Repeat("x ", count) + "\n" // "x" at every even offset 0,2,4,…
+	// "x" is at each even offset: 0, 2, 4, and so on.
+	line := strings.Repeat("x ", count) + "\n"
 	frags := make([]zoekt.LineFragmentMatch, count)
 	for i := range count {
 		frags[i] = frag(i*2, 1)

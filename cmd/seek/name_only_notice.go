@@ -16,7 +16,8 @@ import (
 // files too large for the shard format. They are also files with no bytes in
 // Seek: cloud-only files, missing Git blobs, and unreadable files. Zoekt stores
 // each of them with its NOT-INDEXED marker as content, so one marker query per
-// node counts them. Zoekt's own too-small files (1 or 2 bytes) are not counted.
+// node counts them. The notice does not count Zoekt's own too-small files (1
+// or 2 bytes).
 
 // countedSkipReasons are the marker explanations that the notice counts, as
 // Zoekt writes them (index/document.go; TestCountedSkipReasonsMatchZoekt).

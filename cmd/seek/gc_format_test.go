@@ -19,10 +19,14 @@ func TestGC_TruncateHash(t *testing.T) {
 		in   string
 		want string
 	}{
-		{"0000000000000001", "00000...01"},                 // 16 hex digits: 5, "...", 2
-		{"abcdef0123456789abcdef0123456789", "abcde...89"}, // the 32 hex digits of a corpus ID
-		{"1234567890", "1234567890"},                       // 10 characters stay whole
-		{"abc", "abc"},                                     // fewer than 10 stay whole
+		// 16 hex digits: 5, "...", 2.
+		{"0000000000000001", "00000...01"},
+		// The 32 hex digits of a corpus ID.
+		{"abcdef0123456789abcdef0123456789", "abcde...89"},
+		// 10 characters stay whole.
+		{"1234567890", "1234567890"},
+		// Fewer than 10 characters stay whole.
+		{"abc", "abc"},
 	}
 	for _, c := range cases {
 		if got := truncateHash(corpusID(c.in)); got != c.want {

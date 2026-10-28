@@ -449,9 +449,8 @@ func packSemanticF32Query(backend int, query []float32) semanticNumKongPack {
 
 // semanticFineScratch holds the buffers of one worker. They hold the dot
 // products of one block of rows, the rows of a block with gaps, and the block
-// scores. A
-// pool keeps the buffers, so a search does not clear new memory for each
-// worker.
+// scores. A pool keeps the buffers, so a search does not clear new memory for
+// each worker.
 type semanticFineScratch struct {
 	products []float32
 	gathered []semanticFineF16Vectors
