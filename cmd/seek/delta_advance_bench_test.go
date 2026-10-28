@@ -12,15 +12,18 @@ import (
 // the repo's HEAD advances by exactly one commit.
 //
 // The setup takes a forward chain of recent commit SHAs that ends at the
-// current HEAD. It makes a temporary clone under b.TempDir(), checks out a
-// local benchmark branch at the oldest commit, and builds a base index. Each
-// iteration resets the clone to the next SHA outside the timer, then times the
-// node refresh that a search runs (gitNode.prepare). The sampled chain has at
-// most ten advances. When b.Loop runs more rounds, the benchmark resets the
-// clone to the oldest commit, indexes it outside the timer, and replays the
-// chain.
-// Each timed iteration advances by one real commit, not between two distant
-// commits.
+// current HEAD, and makes a temporary clone under b.TempDir(). Each round
+// takes the next advance of the chain. Outside the timer, it resets the clone
+// to the parent commit and builds a new base index there, in a new cache.
+// Then it resets the clone to the child commit and times the node refresh
+// that a search runs (gitNode.prepare). The sampled chain has at most ten
+// advances; more rounds replay it.
+//
+// Each round starts from a new base, so the deltas do not stack. Stacked
+// deltas keep the content that they replace. When that dead content reaches
+// one full shard, the refresh builds in full (deltaNeedsCompaction), and how
+// soon that happens depends on the size of the sampled commits. A new base
+// makes each round time the same one-commit delta for any history.
 //
 // The benchmark only reads SEEK_BENCH_REPO; the hard resets change the
 // temporary clone.
@@ -35,36 +38,25 @@ func BenchmarkLargeRepo_CommittedAdvance(b *testing.B) {
 			b.Fatalf("benchmark chain is not a direct first-parent advance: %s parent=%s, want %s", commits[i], parent, commits[i-1])
 		}
 	}
-	base := commits[0]
-	chain := commits[1:]
 
-	repoDir := cloneBenchRepoAt(b, sourceRepo, base)
-	paths, plan := setupLargeRepoBench(b, repoDir)
+	repoDir := cloneBenchRepoAt(b, sourceRepo, commits[0])
 	ctx := b.Context()
 
 	for i := 0; b.Loop(); i++ {
 		b.StopTimer()
-		// chain[0] is one commit ahead of base; advance through the chain.
-		// When b.Loop() runs more rounds than the chain has advances, reset
-		// the temporary clone to base and replay.
-		idx := i % len(chain)
-		if idx == 0 && i > 0 {
-			gitRunIn(b, repoDir, "reset", "--hard", base)
-			if _, err := ensureGitCorpusFresh(ctx, plan, paths); err != nil {
-				b.Fatalf("chain replay base index: %v", err)
-			}
-		}
-		gitRunIn(b, repoDir, "reset", "--hard", chain[idx])
+		// commits[idx] is the parent of commits[idx+1].
+		idx := i % (len(commits) - 1)
+		parent, child := commits[idx], commits[idx+1]
+		gitRunIn(b, repoDir, "reset", "--hard", parent)
+		paths, plan := setupLargeRepoBench(b, repoDir)
+		gitRunIn(b, repoDir, "reset", "--hard", child)
 		before, ok := readCommittedGitState(plan.cacheDir)
 		if !ok {
 			b.Fatal("committed benchmark base state is missing")
 		}
-		wantBefore := base
-		if idx > 0 {
-			wantBefore = chain[idx-1]
-		}
-		if before.head.String() != wantBefore {
-			b.Fatalf("iteration %d base state head=%s, want direct parent %s", i, before.head, wantBefore)
+		if before.head.String() != parent || before.baseHead.String() != parent {
+			b.Fatalf("iteration %d base state head=%s base=%s, want a new base at the parent %s",
+				i, before.head, before.baseHead, parent)
 		}
 		b.StartTimer()
 
@@ -73,7 +65,7 @@ func BenchmarkLargeRepo_CommittedAdvance(b *testing.B) {
 		}
 		b.StopTimer()
 		after, ok := readCommittedGitState(plan.cacheDir)
-		if !ok || after.head.String() != chain[idx] || after.baseHead != before.baseHead {
+		if !ok || after.head.String() != child || after.baseHead != before.baseHead {
 			b.Fatalf("iteration %d did not use the direct delta path: before=%+v after=%+v", i, before, after)
 		}
 		b.StartTimer()
