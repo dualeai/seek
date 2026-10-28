@@ -77,6 +77,22 @@ else
 	record_failure "wrapper rewrite" "exit $code, invalid response [$out]"
 fi
 
+# The emitted commands search a copy of the plugin in its own Git repository,
+# with a cache in WORK. So they still search a Git node, but a small one. In
+# the plugin folder, Seek first indexed the whole seek repository, model stage
+# included: the checks took 2.6 min on a Linux runner and 8.7 min on a macOS
+# Intel runner.
+EMITTED_ROOT="$WORK/plugin"
+cp -R "$ROOT/." "$EMITTED_ROOT"
+if ! {
+	git -C "$EMITTED_ROOT" init -q &&
+		git -C "$EMITTED_ROOT" add -A &&
+		git -C "$EMITTED_ROOT" -c user.name=seek-router-test -c user.email=seek-router-test@invalid \
+			-c commit.gpgsign=false commit -q --no-verify -m fixture
+} >/dev/null 2>&1; then
+	record_failure "emitted fixture" "git init or commit failed in $EMITTED_ROOT"
+fi
+
 check_emitted_command() {
 	emitted_name=$1
 	emitted_source=$2
@@ -88,7 +104,7 @@ check_emitted_command() {
 			python3 -c 'import json,sys; print(json.load(sys.stdin)["hookSpecificOutput"]["updatedInput"]["command"])' \
 				2>/dev/null || :
 	)
-	emitted_result=$(CDPATH='' cd -- "$ROOT" && sh -c "$emitted_command" 2>/dev/null)
+	emitted_result=$(CDPATH='' cd -- "$EMITTED_ROOT" && SEEK_CACHE_DIR="$WORK/cache" sh -c "$emitted_command" 2>/dev/null)
 	emitted_run_code=$?
 	case $emitted_result in
 	*"## "*) emitted_match=1 ;;
